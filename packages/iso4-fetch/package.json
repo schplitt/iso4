@@ -1,0 +1,54 @@
+{
+  "name": "@iso4/fetch",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Hardened FetchHandler for the iso4 sandbox: DNS pinning, host allowlist, private-IP blocking, no auto-redirect",
+  "keywords": [
+    "iso4",
+    "sandbox",
+    "fetch",
+    "ssrf",
+    "security",
+    "permissions"
+  ],
+  "license": "MIT",
+  "author": "schplitt",
+  "homepage": "https://github.com/schplitt/iso4/tree/main/packages/iso4-fetch#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schplitt/iso4.git",
+    "directory": "packages/iso4-fetch"
+  },
+  "bugs": {
+    "url": "https://github.com/schplitt/iso4/issues"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "peerDependencies": {
+    "iso4": "workspace:*"
+  },
+  "devDependencies": {
+    "iso4": "workspace:*"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

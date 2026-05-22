@@ -1,0 +1,41 @@
+{
+  "name": "iso4-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.2",
+  "description": "iso4 — fast, sandboxed V8 isolate runtime with permission-controlled fetch and pluggable modules",
+  "license": "MIT",
+  "author": "schplitt",
+  "homepage": "https://github.com/schplitt/iso4#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schplitt/iso4.git"
+  },
+  "bugs": {
+    "url": "https://github.com/schplitt/iso4/issues"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=\"./packages/*\" build",
+    "test": "pnpm -r --filter=\"./packages/*\" test",
+    "test:run": "pnpm -r --filter=\"./packages/*\" test:run",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "typecheck": "pnpm -r --filter=\"./packages/*\" typecheck",
+    "changeset": "changeset",
+    "changeset:version": "changeset version && pnpm install --lockfile-only",
+    "changeset:publish": "pnpm -r --filter=\"./packages/*\" publish --access public --no-git-checks && changeset tag",
+    "prerelease": "pnpm lint && pnpm typecheck && pnpm build && pnpm test:run"
+  },
+  "devDependencies": {
+    "@changesets/cli": "catalog:",
+    "@schplitt/eslint-config": "catalog:",
+    "eslint": "catalog:",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

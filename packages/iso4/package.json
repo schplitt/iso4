@@ -1,0 +1,50 @@
+{
+  "name": "iso4",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Fast, sandboxed V8 isolate runtime with permission-controlled fetch and pluggable modules",
+  "keywords": [
+    "sandbox",
+    "isolate",
+    "v8",
+    "secure",
+    "ai",
+    "agent",
+    "fetch",
+    "permissions"
+  ],
+  "license": "MIT",
+  "author": "schplitt",
+  "homepage": "https://github.com/schplitt/iso4#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schplitt/iso4.git",
+    "directory": "packages/iso4"
+  },
+  "bugs": {
+    "url": "https://github.com/schplitt/iso4/issues"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

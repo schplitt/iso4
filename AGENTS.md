@@ -1,0 +1,263 @@
+# AGENTS.md
+
+## Project Overview
+
+**iso4** is a fast, sandboxed V8 isolate runtime with permission-controlled
+`fetch` and pluggable modules. Built primarily for the AI-agent prefix/postfix
+pattern: host code precompiles setup (globals, data, tool bindings) once,
+then runs many agent-generated postfixes against the resulting V8 startup
+snapshot.
+
+The project is a pnpm monorepo. Architecture and rationale are documented
+exhaustively in three docs at the repo root:
+
+- **`DESIGN.md`** — architecture, execution model, limits, security model,
+  phased build plan. Read this first for any non-trivial change.
+- **`MONOREPO.md`** — package layout, dependency direction, versioning,
+  distribution. Read this before adding code to a new package or moving
+  code between packages.
+- **`packages/iso4/src/types.ts`** — canonical public API surface for the
+  runtime. Changes here are API changes and must align with DESIGN.md.
+
+## Architecture
+
+```
+iso4/                              ← workspace root
+  DESIGN.md
+  MONOREPO.md
+  package.json                     ← workspace root (private)
+  pnpm-workspace.yaml              ← packages glob + catalog
+  eslint.config.js                 ← @schplitt/eslint-config
+  .github/workflows/               ← CI + release
+  packages/
+    iso4/                          ← `iso4` package (the runtime)
+      src/
+        index.ts                   ← public re-exports + createRuntime
+        types.ts                   ← canonical API types
+      tests/
+      package.json
+      tsconfig.json                ← standalone (no extends), copied from starter template
+      tsdown.config.ts
+    iso4-fetch/                    ← @iso4/fetch (planned)
+    iso4-fs/                       ← @iso4/fs    (future)
+    iso4-v8-<platform>/            ← native Rust binaries (planned)
+  native/
+    v8-runtime/                    ← Rust source for the V8 host binary (planned)
+```
+
+### `packages/iso4`
+
+The TypeScript runtime package. Owns:
+
+- Public API: `createRuntime`, `Runtime`, `PrecompiledPrefix`, the type
+  system declared in `src/types.ts`.
+- IPC client + binary frame codec talking to the Rust V8 process.
+- Bridge dispatch routing `_hostCall` frames to host-supplied handlers
+  for `fetch` and `imports`.
+- Mechanical fetch hygiene: header/URL/method validation, body size cap,
+  no-auto-redirect default. Anything that is not policy.
+- Sandbox-side JS shims (`console`, `crypto.getRandomValues`, `fetch` stub,
+  module proxy generation).
+
+Does **not** own:
+
+- Any HTTP client. If `fetch` is called without a configured handler the
+  run fails with `ERR_FETCH_NOT_CONFIGURED`.
+- Any policy. Allow/deny decisions live in handlers the host supplies.
+- Any Node-stdlib emulation. Those live in sibling `@iso4/<name>` packages.
+
+### Future packages
+
+`@iso4/fetch`, `@iso4/fs`, `@iso4/crypto`, etc. are tiny factory packages
+that produce `FetchHandler` or `HostImport` values ready to plug into the
+runtime's options. See `MONOREPO.md` §2 for the canonical list and the
+rule for adding new ones.
+
+## Development
+
+```sh
+pnpm install        # bootstrap workspace
+pnpm build          # build all packages (tsdown)
+pnpm test:run       # run vitest once across all packages (use this in automation)
+pnpm test           # vitest in watch mode (developer use only)
+pnpm lint           # eslint
+pnpm lint:fix       # eslint --fix
+pnpm typecheck      # tsc --noEmit across packages
+pnpm changeset      # record a per-package version bump (use on every user-facing change)
+```
+
+Toolchain:
+
+- **pnpm** for package management (catalog + workspace protocol).
+- **TypeScript** with strict config. Each package has its own standalone
+  `tsconfig.json` copied from the starter template — no `extends`, no
+  project references. Cross-package type resolution happens via pnpm's
+  workspace symlinks in `node_modules`, not via TS project references.
+- **tsdown** for builds; packages emit ESM only.
+- **vitest** for tests, per package.
+- **eslint** via `@schplitt/eslint-config`.
+- **@changesets/cli** for per-package versioning + changelogs. See
+  `.changeset/README.md` for the workflow.
+- **mise** pins the Node version (`mise.toml`).
+- **cargo** (Rust stable) for the V8 host binary under `native/v8-runtime/`.
+
+## Code Style
+
+- ESM only (`"type": "module"` everywhere).
+- TypeScript strict mode enabled, plus extras: `exactOptionalPropertyTypes`,
+  `noUncheckedIndexedAccess`, `noPropertyAccessFromIndexSignature: false`,
+  `isolatedDeclarations`, `verbatimModuleSyntax`.
+- Build via `tsdown` (zero-config-ish).
+- Lint via `@schplitt/eslint-config` (the eslint.config.js is one-line).
+
+## Testing
+
+- Tests live in `packages/<pkg>/tests/`, named `*.test.ts`.
+- Use `pnpm test:run` (single shot, no watch) in any automated path.
+- Use `pnpm test` only for interactive development.
+- Import from `../src` (relative) inside a package's tests.
+- Cross-package integration tests (runtime ↔ Rust binary) will live in a
+  top-level `bench/` or `examples/` once the runtime is wired up; not
+  required during the scaffolding phase.
+
+## Maintaining Documentation
+
+When making changes to the project:
+
+- **`DESIGN.md`** — Update whenever architecture, the execution model,
+  resource-limit semantics, the security model, or the API surface changes.
+  This is the design contract. Out-of-date design docs cost more than the
+  code they describe.
+- **`MONOREPO.md`** — Update whenever package boundaries change, a new
+  package is added, dependency direction shifts, or versioning policy
+  changes.
+- **`packages/iso4/src/types.ts`** — Update whenever the public API
+  changes. This file is the canonical surface; any deviation between it
+  and `DESIGN.md` is a bug.
+- **`AGENTS.md`** (this file) — Update with technical details, architecture,
+  and best practices for AI agents.
+- **`README.md`** — Update with user-facing documentation for end users:
+  - ✅ New exported utilities or functions from any package.
+  - ✅ New configuration options.
+  - ✅ Changes to existing API behavior.
+  - ✅ Installation or setup instructions.
+  - ✅ Usage examples that should appear on first read.
+- **Per-package `README.md`** — Update when that package's specific API or
+  setup changes. The root README is for project orientation; per-package
+  READMEs are for users of that package specifically.
+
+## Agent Guidelines
+
+When working on this project:
+
+1. **Read the design docs first.** Almost every non-trivial change touches
+   something already documented in `DESIGN.md` or `MONOREPO.md`. Use them.
+2. **Keep `types.ts` and `DESIGN.md` in sync.** If you change the API, both
+   files change in the same commit. If you cannot match them, ask before
+   committing.
+3. **Run tests** after making changes: `pnpm test:run` (single-shot).
+4. **Run linting**: `pnpm lint` (or `pnpm lint:fix`).
+5. **Run type checking** before committing: `pnpm typecheck`.
+6. **Validation order**: `pnpm lint:fix` → `pnpm typecheck` → `pnpm test:run`.
+7. **Public API stays in `packages/iso4/src/index.ts`.** All re-exports
+   listed there explicitly. No barrel-exports of `*`.
+8. **Add tests** for new functionality in `packages/<pkg>/tests/`.
+9. **Record learnings** — When the user corrects a mistake or provides
+   context about how something should be done, add it to the "Project
+   Context & Learnings" section below if it's a recurring pattern (not a
+   one-time fix).
+10. **Notify documentation changes** — When updating `README.md`,
+    `AGENTS.md`, `DESIGN.md`, `MONOREPO.md`, or `types.ts`, explicitly
+    call out the changes to the user at the end of your response so they
+    can review and don't overlook them.
+11. **Use available workflow tools first** — When the user asks for
+    branch/commit/PR workflow, use the available MCP/devtools first. Only
+    fall back to `gh` CLI when those tools are not available.
+12. **Use conventional naming for git workflow** — Branch names should use
+    conventional prefixes where appropriate: `feat/`, `fix/`, `chore/`,
+    `docs/`, `refactor/`, `test/`, `build/`, `types/`, `style/`, `perf/`,
+    `examples/`, `ci/`. Commit subjects and PR titles should use
+    conventional-commit style.
+13. **Default PR behavior** — If the current branch already contains the
+    related work, assume the PR should be opened from the current branch
+    to `main` unless the user explicitly asks otherwise.
+14. **Always include a PR body** — PRs created for the user must include a
+    body. If a related issue identifier is known, include the appropriate
+    GitHub-style reference.
+15. **Ask when requirements are unclear** — If requirements are ambiguous,
+    ask a focused clarifying question instead of implementing a guessed
+    solution. This project is in early design; many decisions are still
+    open and the wrong choice is more expensive than a clarifying round trip.
+16. **Prefer simple inline logic over trivial helpers** — Do not introduce
+    tiny one-line helper/utility functions or throwaway `parse*` helpers
+    for trivial one-off logic. Inline unless there is real reuse or a clear
+    API boundary.
+17. **Respect package boundaries** — Before adding code, check the "What
+    goes where" table in `MONOREPO.md` §6. If a change doesn't fit any
+    row, the design needs a conversation before the code does.
+
+## Project Context & Learnings
+
+This section captures project-specific knowledge, tool quirks, and lessons
+learned during development.
+
+### Tools & Dependencies
+
+- Use `pnpm test:run` in automated/agent workflows. `pnpm test` starts watch
+  mode and will hang automation.
+- Prefer `pnpm lint:fix` before manual lint cleanup.
+- The pnpm catalog (`pnpm-workspace.yaml`) is the single source of truth
+  for dev-dep versions. Reference deps as `"catalog:"` in package.json,
+  not hard-coded versions.
+- Node 24+ is required; `mise.toml` pins to 26 for development. CI uses 26.
+
+### Patterns & Conventions
+
+- ESM only. No CJS anywhere.
+- Use conventional branch prefixes and conventional-commit style commit
+  subjects / PR titles.
+- The public API of every package is what's exported from its
+  `src/index.ts`. Tests import from `../src/index.js` (note the `.js`
+  extension — required by NodeNext-style ESM resolution).
+- Keep trivial one-off normalization and branching inline instead of
+  extracting tiny helpers too early.
+- If requirements are ambiguous, ask a focused clarifying question first.
+
+### iso4-specific architectural rules
+
+These are recurring decisions; deviating from them needs an explicit
+conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
+
+- **Only data crosses the sandbox boundary.** Functions never cross by
+  value. V8 `ValueSerializer` enforces this naturally on exports; the
+  bridge enforces it explicitly on host import calls.
+- **User code is always ESM.** Results come back via `export default` /
+  named `export`s, never via globals or `console`.
+- **Globals are runtime-curated.** The host can only contribute names
+  from a small allowlist (currently `fetch`). Everything else goes
+  through `imports`. Adding a new permitted global is a deliberate
+  design decision recorded in `DESIGN.md` §4.2.
+- **`iso4` has no HTTP client and no network policy.** Mechanical hygiene
+  (header validation, URL parsing, body cap) lives in `iso4`. Real fetch
+  behavior + policy lives in `@iso4/fetch` or in host code.
+- **No callbacks across the boundary** in v1. No `setTimeout`, no
+  event listeners on host objects. Functions passed as host-import
+  arguments are rejected with `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`.
+
+### Common Mistakes to Avoid
+
+- Do not use `pnpm test` in automation.
+- Do not create tiny helper/utility functions or `parse*`/`normalize*`
+  wrappers for trivial one-off logic.
+- Do not guess when the requested behavior or scope is unclear.
+- Do not import from a sibling package's internals. Use its public
+  `package.json` exports. If something needs to be shared between sibling
+  packages, that's a design discussion (not just a refactor).
+- Do not silently install new top-level globals into a precompiled
+  prefix's restored context at run time — that breaks the snapshot's
+  shape invariant. Surface with `ERR_UNDECLARED_BINDING` instead.
+- Do not add a default HTTP client to `iso4`. Sandbox network access
+  must be deny-by-default.
+- Do not forget to run `pnpm changeset` when a PR changes user-visible
+  behavior in a published package. Internal-only changes (refactors,
+  tests, docs) do not need one.
