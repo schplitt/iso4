@@ -25,7 +25,13 @@
     "changeset": "changeset",
     "changeset:version": "changeset version && pnpm install --lockfile-only",
     "changeset:publish": "pnpm -r --filter=\"./packages/*\" publish --access public --no-git-checks && changeset tag",
-    "prerelease": "pnpm lint && pnpm typecheck && pnpm build && pnpm test:run"
+    "prerelease": "pnpm lint && pnpm typecheck && pnpm build && pnpm test:run",
+    "build:native": "cargo build --release --manifest-path native/v8-runtime/Cargo.toml",
+    "build:native:dev": "cargo build --manifest-path native/v8-runtime/Cargo.toml",
+    "check:native": "cargo check --manifest-path native/v8-runtime/Cargo.toml",
+    "test:native": "cargo test --manifest-path native/v8-runtime/Cargo.toml",
+    "lint:native": "cargo clippy --manifest-path native/v8-runtime/Cargo.toml -- -D warnings",
+    "fmt:native": "cargo fmt --manifest-path native/v8-runtime/Cargo.toml"
   },
   "devDependencies": {
     "@changesets/cli": "catalog:",
