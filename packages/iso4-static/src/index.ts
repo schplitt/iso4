@@ -7,7 +7,7 @@
  * NOT YET IMPLEMENTED — Phase 11. See DESIGN.md §9.
  */
 
-import type { StaticRuntime, StaticRuntimeOptions } from './types.js'
+import type { StaticRuntime, StaticRuntimeOptions } from './types'
 
 export type {
   // Re-exported from @iso4/core
@@ -36,7 +36,7 @@ export type {
   CallFailure,
   CallError,
   CallErrorCode,
-} from './types.js'
+} from './types'
 
 /**
  * Create a static runtime.

@@ -10,7 +10,7 @@
  * See DESIGN.md and MONOREPO.md for the architectural plan.
  */
 
-import type { Runtime, RuntimeOptions } from './types.js'
+import type { Runtime, RuntimeOptions } from './types'
 
 export type {
   // Re-exported from @iso4/core
@@ -42,7 +42,7 @@ export type {
   SandboxExports,
   RunError,
   RunErrorCode,
-} from './types.js'
+} from './types'
 
 /**
  * Create a dynamic runtime. Spawns the Rust V8 process.

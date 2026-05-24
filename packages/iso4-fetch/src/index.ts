@@ -14,13 +14,13 @@
  */
 
 import type { FetchHandler } from 'iso4'
-import type { SafeFetchOptions } from './types.js'
+import type { SafeFetchOptions } from './types'
 
 export type {
   SafeFetchOptions,
   SafeFetchPolicy,
   SafeFetchRequest,
-} from './types.js'
+} from './types'
 
 /**
  * Build a hardened `FetchHandler` driven by a host-supplied policy callback.

@@ -1,5 +1,5 @@
 import { expect, test } from 'vitest'
-import { createSafeFetch, type SafeFetchPolicy } from '../src/index.js'
+import { createSafeFetch, type SafeFetchPolicy } from '../src/index'
 
 test('createSafeFetch returns a handler that throws (not yet implemented)', async () => {
   const policy: SafeFetchPolicy = () => true

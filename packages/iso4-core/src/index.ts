@@ -12,4 +12,4 @@ export type {
 	HostExportValue,
 	HostExportData,
 	HostExportFunction,
-} from './types.js'
+} from './types'
