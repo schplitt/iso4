@@ -350,22 +350,60 @@ does not throw for sandboxed failures — only for infrastructure failures
 
 ## 6. The wire and protocol
 
-Same shape as secure-exec, slimmed down. Length-prefixed binary frames over
-UDS, 8 message types:
+Length-prefixed binary frames over a Unix domain socket. The canonical
+reference is `docs/protocol.md`; this section is the design summary.
 
-| Code | Direction | Type | Purpose |
-|------|-----------|------|---------|
-| 0x01 | host→rust | Authenticate | Token check on connect |
-| 0x02 | host→rust | Run | Code + imports + globals + limits |
-| 0x03 | host→rust | BridgeResponse | Reply to a previous BridgeCall |
-| 0x04 | host→rust | Terminate | Force stop the run |
-| 0x05 | rust→host | BridgeCall | Sandbox called fetch / host import |
-| 0x06 | rust→host | StdioChunk | console output |
-| 0x07 | rust→host | Result | Final result for a Run |
-| 0x08 | rust→host | Log | Internal runtime diagnostics |
+### 6.1 Frame format
 
-Payloads use V8 `ValueSerializer` for argument/result encoding. No CBOR
-fallback — if Bun later turns out to need it, add it then.
+```
+┌─────────────────────┬──────────────────┬─────────────────────────┐
+│  length  (4 bytes)  │  type  (1 byte)  │  payload  (N bytes)     │
+│  uint32 big-endian  │  see tables      │  message-specific       │
+└─────────────────────┴──────────────────┴─────────────────────────┘
+```
+
+`length` covers `type + payload` — so `length = 1` means type byte only,
+no payload.
+
+### 6.2 Message types
+
+Direction is always known from context (each side knows whether it is
+reading TS-sent or Rust-sent frames), so type bytes are scoped per
+direction. Both tables start at `0x01`.
+
+**TS → Rust**
+
+| Byte   | Name             | Purpose                                      |
+|--------|------------------|----------------------------------------------|
+| `0x01` | `Authenticate`   | First message on connect: protocol version + token |
+| `0x02` | `Run`            | Start a sandboxed execution                  |
+| `0x03` | `BridgeResponse` | Reply to a `BridgeCall` from Rust            |
+| `0x04` | `Terminate`      | Force-stop a running isolate                 |
+
+**Rust → TS**
+
+| Byte   | Name          | Purpose                                               |
+|--------|---------------|-------------------------------------------------------|
+| `0x01` | `BridgeCall`  | Sandbox called `fetch` or a host-module function      |
+| `0x02` | `StdioChunk`  | Eager `console.*` output (stdout or stderr)           |
+| `0x03` | `Result`      | Final result for a `Run` (always sent exactly once)   |
+| `0x04` | `Log`         | Internal runtime diagnostics                          |
+
+### 6.3 Payload encoding
+
+Structured data (arguments, results, exports) uses V8 `ValueSerializer`
+wire format. Raw bytes for stdio chunks. Plain UTF-8 for log strings.
+
+### 6.4 Session lifecycle
+
+One connection per runtime instance. Multiple `Run` messages may be sent
+sequentially on one connection (after each `Result` is received). Concurrent
+runs on one connection are not supported in v1 — each `Run` must complete
+before the next begins.
+
+`BridgeCall` / `BridgeResponse` pairs are also sequential within a run in
+v1: Rust sends one `BridgeCall`, waits for `BridgeResponse`, then continues.
+No multiplexing.
 
 ---
 
