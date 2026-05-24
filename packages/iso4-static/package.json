@@ -1,23 +1,23 @@
 {
-  "name": "@iso4/fetch",
+  "name": "@iso4/static",
   "version": "0.0.0",
   "type": "module",
-  "description": "Hardened FetchHandler for the iso4 sandbox: DNS pinning, host allowlist, private-IP blocking, no auto-redirect",
+  "description": "High-throughput in-process V8 isolate runtime for static (precompiled) JavaScript. napi-rs backend, requires container isolation.",
   "keywords": [
-    "iso4",
     "sandbox",
-    "fetch",
-    "ssrf",
-    "security",
-    "permissions"
+    "isolate",
+    "v8",
+    "napi",
+    "analytics",
+    "performance"
   ],
   "license": "MIT",
   "author": "schplitt",
-  "homepage": "https://github.com/schplitt/iso4/tree/main/packages/iso4-fetch#readme",
+  "homepage": "https://github.com/schplitt/iso4/tree/main/packages/iso4-static#readme",
   "repository": {
     "type": "git",
     "url": "https://github.com/schplitt/iso4.git",
-    "directory": "packages/iso4-fetch"
+    "directory": "packages/iso4-static"
   },
   "bugs": {
     "url": "https://github.com/schplitt/iso4/issues"
@@ -42,11 +42,16 @@
     "test": "vitest",
     "test:run": "vitest run"
   },
-  "peerDependencies": {
+  "dependencies": {
     "@iso4/core": "workspace:*"
   },
+  "optionalDependencies": {
+    "@iso4/static-darwin-arm64": "workspace:*",
+    "@iso4/static-darwin-x64": "workspace:*",
+    "@iso4/static-linux-x64-gnu": "workspace:*",
+    "@iso4/static-linux-arm64-gnu": "workspace:*"
+  },
   "devDependencies": {
-    "@iso4/core": "workspace:*",
     "@changesets/cli": "catalog:",
     "@schplitt/eslint-config": "catalog:",
     "eslint": "catalog:",

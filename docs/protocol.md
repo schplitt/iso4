@@ -59,13 +59,19 @@ log strings.
 
 ## Session lifecycle
 
+Each connection handles exactly one `Run` at a time. The `Runtime` in
+TypeScript maintains a pool of connections (one per `maxIsolates` slot),
+so concurrent callers each get their own connection and run truly in
+parallel inside the Rust process. No message-level multiplexing is needed;
+the connection itself is the concurrency unit.
+
 ```
-TS                                    Rust
+TS (one connection slot)              Rust (one isolate thread)
 │                                       │
 │──── Authenticate ────────────────────▶│  version + token check
 │                                       │  (close on mismatch)
 │                                       │
-│──── Run ─────────────────────────────▶│  spawn isolate thread
+│──── Run ─────────────────────────────▶│  spawn / acquire isolate
 │                                       │
 │          ┌── StdioChunk ─────────────▶│  (zero or more, eager)
 │          │                            │
@@ -74,12 +80,12 @@ TS                                    Rust
 │          │                            │
 │          └── Result ─────────────────▶│  run complete (ok or error)
 │                                       │
-│  (next Run or Terminate)              │
+│  (next Run or Terminate on same conn) │
 ```
 
 Multiple `Run` messages may be sent on the same connection sequentially
-(after each `Result` is received). Concurrent runs on one connection are
-not supported in v1.
+(after each `Result` is received). Concurrent runs use separate connection
+slots from the pool — there is no intra-connection multiplexing in v1.
 
 ---
 

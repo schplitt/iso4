@@ -3,7 +3,7 @@ node_modules
 .env
 
 # Rust build outputs
-native/v8-runtime/target
+target
 
 # OS / editor
 .DS_Store

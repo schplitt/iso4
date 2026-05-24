@@ -1,25 +1,21 @@
 {
-  "name": "iso4",
+  "name": "@iso4/core",
   "version": "0.0.0",
   "type": "module",
-  "description": "Fast, sandboxed V8 isolate runtime with permission-controlled fetch and pluggable modules",
+  "description": "Shared types for the iso4 runtime ecosystem (@iso4/dynamic, @iso4/static, @iso4/fetch)",
   "keywords": [
+    "iso4",
     "sandbox",
-    "isolate",
     "v8",
-    "secure",
-    "ai",
-    "agent",
-    "fetch",
-    "permissions"
+    "types"
   ],
   "license": "MIT",
   "author": "schplitt",
-  "homepage": "https://github.com/schplitt/iso4#readme",
+  "homepage": "https://github.com/schplitt/iso4/tree/main/packages/iso4-core#readme",
   "repository": {
     "type": "git",
     "url": "https://github.com/schplitt/iso4.git",
-    "directory": "packages/iso4"
+    "directory": "packages/iso4-core"
   },
   "bugs": {
     "url": "https://github.com/schplitt/iso4/issues"
@@ -46,5 +42,13 @@
   },
   "engines": {
     "node": ">=24.0.0"
+  },
+  "devDependencies": {
+    "@changesets/cli": "catalog:",
+    "@schplitt/eslint-config": "catalog:",
+    "eslint": "catalog:",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   }
 }

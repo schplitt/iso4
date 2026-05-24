@@ -1,7 +1,7 @@
 # iso4 — Monorepo layout
 
-The reason this is a monorepo and not a single package: the **runtime is
-small, opinionated, and rarely changes**. Everything composed on top of it
+The reason this is a monorepo and not a single package: the **runtimes are
+small, opinionated, and rarely change**. Everything composed on top of them
 — hardened fetch, stdlib stub factories (`@iso4/fs`, `@iso4/crypto`, …),
 tool-calling helpers, agent integrations — has its own release cadence,
 its own dependency set, and its own surface area. Bundling them all into
@@ -11,13 +11,8 @@ would couple unrelated release cycles.
 The rule we follow: **a package exists when it has a different consumer or
 a different set of trust assumptions than the runtime.**
 
-Naming convention:
-- **`iso4`** — the main runtime package, unscoped, the one you `npm i` to
-  get started. Exports `createRuntime`, types, the API surface.
-- **`@iso4/<name>`** — every extension. Hardened fetch (`@iso4/fetch`),
-  stdlib stub factories (`@iso4/fs`, `@iso4/crypto`, …), platform-specific
-  binaries (`@iso4/v8-darwin-arm64`, …). The scope makes ownership obvious
-  and reserves the namespace.
+Naming convention: every package is scoped under `@iso4/`. The scope makes
+ownership obvious and reserves the namespace.
 
 ---
 
@@ -26,40 +21,35 @@ Naming convention:
 ```
 iso4/
   DESIGN.md
-  MONOREPO.md                       ← this file
-  README.md
+  MONOREPO.md
   README.md
   package.json                      ← workspace root, no publishable contents
   pnpm-workspace.yaml
-  turbo.json                        ← (or biome/justfile — TBD)
   .changeset/                       ← per-package version bumps
   packages/
-    iso4/                           ← iso4                       (runtime, types, createRuntime)
-    iso4-fetch/                     ← @iso4/fetch                (hardened FetchHandler)
-    iso4-fs/                        ← @iso4/fs                   (future, node:fs stub factory)
-    iso4-crypto/                    ← @iso4/crypto               (future, node:crypto stub factory)
-    iso4-v8-darwin-arm64/           ← @iso4/v8-darwin-arm64      (native binary)
+    iso4-core/                      ← @iso4/core          (shared types, no runtime code)
+    iso4-dynamic/                   ← @iso4/dynamic       (two-process Rust runtime)
+      src/                          ← TypeScript host API
+      v8-runtime/                   ← Rust source for the V8 host binary
+      tests/
+    iso4-static/                    ← @iso4/static        (in-process napi-rs runtime, Phase 11)
+      src/                          ← TypeScript API (scaffolded, not yet implemented)
+    iso4-fetch/                     ← @iso4/fetch         (hardened FetchHandler)
+    iso4-fs/                        ← @iso4/fs            (future, node:fs stub factory)
+    iso4-crypto/                    ← @iso4/crypto        (future, node:crypto stub factory)
+    iso4-v8-darwin-arm64/           ← @iso4/v8-darwin-arm64      (native binary for @iso4/dynamic)
     iso4-v8-darwin-x64/             ← @iso4/v8-darwin-x64
     iso4-v8-linux-x64-gnu/          ← @iso4/v8-linux-x64-gnu
     iso4-v8-linux-arm64-gnu/        ← @iso4/v8-linux-arm64-gnu
-  native/
-    v8-runtime/                     ← Rust source for the V8 host binary
-      Cargo.toml
-      src/
-        main.rs
-        isolate.rs
-        session.rs
-        execution.rs
-        bridge.rs
-        ipc.rs
-        budget.rs
-        timeout.rs
-        snapshot.rs
+    iso4-static-darwin-arm64/       ← @iso4/static-darwin-arm64  (native binary for @iso4/static, Phase 11)
+    iso4-static-darwin-x64/         ← @iso4/static-darwin-x64
+    iso4-static-linux-x64-gnu/      ← @iso4/static-linux-x64-gnu
+    iso4-static-linux-arm64-gnu/    ← @iso4/static-linux-arm64-gnu
   examples/
-    minimal/                        ← runtime.run, no fetch, no imports
+    minimal/                        ← @iso4/dynamic, no fetch, no imports
     agent-prefix-postfix/           ← canonical AI loop with precompile
     safe-fetch/                     ← @iso4/fetch in action
-    fs-stub/                        ← @iso4/fs in action
+    analytics-pipeline/             ← @iso4/static in action (Phase 11)
   bench/                            ← startup latency, throughput benchmarks
 ```
 
@@ -67,97 +57,114 @@ iso4/
 
 ## 2. Packages
 
-### 2.1 `iso4` — the runtime
+### 2.1 `@iso4/core` — shared types
 
-The only package every consumer needs. Unscoped on purpose: it's the
-entry point you `npm i` to get started, and the name is short.
+Types only. No runtime code, no native dependencies. Every other package
+in the ecosystem depends on this.
 
 Owns:
+- `ResourceLimits` — memory/CPU/wall limits used by both runtimes.
+- `FetchHandler`, `HostFetchRequest`, `HostFetchResponse` — the fetch
+  interface that `@iso4/fetch` implements and both runtimes consume.
+- `HostGlobals` — the allowlisted globals object (currently just `fetch`).
+- `ImportsConfig`, `ImportDefinition`, `SourceImport`, `HostImport`,
+  `HostExports`, `HostExportValue/Data/Function` — the module resolver
+  surface shared by both runtimes.
 
-- The TypeScript host API: `createRuntime`, `Runtime`, `PrecompiledPrefix`,
-  the type system declared in `src/types.ts` (the canonical API surface).
-  The repo root used to hold a `types.ts` spec next to `DESIGN.md`; that
-  file now lives in this package.
-- Spawning the per-platform Rust binary (via `optionalDependencies` on the
-  `@iso4/v8-*` packages, mirroring secure-exec's distribution).
-- The IPC client, frame codec, V8 ValueSerializer wrapper.
-- The bridge dispatch: routing `_hostCall` frames to host-supplied handlers
-  for `fetch` and `imports`.
-- **Mechanical fetch hygiene**: header/URL/method validation, response
-  size cap, no-auto-redirect default. Anything that isn't policy.
-- The sandbox-side JS shims (`console`, `crypto.getRandomValues`, the
-  `fetch` stub + `Response` polyfill, module proxy generation).
+Does **not** own result types (`RunResult`, `CallResult`) — those are
+specific to each runtime's execution model.
 
-Dependencies: minimal. Just what's needed for UDS I/O and basic process
-management. No HTTP client.
+### 2.2 `@iso4/dynamic` — two-process dynamic runtime
 
-What this package **does not** ship:
-- Any HTTP client. If sandbox code calls `fetch` without a configured
-  handler, the run fails with `ERR_FETCH_NOT_CONFIGURED`. There is no
-  default that silently uses the host's network.
-- Any policy. Allow/deny decisions live in handlers the host supplies.
-- Any Node-stdlib emulation. `iso4` knows nothing about `node:fs`,
-  `node:crypto`, etc. Those are entirely separate packages.
+The runtime for dynamic (agent-generated) code. Every `run()` compiles a
+fresh code string and executes it in a fresh isolate from a V8 snapshot.
+Crash-isolated via a separate Rust process.
 
-### 2.2 `@iso4/fetch` — hardened fetch defaults
+Owns:
+- TypeScript host API: `createRuntime`, `Runtime`, `DynamicPrefix`, and
+  all supporting types. Re-exports shared types from `@iso4/core`.
+- Spawning the per-platform Rust binary (via `optionalDependencies` on
+  `@iso4/v8-*` packages).
+- The IPC client, frame codec, and UDS connection pool.
+- Bridge dispatch for `fetch` and host-module imports.
+- `RunResult`, `RunSuccess`, `RunFailure`, `SandboxExports` — the ESM
+  export-based result type specific to this runtime.
 
-Optional but strongly recommended. Owns:
+The Rust source for the V8 host binary lives at
+`packages/iso4-dynamic/v8-runtime/` and is built once per release per
+platform via CI. The compiled binary ships in the corresponding
+`@iso4/v8-<platform>` package.
 
+**Security model**: V8 runs in a separate OS process. An OOM or crash in
+the isolate kills only the Rust subprocess; the host process and all other
+concurrent runs are unaffected.
+
+### 2.3 `@iso4/static` — in-process static runtime (Phase 11)
+
+The runtime for static (precompiled) code called with varying data. The
+prefix is compiled once; `prefix.call('fn', input)` invokes a named export
+with no recompilation and no fresh-isolate overhead. Uses napi-rs to create
+V8 isolates in-process via Node's existing V8 platform.
+
+Owns:
+- TypeScript host API: `createStaticRuntime`, `StaticRuntime`,
+  `StaticPrefix`, `CallResult`. Re-exports shared types from `@iso4/core`.
+- Loading the per-platform napi-rs `.node` binary (via `optionalDependencies`
+  on `@iso4/static-*` packages).
+- Internal isolate pool management.
+- `CallResult`, `CallSuccess`, `CallFailure` — the function-return-value
+  result type specific to this runtime.
+
+The Rust/napi-rs source will live at `packages/iso4-static/napi-runtime/`
+(Phase 11). Compiled `.node` binaries ship in `@iso4/static-<platform>`
+packages, mirroring the `@iso4/v8-*` pattern.
+
+**Security model**: V8 runs in the Node process. An OOM can crash the host
+process. **Requires Docker/Kubernetes or equivalent as the outer security
+boundary.** See DESIGN.md §1.2.
+
+Not yet implemented. Scaffolded types only.
+
+### 2.4 `@iso4/fetch` — hardened fetch defaults
+
+Optional but strongly recommended for `@iso4/dynamic` deployments.
+
+Owns:
 - `createSafeFetch(options)` returning a `FetchHandler` ready to plug into
-  `globals.fetch`.
+  `globals.fetch` of either runtime.
 - DNS pre-resolution with IP pinning (prevents DNS rebinding).
-- Allowlist/denylist matching (exact host, suffix, regex).
+- Allowlist/denylist matching.
 - Private/link-local IP blocking (RFC1918, loopback, link-local, ULA).
-- Redirect re-checking (each hop runs the allowlist again, configurable
-  max redirects).
-- Per-host timeout and concurrency caps.
-- An isolated `undici` Dispatcher so sandbox traffic doesn't share state
-  with the host application's HTTP pool, auth cookies, etc.
+- Redirect re-checking.
+- An isolated `undici` Dispatcher (no shared state with the host app).
 
-Dependencies: `undici` (or `node:fetch` shim under non-Node hosts).
+Depends on `@iso4/core` (peer) for `FetchHandler` and related types.
+Does **not** depend on `@iso4/dynamic` or `@iso4/static` — it works with
+both and has no knowledge of which runtime is in use.
 
-Reason for being separate:
-- `undici` is heavy. Hosts that ship their own HTTP client shouldn't pay
-  for it.
-- The security surface here (DNS, redirect, allowlist matching) is its own
-  domain with its own bugs and its own audit cycle. Decoupling release
-  cadence from the core runtime matters.
-- Some hosts will write entirely custom fetch handlers (e.g., a CDN
-  origin-fetch with internal auth). They should be able to ignore
-  `@iso4/fetch` entirely.
-
-### 2.3 `@iso4/v8-<platform>` — native binaries
+### 2.5 `@iso4/v8-<platform>` — native binaries for @iso4/dynamic
 
 One package per supported platform. Each contains a single compiled Rust
-binary plus a tiny `index.js` that exports the binary path. `iso4` lists
-these as `optionalDependencies`; pnpm/npm install only the one matching
-the host's `process.platform + process.arch`.
+binary plus a tiny `index.js` that exports the binary path.
+`@iso4/dynamic` lists these as `optionalDependencies`; pnpm/npm installs
+only the one matching `process.platform + process.arch`.
 
-Initial platforms:
-- `@iso4/v8-darwin-arm64`
-- `@iso4/v8-darwin-x64`
-- `@iso4/v8-linux-x64-gnu`
-- `@iso4/v8-linux-arm64-gnu`
+Platforms: `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`.
 
-Add `@iso4/v8-win32-x64` when there's demand.
+### 2.6 `@iso4/static-<platform>` — native binaries for @iso4/static (Phase 11)
 
-No source code in these packages — they're build artifacts. Source lives
-under `native/v8-runtime/` and is built once per release per platform via
-CI.
+Same pattern as `@iso4/v8-*` but for the napi-rs `.node` addon.
+`@iso4/static` lists these as `optionalDependencies`.
 
-### 2.4 Stdlib-stub packages (`@iso4/fs`, `@iso4/crypto`, …)
+Platforms mirror `@iso4/v8-*`.
 
-The single most useful kind of extension package. Each one is a tiny
-factory that produces a `HostImport` matching the shape of a Node.js
-stdlib module, ready to plug into `imports.static`.
+### 2.7 Stdlib-stub packages (`@iso4/fs`, `@iso4/crypto`, …)
 
-**Why this pattern exists:** the `iso4` runtime ships zero `node:*`
-emulation. If a host author wants `import fs from "node:fs"` to work in
-the sandbox, they have to provide it. Writing a correct, safe, virtualized
-`node:fs` is tedious. Instead, install `@iso4/fs` and drop it in:
+Tiny factory packages that produce a `HostImport` matching the shape of a
+Node.js stdlib module, ready to plug into `imports.static` of either runtime.
 
 ```ts
-import { createRuntime } from "iso4";
+import { createRuntime } from "@iso4/dynamic";
 import { createFsModule } from "@iso4/fs";
 
 const runtime = await createRuntime();
@@ -165,225 +172,113 @@ const prefix = await runtime.precompile({
   code: prefixSource,
   imports: {
     static: {
-      "node:fs": createFsModule({
-        root: "/sandbox",
-        readOnly: true,
-        maxFileBytes: 1 * 1024 * 1024,
-      }),
+      "node:fs": createFsModule({ root: "/sandbox", readOnly: true }),
     },
   },
 });
 ```
 
-Each stdlib-stub package owns:
-- A factory function that takes per-host configuration (root path,
-  permissions, size limits, etc.).
-- Returns a `HostImport` (`{ kind: "host", exports: { ... } }`).
-- Validates inputs at the bridge boundary, just like core does for fetch.
-- Has its own threat model documented in its README. `@iso4/fs` doesn't
-  let sandbox code escape via path traversal even if the host author
-  forgets to set `root`; the package's defaults are deny-by-default.
-
-Planned (not in v1, in rough priority order):
-
-- **`@iso4/fs`** — virtualized `node:fs` against a configurable host root
-  with permission helpers (read-only mounts, denylist patterns, size
-  caps).
-- **`@iso4/crypto`** — the safe parts of `node:crypto`: hashing, HMAC,
-  random, base64, hex. Anything involving the host keystore is excluded.
-- **`@iso4/path`** — `node:path` is pure (no I/O); ships as a source
-  module rather than a host module. Trivial, but worth packaging.
-- **`@iso4/url`** — same idea, source-module shim for libraries that
-  expect `node:url`.
-- **`@iso4/buffer`** — `node:buffer` shim. Same source-module pattern.
-  Most modern libs use `Uint8Array` natively, so this is for older code.
-
-### 2.5 Other future packages (not in v1)
-
-- **`@iso4/tools`** — helpers for the AI tool-calling pattern.
-  `defineTool({ name, schema, handler })` produces a host module ready to
-  plug into `imports`, with zod-like input validation. Separate because
-  tool-protocol shapes are contested and will change.
-- **`@iso4/console`** — alternate console implementations (structured
-  logging, JSON-line capture, integration with pino/winston). The default
-  runtime-owned console is intentionally minimal.
-- **`@iso4/snapshot-cache`** — disk-backed snapshot persistence across
-  host restarts. Snapshots are tens-to-hundreds of KB; for very large
-  prefixes that's worth caching to disk. Not needed at v1 scale.
-- **`@iso4/tracing`** — OpenTelemetry spans for every bridge call.
-  Useful for production observability, opt-in.
-
-The rule for adding any new package: **at least two consumers want it,
-and the surface area is meaningfully different from anything that already
-exists.**
+Planned (not in v1): `@iso4/fs`, `@iso4/crypto`, `@iso4/path`,
+`@iso4/url`, `@iso4/buffer`.
 
 ---
 
 ## 3. Dependency direction
 
 ```
-                       iso4
-                  ▲  ▲  ▲  ▲
-                  │  │  │  │
-        @iso4/fetch  │  │  @iso4/crypto
-                     │  │
-               @iso4/fs  @iso4/tools (future)
-                     │
-                     ▼
-              host application
+                    @iso4/core
+              ▲       ▲       ▲
+              │       │       │
+    @iso4/dynamic  @iso4/static  @iso4/fetch
+              ▲
+    @iso4/v8-*  (optional, runtime-resolved)
+
+    @iso4/static
+              ▲
+    @iso4/static-* (optional, runtime-resolved, Phase 11)
 ```
 
 Rules:
-
-- **`iso4` depends on nothing in this monorepo** other than the
-  per-platform `@iso4/v8-*` binaries (optional, runtime-resolved).
-- **Every other package depends on `iso4`** (as a peer dependency),
-  never the other way around.
-- **Sibling packages (`@iso4/fetch`, `@iso4/fs`, etc.) do not depend
-  on each other.** If they need to share a utility, it goes into the
-  core `iso4` package's `internal` export (carefully, with a clear name).
-- **No package depends on `examples/` or `bench/`.** Those are leaves.
-
-Why this matters: if `@iso4/fs` ever depended on `@iso4/fetch`, a host
-that wanted only the FS stub would pull in `undici` (a fetch dep)
-transitively. That's the kind of incidental coupling that makes monorepos
-rot.
+- **`@iso4/core` depends on nothing** in this monorepo.
+- **`@iso4/dynamic` and `@iso4/static` depend on `@iso4/core`** for
+  shared types; never on each other.
+- **`@iso4/fetch` depends on `@iso4/core`** (peer) only; never on a runtime.
+- **Sibling stdlib-stub packages do not depend on each other.**
 
 ---
 
 ## 4. Versioning
 
-Independent per package, via [`@changesets/cli`](https://github.com/changesets/changesets).
-Every user-visible PR adds a changeset file (`.changeset/<random>.md`)
-declaring which packages bump and at what level. On push to `main`, the
-`changesets/action` workflow opens a "Version Packages" PR; merging that
-PR triggers publish.
+Independent per package, via `@changesets/cli`. Every user-visible PR adds
+a changeset file declaring which packages bump and at what level.
 
-Reasons:
-
-- `iso4` changes infrequently after v1 and breaking changes are
-  expensive (every consumer pays).
-- `@iso4/fetch` and the stdlib-stub packages may release security
-  patches more often.
-- `@iso4/v8-*` packages bump when V8 itself bumps, independently of API
-  changes.
-
-What does NOT change in lockstep:
-- Bumping `iso4` does not force-bump `@iso4/fetch` or any stdlib-stub
-  package. Each pins its `iso4` peer dependency range explicitly.
-- Bumping a `@iso4/v8-*` patch (new V8 version, same protocol) does not
-  bump `iso4`.
-
-What DOES change in lockstep:
-- Wire-protocol changes between `iso4` (host) and `@iso4/v8-*` (Rust).
-  Both packages bump major. The host validates the binary version on
-  connect and refuses mismatched pairs with a clear error.
-
-The protocol version is a `u16` in the `Authenticate` frame. Bump it
-whenever the wire format changes incompatibly. This is the single mechanism
-preventing "I installed iso4@2 but my @iso4/v8-darwin-arm64@1 binary is
-still cached" foot-guns.
+What changes in lockstep:
+- Wire-protocol changes between `@iso4/dynamic` (TS) and `@iso4/v8-*`
+  (Rust). Both bump major. Protocol version `u16` in the `Authenticate`
+  frame prevents mismatched-binary foot-guns.
+- Same rule for `@iso4/static` ↔ `@iso4/static-*` when Phase 11 lands.
 
 ---
 
 ## 5. Build and dev workflow
 
-Tooling targets:
-- **pnpm** for package management (workspace protocol, peer auto-install).
-- **TypeScript** with `composite: true` for cross-package type checking.
-- **tsup** or **esbuild** for builds; the host packages bundle to dual
-  ESM/CJS.
-- **vitest** for tests, per package, plus an end-to-end suite in `bench/`
-  that exercises real Rust binaries.
-- **Cargo** for the Rust crate.
-- **GitHub Actions** for per-platform native builds with `cross` or
-  cross-compilation runners. Build matrix mirrors the `@iso4/v8-*` packages.
-
-Typical commands (top-level):
-
 ```bash
 pnpm install               # bootstrap
 pnpm build                 # build all TS packages
-cargo build --release      # build the Rust binary for the host platform
-pnpm test                  # vitest across all packages
-pnpm bench                 # latency / throughput benchmarks
+cd packages/iso4-dynamic/v8-runtime && cargo build --release   # Rust binary
+pnpm test:run              # vitest across all packages (single-shot, CI-safe)
 pnpm changeset             # record a version bump
-pnpm release               # build + version + publish
 ```
-
-Native binary build per release: a CI matrix runs `cargo build --release
---target=<triple>` per platform and stages the artifact into the
-corresponding `@iso4/v8-<platform>/` package's `npm/` folder. Cross-builds
-use GitHub-hosted runners (macOS for Apple Silicon, Linux for the Linux
-targets) — no fancy cross-compilation tricks needed for v1.
 
 ---
 
 ## 6. What goes where: a quick reference
 
-When you find yourself wanting to add code, ask:
-
 | If it's about… | Put it in |
 |---|---|
-| The V8 isolate, threads, snapshots, bridge dispatch | `native/v8-runtime/` |
-| The wire protocol or IPC framing | `iso4` AND `native/v8-runtime/` (must match) |
-| Validating that headers/URLs/methods are well-formed | `iso4` (mechanical hygiene, no opinions) |
-| Deciding *which* URLs are allowed | `@iso4/fetch` (or host app code) |
-| Sandbox-side JS shims (`console`, `fetch` stub, etc.) | `iso4` |
-| Hardened HTTP client behavior (DNS pin, redirect re-check, etc.) | `@iso4/fetch` |
-| Virtualized `node:fs` stub with permission checks | `@iso4/fs` |
+| Types shared between runtimes and/or @iso4/fetch | `@iso4/core` |
+| The V8 isolate, UDS, IPC framing, snapshot, bridge dispatch | `@iso4/dynamic/v8-runtime/` (Rust) |
+| The TypeScript host API for dynamic code | `@iso4/dynamic/src/` |
+| The napi-rs in-process isolate pool | `@iso4/static/napi-runtime/` (Rust, Phase 11) |
+| The TypeScript host API for static code | `@iso4/static/src/` |
+| Validating headers/URLs/methods are well-formed | `@iso4/dynamic` (mechanical hygiene) |
+| Deciding which URLs are allowed | `@iso4/fetch` or host app code |
+| Hardened HTTP client (DNS pin, redirect re-check, etc.) | `@iso4/fetch` |
+| Virtualized `node:fs` stub | `@iso4/fs` |
 | Virtualized `node:crypto` stub | `@iso4/crypto` |
-| Other Node stdlib stubs (`node:path`, `node:url`, `node:buffer`) | `@iso4/<name>` |
-| Tool-call schema, input validation, agent helpers | `@iso4/tools` (future) |
-| Native binary distribution | `@iso4/v8-<platform>` |
+| Other Node stdlib stubs | `@iso4/<name>` |
+| Native binary distribution for @iso4/dynamic | `@iso4/v8-<platform>` |
+| Native binary distribution for @iso4/static | `@iso4/static-<platform>` |
 | Worked-example apps | `examples/<name>/` |
 | Latency or throughput measurement | `bench/` |
-
-If the answer doesn't fit any row, the design needs a conversation before
-the code does.
 
 ---
 
 ## 7. Public API surface, summarized
 
-For a host author:
-
 ```ts
-// Always:
-import { createRuntime } from "iso4";
-
-// Pick what you need:
-import { createSafeFetch } from "@iso4/fetch";  // hardened fetch defaults
-import { createFsModule } from "@iso4/fs";       // node:fs stub  (future)
-import { createCryptoModule } from "@iso4/crypto"; // node:crypto stub (future)
+// Dynamic runtime — agent-generated code, crash-isolated
+import { createRuntime } from "@iso4/dynamic";
+import { createSafeFetch } from "@iso4/fetch";
 
 const runtime = await createRuntime();
-
 const prefix = await runtime.precompile({
-  code: `
-    function callTool(name, args) { return globalThis._tool(name, args); }
-    globalThis.callTool = callTool;
-  `,
-  globals: {
-    fetch: createSafeFetch({ allowedHosts: ["api.example.com"] }),
-  },
-  imports: {
-    static: {
-      "node:fs": createFsModule({ root: "/sandbox", readOnly: true }),
-      "agent/tools": { kind: "host", exports: {
-        _tool: async (name, args) => myToolRouter(name, args),
-      }},
-    },
-  },
+  code: `import { search } from 'tools:search'; globalThis.search = search;`,
+  globals: { fetch: createSafeFetch({ allowedHosts: ["api.example.com"] }) },
+  imports: { static: { "tools:search": { kind: "host", exports: { search } } } },
 });
-
 const result = await prefix.run({
-  code: aiGeneratedCode,
-  limits: { cpuTimeMs: 200 },
+  code: `export default await (${agentFn})()`,
 });
-```
 
-That entire surface is the goal. The host imports one package per
-capability they want, and each package is a small factory function.
-Anything more verbose than that means a feature has crept somewhere it
-shouldn't have.
+// Static runtime — precompiled function + varying data (Phase 11)
+import { createStaticRuntime } from "@iso4/static";
+
+const runtime = await createStaticRuntime({ maxConcurrent: 8 });
+const prefix = await runtime.precompile({
+  code: `export function transform(row) { return row.price * row.qty; }`,
+});
+const results = await Promise.all(
+  rows.map(row => prefix.call('transform', row))
+);
+```

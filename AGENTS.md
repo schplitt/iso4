@@ -16,8 +16,10 @@ exhaustively in three docs at the repo root:
 - **`MONOREPO.md`** — package layout, dependency direction, versioning,
   distribution. Read this before adding code to a new package or moving
   code between packages.
-- **`packages/iso4/src/types.ts`** — canonical public API surface for the
-  runtime. Changes here are API changes and must align with DESIGN.md.
+- **`packages/iso4-dynamic/src/types.ts`** — canonical public API surface for
+  `@iso4/dynamic`. Changes here are API changes and must align with DESIGN.md.
+- **`packages/iso4-core/src/types.ts`** — shared types used by all packages.
+  Changes here affect every package in the ecosystem.
 
 ## Architecture
 
@@ -45,9 +47,9 @@ iso4/                              ← workspace root
     v8-runtime/                    ← Rust source for the V8 host binary (planned)
 ```
 
-### `packages/iso4`
+### `packages/iso4-dynamic`
 
-The TypeScript runtime package. Owns:
+The two-process dynamic runtime package (`@iso4/dynamic`). Owns:
 
 - Public API: `createRuntime`, `Runtime`, `PrecompiledPrefix`, the type
   system declared in `src/types.ts`.
@@ -99,7 +101,7 @@ Toolchain:
 - **@changesets/cli** for per-package versioning + changelogs. See
   `.changeset/README.md` for the workflow.
 - **mise** pins the Node version (`mise.toml`).
-- **cargo** (Rust stable) for the V8 host binary under `native/v8-runtime/`.
+- **cargo** (Rust stable) for the V8 host binary under `packages/iso4-dynamic/v8-runtime/`.
 
 ## Code Style
 
@@ -131,9 +133,9 @@ When making changes to the project:
 - **`MONOREPO.md`** — Update whenever package boundaries change, a new
   package is added, dependency direction shifts, or versioning policy
   changes.
-- **`packages/iso4/src/types.ts`** — Update whenever the public API
-  changes. This file is the canonical surface; any deviation between it
-  and `DESIGN.md` is a bug.
+- **`packages/iso4-dynamic/src/types.ts`** — Update whenever the `@iso4/dynamic`
+  API changes. Any deviation between this and `DESIGN.md` is a bug.
+- **`packages/iso4-core/src/types.ts`** — Update whenever shared types change.
 - **`AGENTS.md`** (this file) — Update with technical details, architecture,
   and best practices for AI agents.
 - **`README.md`** — Update with user-facing documentation for end users:
@@ -159,8 +161,8 @@ When working on this project:
 4. **Run linting**: `pnpm lint` (or `pnpm lint:fix`).
 5. **Run type checking** before committing: `pnpm typecheck`.
 6. **Validation order**: `pnpm lint:fix` → `pnpm typecheck` → `pnpm test:run`.
-7. **Public API stays in `packages/iso4/src/index.ts`.** All re-exports
-   listed there explicitly. No barrel-exports of `*`.
+7. **Public API stays in `packages/<pkg>/src/index.ts`.** All re-exports
+   listed explicitly. No barrel-exports of `*`.
 8. **Add tests** for new functionality in `packages/<pkg>/tests/`.
 9. **Record learnings** — When the user corrects a mistake or provides
    context about how something should be done, add it to the "Project
@@ -243,6 +245,22 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 - **No callbacks across the boundary** in v1. No `setTimeout`, no
   event listeners on host objects. Functions passed as host-import
   arguments are rejected with `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`.
+- **Two execution models, one API surface.** iso4 serves two distinct use
+  cases: AI-agent one-shot runs (`prefix.run()`) and analytics persistent
+  sessions (`prefix.openSession()` / `session.call()`). Both use the same
+  `PrecompiledPrefix` and the same snapshot mechanism. The session API is
+  post-v1 but must not be precluded by v1 API decisions.
+- **Two-process is the default backend; in-process is a future opt-in.**
+  The Rust subprocess provides crash isolation critical for untrusted code.
+  The in-process C++ NAPI backend (Phase 12) is for high-throughput analytics
+  inside Docker/K8s where the container is the outer security boundary.
+  Both backends expose the same TypeScript API via `RuntimeOptions.backend`.
+  Do not conflate the two; do not add in-process code in v1.
+- **V8 `ValueSerializer` is irreplaceable for JS values.** Cap'n Proto,
+  MessagePack, and similar cannot replace it for bridge/export payloads
+  because they don't know V8's type system. They can only wrap V8 bytes as
+  opaque `Data` blobs — net overhead, not savings. The current
+  length-prefixed frame format is already appropriately minimal.
 
 ### Common Mistakes to Avoid
 
@@ -261,3 +279,10 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 - Do not forget to run `pnpm changeset` when a PR changes user-visible
   behavior in a published package. Internal-only changes (refactors,
   tests, docs) do not need one.
+- Do not add Cap'n Proto, MessagePack, or similar as the IPC serialization
+  format. V8 `ValueSerializer` is the only correct format for JS values
+  crossing the sandbox boundary. The wire envelope (4-byte length + 1-byte
+  type) is already minimal; don't wrap it in a schema library.
+- Do not add the in-process (NAPI) backend in v1. It is a Phase 12 concern.
+  rusty_v8 cannot be used in-process with Node — it would need a C++ rewrite
+  of `packages/iso4-static/`. That conversation happens at Phase 11, not before.
