@@ -4,9 +4,7 @@ Rust source for the V8 host binary that the `iso4` package spawns to run
 sandboxed JavaScript. The compiled binary is shipped to users via the
 per-platform `@iso4/v8-<platform>` npm packages.
 
-> **Status:** scaffolding. `main()` is a not-implemented stub. The real
-> implementation lands per the phased build plan in
-> [`../../DESIGN.md`](../../DESIGN.md) §9.
+> **Status:** in progress.
 
 ## What this crate is
 
@@ -55,25 +53,6 @@ cargo check --all-targets
 CI runs the latter three on every PR that touches `native/**`. See
 [`../../.github/workflows/ci-rust.yml`](../../.github/workflows/ci-rust.yml).
 
-## Planned module layout
-
-To be created as each phase of the build plan lands. See
-[`../../DESIGN.md`](../../DESIGN.md) §8 for the canonical map and §9 for
-the phasing.
-
-```
-src/
-  main.rs       UDS accept loop, signal handling, connection lifecycle
-  ipc.rs        Binary frame codec (must match packages/iso4/src/ipc.ts)
-  isolate.rs    V8 init, heap_limits, ArrayBuffer allocator, near-OOM cb
-  session.rs    Per-run thread, concurrency slot, event loop
-  execution.rs  Compile + evaluate ESM, module resolver, export extraction
-  bridge.rs    FunctionTemplate stubs, sync/async bridge dispatch
-  budget.rs     CPU budget enter/leave bracketing (async-time exclusion)
-  timeout.rs    Wall-clock backstop thread → terminate_execution()
-  snapshot.rs   v8::StartupData create + restore for precompiled prefixes
-```
-
 ## How the host consumes the binary
 
 At runtime, `iso4` looks for the binary in this order:
@@ -92,7 +71,7 @@ model.
 
 ## Wire protocol versioning
 
-The IPC framing in `src/ipc.rs` (when added) MUST stay byte-for-byte
+The IPC framing in `src/ipc.rs` MUST stay byte-for-byte
 identical with the TypeScript codec in `packages/iso4/src/ipc.ts`. Both
 sides include a `u16` protocol version in the `Authenticate` frame; the
 host refuses to connect to a binary reporting a different version. When

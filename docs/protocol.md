@@ -73,12 +73,12 @@ TS (one connection slot)              Rust (one isolate thread)
 │                                       │
 │──── Run ─────────────────────────────▶│  spawn / acquire isolate
 │                                       │
-│          ┌── StdioChunk ─────────────▶│  (zero or more, eager)
-│          │                            │
-│          │   BridgeCall ─────────────▶│  sandbox called fetch / host fn
-│          │◀── BridgeResponse ─────────│  TS resolves and replies
-│          │                            │
-│          └── Result ─────────────────▶│  run complete (ok or error)
+│◀─── StdioChunk ───────────────────────│  (zero or more, eager)
+│                                       │
+│◀─── BridgeCall ───────────────────────│  sandbox called fetch / host fn
+│──── BridgeResponse ──────────────────▶│  TS resolves and replies
+│                                       │
+│◀─── Result ───────────────────────────│  run complete (ok or error)
 │                                       │
 │  (next Run or Terminate on same conn) │
 ```
