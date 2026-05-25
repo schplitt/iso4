@@ -11,8 +11,8 @@ handed over by name.
 
 > **Status:** early development. The architecture is committed (see
 > [`DESIGN.md`](./DESIGN.md), [`MONOREPO.md`](./MONOREPO.md), and
-> [`packages/iso4/src/types.ts`](./packages/iso4/src/types.ts)) but the
-> runtime is not yet implemented.
+> [`packages/iso4-dynamic/src/types.ts`](./packages/iso4-dynamic/src/types.ts))
+> but the runtime is not yet implemented.
 
 ## Why
 
@@ -61,11 +61,11 @@ if (result.ok) {
 
 | Package | Status | Description |
 |---|---|---|
-| [`iso4`](./packages/iso4) | scaffolding | Core runtime, host API, IPC, sandbox shims |
+| [`@iso4/dynamic`](./packages/iso4-dynamic) | scaffolding | Core dynamic runtime, host API, IPC, sandbox shims |
 | [`@iso4/fetch`](./packages/iso4-fetch) | scaffolding | Hardened `FetchHandler` with DNS pin, allowlist, SSRF blocks |
 | `@iso4/fs` | future | `node:fs` stub factory with configurable root + permissions |
 | `@iso4/crypto` | future | `node:crypto` stub factory (safe parts only) |
-| `@iso4/v8-<platform>` | planned | Per-platform Rust V8 binaries (built from `native/v8-runtime/`) |
+| `@iso4/v8-<platform>` | planned | Per-platform Rust V8 binaries (built from `packages/iso4-dynamic/v8-runtime/`) |
 
 See [`MONOREPO.md`](./MONOREPO.md) for the package boundary rules.
 
@@ -74,7 +74,7 @@ See [`MONOREPO.md`](./MONOREPO.md) for the package boundary rules.
 - [`DESIGN.md`](./DESIGN.md) — architecture, execution model, limits, security model, build plan
 - [`MONOREPO.md`](./MONOREPO.md) — package layout, dependency direction, versioning, distribution
 - [`AGENTS.md`](./AGENTS.md) — guidelines for agents working in this repo
-- [`packages/iso4/src/types.ts`](./packages/iso4/src/types.ts) — canonical public API surface
+- [`packages/iso4-dynamic/src/types.ts`](./packages/iso4-dynamic/src/types.ts) — canonical public API surface
 
 ## Development
 
