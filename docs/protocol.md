@@ -37,23 +37,23 @@ log strings.
 
 ## TS → Rust messages
 
-| Byte   | Name             | Payload                                      | Notes                                        |
-|--------|------------------|----------------------------------------------|----------------------------------------------|
-| `0x01` | `Authenticate`   | `u16` protocol version + UTF-8 token         | First message on every new connection. Rust closes the socket on mismatch. |
-| `0x02` | `Run`            | V8-serialized `RunOptions`                   | Start a sandboxed execution. Rust replies with zero or more `StdioChunk` / `BridgeCall` frames, then exactly one `Result`. |
-| `0x03` | `BridgeResponse` | `u32` call-id + V8-serialized result or error | Reply to a `BridgeCall`. Must be sent before the next `BridgeCall` on the same session (calls are sequential in v1). |
-| `0x04` | `Terminate`      | `u32` run-id                                 | Force-stop a running isolate. Rust sends a `Result` with `ERR_TERMINATED` then closes the session. |
+| Byte   | Name             | Payload                                       | Notes                                                                                                                      |
+| ------ | ---------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `Authenticate`   | `u16` protocol version + UTF-8 token          | First message on every new connection. Rust closes the socket on mismatch.                                                 |
+| `0x02` | `Run`            | V8-serialized `RunOptions`                    | Start a sandboxed execution. Rust replies with zero or more `StdioChunk` / `BridgeCall` frames, then exactly one `Result`. |
+| `0x03` | `BridgeResponse` | `u32` call-id + V8-serialized result or error | Reply to a `BridgeCall`. Must be sent before the next `BridgeCall` on the same session (calls are sequential in v1).       |
+| `0x04` | `Terminate`      | `u32` run-id                                  | Force-stop a running isolate. Rust sends a `Result` with `ERR_TERMINATED` then closes the session.                         |
 
 ---
 
 ## Rust → TS messages
 
-| Byte   | Name          | Payload                                               | Notes                                                              |
-|--------|---------------|-------------------------------------------------------|--------------------------------------------------------------------|
-| `0x01` | `BridgeCall`  | `u32` call-id + UTF-8 module/fn name + V8-serialized args | Sandbox called `fetch` or a host-module function. TS must reply with `BridgeResponse` before execution continues. |
-| `0x02` | `StdioChunk`  | `u8` stream (0 = stdout, 1 = stderr) + raw UTF-8 bytes | Emitted eagerly per `console.*` call. Capped at `limits.maxStdoutBytes` / `limits.maxStderrBytes`. |
-| `0x03` | `Result`      | V8-serialized `RunResult`                             | Final message for a `Run`. Always sent exactly once, even on error or termination. |
-| `0x04` | `Log`         | `u8` level (0=debug,1=info,2=warn,3=error) + UTF-8    | Internal runtime diagnostics. TS may forward to its own logger or discard. |
+| Byte   | Name         | Payload                                                   | Notes                                                                                                             |
+| ------ | ------------ | --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `BridgeCall` | `u32` call-id + UTF-8 module/fn name + V8-serialized args | Sandbox called `fetch` or a host-module function. TS must reply with `BridgeResponse` before execution continues. |
+| `0x02` | `StdioChunk` | `u8` stream (0 = stdout, 1 = stderr) + raw UTF-8 bytes    | Emitted eagerly per `console.*` call. Capped at `limits.maxStdoutBytes` / `limits.maxStderrBytes`.                |
+| `0x03` | `Result`     | V8-serialized `RunResult`                                 | Final message for a `Run`. Always sent exactly once, even on error or termination.                                |
+| `0x04` | `Log`        | `u8` level (0=debug,1=info,2=warn,3=error) + UTF-8        | Internal runtime diagnostics. TS may forward to its own logger or discard.                                        |
 
 ---
 
@@ -104,18 +104,18 @@ updated together on a version bump.
 
 ## Error codes (carried in `Result` payload)
 
-| Code                        | Cause                                              |
-|-----------------------------|----------------------------------------------------|
-| `ERR_USER_CODE`             | Uncaught exception in sandbox JS                   |
-| `ERR_MEMORY_LIMIT`          | V8 heap + ArrayBuffer exceeded `limits.memoryMb`   |
-| `ERR_CPU_TIMEOUT`           | Active JS execution exceeded `limits.cpuTimeMs`    |
-| `ERR_WALL_TIMEOUT`          | Total run time exceeded `limits.wallTimeMs`         |
-| `ERR_TERMINATED`            | Host sent `Terminate`                              |
-| `ERR_FETCH_NOT_CONFIGURED`  | Sandbox called `fetch` but no handler was provided |
-| `ERR_FETCH_INVALID_URL`     | Non-http(s) scheme or unparseable URL              |
-| `ERR_FETCH_INVALID_HEADER`  | CRLF/NUL injection in header name or value         |
-| `ERR_MODULE_NOT_FOUND`      | `import` specifier not in static map or resolver   |
-| `ERR_EXPORT_NOT_SERIALIZABLE` | Export value contains a function or Promise      |
-| `ERR_PREFIX_DISPOSED`       | `PrecompiledPrefix` was evicted from the LRU cache |
-| `ERR_UNDECLARED_BINDING`    | `prefix.run()` passed a name not declared at `precompile()` time |
-| `ERR_FUNCTION_ARGUMENT`     | Host-module function called with a function argument (not supported in v1) |
+| Code                          | Cause                                                                      |
+| ----------------------------- | -------------------------------------------------------------------------- |
+| `ERR_USER_CODE`               | Uncaught exception in sandbox JS                                           |
+| `ERR_MEMORY_LIMIT`            | V8 heap + ArrayBuffer exceeded `limits.memoryMb`                           |
+| `ERR_CPU_TIMEOUT`             | Active JS execution exceeded `limits.cpuTimeMs`                            |
+| `ERR_WALL_TIMEOUT`            | Total run time exceeded `limits.wallTimeMs`                                |
+| `ERR_TERMINATED`              | Host sent `Terminate`                                                      |
+| `ERR_FETCH_NOT_CONFIGURED`    | Sandbox called `fetch` but no handler was provided                         |
+| `ERR_FETCH_INVALID_URL`       | Non-http(s) scheme or unparseable URL                                      |
+| `ERR_FETCH_INVALID_HEADER`    | CRLF/NUL injection in header name or value                                 |
+| `ERR_MODULE_NOT_FOUND`        | `import` specifier not in static map or resolver                           |
+| `ERR_EXPORT_NOT_SERIALIZABLE` | Export value contains a function or Promise                                |
+| `ERR_PREFIX_DISPOSED`         | `PrecompiledPrefix` was evicted from the LRU cache                         |
+| `ERR_UNDECLARED_BINDING`      | `prefix.run()` passed a name not declared at `precompile()` time           |
+| `ERR_FUNCTION_ARGUMENT`       | Host-module function called with a function argument (not supported in v1) |
