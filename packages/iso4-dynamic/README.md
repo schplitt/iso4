@@ -57,16 +57,17 @@ if (result.ok) {
 
 - The TypeScript host API (`createRuntime`, `Runtime`, `PrecompiledPrefix`, …)
 - IPC client + frame codec for the Rust V8 process
-- Bridge dispatch for `fetch` and module imports
-- Mechanical fetch hygiene (header/URL/method validation, body size caps)
-- Sandbox-side JS shims (`console`, `crypto.getRandomValues`, `fetch` stub +
-  `Response` polyfill, module proxy generation)
+- Bridge dispatch for host-configured globals/functions and module imports
+- Mechanical fetch hygiene when the host chooses to expose `fetch`
+  (header/URL/method validation, body size caps)
+- Runtime-owned sandbox shims where explicitly designed. Log handling
+  (`console.*`) is still a TODO; do not infer an inline prelude shim.
 
 ## What this package does not contain
 
-- An HTTP client. If sandbox code calls `fetch` without a configured handler,
-  the run fails with `ERR_FETCH_NOT_CONFIGURED`. Use `@iso4/fetch` for a
-  hardened default.
+- An HTTP client. `fetch` is not special-cased as an always-present runtime
+  global; expose it through the bridge when needed. Use `@iso4/fetch` for a
+  hardened handler.
 - Any policy. Allow/deny decisions live in handlers the host supplies.
 - Any Node-stdlib emulation. Use `@iso4/fs`, `@iso4/crypto`, etc. (planned)
   for stub factories.

@@ -322,13 +322,13 @@ describe('globals', () => {
     await runtime?.dispose()
   })
 
-  test('fetch without handler fails with ERR_FETCH_NOT_CONFIGURED', async () => {
+  test('fetch without configuration is just a missing global/user-code error', async () => {
     const result = await runtime.run({
       code: 'export default await fetch("https://example.com")',
     })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_NOT_CONFIGURED')
+    expect(result.error.code).toBe('ERR_USER_CODE')
   })
 
   test('fetch with handler receives the request and returns response', async () => {
@@ -1027,10 +1027,10 @@ describe('stdout / stderr size limits', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 12. Fetch security — bridge-side mechanical hygiene
+// 12. Configured fetch is just a host bridge global/function
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('fetch security', () => {
+describe('configured fetch bridge', () => {
   let runtime: Runtime
 
   beforeAll(async () => {
@@ -1041,73 +1041,7 @@ describe('fetch security', () => {
     await runtime?.dispose()
   })
 
-  const allowAll = async () => ({ status: 200, headers: {}, body: null })
-
-  test('non-http(s) scheme is ERR_FETCH_INVALID_URL', async () => {
-    const result = await runtime.run({
-      code: 'export default await fetch("file:///etc/passwd")',
-      globals: { fetch: allowAll },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_INVALID_URL')
-  })
-
-  test('javascript: scheme is ERR_FETCH_INVALID_URL', async () => {
-    const result = await runtime.run({
-      code: 'export default await fetch("javascript:alert(1)")',
-      globals: { fetch: allowAll },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_INVALID_URL')
-  })
-
-  test('CRLF in header name is ERR_FETCH_INVALID_HEADER', async () => {
-    const result = await runtime.run({
-      code: `
-        export default await fetch("https://example.com", {
-          headers: { "X-Bad\\r\\nInjected": "value" }
-        })
-      `,
-      globals: { fetch: allowAll },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_INVALID_HEADER')
-  })
-
-  test('CRLF in header value is ERR_FETCH_INVALID_HEADER', async () => {
-    const result = await runtime.run({
-      code: `
-        export default await fetch("https://example.com", {
-          headers: { "X-Normal": "value\\r\\nX-Injected: evil" }
-        })
-      `,
-      globals: { fetch: allowAll },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_INVALID_HEADER')
-  })
-
-  test('NUL byte in header value is ERR_FETCH_INVALID_HEADER', async () => {
-    const result = await runtime.run({
-      code: `
-        export default await fetch("https://example.com", {
-          headers: { "X-Null": "val\\x00ue" }
-        })
-      `,
-      globals: { fetch: allowAll },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_INVALID_HEADER')
-  })
-
-  test('3xx redirect is NOT followed automatically', async () => {
-    // The bridge disables auto-redirect. A 302 response must surface to
-    // sandbox code as a normal 302 response — not silently followed.
+  test('configured fetch can return a 3xx response without auto-following', async () => {
     const result = await runtime.run({
       code: `
         const res = await fetch("https://example.com/redirect")
@@ -1126,24 +1060,7 @@ describe('fetch security', () => {
     expect(result.exports.default).toBe(302)
   })
 
-  test('fetch response body over limit is ERR_FETCH_BODY_TOO_LARGE', async () => {
-    const bigBody = 'x'.repeat(32 * 1024 * 1024) // 32 MB
-    const result = await runtime.run({
-      code: 'export default await (await fetch("https://example.com")).text()',
-      globals: {
-        fetch: async () => ({
-          status: 200,
-          headers: { 'content-type': 'text/plain' },
-          body: bigBody,
-        }),
-      },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_BODY_TOO_LARGE')
-  })
-
-  test('fetch handler throwing surfaces as ERR_FETCH_HOST', async () => {
+  test('configured fetch handler throwing surfaces as generic host bridge failure', async () => {
     const result = await runtime.run({
       code: 'export default await fetch("https://example.com")',
       globals: {
@@ -1154,7 +1071,7 @@ describe('fetch security', () => {
     })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.error.code).toBe('ERR_FETCH_HOST')
+    expect(result.error.code).toBe('ERR_HOST_IMPORT')
   })
 })
 

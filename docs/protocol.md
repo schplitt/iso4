@@ -111,9 +111,6 @@ updated together on a version bump.
 | `ERR_CPU_TIMEOUT`             | Active JS execution exceeded `limits.cpuTimeMs`                            |
 | `ERR_WALL_TIMEOUT`            | Total run time exceeded `limits.wallTimeMs`                                |
 | `ERR_TERMINATED`              | Host sent `Terminate`                                                      |
-| `ERR_FETCH_NOT_CONFIGURED`    | Sandbox called `fetch` but no handler was provided                         |
-| `ERR_FETCH_INVALID_URL`       | Non-http(s) scheme or unparseable URL                                      |
-| `ERR_FETCH_INVALID_HEADER`    | CRLF/NUL injection in header name or value                                 |
 | `ERR_MODULE_NOT_FOUND`        | `import` specifier not in static map or resolver                           |
 | `ERR_EXPORT_NOT_SERIALIZABLE` | Export value contains a function or Promise                                |
 | `ERR_PREFIX_DISPOSED`         | `PrecompiledPrefix` was evicted from the LRU cache                         |

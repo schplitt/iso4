@@ -32,14 +32,14 @@ an async arrow function body; the host wraps it before running:
 ```js
 // What the caller provides:
 async () => {
-  const data = await fetchTool('search', query);
-  return data.results;
+  const data = await fetchTool('search', query)
+  return data.results
 }
 
 // What the host runs:
 export default await (async () => {
-  const data = await fetchTool('search', query);
-  return data.results;
+  const data = await fetchTool('search', query)
+  return data.results
 })()
 ```
 
@@ -55,7 +55,7 @@ function by name; the host calls it with each new input:
 ```js
 // Prefix code (compiled once into the snapshot)
 export async function transform(row) {
-  return { revenue: row.price * row.qty };
+  return { revenue: row.price * row.qty }
 }
 ```
 
@@ -127,7 +127,7 @@ Explicitly **out of scope**:
 - Streaming `Response` / `ReadableStream`. v1 buffers full bodies host-side
   with a configurable cap.
 - Sharing live state between runs. Each `prefix.run()` is a fresh isolate
-  booted from the prefix snapshot — the *prefix's heap shape* is shared,
+  booted from the prefix snapshot — the _prefix's heap shape_ is shared,
   not live mutable state.
 - TypeScript / JSX compilation. Host's responsibility to ship pre-compiled JS.
 - POSIX surface (sockets, FDs, pipes, PTY, process tables). None of it.
@@ -172,7 +172,7 @@ host hands it over by name.
   └─────────────────────────────────────────────────────────┘    
 ```
 
-The host TS package does *not* call into V8 directly. It only sends frames.
+The host TS package does _not_ call into V8 directly. It only sends frames.
 The Rust binary owns all V8 state.
 
 ### 2.1 Why out-of-process
@@ -209,9 +209,10 @@ Every call to `runtime.run(opts)`:
 2. Rust spawns a thread, acquires a concurrency slot, creates a
    `v8::Isolate` with the configured heap limit and custom array-buffer
    allocator.
-3. Rust creates a fresh `v8::Context`. Installs runtime-owned globals
-   (`console`, `crypto.getRandomValues`, etc. — V8 built-ins or tiny shims).
-   Installs host-allowed globals from `opts.globals` (currently just `fetch`).
+3. Rust creates a fresh `v8::Context`. Installs only deliberate runtime-owned
+   globals. Log capture (`console.*`) is a separate design item and must not be
+   smuggled in as an ad-hoc inline prelude. Host-configured globals/functions
+   are installed through the bridge surface declared by the host.
 4. Rust compiles `opts.code` as a `v8::Module` (always ESM) using a module
    resolver that:
    - Looks up each `import` specifier in the host's `imports` map.
@@ -228,14 +229,14 @@ Every call to `runtime.run(opts)`:
 
 ### 3.1 What runs where
 
-| Concern | Where it lives |
-|---|---|
-| User JS code | V8 isolate in Rust process |
-| Source modules (Flavor B) | Compiled into V8, runs in-isolate |
-| Host-implemented modules (Flavor A) | Stubs in V8 call across bridge → host |
-| `fetch` | Stub in V8, host implements with permission check |
-| `console.*` | Captured in Rust, streamed back as stdout/stderr |
-| Result serialization | V8 `ValueSerializer` (Rust side), constrained to data |
+| Concern                             | Where It Lives                                        |
+| ----------------------------------- | ----------------------------------------------------- |
+| User JS code                        | V8 isolate in Rust process                            |
+| Source modules (Flavor B)           | Compiled into V8, runs in-isolate                     |
+| Host-implemented modules (Flavor A) | Stubs in V8 call across bridge → host                 |
+| `fetch`                             | Stub in V8, host implements with permission check     |
+| `console.*`                         | Captured in Rust, streamed back as stdout/stderr      |
+| Result serialization                | V8 `ValueSerializer` (Rust side), constrained to data |
 
 ---
 
@@ -255,6 +256,7 @@ Every call to `runtime.run(opts)`:
 ```
 
 **Memory** is enforced by:
+
 - `v8::CreateParams::heap_limits(0, memoryMb * MB)` for the V8 heap.
 - A custom `v8::Allocator` tracking external `ArrayBuffer` bytes against the
   same budget. Without this, `new ArrayBuffer(2**30)` bypasses heap_limits.
@@ -274,7 +276,7 @@ runaway-await cases (e.g., host fetch implementation never resolves).
 
 ### 4.2 Globals (restricted)
 
-Globals are *not* a free-for-all. The runtime owns most of the global
+Globals are _not_ a free-for-all. The runtime owns most of the global
 namespace; the host can only contribute from a known allowlist. Reasons:
 
 - `console` is owned by the runtime so it can route output to
@@ -286,8 +288,8 @@ namespace; the host can only contribute from a known allowlist. Reasons:
 
 For v1, the host-providable globals are:
 
-| Name | Purpose |
-|---|---|
+| Name    | Purpose                                         |
+| ------- | ----------------------------------------------- |
 | `fetch` | The single I/O entry point. Permission-checked. |
 
 Everything else the host wants to expose goes through `imports`. This keeps
@@ -347,10 +349,10 @@ User code is always parsed as ESM. Results come back via `export`:
 
 ```js
 // User code
-const res = await fetch("https://api.example.com/data");
-const data = await res.json();
-export default data;
-export const fetchedAt = Date.now();
+const res = await fetch('https://api.example.com/data')
+const data = await res.json()
+export default data
+export const fetchedAt = Date.now()
 ```
 
 ```ts
@@ -420,7 +422,7 @@ If the runtime kills the isolate (memory, CPU, wall):
 }
 ```
 
-The result is *always* an object; `ok: true | false` discriminates. `run()`
+The result is _always_ an object; `ok: true | false` discriminates. `run()`
 does not throw for sandboxed failures — only for infrastructure failures
 (e.g., the Rust process crashed).
 
@@ -451,21 +453,21 @@ direction. Both tables start at `0x01`.
 
 **TS → Rust**
 
-| Byte   | Name             | Purpose                                      |
-|--------|------------------|----------------------------------------------|
+| Byte   | Name             | Purpose                                            |
+| ------ | ---------------- | -------------------------------------------------- |
 | `0x01` | `Authenticate`   | First message on connect: protocol version + token |
-| `0x02` | `Run`            | Start a sandboxed execution                  |
-| `0x03` | `BridgeResponse` | Reply to a `BridgeCall` from Rust            |
-| `0x04` | `Terminate`      | Force-stop a running isolate                 |
+| `0x02` | `Run`            | Start a sandboxed execution                        |
+| `0x03` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                  |
+| `0x04` | `Terminate`      | Force-stop a running isolate                       |
 
 **Rust → TS**
 
-| Byte   | Name          | Purpose                                               |
-|--------|---------------|-------------------------------------------------------|
-| `0x01` | `BridgeCall`  | Sandbox called `fetch` or a host-module function      |
-| `0x02` | `StdioChunk`  | Eager `console.*` output (stdout or stderr)           |
-| `0x03` | `Result`      | Final result for a `Run` (always sent exactly once)   |
-| `0x04` | `Log`         | Internal runtime diagnostics                          |
+| Byte   | Name         | Purpose                                             |
+| ------ | ------------ | --------------------------------------------------- |
+| `0x01` | `BridgeCall` | Sandbox called `fetch` or a host-module function    |
+| `0x02` | `StdioChunk` | Eager `console.*` output (stdout or stderr)         |
+| `0x03` | `Result`     | Final result for a `Run` (always sent exactly once) |
+| `0x04` | `Log`        | Internal runtime diagnostics                        |
 
 ### 6.3 Payload encoding
 
@@ -488,6 +490,7 @@ Runtime (TypeScript)
 ```
 
 When `prefix.run()` or `runtime.run()` is called:
+
 1. Claim a free slot from the pool (or queue if all slots are busy).
 2. Send `Run` on that slot's connection.
 3. Receive `StdioChunk` / `BridgeCall` / `BridgeResponse` frames until
@@ -537,7 +540,7 @@ Documented up front so we don't drift into rebuilding secure-exec:
 5. **No WebAssembly.** `set_allow_wasm_code_generation_callback(_ => false)`.
 
 6. **No shared state between runs.** Each `run()` is a fresh `v8::Context`.
-   Module compilation is cached by the runtime for perf; module *state*
+   Module compilation is cached by the runtime for perf; module _state_
    (singletons, top-level variables) is not.
 
 7. **No filesystem.** No FS module is provided. If host code wants to expose
@@ -580,6 +583,7 @@ iso4/
 ```
 
 Target sizes (when complete):
+
 - `iso4`: <1500 LoC TypeScript.
 - `@iso4/fetch`: <500 LoC TypeScript.
 - `@iso4/dynamic/v8-runtime`: <3000 LoC Rust.
@@ -592,21 +596,21 @@ Target sizes (when complete):
 Reordered so the snapshot-based prefix mechanism lands early — it's the
 feature most users will rely on and shapes the IPC protocol.
 
-| Phase | Scope | Deliverable |
-|-------|-------|-------------|
-| 0 | This doc + `packages/iso4-dynamic/src/types.ts` + `packages/iso4-core/src/types.ts` + `MONOREPO.md` + workspace scaffolding | API committed before code |
-| 1 | Rust binary: spawn, UDS, single run, heap limit, CPU timeout (wall-clock), ESM compile + evaluate, captured console, export serialization | `runtime.run({ code, limits })` works end-to-end with no imports, no fetch |
-| 2 | Precompile + `PrecompiledPrefix.run()` via V8 startup snapshots | The canonical AI-agent prefix/postfix loop works |
-| 3 | CPU budget enter/leave bracketing (async time exclusion) | Tight loops killed quickly; `await fetch` doesn't burn budget |
-| 4 | `fetch` global with bridge-side header/URL validation; permission predicate; body cap; abort-on-timeout | Real network usable with deny-by-default control |
-| 5 | `@iso4/fetch` package: `createSafeFetch` with allowlist, DNS pin, private-IP blocking, no-auto-redirect | Hardened default users can opt into in two lines |
-| 6 | Imports: source modules (Flavor B) with V8 code cache | `import * as z from "zod"` works when host provides source |
-| 7 | Imports: host modules (Flavor A) with synthetic V8 modules | `import fs from "node:fs"` works when host provides functions |
-| 8 | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget | Memory and time limits are tight under adversarial input |
-| 9 | Pre-warmed isolate pool (optional, behind a runtime option) | Sub-2ms cold start for high-throughput workloads |
-| 10 | Polish: error types, integration tests, READMEs, examples | Shippable v1 |
-| 11 | `prefix.openSession()` + `Session` API; `HostCall`/`HostCallResult` wire messages; persistent-isolate semantics | Analytics pipeline use case works end-to-end with the two-process backend |
-| 12 | In-process (C++ NAPI) backend behind a `RuntimeOptions.backend` flag; same `Session` API; requires Docker/K8s outer isolation | Sub-µs amortized per-call overhead for high-throughput analytics |
+| Phase | Scope                                                                                                                                     | Deliverable                                                                |
+| ----- | ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| 0     | This doc + `packages/iso4-dynamic/src/types.ts` + `packages/iso4-core/src/types.ts` + `MONOREPO.md` + workspace scaffolding               | API committed before code                                                  |
+| 1     | Rust binary: spawn, UDS, single run, heap limit, CPU timeout (wall-clock), ESM compile + evaluate, captured console, export serialization | `runtime.run({ code, limits })` works end-to-end with no imports, no fetch |
+| 2     | Precompile + `PrecompiledPrefix.run()` via V8 startup snapshots                                                                           | The canonical AI-agent prefix/postfix loop works                           |
+| 3     | CPU budget enter/leave bracketing (async time exclusion)                                                                                  | Tight loops killed quickly; `await fetch` doesn't burn budget              |
+| 4     | `fetch` global with bridge-side header/URL validation; permission predicate; body cap; abort-on-timeout                                   | Real network usable with deny-by-default control                           |
+| 5     | `@iso4/fetch` package: `createSafeFetch` with allowlist, DNS pin, private-IP blocking, no-auto-redirect                                   | Hardened default users can opt into in two lines                           |
+| 6     | Imports: source modules (Flavor B) with V8 code cache                                                                                     | `import * as z from "zod"` works when host provides source                 |
+| 7     | Imports: host modules (Flavor A) with synthetic V8 modules                                                                                | `import fs from "node:fs"` works when host provides functions              |
+| 8     | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
+| 9     | Pre-warmed isolate pool (optional, behind a runtime option)                                                                               | Sub-2ms cold start for high-throughput workloads                           |
+| 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |
+| 11    | `prefix.openSession()` + `Session` API; `HostCall`/`HostCallResult` wire messages; persistent-isolate semantics                           | Analytics pipeline use case works end-to-end with the two-process backend  |
+| 12    | In-process (C++ NAPI) backend behind a `RuntimeOptions.backend` flag; same `Session` API; requires Docker/K8s outer isolation             | Sub-µs amortized per-call overhead for high-throughput analytics           |
 
 Each phase is independently shippable. We stop and reassess at the end of
 each phase.
@@ -634,10 +638,13 @@ To be resolved as we build, not blocking the start:
   unresolved Promises, or just await them once at the top level? Current
   lean: throw, force the user to await before exporting.
 
-- **Should `console.log` flush eagerly to host or buffer until run ends?**
-  Eager flushing lets the host show progress for long-running scripts.
-  Buffering is simpler. Lean: eager, frame-per-write, with a 1 MB cap per
-  stream.
+- **How exactly should logs/stdout/stderr be captured?**
+  Log handling is deliberately deferred. Options include native V8 callbacks,
+  a small owned shim installed by the runtime, eager `StdioChunk` frames, or
+  buffered output returned with `Result`. Do not add an ad-hoc inline JS
+  prelude while this is unresolved. Current lean: eager, frame-per-write,
+  with a 1 MB cap per stream, but this still needs an explicit implementation
+  decision.
 
 - **Snapshot cache LRU cap.** Snapshots live in the Rust process's memory.
   Each is tens-to-hundreds of KB. Default cap: 100 snapshots, LRU evicted.
@@ -764,43 +771,47 @@ that no one would get right at the application layer; the **host author**
 must decide policy. The library cannot decide policy. The host author
 should not have to worry about CRLF injection.
 
-### 12.1 What actually happens when sandbox JS calls `fetch`
+### 12.1 What actually happens when sandbox JS calls a host function such as `fetch`
 
-The sandbox `fetch` global is a tiny stub that bundles the request as a
-plain data object and bridges to the host. The host's configured
-`FetchHandler` runs. Whatever the handler does is the host author's choice.
+`fetch` is not special in the V8 runtime. If the host wants to expose a
+`fetch`-like function, it is installed through the same host bridge mechanism
+as any other configured global/function or host import. The sandbox call is
+bundled as plain data, Rust sends a `BridgeCall`, the TypeScript host runs the
+configured handler, and the result is passed back via `BridgeResponse`.
 
-**The bridge does NOT auto-route to `globalThis.fetch` on the host.** If
-the host author writes `fetch: (req) => globalThis.fetch(req.url, req)`,
-then yes, the host's real network stack runs with sandbox-controlled
-inputs. If they write something restrictive, that runs. The bridge is
-just a function-call protocol.
+**The bridge does NOT auto-route to `globalThis.fetch` on the host.** If the
+host author writes a handler that calls `globalThis.fetch`, then yes, the
+host's real network stack runs with sandbox-controlled inputs. If they write
+something restrictive, that runs. The bridge is just a function-call protocol.
 
 ### 12.2 Attack categories and where each is mitigated
 
-| Attack | Where it lives | Who mitigates |
-|---|---|---|
-| CRLF/NUL injection in header values | Sandbox sends bad bytes that, if forwarded raw, let a naive HTTP client smuggle headers or open second requests | **`@iso4/core`** validates header names and values at the bridge boundary before invoking the host handler. Rejects with `ERR_FETCH_INVALID_HEADER`. |
-| Non-http URL schemes (`file:`, `data:`, `javascript:`) | Sandbox sends a URL string a permissive client might try to fetch | **`@iso4/core`** parses URL via WHATWG URL, rejects non-http(s) with `ERR_FETCH_INVALID_URL`. |
-| URL parse-vs-request mismatch | Permission check parses URL one way, host's HTTP client parses another (`http://a@b/`) | **`@iso4/core`** canonicalizes via WHATWG URL once; same canonical string passed to handler. |
-| Body size DoS | Sandbox sends a 1 GB body | **`@iso4/core`** enforces `limits.maxFetchBodyBytes` before crossing to host. |
-| Response size amplification | Server returns compressed response that decompresses huge | **`@iso4/core`** caps response bytes pre-decompression at the bridge. Hardened handlers (`@iso4/fetch`) refuse `Content-Encoding` unless explicitly enabled. |
-| SSRF to internal services (`169.254.169.254`, RFC1918, loopback) | Sandbox URL points at host-local services | **`@iso4/fetch`** (opt-in) pre-resolves DNS, refuses private/link-local IPs unless allowlisted. |
-| DNS rebinding | Hostname allowlisted, attacker rebinds DNS between permission check and actual fetch | **`@iso4/fetch`** pre-resolves once at bridge layer, makes the actual request to the resolved IP with explicit `Host:` header. |
-| Redirect-based bypass | Allowed host responds with 3xx to internal URL; client follows blindly | **`@iso4/core`** disables auto-redirect in the bridge. 3xx surfaces to sandbox as a normal response; sandbox code must call `fetch` again to follow. Permission check runs on each call. |
-| Auth-header leakage via shared HTTP client | Host wires `fetch` to their app's authenticated axios instance; sandbox now uses host's auth tokens | **Host author** — use a clean HTTP client for sandboxed traffic. `@iso4/fetch` uses an isolated `undici` Dispatcher by default. |
-| Permission policy (which URLs/methods/etc. are allowed) | Application-specific | **Host author**, expressed as a predicate inside the configured handler. `@iso4/fetch` provides allowlist helpers. |
-| Timing oracle on permission denial | Sandbox times responses to detect reachability of internal hosts | Mostly **host author**. `@iso4/fetch` can normalize denial latency. |
+Fetch/network policy and hygiene live in the configured host handler or in a
+helper package such as `@iso4/fetch`, not in V8 execution itself. The runtime
+should not grow fetch-specific error codes; handler failures surface through
+the generic host-bridge error path.
+
+| Attack                                                           | Where It Lives                                                                                                  | Who Mitigates                                                                                                               |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| CRLF/NUL injection in header values                              | Sandbox sends bad bytes that, if forwarded raw, let a naive HTTP client smuggle headers or open second requests | The configured fetch handler / `@iso4/fetch`.                                                                               |
+| Non-http URL schemes (`file:`, `data:`, `javascript:`)           | Sandbox sends a URL string a permissive client might try to fetch                                               | The configured fetch handler / `@iso4/fetch`.                                                                               |
+| URL parse-vs-request mismatch                                    | Permission check parses URL one way, host's HTTP client parses another (`http://a@b/`)                          | The configured fetch handler / `@iso4/fetch`.                                                                               |
+| Body size DoS                                                    | Sandbox sends a 1 GB body                                                                                       | The configured fetch handler / `@iso4/fetch`.                                                                               |
+| Response size amplification                                      | Server returns compressed response that decompresses huge                                                       | The configured fetch handler / `@iso4/fetch`.                                                                               |
+| SSRF to internal services (`169.254.169.254`, RFC1918, loopback) | Sandbox URL points at host-local services                                                                       | `@iso4/fetch` (opt-in) pre-resolves DNS, refuses private/link-local IPs unless allowlisted.                                 |
+| DNS rebinding                                                    | Hostname allowlisted, attacker rebinds DNS between permission check and actual fetch                            | `@iso4/fetch` pre-resolves once at bridge layer, makes the actual request to the resolved IP with explicit `Host:` header.  |
+| Redirect-based bypass                                            | Allowed host responds with 3xx to internal URL; client follows blindly                                          | The configured fetch handler / `@iso4/fetch`.                                                                               |
+| Auth-header leakage via shared HTTP client                       | Host wires `fetch` to their app's authenticated axios instance; sandbox now uses host's auth tokens             | Host author — use a clean HTTP client for sandboxed traffic. `@iso4/fetch` uses an isolated `undici` Dispatcher by default. |
+| Permission policy (which URLs/methods/etc. are allowed)          | Application-specific                                                                                            | Host author, expressed in the configured handler. `@iso4/fetch` provides allowlist helpers.                                 |
+| Timing oracle on permission denial                               | Sandbox times responses to detect reachability of internal hosts                                                | Mostly host author. `@iso4/fetch` can normalize denial latency.                                                             |
 
 ### 12.3 Package boundaries for fetch
 
 - **`iso4`** ships:
-  - Bridge-side validation of header names/values, URL scheme, method, body
-    size, response size cap.
-  - No-auto-redirect by default.
-  - The `FetchHandler` interface every host implementation must conform to.
-  - No default HTTP client — a configured `fetch` is required for sandbox
-    code to actually make network calls, otherwise `ERR_FETCH_NOT_CONFIGURED`.
+  - Generic host-bridge plumbing for configured globals/functions and imports.
+  - No default HTTP client. `fetch` is not special-cased as an always-present
+    runtime global; if the host wants to expose it, it is configured through
+    the same bridge mechanism as other host-provided globals/functions.
 
 - **`@iso4/fetch`** ships:
   - `createSafeFetch({ allowedHosts, blockPrivateIPs, maxRedirects, timeout, ... })`
@@ -928,7 +939,7 @@ picks one off the pool instantly.
 ```ts
 const prefix = await runtime.precompile({
   code: transformCode,
-  sessionPool: { size: 10 },  // pre-warm 10 isolates immediately
+  sessionPool: { size: 10 }, // pre-warm 10 isolates immediately
 })
 
 // 5 requests arrive simultaneously — all get isolates in ~0 ms
@@ -938,10 +949,11 @@ const sessions = await Promise.all(
 const results = await Promise.all(
   sessions.map((s, i) => s.call('transformRow', requests[i].input))
 )
-await Promise.all(sessions.map(s => s.close()))  // returns isolates to pool
+await Promise.all(sessions.map((s) => s.close())) // returns isolates to pool
 ```
 
 Pool semantics:
+
 - `openSession()` on a full pool returns immediately (O(1) isolate hand-off).
 - `openSession()` when the pool is empty either cold-starts a new isolate
   (default) or waits for one to become free if `sessionPool.maxSize` is
@@ -958,26 +970,27 @@ one-shot runs.
 
 TS→Rust:
 
-| Byte   | Name          | Payload                          |
-|--------|---------------|----------------------------------|
-| `0x05` | `OpenSession` | `u32` prefix-id                  |
-| `0x06` | `Call`        | UTF-8 fn name + V8-serialized arg|
-| `0x07` | `CloseSession`| _(empty)_                        |
+| Byte   | Name           | Payload                           |
+| ------ | -------------- | --------------------------------- |
+| `0x05` | `OpenSession`  | `u32` prefix-id                   |
+| `0x06` | `Call`         | UTF-8 fn name + V8-serialized arg |
+| `0x07` | `CloseSession` | _(empty)_                         |
 
 Rust→TS:
 
-| Byte   | Name           | Payload                          |
-|--------|----------------|----------------------------------|
-| `0x05` | `SessionOpened`| _(empty — connection is the id)_ |
-| `0x06` | `CallResult`   | V8-serialized result or error    |
+| Byte   | Name            | Payload                          |
+| ------ | --------------- | -------------------------------- |
+| `0x05` | `SessionOpened` | _(empty — connection is the id)_ |
+| `0x06` | `CallResult`    | V8-serialized result or error    |
 
 No session-id on the wire: the connection itself identifies the session,
 just as the connection identifies which `Run` is active.
 
-**No `fetch`, no `BridgeCall` in session mode.** Session calls are
-synchronous from the isolate's perspective. If the transform function
-tries to `await fetch(...)`, it will throw `ERR_FETCH_NOT_CONFIGURED`.
-The session API is intentionally narrow: pure data in, pure data out,
+**No async host bridge in session mode.** Session calls are synchronous from
+the isolate's perspective. If the transform function tries to call an
+unconfigured host global/function such as `fetch`, it fails like ordinary
+user code (for example, a missing binding), not with a fetch-specific runtime
+error. The session API is intentionally narrow: pure data in, pure data out,
 no async I/O.
 
 ### 13.3 In-process backend (Phase 12)
@@ -1014,13 +1027,13 @@ closes the session).
 
 ### 13.4 Choosing between the models
 
-| | One-shot `run()` | Persistent `session.call()` |
-|---|---|---|
-| Isolate lifetime | per-call | per-session |
-| Async / fetch | ✅ | ❌ (sync only) |
-| Imports (host modules) | ✅ | source-only |
-| IPC cost (two-process) | once per run | once per call |
-| IPC cost (in-process) | ~1ms | ~1–5 µs |
-| Per-row analytics | impractical | ✅ |
-| Crash isolation | ✅ always | ✅ two-process only |
-| Prompt-injection risk | mitigated by limits | same |
+|                        | One-shot `run()`    | Persistent `session.call()` |
+| ---------------------- | ------------------- | --------------------------- |
+| Isolate lifetime       | per-call            | per-session                 |
+| Async / fetch          | ✅                  | ❌ (sync only)              |
+| Imports (host modules) | ✅                  | source-only                 |
+| IPC cost (two-process) | once per run        | once per call               |
+| IPC cost (in-process)  | ~1ms                | ~1–5 µs                     |
+| Per-row analytics      | impractical         | ✅                          |
+| Crash isolation        | ✅ always           | ✅ two-process only         |
+| Prompt-injection risk  | mitigated by limits | same                        |

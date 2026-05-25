@@ -54,17 +54,18 @@ The two-process dynamic runtime package (`@iso4/dynamic`). Owns:
 - Public API: `createRuntime`, `Runtime`, `PrecompiledPrefix`, the type
   system declared in `src/types.ts`.
 - IPC client + binary frame codec talking to the Rust V8 process.
-- Bridge dispatch routing `_hostCall` frames to host-supplied handlers
-  for `fetch` and `imports`.
-- Mechanical fetch hygiene: header/URL/method validation, body size cap,
-  no-auto-redirect default. Anything that is not policy.
-- Sandbox-side JS shims (`console`, `crypto.getRandomValues`, `fetch` stub,
-  module proxy generation).
+- Bridge dispatch routing `_hostCall` frames to host-supplied handlers for
+  configured globals/functions and imports.
+- Mechanical fetch hygiene when the host chooses to expose `fetch`:
+  header/URL/method validation, body size cap, no-auto-redirect default.
+  Anything that is not policy.
+- Runtime-owned sandbox shims where explicitly designed. Log handling
+  (`console.*`) is still a TODO; do not infer an inline prelude shim.
 
 Does **not** own:
 
-- Any HTTP client. If `fetch` is called without a configured handler the
-  run fails with `ERR_FETCH_NOT_CONFIGURED`.
+- Any HTTP client. `fetch` is not special-cased as an always-present runtime
+  global; hosts expose it through the bridge when needed.
 - Any policy. Allow/deny decisions live in handlers the host supplies.
 - Any Node-stdlib emulation. Those live in sibling `@iso4/<name>` packages.
 
@@ -276,6 +277,9 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   shape invariant. Surface with `ERR_UNDECLARED_BINDING` instead.
 - Do not add a default HTTP client to `iso4`. Sandbox network access
   must be deny-by-default.
+- Do not add ad-hoc inline JS preludes for `console`, `crypto`, or `fetch`.
+  Log handling is a deliberate TODO, and `fetch` is just a host-configured
+  bridge global/function rather than a special always-installed runtime stub.
 - Do not forget to run `pnpm changeset` when a PR changes user-visible
   behavior in a published package. Internal-only changes (refactors,
   tests, docs) do not need one.
