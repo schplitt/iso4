@@ -6,18 +6,18 @@ permissions:
 on:
   pull_request:
     paths:
-      - 'native/**'
+      - 'packages/iso4-dynamic/v8-runtime/**'
       - '.github/workflows/ci-rust.yml'
   push:
     branches:
       - main
     paths:
-      - 'native/**'
+      - 'packages/iso4-dynamic/v8-runtime/**'
       - '.github/workflows/ci-rust.yml'
 
 defaults:
   run:
-    working-directory: native/v8-runtime
+    working-directory: packages/iso4-dynamic/v8-runtime
 
 jobs:
   check:
@@ -39,7 +39,7 @@ jobs:
         # turns cold CI runs from ~5 min into ~30 s.
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: native/v8-runtime
+          workspaces: packages/iso4-dynamic/v8-runtime
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
