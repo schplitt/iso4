@@ -22,7 +22,10 @@ pub fn handle_client(mut stream: UnixStream) {
     };
 
     if auth_frame.message_type != ipc::TsToRustMessageType::Authenticate {
-        eprintln!("[iso4-v8] expected Authenticate, got {:?} — closing", auth_frame.message_type);
+        eprintln!(
+            "[iso4-v8] expected Authenticate, got {:?} — closing",
+            auth_frame.message_type
+        );
         return;
     }
 
@@ -67,11 +70,54 @@ pub fn handle_client(mut stream: UnixStream) {
                 break;
             }
             ipc::TsToRustMessageType::Run => {
-                eprintln!("[iso4-v8] Run received ({} payload bytes)", frame.payload.len());
+                eprintln!(
+                    "[iso4-v8] Run received ({} payload bytes)",
+                    frame.payload.len()
+                );
 
                 match sandbox::execute(&frame.payload) {
-                    Ok(result_bytes) => {
-                        if let Err(e) = ipc::write_rust_to_ts_frame(&mut stream, ipc::RustToTsMessageType::Result, &result_bytes) {
+                    Ok(output) => {
+                        if !output.stdout.is_empty() {
+                            let mut payload = Vec::with_capacity(1 + output.stdout.len());
+                            payload.push(0); // stdout
+                            payload.extend_from_slice(output.stdout.as_bytes());
+                            if let Err(e) = ipc::write_rust_to_ts_frame(
+                                &mut stream,
+                                ipc::RustToTsMessageType::StdioChunk,
+                                &payload,
+                            ) {
+                                eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
+                                break;
+                            }
+                        }
+
+                        if !output.stderr.is_empty() {
+                            let mut payload = Vec::with_capacity(1 + output.stderr.len());
+                            payload.push(1); // stderr
+                            payload.extend_from_slice(output.stderr.as_bytes());
+                            if let Err(e) = ipc::write_rust_to_ts_frame(
+                                &mut stream,
+                                ipc::RustToTsMessageType::StdioChunk,
+                                &payload,
+                            ) {
+                                eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
+                                break;
+                            }
+                        }
+
+                        // Phase 2+: replace with V8 ValueSerializer of RunResult.
+                        // For now: send the stringified default export as bytes.
+                        let bytes = output
+                            .default_export
+                            .as_deref()
+                            .unwrap_or("undefined")
+                            .as_bytes()
+                            .to_vec();
+                        if let Err(e) = ipc::write_rust_to_ts_frame(
+                            &mut stream,
+                            ipc::RustToTsMessageType::Result,
+                            &bytes,
+                        ) {
                             eprintln!("[iso4-v8] failed to write Result: {e}");
                             break;
                         }
@@ -79,8 +125,12 @@ pub fn handle_client(mut stream: UnixStream) {
                     Err(e) => {
                         // Execution failed. Log it and send an empty Result
                         // for now. Later this becomes a serialized RunFailure.
-                        eprintln!("[iso4-v8] execute error: {e}");
-                        if let Err(e) = ipc::write_rust_to_ts_frame(&mut stream, ipc::RustToTsMessageType::Result, &[]) {
+                        eprintln!("[iso4-v8] execute error: {e:?}");
+                        if let Err(e) = ipc::write_rust_to_ts_frame(
+                            &mut stream,
+                            ipc::RustToTsMessageType::Result,
+                            &[],
+                        ) {
                             eprintln!("[iso4-v8] failed to write Result: {e}");
                             break;
                         }
