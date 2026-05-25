@@ -1,11 +1,11 @@
 /**
- * @iso4/dynamic — public entry point.
+ * \@iso4/dynamic — public entry point.
  *
  * Two-process dynamic runtime: a Rust V8 subprocess handles sandboxed
  * execution; this package provides the TypeScript host API.
  *
  * Shared types (FetchHandler, ResourceLimits, ImportsConfig, …) are
- * re-exported here from @iso4/core so consumers only need one import.
+ * re-exported here from \@iso4/core so consumers only need one import.
  *
  * See DESIGN.md and MONOREPO.md for the architectural plan.
  */
@@ -49,6 +49,7 @@ export type {
  *
  * NOTE: Not yet implemented. Calling this will throw.
  * See DESIGN.md §9 for the phased build plan.
+ * @param _options
  */
 export async function createRuntime(
   _options?: RuntimeOptions,
