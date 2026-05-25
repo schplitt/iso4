@@ -50,6 +50,18 @@ pub struct Output {
     pub duration_ms: u64,
 }
 
+/// The result of a failed JavaScript execution.
+///
+/// Logs are preserved on failures too: if user code logs and then throws, the
+/// caller still receives the log output produced before the throw.
+#[derive(Debug)]
+pub struct FailureOutput {
+    pub error: RunError,
+    pub stdout: String,
+    pub stderr: String,
+    pub duration_ms: u64,
+}
+
 /// All the ways an execution can fail.
 #[derive(Debug)]
 pub enum RunError {
@@ -87,22 +99,28 @@ pub enum RunError {
 /// **Phase 2+:** payload is V8-serialized `RunOptions`; the code inside it is
 /// still evaluated as ESM with a module resolver, bridge stubs, and full
 /// `ValueSerializer` export extraction.
-pub fn execute(payload: &[u8]) -> Result<Output, RunError> {
-    let code = std::str::from_utf8(payload).map_err(|e| RunError::InvalidPayload(e.to_string()))?;
+pub fn execute(payload: &[u8]) -> Result<Output, FailureOutput> {
+    let code = std::str::from_utf8(payload).map_err(|e| FailureOutput {
+        error: RunError::InvalidPayload(e.to_string()),
+        stdout: String::new(),
+        stderr: String::new(),
+        duration_ms: 0,
+    })?;
     run_code(code)
 }
 
 /// Core execution — separated from `execute` so tests can call it directly
 /// with a `&str` without constructing a fake IPC payload.
-fn run_code(code: &str) -> Result<Output, RunError> {
+fn run_code(code: &str) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(code)
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
 /// inspect the module namespace object for `default` and named exports.
-fn run_module(code: &str) -> Result<Output, RunError> {
+fn run_module(code: &str) -> Result<Output, FailureOutput> {
     let start = std::time::Instant::now();
+    let mut logs = LogBuffers::default();
 
     let mut isolate = v8::Isolate::new(Default::default());
     // Auto microtasks is enough for simple top-level `await Promise.resolve()`.
@@ -112,15 +130,25 @@ fn run_module(code: &str) -> Result<Output, RunError> {
     let scope = &mut v8::HandleScope::new(&mut isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
-    let mut logs = LogBuffers::default();
-    install_console(scope, &mut logs as *mut LogBuffers)?;
+    install_console(scope, &mut logs as *mut LogBuffers)
+        .map_err(|error| failure(error, &logs, start))?;
 
     let scope = &mut v8::TryCatch::new(scope);
 
-    let source_string = v8::String::new(scope, code)
-        .ok_or_else(|| RunError::Internal("failed to intern module source".to_string()))?;
-    let filename = v8::String::new(scope, "<iso4>")
-        .ok_or_else(|| RunError::Internal("failed to intern filename".to_string()))?;
+    let source_string = v8::String::new(scope, code).ok_or_else(|| {
+        failure(
+            RunError::Internal("failed to intern module source".to_string()),
+            &logs,
+            start,
+        )
+    })?;
+    let filename = v8::String::new(scope, "<iso4>").ok_or_else(|| {
+        failure(
+            RunError::Internal("failed to intern filename".to_string()),
+            &logs,
+            start,
+        )
+    })?;
     let origin = v8::ScriptOrigin::new(
         scope,
         filename.into(),
@@ -138,39 +166,65 @@ fn run_module(code: &str) -> Result<Output, RunError> {
 
     let module = match v8::script_compiler::compile_module(scope, &mut source) {
         Some(m) => m,
-        None => return Err(RunError::CompileError(exception_message(scope))),
+        None => {
+            return Err(failure(
+                RunError::CompileError(exception_message(scope)),
+                &logs,
+                start,
+            ))
+        }
     };
 
     if module
         .instantiate_module(scope, no_import_resolver)
         .is_none()
     {
-        return Err(RunError::ModuleNotFound(exception_message(scope)));
+        return Err(failure(
+            RunError::ModuleNotFound(exception_message(scope)),
+            &logs,
+            start,
+        ));
     }
 
     let evaluation = match module.evaluate(scope) {
         Some(value) => value,
         None => {
-            return Err(RunError::RuntimeError {
-                message: exception_message(scope),
-                stack: exception_stack(scope),
-            });
+            return Err(failure(
+                RunError::RuntimeError {
+                    message: exception_message(scope),
+                    stack: exception_stack(scope),
+                },
+                &logs,
+                start,
+            ));
         }
     };
 
     if evaluation.is_promise() {
         let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
-            RunError::Internal("failed to inspect module evaluation promise".to_string())
+            failure(
+                RunError::Internal("failed to inspect module evaluation promise".to_string()),
+                &logs,
+                start,
+            )
         })?;
         match promise.state() {
             v8::PromiseState::Fulfilled => {}
             v8::PromiseState::Rejected => {
                 let rejection = promise.result(scope);
-                return Err(runtime_error_from_value(scope, rejection));
+                return Err(failure(
+                    runtime_error_from_value(scope, rejection),
+                    &logs,
+                    start,
+                ));
             }
             v8::PromiseState::Pending => {
-                return Err(RunError::ExportNotSerializable(
-                    "module evaluation promise is still pending".to_string(),
+                return Err(failure(
+                    RunError::ExportNotSerializable(
+                        "module evaluation promise is still pending".to_string(),
+                    ),
+                    &logs,
+                    start,
                 ));
             }
         }
@@ -179,29 +233,56 @@ fn run_module(code: &str) -> Result<Output, RunError> {
     let namespace = module
         .get_module_namespace()
         .to_object(scope)
-        .ok_or_else(|| RunError::Internal("module namespace is not an object".to_string()))?;
+        .ok_or_else(|| {
+            failure(
+                RunError::Internal("module namespace is not an object".to_string()),
+                &logs,
+                start,
+            )
+        })?;
 
     let names = namespace
         .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
-        .ok_or_else(|| RunError::Internal("failed to read module export names".to_string()))?;
+        .ok_or_else(|| {
+            failure(
+                RunError::Internal("failed to read module export names".to_string()),
+                &logs,
+                start,
+            )
+        })?;
 
     let mut default_export = None;
     let mut named_exports = HashMap::new();
 
     for i in 0..names.length() {
-        let name_value = names
-            .get_index(scope, i)
-            .ok_or_else(|| RunError::Internal("failed to read export name".to_string()))?;
+        let name_value = names.get_index(scope, i).ok_or_else(|| {
+            failure(
+                RunError::Internal("failed to read export name".to_string()),
+                &logs,
+                start,
+            )
+        })?;
         let name = name_value
             .to_string(scope)
             .map(|s| s.to_rust_string_lossy(scope))
-            .ok_or_else(|| RunError::Internal("failed to stringify export name".to_string()))?;
+            .ok_or_else(|| {
+                failure(
+                    RunError::Internal("failed to stringify export name".to_string()),
+                    &logs,
+                    start,
+                )
+            })?;
 
-        let value = namespace
-            .get(scope, name_value)
-            .ok_or_else(|| RunError::Internal(format!("failed to read export {name}")))?;
+        let value = namespace.get(scope, name_value).ok_or_else(|| {
+            failure(
+                RunError::Internal(format!("failed to read export {name}")),
+                &logs,
+                start,
+            )
+        })?;
 
-        let rendered = stringify_export(scope, &name, value)?;
+        let rendered =
+            stringify_export(scope, &name, value).map_err(|error| failure(error, &logs, start))?;
         if name == "default" {
             default_export = Some(rendered);
         } else {
@@ -216,6 +297,15 @@ fn run_module(code: &str) -> Result<Output, RunError> {
         stderr: logs.stderr.join("\n"),
         duration_ms: start.elapsed().as_millis() as u64,
     })
+}
+
+fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> FailureOutput {
+    FailureOutput {
+        error,
+        stdout: logs.stdout.join("\n"),
+        stderr: logs.stderr.join("\n"),
+        duration_ms: start.elapsed().as_millis() as u64,
+    }
 }
 
 fn no_import_resolver<'a>(
@@ -446,7 +536,7 @@ mod tests {
 
     /// Shorthand: run a code string and return the full Output or RunError.
     fn run(code: &str) -> Result<Output, RunError> {
-        run_code(code)
+        run_code(code).map_err(|failure| failure.error)
     }
 
     /// Shorthand: expect success and return the Output, panic otherwise.
@@ -674,6 +764,22 @@ mod tests {
         } else {
             panic!("expected RuntimeError");
         }
+    }
+
+    #[test]
+    fn logs_before_throw_are_preserved_on_failure() {
+        let failure = run_code(
+            r#"
+            console.log("before stdout");
+            console.error("before stderr");
+            throw new Error("boom")
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(failure.error, RunError::RuntimeError { .. }));
+        assert!(failure.stdout.contains("before stdout"));
+        assert!(failure.stderr.contains("before stderr"));
     }
 
     #[test]

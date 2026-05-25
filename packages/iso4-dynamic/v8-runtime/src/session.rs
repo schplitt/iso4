@@ -122,10 +122,38 @@ pub fn handle_client(mut stream: UnixStream) {
                             break;
                         }
                     }
-                    Err(e) => {
+                    Err(failure) => {
+                        if !failure.stdout.is_empty() {
+                            let mut payload = Vec::with_capacity(1 + failure.stdout.len());
+                            payload.push(0); // stdout
+                            payload.extend_from_slice(failure.stdout.as_bytes());
+                            if let Err(e) = ipc::write_rust_to_ts_frame(
+                                &mut stream,
+                                ipc::RustToTsMessageType::StdioChunk,
+                                &payload,
+                            ) {
+                                eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
+                                break;
+                            }
+                        }
+
+                        if !failure.stderr.is_empty() {
+                            let mut payload = Vec::with_capacity(1 + failure.stderr.len());
+                            payload.push(1); // stderr
+                            payload.extend_from_slice(failure.stderr.as_bytes());
+                            if let Err(e) = ipc::write_rust_to_ts_frame(
+                                &mut stream,
+                                ipc::RustToTsMessageType::StdioChunk,
+                                &payload,
+                            ) {
+                                eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
+                                break;
+                            }
+                        }
+
                         // Execution failed. Log it and send an empty Result
                         // for now. Later this becomes a serialized RunFailure.
-                        eprintln!("[iso4-v8] execute error: {e:?}");
+                        eprintln!("[iso4-v8] execute error: {:?}", failure.error);
                         if let Err(e) = ipc::write_rust_to_ts_frame(
                             &mut stream,
                             ipc::RustToTsMessageType::Result,
