@@ -23,11 +23,13 @@ npm i iso4 @iso4/fetch
 
 ```ts
 import { createRuntime } from 'iso4'
-import { createSafeFetch, type SafeFetchPolicy } from '@iso4/fetch'
+import { createSafeFetch } from '@iso4/fetch'
+import type { SafeFetchPolicy } from '@iso4/fetch'
 
 const policy: SafeFetchPolicy = ({ host, path, method, hop, resolvedIp }) => {
   // Hard-deny anything off the allowed origin.
-  if (host !== 'api.example.com') return false
+  if (host !== 'api.example.com')
+return false
 
   // Method-level restriction with an explicit reason for the sandbox.
   if (method !== 'GET' && method !== 'POST') {
@@ -73,26 +75,26 @@ The single mechanism for allow/deny. Receives a normalized
 
 ```ts
 interface SafeFetchRequest {
-  url: string                          // canonical URL
+  url: string // canonical URL
   protocol: 'http' | 'https'
-  host: string                         // hostname only
-  port: number                         // 80/443 implicit
-  path: string                         // /path?query
-  method: string                       // uppercased
-  headers: Record<string, string>      // names lowercased
-  resolvedIp: string | null            // when pinDns is on
-  hop: number                          // 0 = initial, 1+ = redirect
+  host: string // hostname only
+  port: number // 80/443 implicit
+  path: string // /path?query
+  method: string // uppercased
+  headers: Record<string, string> // names lowercased
+  resolvedIp: string | null // when pinDns is on
+  hop: number // 0 = initial, 1+ = redirect
 }
 ```
 
 Return value semantics:
 
-| Return                              | Result                                          |
-|-------------------------------------|-------------------------------------------------|
-| `true`                              | Allow                                           |
-| `false`                             | Deny with generic reason `"request denied by policy"` |
-| `throw new Error("custom reason")`  | Deny; the thrown message surfaces to sandbox    |
-| `Promise<...>` of any of the above  | Same, awaited                                   |
+| Return                             | Result                                                |
+| ---------------------------------- | ----------------------------------------------------- |
+| `true`                             | Allow                                                 |
+| `false`                            | Deny with generic reason `"request denied by policy"` |
+| `throw new Error("custom reason")` | Deny; the thrown message surfaces to sandbox          |
+| `Promise<...>` of any of the above | Same, awaited                                         |
 
 The sandbox-side `fetch()` Promise rejects with an `Error` whose
 `.message` is the deny reason. The host therefore controls how much detail
@@ -103,14 +105,14 @@ leaks back into the sandbox.
 Mitigations layered on top of the mechanical hygiene `iso4` core already
 enforces:
 
-| Attack                                      | Mitigation                                                                 |
-|---------------------------------------------|----------------------------------------------------------------------------|
-| SSRF to internal services / metadata IPs    | DNS pre-resolution (`pinDns`) + policy sees `resolvedIp` to enforce ranges |
-| DNS rebinding                               | DNS pinned at request time; underlying fetch goes to the resolved IP       |
-| Redirect-based bypass                       | No auto-redirect by default; with `maxRedirects > 0`, policy re-runs per hop |
-| Response-size amplification                 | `maxBodyBytes` enforced pre-decompression; compressed responses off by default |
-| Host-app HTTP pool / auth leakage           | Uses an isolated `undici` Dispatcher with no shared cookies, auth, or middleware |
-| Method-based attacks                        | Policy can enforce method allowlists                                       |
+| Attack                                   | Mitigation                                                                       |
+| ---------------------------------------- | -------------------------------------------------------------------------------- |
+| SSRF to internal services / metadata IPs | DNS pre-resolution (`pinDns`) + policy sees `resolvedIp` to enforce ranges       |
+| DNS rebinding                            | DNS pinned at request time; underlying fetch goes to the resolved IP             |
+| Redirect-based bypass                    | No auto-redirect by default; with `maxRedirects > 0`, policy re-runs per hop     |
+| Response-size amplification              | `maxBodyBytes` enforced pre-decompression; compressed responses off by default   |
+| Host-app HTTP pool / auth leakage        | Uses an isolated `undici` Dispatcher with no shared cookies, auth, or middleware |
+| Method-based attacks                     | Policy can enforce method allowlists                                             |
 
 See [`../../DESIGN.md`](../../DESIGN.md) §12 for the full threat model.
 

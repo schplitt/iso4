@@ -1,5 +1,5 @@
 /**
- * @iso4/static — public entry point.
+ * \@iso4/static — public entry point.
  *
  * In-process static runtime using napi-rs. Requires Docker/Kubernetes as
  * the outer security boundary. See DESIGN.md §1.2 and §13.
@@ -43,6 +43,7 @@ export type {
  *
  * NOTE: Not yet implemented. Calling this will throw.
  * See DESIGN.md §9 Phase 11 for the build plan.
+ * @param _options
  */
 export async function createStaticRuntime(
   _options?: StaticRuntimeOptions,

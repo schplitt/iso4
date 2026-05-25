@@ -45,12 +45,6 @@
   "dependencies": {
     "@iso4/core": "workspace:*"
   },
-  "optionalDependencies": {
-    "@iso4/static-darwin-arm64": "workspace:*",
-    "@iso4/static-darwin-x64": "workspace:*",
-    "@iso4/static-linux-x64-gnu": "workspace:*",
-    "@iso4/static-linux-arm64-gnu": "workspace:*"
-  },
   "devDependencies": {
     "@changesets/cli": "catalog:",
     "@schplitt/eslint-config": "catalog:",
@@ -58,6 +52,12 @@
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
+  },
+  "optionalDependencies": {
+    "@iso4/static-darwin-arm64": "workspace:*",
+    "@iso4/static-darwin-x64": "workspace:*",
+    "@iso4/static-linux-arm64-gnu": "workspace:*",
+    "@iso4/static-linux-x64-gnu": "workspace:*"
   },
   "engines": {
     "node": ">=24.0.0"

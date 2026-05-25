@@ -42,17 +42,17 @@
     "test": "vitest",
     "test:run": "vitest run"
   },
-  "peerDependencies": {
-    "@iso4/core": "workspace:*"
-  },
   "devDependencies": {
-    "@iso4/core": "workspace:*",
     "@changesets/cli": "catalog:",
+    "@iso4/core": "workspace:*",
     "@schplitt/eslint-config": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@iso4/core": "workspace:*"
   },
   "engines": {
     "node": ">=24.0.0"

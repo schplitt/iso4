@@ -40,9 +40,6 @@
     "test": "vitest",
     "test:run": "vitest run"
   },
-  "engines": {
-    "node": ">=24.0.0"
-  },
   "devDependencies": {
     "@changesets/cli": "catalog:",
     "@schplitt/eslint-config": "catalog:",
@@ -50,5 +47,8 @@
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   }
 }

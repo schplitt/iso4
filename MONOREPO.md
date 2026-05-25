@@ -63,6 +63,7 @@ Types only. No runtime code, no native dependencies. Every other package
 in the ecosystem depends on this.
 
 Owns:
+
 - `ResourceLimits` — memory/CPU/wall limits used by both runtimes.
 - `FetchHandler`, `HostFetchRequest`, `HostFetchResponse` — the fetch
   interface that `@iso4/fetch` implements and both runtimes consume.
@@ -81,6 +82,7 @@ fresh code string and executes it in a fresh isolate from a V8 snapshot.
 Crash-isolated via a separate Rust process.
 
 Owns:
+
 - TypeScript host API: `createRuntime`, `Runtime`, `DynamicPrefix`, and
   all supporting types. Re-exports shared types from `@iso4/core`.
 - Spawning the per-platform Rust binary (via `optionalDependencies` on
@@ -107,6 +109,7 @@ with no recompilation and no fresh-isolate overhead. Uses napi-rs to create
 V8 isolates in-process via Node's existing V8 platform.
 
 Owns:
+
 - TypeScript host API: `createStaticRuntime`, `StaticRuntime`,
   `StaticPrefix`, `CallResult`. Re-exports shared types from `@iso4/core`.
 - Loading the per-platform napi-rs `.node` binary (via `optionalDependencies`
@@ -130,6 +133,7 @@ Not yet implemented. Scaffolded types only.
 Optional but strongly recommended for `@iso4/dynamic` deployments.
 
 Owns:
+
 - `createSafeFetch(options)` returning a `FetchHandler` ready to plug into
   `globals.fetch` of either runtime.
 - DNS pre-resolution with IP pinning (prevents DNS rebinding).
@@ -164,18 +168,18 @@ Tiny factory packages that produce a `HostImport` matching the shape of a
 Node.js stdlib module, ready to plug into `imports.static` of either runtime.
 
 ```ts
-import { createRuntime } from "@iso4/dynamic";
-import { createFsModule } from "@iso4/fs";
+import { createRuntime } from '@iso4/dynamic'
+import { createFsModule } from '@iso4/fs'
 
-const runtime = await createRuntime();
+const runtime = await createRuntime()
 const prefix = await runtime.precompile({
   code: prefixSource,
   imports: {
     static: {
-      "node:fs": createFsModule({ root: "/sandbox", readOnly: true }),
+      'node:fs': createFsModule({ root: '/sandbox', readOnly: true }),
     },
   },
-});
+})
 ```
 
 Planned (not in v1): `@iso4/fs`, `@iso4/crypto`, `@iso4/path`,
@@ -199,6 +203,7 @@ Planned (not in v1): `@iso4/fs`, `@iso4/crypto`, `@iso4/path`,
 ```
 
 Rules:
+
 - **`@iso4/core` depends on nothing** in this monorepo.
 - **`@iso4/dynamic` and `@iso4/static` depend on `@iso4/core`** for
   shared types; never on each other.
@@ -213,6 +218,7 @@ Independent per package, via `@changesets/cli`. Every user-visible PR adds
 a changeset file declaring which packages bump and at what level.
 
 What changes in lockstep:
+
 - Wire-protocol changes between `@iso4/dynamic` (TS) and `@iso4/v8-*`
   (Rust). Both bump major. Protocol version `u16` in the `Authenticate`
   frame prevents mismatched-binary foot-guns.
@@ -222,7 +228,7 @@ What changes in lockstep:
 
 ## 5. Build and dev workflow
 
-```bash
+```sh
 pnpm install               # bootstrap
 pnpm build                 # build all TS packages
 cd packages/iso4-dynamic/v8-runtime && cargo build --release   # Rust binary
@@ -234,23 +240,23 @@ pnpm changeset             # record a version bump
 
 ## 6. What goes where: a quick reference
 
-| If it's about… | Put it in |
-|---|---|
-| Types shared between runtimes and/or @iso4/fetch | `@iso4/core` |
-| The V8 isolate, UDS, IPC framing, snapshot, bridge dispatch | `@iso4/dynamic/v8-runtime/` (Rust) |
-| The TypeScript host API for dynamic code | `@iso4/dynamic/src/` |
-| The napi-rs in-process isolate pool | `@iso4/static/napi-runtime/` (Rust, Phase 11) |
-| The TypeScript host API for static code | `@iso4/static/src/` |
-| Validating headers/URLs/methods are well-formed | `@iso4/dynamic` (mechanical hygiene) |
-| Deciding which URLs are allowed | `@iso4/fetch` or host app code |
-| Hardened HTTP client (DNS pin, redirect re-check, etc.) | `@iso4/fetch` |
-| Virtualized `node:fs` stub | `@iso4/fs` |
-| Virtualized `node:crypto` stub | `@iso4/crypto` |
-| Other Node stdlib stubs | `@iso4/<name>` |
-| Native binary distribution for @iso4/dynamic | `@iso4/v8-<platform>` |
-| Native binary distribution for @iso4/static | `@iso4/static-<platform>` |
-| Worked-example apps | `examples/<name>/` |
-| Latency or throughput measurement | `bench/` |
+| If It's About…                                              | Put It In                                     |
+| ----------------------------------------------------------- | --------------------------------------------- |
+| Types shared between runtimes and/or @iso4/fetch            | `@iso4/core`                                  |
+| The V8 isolate, UDS, IPC framing, snapshot, bridge dispatch | `@iso4/dynamic/v8-runtime/` (Rust)            |
+| The TypeScript host API for dynamic code                    | `@iso4/dynamic/src/`                          |
+| The napi-rs in-process isolate pool                         | `@iso4/static/napi-runtime/` (Rust, Phase 11) |
+| The TypeScript host API for static code                     | `@iso4/static/src/`                           |
+| Validating headers/URLs/methods are well-formed             | `@iso4/dynamic` (mechanical hygiene)          |
+| Deciding which URLs are allowed                             | `@iso4/fetch` or host app code                |
+| Hardened HTTP client (DNS pin, redirect re-check, etc.)     | `@iso4/fetch`                                 |
+| Virtualized `node:fs` stub                                  | `@iso4/fs`                                    |
+| Virtualized `node:crypto` stub                              | `@iso4/crypto`                                |
+| Other Node stdlib stubs                                     | `@iso4/<name>`                                |
+| Native binary distribution for @iso4/dynamic                | `@iso4/v8-<platform>`                         |
+| Native binary distribution for @iso4/static                 | `@iso4/static-<platform>`                     |
+| Worked-example apps                                         | `examples/<name>/`                            |
+| Latency or throughput measurement                           | `bench/`                                      |
 
 ---
 
@@ -258,27 +264,27 @@ pnpm changeset             # record a version bump
 
 ```ts
 // Dynamic runtime — agent-generated code, crash-isolated
-import { createRuntime } from "@iso4/dynamic";
-import { createSafeFetch } from "@iso4/fetch";
-
-const runtime = await createRuntime();
-const prefix = await runtime.precompile({
-  code: `import { search } from 'tools:search'; globalThis.search = search;`,
-  globals: { fetch: createSafeFetch({ allowedHosts: ["api.example.com"] }) },
-  imports: { static: { "tools:search": { kind: "host", exports: { search } } } },
-});
-const result = await prefix.run({
-  code: `export default await (${agentFn})()`,
-});
+import { createRuntime } from '@iso4/dynamic'
+import { createSafeFetch } from '@iso4/fetch'
 
 // Static runtime — precompiled function + varying data (Phase 11)
-import { createStaticRuntime } from "@iso4/static";
+import { createStaticRuntime } from '@iso4/static'
 
-const runtime = await createStaticRuntime({ maxConcurrent: 8 });
+const runtime = await createRuntime()
+const prefix = await runtime.precompile({
+  code: `import { search } from 'tools:search'; globalThis.search = search;`,
+  globals: { fetch: createSafeFetch({ allowedHosts: ['api.example.com'] }) },
+  imports: { static: { 'tools:search': { kind: 'host', exports: { search } } } },
+})
+const result = await prefix.run({
+  code: `export default await (${agentFn})()`,
+})
+
+const runtime = await createStaticRuntime({ maxConcurrent: 8 })
 const prefix = await runtime.precompile({
   code: `export function transform(row) { return row.price * row.qty; }`,
-});
+})
 const results = await Promise.all(
-  rows.map(row => prefix.call('transform', row))
-);
+  rows.map((row) => prefix.call('transform', row))
+)
 ```

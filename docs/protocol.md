@@ -115,4 +115,5 @@ updated together on a version bump.
 | `ERR_EXPORT_NOT_SERIALIZABLE` | Export value contains a function or Promise                                |
 | `ERR_PREFIX_DISPOSED`         | `PrecompiledPrefix` was evicted from the LRU cache                         |
 | `ERR_UNDECLARED_BINDING`      | `prefix.run()` passed a name not declared at `precompile()` time           |
-| `ERR_FUNCTION_ARGUMENT`       | Host-module function called with a function argument (not supported in v1) |
+| `ERR_FUNCTION_ARGUMENT`       | Host bridge function called with a function argument (not supported in v1) |
+| `ERR_HOST_BRIDGE`             | Configured host global/import handler threw or rejected                    |

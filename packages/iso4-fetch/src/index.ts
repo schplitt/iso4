@@ -1,5 +1,5 @@
 /**
- * @iso4/fetch — public entry point.
+ * \@iso4/fetch — public entry point.
  *
  * Hardened `FetchHandler` for the iso4 sandbox. The factory returns a
  * function the host plugs into `globals.fetch` when calling `precompile()`
@@ -31,6 +31,7 @@ export type {
  * destination IP.
  *
  * NOTE: Not yet implemented. The returned handler throws on every call.
+ * @param options
  */
 export function createSafeFetch(options: SafeFetchOptions): FetchHandler {
   // Capture options so the (future) implementation can read them. The

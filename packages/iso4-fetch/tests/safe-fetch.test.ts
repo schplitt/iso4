@@ -1,5 +1,6 @@
 import { expect, test } from 'vitest'
-import { createSafeFetch, type SafeFetchPolicy } from '../src/index'
+import { createSafeFetch } from '../src/index'
+import type { SafeFetchPolicy } from '../src/index'
 
 test('createSafeFetch returns a handler that throws (not yet implemented)', async () => {
   const policy: SafeFetchPolicy = () => true
@@ -17,7 +18,8 @@ test('createSafeFetch returns a handler that throws (not yet implemented)', asyn
 
 test('createSafeFetch accepts the documented option shape without throwing at construction', () => {
   const policy: SafeFetchPolicy = ({ host, method, path, hop }) => {
-    if (host !== 'api.example.com') return false
+    if (host !== 'api.example.com')
+      return false
     if (method !== 'GET' && method !== 'POST') {
       throw new Error(`method ${method} not allowed`)
     }

@@ -1,5 +1,5 @@
 /**
- * @iso4/fetch — option and policy types for hardened FetchHandler construction.
+ * \@iso4/fetch — option and policy types for hardened FetchHandler construction.
  *
  * The package's job is to produce a `FetchHandler` (defined in `iso4`) that
  * delegates allow/deny decisions to a host-supplied **policy callback**.
@@ -20,10 +20,14 @@
  * additions are optional fields, never breaking changes to existing ones.
  */
 export interface SafeFetchRequest {
-  /** Full canonical URL string, e.g. `"https://api.example.com/users?x=1"`. */
+  /**
+   * Full canonical URL string, e.g. `"https://api.example.com/users?x=1"`.
+   */
   url: string
 
-  /** Protocol without trailing colon. Always `"http"` or `"https"`. */
+  /**
+   * Protocol without trailing colon. Always `"http"` or `"https"`.
+   */
   protocol: 'http' | 'https'
 
   /**
@@ -44,7 +48,9 @@ export interface SafeFetchRequest {
    */
   path: string
 
-  /** Uppercased HTTP method. Always non-empty. */
+  /**
+   * Uppercased HTTP method. Always non-empty.
+   */
   method: string
 
   /**

@@ -59,13 +59,13 @@ if (result.ok) {
 
 ## Packages
 
-| Package | Status | Description |
-|---|---|---|
-| [`@iso4/dynamic`](./packages/iso4-dynamic) | scaffolding | Core dynamic runtime, host API, IPC, sandbox shims |
-| [`@iso4/fetch`](./packages/iso4-fetch) | scaffolding | Hardened `FetchHandler` with DNS pin, allowlist, SSRF blocks |
-| `@iso4/fs` | future | `node:fs` stub factory with configurable root + permissions |
-| `@iso4/crypto` | future | `node:crypto` stub factory (safe parts only) |
-| `@iso4/v8-<platform>` | planned | Per-platform Rust V8 binaries (built from `packages/iso4-dynamic/v8-runtime/`) |
+| Package                                    | Status      | Description                                                                    |
+| ------------------------------------------ | ----------- | ------------------------------------------------------------------------------ |
+| [`@iso4/dynamic`](./packages/iso4-dynamic) | scaffolding | Core dynamic runtime, host API, IPC, sandbox shims                             |
+| [`@iso4/fetch`](./packages/iso4-fetch)     | scaffolding | Hardened `FetchHandler` with DNS pin, allowlist, SSRF blocks                   |
+| `@iso4/fs`                                 | future      | `node:fs` stub factory with configurable root + permissions                    |
+| `@iso4/crypto`                             | future      | `node:crypto` stub factory (safe parts only)                                   |
+| `@iso4/v8-<platform>`                      | planned     | Per-platform Rust V8 binaries (built from `packages/iso4-dynamic/v8-runtime/`) |
 
 See [`MONOREPO.md`](./MONOREPO.md) for the package boundary rules.
 

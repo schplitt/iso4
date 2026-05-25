@@ -1,5 +1,5 @@
 /**
- * End-to-end tests for @iso4/dynamic.
+ * End-to-end tests for \@iso4/dynamic.
  *
  * These tests exercise the full stack: TypeScript host → Rust IPC → V8 →
  * Rust IPC → TypeScript host. They are the source of truth for what the
@@ -11,19 +11,19 @@
  * for that phase.
  *
  * Test organisation:
- *   1. Direct run (no precompile)
- *   2. Precompile + prefix.run()
- *   3. Globals — fetch handler and custom tool functions
- *   4. Source imports — host-provided JS libraries (e.g. zod-like)
- *   5. Host imports — host-provided function bridges
- *   6. Console / logging
- *   7. Error handling
- *   8. Resource limits
+ * 1. Direct run (no precompile)
+ * 2. Precompile + prefix.run()
+ * 3. Globals — fetch handler and custom tool functions
+ * 4. Source imports — host-provided JS libraries (e.g. zod-like)
+ * 5. Host imports — host-provided function bridges
+ * 6. Console / logging
+ * 7. Error handling
+ * 8. Resource limits
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createRuntime } from '../src/index.js'
-import type { Runtime, DynamicPrefix } from '../src/types.js'
+import type { Runtime } from '../src/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared mock libraries (host-provided JS source strings)
@@ -110,42 +110,48 @@ describe('runtime.run() — direct execution', () => {
   test('export default number', async () => {
     const result = await runtime.run({ code: 'export default 42' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(42)
   })
 
   test('export default string', async () => {
     const result = await runtime.run({ code: 'export default "hello"' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe('hello')
   })
 
   test('export default boolean', async () => {
     const result = await runtime.run({ code: 'export default true' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(true)
   })
 
   test('export default null', async () => {
     const result = await runtime.run({ code: 'export default null' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBeNull()
   })
 
   test('export default object', async () => {
     const result = await runtime.run({ code: 'export default { x: 1, y: 2 }' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toEqual({ x: 1, y: 2 })
   })
 
   test('export default array', async () => {
     const result = await runtime.run({ code: 'export default [1, 2, 3]' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toEqual([1, 2, 3])
   })
 
@@ -154,7 +160,8 @@ describe('runtime.run() — direct execution', () => {
       code: 'export const x = 10; export const y = 20',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.named.x).toBe(10)
     expect(result.exports.named.y).toBe(20)
   })
@@ -164,7 +171,8 @@ describe('runtime.run() — direct execution', () => {
       code: 'export default 99; export const label = "hi"',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(99)
     expect(result.exports.named.label).toBe('hi')
   })
@@ -174,7 +182,8 @@ describe('runtime.run() — direct execution', () => {
       code: 'export default await Promise.resolve(7)',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(7)
   })
 
@@ -186,14 +195,16 @@ describe('runtime.run() — direct execution', () => {
       `,
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(2)
   })
 
   test('duration is populated', async () => {
     const result = await runtime.run({ code: 'export default 1' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.durationMs).toBeGreaterThanOrEqual(0)
     expect(result.durationMs).toBeLessThan(5000)
   })
@@ -231,7 +242,8 @@ describe('precompile + prefix.run()', () => {
     })
     const result = await prefix.run({ code: 'export default base + 1' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(101)
     await prefix.dispose()
   })
@@ -249,7 +261,8 @@ describe('precompile + prefix.run()', () => {
 
     for (const [i, result] of results.entries()) {
       expect(result.ok).toBe(true)
-      if (!result.ok) continue
+      if (!result.ok)
+        continue
       expect(result.exports.default).toBe((i + 1) * 10)
     }
 
@@ -266,7 +279,8 @@ describe('precompile + prefix.run()', () => {
     })
 
     expect(second.ok).toBe(true)
-    if (!second.ok) return
+    if (!second.ok)
+      return
     expect(second.exports.default).toBe('clean')
 
     await prefix.dispose()
@@ -284,7 +298,8 @@ describe('precompile + prefix.run()', () => {
 
     const result = await prefix.run({ code: 'export default add(3, 4)' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(7)
 
     await prefix.dispose()
@@ -302,7 +317,8 @@ describe('precompile + prefix.run()', () => {
     await prefix.dispose()
     const result = await prefix.run({ code: 'export default 1' })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_PREFIX_DISPOSED')
   })
 })
@@ -327,7 +343,8 @@ describe('globals', () => {
       code: 'export default await fetch("https://example.com")',
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_USER_CODE')
   })
 
@@ -354,7 +371,8 @@ describe('globals', () => {
 
     expect(requests).toEqual(['https://api.example.com/data'])
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(42)
   })
 
@@ -366,7 +384,8 @@ describe('globals', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     // sandbox gets the 403 back — no error thrown at the bridge level
     expect(result.exports.default).toBe(403)
   })
@@ -387,7 +406,7 @@ describe('globals', () => {
       code: 'export default await run("https://run-a.example.com")',
       globals: {
         fetch: async (req) => {
-          calls.push('a:' + req.url)
+          calls.push(`a:${req.url}`)
           return { status: 200, headers: {}, body: null }
         },
       },
@@ -397,7 +416,7 @@ describe('globals', () => {
       code: 'export default await run("https://run-b.example.com")',
       globals: {
         fetch: async (req) => {
-          calls.push('b:' + req.url)
+          calls.push(`b:${req.url}`)
           return { status: 200, headers: {}, body: null }
         },
       },
@@ -438,7 +457,8 @@ describe('source imports', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(7)
   })
 
@@ -453,7 +473,8 @@ describe('source imports', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(55) // clamp(5,0,10)=5, lerp(0,100,0.5)=50 → 55
   })
 
@@ -469,7 +490,8 @@ describe('source imports', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toEqual({ name: 'Alice', age: 30 })
   })
 
@@ -485,7 +507,8 @@ describe('source imports', () => {
       },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_USER_CODE')
     expect(result.error.message).toContain('missing required key')
   })
@@ -502,7 +525,8 @@ describe('source imports', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toMatchObject({ success: false })
   })
 
@@ -518,7 +542,8 @@ describe('source imports', () => {
       code: 'export default multiply(add(1, 2), 4)',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(12)
 
     await prefix.dispose()
@@ -529,7 +554,8 @@ describe('source imports', () => {
       code: 'import { x } from "not:registered"; export default x',
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_MODULE_NOT_FOUND')
   })
 
@@ -548,7 +574,8 @@ describe('source imports', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(15)
   })
 })
@@ -591,7 +618,8 @@ describe('host imports', () => {
     })
     expect(calls).toEqual(['ping'])
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe('PING')
   })
 
@@ -616,7 +644,8 @@ describe('host imports', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe('data for users')
   })
 
@@ -643,7 +672,8 @@ describe('host imports', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(2)
   })
 
@@ -688,7 +718,8 @@ describe('host imports', () => {
       },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED')
   })
 })
@@ -713,7 +744,8 @@ describe('console capture', () => {
       code: 'console.log("hello"); export default 1',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.stdout).toContain('hello')
   })
 
@@ -722,7 +754,8 @@ describe('console capture', () => {
       code: 'console.error("oops"); export default 1',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.stderr).toContain('oops')
   })
 
@@ -731,7 +764,8 @@ describe('console capture', () => {
       code: 'console.log("stdout only"); export default 1',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.stderr).toBe('')
   })
 
@@ -745,7 +779,8 @@ describe('console capture', () => {
       `,
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.stdout).toContain('line one')
     expect(result.stdout).toContain('line two')
     expect(result.stdout).toContain('line three')
@@ -755,7 +790,8 @@ describe('console capture', () => {
     await runtime.run({ code: 'console.log("run-a output"); export default 1' })
     const second = await runtime.run({ code: 'export default 1' })
     expect(second.ok).toBe(true)
-    if (!second.ok) return
+    if (!second.ok)
+      return
     expect(second.stdout).toBe('')
   })
 })
@@ -778,7 +814,8 @@ describe('error handling', () => {
   test('syntax error → ERR_COMPILE', async () => {
     const result = await runtime.run({ code: 'export default (((' })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_COMPILE')
   })
 
@@ -787,7 +824,8 @@ describe('error handling', () => {
       code: 'throw new Error("something went wrong")',
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_USER_CODE')
     expect(result.error.message).toContain('something went wrong')
   })
@@ -801,7 +839,8 @@ describe('error handling', () => {
       `,
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.stack).toBeTruthy()
     expect(result.error.stack).toContain('inner')
   })
@@ -811,7 +850,8 @@ describe('error handling', () => {
       code: 'export default function() {}',
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
   })
 
@@ -821,7 +861,8 @@ describe('error handling', () => {
 
     const good = await runtime.run({ code: 'export default 42' })
     expect(good.ok).toBe(true)
-    if (!good.ok) return
+    if (!good.ok)
+      return
     expect(good.exports.default).toBe(42)
   })
 })
@@ -847,7 +888,8 @@ describe('resource limits', () => {
       limits: { cpuTimeMs: 200, wallTimeMs: 500 },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(['ERR_CPU_TIMEOUT', 'ERR_WALL_TIMEOUT']).toContain(result.error.code)
   })
 
@@ -860,7 +902,8 @@ describe('resource limits', () => {
       limits: { memoryMb: 32 },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
   })
 
@@ -870,7 +913,8 @@ describe('resource limits', () => {
       limits: { wallTimeMs: 300 },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_WALL_TIMEOUT')
   })
 
@@ -906,7 +950,8 @@ describe('AbortSignal cancellation', () => {
       signal: controller.signal,
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_ABORTED')
   })
 
@@ -933,7 +978,8 @@ describe('AbortSignal cancellation', () => {
       },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_ABORTED')
   })
 
@@ -944,7 +990,8 @@ describe('AbortSignal cancellation', () => {
 
     const result = await runtime.run({ code: 'export default 42' })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(42)
   })
 })
@@ -978,7 +1025,8 @@ describe('export size limit', () => {
       code: 'export default "x".repeat(32 * 1024 * 1024)',
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_EXPORT_TOO_LARGE')
   })
 })
@@ -1003,7 +1051,8 @@ describe('stdout / stderr size limits', () => {
       code: 'console.log("hello"); export default 1',
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.stdout).toContain('hello')
   })
 
@@ -1056,7 +1105,8 @@ describe('configured fetch bridge', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe(302)
   })
 
@@ -1070,16 +1120,17 @@ describe('configured fetch bridge', () => {
       },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_HOST_IMPORT')
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
   })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 13. Host import error propagation
+// 13. Host bridge error propagation
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('host import error propagation', () => {
+describe('host bridge error propagation', () => {
   let runtime: Runtime
 
   beforeAll(async () => {
@@ -1090,7 +1141,7 @@ describe('host import error propagation', () => {
     await runtime?.dispose()
   })
 
-  test('host import function throwing is ERR_HOST_IMPORT', async () => {
+  test('host import function throwing is ERR_HOST_BRIDGE', async () => {
     const result = await runtime.run({
       code: `
         import { boom } from 'host:broken'
@@ -1110,11 +1161,12 @@ describe('host import error propagation', () => {
       },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_HOST_IMPORT')
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
   })
 
-  test('host import async function rejecting is ERR_HOST_IMPORT', async () => {
+  test('host import async function rejecting is ERR_HOST_BRIDGE', async () => {
     const result = await runtime.run({
       code: `
         import { fail } from 'host:broken'
@@ -1134,8 +1186,9 @@ describe('host import error propagation', () => {
       },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.code).toBe('ERR_HOST_IMPORT')
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
   })
 })
 
@@ -1164,7 +1217,8 @@ describe('ERR_UNDECLARED_BINDING', () => {
       globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
     await prefix.dispose()
   })
@@ -1223,7 +1277,8 @@ describe('CPU budget vs wall time', () => {
       },
     })
     expect(result.ok).toBe(true)
-    if (!result.ok) return
+    if (!result.ok)
+      return
     expect(result.exports.default).toBe('done')
   })
 
@@ -1235,7 +1290,8 @@ describe('CPU budget vs wall time', () => {
       limits: { cpuTimeMs: 100, wallTimeMs: 30_000 },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_CPU_TIMEOUT')
   })
 
@@ -1249,7 +1305,8 @@ describe('CPU budget vs wall time', () => {
       limits: { cpuTimeMs: 30_000, wallTimeMs: 200 },
     })
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.code).toBe('ERR_WALL_TIMEOUT')
   })
 })
