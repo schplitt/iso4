@@ -10,6 +10,20 @@ use crate::v8 as sandbox;
 
 const EXPECTED_TOKEN: &str = "dev-token";
 
+fn write_stdio_chunks(
+    stream: &mut UnixStream,
+    stream_byte: u8,
+    lines: &[String],
+) -> std::io::Result<()> {
+    for line in lines {
+        let mut payload = Vec::with_capacity(1 + line.len());
+        payload.push(stream_byte);
+        payload.extend_from_slice(line.as_bytes());
+        ipc::write_rust_to_ts_frame(stream, ipc::RustToTsMessageType::StdioChunk, &payload)?;
+    }
+    Ok(())
+}
+
 pub fn handle_client(mut stream: UnixStream) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
@@ -77,32 +91,13 @@ pub fn handle_client(mut stream: UnixStream) {
 
                 match sandbox::execute(&frame.payload) {
                     Ok(output) => {
-                        if !output.stdout.is_empty() {
-                            let mut payload = Vec::with_capacity(1 + output.stdout.len());
-                            payload.push(0); // stdout
-                            payload.extend_from_slice(output.stdout.as_bytes());
-                            if let Err(e) = ipc::write_rust_to_ts_frame(
-                                &mut stream,
-                                ipc::RustToTsMessageType::StdioChunk,
-                                &payload,
-                            ) {
-                                eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
-                                break;
-                            }
+                        if let Err(e) = write_stdio_chunks(&mut stream, 0, &output.stdout) {
+                            eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
+                            break;
                         }
-
-                        if !output.stderr.is_empty() {
-                            let mut payload = Vec::with_capacity(1 + output.stderr.len());
-                            payload.push(1); // stderr
-                            payload.extend_from_slice(output.stderr.as_bytes());
-                            if let Err(e) = ipc::write_rust_to_ts_frame(
-                                &mut stream,
-                                ipc::RustToTsMessageType::StdioChunk,
-                                &payload,
-                            ) {
-                                eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
-                                break;
-                            }
+                        if let Err(e) = write_stdio_chunks(&mut stream, 1, &output.stderr) {
+                            eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
+                            break;
                         }
 
                         // Phase 2+: replace with V8 ValueSerializer of RunResult.
@@ -123,32 +118,13 @@ pub fn handle_client(mut stream: UnixStream) {
                         }
                     }
                     Err(failure) => {
-                        if !failure.stdout.is_empty() {
-                            let mut payload = Vec::with_capacity(1 + failure.stdout.len());
-                            payload.push(0); // stdout
-                            payload.extend_from_slice(failure.stdout.as_bytes());
-                            if let Err(e) = ipc::write_rust_to_ts_frame(
-                                &mut stream,
-                                ipc::RustToTsMessageType::StdioChunk,
-                                &payload,
-                            ) {
-                                eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
-                                break;
-                            }
+                        if let Err(e) = write_stdio_chunks(&mut stream, 0, &failure.stdout) {
+                            eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
+                            break;
                         }
-
-                        if !failure.stderr.is_empty() {
-                            let mut payload = Vec::with_capacity(1 + failure.stderr.len());
-                            payload.push(1); // stderr
-                            payload.extend_from_slice(failure.stderr.as_bytes());
-                            if let Err(e) = ipc::write_rust_to_ts_frame(
-                                &mut stream,
-                                ipc::RustToTsMessageType::StdioChunk,
-                                &payload,
-                            ) {
-                                eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
-                                break;
-                            }
+                        if let Err(e) = write_stdio_chunks(&mut stream, 1, &failure.stderr) {
+                            eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
+                            break;
                         }
 
                         // Execution failed. Log it and send an empty Result

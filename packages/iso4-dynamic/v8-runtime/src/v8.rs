@@ -39,12 +39,11 @@ pub struct Output {
     /// Phase 2+: V8-serialized values.
     pub named_exports: HashMap<String, String>,
 
-    /// Everything written to console.log / console.info / console.warn,
-    /// newline-separated. Empty if nothing was logged.
-    pub stdout: String,
+    /// Lines written to console.log / console.debug / console.info.
+    pub stdout: Vec<String>,
 
-    /// Everything written to console.error, newline-separated.
-    pub stderr: String,
+    /// Lines written to console.warn / console.error.
+    pub stderr: Vec<String>,
 
     /// Wall-clock time from start of execution to result, in milliseconds.
     pub duration_ms: u64,
@@ -57,8 +56,8 @@ pub struct Output {
 #[derive(Debug)]
 pub struct FailureOutput {
     pub error: RunError,
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<String>,
+    pub stderr: Vec<String>,
     pub duration_ms: u64,
 }
 
@@ -102,8 +101,8 @@ pub enum RunError {
 pub fn execute(payload: &[u8]) -> Result<Output, FailureOutput> {
     let code = std::str::from_utf8(payload).map_err(|e| FailureOutput {
         error: RunError::InvalidPayload(e.to_string()),
-        stdout: String::new(),
-        stderr: String::new(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
         duration_ms: 0,
     })?;
     run_code(code)
@@ -293,8 +292,8 @@ fn run_module(code: &str) -> Result<Output, FailureOutput> {
     Ok(Output {
         default_export,
         named_exports,
-        stdout: logs.stdout.join("\n"),
-        stderr: logs.stderr.join("\n"),
+        stdout: logs.stdout.clone(),
+        stderr: logs.stderr.clone(),
         duration_ms: start.elapsed().as_millis() as u64,
     })
 }
@@ -302,8 +301,8 @@ fn run_module(code: &str) -> Result<Output, FailureOutput> {
 fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> FailureOutput {
     FailureOutput {
         error,
-        stdout: logs.stdout.join("\n"),
-        stderr: logs.stderr.join("\n"),
+        stdout: logs.stdout.clone(),
+        stderr: logs.stderr.clone(),
         duration_ms: start.elapsed().as_millis() as u64,
     }
 }
@@ -555,6 +554,10 @@ mod tests {
         }
     }
 
+    fn has_line(lines: &[String], needle: &str) -> bool {
+        lines.iter().any(|line| line.contains(needle))
+    }
+
     // ── Basic ESM execution ───────────────────────────────────────────────
 
     #[test]
@@ -686,31 +689,31 @@ mod tests {
     #[test]
     fn console_log_captured_in_stdout() {
         let out = run_ok(r#"console.log("hello from log"); export default 1"#);
-        assert!(out.stdout.contains("hello from log"));
+        assert!(has_line(&out.stdout, "hello from log"));
     }
 
     #[test]
     fn console_error_captured_in_stderr() {
         let out = run_ok(r#"console.error("something went wrong"); export default 1"#);
-        assert!(out.stderr.contains("something went wrong"));
+        assert!(has_line(&out.stderr, "something went wrong"));
     }
 
     #[test]
     fn console_warn_captured_in_stderr() {
         let out = run_ok(r#"console.warn("watch out"); export default 1"#);
-        assert!(out.stderr.contains("watch out"));
+        assert!(has_line(&out.stderr, "watch out"));
     }
 
     #[test]
     fn console_debug_captured_in_stdout() {
         let out = run_ok(r#"console.debug("debugging"); export default 1"#);
-        assert!(out.stdout.contains("debugging"));
+        assert!(has_line(&out.stdout, "debugging"));
     }
 
     #[test]
     fn console_info_captured_in_stdout() {
         let out = run_ok(r#"console.info("just so you know"); export default 1"#);
-        assert!(out.stdout.contains("just so you know"));
+        assert!(has_line(&out.stdout, "just so you know"));
     }
 
     #[test]
@@ -723,9 +726,9 @@ mod tests {
             export default 1
             "#,
         );
-        assert!(out.stdout.contains("line one"));
-        assert!(out.stdout.contains("line two"));
-        assert!(out.stdout.contains("line three"));
+        assert!(has_line(&out.stdout, "line one"));
+        assert!(has_line(&out.stdout, "line two"));
+        assert!(has_line(&out.stdout, "line three"));
     }
 
     #[test]
@@ -737,9 +740,9 @@ mod tests {
     #[test]
     fn console_log_multiple_args_joined() {
         let out = run_ok(r#"console.log("a", "b", "c"); export default 1"#);
-        assert!(out.stdout.contains("a"));
-        assert!(out.stdout.contains("b"));
-        assert!(out.stdout.contains("c"));
+        assert!(has_line(&out.stdout, "a"));
+        assert!(has_line(&out.stdout, "b"));
+        assert!(has_line(&out.stdout, "c"));
     }
 
     // ── Error handling ────────────────────────────────────────────────────
@@ -778,8 +781,8 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(failure.error, RunError::RuntimeError { .. }));
-        assert!(failure.stdout.contains("before stdout"));
-        assert!(failure.stderr.contains("before stderr"));
+        assert!(has_line(&failure.stdout, "before stdout"));
+        assert!(has_line(&failure.stderr, "before stderr"));
     }
 
     #[test]
