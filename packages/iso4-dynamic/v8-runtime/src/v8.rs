@@ -88,33 +88,20 @@ pub enum RunError {
 
 /// Execute a sandboxed run and return the full output.
 ///
-/// `payload` is the raw bytes from a `Run` IPC frame.
-///
-/// **Phase 1 (now):** payload is treated as a plain UTF-8 ESM source string.
-///
-/// **Phase 2+:** payload is V8-serialized `RunOptions`; the code inside it is
-/// still evaluated as ESM with a module resolver, bridge stubs, and full
-/// `ValueSerializer` export extraction.
-pub fn execute(payload: &[u8]) -> Result<Output, FailureOutput> {
-    let code = std::str::from_utf8(payload).map_err(|e| FailureOutput {
-        error: RunError::InvalidPayload(e.to_string()),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        duration_ms: 0,
-    })?;
-    run_code(code)
+/// `filename` is used in V8 stack traces. Defaults to `"<iso4>"` when `None`.
+pub fn execute(code: &str, filename: Option<&str>) -> Result<Output, FailureOutput> {
+    run_code(code, filename.unwrap_or("<iso4>"))
 }
 
-/// Core execution — separated from `execute` so tests can call it directly
-/// with a `&str` without constructing a fake IPC payload.
-fn run_code(code: &str) -> Result<Output, FailureOutput> {
+/// Core execution — separated from `execute` so tests can call it directly.
+fn run_code(code: &str, filename: &str) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code)
+    run_module(code, filename)
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
 /// inspect the module namespace object for `default` and named exports.
-fn run_module(code: &str) -> Result<Output, FailureOutput> {
+fn run_module(code: &str, filename: &str) -> Result<Output, FailureOutput> {
     let start = std::time::Instant::now();
     let mut logs = LogBuffers::default();
 
@@ -138,7 +125,7 @@ fn run_module(code: &str) -> Result<Output, FailureOutput> {
             start,
         )
     })?;
-    let filename = v8::String::new(scope, "<iso4>").ok_or_else(|| {
+    let filename = v8::String::new(scope, filename).ok_or_else(|| {
         failure(
             RunError::Internal("failed to intern filename".to_string()),
             &logs,
@@ -669,7 +656,7 @@ mod tests {
 
     /// Shorthand: run a code string and return the full Output or RunError.
     fn run(code: &str) -> Result<Output, RunError> {
-        run_code(code).map_err(|failure| failure.error)
+        run_code(code, "<iso4>").map_err(|failure| failure.error)
     }
 
     /// Shorthand: expect success and return the Output, panic otherwise.
@@ -980,6 +967,7 @@ mod tests {
             console.error("before stderr");
             throw new Error("boom")
             "#,
+            "<iso4>",
         )
         .unwrap_err();
 

@@ -79,20 +79,28 @@ pub fn handle_client(mut stream: UnixStream) {
                 break;
             }
             ipc::TsToRustMessageType::Run => {
+                let payload = match ipc::parse_run_payload(&frame.payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[iso4-v8] malformed Run payload: {e} — closing");
+                        break;
+                    }
+                };
+
                 eprintln!(
-                    "[iso4-v8] Run received ({} payload bytes)",
-                    frame.payload.len()
+                    "[iso4-v8] Run {} received ({} code bytes)",
+                    payload.run_id,
+                    payload.code.len()
                 );
 
-                // Phase 1: payload is raw UTF-8 ESM source. run_id is hardcoded
-                // to 0 until RunPayload parsing is implemented.
-                let run_id: u32 = 0;
-
-                let result_payload = match sandbox::execute(&frame.payload) {
+                let result_payload = match sandbox::execute(
+                    &payload.code,
+                    payload.filename.as_deref(),
+                ) {
                     Ok(output) => {
                         eprintln!("[iso4-v8] run succeeded in {}ms", output.duration_ms);
                         wire::encode_run_completion_payload(
-                            run_id,
+                            payload.run_id,
                             wire::RunCompletion::Success(wire::RunSuccessPayload {
                                 exports: output.exports,
                                 stdout: output.stdout,
@@ -107,7 +115,7 @@ pub fn handle_client(mut stream: UnixStream) {
                             failure.duration_ms, failure.error
                         );
                         wire::encode_run_completion_payload(
-                            run_id,
+                            payload.run_id,
                             wire::RunCompletion::Failure(wire::RunFailurePayload {
                                 error: wire::run_error_to_payload(&failure.error),
                                 stdout: failure.stdout,
