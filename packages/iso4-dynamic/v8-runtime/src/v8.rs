@@ -794,10 +794,14 @@ fn error_message_from_value(
 ) -> Option<String> {
     let object = value.to_object(scope)?;
     let key = v8::String::new(scope, "message")?;
-    object
-        .get(scope, key.into())?
-        .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
+    let msg = object.get(scope, key.into())?;
+    // Skip undefined/null — thrown primitives (strings, numbers) produce a
+    // String wrapper object whose .message property is undefined, which would
+    // stringify to the literal "undefined" instead of the thrown value.
+    if msg.is_undefined() || msg.is_null() {
+        return None;
+    }
+    msg.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
 }
 
 fn stack_from_value(
