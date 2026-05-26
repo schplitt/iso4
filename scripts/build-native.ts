@@ -61,6 +61,21 @@ chmodSync(destinationBinary, 0o755)
 console.log(`[iso4] copied ${sourceBinary}`)
 console.log(`[iso4]     -> ${destinationBinary}`)
 
+// On macOS, ad-hoc re-sign after copying. The copy invalidates the original
+// code signature (macOS tracks the signature against the file content + path).
+// Without this the binary is killed immediately on launch with
+// SIGKILL / EXC_BAD_ACCESS "Code Signature Invalid".
+if (process.platform === 'darwin') {
+  const codesign = spawnSync('codesign', ['--sign', '-', '--force', destinationBinary], {
+    cwd: repoRoot,
+    stdio: 'inherit',
+  })
+  if (codesign.status !== 0) {
+    throw new Error(`codesign failed with status ${codesign.status}`)
+  }
+  console.log(`[iso4] ad-hoc signed ${destinationBinary}`)
+}
+
 function currentPlatformPackage(): string {
   if (process.platform === 'darwin' && process.arch === 'arm64') {
     return 'iso4-v8-darwin-arm64'
