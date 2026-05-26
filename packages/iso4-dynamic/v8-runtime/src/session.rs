@@ -11,15 +11,41 @@
 //!   payload is still a plain UTF-8 code string (Phase 1). Once `RunPayload`
 //!   parsing lands, the `run_id` will be read from the payload.
 
+use std::collections::HashMap;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::ipc;
 use crate::v8 as sandbox;
 use crate::wire;
 
+/// State shared across all connection threads in the same Rust process.
+///
+/// Using a single shared store means a prefix compiled on connection 0 is
+/// visible to connections 1, 2, … N — which is required for the TypeScript
+/// pool to route any run to any free slot.
+pub struct SharedState {
+    /// Snapshots keyed by their string PrefixId.
+    pub prefix_store: Mutex<HashMap<String, Vec<u8>>>,
+    /// Monotonically increasing counter for generating unique PrefixIds.
+    pub next_prefix_id: AtomicU64,
+}
+
+impl SharedState {
+    pub fn new() -> Self {
+        Self {
+            prefix_store: Mutex::new(HashMap::new()),
+            next_prefix_id: AtomicU64::new(0),
+        }
+    }
+}
+
+
+
 const EXPECTED_TOKEN: &str = "dev-token";
 
-pub fn handle_client(mut stream: UnixStream) {
+pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
     let auth_frame = match ipc::read_ts_to_rust_frame(&mut stream) {
@@ -64,10 +90,8 @@ pub fn handle_client(mut stream: UnixStream) {
 
     // ── Step 3: message loop ──────────────────────────────────────────────
 
-    // Prefix store: maps PrefixId → V8 snapshot bytes.
-    // Scoped to this connection so each client has independent prefix state.
-    let mut prefix_store: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-    let mut next_prefix_id: u64 = 0;
+    // Prefix store and ID counter are shared across all connections so a
+    // prefix compiled on any slot is visible to all other slots in the pool.
 
     loop {
         let frame = match ipc::read_ts_to_rust_frame(&mut stream) {
@@ -152,13 +176,28 @@ pub fn handle_client(mut stream: UnixStream) {
                 let result_payload =
                     match sandbox::precompile(&payload.code, payload.filename.as_deref()) {
                         Ok(snapshot_bytes) => {
-                            next_prefix_id += 1;
-                            let prefix_id = next_prefix_id.to_string();
+                            let prefix_id = shared
+                                .next_prefix_id
+                                .fetch_add(1, Ordering::Relaxed)
+                                .to_string();
                             eprintln!(
-                                "[iso4-v8] precompile succeeded — prefix_id={prefix_id}                                  ({} snapshot bytes)",
+                                "[iso4-v8] precompile succeeded — prefix_id={prefix_id} \
+                                 ({} snapshot bytes)",
                                 snapshot_bytes.len()
                             );
-                            prefix_store.insert(prefix_id.clone(), snapshot_bytes);
+                            // unwrap_or_else(|p| p.into_inner()): if a thread panicked
+                            // while holding this lock, Rust marks the Mutex "poisoned"
+                            // and .unwrap() would cascade-panic here too. PoisonError
+                            // wraps the MutexGuard live at panic time; .into_inner()
+                            // discards the poison flag and returns the guard. The
+                            // HashMap is intact after a panic on insert/get/remove,
+                            // so recovering is always safe. Same pattern on all three
+                            // lock sites below.
+                            shared
+                                .prefix_store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(prefix_id.clone(), snapshot_bytes);
                             wire::encode_precompile_result_payload(Some(&prefix_id), None)
                         }
                         Err(failure) => {
@@ -191,7 +230,14 @@ pub fn handle_client(mut stream: UnixStream) {
                     }
                 };
 
-                let result_payload = match prefix_store.get(&payload.prefix_id) {
+                let snapshot_clone = shared
+                    .prefix_store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) // see poison comment above
+                    .get(&payload.prefix_id)
+                    .cloned();
+
+                let result_payload = match snapshot_clone {
                     None => {
                         eprintln!(
                             "[iso4-v8] PrefixRun {} — prefix_id={} not found",
@@ -221,7 +267,7 @@ pub fn handle_client(mut stream: UnixStream) {
                             payload.run_id, payload.prefix_id, payload.code.len()
                         );
                         match sandbox::execute_with_prefix(
-                            snapshot_bytes,
+                            &snapshot_bytes,
                             &payload.code,
                             payload.filename.as_deref(),
                         ) {
@@ -271,7 +317,12 @@ pub fn handle_client(mut stream: UnixStream) {
             ipc::TsToRustMessageType::DisposePrefix => {
                 match ipc::parse_dispose_prefix_payload(&frame.payload) {
                     Ok(prefix_id) => {
-                        let existed = prefix_store.remove(&prefix_id).is_some();
+                        let existed = shared
+                            .prefix_store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&prefix_id)
+                            .is_some();
                         eprintln!(
                             "[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})"
                         );

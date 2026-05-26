@@ -9,6 +9,7 @@ mod v8;
 mod wire;
 
 use std::os::unix::net::UnixListener;
+use std::sync::Arc;
 
 fn main() {
     let socket_path = "/tmp/iso4-dynamic-v8.sock";
@@ -26,10 +27,15 @@ fn main() {
 
     eprintln!("[iso4-v8] listening on {socket_path}");
 
+    // Shared state across all connection threads: prefix snapshots and the
+    // counter used to generate unique PrefixIds.
+    let shared = Arc::new(session::SharedState::new());
+
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                std::thread::spawn(|| session::handle_client(stream));
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || session::handle_client(stream, shared));
             }
             Err(e) => {
                 eprintln!("[iso4-v8] accept error: {e}");
