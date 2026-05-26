@@ -47,8 +47,8 @@ export type {
 /**
  * Create a dynamic runtime. Spawns the Rust V8 process.
  *
- * NOTE: Not yet implemented. Calling this will throw.
- * See DESIGN.md §9 for the phased build plan.
+ * NOTE: Not yet implemented. Calling this will throw until the Rust→TS result
+ * payload uses the real structured value protocol.
  * @param _options
  */
 export async function createRuntime(

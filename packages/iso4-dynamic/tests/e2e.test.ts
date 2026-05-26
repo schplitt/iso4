@@ -766,7 +766,7 @@ describe('console capture', () => {
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.stderr).toBe('')
+    expect(result.stderr).toEqual([])
   })
 
   test('multiple console.log calls all captured', async () => {
@@ -792,7 +792,7 @@ describe('console capture', () => {
     expect(second.ok).toBe(true)
     if (!second.ok)
       return
-    expect(second.stdout).toBe('')
+    expect(second.stdout).toEqual([])
   })
 })
 
@@ -1068,7 +1068,7 @@ describe('stdout / stderr size limits', () => {
     // Either succeeds with truncated stdout, or fails with a known error code.
     // Must not hang or crash the process.
     if (result.ok) {
-      expect(result.stdout.length).toBeLessThanOrEqual(2 * 1024 * 1024)
+      expect(result.stdout.join('\n').length).toBeLessThanOrEqual(2 * 1024 * 1024)
     } else {
       expect(result.error.code).toBe('ERR_INTERNAL')
     }

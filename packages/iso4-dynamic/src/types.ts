@@ -175,16 +175,16 @@ export type RunResult = RunSuccess | RunFailure
 export interface RunSuccess {
   ok: true
   exports: SandboxExports
-  stdout: string
-  stderr: string
+  stdout: string[]
+  stderr: string[]
   durationMs: number
 }
 
 export interface RunFailure {
   ok: false
   error: RunError
-  stdout: string
-  stderr: string
+  stdout: string[]
+  stderr: string[]
   durationMs: number
 }
 
@@ -197,7 +197,7 @@ export type SandboxExports = {
 }
 & {
   /**
-   * Other named exports.
+   * Named exports live directly on the export object.
    */
   [name: string]: unknown
 }
