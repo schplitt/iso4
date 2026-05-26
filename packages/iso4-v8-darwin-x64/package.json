@@ -5,21 +5,21 @@
   "description": "Native iso4 V8 runtime binary for darwin-x64",
   "license": "MIT",
   "author": "schplitt",
-  "os": [
-    "darwin"
-  ],
-  "cpu": [
-    "x64"
-  ],
   "exports": {
     ".": "./index.js",
     "./bin/iso4-v8": "./bin/iso4-v8"
   },
   "files": [
-    "index.js",
-    "bin/iso4-v8"
+    "bin/iso4-v8",
+    "index.js"
   ],
   "engines": {
     "node": ">=24.0.0"
-  }
+  },
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ]
 }

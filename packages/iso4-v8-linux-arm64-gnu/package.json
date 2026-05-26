@@ -5,21 +5,21 @@
   "description": "Native iso4 V8 runtime binary for linux-arm64-gnu",
   "license": "MIT",
   "author": "schplitt",
-  "os": [
-    "linux"
-  ],
-  "cpu": [
-    "arm64"
-  ],
   "exports": {
     ".": "./index.js",
     "./bin/iso4-v8": "./bin/iso4-v8"
   },
   "files": [
-    "index.js",
-    "bin/iso4-v8"
+    "bin/iso4-v8",
+    "index.js"
   ],
   "engines": {
     "node": ">=24.0.0"
-  }
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ]
 }
