@@ -6,6 +6,7 @@
 mod ipc;
 mod session;
 mod v8;
+mod wire;
 
 use std::os::unix::net::UnixListener;
 

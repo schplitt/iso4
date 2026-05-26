@@ -3,9 +3,10 @@
 //! Owns everything V8-related: platform init, isolate creation, compilation,
 //! evaluation, result extraction, console capture, and limit enforcement.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Once;
+
+use crate::wire::WireValue;
 
 static INIT: Once = Once::new();
 
@@ -30,14 +31,10 @@ pub fn init_platform() {
 /// The result of a successful JavaScript execution.
 #[derive(Debug)]
 pub struct Output {
-    /// Value of `export default`, stringified.
-    /// `None` if the module did not export a default.
-    /// Phase 2+: V8-serialized bytes for the full export map.
-    pub default_export: Option<String>,
-
-    /// Named exports (`export const x = 1` → `{"x": "1"}`), stringified.
-    /// Phase 2+: V8-serialized values.
-    pub named_exports: HashMap<String, String>,
+    /// All exports as a flat `WireValue::Object`.
+    /// The `default` export (if any) appears as the `"default"` key alongside
+    /// named exports. An empty module produces `WireValue::Object(vec![])`.
+    pub exports: WireValue,
 
     /// Lines written to console.log / console.debug / console.info.
     pub stdout: Vec<String>,
@@ -250,8 +247,7 @@ fn run_module(code: &str) -> Result<Output, FailureOutput> {
             )
         })?;
 
-    let mut default_export = None;
-    let mut named_exports = HashMap::new();
+    let mut fields: Vec<(String, WireValue)> = Vec::new();
 
     for i in 0..names.length() {
         let name_value = names.get_index(scope, i).ok_or_else(|| {
@@ -280,18 +276,13 @@ fn run_module(code: &str) -> Result<Output, FailureOutput> {
             )
         })?;
 
-        let rendered =
-            stringify_export(scope, &name, value).map_err(|error| failure(error, &logs, start))?;
-        if name == "default" {
-            default_export = Some(rendered);
-        } else {
-            named_exports.insert(name, rendered);
-        }
+        let wire =
+            export_to_wire(scope, &name, value).map_err(|error| failure(error, &logs, start))?;
+        fields.push((name, wire));
     }
 
     Ok(Output {
-        default_export,
-        named_exports,
+        exports: WireValue::Object(fields),
         stdout: logs.stdout.clone(),
         stderr: logs.stderr.clone(),
         duration_ms: start.elapsed().as_millis() as u64,
@@ -414,59 +405,197 @@ fn append_console_line(
     }
 }
 
-fn stringify_export(
+/// Convert a top-level module export value to a `WireValue`.
+///
+/// Adds the export `name` to error messages for functions/promises.
+/// Initialises the identity-based visiting set used by `value_to_wire`.
+fn export_to_wire(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     name: &str,
     value: v8::Local<v8::Value>,
-) -> Result<String, RunError> {
+) -> Result<WireValue, RunError> {
     if value.is_function() {
         return Err(RunError::ExportNotSerializable(format!(
-            "export {name} is a function"
+            "export \"{name}\" is a function"
         )));
     }
     if value.is_promise() {
         return Err(RunError::ExportNotSerializable(format!(
-            "export {name} is an unresolved Promise"
+            "export \"{name}\" is an unresolved Promise"
         )));
     }
-    stringify_value(scope, value)
+    let mut visiting: Vec<v8::Global<v8::Value>> = Vec::new();
+    value_to_wire(scope, value, &mut visiting)
 }
 
-fn stringify_value(
+/// Check whether `value` is already on the current recursion path (`visiting`).
+///
+/// Uses `strict_equals` — V8 reference equality — so two distinct JS objects
+/// that happen to have the same shape are never confused.
+///
+/// Returns `Ok(())` and pushes `value` if no cycle is found.
+/// Returns `Err` without pushing if a cycle is detected; the caller must NOT
+/// call `visiting.pop()` in the error branch.
+fn check_and_push(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
-) -> Result<String, RunError> {
-    if value.is_undefined() {
-        return Ok("undefined".to_string());
-    }
-
-    if value.is_object() {
-        if let Some(json) = json_stringify(scope, value) {
-            return Ok(json);
+    visiting: &mut Vec<v8::Global<v8::Value>>,
+) -> Result<(), RunError> {
+    for visited_global in visiting.iter() {
+        let visited_local = v8::Local::new(scope.as_mut(), visited_global);
+        if value.strict_equals(visited_local) {
+            return Err(RunError::ExportNotSerializable(
+                "cyclic or self-referential structure detected in export value"
+                    .to_string(),
+            ));
         }
     }
-
-    value
-        .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
-        .ok_or_else(|| RunError::Internal("failed to stringify V8 value".to_string()))
+    visiting.push(v8::Global::new(scope.as_mut(), value));
+    Ok(())
 }
 
-fn json_stringify(
+/// Serialise the items of a V8 array that has already been pushed onto
+/// `visiting` by the caller.
+fn serialize_array_items(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    array: v8::Local<v8::Array>,
+    visiting: &mut Vec<v8::Global<v8::Value>>,
+) -> Result<Vec<WireValue>, RunError> {
+    let len = array.length();
+    let mut items = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        let item = array
+            .get_index(scope, i)
+            .ok_or_else(|| RunError::Internal(format!("failed to read array index {i}")))?;
+        items.push(value_to_wire(scope, item, visiting)?);
+    }
+    Ok(items)
+}
+
+/// Serialise the own enumerable string-keyed properties of a V8 object that
+/// has already been pushed onto `visiting` by the caller.
+fn serialize_object_fields(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    object: v8::Local<v8::Object>,
+    visiting: &mut Vec<v8::Global<v8::Value>>,
+) -> Result<Vec<(String, WireValue)>, RunError> {
+    let names = object
+        .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+        .ok_or_else(|| RunError::Internal("failed to get own property names".to_string()))?;
+    let mut fields = Vec::with_capacity(names.length() as usize);
+    for i in 0..names.length() {
+        let name_value = names
+            .get_index(scope, i)
+            .ok_or_else(|| RunError::Internal("failed to read property name".to_string()))?;
+        let name = name_value
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+            .ok_or_else(|| {
+                RunError::Internal("failed to stringify property name".to_string())
+            })?;
+        let val = object
+            .get(scope, name_value)
+            .ok_or_else(|| RunError::Internal(format!("failed to read property {name}")))?;
+        fields.push((name, value_to_wire(scope, val, visiting)?));
+    }
+    Ok(fields)
+}
+
+/// Recursively convert a V8 value to a `WireValue`.
+///
+/// `visiting` is the set of reference-type values (objects/arrays) currently
+/// on the recursion path. It acts as a call-stack to detect cycles:
+/// - pushed when entering an object or array
+/// - popped when leaving (whether success or error)
+/// - compared with `strict_equals` (V8 reference equality) at each entry
+///
+/// Shared but non-cyclic references (the same object appearing in two
+/// different fields) are serialised correctly: the object is popped after
+/// the first field, so it is not in the set when the second field is visited.
+fn value_to_wire(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
-) -> Option<String> {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let json_key = v8::String::new(scope, "JSON")?;
-    let stringify_key = v8::String::new(scope, "stringify")?;
-    let json = global.get(scope, json_key.into())?.to_object(scope)?;
-    let stringify_value = json.get(scope, stringify_key.into())?;
-    let stringify = v8::Local::<v8::Function>::try_from(stringify_value).ok()?;
-    let result = stringify.call(scope, json.into(), &[value])?;
-    result
-        .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
+    visiting: &mut Vec<v8::Global<v8::Value>>,
+) -> Result<WireValue, RunError> {
+    // ── Primitives (no cycle risk) ────────────────────────────────────────
+    if value.is_undefined() {
+        return Ok(WireValue::Undefined);
+    }
+    if value.is_null() {
+        return Ok(WireValue::Null);
+    }
+    if value.is_boolean() {
+        return Ok(WireValue::Bool(value.boolean_value(scope)));
+    }
+    if value.is_number() {
+        return Ok(WireValue::Number(
+            value.number_value(scope).unwrap_or(f64::NAN),
+        ));
+    }
+    if value.is_string() {
+        let s = value
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+            .ok_or_else(|| {
+                RunError::Internal("failed to convert V8 string value".to_string())
+            })?;
+        return Ok(WireValue::String(s));
+    }
+    if value.is_big_int() {
+        let bigint = v8::Local::<v8::BigInt>::try_from(value)
+            .map_err(|_| RunError::Internal("failed to cast to BigInt".to_string()))?;
+        let (i_val, fits_i64) = bigint.i64_value();
+        if fits_i64 {
+            return Ok(WireValue::BigInt(i_val.to_string()));
+        }
+        let (u_val, fits_u64) = bigint.u64_value();
+        if fits_u64 {
+            return Ok(WireValue::BigInt(u_val.to_string()));
+        }
+        return Err(RunError::ExportNotSerializable(
+            "BigInt value is out of the supported i64/u64 range for wire encoding"
+                .to_string(),
+        ));
+    }
+    if value.is_symbol() {
+        return Err(RunError::ExportNotSerializable(
+            "Symbol values cannot be serialized".to_string(),
+        ));
+    }
+    // ── Reference types — cycle detection applies ─────────────────────────
+    if value.is_function() {
+        return Err(RunError::ExportNotSerializable(
+            "function values cannot be serialized".to_string(),
+        ));
+    }
+    if value.is_promise() {
+        return Err(RunError::ExportNotSerializable(
+            "unresolved Promise values cannot be serialized".to_string(),
+        ));
+    }
+    // Arrays must be checked before the generic object path (arrays are objects).
+    if value.is_array() {
+        check_and_push(scope, value, visiting)?;
+        let result = match v8::Local::<v8::Array>::try_from(value) {
+            Ok(arr) => serialize_array_items(scope, arr, visiting).map(WireValue::Array),
+            Err(_) => Err(RunError::Internal("failed to cast to Array".to_string())),
+        };
+        visiting.pop();
+        return result;
+    }
+    if value.is_object() {
+        check_and_push(scope, value, visiting)?;
+        let result = match value.to_object(scope) {
+            Some(obj) => serialize_object_fields(scope, obj, visiting).map(WireValue::Object),
+            None => Err(RunError::Internal("failed to cast to object".to_string())),
+        };
+        visiting.pop();
+        return result;
+    }
+
+    Err(RunError::ExportNotSerializable(
+        "unsupported or unknown value type".to_string(),
+    ))
 }
 
 fn runtime_error_from_value(
@@ -474,7 +603,11 @@ fn runtime_error_from_value(
     value: v8::Local<v8::Value>,
 ) -> RunError {
     let message = error_message_from_value(scope, value)
-        .or_else(|| stringify_value(scope, value).ok())
+        .or_else(|| {
+            value
+                .to_string(scope)
+                .map(|s| s.to_rust_string_lossy(scope))
+        })
         .unwrap_or_else(|| "JavaScript error".to_string());
     RunError::RuntimeError {
         message,
@@ -532,6 +665,7 @@ fn exception_stack(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::WireValue;
 
     /// Shorthand: run a code string and return the full Output or RunError.
     fn run(code: &str) -> Result<Output, RunError> {
@@ -558,31 +692,106 @@ mod tests {
         lines.iter().any(|line| line.contains(needle))
     }
 
+    // ── WireValue test helpers ────────────────────────────────────────────────
+    //
+    // These convert the new WireValue-based Output back to the human-readable
+    // string representations that the original tests expected. This keeps the
+    // test bodies unchanged (or nearly so) while the internal representation
+    // moves from stringified exports to structured WireValue.
+
+    /// Look up a field in the top-level exports Object by name.
+    fn get_field(out: &Output, key: &str) -> Option<WireValue> {
+        if let WireValue::Object(fields) = &out.exports {
+            fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Return the `default` export rendered as a display string, or `None`.
+    fn get_default(out: &Output) -> Option<String> {
+        get_field(out, "default").map(|v| wire_to_display_str(&v))
+    }
+
+    /// Return a named export rendered as a display string, or `None`.
+    fn get_named(out: &Output, key: &str) -> Option<String> {
+        get_field(out, key).map(|v| wire_to_display_str(&v))
+    }
+
+    /// Return all export key names.
+    fn export_keys(out: &Output) -> Vec<String> {
+        if let WireValue::Object(fields) = &out.exports {
+            fields.iter().map(|(k, _)| k.clone()).collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Render a `WireValue` as a human-readable string similar to what V8's
+    /// `ToString()` / `JSON.stringify()` would produce. Used only in tests.
+    fn wire_to_display_str(v: &WireValue) -> String {
+        match v {
+            WireValue::Undefined => "undefined".to_string(),
+            WireValue::Null => "null".to_string(),
+            WireValue::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+            WireValue::Number(n) => {
+                if n.is_nan() {
+                    "NaN".to_string()
+                } else if n.is_infinite() {
+                    if *n > 0.0 {
+                        "Infinity".to_string()
+                    } else {
+                        "-Infinity".to_string()
+                    }
+                } else if n.fract() == 0.0 && n.abs() < 1e15 {
+                    format!("{}", *n as i64)
+                } else {
+                    format!("{n}")
+                }
+            }
+            WireValue::String(s) => s.clone(),
+            WireValue::BigInt(s) => s.clone(),
+            WireValue::Bytes(_) => "[Uint8Array]".to_string(),
+            WireValue::Array(items) => {
+                let parts: Vec<String> =
+                    items.iter().map(wire_to_display_str).collect();
+                format!("[{}]", parts.join(","))
+            }
+            WireValue::Object(fields) => {
+                let parts: Vec<String> = fields
+                    .iter()
+                    .map(|(k, v)| format!("{k:?}:{}", wire_to_display_str(v)))
+                    .collect();
+                format!("{{{}}}", parts.join(","))
+            }
+        }
+    }
+
     // ── Basic ESM execution ───────────────────────────────────────────────
 
     #[test]
     fn basic_arithmetic_returns_result() {
         let out = run_ok("export default 1 + 1");
-        assert_eq!(out.default_export.as_deref(), Some("2"));
+        assert_eq!(get_default(&out).as_deref(), Some("2"));
     }
 
     #[test]
     fn string_concatenation_returns_result() {
         let out = run_ok("export default 'hello' + ' world'");
-        assert_eq!(out.default_export.as_deref(), Some("hello world"));
+        assert_eq!(get_default(&out).as_deref(), Some("hello world"));
     }
 
     #[test]
     fn boolean_true_returns_result() {
         let out = run_ok("export default true");
-        assert_eq!(out.default_export.as_deref(), Some("true"));
+        assert_eq!(get_default(&out).as_deref(), Some("true"));
     }
 
     #[test]
     fn empty_code_returns_no_default_export() {
         let out = run_ok("");
-        assert!(out.default_export.is_none());
-        assert!(out.named_exports.is_empty());
+        assert!(get_default(&out).is_none());
+        assert!(export_keys(&out).is_empty());
     }
 
     // ── ESM exports ──────────────────────────────────────────────────────
@@ -590,31 +799,31 @@ mod tests {
     #[test]
     fn export_default_number() {
         let out = run_ok("export default 42");
-        assert_eq!(out.default_export.as_deref(), Some("42"));
+        assert_eq!(get_default(&out).as_deref(), Some("42"));
     }
 
     #[test]
     fn export_default_string() {
         let out = run_ok(r#"export default "hello""#);
-        assert_eq!(out.default_export.as_deref(), Some("hello"));
+        assert_eq!(get_default(&out).as_deref(), Some("hello"));
     }
 
     #[test]
     fn export_default_boolean() {
         let out = run_ok("export default true");
-        assert_eq!(out.default_export.as_deref(), Some("true"));
+        assert_eq!(get_default(&out).as_deref(), Some("true"));
     }
 
     #[test]
     fn export_default_null() {
         let out = run_ok("export default null");
-        assert_eq!(out.default_export.as_deref(), Some("null"));
+        assert_eq!(get_default(&out).as_deref(), Some("null"));
     }
 
     #[test]
     fn export_default_object() {
         let out = run_ok(r#"export default { x: 1, y: 2 }"#);
-        let d = out.default_export.unwrap();
+        let d = get_default(&out).unwrap();
         // Order is not guaranteed — just check both keys are present.
         assert!(d.contains("x") && d.contains("1"));
         assert!(d.contains("y") && d.contains("2"));
@@ -623,39 +832,33 @@ mod tests {
     #[test]
     fn export_default_array() {
         let out = run_ok("export default [1, 2, 3]");
-        assert_eq!(out.default_export.as_deref(), Some("[1,2,3]"));
+        assert_eq!(get_default(&out).as_deref(), Some("[1,2,3]"));
     }
 
     #[test]
     fn named_export_single() {
         let out = run_ok("export const answer = 42");
-        assert_eq!(
-            out.named_exports.get("answer").map(|s| s.as_str()),
-            Some("42")
-        );
+        assert_eq!(get_named(&out, "answer").as_deref(), Some("42"));
     }
 
     #[test]
     fn named_exports_multiple() {
         let out = run_ok("export const x = 1; export const y = 2");
-        assert_eq!(out.named_exports.get("x").map(|s| s.as_str()), Some("1"));
-        assert_eq!(out.named_exports.get("y").map(|s| s.as_str()), Some("2"));
+        assert_eq!(get_named(&out, "x").as_deref(), Some("1"));
+        assert_eq!(get_named(&out, "y").as_deref(), Some("2"));
     }
 
     #[test]
     fn default_and_named_exports_together() {
         let out = run_ok("export default 99; export const label = 'hi'");
-        assert_eq!(out.default_export.as_deref(), Some("99"));
-        assert_eq!(
-            out.named_exports.get("label").map(|s| s.as_str()),
-            Some("hi")
-        );
+        assert_eq!(get_default(&out).as_deref(), Some("99"));
+        assert_eq!(get_named(&out, "label").as_deref(), Some("hi"));
     }
 
     #[test]
     fn no_export_gives_no_default() {
         let out = run_ok("const x = 1");
-        assert!(out.default_export.is_none());
+        assert!(get_default(&out).is_none());
     }
 
     // ── Async / top-level await ───────────────────────────────────────────
@@ -663,7 +866,7 @@ mod tests {
     #[test]
     fn top_level_await_resolves() {
         let out = run_ok("export default await Promise.resolve(7)");
-        assert_eq!(out.default_export.as_deref(), Some("7"));
+        assert_eq!(get_default(&out).as_deref(), Some("7"));
     }
 
     #[test]
@@ -674,7 +877,7 @@ mod tests {
             export default await compute();
             "#,
         );
-        assert_eq!(out.default_export.as_deref(), Some("2"));
+        assert_eq!(get_default(&out).as_deref(), Some("2"));
     }
 
     #[test]
@@ -840,19 +1043,258 @@ mod tests {
         assert!(matches!(err, RunError::ExportNotSerializable(_)));
     }
 
+    // ── Complex value structures ───────────────────────────────────────────
+
+    /// Helper: look up a key inside a `WireValue::Object`, returning the value.
+    fn wire_obj_get(v: &WireValue, key: &str) -> Option<WireValue> {
+        if let WireValue::Object(fields) = v {
+            fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn sum_1_to_100_in_nested_object() {
+        // Runtime arithmetic + nested object export.
+        let out = run_ok(
+            r#"
+            let sum = 0;
+            for (let i = 1; i <= 100; i++) sum += i;
+            export default {
+                result: sum,
+                metadata: { label: "sum_1_to_100", iterations: 100 }
+            }
+            "#,
+        );
+        let default_val = get_field(&out, "default").unwrap();
+        assert_eq!(wire_obj_get(&default_val, "result"), Some(WireValue::Number(5050.0)));
+        let meta = wire_obj_get(&default_val, "metadata").unwrap();
+        assert_eq!(
+            wire_obj_get(&meta, "label"),
+            Some(WireValue::String("sum_1_to_100".to_string()))
+        );
+        assert_eq!(wire_obj_get(&meta, "iterations"), Some(WireValue::Number(100.0)));
+    }
+
+    #[test]
+    fn objects_inside_array() {
+        let out = run_ok("export default [{ a: 1 }, { b: 2 }, { c: 3 }]");
+        let val = get_field(&out, "default").unwrap();
+        if let WireValue::Array(items) = val {
+            assert_eq!(items.len(), 3);
+            assert_eq!(wire_obj_get(&items[0], "a"), Some(WireValue::Number(1.0)));
+            assert_eq!(wire_obj_get(&items[1], "b"), Some(WireValue::Number(2.0)));
+            assert_eq!(wire_obj_get(&items[2], "c"), Some(WireValue::Number(3.0)));
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn object_in_second_object_in_array() {
+        // Array → Object → Object nesting.
+        let out = run_ok(
+            r#"export default [{ outer: { inner: 42 } }, { x: [1, 2, 3] }]"#,
+        );
+        let val = get_field(&out, "default").unwrap();
+        if let WireValue::Array(items) = val {
+            let inner = wire_obj_get(&wire_obj_get(&items[0], "outer").unwrap(), "inner");
+            assert_eq!(inner, Some(WireValue::Number(42.0)));
+            let arr = wire_obj_get(&items[1], "x").unwrap();
+            assert_eq!(
+                arr,
+                WireValue::Array(vec![
+                    WireValue::Number(1.0),
+                    WireValue::Number(2.0),
+                    WireValue::Number(3.0),
+                ])
+            );
+        } else {
+            panic!("expected Array");
+        }
+    }
+
+    #[test]
+    fn deep_alternating_nesting_array_object_array_object() {
+        // Object → Array → Object → Array → Number
+        let out = run_ok(
+            r#"export default { a: [{ b: [{ c: 42 }, { d: "hello" }] }] }"#,
+        );
+        let default_val = get_field(&out, "default").unwrap();
+        let a = wire_obj_get(&default_val, "a").unwrap();
+        if let WireValue::Array(a_items) = a {
+            let b = wire_obj_get(&a_items[0], "b").unwrap();
+            if let WireValue::Array(b_items) = b {
+                assert_eq!(wire_obj_get(&b_items[0], "c"), Some(WireValue::Number(42.0)));
+                assert_eq!(
+                    wire_obj_get(&b_items[1], "d"),
+                    Some(WireValue::String("hello".to_string()))
+                );
+            } else {
+                panic!("expected b to be Array");
+            }
+        } else {
+            panic!("expected a to be Array");
+        }
+    }
+
+    #[test]
+    fn multiple_named_exports_with_complex_values() {
+        let out = run_ok(
+            r#"
+            export const nums = [1, 2, 3];
+            export const info = { count: 3, total: 6 };
+            export default "summary";
+            "#,
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("summary"));
+        assert_eq!(
+            get_field(&out, "nums"),
+            Some(WireValue::Array(vec![
+                WireValue::Number(1.0),
+                WireValue::Number(2.0),
+                WireValue::Number(3.0),
+            ]))
+        );
+        let info = get_field(&out, "info").unwrap();
+        assert_eq!(wire_obj_get(&info, "count"), Some(WireValue::Number(3.0)));
+        assert_eq!(wire_obj_get(&info, "total"), Some(WireValue::Number(6.0)));
+    }
+
+    // ── Cycle detection ───────────────────────────────────────────────────
+
+    #[test]
+    fn cyclic_object_is_rejected() {
+        let err = run_err(
+            r#"
+            const obj = { x: 1 };
+            obj.self = obj;
+            export default obj;
+            "#,
+        );
+        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    }
+
+    #[test]
+    fn cyclic_array_is_rejected() {
+        let err = run_err(
+            r#"
+            const arr = [1, 2, 3];
+            arr.push(arr);
+            export default arr;
+            "#,
+        );
+        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    }
+
+    #[test]
+    fn indirect_cycle_array_inside_object_inside_array() {
+        // arr → obj → arr (cross-type indirect cycle)
+        let err = run_err(
+            r#"
+            const arr = [];
+            const obj = { arr };
+            arr.push(obj);
+            export default arr;
+            "#,
+        );
+        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    }
+
+    #[test]
+    fn indirect_cycle_two_objects() {
+        let err = run_err(
+            r#"
+            const a = {};
+            const b = { a };
+            a.b = b;
+            export default a;
+            "#,
+        );
+        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    }
+
+    #[test]
+    fn shared_reference_is_not_a_cycle() {
+        // The same object appears in two fields but is not cyclic.
+        // This must succeed — pop-after-visit ensures no false positive.
+        let out = run_ok(
+            r#"
+            const shared = { x: 1 };
+            export default { a: shared, b: shared };
+            "#,
+        );
+        let default_val = get_field(&out, "default").unwrap();
+        assert_eq!(wire_obj_get(&wire_obj_get(&default_val, "a").unwrap(), "x"), Some(WireValue::Number(1.0)));
+        assert_eq!(wire_obj_get(&wire_obj_get(&default_val, "b").unwrap(), "x"), Some(WireValue::Number(1.0)));
+    }
+
+    #[test]
+    fn shared_array_reference_is_not_a_cycle() {
+        let out = run_ok(
+            r#"
+            const shared = [1, 2, 3];
+            export default { first: shared, second: shared };
+            "#,
+        );
+        let default_val = get_field(&out, "default").unwrap();
+        let expected_arr = WireValue::Array(vec![
+            WireValue::Number(1.0),
+            WireValue::Number(2.0),
+            WireValue::Number(3.0),
+        ]);
+        assert_eq!(wire_obj_get(&default_val, "first"), Some(expected_arr.clone()));
+        assert_eq!(wire_obj_get(&default_val, "second"), Some(expected_arr));
+    }
+
+    // ── BigInt ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn bigint_positive_encodes_as_decimal_string() {
+        let out = run_ok("export default 42n");
+        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt("42".to_string())));
+    }
+
+    #[test]
+    fn bigint_negative_encodes_as_decimal_string() {
+        let out = run_ok("export default -100n");
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::BigInt("-100".to_string()))
+        );
+    }
+
+    #[test]
+    fn bigint_zero_encodes_correctly() {
+        let out = run_ok("export default 0n");
+        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt("0".to_string())));
+    }
+
+    #[test]
+    fn bigint_inside_object_encodes_correctly() {
+        let out = run_ok("export default { count: 1000000000000n }");
+        let default_val = get_field(&out, "default").unwrap();
+        assert_eq!(
+            wire_obj_get(&default_val, "count"),
+            Some(WireValue::BigInt("1000000000000".to_string()))
+        );
+    }
+
     // ── Globals ───────────────────────────────────────────────────────────
 
     #[test]
     fn math_random_is_available() {
         // Math is a V8 built-in — no setup needed.
         let out = run_ok("export default typeof Math.random === 'function'");
-        assert_eq!(out.default_export.as_deref(), Some("true"));
+        assert_eq!(get_default(&out).as_deref(), Some("true"));
     }
 
     #[test]
     fn json_parse_stringify_available() {
         let out = run_ok(r#"export default JSON.stringify({a:1})"#);
-        assert_eq!(out.default_export.as_deref(), Some(r#"{"a":1}"#));
+        // JSON.stringify returns a JS string — WireValue::String — displayed as-is.
+        assert_eq!(get_default(&out).as_deref(), Some(r#"{"a":1}"#));
     }
 
     #[test]
@@ -871,26 +1313,26 @@ mod tests {
             export default buf.length
             "#,
         );
-        assert_eq!(out.default_export.as_deref(), Some("8"));
+        assert_eq!(get_default(&out).as_deref(), Some("8"));
     }
 
     #[test]
     fn console_is_defined() {
         let out = run_ok("export default typeof console");
-        assert_eq!(out.default_export.as_deref(), Some("object"));
+        assert_eq!(get_default(&out).as_deref(), Some("object"));
     }
 
     #[test]
     fn node_globals_are_not_available() {
         // `process` and `require` must not exist in the sandbox.
         let out = run_ok("export default typeof process");
-        assert_eq!(out.default_export.as_deref(), Some("undefined"));
+        assert_eq!(get_default(&out).as_deref(), Some("undefined"));
     }
 
     #[test]
     fn node_require_is_not_available() {
         let out = run_ok("export default typeof require");
-        assert_eq!(out.default_export.as_deref(), Some("undefined"));
+        assert_eq!(get_default(&out).as_deref(), Some("undefined"));
     }
 
     // ── Imports ───────────────────────────────────────────────────────────
@@ -1077,7 +1519,7 @@ mod tests {
         // only `fetch` as a host-provided global. Everything else should go
         // through imports unless the design changes.
         let out = run_ok(r#"export default globalThis.appVersion"#);
-        assert_eq!(out.default_export.as_deref(), Some("1.2.3"));
+        assert_eq!(get_default(&out).as_deref(), Some("1.2.3"));
     }
 
     #[test]
@@ -1097,7 +1539,7 @@ mod tests {
         // A global that was never declared should silently be undefined,
         // not throw a ReferenceError. Optional chaining makes this safe.
         let out = run_ok(r#"export default globalThis.neverDeclared ?? "fallback""#);
-        assert_eq!(out.default_export.as_deref(), Some("fallback"));
+        assert_eq!(get_default(&out).as_deref(), Some("fallback"));
     }
 
     #[test]
@@ -1134,9 +1576,9 @@ mod tests {
         // run. Each run gets a fresh context.
         let out1 = run_ok("globalThis.__leakTest = 99; export default 1");
         let out2 = run_ok("export default globalThis.__leakTest ?? 'clean'");
-        assert_eq!(out1.default_export.as_deref(), Some("1"));
+        assert_eq!(get_default(&out1).as_deref(), Some("1"));
         // Must be 'clean', not 99.
-        assert_eq!(out2.default_export.as_deref(), Some("clean"));
+        assert_eq!(get_default(&out2).as_deref(), Some("clean"));
     }
 
     #[test]

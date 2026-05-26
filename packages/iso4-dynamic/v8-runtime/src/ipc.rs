@@ -49,16 +49,20 @@ pub enum TsToRustMessageType {
 }
 
 /// Message types sent from Rust to the TypeScript host.
+///
+/// Byte values match `docs/protocol.md` §2.2. There is no `StdioChunk` in the
+/// real protocol — stdout/stderr are captured by Rust and included inside the
+/// `Result` payload at the end of the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RustToTsMessageType {
-    /// Sandbox called a host function like `fetch`.
+    /// Sandbox called a configured host global/function or host import.
     BridgeCall = 0x01,
-    /// Eager stdout/stderr chunk.
-    StdioChunk = 0x02,
-    /// Final run result.
-    Result = 0x03,
-    /// Internal runtime diagnostic log.
+    /// Final run result. Payload is a `RunCompletionPayload`.
+    Result = 0x02,
+    /// Result of a `Precompile` request.
+    PrecompileResult = 0x03,
+    /// Internal runtime diagnostic log (not sandbox stdout/stderr).
     Log = 0x04,
 }
 
@@ -249,12 +253,12 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
 pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType> {
     match byte {
         0x01 => Ok(RustToTsMessageType::BridgeCall),
-        0x02 => Ok(RustToTsMessageType::StdioChunk),
-        0x03 => Ok(RustToTsMessageType::Result),
+        0x02 => Ok(RustToTsMessageType::Result),
+        0x03 => Ok(RustToTsMessageType::PrecompileResult),
         0x04 => Ok(RustToTsMessageType::Log),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unknown Rust->TS message type: {byte:#02x}"),
+            format!("unknown Rust->TS message type: {byte:#04x}"),
         )),
     }
 }
@@ -392,5 +396,21 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "unknown Rust->TS message type: 0xff");
+    }
+
+    #[test]
+    fn result_byte_matches_protocol_spec() {
+        // docs/protocol.md §2.2: Result = 0x02
+        assert_eq!(RustToTsMessageType::Result as u8, 0x02);
+    }
+
+    #[test]
+    fn precompile_result_byte_matches_protocol_spec() {
+        assert_eq!(RustToTsMessageType::PrecompileResult as u8, 0x03);
+    }
+
+    #[test]
+    fn log_byte_matches_protocol_spec() {
+        assert_eq!(RustToTsMessageType::Log as u8, 0x04);
     }
 }

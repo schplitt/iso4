@@ -2,27 +2,22 @@
 //!
 //! `handle_client` is the entry point for one authenticated connection.
 //! It owns the message loop for the lifetime of that connection.
+//!
+//! Protocol notes:
+//! - Logs (stdout/stderr) are captured during execution and returned inside
+//!   the `Result` frame's `RunCompletionPayload`. There are no `StdioChunk`
+//!   frames in the real protocol.
+//! - Each `Run` currently sends a hard-coded `run_id = 0` because the `Run`
+//!   payload is still a plain UTF-8 code string (Phase 1). Once `RunPayload`
+//!   parsing lands, the `run_id` will be read from the payload.
 
 use std::os::unix::net::UnixStream;
 
 use crate::ipc;
 use crate::v8 as sandbox;
+use crate::wire;
 
 const EXPECTED_TOKEN: &str = "dev-token";
-
-fn write_stdio_chunks(
-    stream: &mut UnixStream,
-    stream_byte: u8,
-    lines: &[String],
-) -> std::io::Result<()> {
-    for line in lines {
-        let mut payload = Vec::with_capacity(1 + line.len());
-        payload.push(stream_byte);
-        payload.extend_from_slice(line.as_bytes());
-        ipc::write_rust_to_ts_frame(stream, ipc::RustToTsMessageType::StdioChunk, &payload)?;
-    }
-    Ok(())
-}
 
 pub fn handle_client(mut stream: UnixStream) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
@@ -89,56 +84,47 @@ pub fn handle_client(mut stream: UnixStream) {
                     frame.payload.len()
                 );
 
-                match sandbox::execute(&frame.payload) {
-                    Ok(output) => {
-                        if let Err(e) = write_stdio_chunks(&mut stream, 0, &output.stdout) {
-                            eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
-                            break;
-                        }
-                        if let Err(e) = write_stdio_chunks(&mut stream, 1, &output.stderr) {
-                            eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
-                            break;
-                        }
+                // Phase 1: payload is raw UTF-8 ESM source. run_id is hardcoded
+                // to 0 until RunPayload parsing is implemented.
+                let run_id: u32 = 0;
 
-                        // Phase 2+: replace with V8 ValueSerializer of RunResult.
-                        // For now: send the stringified default export as bytes.
-                        let bytes = output
-                            .default_export
-                            .as_deref()
-                            .unwrap_or("undefined")
-                            .as_bytes()
-                            .to_vec();
-                        if let Err(e) = ipc::write_rust_to_ts_frame(
-                            &mut stream,
-                            ipc::RustToTsMessageType::Result,
-                            &bytes,
-                        ) {
-                            eprintln!("[iso4-v8] failed to write Result: {e}");
-                            break;
-                        }
+                let result_payload = match sandbox::execute(&frame.payload) {
+                    Ok(output) => {
+                        eprintln!("[iso4-v8] run succeeded in {}ms", output.duration_ms);
+                        wire::encode_run_completion_payload(
+                            run_id,
+                            wire::RunCompletion::Success(wire::RunSuccessPayload {
+                                exports: output.exports,
+                                stdout: output.stdout,
+                                stderr: output.stderr,
+                                duration_ms: output.duration_ms as f64,
+                            }),
+                        )
                     }
                     Err(failure) => {
-                        if let Err(e) = write_stdio_chunks(&mut stream, 0, &failure.stdout) {
-                            eprintln!("[iso4-v8] failed to write stdout chunk: {e}");
-                            break;
-                        }
-                        if let Err(e) = write_stdio_chunks(&mut stream, 1, &failure.stderr) {
-                            eprintln!("[iso4-v8] failed to write stderr chunk: {e}");
-                            break;
-                        }
-
-                        // Execution failed. Log it and send an empty Result
-                        // for now. Later this becomes a serialized RunFailure.
-                        eprintln!("[iso4-v8] execute error: {:?}", failure.error);
-                        if let Err(e) = ipc::write_rust_to_ts_frame(
-                            &mut stream,
-                            ipc::RustToTsMessageType::Result,
-                            &[],
-                        ) {
-                            eprintln!("[iso4-v8] failed to write Result: {e}");
-                            break;
-                        }
+                        eprintln!(
+                            "[iso4-v8] run failed in {}ms: {:?}",
+                            failure.duration_ms, failure.error
+                        );
+                        wire::encode_run_completion_payload(
+                            run_id,
+                            wire::RunCompletion::Failure(wire::RunFailurePayload {
+                                error: wire::run_error_to_payload(&failure.error),
+                                stdout: failure.stdout,
+                                stderr: failure.stderr,
+                                duration_ms: failure.duration_ms as f64,
+                            }),
+                        )
                     }
+                };
+
+                if let Err(e) = ipc::write_rust_to_ts_frame(
+                    &mut stream,
+                    ipc::RustToTsMessageType::Result,
+                    &result_payload,
+                ) {
+                    eprintln!("[iso4-v8] failed to write Result frame: {e}");
+                    break;
                 }
             }
             ipc::TsToRustMessageType::Terminate => {
