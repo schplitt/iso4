@@ -22,8 +22,8 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
-import { createRuntime } from '../src/index.js'
-import type { Runtime } from '../src/types.js'
+import { createRuntime } from '../src/index'
+import type { Runtime } from '../src/types'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared mock libraries (host-provided JS source strings)
@@ -162,8 +162,8 @@ describe('runtime.run() — direct execution', () => {
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.exports.named.x).toBe(10)
-    expect(result.exports.named.y).toBe(20)
+    expect(result.exports.x).toBe(10)
+    expect(result.exports.y).toBe(20)
   })
 
   test('default and named exports together', async () => {
@@ -174,7 +174,7 @@ describe('runtime.run() — direct execution', () => {
     if (!result.ok)
       return
     expect(result.exports.default).toBe(99)
-    expect(result.exports.named.label).toBe('hi')
+    expect(result.exports.label).toBe('hi')
   })
 
   test('top-level await resolves', async () => {
