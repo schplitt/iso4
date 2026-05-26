@@ -373,16 +373,21 @@ impl<'a> PayloadReader<'a> {
     }
 }
 
-// ── RunPayload parser ─────────────────────────────────────────────────────────
+// ── Payload parsers ──────────────────────────────────────────────────────────────
 
-/// Parse the payload bytes of a `Run` frame per `docs/protocol.md` §5.2.
-pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
-    let mut r = PayloadReader::new(payload);
-
-    let run_id = r.read_u32()?;
+/// Parse the shared code + filename + limits + globals + imports fields that
+/// appear in `RunPayload`, `PrecompilePayload`, and `PrefixRunPayload`.
+fn parse_code_fields(
+    r: &mut PayloadReader,
+) -> io::Result<(
+    String,
+    Option<String>,
+    ResourceLimits,
+    Vec<HostGlobalBinding>,
+    Vec<ImportBinding>,
+)> {
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
-
     let limits = ResourceLimits {
         memory_mb: r.read_u32()?,
         cpu_time_ms: r.read_u32()?,
@@ -392,23 +397,18 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
         max_stderr_bytes: r.read_u32()?,
         max_bridge_payload_bytes: r.read_u32()?,
     };
-
     let globals_count = r.read_u32()? as usize;
     let mut globals = Vec::with_capacity(globals_count);
     for _ in 0..globals_count {
         globals.push(HostGlobalBinding { name: r.read_string()? });
     }
-
     let imports_count = r.read_u32()? as usize;
     let mut imports = Vec::with_capacity(imports_count);
     for _ in 0..imports_count {
         let specifier = r.read_string()?;
         let kind_byte = r.read_u8()?;
         let (kind, source, host_exports) = match kind_byte {
-            0 => {
-                let source = r.read_optional_string()?;
-                (ImportKind::Source, source, vec![])
-            }
+            0 => (ImportKind::Source, r.read_optional_string()?, vec![]),
             1 => {
                 let count = r.read_u32()? as usize;
                 let mut exports = Vec::with_capacity(count);
@@ -426,9 +426,66 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
         };
         imports.push(ImportBinding { specifier, kind, source, host_exports });
     }
+    Ok((code, filename, limits, globals, imports))
+}
 
+/// Parse the payload bytes of a `Run` frame per `docs/protocol.md` §5.2.
+pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
+    let mut r = PayloadReader::new(payload);
+    let run_id = r.read_u32()?;
+    let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
     r.assert_done()?;
     Ok(RunPayload { run_id, code, filename, limits, globals, imports })
+}
+
+/// Fully parsed `Precompile` frame payload per `docs/protocol.md` §5.2.
+/// Same fields as `RunPayload` but without `run_id`.
+#[derive(Debug)]
+pub struct PrecompilePayload {
+    pub code: String,
+    pub filename: Option<String>,
+    pub limits: ResourceLimits,
+    pub globals: Vec<HostGlobalBinding>,
+    pub imports: Vec<ImportBinding>,
+}
+
+/// Parse the payload bytes of a `Precompile` frame per `docs/protocol.md` §5.2.
+pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload> {
+    let mut r = PayloadReader::new(payload);
+    let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
+    r.assert_done()?;
+    Ok(PrecompilePayload { code, filename, limits, globals, imports })
+}
+
+/// Fully parsed `PrefixRun` frame payload per `docs/protocol.md` §5.2.
+#[derive(Debug)]
+pub struct PrefixRunPayload {
+    pub run_id: u32,
+    pub prefix_id: String,
+    pub code: String,
+    pub filename: Option<String>,
+    pub limits: ResourceLimits,
+    pub globals: Vec<HostGlobalBinding>,
+    pub imports: Vec<ImportBinding>,
+}
+
+/// Parse the payload bytes of a `PrefixRun` frame per `docs/protocol.md` §5.2.
+pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> {
+    let mut r = PayloadReader::new(payload);
+    let run_id = r.read_u32()?;
+    let prefix_id = r.read_string()?;
+    let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
+    r.assert_done()?;
+    Ok(PrefixRunPayload { run_id, prefix_id, code, filename, limits, globals, imports })
+}
+
+/// Parse the payload bytes of a `DisposePrefix` frame.
+/// Payload is a single `PrefixId` (a length-prefixed UTF-8 string).
+pub fn parse_dispose_prefix_payload(payload: &[u8]) -> io::Result<String> {
+    let mut r = PayloadReader::new(payload);
+    let id = r.read_string()?;
+    r.assert_done()?;
+    Ok(id)
 }
 
 /// Convert a raw type byte into a known TS->Rust message type.

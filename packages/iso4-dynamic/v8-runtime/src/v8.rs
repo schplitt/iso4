@@ -93,21 +93,61 @@ pub fn execute(code: &str, filename: Option<&str>) -> Result<Output, FailureOutp
     run_code(code, filename.unwrap_or("<iso4>"))
 }
 
+/// Execute a postfix against a pre-compiled prefix snapshot.
+///
+/// The snapshot was produced by `precompile`. The restored context has the
+/// prefix's global state; `console` is re-installed so postfix code can log.
+pub fn execute_with_prefix(
+    snapshot_bytes: &[u8],
+    code: &str,
+    filename: Option<&str>,
+) -> Result<Output, FailureOutput> {
+    init_platform();
+    run_module(code, filename.unwrap_or("<iso4>"), Some(snapshot_bytes))
+}
+
+/// Compile prefix code into a V8 startup snapshot blob.
+///
+/// Returns the raw snapshot bytes on success. The bytes can be stored and
+/// passed to `execute_with_prefix` for many subsequent postfix runs.
+///
+/// Note: `console` is **not** available inside prefix code — native callbacks
+/// cannot be snapshotted without `ExternalReferences` (a Phase 2 concern).
+/// Prefix code that calls `console.*` will receive a `TypeError`.
+pub fn precompile(
+    code: &str,
+    filename: Option<&str>,
+) -> Result<Vec<u8>, FailureOutput> {
+    init_platform();
+    precompile_module(code, filename.unwrap_or("<prefix>"))
+}
+
 /// Core execution — separated from `execute` so tests can call it directly.
 fn run_code(code: &str, filename: &str) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename)
+    run_module(code, filename, None)
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
 /// inspect the module namespace object for `default` and named exports.
-fn run_module(code: &str, filename: &str) -> Result<Output, FailureOutput> {
+///
+/// When `snapshot` is `Some(bytes)`, the isolate is created from that V8
+/// startup snapshot so the prefix context is restored before postfix code runs.
+fn run_module(
+    code: &str,
+    filename: &str,
+    snapshot: Option<&[u8]>,
+) -> Result<Output, FailureOutput> {
     let start = std::time::Instant::now();
     let mut logs = LogBuffers::default();
 
-    let mut isolate = v8::Isolate::new(Default::default());
-    // Auto microtasks is enough for simple top-level `await Promise.resolve()`.
-    // Host bridge waits will need an explicit event-loop later.
+    let mut isolate = match snapshot {
+        None => v8::Isolate::new(Default::default()),
+        Some(bytes) => {
+            let params = v8::Isolate::create_params().snapshot_blob(bytes.to_vec());
+            v8::Isolate::new(params)
+        }
+    };
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Auto);
 
     let scope = &mut v8::HandleScope::new(&mut isolate);
@@ -274,6 +314,152 @@ fn run_module(code: &str, filename: &str) -> Result<Output, FailureOutput> {
         stderr: logs.stderr.clone(),
         duration_ms: start.elapsed().as_millis() as u64,
     })
+}
+
+/// Compile and snapshot prefix code into a raw V8 startup blob.
+///
+/// Uses `Isolate::snapshot_creator` instead of `Isolate::new`. The scope
+/// block must drop before `create_blob` is called, so compilation runs inside
+/// an immediately-invoked closure that borrows `&mut isolate`.
+fn precompile_module(code: &str, filename: &str) -> Result<Vec<u8>, FailureOutput> {
+    let start = std::time::Instant::now();
+
+    let mut isolate = v8::Isolate::snapshot_creator(None, None);
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Auto);
+
+    // All V8 scopes must be dropped before create_blob is called.
+    // The IIFE ensures the &mut isolate borrow ends when the closure returns.
+    let compile_result: Result<(), FailureOutput> = (|| {
+        let mut logs = LogBuffers::default();
+
+        let scope = &mut v8::HandleScope::new(&mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        // Mark this context as the snapshot default BEFORE creating TryCatch.
+        // Must be called while the context Local is still alive.
+        scope.set_default_context(context);
+
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let source_string = v8::String::new(scope, code).ok_or_else(|| {
+            failure(
+                RunError::Internal("failed to intern module source".to_string()),
+                &logs,
+                start,
+            )
+        })?;
+        let filename_str = v8::String::new(scope, filename).ok_or_else(|| {
+            failure(
+                RunError::Internal("failed to intern filename".to_string()),
+                &logs,
+                start,
+            )
+        })?;
+        let origin = v8::ScriptOrigin::new(
+            scope,
+            filename_str.into(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            false,
+            false,
+            true,
+            None,
+        );
+        let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
+
+        let module = match v8::script_compiler::compile_module(scope, &mut source) {
+            Some(m) => m,
+            None => {
+                return Err(failure(
+                    RunError::CompileError(exception_message(scope)),
+                    &logs,
+                    start,
+                ))
+            }
+        };
+
+        if module
+            .instantiate_module(scope, no_import_resolver)
+            .is_none()
+        {
+            return Err(failure(
+                RunError::ModuleNotFound(exception_message(scope)),
+                &logs,
+                start,
+            ));
+        }
+
+        let evaluation = match module.evaluate(scope) {
+            Some(v) => v,
+            None => {
+                return Err(failure(
+                    RunError::RuntimeError {
+                        message: exception_message(scope),
+                        stack: exception_stack(scope),
+                    },
+                    &logs,
+                    start,
+                ))
+            }
+        };
+
+        if evaluation.is_promise() {
+            let promise =
+                v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
+                    failure(
+                        RunError::Internal(
+                            "failed to inspect module evaluation promise".to_string(),
+                        ),
+                        &logs,
+                        start,
+                    )
+                })?;
+            match promise.state() {
+                v8::PromiseState::Fulfilled => {}
+                v8::PromiseState::Rejected => {
+                    let rejection = promise.result(scope);
+                    return Err(failure(
+                        runtime_error_from_value(scope, rejection),
+                        &logs,
+                        start,
+                    ));
+                }
+                v8::PromiseState::Pending => {
+                    return Err(failure(
+                        RunError::ExportNotSerializable(
+                            "module evaluation promise is still pending".to_string(),
+                        ),
+                        &logs,
+                        start,
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    })();
+
+    // V8 requires create_blob to be called before dropping a snapshot-creator
+    // isolate, even when compilation failed. We call it unconditionally and
+    // only use the blob on the success path.
+    let snapshot_opt = isolate.create_blob(v8::FunctionCodeHandling::Keep);
+
+    compile_result?;
+
+    snapshot_opt
+        .map(|s| s.to_vec())
+        .ok_or_else(|| FailureOutput {
+            error: RunError::Internal(
+                "V8 snapshot creation returned an empty blob".to_string(),
+            ),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
 }
 
 fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> FailureOutput {
@@ -1590,6 +1776,92 @@ mod tests {
     fn duration_ms_is_populated() {
         let out = run_ok("export default 1 + 1");
         assert!(out.duration_ms < 5_000);
+    }
+
+    // ── Precompile / snapshots ──────────────────────────────────────────────
+
+    #[test]
+    fn precompile_returns_non_empty_snapshot_bytes() {
+        let bytes = precompile("const x = 1", None).unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn precompile_compile_error_is_reported() {
+        let err = precompile("export default (((", None).unwrap_err();
+        assert!(matches!(err.error, RunError::CompileError(_)));
+    }
+
+    #[test]
+    fn precompile_runtime_error_is_reported() {
+        let err = precompile(r#"throw new Error("prefix failed")"#, None).unwrap_err();
+        assert!(matches!(err.error, RunError::RuntimeError { .. }));
+    }
+
+    #[test]
+    fn execute_with_prefix_basic_postfix() {
+        // Module-scoped `const` stays in the prefix module's scope.
+        // Use globalThis to share values with the postfix module.
+        let snapshot = precompile("globalThis.base = 100", None).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.base + 1", None)
+            .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("101"));
+    }
+
+    #[test]
+    fn execute_with_prefix_global_mutation_visible_in_postfix() {
+        let snapshot = precompile("globalThis.answer = 42", None).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.answer", None).unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn execute_with_prefix_multiple_postfixes_are_independent() {
+        let snapshot = precompile("globalThis.base = 10", None).unwrap();
+        let b = "globalThis.base";
+        let out1 = execute_with_prefix(&snapshot, &format!("export default {b} * 2"), None).unwrap();
+        let out2 = execute_with_prefix(&snapshot, &format!("export default {b} * 3"), None).unwrap();
+        let out3 = execute_with_prefix(&snapshot, &format!("export default {b} * 4"), None).unwrap();
+        assert_eq!(get_default(&out1).as_deref(), Some("20"));
+        assert_eq!(get_default(&out2).as_deref(), Some("30"));
+        assert_eq!(get_default(&out3).as_deref(), Some("40"));
+    }
+
+    #[test]
+    fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
+        let snapshot = precompile("globalThis.counter = 0", None).unwrap();
+        execute_with_prefix(&snapshot, "globalThis.counter = 99; export default 1", None).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.counter", None).unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn execute_with_prefix_complex_prefix_computation() {
+        let snapshot = precompile(
+            r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
+            None,
+        ).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.sq[7]", None).unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("49"));
+    }
+
+    #[test]
+    fn execute_with_prefix_console_is_available_in_postfix() {
+        let snapshot = precompile("const x = 1", None).unwrap();
+        let out = execute_with_prefix(
+            &snapshot,
+            r#"console.log("hello from postfix"); export default 1"#,
+            None,
+        ).unwrap();
+        assert!(out.stdout.iter().any(|l| l.contains("hello from postfix")));
+    }
+
+    #[test]
+    fn execute_with_prefix_postfix_runtime_error_is_reported() {
+        let snapshot = precompile("", None).unwrap();
+        let err = execute_with_prefix(&snapshot, r#"throw new Error("postfix failed")"#, None)
+            .unwrap_err();
+        assert!(matches!(err.error, RunError::RuntimeError { .. }));
     }
 
     // ── AbortSignal / cancellation ────────────────────────────────────────

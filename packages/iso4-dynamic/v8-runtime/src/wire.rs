@@ -337,6 +337,43 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
     }
 }
 
+// ── PrecompileResultPayload encoder ──────────────────────────────────────────
+
+/// Encode a `PrecompileResultPayload` per `docs/protocol.md` §5.6.
+///
+/// Wire layout:
+/// ```text
+/// u8    ok
+/// u8    prefixIdPresent  (1 when ok = true)
+///   String  prefixId
+/// u8    errorPresent     (1 when ok = false)
+///   RunErrorPayload  error
+/// ```
+pub fn encode_precompile_result_payload(
+    prefix_id: Option<&str>,
+    error: Option<&RunErrorPayload>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match (prefix_id, error) {
+        (Some(id), _) => {
+            encode_bool(true, &mut out);
+            out.push(1);
+            encode_string(id, &mut out);
+            out.push(0);
+        }
+        (_, Some(err)) => {
+            encode_bool(false, &mut out);
+            out.push(0);
+            out.push(1);
+            encode_run_error_payload(err, &mut out);
+        }
+        (None, None) => {
+            panic!("encode_precompile_result_payload: must provide either prefix_id or error")
+        }
+    }
+    out
+}
+
 // ── RunError → RunErrorPayload ─────────────────────────────────────────────────
 
 /// Convert a V8 `RunError` into the wire-level `RunErrorPayload` per the error

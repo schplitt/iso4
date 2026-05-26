@@ -64,6 +64,11 @@ pub fn handle_client(mut stream: UnixStream) {
 
     // ── Step 3: message loop ──────────────────────────────────────────────
 
+    // Prefix store: maps PrefixId → V8 snapshot bytes.
+    // Scoped to this connection so each client has independent prefix state.
+    let mut prefix_store: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut next_prefix_id: u64 = 0;
+
     loop {
         let frame = match ipc::read_ts_to_rust_frame(&mut stream) {
             Ok(f) => f,
@@ -136,16 +141,147 @@ pub fn handle_client(mut stream: UnixStream) {
                 }
             }
             ipc::TsToRustMessageType::Precompile => {
-                eprintln!("[iso4-v8] Precompile not yet implemented — closing");
-                break;
+                let payload = match ipc::parse_precompile_payload(&frame.payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[iso4-v8] malformed Precompile payload: {e} — closing");
+                        break;
+                    }
+                };
+
+                let result_payload =
+                    match sandbox::precompile(&payload.code, payload.filename.as_deref()) {
+                        Ok(snapshot_bytes) => {
+                            next_prefix_id += 1;
+                            let prefix_id = next_prefix_id.to_string();
+                            eprintln!(
+                                "[iso4-v8] precompile succeeded — prefix_id={prefix_id}                                  ({} snapshot bytes)",
+                                snapshot_bytes.len()
+                            );
+                            prefix_store.insert(prefix_id.clone(), snapshot_bytes);
+                            wire::encode_precompile_result_payload(Some(&prefix_id), None)
+                        }
+                        Err(failure) => {
+                            eprintln!(
+                                "[iso4-v8] precompile failed in {}ms: {:?}",
+                                failure.duration_ms, failure.error
+                            );
+                            wire::encode_precompile_result_payload(
+                                None,
+                                Some(&wire::run_error_to_payload(&failure.error)),
+                            )
+                        }
+                    };
+
+                if let Err(e) = ipc::write_rust_to_ts_frame(
+                    &mut stream,
+                    ipc::RustToTsMessageType::PrecompileResult,
+                    &result_payload,
+                ) {
+                    eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
+                    break;
+                }
             }
             ipc::TsToRustMessageType::PrefixRun => {
-                eprintln!("[iso4-v8] PrefixRun not yet implemented — closing");
-                break;
+                let payload = match ipc::parse_prefix_run_payload(&frame.payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[iso4-v8] malformed PrefixRun payload: {e} — closing");
+                        break;
+                    }
+                };
+
+                let result_payload = match prefix_store.get(&payload.prefix_id) {
+                    None => {
+                        eprintln!(
+                            "[iso4-v8] PrefixRun {} — prefix_id={} not found",
+                            payload.run_id, payload.prefix_id
+                        );
+                        wire::encode_run_completion_payload(
+                            payload.run_id,
+                            wire::RunCompletion::Failure(wire::RunFailurePayload {
+                                error: wire::RunErrorPayload {
+                                    code: "ERR_PREFIX_DISPOSED".to_string(),
+                                    name: "Error".to_string(),
+                                    message: format!(
+                                        "prefix '{}' has been disposed or never existed",
+                                        payload.prefix_id
+                                    ),
+                                    stack: None,
+                                },
+                                stdout: Vec::new(),
+                                stderr: Vec::new(),
+                                duration_ms: 0.0,
+                            }),
+                        )
+                    }
+                    Some(snapshot_bytes) => {
+                        eprintln!(
+                            "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes)",
+                            payload.run_id, payload.prefix_id, payload.code.len()
+                        );
+                        match sandbox::execute_with_prefix(
+                            snapshot_bytes,
+                            &payload.code,
+                            payload.filename.as_deref(),
+                        ) {
+                            Ok(output) => {
+                                eprintln!(
+                                    "[iso4-v8] PrefixRun {} succeeded in {}ms",
+                                    payload.run_id, output.duration_ms
+                                );
+                                wire::encode_run_completion_payload(
+                                    payload.run_id,
+                                    wire::RunCompletion::Success(wire::RunSuccessPayload {
+                                        exports: output.exports,
+                                        stdout: output.stdout,
+                                        stderr: output.stderr,
+                                        duration_ms: output.duration_ms as f64,
+                                    }),
+                                )
+                            }
+                            Err(failure) => {
+                                eprintln!(
+                                    "[iso4-v8] PrefixRun {} failed in {}ms: {:?}",
+                                    payload.run_id, failure.duration_ms, failure.error
+                                );
+                                wire::encode_run_completion_payload(
+                                    payload.run_id,
+                                    wire::RunCompletion::Failure(wire::RunFailurePayload {
+                                        error: wire::run_error_to_payload(&failure.error),
+                                        stdout: failure.stdout,
+                                        stderr: failure.stderr,
+                                        duration_ms: failure.duration_ms as f64,
+                                    }),
+                                )
+                            }
+                        }
+                    }
+                };
+
+                if let Err(e) = ipc::write_rust_to_ts_frame(
+                    &mut stream,
+                    ipc::RustToTsMessageType::Result,
+                    &result_payload,
+                ) {
+                    eprintln!("[iso4-v8] failed to write Result frame: {e}");
+                    break;
+                }
             }
             ipc::TsToRustMessageType::DisposePrefix => {
-                eprintln!("[iso4-v8] DisposePrefix not yet implemented — closing");
-                break;
+                match ipc::parse_dispose_prefix_payload(&frame.payload) {
+                    Ok(prefix_id) => {
+                        let existed = prefix_store.remove(&prefix_id).is_some();
+                        eprintln!(
+                            "[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})"
+                        );
+                        // No response frame — DisposePrefix is fire-and-forget.
+                    }
+                    Err(e) => {
+                        eprintln!("[iso4-v8] malformed DisposePrefix payload: {e} — closing");
+                        break;
+                    }
+                }
             }
             ipc::TsToRustMessageType::BridgeResponse => {
                 eprintln!("[iso4-v8] unexpected BridgeResponse outside of run — closing");
