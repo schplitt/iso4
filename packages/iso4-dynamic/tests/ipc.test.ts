@@ -18,6 +18,15 @@ import {
 
 import { Buffer } from 'node:buffer'
 
+// ── Payload encoders ───────────────────────────────────────────────────────
+
+import {
+  encodeRunPayload,
+  encodePrecompilePayload,
+  encodePrefixRunPayload,
+  encodeDisposePrefixPayload,
+} from '../src/ipc.js'
+
 describe('ipc frame codec', () => {
   test('frame roundtrip preserves type and payload', () => {
     const bytes = encodeFrame(0x02, Buffer.from('hello'))
@@ -163,5 +172,61 @@ describe('Authenticate payload', () => {
     expect(() => decodeAuthenticatePayload(Buffer.from([0x00]))).toThrow(
       /payload too short for Authenticate/,
     )
+  })
+})
+
+function readU32BE(buf: Buffer, offset: number): number {
+  return buf.readUInt32BE(offset)
+}
+function readString(buf: Buffer, offset: number): { value: string, end: number } {
+  const len = readU32BE(buf, offset)
+  return { value: buf.subarray(offset + 4, offset + 4 + len).toString('utf8'), end: offset + 4 + len }
+}
+
+describe('payload encoders', () => {
+  test('encodeRunPayload encodes runId and code correctly', () => {
+    const buf = encodeRunPayload({ runId: 7, code: 'export default 1' })
+    expect(readU32BE(buf, 0)).toBe(7) // runId
+    const { value: code } = readString(buf, 4)
+    expect(code).toBe('export default 1')
+  })
+
+  test('encodeRunPayload with no filename writes absent byte', () => {
+    const buf = encodeRunPayload({ runId: 1, code: 'x' })
+    const codeEnd = 4 + 4 + 1 // runId + codeLen + 1 char
+    expect(buf[codeEnd]).toBe(0) // filename absent
+  })
+
+  test('encodeRunPayload with filename writes present byte and string', () => {
+    const buf = encodeRunPayload({ runId: 1, code: 'x', filename: 'agent.js' })
+    const codeEnd = 4 + 4 + 1
+    expect(buf[codeEnd]).toBe(1) // filename present
+    const { value: fn } = readString(buf, codeEnd + 1)
+    expect(fn).toBe('agent.js')
+  })
+
+  test('encodePrecompilePayload has no runId prefix', () => {
+    const runBuf = encodeRunPayload({ runId: 0, code: 'x' })
+    const preBuf = encodePrecompilePayload({ code: 'x' })
+    // PrecompilePayload is 4 bytes shorter (no runId)
+    expect(preBuf.byteLength).toBe(runBuf.byteLength - 4)
+    const { value: code } = readString(preBuf, 0)
+    expect(code).toBe('x')
+  })
+
+  test('encodePrefixRunPayload encodes runId, prefixId, and code', () => {
+    const buf = encodePrefixRunPayload({ runId: 3, prefixId: '42', code: 'y' })
+    expect(readU32BE(buf, 0)).toBe(3) // runId
+    const { value: prefixId, end } = readString(buf, 4)
+    expect(prefixId).toBe('42')
+    const { value: code } = readString(buf, end)
+    expect(code).toBe('y')
+  })
+
+  test('encodeDisposePrefixPayload encodes just the prefixId string', () => {
+    const buf = encodeDisposePrefixPayload('99')
+    const { value } = readString(buf, 0)
+    expect(value).toBe('99')
+    expect(buf.byteLength).toBe(4 + 2) // u32 len + '99'
   })
 })

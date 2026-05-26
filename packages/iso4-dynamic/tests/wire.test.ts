@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'vitest'
 import { WireDecodeError, decodeRunCompletionPayload, decodeWireValue } from '../src/wire'
 
+// ── decodePrecompileResultPayload ──────────────────────────────────────────
+
+import { decodePrecompileResultPayload } from '../src/wire.js'
+
 // ── Test-only encoder ──────────────────────────────────────────────────────
 //
 // Mirrors the Rust `encode_wire_value` / `encode_run_completion_payload`
@@ -667,5 +671,62 @@ describe('decodeRunCompletionPayload — errors', () => {
         Uint8Array.from([0x00, 0x00, 0x00, 0x00, 0x02]),
       ),
     ).toThrow(WireDecodeError)
+  })
+})
+
+describe('decodePrecompileResultPayload', () => {
+  function encodePrecompileSuccess(prefixId: string): Uint8Array {
+    const parts: number[] = []
+    parts.push(1) // ok = true
+    parts.push(1) // prefixIdPresent = 1
+    encodeString(prefixId, parts)
+    parts.push(0) // errorPresent = 0
+    return Uint8Array.from(parts)
+  }
+
+  function encodePrecompileFailure(code: string, message: string, stack?: string): Uint8Array {
+    const parts: number[] = []
+    parts.push(0) // ok = false
+    parts.push(0) // prefixIdPresent = 0
+    parts.push(1) // errorPresent = 1
+    encodeString(code, parts)
+    encodeString('SyntaxError', parts)
+    encodeString(message, parts)
+    if (stack !== undefined) {
+      parts.push(1); encodeString(stack, parts)
+    } else {
+      parts.push(0)
+    }
+    return Uint8Array.from(parts)
+  }
+
+  test('success decodes prefixId', () => {
+    const result = decodePrecompileResultPayload(encodePrecompileSuccess('42'))
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.prefixId).toBe('42')
+  })
+
+  test('failure decodes error fields', () => {
+    const result = decodePrecompileResultPayload(
+      encodePrecompileFailure('ERR_COMPILE', 'bad syntax', 'at line 1'),
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_COMPILE')
+    expect(result.error.message).toBe('bad syntax')
+    expect(result.error.stack).toBe('at line 1')
+  })
+
+  test('failure without stack', () => {
+    const result = decodePrecompileResultPayload(
+      encodePrecompileFailure('ERR_USER_CODE', 'boom'),
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.stack).toBeUndefined()
   })
 })

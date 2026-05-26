@@ -1,14 +1,20 @@
-import { Buffer } from 'node:buffer'
+import type { Buffer } from 'node:buffer'
 import { createConnection } from 'node:net'
 import type { Socket } from 'node:net'
 import {
   FrameReader,
   PROTOCOL_VERSION,
+
   RustToTsMessageTypes,
   TsToRustMessageTypes,
   encodeAuthenticatePayload,
+  encodeDisposePrefixPayload,
+  encodePrecompilePayload,
+  encodePrefixRunPayload,
+  encodeRunPayload,
   encodeTsToRustFrame,
 } from './ipc'
+import type { PrecompilePayloadOptions, PrefixRunPayloadOptions, ResourceLimits, RunPayloadOptions } from './ipc'
 
 export const DEFAULT_SOCKET_PATH: string = '/tmp/iso4-dynamic-v8.sock'
 
@@ -20,6 +26,8 @@ export interface RuntimeIpcClientOptions {
 export interface RawRunResult {
   result: Uint8Array
 }
+
+export type { ResourceLimits, RunPayloadOptions, PrecompilePayloadOptions, PrefixRunPayloadOptions }
 
 export class RuntimeIpcClient {
   private readonly socket: Socket
@@ -60,13 +68,30 @@ export class RuntimeIpcClient {
     return client
   }
 
-  async runRawCode(code: string): Promise<RawRunResult> {
+  private nextRunId = 0
+  private nextRunIdValue(): number {
+    this.nextRunId = (this.nextRunId + 1) & 0xffffffff
+    return this.nextRunId
+  }
+
+  async runRawCode(
+    code: string,
+    options?: { filename?: string, limits?: ResourceLimits },
+  ): Promise<RawRunResult> {
     if (this.disposed) {
       throw new Error('runtime IPC client is disposed')
     }
 
     await this.write(
-      encodeTsToRustFrame(TsToRustMessageTypes.Run, Buffer.from(code, 'utf8')),
+      encodeTsToRustFrame(
+        TsToRustMessageTypes.Run,
+        encodeRunPayload({
+          runId: this.nextRunIdValue(),
+          code,
+          filename: options?.filename,
+          limits: options?.limits,
+        }),
+      ),
     )
 
     for await (const frame of this.reader) {
@@ -85,6 +110,71 @@ export class RuntimeIpcClient {
     }
 
     throw new Error('connection closed before receiving a Result frame')
+  }
+
+  async precompile(
+    options: PrecompilePayloadOptions,
+  ): Promise<Uint8Array> {
+    if (this.disposed)
+      throw new Error('runtime IPC client is disposed')
+
+    await this.write(
+      encodeTsToRustFrame(
+        TsToRustMessageTypes.Precompile,
+        encodePrecompilePayload(options),
+      ),
+    )
+
+    for await (const frame of this.reader) {
+      if (frame.messageType === RustToTsMessageTypes.PrecompileResult) {
+        return frame.payload
+      }
+      if (frame.messageType === RustToTsMessageTypes.Log)
+        continue
+    }
+
+    throw new Error('connection closed before receiving a PrecompileResult frame')
+  }
+
+  async prefixRun(
+    options: PrefixRunPayloadOptions,
+  ): Promise<RawRunResult> {
+    if (this.disposed)
+      throw new Error('runtime IPC client is disposed')
+
+    await this.write(
+      encodeTsToRustFrame(
+        TsToRustMessageTypes.PrefixRun,
+        encodePrefixRunPayload({
+          ...options,
+          runId: this.nextRunIdValue(),
+        }),
+      ),
+    )
+
+    for await (const frame of this.reader) {
+      switch (frame.messageType) {
+        case RustToTsMessageTypes.Result:
+          return { result: frame.payload }
+        case RustToTsMessageTypes.Log:
+          break
+        case RustToTsMessageTypes.BridgeCall:
+          throw new Error('BridgeCall is not implemented in raw IPC client')
+      }
+    }
+
+    throw new Error('connection closed before receiving a Result frame')
+  }
+
+  async disposePrefix(prefixId: string): Promise<void> {
+    if (this.disposed)
+      return
+    await this.write(
+      encodeTsToRustFrame(
+        TsToRustMessageTypes.DisposePrefix,
+        encodeDisposePrefixPayload(prefixId),
+      ),
+    )
   }
 
   async dispose(): Promise<void> {

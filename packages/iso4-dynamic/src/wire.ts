@@ -279,6 +279,54 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
   }
 }
 
+// ── PrecompileResultPayload decoder ───────────────────────────────────────────
+
+export type PrecompileResult
+  = | { ok: true, prefixId: string }
+    | { ok: false, error: { code: string, name: string, message: string, stack?: string } }
+
+/**
+ * Decode a `PrecompileResultPayload` from a `PrecompileResult` frame.
+ *
+ * Wire layout per `docs/protocol.md` §5.6:
+ * ```
+ * u8    ok
+ * u8    prefixIdPresent   (1 when ok = true)
+ *   String  prefixId
+ * u8    errorPresent      (1 when ok = false)
+ *   RunErrorPayload  error
+ * ```
+ * @param buf
+ */
+export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult {
+  const reader = new WireReader(buf)
+  const ok = reader.readBool()
+
+  if (ok) {
+    const prefixIdPresent = reader.readU8()
+    if (prefixIdPresent !== 1) {
+      throw new WireDecodeError('expected prefixId present byte = 1 when ok = true')
+    }
+    const prefixId = reader.readString()
+    reader.readU8() // errorPresent = 0
+    reader.assertDone()
+    return { ok: true, prefixId }
+  }
+
+  reader.readU8() // prefixIdPresent = 0
+  const errorPresent = reader.readU8()
+  if (errorPresent !== 1) {
+    throw new WireDecodeError('expected error present byte = 1 when ok = false')
+  }
+  const code = reader.readString()
+  const name = reader.readString()
+  const message = reader.readString()
+  const stackPresent = reader.readU8()
+  const stack = stackPresent === 1 ? reader.readString() : undefined
+  reader.assertDone()
+  return { ok: false, error: { code, name, message, stack } }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function wireObjectToExports(raw: unknown): SandboxExports {

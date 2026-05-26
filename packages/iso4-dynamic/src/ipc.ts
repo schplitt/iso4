@@ -1,5 +1,4 @@
 import { Buffer } from 'node:buffer'
-import type { Socket } from 'node:net'
 
 export const PROTOCOL_VERSION: 1 = 1
 
@@ -91,7 +90,7 @@ export class FrameReader {
     }
   }
 
-  async *[Symbol.asyncIterator](): AsyncGenerator<RustToTsFrame> {
+  async * [Symbol.asyncIterator](): AsyncGenerator<RustToTsFrame> {
     for (;;) {
       yield await this.readRustToTsFrame()
     }
@@ -270,6 +269,157 @@ export function decodeAuthenticatePayload(
     protocolVersion: view.readUInt16BE(0),
     token: view.subarray(2).toString('utf8'),
   }
+}
+
+// ── Payload encoder helpers ───────────────────────────────────────────────
+//
+// Mirror of the Rust `PayloadReader` primitive encoders in `ipc.rs`.
+// All integers are big-endian per docs/protocol.md §3.
+
+class PayloadWriter {
+  private readonly parts: Buffer[] = []
+
+  writeU8(n: number): this {
+    const b = Buffer.allocUnsafe(1)
+    b.writeUInt8(n, 0)
+    this.parts.push(b)
+    return this
+  }
+
+  writeU32(n: number): this {
+    const b = Buffer.allocUnsafe(4)
+    b.writeUInt32BE(n, 0)
+    this.parts.push(b)
+    return this
+  }
+
+  writeString(s: string): this {
+    const encoded = Buffer.from(s, 'utf8')
+    this.writeU32(encoded.byteLength)
+    this.parts.push(encoded)
+    return this
+  }
+
+  writeOptionalString(s: string | undefined): this {
+    if (s === undefined) {
+      this.writeU8(0)
+    } else {
+      this.writeU8(1)
+      this.writeString(s)
+    }
+    return this
+  }
+
+  writeResourceLimits(limits: ResourceLimits): this {
+    this.writeU32(limits.memoryMb ?? 0)
+    this.writeU32(limits.cpuTimeMs ?? 0)
+    this.writeU32(limits.wallTimeMs ?? 0)
+    this.writeU32(limits.maxExportBytes ?? 0)
+    this.writeU32(limits.maxStdoutBytes ?? 0)
+    this.writeU32(limits.maxStderrBytes ?? 0)
+    this.writeU32(limits.maxBridgePayloadBytes ?? 0)
+    return this
+  }
+
+  toBuffer(): Buffer {
+    return Buffer.concat(this.parts)
+  }
+}
+
+// ── ResourceLimits ──────────────────────────────────────────────────────────
+
+export interface ResourceLimits {
+  memoryMb?: number
+  cpuTimeMs?: number
+  wallTimeMs?: number
+  maxExportBytes?: number
+  maxStdoutBytes?: number
+  maxStderrBytes?: number
+  maxBridgePayloadBytes?: number
+}
+
+// ── RunPayload ──────────────────────────────────────────────────────────────
+
+export interface RunPayloadOptions {
+  runId: number
+  code: string
+  filename?: string
+  limits?: ResourceLimits
+}
+
+/**
+ * Encode a `RunPayload` per `docs/protocol.md` §5.2.
+ * Globals and imports are empty for now (Phase 3+ / Phase 6+).
+ * @param options
+ */
+export function encodeRunPayload(options: RunPayloadOptions): Buffer {
+  return new PayloadWriter()
+    .writeU32(options.runId)
+    .writeString(options.code)
+    .writeOptionalString(options.filename)
+    .writeResourceLimits(options.limits ?? {})
+    .writeU32(0) // globals count
+    .writeU32(0) // imports count
+    .toBuffer()
+}
+
+// ── PrecompilePayload ───────────────────────────────────────────────────────
+
+export interface PrecompilePayloadOptions {
+  code: string
+  filename?: string
+  limits?: ResourceLimits
+}
+
+/**
+ * Encode a `PrecompilePayload` per `docs/protocol.md` §5.2.
+ * Same as `RunPayload` without `runId`.
+ * @param options
+ */
+export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buffer {
+  return new PayloadWriter()
+    .writeString(options.code)
+    .writeOptionalString(options.filename)
+    .writeResourceLimits(options.limits ?? {})
+    .writeU32(0) // globals count
+    .writeU32(0) // imports count
+    .toBuffer()
+}
+
+// ── PrefixRunPayload ────────────────────────────────────────────────────────
+
+export interface PrefixRunPayloadOptions {
+  runId: number
+  prefixId: string
+  code: string
+  filename?: string
+  limits?: ResourceLimits
+}
+
+/**
+ * Encode a `PrefixRunPayload` per `docs/protocol.md` §5.2.
+ * @param options
+ */
+export function encodePrefixRunPayload(options: PrefixRunPayloadOptions): Buffer {
+  return new PayloadWriter()
+    .writeU32(options.runId)
+    .writeString(options.prefixId)
+    .writeString(options.code)
+    .writeOptionalString(options.filename)
+    .writeResourceLimits(options.limits ?? {})
+    .writeU32(0) // globals count
+    .writeU32(0) // imports count
+    .toBuffer()
+}
+
+// ── DisposePrefixPayload ────────────────────────────────────────────────────
+
+/**
+ * Encode a `DisposePrefix` payload — just the PrefixId string.
+ * @param prefixId
+ */
+export function encodeDisposePrefixPayload(prefixId: string): Buffer {
+  return new PayloadWriter().writeString(prefixId).toBuffer()
 }
 
 export function parseTsToRustMessageType(
