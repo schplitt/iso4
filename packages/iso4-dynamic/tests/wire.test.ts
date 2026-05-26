@@ -1,9 +1,7 @@
 import { describe, expect, test } from 'vitest'
-import { WireDecodeError, decodeRunCompletionPayload, decodeWireValue } from '../src/wire'
+import { WireDecodeError, decodeRunCompletionPayload, decodeWireValue, decodePrecompileResultPayload } from '../src/wire'
 
 // ── decodePrecompileResultPayload ──────────────────────────────────────────
-
-import { decodePrecompileResultPayload } from '../src/wire.js'
 
 // ── Test-only encoder ──────────────────────────────────────────────────────
 //
@@ -693,7 +691,8 @@ describe('decodePrecompileResultPayload', () => {
     encodeString('SyntaxError', parts)
     encodeString(message, parts)
     if (stack !== undefined) {
-      parts.push(1); encodeString(stack, parts)
+      parts.push(1)
+      encodeString(stack, parts)
     } else {
       parts.push(0)
     }

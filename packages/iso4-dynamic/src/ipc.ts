@@ -389,7 +389,6 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buff
 // ── PrefixRunPayload ────────────────────────────────────────────────────────
 
 export interface PrefixRunPayloadOptions {
-  runId: number
   prefixId: string
   code: string
   filename?: string
@@ -398,9 +397,13 @@ export interface PrefixRunPayloadOptions {
 
 /**
  * Encode a `PrefixRunPayload` per `docs/protocol.md` §5.2.
+ * `runId` is managed by the client and injected at call time — not part of
+ * the public options interface.
  * @param options
  */
-export function encodePrefixRunPayload(options: PrefixRunPayloadOptions): Buffer {
+export function encodePrefixRunPayload(
+  options: PrefixRunPayloadOptions & { runId: number },
+): Buffer {
   return new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.prefixId)

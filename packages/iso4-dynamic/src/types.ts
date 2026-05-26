@@ -75,6 +75,11 @@ export interface Runtime {
    */
   dispose: () => Promise<void>
 
+  /**
+   * Enables `await using runtime = await createRuntime()` syntax.
+   */
+  [Symbol.asyncDispose]: () => Promise<void>
+
   readonly alive: boolean
 }
 
@@ -126,6 +131,11 @@ export interface DynamicPrefix {
    * Release the snapshot. Subsequent run() calls reject. Idempotent.
    */
   dispose: () => Promise<void>
+
+  /**
+   * Enables `await using prefix = await runtime.precompile(...)` syntax.
+   */
+  [Symbol.asyncDispose]: () => Promise<void>
 
   readonly alive: boolean
 }

@@ -14,18 +14,15 @@ import {
   encodeTsToRustFrame,
   parseRustToTsMessageType,
   parseTsToRustMessageType,
+  encodeRunPayload,
+  encodePrecompilePayload,
+  encodePrefixRunPayload,
+  encodeDisposePrefixPayload,
 } from '../src/ipc'
 
 import { Buffer } from 'node:buffer'
 
 // ── Payload encoders ───────────────────────────────────────────────────────
-
-import {
-  encodeRunPayload,
-  encodePrecompilePayload,
-  encodePrefixRunPayload,
-  encodeDisposePrefixPayload,
-} from '../src/ipc.js'
 
 describe('ipc frame codec', () => {
   test('frame roundtrip preserves type and payload', () => {
@@ -198,11 +195,11 @@ describe('payload encoders', () => {
   })
 
   test('encodeRunPayload with filename writes present byte and string', () => {
-    const buf = encodeRunPayload({ runId: 1, code: 'x', filename: 'agent.js' })
+    const buf = encodeRunPayload({ runId: 1, code: 'x', filename: 'agent' })
     const codeEnd = 4 + 4 + 1
     expect(buf[codeEnd]).toBe(1) // filename present
     const { value: fn } = readString(buf, codeEnd + 1)
-    expect(fn).toBe('agent.js')
+    expect(fn).toBe('agent')
   })
 
   test('encodePrecompilePayload has no runId prefix', () => {

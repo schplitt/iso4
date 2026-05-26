@@ -134,4 +134,4 @@ export type HostExportData
 
 export type HostExportFunction = (
   ...args: HostExportData[]
-) => Promise<HostExportData> | HostExportData
+) => (Promise<HostExportData | void> | HostExportData | void)
