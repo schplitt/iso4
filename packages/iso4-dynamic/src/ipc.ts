@@ -8,8 +8,11 @@ export const DEFAULT_MAX_FRAME_LENGTH: number = 64 * 1024 * 1024
 export const TsToRustMessageTypes = {
   Authenticate: 0x01,
   Run: 0x02,
-  BridgeResponse: 0x03,
-  Terminate: 0x04,
+  Precompile: 0x03,
+  PrefixRun: 0x04,
+  DisposePrefix: 0x05,
+  BridgeResponse: 0x06,
+  Terminate: 0x07,
 } as const
 
 export type TsToRustMessageType
@@ -17,8 +20,8 @@ export type TsToRustMessageType
 
 export const RustToTsMessageTypes = {
   BridgeCall: 0x01,
-  StdioChunk: 0x02,
-  Result: 0x03,
+  Result: 0x02,
+  PrecompileResult: 0x03,
   Log: 0x04,
 } as const
 
@@ -275,6 +278,9 @@ export function parseTsToRustMessageType(
   switch (byte) {
     case TsToRustMessageTypes.Authenticate:
     case TsToRustMessageTypes.Run:
+    case TsToRustMessageTypes.Precompile:
+    case TsToRustMessageTypes.PrefixRun:
+    case TsToRustMessageTypes.DisposePrefix:
     case TsToRustMessageTypes.BridgeResponse:
     case TsToRustMessageTypes.Terminate:
       return byte
@@ -288,8 +294,8 @@ export function parseRustToTsMessageType(
 ): RustToTsMessageType {
   switch (byte) {
     case RustToTsMessageTypes.BridgeCall:
-    case RustToTsMessageTypes.StdioChunk:
     case RustToTsMessageTypes.Result:
+    case RustToTsMessageTypes.PrecompileResult:
     case RustToTsMessageTypes.Log:
       return byte
     default:

@@ -59,7 +59,7 @@ async function listen(
 }
 
 describe('RuntimeIpcClient', () => {
-  test('connects, authenticates, sends Run, and collects stdout/stderr/result', async () => {
+  test('connects, authenticates, sends Run, and receives Result', async () => {
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
       socket.on('data', (chunk) => reader.push(chunk))
@@ -77,20 +77,10 @@ describe('RuntimeIpcClient', () => {
         'export default 42',
       )
 
+      // Result frame carries the full RunCompletionPayload (no StdioChunk
+      // in the real protocol — logs are inside the Result payload).
       socket.write(
-        encodeRustToTsFrame(
-          RustToTsMessageTypes.StdioChunk,
-          Buffer.concat([Buffer.from([0]), Buffer.from('hello stdout')]),
-        ),
-      )
-      socket.write(
-        encodeRustToTsFrame(
-          RustToTsMessageTypes.StdioChunk,
-          Buffer.concat([Buffer.from([1]), Buffer.from('hello stderr')]),
-        ),
-      )
-      socket.write(
-        encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('42')),
+        encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('payload')),
       )
     })
 
@@ -100,9 +90,7 @@ describe('RuntimeIpcClient', () => {
     })
     const result = await client.runRawCode('export default 42')
 
-    expect(result.stdout).toEqual(['hello stdout'])
-    expect(result.stderr).toEqual(['hello stderr'])
-    expect(Buffer.from(result.result).toString('utf8')).toBe('42')
+    expect(Buffer.from(result.result).toString('utf8')).toBe('payload')
 
     await client.dispose()
   })

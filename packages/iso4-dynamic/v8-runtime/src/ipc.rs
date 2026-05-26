@@ -35,6 +35,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_MAX_FRAME_LENGTH: u32 = 64 * 1024 * 1024;
 
 /// Message types sent from the TypeScript host to Rust.
+///
+/// Byte values match `docs/protocol.md` §2.1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TsToRustMessageType {
@@ -42,10 +44,16 @@ pub enum TsToRustMessageType {
     Authenticate = 0x01,
     /// Start a sandboxed execution.
     Run = 0x02,
+    /// Compile a prefix into a V8 snapshot.
+    Precompile = 0x03,
+    /// Run postfix code against a stored snapshot.
+    PrefixRun = 0x04,
+    /// Release a stored snapshot. Idempotent.
+    DisposePrefix = 0x05,
     /// Reply to a `BridgeCall` sent by Rust.
-    BridgeResponse = 0x03,
+    BridgeResponse = 0x06,
     /// Force-stop a running isolate.
-    Terminate = 0x04,
+    Terminate = 0x07,
 }
 
 /// Message types sent from Rust to the TypeScript host.
@@ -431,11 +439,14 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
     match byte {
         0x01 => Ok(TsToRustMessageType::Authenticate),
         0x02 => Ok(TsToRustMessageType::Run),
-        0x03 => Ok(TsToRustMessageType::BridgeResponse),
-        0x04 => Ok(TsToRustMessageType::Terminate),
+        0x03 => Ok(TsToRustMessageType::Precompile),
+        0x04 => Ok(TsToRustMessageType::PrefixRun),
+        0x05 => Ok(TsToRustMessageType::DisposePrefix),
+        0x06 => Ok(TsToRustMessageType::BridgeResponse),
+        0x07 => Ok(TsToRustMessageType::Terminate),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unknown TS->Rust message type: {byte:#02x}"),
+            format!("unknown TS->Rust message type: {byte:#04x}"),
         )),
     }
 }

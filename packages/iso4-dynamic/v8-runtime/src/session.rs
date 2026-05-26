@@ -135,12 +135,24 @@ pub fn handle_client(mut stream: UnixStream) {
                     break;
                 }
             }
-            ipc::TsToRustMessageType::Terminate => {
-                eprintln!("[iso4-v8] Terminate received — closing");
+            ipc::TsToRustMessageType::Precompile => {
+                eprintln!("[iso4-v8] Precompile not yet implemented — closing");
+                break;
+            }
+            ipc::TsToRustMessageType::PrefixRun => {
+                eprintln!("[iso4-v8] PrefixRun not yet implemented — closing");
+                break;
+            }
+            ipc::TsToRustMessageType::DisposePrefix => {
+                eprintln!("[iso4-v8] DisposePrefix not yet implemented — closing");
                 break;
             }
             ipc::TsToRustMessageType::BridgeResponse => {
                 eprintln!("[iso4-v8] unexpected BridgeResponse outside of run — closing");
+                break;
+            }
+            ipc::TsToRustMessageType::Terminate => {
+                eprintln!("[iso4-v8] Terminate received — closing");
                 break;
             }
         }

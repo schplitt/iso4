@@ -18,8 +18,6 @@ export interface RuntimeIpcClientOptions {
 }
 
 export interface RawRunResult {
-  stdout: string[]
-  stderr: string[]
   result: Uint8Array
 }
 
@@ -71,35 +69,10 @@ export class RuntimeIpcClient {
       encodeTsToRustFrame(TsToRustMessageTypes.Run, Buffer.from(code, 'utf8')),
     )
 
-    const stdout: string[] = []
-    const stderr: string[] = []
-
     for await (const frame of this.reader) {
       switch (frame.messageType) {
-        case RustToTsMessageTypes.StdioChunk: {
-          const stream = frame.payload[0]
-          const text = Buffer.from(
-            frame.payload.buffer,
-            frame.payload.byteOffset + 1,
-            Math.max(0, frame.payload.byteLength - 1),
-          ).toString('utf8')
-
-          if (stream === 0) {
-            stdout.push(text)
-          } else if (stream === 1) {
-            stderr.push(text)
-          } else {
-            throw new Error(`unknown stdio stream byte: ${String(stream)}`)
-          }
-          break
-        }
-
         case RustToTsMessageTypes.Result:
-          return {
-            stdout,
-            stderr,
-            result: frame.payload,
-          }
+          return { result: frame.payload }
 
         case RustToTsMessageTypes.Log:
           // Runtime diagnostics are intentionally ignored for the raw helper.

@@ -91,7 +91,11 @@ describe('typed frame codec', () => {
 
   test('message type parsers accept known values', () => {
     expect(parseTsToRustMessageType(0x01)).toBe(TsToRustMessageTypes.Authenticate)
-    expect(parseRustToTsMessageType(0x03)).toBe(RustToTsMessageTypes.Result)
+    expect(parseTsToRustMessageType(0x03)).toBe(TsToRustMessageTypes.Precompile)
+    expect(parseTsToRustMessageType(0x06)).toBe(TsToRustMessageTypes.BridgeResponse)
+    expect(parseTsToRustMessageType(0x07)).toBe(TsToRustMessageTypes.Terminate)
+    expect(parseRustToTsMessageType(0x02)).toBe(RustToTsMessageTypes.Result)
+    expect(parseRustToTsMessageType(0x03)).toBe(RustToTsMessageTypes.PrecompileResult)
   })
 })
 
@@ -118,7 +122,7 @@ describe('buffered frame reader', () => {
 
   test('reads merged frames one at a time', async () => {
     const reader = new FrameReader()
-    const first = encodeRustToTsFrame(RustToTsMessageTypes.StdioChunk, Buffer.from([0, 97]))
+    const first = encodeRustToTsFrame(RustToTsMessageTypes.Log, Buffer.from([0x01]))
     const second = encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('ok'))
 
     reader.push(Buffer.concat([first, second]))
@@ -126,8 +130,8 @@ describe('buffered frame reader', () => {
     const a = await reader.readRustToTsFrame()
     const b = await reader.readRustToTsFrame()
 
-    expect(a.messageType).toBe(RustToTsMessageTypes.StdioChunk)
-    expect([...a.payload]).toEqual([0, 97])
+    expect(a.messageType).toBe(RustToTsMessageTypes.Log)
+    expect([...a.payload]).toEqual([0x01])
     expect(b.messageType).toBe(RustToTsMessageTypes.Result)
     expect(Buffer.from(b.payload).toString('utf8')).toBe('ok')
   })
