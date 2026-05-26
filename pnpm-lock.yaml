@@ -99,6 +99,19 @@ importers:
       vitest:
         specifier: 'catalog:'
         version: 4.1.7(@types/node@24.12.4)(vite@8.0.14(@types/node@24.12.4)(yaml@2.9.0))
+    optionalDependencies:
+      '@iso4/v8-darwin-arm64':
+        specifier: workspace:*
+        version: link:../iso4-v8-darwin-arm64
+      '@iso4/v8-darwin-x64':
+        specifier: workspace:*
+        version: link:../iso4-v8-darwin-x64
+      '@iso4/v8-linux-arm64-gnu':
+        specifier: workspace:*
+        version: link:../iso4-v8-linux-arm64-gnu
+      '@iso4/v8-linux-x64-gnu':
+        specifier: workspace:*
+        version: link:../iso4-v8-linux-x64-gnu
 
   packages/iso4-fetch:
     devDependencies:
@@ -148,6 +161,14 @@ importers:
       vitest:
         specifier: 'catalog:'
         version: 4.1.7(@types/node@24.12.4)(vite@8.0.14(@types/node@24.12.4)(yaml@2.9.0))
+
+  packages/iso4-v8-darwin-arm64: {}
+
+  packages/iso4-v8-darwin-x64: {}
+
+  packages/iso4-v8-linux-arm64-gnu: {}
+
+  packages/iso4-v8-linux-x64-gnu: {}
 
 packages:
 

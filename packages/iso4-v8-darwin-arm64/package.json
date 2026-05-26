@@ -1,0 +1,25 @@
+{
+  "name": "@iso4/v8-darwin-arm64",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Native iso4 V8 runtime binary for darwin-arm64",
+  "license": "MIT",
+  "author": "schplitt",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./bin/iso4-v8": "./bin/iso4-v8"
+  },
+  "files": [
+    "index.js",
+    "bin/iso4-v8"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

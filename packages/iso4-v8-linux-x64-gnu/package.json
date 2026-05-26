@@ -1,0 +1,25 @@
+{
+  "name": "@iso4/v8-linux-x64-gnu",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Native iso4 V8 runtime binary for linux-x64-gnu",
+  "license": "MIT",
+  "author": "schplitt",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./bin/iso4-v8": "./bin/iso4-v8"
+  },
+  "files": [
+    "index.js",
+    "bin/iso4-v8"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
