@@ -5,13 +5,16 @@
  * isolate slot), and exposes the `Runtime` + `DynamicPrefix` API.
  */
 
-import { access } from 'node:fs/promises'
-import { cpus } from 'node:os'
+import { access, unlink } from 'node:fs/promises'
+import { cpus, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import process from 'node:process'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 
 import { resolveRuntimeBinary } from './binary'
-import { RuntimeIpcClient, DEFAULT_SOCKET_PATH } from './client'
+import { RuntimeIpcClient } from './client'
 import type { PrecompilePayloadOptions, PrefixRunPayloadOptions } from './ipc'
 import { ConnectionPool } from './pool'
 import {
@@ -28,8 +31,6 @@ import type {
   Runtime,
   RuntimeOptions,
 } from './types'
-
-import process from 'node:process'
 
 export type {
   // Re-exported from @iso4/core
@@ -63,17 +64,19 @@ export type {
   RunErrorCode,
 } from './types'
 
-// Hardcoded for Phase 1. Configurable via env-var pass-through in a later
-// phase once the socket path + token are no longer baked into the binary.
-const DEV_TOKEN = 'dev-token'
-
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export async function createRuntime(options?: RuntimeOptions): Promise<Runtime> {
   const binaryPath = resolveRuntimeBinary(options)
   const maxIsolates = options?.maxIsolates ?? cpus().length
 
-  const proc = spawn(binaryPath, [], {
+  // Generate a per-process unique socket path and a cryptographically
+  // random auth token. Both are passed as CLI args to the Rust binary so
+  // no other process can predict the path or authenticate.
+  const socketPath = join(tmpdir(), `iso4-v8-${process.pid}-${randomUUID().slice(0, 8)}.sock`)
+  const token = randomUUID()
+
+  const proc = spawn(binaryPath, ['--socket', socketPath, '--token', token], {
     // stdin closed, stdout ignored, stderr forwarded so runtime diagnostics
     // (the [iso4-v8] eprintln! lines) appear in the host process's stderr.
     stdio: ['ignore', 'ignore', 'inherit'],
@@ -83,16 +86,16 @@ export async function createRuntime(options?: RuntimeOptions): Promise<Runtime> 
     process.stderr.write(`[iso4] failed to start V8 process: ${err.message}\n`)
   })
 
-  await waitForSocket(DEFAULT_SOCKET_PATH)
+  await waitForSocket(socketPath)
 
   // Open all pool connections in parallel.
   const clients = await Promise.all(
     Array.from({ length: maxIsolates }, () =>
-      RuntimeIpcClient.connect({ socketPath: DEFAULT_SOCKET_PATH, token: DEV_TOKEN })),
+      RuntimeIpcClient.connect({ socketPath, token })),
   )
 
   const pool = new ConnectionPool(clients)
-  return new RuntimeImpl(proc, pool)
+  return new RuntimeImpl(proc, pool, socketPath)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -146,11 +149,13 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
 class RuntimeImpl implements Runtime {
   private readonly proc: ChildProcess
   private readonly pool: ConnectionPool
+  private readonly socketPath: string
   private _alive = true
 
-  constructor(proc: ChildProcess, pool: ConnectionPool) {
+  constructor(proc: ChildProcess, pool: ConnectionPool, socketPath: string) {
     this.proc = proc
     this.pool = pool
+    this.socketPath = socketPath
     proc.once('exit', () => {
       this._alive = false
     })
@@ -204,6 +209,13 @@ class RuntimeImpl implements Runtime {
     this._alive = false
     await this.pool.dispose()
     this.proc.kill()
+    // Best-effort cleanup: the Rust process leaves the socket file on disk
+    // after it exits. Remove it; ignore the error if it's already gone.
+    try {
+      await unlink(this.socketPath)
+    } catch {
+      // already removed or never created — that's fine
+    }
   }
 
   async [Symbol.asyncDispose](): Promise<void> {

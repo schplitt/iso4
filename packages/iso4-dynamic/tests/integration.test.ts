@@ -1,9 +1,9 @@
 /**
  * Comprehensive integration tests for \@iso4/dynamic.
  *
- * Uses a single runtime instance for ALL tests so we don't spawn multiple
- * binaries that would collide on the hardcoded /tmp/iso4-dynamic-v8.sock
- * path. Tests that need future phases are included and will fail with their
+ * Uses a single runtime instance for ALL tests to avoid the overhead of
+ * spawning multiple binaries. Tests that need future phases are included
+ * and will fail with their
  * real error — that's intentional so we can see exactly what's missing.
  *
  * Phase notes:

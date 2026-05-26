@@ -30,20 +30,19 @@ pub struct SharedState {
     pub prefix_store: Mutex<HashMap<String, Vec<u8>>>,
     /// Monotonically increasing counter for generating unique PrefixIds.
     pub next_prefix_id: AtomicU64,
+    /// Auth token — must match the token sent in every Authenticate frame.
+    pub token: String,
 }
 
 impl SharedState {
-    pub fn new() -> Self {
+    pub fn new(token: String) -> Self {
         Self {
             prefix_store: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),
+            token,
         }
     }
 }
-
-
-
-const EXPECTED_TOKEN: &str = "dev-token";
 
 pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
@@ -81,7 +80,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
         return;
     }
 
-    if auth.token != EXPECTED_TOKEN {
+    if auth.token != shared.token {
         eprintln!("[iso4-v8] bad token — closing");
         return;
     }

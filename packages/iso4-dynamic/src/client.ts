@@ -16,10 +16,8 @@ import {
 } from './ipc'
 import type { PrecompilePayloadOptions, PrefixRunPayloadOptions, ResourceLimits, RunPayloadOptions } from './ipc'
 
-export const DEFAULT_SOCKET_PATH: string = '/tmp/iso4-dynamic-v8.sock'
-
 export interface RuntimeIpcClientOptions {
-  socketPath?: string
+  socketPath: string
   token: string
 }
 
@@ -52,7 +50,7 @@ export class RuntimeIpcClient {
   }
 
   static async connect(options: RuntimeIpcClientOptions): Promise<RuntimeIpcClient> {
-    const socket = await connectSocket(options.socketPath ?? DEFAULT_SOCKET_PATH)
+    const socket = await connectSocket(options.socketPath)
     const client = new RuntimeIpcClient(socket)
 
     await client.write(

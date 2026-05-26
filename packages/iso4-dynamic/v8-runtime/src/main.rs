@@ -12,12 +12,12 @@ use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
-    let socket_path = "/tmp/iso4-dynamic-v8.sock";
+    let (socket_path, token) = parse_args();
 
     // Remove stale socket from a previous run if present.
-    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(&socket_path);
 
-    let listener = match UnixListener::bind(socket_path) {
+    let listener = match UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[iso4-v8] failed to bind socket at {socket_path}: {e}");
@@ -27,9 +27,9 @@ fn main() {
 
     eprintln!("[iso4-v8] listening on {socket_path}");
 
-    // Shared state across all connection threads: prefix snapshots and the
-    // counter used to generate unique PrefixIds.
-    let shared = Arc::new(session::SharedState::new());
+    // Shared state across all connection threads: prefix snapshots, the
+    // counter used to generate unique PrefixIds, and the auth token.
+    let shared = Arc::new(session::SharedState::new(token));
 
     for stream in listener.incoming() {
         match stream {
@@ -43,4 +43,39 @@ fn main() {
             }
         }
     }
+}
+
+fn parse_args() -> (String, String) {
+    let args: Vec<String> = std::env::args().collect();
+    let mut socket: Option<String> = None;
+    let mut token: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--socket" if i + 1 < args.len() => {
+                socket = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--token" if i + 1 < args.len() => {
+                token = Some(args[i + 1].clone());
+                i += 2;
+            }
+            arg => {
+                eprintln!("[iso4-v8] unknown argument: {arg}");
+                i += 1;
+            }
+        }
+    }
+
+    let socket = socket.unwrap_or_else(|| {
+        eprintln!("[iso4-v8] --socket <path> is required");
+        std::process::exit(1);
+    });
+    let token = token.unwrap_or_else(|| {
+        eprintln!("[iso4-v8] --token <secret> is required");
+        std::process::exit(1);
+    });
+
+    (socket, token)
 }
