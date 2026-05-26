@@ -2,9 +2,9 @@ import { Buffer } from 'node:buffer'
 import { createConnection } from 'node:net'
 import type { Socket } from 'node:net'
 import {
+  FrameReader,
   PROTOCOL_VERSION,
   RustToTsMessageTypes,
-  SocketFrameReader,
   TsToRustMessageTypes,
   encodeAuthenticatePayload,
   encodeTsToRustFrame,
@@ -25,12 +25,24 @@ export interface RawRunResult {
 
 export class RuntimeIpcClient {
   private readonly socket: Socket
-  private readonly reader: SocketFrameReader
+  private readonly reader: FrameReader
   private disposed = false
 
   private constructor(socket: Socket) {
     this.socket = socket
-    this.reader = new SocketFrameReader(socket)
+    this.reader = new FrameReader()
+    socket.on('data', (chunk: Buffer) => {
+      this.reader.push(chunk)
+    })
+    socket.once('error', (error: Error) => {
+      this.reader.close(error)
+    })
+    socket.once('end', () => {
+      this.reader.close(new Error('socket ended'))
+    })
+    socket.once('close', () => {
+      this.reader.close(new Error('socket closed'))
+    })
   }
 
   static async connect(options: RuntimeIpcClientOptions): Promise<RuntimeIpcClient> {
@@ -62,9 +74,7 @@ export class RuntimeIpcClient {
     const stdout: string[] = []
     const stderr: string[] = []
 
-    for (;;) {
-      const frame = await this.reader.readRustToTsFrame()
-
+    for await (const frame of this.reader) {
       switch (frame.messageType) {
         case RustToTsMessageTypes.StdioChunk: {
           const stream = frame.payload[0]
@@ -100,6 +110,8 @@ export class RuntimeIpcClient {
           throw new Error('BridgeCall is not implemented in raw IPC client')
       }
     }
+
+    throw new Error('connection closed before receiving a Result frame')
   }
 
   async dispose(): Promise<void> {

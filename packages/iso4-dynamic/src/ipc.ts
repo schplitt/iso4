@@ -88,6 +88,12 @@ export class FrameReader {
     }
   }
 
+  async *[Symbol.asyncIterator](): AsyncGenerator<RustToTsFrame> {
+    for (;;) {
+      yield await this.readRustToTsFrame()
+    }
+  }
+
   close(error: Error = new Error('frame reader closed')): void {
     if (this.closedError !== null) {
       return
@@ -137,33 +143,6 @@ export class FrameReader {
     const frameBytes = this.buffer.subarray(0, 4 + length)
     this.buffer = this.buffer.subarray(4 + length)
     return decodeFrame(frameBytes)
-  }
-}
-
-export class SocketFrameReader {
-  private readonly frames: FrameReader = new FrameReader()
-
-  constructor(socket: Socket) {
-    socket.on('data', (chunk: Buffer) => {
-      this.frames.push(chunk)
-    })
-    socket.once('error', (error: Error) => {
-      this.frames.close(error)
-    })
-    socket.once('end', () => {
-      this.frames.close(new Error('socket ended'))
-    })
-    socket.once('close', () => {
-      this.frames.close(new Error('socket closed'))
-    })
-  }
-
-  readFrame(): Promise<Frame> {
-    return this.frames.readFrame()
-  }
-
-  readRustToTsFrame(): Promise<RustToTsFrame> {
-    return this.frames.readRustToTsFrame()
   }
 }
 
