@@ -188,15 +188,18 @@ export interface RunFailure {
   durationMs: number
 }
 
-export interface SandboxExports {
+export type SandboxExports = {
   /**
    * Value of `export default` in user code, or `undefined`.
    */
   default: unknown
+
+}
+& {
   /**
-   * Map of named exports. Empty object if none.
+   * Other named exports.
    */
-  named: Record<string, unknown>
+  [name: string]: unknown
 }
 
 export interface RunError {
