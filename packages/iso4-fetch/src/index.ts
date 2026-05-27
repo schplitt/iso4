@@ -13,10 +13,12 @@
  * (see `../../../DESIGN.md` §9).
  */
 
-import type { FetchHandler } from 'iso4'
-import type { SafeFetchOptions } from './types'
+import type { FetchHandler, SafeFetchOptions } from './types'
 
 export type {
+  FetchHandler,
+  HostFetchRequest,
+  HostFetchResponse,
   SafeFetchOptions,
   SafeFetchPolicy,
   SafeFetchRequest,

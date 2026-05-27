@@ -16,9 +16,6 @@ import type { HostGlobals, ImportsConfig, ResourceLimits } from '@iso4/core'
 
 export type {
   ResourceLimits,
-  FetchHandler,
-  HostFetchRequest,
-  HostFetchResponse,
   HostGlobals,
   ImportsConfig,
   ImportDefinition,

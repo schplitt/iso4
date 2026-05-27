@@ -19,7 +19,7 @@ export interface ResourceLimits {
 
   /**
    * Maximum *active* execution time in milliseconds. Time spent waiting on
-   * host bridge calls (fetch, host imports) is excluded.
+   * host bridge calls (globals, host imports) is excluded.
    * @default 5_000
    */
   cpuTimeMs: number
@@ -31,55 +31,38 @@ export interface ResourceLimits {
   wallTimeMs: number
 
   /**
-   * Maximum bytes per `fetch` response body.
+   * Maximum bytes allowed in a single bridge call payload (arguments +
+   * return value combined). Applies to all host-bridge calls — globals and
+   * host imports alike.
    * @default 16 * 1024 * 1024
    */
-  maxFetchBodyBytes: number
+  maxBridgePayloadBytes: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Fetch (shared — @iso4/fetch implements FetchHandler for both runtimes)
-// ─────────────────────────────────────────────────────────────────────────
-
-/**
- * Host-side fetch handler. Implement directly or use \@iso4/fetch.
- */
-export type FetchHandler = (
-  request: HostFetchRequest,
-) => Promise<HostFetchResponse> | HostFetchResponse
-
-export interface HostFetchRequest {
-  url: string
-  method: string
-  /**
-   * Lower-cased, deduped.
-   */
-  headers: Record<string, string>
-  /**
-   * null for bodyless methods. Strings are UTF-8.
-   */
-  body: Uint8Array | string | null
-  signal: AbortSignal
-}
-
-export interface HostFetchResponse {
-  status: number
-  statusText?: string
-  headers: Record<string, string>
-  body: Uint8Array | string | null
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Globals allowlist (same shape for both runtimes)
+// Globals (generic bridge — any non-reserved name is permitted)
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
- * Host-providable globals. Only allowlisted names are accepted.
- * Fetch is allowed in both runtimes even if rarely useful in \@iso4/static.
+ * Host-provided globals. Any name not reserved by V8 or the runtime is
+ * permitted. Each value becomes a bridge stub in the sandbox global object.
+ *
+ * Reserved names (must not be used): `console`, `URL`, `URLSearchParams`,
+ * `TextEncoder`, `TextDecoder`, `crypto`, `Event`, `AbortController`,
+ * `AbortSignal`.
+ *
+ * Common usage:
+ * ```ts
+ * globals: {
+ *   fetch: myFetchHandler,   // \@iso4/fetch provides createSafeFetch()
+ *   myTool: async (arg) => doSomething(arg),
+ * }
+ * ```
+ *
+ * `fetch` is not special — it goes through the same bridge path as any
+ * other entry. See DESIGN.md §4.2 and §12.1.
  */
-export interface HostGlobals {
-  fetch?: FetchHandler
-}
+export type HostGlobals = Record<string, HostExportFunction>
 
 // ─────────────────────────────────────────────────────────────────────────
 // Imports (same resolution model for both runtimes)

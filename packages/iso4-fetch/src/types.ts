@@ -1,5 +1,5 @@
 /**
- * \@iso4/fetch — option and policy types for hardened FetchHandler construction.
+ * \@iso4/fetch — FetchHandler types and option/policy types for hardened fetch.
  *
  * The package's job is to produce a `FetchHandler` (defined in `iso4`) that
  * delegates allow/deny decisions to a host-supplied **policy callback**.
@@ -19,6 +19,54 @@
  * URL canonicalization and header validation. The shape is stable: future
  * additions are optional fields, never breaking changes to existing ones.
  */
+// ─────────────────────────────────────────────────────────────────────────
+// FetchHandler — the typed interface for a fetch-compatible bridge handler.
+// These types live here, not in \@iso4/core, because fetch handling is not
+// a core bridge concern. The core bridge is generic: HostExportFunction.
+// FetchHandler is a convenience wrapper with fetch-shaped request/response.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * The request object a FetchHandler receives. Reflects the sandbox's
+ * `fetch(url, init)` call after URL parsing and header normalisation.
+ */
+export interface HostFetchRequest {
+  url: string
+  method: string
+  /**
+   * Header names are lowercased.
+   */
+  headers: Record<string, string>
+  /**
+   * null for bodyless methods.
+   */
+  body: Uint8Array | string | null
+}
+
+export interface HostFetchResponse {
+  status: number
+  statusText?: string
+  headers: Record<string, string>
+  body: Uint8Array | string | null
+}
+
+/**
+ * A typed handler for a `fetch`-compatible global. Implement directly or
+ * use `createSafeFetch` from this package.
+ *
+ * Plug into globals:
+ * ```ts
+ * globals: { fetch: myHandler }
+ * ```
+ */
+export type FetchHandler = (
+  request: HostFetchRequest,
+) => Promise<HostFetchResponse> | HostFetchResponse
+
+// ─────────────────────────────────────────────────────────────────────────
+// SafeFetch policy types — for createSafeFetch() option surface.
+// ─────────────────────────────────────────────────────────────────────────
+
 export interface SafeFetchRequest {
   /**
    * Full canonical URL string, e.g. `"https://api.example.com/users?x=1"`.
@@ -147,9 +195,6 @@ export interface SafeFetchOptions {
 
   /**
    * Maximum response body size in bytes, enforced pre-decompression.
-   * `iso4` core also caps responses based on `limits.maxFetchBodyBytes`;
-   * whichever is lower wins.
-   *
    * @default 16 * 1024 * 1024
    */
   maxBodyBytes?: number

@@ -274,31 +274,28 @@ that calls `isolate.terminate_execution()` when the bracketed time exceeds
 **Wall time** is a single guard timer that fires regardless. Catches
 runaway-await cases (e.g., host fetch implementation never resolves).
 
-### 4.2 Globals (restricted)
+### 4.2 Globals (block-listed, not allowlisted)
 
-Globals are _not_ a free-for-all. The runtime owns most of the global
-namespace; the host can only contribute from a known allowlist. Reasons:
+Globals are _not_ a free-for-all. The runtime owns a fixed set of reserved
+names that the host must not shadow:
 
-- `console` is owned by the runtime so it can route output to
-  `result.stdout` / `result.stderr` reliably.
-- Globals like `URL`, `TextEncoder`, `crypto.subtle` come from V8 and must
-  not be shadowed.
-- Letting the host inject arbitrary names into the global namespace makes
-  user-code intent ambiguous (was `myThing` user-defined or host-supplied?).
+- `console` — owned by the runtime for output capture.
+- V8 built-ins: `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
+  `crypto`, `Event`, `AbortController`, `AbortSignal`, etc.
 
-For v1, the host-providable globals are:
+Any name **not** on that reserved list may be provided by the host as a
+global. The host passes `globals: { fetch: fn, myTool: fn, transform: fn }`
+and each name becomes a bridge stub in the sandbox's global object —
+callable from user code just like a built-in.
 
-| Name    | Purpose                                         |
-| ------- | ----------------------------------------------- |
-| `fetch` | The single I/O entry point. Permission-checked. |
+`fetch` is not special in this mechanism. It is simply the most common
+global name hosts will provide. It goes through the exact same bridge path
+as `myTool` or any other host-provided global (see §12.1).
 
-Everything else the host wants to expose goes through `imports`. This keeps
-the global namespace small and predictable, and forces extension to happen
-through a named, statically-greppable mechanism.
-
-(If a future need arises for a second global, it goes through the same
-allowlist mechanism with an explicit decision in this doc, not as a generic
-"host can inject anything" knob.)
+Everything else the host wants to expose goes through `imports`. Globals are
+for things user code expects to find as a bare name (`fetch(url)` not
+`import { fetch } from 'host:net'`). When in doubt, prefer `imports` —
+they are statically greppable and cannot accidentally shadow a built-in.
 
 ### 4.3 Imports
 
@@ -771,18 +768,30 @@ that no one would get right at the application layer; the **host author**
 must decide policy. The library cannot decide policy. The host author
 should not have to worry about CRLF injection.
 
-### 12.1 What actually happens when sandbox JS calls a host function such as `fetch`
+### 12.1 What actually happens when sandbox JS calls a host-provided global
 
-`fetch` is not special in the V8 runtime. If the host wants to expose a
-`fetch`-like function, it is installed through the same host bridge mechanism
-as any other configured global/function or host import. The sandbox call is
-bundled as plain data, Rust sends a `BridgeCall`, the TypeScript host runs the
-configured handler, and the result is passed back via `BridgeResponse`.
+Host-provided globals (`fetch`, `myTool`, or any other non-reserved name)
+are installed as bridge stubs in the V8 context. When sandbox code calls
+one, the call is serialized as plain data via V8 `ValueSerializer`, Rust
+sends a `BridgeCall` frame with the function name and arguments, the
+TypeScript host runs the configured handler for that name, and the result
+is passed back via `BridgeResponse`.
+
+**The bridge is fully generic.** It has no knowledge of fetch semantics,
+URL parsing, or HTTP. `fetch` is just a string key the host chose to
+register. If the host registers `{ fetch: myFn }`, then `myFn` is called
+with whatever V8-deserialized arguments the sandbox passed.
 
 **The bridge does NOT auto-route to `globalThis.fetch` on the host.** If the
 host author writes a handler that calls `globalThis.fetch`, then yes, the
 host's real network stack runs with sandbox-controlled inputs. If they write
 something restrictive, that runs. The bridge is just a function-call protocol.
+
+This means `FetchHandler`, `HostFetchRequest`, and `HostFetchResponse` are
+**not core types**. They are convenience types defined in `@iso4/fetch` that
+describe the expected call shape for a `fetch`-compatible handler. Core only
+knows `HostExportFunction` — a function that takes `HostExportData` arguments
+and returns `HostExportData`.
 
 ### 12.2 Attack categories and where each is mitigated
 
@@ -808,14 +817,18 @@ the generic host-bridge error path.
 ### 12.3 Package boundaries for fetch
 
 - **`iso4`** ships:
-  - Generic host-bridge plumbing for configured globals/functions and imports.
-  - No default HTTP client. `fetch` is not special-cased as an always-present
-    runtime global; if the host wants to expose it, it is configured through
-    the same bridge mechanism as other host-provided globals/functions.
+  - Generic host-bridge plumbing for globals and imports. The bridge
+    serializes call arguments and return values as `HostExportData` in both
+    directions. No fetch-specific logic anywhere in the core.
+  - `HostGlobals` is `Record<string, HostExportFunction>` — any non-reserved
+    name, any bridge function.
 
 - **`@iso4/fetch`** ships:
+  - `FetchHandler`, `HostFetchRequest`, `HostFetchResponse` — typed
+    convenience wrapper for the fetch call shape.
   - `createSafeFetch({ allowedHosts, blockPrivateIPs, maxRedirects, timeout, ... })`
-    returning a hardened `FetchHandler`.
+    returning a `HostExportFunction`-compatible handler that does all the
+    mechanical hygiene before calling the real network.
   - DNS pre-resolution with IP pinning.
   - Isolated `undici` Dispatcher (no shared connection pool with the host).
   - Per-host rate limiting hooks.

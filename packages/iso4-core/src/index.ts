@@ -1,8 +1,5 @@
 export type {
   ResourceLimits,
-  FetchHandler,
-  HostFetchRequest,
-  HostFetchResponse,
   HostGlobals,
   ImportsConfig,
   ImportDefinition,
