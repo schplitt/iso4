@@ -124,6 +124,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 let result_payload = match sandbox::execute(
                     &payload.code,
                     payload.filename.as_deref(),
+                    sandbox::Limits {
+                        wall_time_ms: payload.limits.wall_time_ms,
+                        cpu_time_ms:  payload.limits.cpu_time_ms,
+                        memory_mb:    payload.limits.memory_mb,
+                    },
                 ) {
                     Ok(output) => {
                         eprintln!("[iso4-v8] run succeeded in {}ms", output.duration_ms);
@@ -269,6 +274,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             &snapshot_bytes,
                             &payload.code,
                             payload.filename.as_deref(),
+                            sandbox::Limits {
+                                wall_time_ms: payload.limits.wall_time_ms,
+                                cpu_time_ms:  payload.limits.cpu_time_ms,
+                                memory_mb:    payload.limits.memory_mb,
+                            },
                         ) {
                             Ok(output) => {
                                 eprintln!(

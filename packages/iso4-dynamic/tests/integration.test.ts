@@ -924,29 +924,29 @@ describe('resource limits (Phase 3/8)', () => {
     }
   })
 
-  // Skipped: infinite loop hangs the suite until Phase 3 enforces cpu budget
-  test.skip('tight cpu budget kills tight loop (Phase 3)', async () => {
+  test('tight cpu budget kills tight loop', async () => {
     const result = await runtime.run({
-      code: 'let i = 0; while(true) i++; export default i',
-      limits: { cpuTimeMs: 100, wallTimeMs: 2_000 },
+      code: 'let i = 0; while (true) { i++; }',
+      limits: { cpuTimeMs: 200, wallTimeMs: 2_000 },
     })
     expect(result.ok).toBe(false)
     if (result.ok)
       return
     expect(['ERR_CPU_TIMEOUT', 'ERR_WALL_TIMEOUT']).toContain(result.error.code)
-  })
+  }, 5_000)
 
-  // Skipped: slow async hangs the suite until Phase 3 enforces wall timeout
-  test.skip('tight wall timeout kills slow async (Phase 3)', async () => {
+  // wall timeout via async hang (e.g. await slowFetch()) requires Phase 4 bridge.
+  // Use a tight loop with wall_time_ms < cpu_time_ms to test wall timeout:
+  test('wall timeout fires before cpu timeout', async () => {
     const result = await runtime.run({
-      code: 'export default await new Promise(r => setTimeout(r, 60_000))',
-      limits: { wallTimeMs: 200 },
+      code: 'let i = 0; while (true) { i++; }',
+      limits: { cpuTimeMs: 30_000, wallTimeMs: 200 },
     })
     expect(result.ok).toBe(false)
     if (result.ok)
       return
     expect(result.error.code).toBe('ERR_WALL_TIMEOUT')
-  })
+  }, 5_000)
 
   // Skipped: memory exhaustion OOMs the process until Phase 8 enforces heap limit
   test.skip('heap limit kills memory hog (Phase 8)', async () => {

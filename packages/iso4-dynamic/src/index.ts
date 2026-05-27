@@ -35,9 +35,6 @@ import type {
 export type {
   // Re-exported from @iso4/core
   ResourceLimits,
-  FetchHandler,
-  HostFetchRequest,
-  HostFetchResponse,
   HostGlobals,
   ImportsConfig,
   ImportDefinition,

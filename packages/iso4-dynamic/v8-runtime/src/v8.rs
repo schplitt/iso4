@@ -4,7 +4,13 @@
 //! evaluation, result extraction, console capture, and limit enforcement.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::sync::Once;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::RecvTimeoutError;
 
 use crate::wire::WireValue;
 
@@ -24,6 +30,79 @@ pub fn init_platform() {
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
+}
+
+// ── Limits ───────────────────────────────────────────────────────────────────
+
+/// Resource limits for a single run. Zero means "no limit" for that field.
+#[derive(Clone, Copy, Default)]
+pub struct Limits {
+    pub wall_time_ms: u32,
+    pub cpu_time_ms:  u32,
+    pub memory_mb:    u32, // reserved — enforced in Phase 8
+}
+
+
+/// Termination reason set by the first limit-guard thread to fire.
+///
+/// Stored in a `OnceLock` — first write wins, subsequent writes are no-ops.
+/// The two-variant enum means absence of timeout is represented naturally
+/// by `OnceLock::get()` returning `None`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminationReason {
+    Wall,
+    Cpu,
+}
+
+/// Tracks how much active V8 execution time has elapsed.
+///
+/// `enter()` / `leave()` bracket each period when V8 is actually running JS.
+/// Time spent waiting on host bridge calls (Phase 4+) is excluded by calling
+/// `leave()` before dispatching a bridge call and `enter()` on return.
+///
+/// Without bridge calls (current), `enter()` is called once just before
+/// `module.evaluate()` and `leave()` once when the run ends, so `elapsed_ms()`
+/// equals the wall time of the evaluation phase (compile + instantiate time
+/// excluded).
+pub struct CpuBudget {
+    accumulated_ns: AtomicU64,
+    epoch_start:    Mutex<Option<Instant>>,
+}
+
+impl CpuBudget {
+    pub fn new() -> Self {
+        Self {
+            accumulated_ns: AtomicU64::new(0),
+            epoch_start:    Mutex::new(None),
+        }
+    }
+
+    /// Mark the start of a V8 execution epoch.
+    pub fn enter(&self) {
+        *self.epoch_start.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// End the current epoch and accumulate its duration.
+    pub fn leave(&self) {
+        let mut g = self.epoch_start.lock().unwrap();
+        if let Some(t) = g.take() {
+            self.accumulated_ns.fetch_add(
+                t.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Total accumulated CPU time in milliseconds.
+    pub fn elapsed_ms(&self) -> u64 {
+        let base   = self.accumulated_ns.load(Ordering::Relaxed);
+        let active = self.epoch_start
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        (base + active) / 1_000_000
+    }
 }
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -89,8 +168,12 @@ pub enum RunError {
 /// Execute a sandboxed run and return the full output.
 ///
 /// `filename` is used in V8 stack traces. Defaults to `"<iso4>"` when `None`.
-pub fn execute(code: &str, filename: Option<&str>) -> Result<Output, FailureOutput> {
-    run_code(code, filename.unwrap_or("<iso4>"))
+pub fn execute(
+    code: &str,
+    filename: Option<&str>,
+    limits: Limits,
+) -> Result<Output, FailureOutput> {
+    run_code(code, filename.unwrap_or("<iso4>"), limits)
 }
 
 /// Execute a postfix against a pre-compiled prefix snapshot.
@@ -101,9 +184,10 @@ pub fn execute_with_prefix(
     snapshot_bytes: &[u8],
     code: &str,
     filename: Option<&str>,
+    limits: Limits,
 ) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename.unwrap_or("<iso4>"), Some(snapshot_bytes))
+    run_module(code, filename.unwrap_or("<iso4>"), Some(snapshot_bytes), limits)
 }
 
 /// Compile prefix code into a V8 startup snapshot blob.
@@ -114,6 +198,10 @@ pub fn execute_with_prefix(
 /// Note: `console` is **not** available inside prefix code — native callbacks
 /// cannot be snapshotted without `ExternalReferences` (a Phase 2 concern).
 /// Prefix code that calls `console.*` will receive a `TypeError`.
+///
+/// No execution-time limits are applied: prefix code is host-authored and
+/// trusted. If execution limits are needed for snapshot creation in future,
+/// add an optional `limits: Limits` parameter here.
 pub fn precompile(
     code: &str,
     filename: Option<&str>,
@@ -123,9 +211,9 @@ pub fn precompile(
 }
 
 /// Core execution — separated from `execute` so tests can call it directly.
-fn run_code(code: &str, filename: &str) -> Result<Output, FailureOutput> {
+fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename, None)
+    run_module(code, filename, None, limits)
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
@@ -137,6 +225,7 @@ fn run_module(
     code: &str,
     filename: &str,
     snapshot: Option<&[u8]>,
+    limits: Limits,
 ) -> Result<Output, FailureOutput> {
     let start = std::time::Instant::now();
     let mut logs = LogBuffers::default();
@@ -149,6 +238,64 @@ fn run_module(
         }
     };
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Auto);
+
+    // ── Limit guard threads ───────────────────────────────────────────────────
+    //
+    // CURRENT APPROACH: one OS guard thread per limit type per run
+    // ─────────────────────────────────────────────────────────────
+    // Each run spawns up to two short-lived guard threads:
+    //   • wall guard  — sleeps for wall_time_ms, fires terminate_execution()
+    //   • cpu guard   — polls budget.elapsed_ms() every 10 ms, fires on excess
+    //
+    // This is simple, correct, and sufficient for typical agent workloads
+    // (10–50 concurrent runs). At 100 concurrent runs: 200 guard threads.
+    // Modern Linux supports ~10k threads; macOS supports ~2k. In practice
+    // these threads sleep for the run duration and consume negligible CPU.
+    //
+    // REVISIT IF: throughput regularly exceeds ~200–300 concurrent runs on a
+    // single binary, or thread-spawn latency shows up in profiling.
+    //
+    // POOLING ALTERNATIVE (e.g. isolated-vm's approach)
+    // ─────────────────────────────────────────────────
+    // A single shared priority-queue timer thread manages all pending deadlines:
+    //   1. Each run registers (deadline, IsolateHandle) into the shared queue.
+    //   2. The pool thread sleeps until the nearest deadline.
+    //   3. On expiry it calls isolate.request_interrupt(callback) — this
+    //      delivers a callback *within* the V8 isolate at the next JS safepoint,
+    //      and the callback calls terminate_execution().
+    //   4. RequestInterrupt is thread-safe and does not require the V8 thread.
+    //
+    // At 100 concurrent runs: ~1 pool thread instead of 200. isolated-vm uses
+    // exactly this model (src/isolate/run_with_timeout.h + src/lib/timer.cc).
+    //
+    // OTHER OPTIONS TO EVALUATE BEFORE BUILDING THE POOL
+    // ────────────────────────────────────────────────────
+    // • OS-level SIGALRM / timer_create per thread (POSIX, avoids user-space
+    //   poll but requires signal-safe V8 interaction — fragile).
+    // • tokio::time::timeout wrapping a blocking thread — does NOT work for
+    //   tight JS loops (monopolises the async executor; timer never fires).
+    // • Two-process SIGKILL as absolute backstop — iso4's architecture already
+    //   provides this: the Node host can kill the Rust subprocess unconditionally
+    //   on wall-timeout, something in-process runtimes (isolated-vm, Node vm)
+    //   fundamentally cannot do without crashing the host.
+    //
+    // See .notes/timeout-enforcement.md for the full research brief.
+    //
+    // Both guards are set up before entering V8 scopes so the IsolateHandle
+    // is obtained while we still hold a plain &Isolate borrow.
+    let reason         = Arc::new(OnceLock::<TerminationReason>::new());
+    let handle         = isolate.thread_safe_handle();
+    let cancel_handle  = handle.clone(); // for cancel_terminate_execution on success
+    let cpu_budget     = Arc::new(CpuBudget::new());
+    let cancel_wall    = start_wall_guard(handle.clone(), Arc::clone(&reason), limits.wall_time_ms);
+    let cancel_cpu     = start_cpu_guard(handle, Arc::clone(&reason), Arc::clone(&cpu_budget), limits.cpu_time_ms);
+    // cpu_budget.enter() is called immediately before module.evaluate() so
+    // compilation and scope setup time is not charged against the CPU budget.
+    let _guard_canceller = GuardCanceller {
+        cancel_wall: &cancel_wall,
+        cancel_cpu:  &cancel_cpu,
+        budget:      &cpu_budget,
+    };
 
     let scope = &mut v8::HandleScope::new(&mut isolate);
     let context = v8::Context::new(scope, Default::default());
@@ -209,17 +356,27 @@ fn run_module(
         ));
     }
 
+    cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
     let evaluation = match module.evaluate(scope) {
-        Some(value) => value,
+        Some(value) => {
+            // Run completed — cancel guards before inspecting exports.
+            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+            // Clear any sticky termination flag a late-firing guard may have
+            // set after evaluate() returned, so export extraction succeeds.
+            cancel_handle.cancel_terminate_execution();
+            value
+        }
         None => {
-            return Err(failure(
-                RunError::RuntimeError {
+            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+            let error = match reason.get().copied() {
+                Some(TerminationReason::Wall) => RunError::WallTimeout,
+                Some(TerminationReason::Cpu)  => RunError::CpuTimeout,
+                None => RunError::RuntimeError {
                     message: exception_message(scope),
-                    stack: exception_stack(scope),
+                    stack:   exception_stack(scope),
                 },
-                &logs,
-                start,
-            ));
+            };
+            return Err(failure(error, &logs, start));
         }
     };
 
@@ -235,6 +392,7 @@ fn run_module(
             v8::PromiseState::Fulfilled => {}
             v8::PromiseState::Rejected => {
                 let rejection = promise.result(scope);
+                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
                 return Err(failure(
                     runtime_error_from_value(scope, rejection),
                     &logs,
@@ -242,6 +400,7 @@ fn run_module(
                 ));
             }
             v8::PromiseState::Pending => {
+                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
                 return Err(failure(
                     RunError::ExportNotSerializable(
                         "module evaluation promise is still pending".to_string(),
@@ -481,6 +640,90 @@ fn no_import_resolver<'a>(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// ── Limit guard helpers ────────────────────────────────────────────────────
+
+/// Spawn a wall-clock guard thread. Returns a cancel sender.
+/// Sending anything on it (or dropping it) cancels the guard.
+/// If `wall_time_ms == 0`, no thread is spawned but a sender is still returned.
+fn start_wall_guard(
+    handle: v8::IsolateHandle,
+    reason: Arc<OnceLock<TerminationReason>>,
+    wall_time_ms: u32,
+) -> crossbeam_channel::Sender<()> {
+    let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+    if wall_time_ms > 0 {
+        std::thread::spawn(move || {
+            let timeout = Duration::from_millis(wall_time_ms as u64);
+            if let Err(crossbeam_channel::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
+                reason.set(TerminationReason::Wall).ok(); // first writer wins
+                handle.terminate_execution();
+            }
+            // Err(Disconnected) means cancel_guards() fired first — do nothing.
+        });
+    }
+    tx
+}
+
+/// Spawn a CPU-budget guard thread. Returns a cancel sender.
+/// Polls `budget.elapsed_ms()` every 10 ms; fires when it exceeds `cpu_time_ms`.
+/// Phase 4 hook: call `budget.leave()` before bridge calls and `budget.enter()`
+/// after to exclude host wait time from the measurement.
+fn start_cpu_guard(
+    handle: v8::IsolateHandle,
+    reason: Arc<OnceLock<TerminationReason>>,
+    budget: Arc<CpuBudget>,
+    cpu_time_ms: u32,
+) -> crossbeam_channel::Sender<()> {
+    let (tx, rx) = crossbeam_channel::bounded::<()>(1);
+    if cpu_time_ms > 0 {
+        std::thread::spawn(move || loop {
+            match rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(_) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    if budget.elapsed_ms() >= cpu_time_ms as u64 {
+                        reason.set(TerminationReason::Cpu).ok(); // first writer wins
+                        handle.terminate_execution();
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    tx
+}
+
+/// Cancel both guard threads and close the CPU epoch.
+///
+/// Idempotent: safe to call more than once on the same guard set.
+/// Must be called on every exit path from `run_module` after evaluation.
+fn cancel_guards(
+    cancel_wall: &crossbeam_channel::Sender<()>,
+    cancel_cpu: &crossbeam_channel::Sender<()>,
+    budget: &CpuBudget,
+) {
+    budget.leave();
+    let _ = cancel_wall.send(());
+    let _ = cancel_cpu.send(());
+}
+
+/// RAII guard that cancels limit-enforcement threads on drop.
+///
+/// Ensures guards exit promptly even when `run_module` returns early via `?`.
+/// All explicit `cancel_guards(...)` calls are kept for clarity and early
+/// cancellation; this struct is defence-in-depth for error-path returns.
+struct GuardCanceller<'a> {
+    cancel_wall: &'a crossbeam_channel::Sender<()>,
+    cancel_cpu:  &'a crossbeam_channel::Sender<()>,
+    budget:      &'a CpuBudget,
+}
+
+impl Drop for GuardCanceller<'_> {
+    fn drop(&mut self) {
+        cancel_guards(self.cancel_wall, self.cancel_cpu, self.budget);
+    }
+}
+
 
 fn install_console(scope: &mut v8::HandleScope, buffers: *mut LogBuffers) -> Result<(), RunError> {
     let console = v8::Object::new(scope);
@@ -846,7 +1089,7 @@ mod tests {
 
     /// Shorthand: run a code string and return the full Output or RunError.
     fn run(code: &str) -> Result<Output, RunError> {
-        run_code(code, "<iso4>").map_err(|failure| failure.error)
+        run_code(code, "<iso4>", Limits::default()).map_err(|failure| failure.error)
     }
 
     /// Shorthand: expect success and return the Output, panic otherwise.
@@ -1158,6 +1401,7 @@ mod tests {
             throw new Error("boom")
             "#,
             "<iso4>",
+            Limits::default(),
         )
         .unwrap_err();
 
@@ -1554,10 +1798,99 @@ mod tests {
     // or OOM the process. Un-ignore when the corresponding phase lands.
 
     #[test]
-    #[ignore = "requires cpu timeout (Phase 1 wall-clock, Phase 3 cpu budget)"]
-    fn infinite_loop_is_cpu_timeout() {
-        let err = run_err("while(true) {}");
+    fn infinite_loop_hits_cpu_or_wall_timeout() {
+        // cpu_time_ms=200, wall_time_ms=1000: the CPU guard fires at ~200–210ms,
+        // the wall guard fires at 1000ms. CpuTimeout must always win by ~800ms.
+        let err = run_code(
+            "while(true) {}",
+            "<test>",
+            Limits { cpu_time_ms: 200, wall_time_ms: 1_000, ..Default::default() },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CpuTimeout),
+            "expected CpuTimeout (cpu=200ms fires ~800ms before wall=1000ms), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn limits_zero_means_disabled() {
+        let out = run_code(
+            "export default 42",
+            "<test>",
+            Limits { cpu_time_ms: 0, wall_time_ms: 0, ..Default::default() },
+        ).unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn run_within_budget_succeeds() {
+        let out = run_code(
+            "let s = 0; for (let i = 0; i < 10_000; i++) s += i; export default s",
+            "<test>",
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+        ).unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("49995000"));
+    }
+
+    #[test]
+    fn execute_with_prefix_infinite_loop_is_killed() {
+        let snapshot = precompile("globalThis.base = 10", None).unwrap();
+        let err = execute_with_prefix(
+            &snapshot,
+            "while (true) {}",
+            None,
+            Limits { cpu_time_ms: 200, wall_time_ms: 1_000, ..Default::default() },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CpuTimeout | RunError::WallTimeout),
+            "expected timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn for_loop_infinite_hits_timeout() {
+        let err = run_code(
+            "for (let i = 0;;) i++",
+            "<test>",
+            Limits { cpu_time_ms: 200, wall_time_ms: 1_000, ..Default::default() },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
         assert!(matches!(err, RunError::CpuTimeout | RunError::WallTimeout));
+    }
+
+    #[test]
+    fn deep_recursion_is_runtime_error_not_timeout() {
+        let err = run_code(
+            "function inf(n) { return inf(n + 1); } export default inf(0)",
+            "<test>",
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::RuntimeError { .. }),
+            "expected RuntimeError (stack overflow), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn very_tight_wall_limit_fires() {
+        let err = run_code(
+            "while (true) {}",
+            "<test>",
+            Limits { cpu_time_ms: 30_000, wall_time_ms: 1, ..Default::default() },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::WallTimeout | RunError::CpuTimeout),
+            "expected timeout, got {err:?}"
+        );
     }
 
     #[test]
@@ -1573,14 +1906,26 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires wall-clock timeout (Phase 1)"]
-    fn long_running_async_is_wall_timeout() {
-        let err = run_err(
-            r#"
-            export default await new Promise(resolve => setTimeout(resolve, 999999))
-            "#,
+    fn wall_timeout_fires_before_cpu_timeout() {
+        // wall_time_ms is tight; cpu_time_ms is generous.
+        // A tight loop must be killed by the wall clock, not the CPU budget.
+        //
+        // Note: "pure async hang" (awaiting a never-resolving Promise) returns
+        // synchronously from module.evaluate() with a pending Promise — V8 has
+        // already returned control to us, so there is nothing to interrupt.
+        // That case is ERR_EXPORT_NOT_SERIALIZABLE. Interrupting a bridge call
+        // that never returns is the real async-hang scenario (Phase 4).
+        let err = run_code(
+            "let i = 0; while (true) { i++; }",
+            "<test>",
+            Limits { wall_time_ms: 200, cpu_time_ms: 30_000, ..Default::default() },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::WallTimeout),
+            "expected WallTimeout, got {err:?}"
         );
-        assert!(matches!(err, RunError::WallTimeout));
     }
 
     // ── Source modules (host-provided JS) ───────────────────────────────
@@ -1807,7 +2152,7 @@ mod tests {
         // Module-scoped `const` stays in the prefix module's scope.
         // Use globalThis to share values with the postfix module.
         let snapshot = precompile("globalThis.base = 100", None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.base + 1", None)
+        let out = execute_with_prefix(&snapshot, "export default globalThis.base + 1", None, Limits::default())
             .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("101"));
     }
@@ -1815,7 +2160,7 @@ mod tests {
     #[test]
     fn execute_with_prefix_global_mutation_visible_in_postfix() {
         let snapshot = precompile("globalThis.answer = 42", None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.answer", None).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.answer", None, Limits::default()).unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42"));
     }
 
@@ -1823,9 +2168,9 @@ mod tests {
     fn execute_with_prefix_multiple_postfixes_are_independent() {
         let snapshot = precompile("globalThis.base = 10", None).unwrap();
         let b = "globalThis.base";
-        let out1 = execute_with_prefix(&snapshot, &format!("export default {b} * 2"), None).unwrap();
-        let out2 = execute_with_prefix(&snapshot, &format!("export default {b} * 3"), None).unwrap();
-        let out3 = execute_with_prefix(&snapshot, &format!("export default {b} * 4"), None).unwrap();
+        let out1 = execute_with_prefix(&snapshot, &format!("export default {b} * 2"), None, Limits::default()).unwrap();
+        let out2 = execute_with_prefix(&snapshot, &format!("export default {b} * 3"), None, Limits::default()).unwrap();
+        let out3 = execute_with_prefix(&snapshot, &format!("export default {b} * 4"), None, Limits::default()).unwrap();
         assert_eq!(get_default(&out1).as_deref(), Some("20"));
         assert_eq!(get_default(&out2).as_deref(), Some("30"));
         assert_eq!(get_default(&out3).as_deref(), Some("40"));
@@ -1834,8 +2179,8 @@ mod tests {
     #[test]
     fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
         let snapshot = precompile("globalThis.counter = 0", None).unwrap();
-        execute_with_prefix(&snapshot, "globalThis.counter = 99; export default 1", None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.counter", None).unwrap();
+        execute_with_prefix(&snapshot, "globalThis.counter = 99; export default 1", None, Limits::default()).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.counter", None, Limits::default()).unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("0"));
     }
 
@@ -1845,7 +2190,7 @@ mod tests {
             r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
             None,
         ).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.sq[7]", None).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.sq[7]", None, Limits::default()).unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("49"));
     }
 
@@ -1856,6 +2201,7 @@ mod tests {
             &snapshot,
             r#"console.log("hello from postfix"); export default 1"#,
             None,
+            Limits::default(),
         ).unwrap();
         assert!(out.stdout.iter().any(|l| l.contains("hello from postfix")));
     }
@@ -1863,7 +2209,7 @@ mod tests {
     #[test]
     fn execute_with_prefix_postfix_runtime_error_is_reported() {
         let snapshot = precompile("", None).unwrap();
-        let err = execute_with_prefix(&snapshot, r#"throw new Error("postfix failed")"#, None)
+        let err = execute_with_prefix(&snapshot, r#"throw new Error("postfix failed")"#, None, Limits::default())
             .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError { .. }));
     }

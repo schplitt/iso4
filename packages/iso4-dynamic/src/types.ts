@@ -98,6 +98,27 @@ export interface PrecompileOptions {
 
   globals?: HostGlobals
   imports?: ImportsConfig
+
+  /**
+   * Resource limits applied to prefix code evaluation.
+   *
+   * **Important:** limits are NOT enforced during `precompile()`. Prefix code
+   * is assumed to be developer-authored (the host application author), not
+   * AI-agent-generated. The trust model treats prefix code the same way you
+   * would treat application startup code — it runs once at precompile time
+   * under the developer's control.
+   *
+   * **Currently a no-op placeholder.** The field is sent over the wire but
+   * silently discarded — no default limits are stored or propagated to
+   * `prefix.run()` calls. Pass limits directly to each `prefix.run()` call.
+   * Storing precompile-time limits as per-prefix defaults is a planned
+   * future improvement.
+   *
+   * Limits that DO apply to `prefix.run()` calls:
+   * - `cpuTimeMs` — active V8 execution time only (async host-call wait excluded)
+   * - `wallTimeMs` — hard wall-clock cap including async waits
+   * - `memoryMb` — heap + ArrayBuffer budget (Phase 8, not yet enforced)
+   */
   limits?: Partial<ResourceLimits>
 
   /**
