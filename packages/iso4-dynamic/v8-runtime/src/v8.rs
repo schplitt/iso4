@@ -48,6 +48,11 @@ pub struct Limits {
     /// bridge response payload. Zero means no per-bridge limit; the framing
     /// layer's 64 MiB cap is the only constraint.
     pub max_bridge_payload_bytes: u32,
+    /// Maximum number of bridge calls (globals + host imports combined) a
+    /// single run may make. Zero means no per-run limit.
+    /// Default on the TS side is 10 when the host does not set an explicit
+    /// value, so the door is never accidentally left open.
+    pub max_bridge_calls: u32,
 }
 
 
@@ -175,6 +180,8 @@ pub enum RunError {
     FunctionArgumentNotSupported,
     /// Bridge call or response payload exceeded `limits.maxBridgePayloadBytes`.
     BridgePayloadTooLarge,
+    /// Total bridge calls in this run exceeded `limits.maxBridgeCalls`.
+    BridgeCallLimitExceeded,
     /// Unexpected internal runtime failure.
     Internal(String),
 }
@@ -345,6 +352,7 @@ fn run_module(
     // callback reconstructs a ManuallyDrop<UnixStream> from it for the
     // duration of one BridgeCall/BridgeResponse exchange and never closes it.
     let call_id = Arc::new(AtomicU32::new(0));
+    let bridge_call_count = Arc::new(AtomicU32::new(0));
     let bridge_error: Arc<OnceLock<RunError>> = Arc::new(OnceLock::new());
 
     // Box-per-stub allocations; kept alive until after evaluate() returns.
@@ -365,6 +373,8 @@ fn run_module(
             cancel_handle.clone(), // thread-safe handle; cancel_handle is a clone
             Arc::clone(&reason),
             limits.max_bridge_payload_bytes,
+            Arc::clone(&bridge_call_count),
+            limits.max_bridge_calls,
             &mut callback_data_boxes,
         )
         .map_err(|e| failure(e, &logs, start))?;
@@ -441,6 +451,7 @@ fn run_module(
                     RunError::HostBridge(m)              => RunError::HostBridge(m.clone()),
                     RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
                     RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
+                    RunError::BridgeCallLimitExceeded      => RunError::BridgeCallLimitExceeded,
                     other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                 };
                 return Err(failure(owned, &logs, start));
@@ -478,6 +489,7 @@ fn run_module(
                         RunError::HostBridge(m)               => RunError::HostBridge(m.clone()),
                         RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
                         RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
+                        RunError::BridgeCallLimitExceeded      => RunError::BridgeCallLimitExceeded,
                         other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                     };
                     return Err(failure(owned, &logs, start));
@@ -502,6 +514,7 @@ fn run_module(
                         RunError::HostBridge(m)               => RunError::HostBridge(m.clone()),
                         RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
                         RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
+                        RunError::BridgeCallLimitExceeded      => RunError::BridgeCallLimitExceeded,
                         other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                     };
                     return Err(failure(owned, &logs, start));
@@ -888,6 +901,11 @@ struct GlobalCallbackData {
     /// for a bridge response payload. Zero means no per-bridge limit — the
     /// framing layer's 64 MiB cap is the only constraint.
     max_bridge_payload_bytes: u32,
+    /// Shared counter of bridge calls made so far in this run, across all
+    /// stubs. Incremented before any I/O; checked against `max_bridge_calls`.
+    bridge_call_count: Arc<AtomicU32>,
+    /// Maximum bridge calls allowed per run. Zero means no limit.
+    max_bridge_calls: u32,
 }
 
 /// A single generic V8 FunctionCallback used for every host-declared global.
@@ -915,6 +933,18 @@ fn bridge_global_callback(
     // `callback_data_boxes` inside `run_module`, which is kept alive until after
     // `module.evaluate()` returns. No callback fires after that.
     let data = unsafe { &*data };
+
+    // ── Bridge call count limit ────────────────────────────────────────────
+    // Check and increment before any I/O so the counter is always accurate
+    // even when subsequent steps (payload check, socket write) fail early.
+    if data.max_bridge_calls > 0 {
+        let prev = data.bridge_call_count.fetch_add(1, Ordering::Relaxed);
+        if prev >= data.max_bridge_calls {
+            data.bridge_error.set(RunError::BridgeCallLimitExceeded).ok();
+            throw_v8_error(scope, "[iso4] bridge: maxBridgeCalls limit exceeded");
+            return;
+        }
+    }
 
     // ── Serialise arguments ────────────────────────────────────────────────
     let mut wire_args: Vec<WireValue> = Vec::with_capacity(args.length() as usize);
@@ -1094,6 +1124,8 @@ fn install_bridge_globals(
     isolate_handle: v8::IsolateHandle,
     termination_reason: Arc<OnceLock<TerminationReason>>,
     max_bridge_payload_bytes: u32,
+    bridge_call_count: Arc<AtomicU32>,
+    max_bridge_calls: u32,
     out_boxes: &mut Vec<Box<GlobalCallbackData>>,
 ) -> Result<(), RunError> {
     let global_obj = scope.get_current_context().global(scope);
@@ -1109,6 +1141,8 @@ fn install_bridge_globals(
             isolate_handle: isolate_handle.clone(),
             termination_reason: Arc::clone(&termination_reason),
             max_bridge_payload_bytes,
+            bridge_call_count: Arc::clone(&bridge_call_count),
+            max_bridge_calls,
         });
         // Pass a raw pointer to the Box's heap allocation as External data.
         // The Box is stored in out_boxes and outlives all V8 callbacks.
@@ -3297,6 +3331,182 @@ mod tests {
         h.join().unwrap();
         // "__proto__" was dropped; only "x" and "y" survive as own properties.
         assert_eq!(get_default(&out.unwrap()).as_deref(), Some("x,y"));
+    }
+
+    // ── max_bridge_calls limit ─────────────────────────────────────────────
+
+    /// Drain N BridgeCall frames from `server`, responding to each with the
+    /// given WireValue. Returns the number of calls actually received before
+    /// the socket is closed/times-out.
+    fn drain_bridge_calls(
+        mut server: std::os::unix::net::UnixStream,
+        max: usize,
+        value: WireValue,
+    ) -> usize {
+        let mut count = 0;
+        server.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        while count < max {
+            match ipc::read_rust_to_ts_frame(&mut server) {
+                Ok(frame) if frame.message_type == ipc::RustToTsMessageType::BridgeCall => {
+                    // Parse call_id from the first 4 bytes of the payload.
+                    let call_id = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+                    let resp = bridge_resp_ok(call_id, &value);
+                    if ipc::write_ts_to_rust_frame(
+                        &mut server,
+                        ipc::TsToRustMessageType::BridgeResponse,
+                        &resp,
+                    ).is_err() {
+                        break;
+                    }
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn bridge_call_limit_exceeded_after_limit_calls() {
+        // The sandbox calls myTool 5 times; limit is 3. The first 3 succeed,
+        // the 4th triggers ERR_BRIDGE_CALL_LIMIT_EXCEEDED before any I/O.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle = std::thread::spawn(move || {
+            drain_bridge_calls(server, 10, WireValue::Number(1.0))
+        });
+
+        let err = execute(
+            // 5 sequential awaited calls
+            "let n = 0; \
+             n += await myTool(); \
+             n += await myTool(); \
+             n += await myTool(); \
+             n += await myTool(); \
+             n += await myTool(); \
+             export default n",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_calls: 3,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            Some(fd),
+        ).unwrap_err().error;
+
+        let calls_handled = handle.join().unwrap();
+        assert!(matches!(err, RunError::BridgeCallLimitExceeded),
+            "expected BridgeCallLimitExceeded, got {err:?}");
+        // Exactly 3 calls should have reached the host before the 4th was blocked.
+        assert_eq!(calls_handled, 3, "expected 3 calls to reach host, got {calls_handled}");
+    }
+
+    #[test]
+    fn bridge_call_limit_zero_means_no_limit() {
+        // max_bridge_calls = 0 disables the count limit entirely.
+        // All 5 calls should succeed.
+        let (out, h) = run_with_bridge(
+            "let n = 0; \
+             n += await myTool(); \
+             n += await myTool(); \
+             n += await myTool(); \
+             n += await myTool(); \
+             n += await myTool(); \
+             export default n",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_calls: 0,
+                ..Default::default()
+            },
+            |s| {
+                // Respond to all 5 calls.
+                for call_id in 0..5u32 {
+                    let _ = ipc::read_rust_to_ts_frame(s);
+                    ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
+                        &bridge_resp_ok(call_id, &WireValue::Number(10.0))).unwrap();
+                }
+            },
+        );
+        h.join().unwrap();
+        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("50"));
+    }
+
+    #[test]
+    fn bridge_call_exactly_at_limit_succeeds() {
+        // max_bridge_calls = 3; sandbox makes exactly 3 calls → should succeed.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle = std::thread::spawn(move || {
+            drain_bridge_calls(server, 10, WireValue::Number(1.0))
+        });
+
+        let out = execute(
+            "let n = 0; \
+             n += await myTool(); \
+             n += await myTool(); \
+             n += await myTool(); \
+             export default n",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_calls: 3,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            Some(fd),
+        ).unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn bridge_call_limit_is_shared_across_globals() {
+        // max_bridge_calls applies across all stubs in a run.
+        // Two globals (toolA + toolB) share the same counter.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        // Respond to up to 4 bridge calls, regardless of which global.
+        let handle = std::thread::spawn(move || {
+            drain_bridge_calls(server, 4, WireValue::Number(1.0))
+        });
+
+        let err = execute(
+            // 2 calls to toolA + 2 calls to toolB = 4 total; limit = 3
+            "await toolA(); await toolA(); await toolB(); await toolB(); \
+             export default 'done'",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_calls: 3,
+                ..Default::default()
+            },
+            &["toolA".to_string(), "toolB".to_string()],
+            Some(fd),
+        ).unwrap_err().error;
+
+        let calls_handled = handle.join().unwrap();
+        assert!(matches!(err, RunError::BridgeCallLimitExceeded),
+            "expected BridgeCallLimitExceeded, got {err:?}");
+        assert_eq!(calls_handled, 3, "expected 3 calls before limit, got {calls_handled}");
     }
 
     #[test]

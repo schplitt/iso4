@@ -37,6 +37,18 @@ export interface ResourceLimits {
    * @default 16 * 1024 * 1024
    */
   maxBridgePayloadBytes: number
+
+  /**
+   * Maximum number of bridge calls (globals + host imports combined) a
+   * single run may make. Zero disables the per-run limit entirely.
+   *
+   * Protects against untrusted sandbox code making unbounded calls to host
+   * handlers (e.g. `while(true) { await myTool() }`) which consumes near-zero
+   * CPU budget but can exhaust host resources (network, DB, LLM quota).
+   *
+   * @default 10
+   */
+  maxBridgeCalls: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────

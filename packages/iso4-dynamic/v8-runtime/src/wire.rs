@@ -480,6 +480,12 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             message: "bridge payload exceeds configured maxBridgePayloadBytes limit".to_string(),
             stack: None,
         },
+        RunError::BridgeCallLimitExceeded => RunErrorPayload {
+            code: "ERR_BRIDGE_CALL_LIMIT_EXCEEDED".to_string(),
+            name: "Error".to_string(),
+            message: "run exceeded the configured maxBridgeCalls limit".to_string(),
+            stack: None,
+        },
         RunError::Internal(msg) => RunErrorPayload {
             code: "ERR_INTERNAL".to_string(),
             name: "Error".to_string(),

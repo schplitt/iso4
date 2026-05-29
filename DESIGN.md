@@ -253,6 +253,7 @@ Every call to `runtime.run(opts)`:
   maxStdoutBytes: 1 * 1024 * 1024,
   maxStderrBytes: 1 * 1024 * 1024,
   maxBridgePayloadBytes: 0,       // 0 = no per-bridge cap (64 MiB framing cap applies)
+  maxBridgeCalls: 10,             // 0 = unlimited; default 10 protects against runaway loops
 }
 ```
 

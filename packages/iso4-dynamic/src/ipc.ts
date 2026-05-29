@@ -324,6 +324,9 @@ class PayloadWriter {
     this.writeU32(limits.maxStdoutBytes ?? 0)
     this.writeU32(limits.maxStderrBytes ?? 0)
     this.writeU32(limits.maxBridgePayloadBytes ?? 0)
+    // Default to 10 when not explicitly set so the door is never accidentally
+    // left open. Pass 0 to disable the limit entirely.
+    this.writeU32(limits.maxBridgeCalls ?? 10)
     return this
   }
 
@@ -335,13 +338,22 @@ class PayloadWriter {
 // ── ResourceLimits ──────────────────────────────────────────────────────────
 
 export interface ResourceLimits {
+  /** V8 heap + ArrayBuffer budget in megabytes. Zero = no limit. @default 0 */
   memoryMb?: number
+  /** Active JS execution time in ms (host-wait excluded). Zero = no limit. @default 0 */
   cpuTimeMs?: number
+  /** Hard wall-clock cap in ms including async waits. Zero = no limit. @default 0 */
   wallTimeMs?: number
+  /** Max serialised export size in bytes. Zero = no limit. @default 0 */
   maxExportBytes?: number
+  /** Max captured stdout size in bytes. Zero = no limit. @default 0 */
   maxStdoutBytes?: number
+  /** Max captured stderr size in bytes. Zero = no limit. @default 0 */
   maxStderrBytes?: number
+  /** Max bridge call/response payload in bytes. Zero = no limit (64 MiB framing cap applies). @default 0 */
   maxBridgePayloadBytes?: number
+  /** Max total bridge calls per run. Zero = no limit. @default 10 */
+  maxBridgeCalls?: number
 }
 
 // ── RunPayload ──────────────────────────────────────────────────────────────

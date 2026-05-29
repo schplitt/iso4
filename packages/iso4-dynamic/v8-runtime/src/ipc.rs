@@ -251,6 +251,10 @@ pub struct ResourceLimits {
     pub max_stdout_bytes: u32,
     pub max_stderr_bytes: u32,
     pub max_bridge_payload_bytes: u32,
+    /// Maximum number of bridge calls (globals + host imports combined) allowed
+    /// per run. Zero means no limit on the Rust side; the TS side defaults
+    /// to 10 when the host leaves this unset.
+    pub max_bridge_calls: u32,
 }
 
 /// A host global the sandbox is allowed to reference.
@@ -396,6 +400,7 @@ fn parse_code_fields(
         max_stdout_bytes: r.read_u32()?,
         max_stderr_bytes: r.read_u32()?,
         max_bridge_payload_bytes: r.read_u32()?,
+        max_bridge_calls: r.read_u32()?,
     };
     let globals_count = r.read_u32()? as usize;
     let mut globals = Vec::with_capacity(globals_count);
@@ -691,8 +696,8 @@ mod tests {
             Some(f) => { v.push(1); push_string(&mut v, f); }
             None => { v.push(0); }
         }
-        // ResourceLimits: 7 × u32, all zero
-        v.extend_from_slice(&[0u8; 28]);
+        // ResourceLimits: 8 × u32, all zero
+        v.extend_from_slice(&[0u8; 32]);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v
@@ -740,6 +745,7 @@ mod tests {
         push_u32(&mut v, 512 * 1024);  // max_stdout_bytes
         push_u32(&mut v, 512 * 1024);  // max_stderr_bytes
         push_u32(&mut v, 64 * 1024);   // max_bridge_payload_bytes
+        push_u32(&mut v, 1_000);       // max_bridge_calls
         push_u32(&mut v, 0);          // globals count
         push_u32(&mut v, 0);          // imports count
 

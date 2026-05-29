@@ -1322,3 +1322,181 @@ describe('CPU budget vs wall time', () => {
     expect(result.error.code).toBe('ERR_WALL_TIMEOUT')
   }, 5_000)
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 16. maxBridgeCalls limit
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('maxBridgeCalls limit', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('exceeding maxBridgeCalls returns ERR_BRIDGE_CALL_LIMIT_EXCEEDED', async () => {
+    let calls = 0
+    const result = await runtime.run({
+      code: `
+        await myTool()
+        await myTool()
+        await myTool()
+        await myTool()
+        export default 'done'
+      `,
+      limits: { maxBridgeCalls: 3, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
+      globals: {
+        myTool: () => {
+          calls++
+          return null
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    // 3 calls reached the host before the 4th was blocked Rust-side
+    expect(calls).toBe(3)
+  })
+
+  test('exactly at limit succeeds', async () => {
+    let calls = 0
+    const result = await runtime.run({
+      code: `
+        await myTool()
+        await myTool()
+        await myTool()
+        export default 'done'
+      `,
+      limits: { maxBridgeCalls: 3, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
+      globals: {
+        myTool: () => {
+          calls++
+          return null
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(calls).toBe(3)
+  })
+
+  test('zero disables the limit', async () => {
+    let calls = 0
+    const result = await runtime.run({
+      code: `
+        await myTool()
+        await myTool()
+        await myTool()
+        await myTool()
+        await myTool()
+        export default 'done'
+      `,
+      limits: { maxBridgeCalls: 0, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
+      globals: {
+        myTool: () => {
+          calls++
+          return null
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(calls).toBe(5)
+  })
+
+  test('default limit of 10 applies when limits not set', async () => {
+    // When limits is omitted the TS encoder sends maxBridgeCalls=10.
+    // 11 calls should fail; 10 should succeed.
+    let callsOnFail = 0
+    const failResult = await runtime.run({
+      code: `${Array.from({ length: 11 }, () => 'await myTool()').join('\n')
+      }\nexport default "done"`,
+      globals: { myTool: () => {
+        callsOnFail++
+        return null
+      } },
+    })
+    expect(failResult.ok).toBe(false)
+    if (failResult.ok)
+      return
+    expect(failResult.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    expect(callsOnFail).toBe(10)
+
+    let callsOnPass = 0
+    const passResult = await runtime.run({
+      code: `${Array.from({ length: 10 }, () => 'await myTool()').join('\n')
+      }\nexport default "done"`,
+      globals: { myTool: () => {
+        callsOnPass++
+        return null
+      } },
+    })
+    expect(passResult.ok).toBe(true)
+    expect(callsOnPass).toBe(10)
+  })
+
+  test('limit is shared across multiple declared globals', async () => {
+    let calls = 0
+    const result = await runtime.run({
+      code: `
+        await toolA()
+        await toolA()
+        await toolB()
+        await toolB()
+        export default 'done'
+      `,
+      limits: { maxBridgeCalls: 3, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
+      globals: {
+        toolA: () => {
+          calls++
+          return null
+        },
+        toolB: () => {
+          calls++
+          return null
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    expect(calls).toBe(3)
+  })
+
+  test('limit applies on prefix.run() too', async () => {
+    const prefix = await runtime.precompile({
+      code: '',
+      globals: { myTool: () => null },
+    })
+
+    let calls = 0
+    const result = await prefix.run({
+      code: `
+        await myTool()
+        await myTool()
+        await myTool()
+        await myTool()
+        export default 'done'
+      `,
+      limits: { maxBridgeCalls: 2, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
+      globals: { myTool: () => {
+        calls++
+        return null
+      } },
+    })
+
+    expect(result.ok).toBe(false)
+    if (result.ok) {
+      await prefix.dispose()
+      return
+    }
+    expect(result.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    expect(calls).toBe(2)
+    await prefix.dispose()
+  })
+})

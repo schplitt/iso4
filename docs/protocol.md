@@ -309,6 +309,7 @@ socket immediately on version or token mismatch.
 | `maxStdoutBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
 | `maxStderrBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
 | `maxBridgePayloadBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` or `BridgeResponsePayload`. Zero = no limit (framing cap of 64 MiB applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
+| `maxBridgeCalls`        | `u32`    | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. TS default: `10` when the host does not set an explicit value. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`. |
 
 `HostGlobalBinding`:
 
@@ -365,6 +366,13 @@ performing any I/O. Rust also checks the `BridgeResponsePayload` byte length
 immediately after reading the frame; if it exceeds the limit the run terminates
 with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` before decoding the payload. The fallback
 cap is the framing layer's 64 MiB `DEFAULT_MAX_FRAME_LENGTH`.
+
+**`maxBridgeCalls` enforcement:** When non-zero, Rust maintains a per-run
+call counter shared across all bridge stubs. On each bridge call entry the
+counter is incremented before any I/O. If the pre-increment value is already
+at the limit, the run terminates with `ERR_BRIDGE_CALL_LIMIT_EXCEEDED` before
+any frame is written to the socket. The TS encoder sends `10` when the host
+does not set an explicit value, so the limit is always active by default.
 
 ### 5.5 Diagnostic log payloads
 
@@ -475,6 +483,7 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                          |
 | `ERR_HOST_BRIDGE`                     | Configured host global/import handler threw or rejected.                    |
 | `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call or response payload exceeded `limits.maxBridgePayloadBytes`.    |
+| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.           |
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`. |
 | `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                    |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                             |
