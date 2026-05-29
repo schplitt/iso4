@@ -1,14 +1,61 @@
 # @iso4/fetch
 
-Hardened `FetchHandler` for [@iso4/sandbox](../iso4-sandbox).
+Secure HTTP plumbing for host-authored APIs exposed to [@iso4/sandbox](../iso4-sandbox) agents.
 
-Every request flows through a host-supplied **policy callback** that decides
-allow or deny. On top of that the package ships mitigations for SSRF, DNS
-rebinding, redirect bypass, and response amplification.
+## The pattern
 
-> **Status:** scaffolding. Types and option surface are stable, but the
-> returned handler currently throws on every call. Implementation lands in
-> build-plan phase 5 (see [DESIGN.md](../../DESIGN.md) §9).
+The sandbox bridge only carries plain data — the agent can never receive a
+real `Response` object with `.json()` or `.text()`. Exposing a raw `fetch`
+global is therefore the wrong shape.
+
+The right pattern: author a typed host module with a domain-specific API
+and wire it to real HTTP internally. The agent learns the API from TypeScript
+types you provide and never touches raw fetch.
+
+```ts
+// agent code — clean, typed by the host
+import { getUsers, queueDeletion } from 'host:api'
+
+const users = await getUsers() // res.body is a ready-to-use array
+const ack = await queueDeletion(42) // no real DELETE was sent
+```
+
+```ts
+// host code
+import { createSafeFetch } from '@iso4/fetch'
+
+const fetch = createSafeFetch({
+  rules: {
+    host: 'api.example.com',
+    // all routes on this origin get auth injected automatically
+    middleware: async (ctx, next) => {
+      ctx.req.header('authorization', `Bearer ${await vault.get('token')}`)
+      return next()
+    },
+    routes: [
+      {
+        path: '/v1/users/**',
+        methods: 'GET',
+        // real HTTP + unwrap the response for the agent
+        middleware: async (_ctx, next) => {
+          const res = await next()
+          return await res.json() // agent gets res.body as a parsed object
+        },
+      },
+      {
+        path: '/v1/items/:id',
+        methods: 'DELETE',
+        // no HTTP — synthesise the response entirely
+        middleware: async (ctx, _next) => ({
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+          body: { queued: true, id: ctx.req.params['id'] },
+        }),
+      },
+    ],
+  },
+})
+```
 
 ## Install
 
@@ -16,81 +63,143 @@ rebinding, redirect bypass, and response amplification.
 npm i @iso4/sandbox @iso4/fetch
 ```
 
-## Usage
+## Rules
+
+Every request must match a declared rule before any middleware runs or any
+network call is made. Unmatched requests are denied immediately.
 
 ```ts
-import { createSandbox } from '@iso4/sandbox'
-import { createSafeFetch } from '@iso4/fetch'
-import type { SafeFetchPolicy } from '@iso4/fetch'
+const fetch = createSafeFetch({
+  rules: [
+    {
+      host: 'api.github.com', // exact hostname or '*.example.com' (single level)
+      httpsOnly: true, // default — set false to allow HTTP
+      // port: 443                 // default; list explicit ports to allow others
+      routes: [
+        { path: '/repos/**', methods: ['GET', 'POST'] },
+        { path: '/repos/:owner/:repo/issues/:id', methods: 'GET' },
+      ],
+    },
+    {
+      host: 'raw.githubusercontent.com',
+      routes: [{ path: '/**', methods: 'GET' }],
+    },
+  ],
+})
+```
 
-const policy: SafeFetchPolicy = ({ host, path, method, hop, resolvedIp }) => {
-  if (host !== 'api.example.com')
-return false
+Path patterns use [rou3](https://github.com/h3js/rou3) / URLPattern syntax:
 
-  if (method !== 'GET' && method !== 'POST')
-    throw new Error(`method ${method} not permitted`)
+| Pattern                 | Matches                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `/users/:id`            | `/users/42` — named param, available as `ctx.req.params.id`    |
+| `/api/**`               | `/api`, `/api/users`, `/api/users/123` — zero-or-more segments |
+| `/files/:ext(png\|jpg)` | `/files/png` — constrained param                               |
 
-  if (path.startsWith('/admin'))
-    throw new Error('admin endpoints denied')
+An empty `routes: []` denies all paths on that origin.
 
-  // Re-runs on every redirect hop
-  if (hop > 0 && host !== 'api.example.com')
-    throw new Error('cross-origin redirect denied')
+## Middleware
 
-  return true
-}
+Middleware is the single extension point. The `(ctx, next)` pattern covers
+every use case: request mutation, response inspection, logging, and synthetic
+overrides.
 
-const sandbox = await createSandbox()
-const prefix = await sandbox.precompile({
-  code: `/* host setup */`,
-  globals: {
-    fetch: createSafeFetch({
-      policy,
-      pinDns: true,
-      maxRedirects: 0,
-      timeoutMs: 5_000,
-    }),
+Three levels, running in order — global wraps origin wraps route:
+
+```ts
+createSafeFetch({
+  middleware: someGlobalMiddleware, // global — every request
+  rules: {
+    host: 'api.example.com',
+    middleware: someOriginMiddleware, // origin — every request to this host
+    routes: [{
+      path: '/v1/**',
+      middleware: someRouteMiddleware, // route — this path only
+    }],
   },
 })
 ```
 
-## The policy callback
-
-The single mechanism for allow/deny. Receives a normalized
-[`SafeFetchRequest`](./src/types.ts) for every outbound call:
+### Request mutation (auth, URL rewrite, headers)
 
 ```ts
-interface SafeFetchRequest {
-  url: string // canonical URL
-  protocol: 'http' | 'https'
-  host: string // hostname only
-  port: number // 80/443 implicit
-  path: string // /path?query
-  method: string // uppercased
-  headers: Record<string, string> // names lowercased
-  resolvedIp: string | null // when pinDns is on
-  hop: number // 0 = initial, 1+ = redirect
+async function someRequestMiddleware(ctx, next) {
+  ctx.req.header('authorization', `Bearer ${token}`) // injected, agent never sees it
+  ctx.req.setUrl(ctx.req.url.replace('/v1/', '/v2/'))
+  return next()
 }
 ```
 
-| Return                             | Result                            |
-| ---------------------------------- | --------------------------------- |
-| `true`                             | Allow                             |
-| `false`                            | Deny with generic reason          |
-| `throw new Error("reason")`        | Deny; message surfaces to sandbox |
-| `Promise<...>` of any of the above | Same, awaited                     |
+`ctx.req` fields: `url` (via `setUrl()`), `method`, `headers` (mutable object
+or `header(name, val)`), `body` (via `setBody()`), `params`, `hop`, `raw`
+(original unmodified bridge request).
 
-## What it protects against
+### Response inspection / logging
 
-| Attack                        | Mitigation                                                   |
-| ----------------------------- | ------------------------------------------------------------ |
-| SSRF to internal/metadata IPs | DNS pre-resolution + policy sees `resolvedIp`                |
-| DNS rebinding                 | DNS pinned at request time, request goes to resolved IP      |
-| Redirect-based bypass         | No auto-redirect by default; policy re-runs per hop          |
-| Response-size amplification   | `maxBodyBytes` enforced; compressed responses off by default |
-| Host-app auth leakage         | Isolated `undici` Dispatcher — no shared cookies or auth     |
+```ts
+async function someResponseMiddleware(ctx, next) {
+  const t = Date.now()
+  const res = await next()
+  console.log(`${ctx.req.method} ${ctx.req.url} → ${res.status} (${Date.now() - t}ms)`)
+  return res
+}
+```
 
-See [DESIGN.md](../../DESIGN.md) §12 for the full threat model.
+### Response rewrite (replaces `transform`)
+
+```ts
+async function someResponseRewriteMiddleware(_ctx, next) {
+  const res = await next()
+  const data = JSON.parse(new TextDecoder().decode(res.body as Uint8Array))
+  return { ...res, body: data } // agent gets res.body as a parsed object
+}
+```
+
+### Synthetic response — no HTTP (replaces `handle`)
+
+Skip `next()` entirely. No network call is made.
+
+```ts
+async function someSyntheticResponseMiddleware(ctx, _next) {
+  return {
+    status: 202,
+    headers: { 'content-type': 'application/json' },
+    body: { queued: true, id: ctx.req.params['id'] },
+  }
+}
+```
+
+## Policy callback
+
+For dynamic allow/deny logic that can't be expressed as static rules —
+per-tenant checks, rate limiting, etc. Falls back to this when no origin rule
+matches, or is the sole mechanism when `rules` is omitted.
+
+```ts
+createSafeFetch({
+  policy: async ({ host, method, resolvedIp }) => {
+    if (resolvedIp && isInternal(resolvedIp))
+return false
+    const tenant = await db.findByHost(host)
+    return tenant?.allowedMethods.includes(method) ?? false
+  },
+})
+```
+
+`policy` runs only when no `rules` origin matched. If an origin matches but
+no route does the request is denied without consulting `policy`.
+
+## Security defaults
+
+| Threat                 | Mitigation                                                                   |
+| ---------------------- | ---------------------------------------------------------------------------- |
+| SSRF / private IP      | DNS pre-resolved before every request; loopback, RFC1918, link-local blocked |
+| DNS rebinding          | undici DNS interceptor pins the connection to the resolved IP                |
+| Redirect bypass        | No auto-follow by default; allow/deny re-checked on each hop                 |
+| Response amplification | Body streamed with `maxBodyBytes` cap                                        |
+| Host auth leakage      | Isolated undici `Agent` — no shared pool, cookies, or auth with the host app |
+| Path traversal         | Paths decoded and `.`/`..`-normalised before route matching                  |
+| Double-encoded paths   | Detected and rejected at parse time                                          |
 
 ## License
 

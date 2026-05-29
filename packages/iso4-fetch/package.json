@@ -42,6 +42,10 @@
     "test": "vitest",
     "test:run": "vitest run"
   },
+  "dependencies": {
+    "rou3": "catalog:",
+    "undici": "catalog:"
+  },
   "devDependencies": {
     "@changesets/cli": "catalog:",
     "@schplitt/eslint-config": "catalog:",

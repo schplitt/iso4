@@ -1,34 +1,17 @@
 /**
  * \@iso4/fetch — FetchHandler types and option/policy types for hardened fetch.
  *
- * The package's job is to produce a `FetchHandler` (defined in `iso4`) that
- * delegates allow/deny decisions to a host-supplied **policy callback**.
- * The callback receives a normalized request descriptor; the host returns
- * `true` to allow, `false` to deny with a generic reason, or throws an
- * `Error` to deny with a custom reason that surfaces to sandbox code.
- *
- * See `../../../DESIGN.md` §12 for the threat model and the responsibility
- * split between `iso4` (mechanical hygiene), this package (hardened
- * defaults), and host application code (policy).
+ * The responsibility split: `iso4` handles mechanical hygiene, this package
+ * provides hardened defaults, and host application code supplies policy.
  */
 
-/**
- * Normalized request descriptor passed to a `SafeFetchPolicy`.
- *
- * All fields are derived from the sandbox-provided request after WHATWG
- * URL canonicalization and header validation. The shape is stable: future
- * additions are optional fields, never breaking changes to existing ones.
- */
 // ─────────────────────────────────────────────────────────────────────────
-// FetchHandler — the typed interface for a fetch-compatible bridge handler.
-// These types live here, not a core bridge concern, because fetch handling is not
-// a core bridge concern. The core bridge is generic: HostExportFunction.
-// FetchHandler is a convenience wrapper with fetch-shaped request/response.
+// FetchHandler
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
- * The request object a FetchHandler receives. Reflects the sandbox's
- * `fetch(url, init)` call after URL parsing and header normalisation.
+ * The request object a FetchHandler receives from the bridge when the sandbox
+ * calls `fetch(url, init)`.
  */
 export interface HostFetchRequest {
   url: string
@@ -38,189 +21,404 @@ export interface HostFetchRequest {
    */
   headers: Record<string, string>
   /**
-   * null for bodyless methods.
+   * `null` for bodyless methods.
    */
   body: Uint8Array | string | null
+  /**
+   * Planned — not yet wired from the bridge; present here so the type is
+   * forward-compatible.
+   */
+  signal?: AbortSignal
 }
 
 export interface HostFetchResponse {
   status: number
   statusText?: string
   headers: Record<string, string>
-  body: Uint8Array | string | null
+  /**
+   * Any V8-serializable value — the bridge carries it as plain data.
+   * Use `Uint8Array` for raw bytes, `string` for text, a plain object or
+   * array for parsed JSON, or `null` for bodyless responses.
+   */
+  body: unknown
 }
 
 /**
- * A typed handler for a `fetch`-compatible global. Implement directly or
- * use `createSafeFetch` from this package.
+ * A function returned by `createSafeFetch`, conforming to the bridge's
+ * `HostExportFunction` calling convention: receives raw deserialized
+ * arguments from the sandbox, validates them, and returns plain data.
  *
- * Plug into globals:
- * ```ts
- * globals: { fetch: myHandler }
- * ```
+ * Plug into a global name or a host module export — do NOT name it `fetch`
+ * unless you want the sandbox agent using the raw web fetch signature.
  */
-export type FetchHandler = (
-  request: HostFetchRequest,
-) => Promise<HostFetchResponse> | HostFetchResponse
+export type SafeFetchFn = (...args: unknown[]) => Promise<HostFetchResponse>
 
 // ─────────────────────────────────────────────────────────────────────────
-// SafeFetch policy types — for createSafeFetch() option surface.
+// Middleware
 // ─────────────────────────────────────────────────────────────────────────
 
-export interface SafeFetchRequest {
+/**
+ * The mutable request side of the middleware context.
+ *
+ * All mutations are invisible to the sandbox agent — they only affect what
+ * goes on the wire. `raw` preserves the original unmodified request from
+ * the bridge at all times.
+ */
+export interface FetchContextReq {
   /**
-   * Full canonical URL string, e.g. `"https://api.example.com/users?x=1"`.
+   * Current URL (starts as the agent's URL; updated by `setUrl`).
    */
-  url: string
+  readonly url: string
+  /**
+   * HTTP method, uppercased.
+   */
+  readonly method: string
+  /**
+   * Route parameters extracted by the path pattern.
+   * e.g. `/users/:id` matching `/users/42` → `{ id: '42' }`.
+   */
+  readonly params: Record<string, string>
+  /**
+   * Redirect hop index — 0 for the initial request.
+   */
+  readonly hop: number
+  /**
+   * Original untouched request from the bridge.
+   */
+  readonly raw: HostFetchRequest
 
   /**
-   * Protocol without trailing colon. Always `"http"` or `"https"`.
-   */
-  protocol: 'http' | 'https'
-
-  /**
-   * Hostname only — no port, lowercased.
-   * Example: `"api.example.com"`.
-   */
-  host: string
-
-  /**
-   * Port number. Defaults to 80 for `http:` and 443 for `https:` when the
-   * URL doesn't specify one.
-   */
-  port: number
-
-  /**
-   * Path plus query string, starting with `/`.
-   * Example: `"/users/42?include=profile"`.
-   */
-  path: string
-
-  /**
-   * Uppercased HTTP method. Always non-empty.
-   */
-  method: string
-
-  /**
-   * Request headers, names lowercased. Values are strings with CRLF /
-   * control chars already rejected by `iso4` core's bridge-side validation.
+   * Outgoing headers. Mutate directly or use `header()` for automatic
+   * lowercasing. These replace whatever the agent sent.
    */
   headers: Record<string, string>
 
   /**
-   * Resolved IP for `host`, if `@iso4/fetch` performed DNS pre-resolution
-   * before invoking the policy. `null` when policy runs pre-resolution.
-   * Use this to make policy decisions based on the actual destination
-   * rather than the trusted-input hostname.
+   * Outgoing body. Mutate directly or use `setBody()`.
    */
-  resolvedIp: string | null
+  body: Uint8Array | string | null
 
   /**
-   * Redirect hop index. `0` for the initial request, `1+` for each
-   * subsequent redirect. The policy is re-run on every hop when
-   * `maxRedirects > 0`, so the policy can implement per-hop rules.
+   * Set (or overwrite) a single outgoing header.
+   * The name is lowercased automatically.
+   */
+  header: (name: string, value: string) => void
+
+  /**
+   * Replace the outgoing URL.
+   */
+  setUrl: (url: string) => void
+
+  /**
+   * Replace the outgoing body.
+   */
+  setBody: (body: Uint8Array | string | null) => void
+}
+
+/**
+ * Context passed to every `FetchMiddleware`.
+ *
+ * `req` is the mutable outgoing request (mutate before `next()`).
+ * `res` is the response being built (`null` until `next()` completes or a
+ * middleware returns a response directly). Read and reassign after `next()`
+ * to inspect or replace the response.
+ */
+export interface FetchContext {
+  readonly req: FetchContextReq
+  /**
+   * The response. `null` before `next()` is called.
+   * After `next()`, holds the response from downstream.
+   * Assign to replace it:
+   * ```ts
+   * await next()
+   * ctx.res = { ...ctx.res!, body: parsed }
+   * ```
+   */
+  res: HostFetchResponse | null
+}
+
+/**
+ * A middleware function that runs after the allow/deny check and before the
+ * real HTTP call. Mutations to `ctx.req` are invisible to the agent but
+ * applied to every outgoing request that matches the level the middleware
+ * is attached to.
+ *
+ * Three levels of middleware are available — global (on `createSafeFetch`),
+ * origin (on `FetchOriginRule`), and route (on `FetchRouteRule`). They run
+ * in that order so more specific middleware runs last and can override
+ * broader changes.
+ *
+ * @example inject auth (covers every case: auth, logging, URL rewriting)
+ * ```ts
+ * async (ctx) => {
+ *   ctx.req.header('authorization', `Bearer ${await vault.get('key')}`)
+ *   console.log(`→ ${ctx.req.method} ${ctx.req.url}`)
+ * }
+ * ```
+ */
+/**
+ * Runs the downstream middleware chain and ultimately the real HTTP call.
+ * Sets `ctx.res` when it completes. Returns `void` — read `ctx.res` after
+ * awaiting to inspect the response.
+ */
+export type Next = () => Promise<void>
+
+/**
+ * A middleware function in the `(ctx, next)` style.
+ *
+ * **Return value semantics:**
+ * - Return `void` / nothing — chain continues; `ctx.res` propagates as-is.
+ * - Return a `HostFetchResponse` — that response is set on `ctx.res` and
+ *   returned to the agent immediately. Outer middleware still runs its
+ *   after-`next()` code but the HTTP call is skipped.
+ * - `throw` — execution terminates; the sandbox `fetch()` call rejects.
+ *   Use this to block a request with an error visible to the agent.
+ *
+ * **Pattern: mutate request (auth, URL rewrite)**
+ * ```ts
+ * async (ctx, next) => {
+ *   ctx.req.header('authorization', `Bearer ${await vault.get('key')}`)
+ *   await next()
+ * }
+ * ```
+ *
+ * **Pattern: inspect / rewrite response**
+ * ```ts
+ * async (ctx, next) => {
+ *   await next()
+ *   ctx.res = { ...ctx.res!, body: JSON.parse(new TextDecoder().decode(ctx.res!.body as Uint8Array)) }
+ * }
+ * ```
+ *
+ * **Pattern: log timing**
+ * ```ts
+ * async (ctx, next) => {
+ *   const t = Date.now()
+ *   await next()
+ *   console.log(`${ctx.req.method} ${ctx.req.url} → ${ctx.res?.status} (${Date.now() - t}ms)`)
+ * }
+ * ```
+ *
+ * **Pattern: synthetic response (no HTTP)**
+ * ```ts
+ * async (ctx, _next) => ({
+ *   status: 202,
+ *   headers: { 'content-type': 'application/json' },
+ *   body: { queued: true, id: ctx.req.params['id'] },
+ * })
+ * ```
+ *
+ * **Pattern: block with error**
+ * ```ts
+ * async (ctx, next) => {
+ *   if (isSuspicious(ctx.req)) throw new Error('request blocked')
+ *   await next()
+ * }
+ * ```
+ */
+export type FetchMiddleware = (
+  ctx: FetchContext,
+  next: Next,
+) => HostFetchResponse | void | Promise<HostFetchResponse | void>
+
+// ─────────────────────────────────────────────────────────────────────────
+// Route-based allowlist
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * A single route entry within a `FetchOriginRule`.
+ *
+ * Path patterns use URLPattern/rou3 syntax:
+ *   `/users/:id`            — named parameter
+ *   `/v2/events`            — exact match
+ *   `/reports/**`           — zero-or-more sub-path segments
+ *   `/files/:ext(png|jpg)`  — constrained parameter
+ */
+export interface FetchRouteRule {
+  /**
+   * Path pattern. Must start with `/`.
+   * `/**` and `/prefix/**` both match the prefix itself (zero-segment wildcard).
+   */
+  path: string
+
+  /**
+   * Allowed HTTP method(s). Case-insensitive.
+   * A string, an array, `'*'`, or omitted all mean "any method".
+   */
+  methods?: string | string[]
+
+  /**
+   * Middleware that runs for requests matching this specific route,
+   * after global and origin middleware. Route middleware runs last so it
+   * can override anything set at broader levels.
+   */
+  middleware?: FetchMiddleware
+}
+
+/**
+ * Per-origin set of allowed routes.
+ */
+export interface FetchOriginRule {
+  /**
+   * Hostname(s) to match.
+   * - Exact: `'api.example.com'`
+   * - Single-level subdomain wildcard: `'*.example.com'`
+   *   (matches `sub.example.com`, not `a.b.example.com` or `example.com`)
+   * - Array for multiple hostnames under the same routes.
+   */
+  host: string | string[]
+
+  /**
+   * Allowed port(s). When omitted, only the standard port for the protocol
+   * is allowed (443 for https, 80 for http).
+   */
+  port?: number | number[]
+
+  /**
+   * Require HTTPS. Default `true`. Must be explicitly `false` to allow HTTP.
+   *
+   * @default true
+   */
+  httpsOnly?: boolean
+
+  /**
+   * Route rules for this origin. Method + path must match at least one entry.
+   * First match wins. An empty array denies all paths on this origin.
+   */
+  routes: FetchRouteRule[]
+
+  /**
+   * Middleware that runs for every matched request on this origin, after
+   * global middleware and before route middleware.
+   */
+  middleware?: FetchMiddleware
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Policy
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface SafeFetchRequest {
+  /**
+   * Full canonical URL string.
+   */
+  url: string
+  /**
+   * Protocol without trailing colon — always `'http'` or `'https'`.
+   */
+  protocol: 'http' | 'https'
+  /**
+   * Hostname only, lowercased.
+   */
+  host: string
+  /**
+   * Effective port — 443 or 80 when not explicit in the URL.
+   */
+  port: number
+  /**
+   * Path plus query string, starting with `/`.
+   */
+  path: string
+  /**
+   * Uppercased HTTP method.
+   */
+  method: string
+  /**
+   * Request headers, names lowercased.
+   */
+  headers: Record<string, string>
+  /**
+   * Resolved IP when `pinDns: true`. `null` when `pinDns: false` or when
+   * using policy-only mode without rules.
+   */
+  resolvedIp: string | null
+  /**
+   * `0` for the initial request, `1+` for redirect hops.
    */
   hop: number
 }
 
 /**
- * Allow/deny decision for a single request.
+ * Allow/deny predicate for a single request.
  *
- * Semantics:
- *   - Return `true` to allow the request.
- *   - Return `false` to deny with a generic reason (`"request denied by policy"`).
- *   - `throw new Error("custom reason")` to deny with that reason as the
- *     message visible to sandbox code.
- *
- * The sandbox-side `fetch()` Promise rejects with an `Error` whose
- * `.message` is the deny reason. The host therefore controls what level of
- * detail leaks back into the sandbox — return `false` to keep reasons
- * opaque, throw with a message to make them explicit.
- *
- * Async policies are supported; the underlying request waits for the
- * returned Promise to settle before issuing.
+ * - Return `true` to allow.
+ * - Return `false` to deny with a generic message.
+ * - `throw new Error('reason')` to deny with a custom message visible to
+ *   sandbox code.
+ * - Async (returning a `Promise`) is supported.
  */
 export type SafeFetchPolicy = (
   request: SafeFetchRequest,
 ) => boolean | Promise<boolean>
 
-/**
- * Options for `createSafeFetch`.
- *
- * The `policy` callback is required. All other options have safe defaults.
- */
+// ─────────────────────────────────────────────────────────────────────────
+// createSafeFetch options
+// ─────────────────────────────────────────────────────────────────────────
+
 export interface SafeFetchOptions {
   /**
-   * REQUIRED. Decides allow/deny per request.
+   * Declarative origin + route allowlist. At least one of `rules` or
+   * `policy` is required.
    *
-   * See `SafeFetchPolicy` for the return-value and throwing semantics.
-   *
-   * The policy is invoked after `iso4` core's bridge-side validation
-   * (URL parsing, header sanitization, method check) and after optional
-   * DNS pre-resolution by this package. So by the time the policy sees a
-   * request, the inputs are guaranteed to be well-formed; the policy is
-   * purely a destination-and-shape check, not a parser.
+   * If an origin matches but no route does → DENY (does not fall through to
+   * `policy`). If no origin matches → falls through to `policy` if provided.
    */
-  policy: SafeFetchPolicy
+  rules?: FetchOriginRule | FetchOriginRule[]
 
   /**
-   * When `true`, this package performs DNS resolution once before
-   * invoking `policy` and pins the underlying HTTP request to the
-   * resolved IP literal (with explicit `Host:` header). Prevents DNS
-   * rebinding attacks.
-   *
-   * When `false`, the underlying HTTP client resolves DNS itself at
-   * request time. Policies see `resolvedIp: null`.
+   * Allow/deny callback — fallback for requests not matched by any rule, or
+   * the sole mechanism when `rules` is omitted.
+   */
+  policy?: SafeFetchPolicy
+
+  /**
+   * Global middleware that runs for every allowed request, before origin and
+   * route middleware.
+   */
+  middleware?: FetchMiddleware
+
+  /**
+   * Pre-resolve DNS and pin the connection to the resolved IP.
+   * Prevents SSRF and DNS rebinding. `SafeFetchRequest.resolvedIp` is set.
    *
    * @default true
    */
   pinDns?: boolean
 
   /**
-   * Maximum number of HTTP redirects to follow automatically. Each hop
-   * re-runs `policy` with `hop` incremented. When the limit is hit, the
-   * underlying response (3xx) is returned to the sandbox as-is.
+   * Auto-follow redirects up to this many hops. The full allow/deny +
+   * middleware chain re-runs on each hop. `0` passes 3xx responses through.
    *
-   * @default 0 (do not auto-follow; redirect responses pass through)
+   * @default 0
    */
   maxRedirects?: number
 
   /**
-   * Per-request timeout in milliseconds. Aborts the underlying HTTP
-   * request after this many milliseconds; the sandbox `fetch` rejects.
+   * Per-request timeout in milliseconds.
    *
    * @default 30_000
    */
   timeoutMs?: number
 
   /**
-   * Maximum response body size in bytes, enforced pre-decompression.
+   * Maximum response body size in bytes (streaming, enforced before the
+   * response reaches any caller).
+   *
    * @default 16 * 1024 * 1024
    */
   maxBodyBytes?: number
 
   /**
-   * Whether to allow `Content-Encoding: gzip` / `br` / `deflate`
-   * decompression. Disabled by default — compression-amplification is an
-   * attack vector and the sandbox can request `Accept-Encoding: identity`.
+   * Allow compressed responses. When `false`, `Accept-Encoding: identity`
+   * is sent to prevent response-amplification attacks.
    *
    * @default false
    */
   allowCompressedResponses?: boolean
 
   /**
-   * Optional hook invoked after `policy` allows a request, just before
-   * the underlying HTTP call is issued. Useful for structured logging /
-   * audit. Throwing from this hook is treated as a denial; the thrown
-   * error's message becomes the sandbox-visible deny reason.
-   */
-  onRequest?: (request: SafeFetchRequest) => void | Promise<void>
-
-  /**
-   * Optional hook invoked when a request is denied (by `policy` returning
-   * `false`/throwing, or by `onRequest` throwing, or by an internal check
-   * like the redirect limit). Useful for alerting on suspicious sandbox
-   * behavior. Throwing from this hook is ignored.
+   * Alert hook — called on every denial. Errors thrown here are ignored.
+   * For request logging use middleware with `next()`.
    */
   onDenied?: (request: SafeFetchRequest, reason: string) => void | Promise<void>
 }
