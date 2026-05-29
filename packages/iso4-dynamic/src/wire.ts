@@ -164,10 +164,9 @@ function decodeWireValueFromReader(reader: WireReader): unknown {
     }
     case TAG_OBJECT: {
       const count = reader.readU32()
-      // Object.create(null) — no prototype chain, so obj['__proto__'] = x
-      // is a plain data assignment rather than a [[Set]] that triggers the
-      // __proto__ setter on Object.prototype. Prevents sandbox-controlled
-      // keys from manipulating the decoded object's prototype chain.
+      // Object.create(null) — no prototype chain, so any '__proto__' key
+      // that survives is a plain data property rather than a [[Set]] that
+      // triggers the __proto__ accessor on Object.prototype.
       // TODO: Object.create(null) has a known V8 hidden-class penalty vs {}.
       // Profile before optimising — security comes first; a null-prototype
       // map with string keys may eventually be replaced by a Map<string,unknown>
@@ -175,7 +174,13 @@ function decodeWireValueFromReader(reader: WireReader): unknown {
       const obj = Object.create(null) as Record<string, unknown>
       for (let i = 0; i < count; i++) {
         const key = reader.readString()
-        obj[key] = decodeWireValueFromReader(reader)
+        // Always decode the value to advance the reader, even for dropped keys.
+        const val = decodeWireValueFromReader(reader)
+        // Drop "__proto__" — defence-in-depth: Rust already elides it at
+        // the encoding boundary (serialize_object_fields), but guard here
+        // too so this decoder is self-contained and safe regardless.
+        if (key === '__proto__') continue
+        obj[key] = val
       }
       return obj
     }
@@ -433,7 +438,13 @@ class WireWriter {
       return this
     }
     if (typeof value === 'object') {
+      // Drop "__proto__" before computing the field count.
+      // Object.entries on null-proto objects (e.g. those returned from
+      // decodeWireValue) includes any own "__proto__" data property, so an
+      // explicit guard is required to prevent it from crossing the boundary
+      // in the host→sandbox direction.  Filter first so the count is correct.
       const entries = Object.entries(value as Record<string, unknown>)
+        .filter(([k]) => k !== '__proto__')
       this.writeU8(ENC_TAG_OBJECT)
       this.writeU32(entries.length)
       for (const [k, v] of entries) {

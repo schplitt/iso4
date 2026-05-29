@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'vitest'
-import { WireDecodeError, decodeRunCompletionPayload, decodeWireValue, decodePrecompileResultPayload } from '../src/wire'
+import {
+  WireDecodeError,
+  decodeRunCompletionPayload,
+  decodeWireValue,
+  decodePrecompileResultPayload,
+  encodeWireValue as encodeWireValueProduction,
+} from '../src/wire.js'
 
 // ── decodePrecompileResultPayload ──────────────────────────────────────────
 
@@ -727,5 +733,94 @@ describe('decodePrecompileResultPayload', () => {
     if (result.ok)
       return
     expect(result.error.stack).toBeUndefined()
+  })
+})
+
+// ── __proto__ elision — encoder (host → Rust direction) ───────────────────
+//
+// `Object.entries` on a null-proto object (the kind decodeWireValue produces)
+// includes any own "__proto__" data property.  The production encoder must
+// filter it so a decoded sandbox value echoed back as a bridge response does
+// not forward __proto__ to the sandbox.
+
+describe('encodeWireValue — __proto__ elision', () => {
+  test('__proto__ own key on null-proto object is dropped', () => {
+    // Object.create(null) + obj['__proto__'] = x is the round-trip path:
+    // sandbox → TS decodes (null-proto obj) → host returns it → encoder
+    const obj = Object.create(null) as Record<string, unknown>
+    obj['x'] = 1
+    obj['__proto__'] = { polluted: true }
+    obj['y'] = 2
+
+    const decoded = decodeWireValue(encodeWireValueProduction(obj)) as Record<string, unknown>
+    expect(decoded['x']).toBe(1)
+    expect(decoded['y']).toBe(2)
+    expect(Object.prototype.hasOwnProperty.call(decoded, '__proto__')).toBe(false)
+  })
+
+  test('keys before and after __proto__ are all preserved', () => {
+    const obj = Object.create(null) as Record<string, unknown>
+    obj['before'] = 'a'
+    obj['__proto__'] = 'evil'
+    obj['after'] = 'b'
+
+    const decoded = decodeWireValue(encodeWireValueProduction(obj)) as Record<string, unknown>
+    expect(decoded['before']).toBe('a')
+    expect(decoded['after']).toBe('b')
+    expect(Object.prototype.hasOwnProperty.call(decoded, '__proto__')).toBe(false)
+  })
+
+  test('plain object literal never has own __proto__ — unaffected', () => {
+    // { __proto__: val } sets the prototype, not an own property, so
+    // Object.entries won't include it regardless. The filter is a no-op here.
+    const decoded = decodeWireValue(encodeWireValueProduction({ a: 1 })) as Record<string, unknown>
+    expect(decoded['a']).toBe(1)
+    expect(Object.prototype.hasOwnProperty.call(decoded, '__proto__')).toBe(false)
+  })
+})
+
+// ── __proto__ elision — decoder (Rust → TS direction, defence-in-depth) ───
+//
+// Rust's serialize_object_fields already drops "__proto__" before encoding,
+// so the TS decoder should never see it in practice.  The guard is there as
+// a self-contained safety net.  These tests use the local test encoder (no
+// filtering) to craft wire bytes that contain a __proto__ key directly.
+
+describe('decodeWireValue — __proto__ elision (defence-in-depth)', () => {
+  test('__proto__ key in wire bytes is dropped, sibling keys survive', () => {
+    // Use the local test encoder (no __proto__ filter) to craft the bytes.
+    const wire = encodeWireValue(
+      (() => {
+        const o = Object.create(null) as Record<string, unknown>
+        o['x'] = 1
+        o['__proto__'] = 99
+        o['y'] = 2
+        return o
+      })(),
+    )
+
+    const decoded = decodeWireValue(wire) as Record<string, unknown>
+    expect(decoded['x']).toBe(1)
+    expect(decoded['y']).toBe(2)
+    expect(Object.prototype.hasOwnProperty.call(decoded, '__proto__')).toBe(false)
+    // Prototype must be null — Object.create(null)
+    expect(Object.getPrototypeOf(decoded)).toBeNull()
+  })
+
+  test('value bytes after a dropped __proto__ are consumed — no reader corruption', () => {
+    // A complex nested value under __proto__ must be fully consumed so
+    // subsequent keys decode correctly.
+    const wire = encodeWireValue(
+      (() => {
+        const o = Object.create(null) as Record<string, unknown>
+        o['__proto__'] = { deeply: { nested: [1, 2, 3] } }
+        o['after'] = 'clean'
+        return o
+      })(),
+    )
+
+    const decoded = decodeWireValue(wire) as Record<string, unknown>
+    expect(decoded['after']).toBe('clean')
+    expect(Object.prototype.hasOwnProperty.call(decoded, '__proto__')).toBe(false)
   })
 })

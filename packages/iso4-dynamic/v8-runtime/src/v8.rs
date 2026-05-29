@@ -1149,11 +1149,16 @@ fn wire_to_v8_value<'s>(
         WireValue::Object(fields) => {
             let obj = v8::Object::new(scope);
             for (key, val) in fields {
-                // Use create_data_property ([[DefineOwnProperty]]) instead
-                // of set ([[Set]]) so that a key like "__proto__" is stored
-                // as a plain own data property rather than going through
-                // the __proto__ accessor and modifying the object's
-                // prototype chain.
+                // Drop "__proto__" — silently elided in both directions.
+                // `serialize_object_fields` already drops it sandbox→host;
+                // we mirror that here for host→sandbox so the behaviour is
+                // symmetric.  Even though `create_data_property`
+                // ([[DefineOwnProperty]]) would store it as a plain own data
+                // property without touching the prototype chain, the protocol
+                // policy is: "__proto__" keys never cross either boundary.
+                if key == "__proto__" {
+                    continue;
+                }
                 let k = v8::String::new(scope, key)?;
                 let v = wire_to_v8_value(scope, val)?;
                 if obj.create_data_property(scope, k.into(), v).is_none() {
@@ -1376,15 +1381,14 @@ fn serialize_object_fields(
             .ok_or_else(|| {
                 RunError::Internal("failed to stringify property name".to_string())
             })?;
-        // Drop "__proto__" before it crosses the bridge. V8 enumerates it
-        // as an own property, but forwarding it to a plain JS object on the
-        // TS side would invoke the __proto__ setter on Object.prototype and
-        // rewrite the decoded object's prototype chain.
-        //
-        // Defence-in-depth: the TS decoder already uses Object.create(null)
-        // (no prototype chain), so even if this filter were removed the TS
-        // side would store "__proto__" as a plain data property safely. The
-        // filter is kept here as a belt-and-suspenders measure.
+        // Drop "__proto__" before it crosses the bridge.  Protocol policy:
+        // "__proto__" keys are silently elided in both directions — here
+        // (sandbox→host) and in `wire_to_v8_value` (host→sandbox).
+        // Defence-in-depth: the TS decoder also uses Object.create(null)
+        // so even if this guard were absent the TS side would store
+        // "__proto__" as a plain data property without touching any
+        // prototype chain.  The guard remains for belt-and-suspenders
+        // and for symmetry with the host→sandbox drop.
         if name == "__proto__" {
             continue;
         }
@@ -3061,5 +3065,60 @@ mod tests {
             Some(fd),
         ).unwrap_err().error;
         assert!(matches!(err, RunError::WallTimeout), "got {err:?}");
+    }
+
+    // ── __proto__ elision ─────────────────────────────────────────────────────
+
+    #[test]
+    fn bridge_proto_key_in_host_response_is_dropped() {
+        // Host returns an object that contains "__proto__" as a key.
+        // wire_to_v8_value must drop it: the sandbox must NOT see __proto__
+        // as an own property of the returned object.
+        let (out, h) = run_with_bridge(
+            // Sort own property names to get a deterministic comma-joined string.
+            "const r = await myTool(); \
+             export default Object.getOwnPropertyNames(r).sort().join(',')",
+            "myTool",
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::Object(vec![
+                        ("x".to_string(),         WireValue::Number(1.0)),
+                        ("__proto__".to_string(), WireValue::Number(99.0)),
+                        ("y".to_string(),         WireValue::Number(2.0)),
+                    ])),
+                ).unwrap();
+            },
+        );
+        h.join().unwrap();
+        // "__proto__" was dropped; only "x" and "y" survive as own properties.
+        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("x,y"));
+    }
+
+    #[test]
+    fn sandbox_export_with_proto_own_property_is_dropped() {
+        // Sandbox creates an object with __proto__ as an explicit own
+        // enumerable property via Object.defineProperty (a plain object
+        // literal `{ __proto__: x }` sets the prototype instead).
+        // serialize_object_fields must drop it before crossing to the host.
+        let out = run_ok(r#"
+            const obj = {};
+            Object.defineProperty(obj, '__proto__', { value: 99, enumerable: true });
+            obj.x = 1;
+            export default obj;
+        "#);
+        let default_val = get_field(&out, "default").unwrap();
+        if let WireValue::Object(fields) = default_val {
+            let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+            assert!(
+                !keys.contains(&"__proto__"),
+                "expected __proto__ to be dropped, got keys: {keys:?}"
+            );
+            assert!(keys.contains(&"x"), "expected x to survive");
+        } else {
+            panic!("expected WireValue::Object");
+        }
     }
 }

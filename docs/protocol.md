@@ -130,6 +130,22 @@ Rust MUST reject the following when extracting sandbox values:
 Objects are serialized as own enumerable string-keyed properties only. Prototype
 methods and non-enumerable properties are not serialized.
 
+The key `"__proto__"` is **silently elided in both directions**:
+
+- **Sandbox → host** (`serialize_object_fields` in `v8.rs`): dropped before the
+  `BridgeCall` or export payload is encoded.
+- **Host → sandbox** (`wire_to_v8_value` in `v8.rs`): dropped before the value
+  is injected into the V8 object.
+
+The TS WireValue encoder (`encodeWireValue`) and decoder (`decodeWireValue`)
+apply the same guard for defence-in-depth.
+
+A host returning `{ "__proto__": { polluted: true }, x: 1 }` delivers only
+`{ x: 1 }` to the sandbox. A sandbox exporting
+`Object.defineProperty({}, "__proto__", { value: 1, enumerable: true })`
+delivers only `{}` to the host. The key is not re-encoded under a mangled
+safe name — it is simply dropped.
+
 ### 4.3 Encoding examples
 
 #### Example: nested object and array export
