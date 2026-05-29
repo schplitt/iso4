@@ -864,3 +864,52 @@ describe('decodeWireValue — __proto__ elision (defence-in-depth)', () => {
     expect(Object.prototype.hasOwnProperty.call(decoded, '__proto__')).toBe(false)
   })
 })
+
+// ── encodeWireValue — cycle detection ─────────────────────────────────────
+
+describe('encodeWireValue — cycle detection', () => {
+  test('object self-reference throws TypeError', () => {
+    const a: Record<string, unknown> = {}
+    a['self'] = a
+    expect(() => encodeWireValueProduction(a)).toThrow(TypeError)
+    expect(() => encodeWireValueProduction(a)).toThrow('cyclic')
+  })
+
+  test('array self-reference throws TypeError', () => {
+    const a: unknown[] = []
+    a.push(a)
+    expect(() => encodeWireValueProduction(a)).toThrow(TypeError)
+    expect(() => encodeWireValueProduction(a)).toThrow('cyclic')
+  })
+
+  test('mutual object cycle throws TypeError', () => {
+    const a: Record<string, unknown> = {}
+    const b: Record<string, unknown> = { a }
+    a['b'] = b
+    expect(() => encodeWireValueProduction(a)).toThrow(TypeError)
+  })
+
+  test('array containing itself throws TypeError', () => {
+    const a: unknown[] = [1, 2]
+    a.push(a)
+    expect(() => encodeWireValueProduction(a)).toThrow(TypeError)
+  })
+
+  test('diamond shape (same object at two leaves) does NOT throw', () => {
+    // Diamonds are not cycles — the shared node appears twice in the
+    // tree but is never an ancestor of itself on the current path.
+    const shared = { v: 42 }
+    expect(() => encodeWireValueProduction({ a: shared, b: shared })).not.toThrow()
+  })
+
+  test('diamond array (same array at two leaves) does NOT throw', () => {
+    const shared = [1, 2, 3]
+    expect(() => encodeWireValueProduction([shared, shared])).not.toThrow()
+  })
+
+  test('deep mutual cycle throws TypeError', () => {
+    const a: Record<string, unknown> = { x: { y: {} } }
+    ;((a['x'] as Record<string, unknown>)['y'] as Record<string, unknown>)['back'] = a
+    expect(() => encodeWireValueProduction(a)).toThrow(TypeError)
+  })
+})

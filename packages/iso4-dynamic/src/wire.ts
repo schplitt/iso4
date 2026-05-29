@@ -396,6 +396,14 @@ const ENC_TAG_OBJECT = 0x09
 
 class WireWriter {
   private readonly parts: Buffer[] = []
+  /**
+   * Objects currently on the recursion stack. Used for cycle detection.
+   * Mirrors the `visiting` Vec in Rust's `value_to_wire`.
+   *
+   * Path-based (add before recursing, delete after): allows diamond shapes
+   * (`{ a: x, b: x }` where x is the same object) but rejects true cycles.
+   */
+  private readonly visiting = new WeakSet<object>()
 
   writeU8(n: number): this {
     const b = Buffer.allocUnsafe(1)
@@ -476,14 +484,27 @@ class WireWriter {
       return this
     }
     if (Array.isArray(value)) {
+      if (this.visiting.has(value)) {
+        throw new TypeError(
+          '[iso4] encodeWireValue: cyclic or self-referential structure',
+        )
+      }
+      this.visiting.add(value)
       this.writeU8(ENC_TAG_ARRAY)
       this.writeU32(value.length)
       for (const item of value) {
         this.writeValue(item)
       }
+      this.visiting.delete(value)
       return this
     }
     if (typeof value === 'object') {
+      if (this.visiting.has(value)) {
+        throw new TypeError(
+          '[iso4] encodeWireValue: cyclic or self-referential structure',
+        )
+      }
+      this.visiting.add(value)
       // Drop "__proto__" before computing the field count.
       // Object.entries on null-proto objects (e.g. those returned from
       // decodeWireValue) includes any own "__proto__" data property, so an
@@ -497,6 +518,7 @@ class WireWriter {
         this.writeString(k)
         this.writeValue(v)
       }
+      this.visiting.delete(value)
       return this
     }
     // Unrepresentable: function, symbol, Date, Map, Set, RegExp, class instance, etc.
