@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::ipc;
@@ -96,6 +96,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
 
     eprintln!("[iso4-v8] client authenticated");
 
+    // Per-connection bridge call-ID counter.  Monotonically increasing across
+    // all runs on this connection so callIds never reset to 0 between runs.
+    // This ensures that a stale BridgeResponse from a previous run's orphaned
+    // TS handler is rejected by bridge_global_callback (its callId will be
+    // less than the current run's first callId). See deferred-fixes D1.
+    let call_id_counter = Arc::new(AtomicU32::new(0));
+
     // ── Step 3: message loop ──────────────────────────────────────────────
 
     // Prefix store and ID counter are shared across all connections so a
@@ -150,6 +157,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     },
                     &globals,
                     stream_fd,
+                    Arc::clone(&call_id_counter),
                 ) {
                     Ok(output) => {
                         eprintln!("[iso4-v8] run succeeded in {}ms", output.duration_ms);
@@ -351,6 +359,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             },
                             &run_globals,
                             stream_fd,
+                            Arc::clone(&call_id_counter),
                         ) {
                             Ok(output) => {
                                 eprintln!(

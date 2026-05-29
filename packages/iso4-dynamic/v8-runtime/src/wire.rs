@@ -546,12 +546,14 @@ pub fn encode_bridge_call_payload(
 /// ```
 pub fn parse_bridge_response_payload(
     payload: &[u8],
-) -> io::Result<Result<WireValue, String>> {
+) -> io::Result<(u32, Result<WireValue, String>)> {
     let mut offset = 0;
 
-    // callId - read and discard; Rust already knows which call this is for
-    // since bridge calls are sequential in v1.
-    let _call_id = read_u32(payload, &mut offset)?;
+    // callId - returned to the caller for validation.  In v1 bridge calls are
+    // sequential within a run, but the connection is reused across runs so a
+    // stale BridgeResponse from a previous run's orphaned handler can arrive
+    // here.  The caller compares this value against the callId it sent.
+    let call_id = read_u32(payload, &mut offset)?;
 
     let ok_byte = read_u8(payload, &mut offset)?;
     match ok_byte {
@@ -563,7 +565,7 @@ pub fn parse_bridge_response_payload(
             } else {
                 WireValue::Undefined
             };
-            Ok(Ok(value))
+            Ok((call_id, Ok(value)))
         }
         0 => {
             // ok = false - read the error payload: code name message stack
@@ -576,7 +578,7 @@ pub fn parse_bridge_response_payload(
                 // the payload. We don't use it — it's host-side context only.
                 let _ = read_string(payload, &mut offset)?;
             }
-            Ok(Err(message))
+            Ok((call_id, Err(message)))
         }
         b => Err(io::Error::new(
             io::ErrorKind::InvalidData,

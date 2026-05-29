@@ -246,6 +246,7 @@ learned during development.
   for dev-dep versions. Reference deps as `"catalog:"` in package.json,
   not hard-coded versions.
 - Node 24+ is required; `mise.toml` pins to 26 for development. CI uses 26.
+- `spawn_responder` in `v8.rs` tests reads and discards one frame before calling the `respond` closure. Tests using `run_with_bridge` where the respond closure needs to handle multiple calls must NOT try to read frames inside respond — use `drain_bridge_calls` with a direct socket pair instead (see `bridge_call_exactly_at_limit_succeeds` as the pattern to follow).
 - `@iso4/core` has no test files; `vitest run` exits non-zero when no test
   files are found. This is a known gap — `pnpm test:run` will report it as
   a failure. Ignore it until a test file is added to that package.

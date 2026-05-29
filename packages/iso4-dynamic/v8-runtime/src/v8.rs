@@ -200,9 +200,10 @@ pub fn execute(
     limits: Limits,
     globals: &[String],
     stream_fd: Option<RawFd>,
+    call_id_counter: Arc<AtomicU32>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename.unwrap_or("<iso4>"), None, limits, globals, stream_fd)
+    run_module(code, filename.unwrap_or("<iso4>"), None, limits, globals, stream_fd, call_id_counter)
 }
 
 /// Execute a postfix against a pre-compiled prefix snapshot.
@@ -217,9 +218,10 @@ pub fn execute_with_prefix(
     limits: Limits,
     globals: &[String],
     stream_fd: Option<RawFd>,
+    call_id_counter: Arc<AtomicU32>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename.unwrap_or("<iso4>"), Some(snapshot_bytes), limits, globals, stream_fd)
+    run_module(code, filename.unwrap_or("<iso4>"), Some(snapshot_bytes), limits, globals, stream_fd, call_id_counter)
 }
 
 /// Compile prefix code into a V8 startup snapshot blob.
@@ -245,7 +247,7 @@ pub fn precompile(
 /// Core execution without bridge - used by tests.
 fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename, None, limits, &[], None)
+    run_module(code, filename, None, limits, &[], None, Arc::new(AtomicU32::new(0)))
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
@@ -263,6 +265,12 @@ fn run_module(
     limits: Limits,
     globals: &[String],
     stream_fd: Option<RawFd>,
+    // Per-connection call-ID counter. Shared across all runs on the same
+    // connection so callIds are monotonically increasing and never reset to 0
+    // between runs. This prevents a stale BridgeResponse from a previous
+    // run's orphaned handler from being accepted as a valid response by the
+    // next run's bridge_global_callback.
+    call_id_counter: Arc<AtomicU32>,
 ) -> Result<Output, FailureOutput> {
     let start = std::time::Instant::now();
     let mut logs = LogBuffers::default();
@@ -351,7 +359,7 @@ fn run_module(
     // The socket is carried as a raw file descriptor (RawFd = i32). The
     // callback reconstructs a ManuallyDrop<UnixStream> from it for the
     // duration of one BridgeCall/BridgeResponse exchange and never closes it.
-    let call_id = Arc::new(AtomicU32::new(0));
+    let call_id = call_id_counter;
     let bridge_call_count = Arc::new(AtomicU32::new(0));
     let bridge_error: Arc<OnceLock<RunError>> = Arc::new(OnceLock::new());
 
@@ -1080,7 +1088,7 @@ fn bridge_global_callback(
     }
 
     // ── Decode BridgeResponse ──────────────────────────────────────────────
-    let response = match wire::parse_bridge_response_payload(&frame.payload) {
+    let (response_call_id, response) = match wire::parse_bridge_response_payload(&frame.payload) {
         Ok(r) => r,
         Err(e) => {
             data.bridge_error
@@ -1090,6 +1098,23 @@ fn bridge_global_callback(
             return;
         }
     };
+
+    // ── Validate callId ───────────────────────────────────────────────────
+    // The connection is reused across runs; a late BridgeResponse from a
+    // previous run's orphaned handler could arrive here after the per-
+    // connection counter has advanced past that run.  If the callId in the
+    // response does not match what we sent, reject it immediately so stale
+    // data is never injected into this run's sandbox.
+    if response_call_id != call_id {
+        data.bridge_error
+            .set(RunError::Internal(format!(
+                "bridge: unexpected callId in response (expected {call_id}, got {response_call_id})\
+                 — possible cross-run frame contamination"
+            )))
+            .ok();
+        throw_v8_error(scope, "[iso4] bridge: unexpected callId in response");
+        return;
+    }
 
     match response {
         Ok(wire_value) => {
@@ -2455,6 +2480,7 @@ mod tests {
             Limits { cpu_time_ms: 200, wall_time_ms: 1_000, ..Default::default() },
             &[],
             None,
+            Arc::new(AtomicU32::new(0)),
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -2765,7 +2791,7 @@ mod tests {
         // Module-scoped `const` stays in the prefix module's scope.
         // Use globalThis to share values with the postfix module.
         let snapshot = precompile("globalThis.base = 100", None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.base + 1", None, Limits::default(), &[], None)
+        let out = execute_with_prefix(&snapshot, "export default globalThis.base + 1", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0)))
             .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("101"));
     }
@@ -2773,7 +2799,7 @@ mod tests {
     #[test]
     fn execute_with_prefix_global_mutation_visible_in_postfix() {
         let snapshot = precompile("globalThis.answer = 42", None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.answer", None, Limits::default(), &[], None).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.answer", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42"));
     }
 
@@ -2781,9 +2807,9 @@ mod tests {
     fn execute_with_prefix_multiple_postfixes_are_independent() {
         let snapshot = precompile("globalThis.base = 10", None).unwrap();
         let b = "globalThis.base";
-        let out1 = execute_with_prefix(&snapshot, &format!("export default {b} * 2"), None, Limits::default(), &[], None).unwrap();
-        let out2 = execute_with_prefix(&snapshot, &format!("export default {b} * 3"), None, Limits::default(), &[], None).unwrap();
-        let out3 = execute_with_prefix(&snapshot, &format!("export default {b} * 4"), None, Limits::default(), &[], None).unwrap();
+        let out1 = execute_with_prefix(&snapshot, &format!("export default {b} * 2"), None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
+        let out2 = execute_with_prefix(&snapshot, &format!("export default {b} * 3"), None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
+        let out3 = execute_with_prefix(&snapshot, &format!("export default {b} * 4"), None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
         assert_eq!(get_default(&out1).as_deref(), Some("20"));
         assert_eq!(get_default(&out2).as_deref(), Some("30"));
         assert_eq!(get_default(&out3).as_deref(), Some("40"));
@@ -2792,8 +2818,8 @@ mod tests {
     #[test]
     fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
         let snapshot = precompile("globalThis.counter = 0", None).unwrap();
-        execute_with_prefix(&snapshot, "globalThis.counter = 99; export default 1", None, Limits::default(), &[], None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.counter", None, Limits::default(), &[], None).unwrap();
+        execute_with_prefix(&snapshot, "globalThis.counter = 99; export default 1", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.counter", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("0"));
     }
 
@@ -2803,7 +2829,7 @@ mod tests {
             r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
             None,
         ).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.sq[7]", None, Limits::default(), &[], None).unwrap();
+        let out = execute_with_prefix(&snapshot, "export default globalThis.sq[7]", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("49"));
     }
 
@@ -2817,6 +2843,7 @@ mod tests {
             Limits::default(),
             &[],
             None,
+            Arc::new(AtomicU32::new(0)),
         ).unwrap();
         assert!(out.stdout.iter().any(|l| l.contains("hello from postfix")));
     }
@@ -2824,7 +2851,7 @@ mod tests {
     #[test]
     fn execute_with_prefix_postfix_runtime_error_is_reported() {
         let snapshot = precompile("", None).unwrap();
-        let err = execute_with_prefix(&snapshot, r#"throw new Error("postfix failed")"#, None, Limits::default(), &[], None)
+        let err = execute_with_prefix(&snapshot, r#"throw new Error("postfix failed")"#, None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0)))
             .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError { .. }));
     }
@@ -2946,6 +2973,7 @@ mod tests {
             Limits { cpu_time_ms: 50, wall_time_ms: 5_000, ..Default::default() },
             &["myTool".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         );
         responder.join().unwrap();
         assert!(out.is_ok(), "expected Ok (bridge wait excluded from cpu), got: {:?}",
@@ -3021,6 +3049,7 @@ mod tests {
         let handle = spawn_responder(server, respond);
         let result = execute(
             code, None, limits, &[global.to_string()], Some(fd),
+            Arc::new(AtomicU32::new(0)),
         );
         (result, handle)
     }
@@ -3083,6 +3112,7 @@ mod tests {
             Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
             &["add".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap();
         responder.join().unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("99"));
@@ -3127,6 +3157,7 @@ mod tests {
             Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
             &["myTool".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap_err().error;
 
         responder.join().unwrap();
@@ -3162,6 +3193,7 @@ mod tests {
             },
             &["myTool".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap_err().error;
 
         responder.join().unwrap();
@@ -3258,6 +3290,7 @@ mod tests {
             Limits { cpu_time_ms: 10_000, wall_time_ms: 300, ..Default::default() },
             &["myTool".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap_err().error;
 
         assert!(matches!(err, RunError::WallTimeout),
@@ -3299,6 +3332,7 @@ mod tests {
             Limits { wall_time_ms: 200, cpu_time_ms: 30_000, ..Default::default() },
             &["myTool".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap_err().error;
         assert!(matches!(err, RunError::WallTimeout), "got {err:?}");
     }
@@ -3398,6 +3432,7 @@ mod tests {
             },
             &["myTool".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap_err().error;
 
         let calls_handled = handle.join().unwrap();
@@ -3411,7 +3446,17 @@ mod tests {
     fn bridge_call_limit_zero_means_no_limit() {
         // max_bridge_calls = 0 disables the count limit entirely.
         // All 5 calls should succeed.
-        let (out, h) = run_with_bridge(
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle = std::thread::spawn(move || {
+            drain_bridge_calls(server, 5, WireValue::Number(10.0))
+        });
+
+        let out = execute(
             "let n = 0; \
              n += await myTool(); \
              n += await myTool(); \
@@ -3419,24 +3464,20 @@ mod tests {
              n += await myTool(); \
              n += await myTool(); \
              export default n",
-            "myTool",
+            None,
             Limits {
                 cpu_time_ms: 5_000,
                 wall_time_ms: 10_000,
                 max_bridge_calls: 0,
                 ..Default::default()
             },
-            |s| {
-                // Respond to all 5 calls.
-                for call_id in 0..5u32 {
-                    let _ = ipc::read_rust_to_ts_frame(s);
-                    ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                        &bridge_resp_ok(call_id, &WireValue::Number(10.0))).unwrap();
-                }
-            },
-        );
-        h.join().unwrap();
-        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("50"));
+            &["myTool".to_string()],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        ).unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("50"));
     }
 
     #[test]
@@ -3467,6 +3508,7 @@ mod tests {
             },
             &["myTool".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap();
 
         handle.join().unwrap();
@@ -3501,12 +3543,126 @@ mod tests {
             },
             &["toolA".to_string(), "toolB".to_string()],
             Some(fd),
+            Arc::new(AtomicU32::new(0)),
         ).unwrap_err().error;
 
         let calls_handled = handle.join().unwrap();
         assert!(matches!(err, RunError::BridgeCallLimitExceeded),
             "expected BridgeCallLimitExceeded, got {err:?}");
         assert_eq!(calls_handled, 3, "expected 3 calls before limit, got {calls_handled}");
+    }
+
+    // ── callId validation ──────────────────────────────────────────────────
+
+    #[test]
+    fn bridge_response_with_wrong_call_id_is_rejected() {
+        // A BridgeResponse whose callId does not match the one Rust sent must
+        // be rejected as ERR_INTERNAL (cross-run contamination guard).
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle = std::thread::spawn(move || {
+            // Read the BridgeCall and reply with a deliberately wrong callId.
+            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            assert_eq!(frame.message_type, ipc::RustToTsMessageType::BridgeCall);
+            let sent_call_id = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+            // Respond with a callId that differs from the one Rust sent.
+            let wrong_call_id = sent_call_id.wrapping_add(99);
+            ipc::write_ts_to_rust_frame(
+                &mut server,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(wrong_call_id, &WireValue::Number(1.0)),
+            ).unwrap();
+        });
+
+        let err = execute(
+            "export default await myTool()",
+            None,
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            &["myTool".to_string()],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        ).unwrap_err().error;
+
+        handle.join().unwrap();
+        assert!(matches!(err, RunError::Internal(_)),
+            "expected Internal (callId mismatch), got {err:?}");
+    }
+
+    #[test]
+    fn per_connection_call_id_counter_prevents_cross_run_alias() {
+        // Simulates two sequential runs sharing the same per-connection
+        // call_id_counter.  Run 1 uses callId=0; the counter advances so
+        // Run 2 starts at callId=1 — a stale BridgeResponse with callId=0
+        // that arrives during Run 2 is rejected as a callId mismatch.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // ── Run 1: succeeds normally ─────────────────────────────────────
+        let (mut server1, client1) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client1 = ManuallyDrop::new(client1);
+        let fd1 = client1.as_raw_fd();
+
+        let h1 = std::thread::spawn(move || {
+            let frame = ipc::read_rust_to_ts_frame(&mut server1).unwrap();
+            let cid = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+            ipc::write_ts_to_rust_frame(
+                &mut server1,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(cid, &WireValue::Number(1.0)),
+            ).unwrap();
+            cid // return the callId run 1 used
+        });
+
+        let out = execute(
+            "export default await myTool()",
+            None,
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            &["myTool".to_string()],
+            Some(fd1),
+            Arc::clone(&counter),
+        ).unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("1"));
+        let run1_call_id = h1.join().unwrap();
+        assert_eq!(run1_call_id, 0, "run 1 should use callId=0");
+
+        // ── Run 2: counter has advanced; a stale run-1 response is rejected ─
+        let (mut server2, client2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client2 = ManuallyDrop::new(client2);
+        let fd2 = client2.as_raw_fd();
+
+        let h2 = std::thread::spawn(move || {
+            let frame = ipc::read_rust_to_ts_frame(&mut server2).unwrap();
+            let cid = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+            // Simulate a stale BridgeResponse from run 1 arriving here
+            // (callId=0 instead of the expected callId for run 2).
+            ipc::write_ts_to_rust_frame(
+                &mut server2,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(run1_call_id, &WireValue::Number(99.0)), // stale callId=0
+            ).unwrap();
+            cid // return callId run 2 expected
+        });
+
+        let err = execute(
+            "export default await myTool()",
+            None,
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            &["myTool".to_string()],
+            Some(fd2),
+            Arc::clone(&counter),
+        ).unwrap_err().error;
+
+        let run2_call_id = h2.join().unwrap();
+        assert!(run2_call_id > run1_call_id,
+            "run 2 callId ({run2_call_id}) must be > run 1 callId ({run1_call_id})");
+        assert!(matches!(err, RunError::Internal(_)),
+            "expected Internal (stale callId rejected), got {err:?}");
     }
 
     #[test]
