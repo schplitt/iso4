@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer'
+import { decodeWireValueFromSlice } from './wire.js'
 
 export const PROTOCOL_VERSION: 1 = 1
 
@@ -277,7 +278,7 @@ export function decodeAuthenticatePayload(
 // All integers are big-endian per docs/protocol.md §3.
 
 class PayloadWriter {
-  private readonly parts: Buffer[] = []
+  readonly parts: Buffer[] = []
 
   writeU8(n: number): this {
     const b = Buffer.allocUnsafe(1)
@@ -297,6 +298,11 @@ class PayloadWriter {
     const encoded = Buffer.from(s, 'utf8')
     this.writeU32(encoded.byteLength)
     this.parts.push(encoded)
+    return this
+  }
+
+  writeBytes(bytes: Uint8Array): this {
+    this.parts.push(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength))
     return this
   }
 
@@ -345,22 +351,24 @@ export interface RunPayloadOptions {
   code: string
   filename?: string
   limits?: ResourceLimits
+  globals?: string[]
 }
 
 /**
  * Encode a `RunPayload` per `docs/protocol.md` §5.2.
- * Globals and imports are empty for now (Phase 3+ / Phase 6+).
  * @param options
  */
 export function encodeRunPayload(options: RunPayloadOptions): Buffer {
-  return new PayloadWriter()
+  const w = new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
-    .writeU32(0) // globals count
-    .writeU32(0) // imports count
-    .toBuffer()
+  const globals = options.globals ?? []
+  w.writeU32(globals.length)
+  for (const name of globals) w.writeString(name)
+  w.writeU32(0) // imports count (Phase 6+)
+  return w.toBuffer()
 }
 
 // ── PrecompilePayload ───────────────────────────────────────────────────────
@@ -369,6 +377,7 @@ export interface PrecompilePayloadOptions {
   code: string
   filename?: string
   limits?: ResourceLimits
+  globals?: string[]
 }
 
 /**
@@ -377,13 +386,15 @@ export interface PrecompilePayloadOptions {
  * @param options
  */
 export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buffer {
-  return new PayloadWriter()
+  const w = new PayloadWriter()
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
-    .writeU32(0) // globals count
-    .writeU32(0) // imports count
-    .toBuffer()
+  const globals = options.globals ?? []
+  w.writeU32(globals.length)
+  for (const name of globals) w.writeString(name)
+  w.writeU32(0) // imports count (Phase 6+)
+  return w.toBuffer()
 }
 
 // ── PrefixRunPayload ────────────────────────────────────────────────────────
@@ -393,6 +404,7 @@ export interface PrefixRunPayloadOptions {
   code: string
   filename?: string
   limits?: ResourceLimits
+  globals?: string[]
 }
 
 /**
@@ -404,15 +416,17 @@ export interface PrefixRunPayloadOptions {
 export function encodePrefixRunPayload(
   options: PrefixRunPayloadOptions & { runId: number },
 ): Buffer {
-  return new PayloadWriter()
+  const w = new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.prefixId)
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
-    .writeU32(0) // globals count
-    .writeU32(0) // imports count
-    .toBuffer()
+  const globals = options.globals ?? []
+  w.writeU32(globals.length)
+  for (const name of globals) w.writeString(name)
+  w.writeU32(0) // imports count (Phase 6+)
+  return w.toBuffer()
 }
 
 // ── DisposePrefixPayload ────────────────────────────────────────────────────
@@ -423,6 +437,110 @@ export function encodePrefixRunPayload(
  */
 export function encodeDisposePrefixPayload(prefixId: string): Buffer {
   return new PayloadWriter().writeString(prefixId).toBuffer()
+}
+
+// ── BridgeCall decoder (Rust → TS) ───────────────────────────────────────────
+
+export interface BridgeCallInfo {
+  callId: number
+  /**
+   * 0 = global, 1 = import (Phase 7)
+   */
+  targetKind: 0 | 1
+  specifier: string | undefined
+  exportName: string
+  args: unknown[]
+}
+
+/**
+ * Decode a `BridgeCallPayload` from a `BridgeCall` frame sent by Rust.
+ * Per `docs/protocol.md` §5.4.
+ * @param buf
+ */
+export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
+  const view = Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength)
+  let offset = 0
+
+  const readU8 = (): number => {
+    if (offset >= view.byteLength)
+      throw new Error('BridgeCall payload truncated (u8)')
+    return view.readUInt8(offset++)
+  }
+  const readU32 = (): number => {
+    if (offset + 4 > view.byteLength)
+      throw new Error('BridgeCall payload truncated (u32)')
+    const n = view.readUInt32BE(offset)
+    offset += 4
+    return n
+  }
+  const readString = (): string => {
+    const len = readU32()
+    if (offset + len > view.byteLength)
+      throw new Error('BridgeCall payload truncated (string)')
+    const s = view.subarray(offset, offset + len).toString('utf8')
+    offset += len
+    return s
+  }
+  const readWireValue = (): [unknown, number] => {
+    const slice = new Uint8Array(view.buffer, view.byteOffset + offset, view.byteLength - offset)
+    const [value, consumed] = decodeWireValueFromSlice(slice)
+    offset += consumed
+    return [value, consumed]
+  }
+
+  const callId = readU32()
+  const targetKindRaw = readU8()
+  if (targetKindRaw !== 0 && targetKindRaw !== 1)
+    throw new Error(`invalid bridge targetKind: ${targetKindRaw}`)
+  const targetKind = targetKindRaw as 0 | 1
+  const specifierPresent = readU8()
+  const specifier = specifierPresent === 1 ? readString() : undefined
+  const exportName = readString()
+  const argCount = readU32()
+  const args: unknown[] = []
+  for (let i = 0; i < argCount; i++) {
+    const [value] = readWireValue()
+    args.push(value)
+  }
+  return { callId, targetKind, specifier, exportName, args }
+}
+
+// ── BridgeResponse encoder (TS → Rust) ──────────────────────────────────────
+
+/**
+ * Encode a `BridgeResponsePayload` per `docs/protocol.md` §5.4.
+ *
+ * When `ok = true`, `encodedValue` contains pre-encoded WireValue bytes.
+ * When `ok = false`, `errorMessage` is the handler rejection message.
+ * @param callId
+ * @param ok
+ * @param encodedValue
+ * @param errorMessage
+ */
+export function encodeBridgeResponsePayload(
+  callId: number,
+  ok: boolean,
+  encodedValue?: Uint8Array,
+  errorMessage?: string,
+): Buffer {
+  const w = new PayloadWriter()
+  w.writeU32(callId)
+  if (ok) {
+    w.writeU8(1) // ok = true
+    if (encodedValue !== undefined && encodedValue.byteLength > 0) {
+      w.writeU8(1) // value present
+      w.writeBytes(encodedValue)
+    } else {
+      w.writeU8(0) // value absent → Undefined
+    }
+  } else {
+    w.writeU8(0) // ok = false
+    w.writeString('ERR_HOST_BRIDGE')
+    w.writeString('Error')
+    w.writeString(errorMessage ?? 'host handler failed')
+    w.writeU8(0) // no stack
+  }
+  return w.toBuffer()
 }
 
 export function parseTsToRustMessageType(

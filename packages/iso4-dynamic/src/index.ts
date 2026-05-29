@@ -1,5 +1,5 @@
 /**
- * \@iso4/dynamic — public entry point.
+ * \@iso4/dynamic - public entry point.
  *
  * Spawns the Rust V8 subprocess, manages a pool of UDS connections (one per
  * isolate slot), and exposes the `Runtime` + `DynamicPrefix` API.
@@ -15,7 +15,7 @@ import type { ChildProcess } from 'node:child_process'
 
 import { resolveRuntimeBinary } from './binary'
 import { RuntimeIpcClient } from './client'
-import type { PrecompilePayloadOptions, PrefixRunPayloadOptions } from './ipc'
+
 import { ConnectionPool } from './pool'
 import {
   decodePrecompileResultPayload,
@@ -23,6 +23,7 @@ import {
 } from './wire'
 import type {
   DynamicPrefix,
+  HostGlobals,
   PrecompileOptions,
   PrefixRunOptions,
   ResourceLimits,
@@ -141,6 +142,8 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
   }
 }
 
+// ── Bridge dispatcher factory ─────────────────────────────────────────────
+
 // ── RuntimeImpl ────────────────────────────────────────────────────────────
 
 class RuntimeImpl implements Runtime {
@@ -163,24 +166,30 @@ class RuntimeImpl implements Runtime {
   }
 
   async run(options: RunOptions): Promise<RunResult> {
+    if (options.signal?.aborted) {
+      return { ok: false, error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' }, stdout: [], stderr: [], durationMs: 0 }
+    }
     return this.pool.withClient(async (client) => {
       const raw = await client.runRawCode(options.code, {
         filename: options.filename,
         limits: toWireLimits(options.limits),
+        globals: options.globals,
       })
       return decodeRunCompletionPayload(raw.result).result
     })
   }
 
-  async precompile(options: PrecompileOptions): Promise<DynamicPrefix> {
-    const encodeOptions: PrecompilePayloadOptions = {
-      code: options.code,
-      filename: options.filename,
-      limits: toWireLimits(options.limits),
-    }
-
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+  async precompile<G extends HostGlobals = {}>(
+    options: PrecompileOptions<G>,
+  ): Promise<DynamicPrefix<G>> {
     return this.pool.withClient(async (client) => {
-      const raw = await client.precompile(encodeOptions)
+      const raw = await client.precompile({
+        code: options.code,
+        filename: options.filename,
+        limits: toWireLimits(options.limits),
+        globals: options.globals,
+      })
       const result = decodePrecompileResultPayload(raw)
 
       if (!result.ok) {
@@ -196,7 +205,7 @@ class RuntimeImpl implements Runtime {
         throw err
       }
 
-      return new DynamicPrefixImpl(result.prefixId, this.pool)
+      return new DynamicPrefixImpl<G>(result.prefixId, this.pool, options.globals ?? {} as G)
     })
   }
 
@@ -211,7 +220,7 @@ class RuntimeImpl implements Runtime {
     try {
       await unlink(this.socketPath)
     } catch {
-      // already removed or never created — that's fine
+      // already removed or never created - that's fine
     }
   }
 
@@ -222,21 +231,31 @@ class RuntimeImpl implements Runtime {
 
 // ── DynamicPrefixImpl ──────────────────────────────────────────────────────
 
-class DynamicPrefixImpl implements DynamicPrefix {
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type
+class DynamicPrefixImpl<G extends HostGlobals = {}>
+implements DynamicPrefix<G> {
   readonly id: string
   private readonly pool: ConnectionPool
+  /**
+   * Handlers declared at precompile time. Used as defaults for any run that
+   * does not supply its own override, per DESIGN.md §11.4 "Rebinding rules":
+   * "If the prefix declared a global the run doesn't supply, the
+   * precompile-time implementation is reused."
+   */
+  private readonly defaultGlobals: G
   private _alive = true
 
-  constructor(id: string, pool: ConnectionPool) {
+  constructor(id: string, pool: ConnectionPool, defaultGlobals: G) {
     this.id = id
     this.pool = pool
+    this.defaultGlobals = defaultGlobals
   }
 
   get alive(): boolean {
     return this._alive
   }
 
-  async run(options: PrefixRunOptions): Promise<RunResult> {
+  async run(options: PrefixRunOptions<G>): Promise<RunResult> {
     if (!this._alive) {
       return {
         ok: false,
@@ -251,15 +270,19 @@ class DynamicPrefixImpl implements DynamicPrefix {
       }
     }
 
-    const encodeOptions: PrefixRunPayloadOptions = {
-      prefixId: this.id,
-      code: options.code,
-      filename: options.filename,
-      limits: toWireLimits(options.limits),
+    if (options.signal?.aborted) {
+      return { ok: false, error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' }, stdout: [], stderr: [], durationMs: 0 }
     }
-
+    // Merge: run-time globals override precompile-time defaults (DESIGN.md §11.4).
+    const globals: HostGlobals = { ...this.defaultGlobals as HostGlobals, ...options.globals as HostGlobals }
     return this.pool.withClient(async (client) => {
-      const raw = await client.prefixRun(encodeOptions)
+      const raw = await client.prefixRun({
+        prefixId: this.id,
+        code: options.code,
+        filename: options.filename,
+        limits: toWireLimits(options.limits),
+        globals,
+      })
       return decodeRunCompletionPayload(raw.result).result
     })
   }
@@ -268,7 +291,7 @@ class DynamicPrefixImpl implements DynamicPrefix {
     if (!this._alive)
       return
     this._alive = false
-    // Fire-and-forget — no response frame for DisposePrefix.
+    // Fire-and-forget - no response frame for DisposePrefix.
     await this.pool.withClient((client) => client.disposePrefix(this.id))
   }
 

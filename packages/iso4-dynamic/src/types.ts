@@ -60,12 +60,28 @@ export interface Runtime {
 
   /**
    * Pre-compile a prefix of code into a V8 startup snapshot.
-   * The returned DynamicPrefix boots isolates from the snapshot on each run().
    *
-   * globals and imports declared here define the bridge surface shape.
-   * Subsequent prefix.run() calls rebind implementations but cannot add names.
+   * The type parameter `G` is inferred from the `globals` you pass and flows
+   * into the returned `DynamicPrefix<G>`. This lets TypeScript enforce at
+   * the call site that `prefix.run()` can only rebind names declared here:
+   *
+   * ```ts
+   * const prefix = await runtime.precompile({
+   *   globals: { fetch: myHandler, myTool: otherHandler },
+   * })
+   * // prefix: DynamicPrefix<{ fetch: ..., myTool: ... }>
+   *
+   * prefix.run({ globals: { fetch: newHandler } })          // ✅
+   * prefix.run({ globals: { undeclared: someHandler } })    // ❌ TS error
+   * ```
+   *
+   * Globals declared here serve as **default** implementations for all runs.
+   * `prefix.run()` may override any subset; omitted names reuse the default.
    */
-  precompile: (options: PrecompileOptions) => Promise<DynamicPrefix>
+  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+  precompile: <G extends HostGlobals = {}>(
+    options: PrecompileOptions<G>,
+  ) => Promise<DynamicPrefix<G>>
 
   /**
    * Tear down the Rust process. Outstanding prefixes are invalidated.
@@ -86,7 +102,17 @@ export type CreateRuntime = (options?: RuntimeOptions) => Promise<Runtime>
 // Precompiled prefix
 // ─────────────────────────────────────────────────────────────────────────
 
-export interface PrecompileOptions {
+/**
+ * Options for `runtime.precompile()`.
+ *
+ * `G` is the shape of globals this prefix declares. TypeScript infers it
+ * from the `globals` field, so the returned `DynamicPrefix<G>` is typed to
+ * allow only those names to be rebound in subsequent `prefix.run()` calls.
+ *
+ * When `globals` is omitted the type parameter defaults to `{}` (no declared
+ * globals). Declare globals explicitly to allow rebinding at run time.
+ */
+export interface PrecompileOptions<G extends HostGlobals> {
   /**
    * ESM source code to evaluate before snapshotting. Top-level await works.
    *
@@ -96,7 +122,22 @@ export interface PrecompileOptions {
    */
   code: string
 
-  globals?: HostGlobals
+  /**
+   * Declares the globals that sandbox code will be able to call.
+   *
+   * This defines the **bridge surface shape** — the full set of names the
+   * sandbox may invoke as globals. Names declared here:
+   *
+   * - Become bridge stubs in the V8 context on every `prefix.run()` call.
+   * - Can be rebound per-run via `prefix.run({ globals })`.
+   * - Cannot be supplemented at run time — a name not declared here will
+   *   cause `ERR_UNDECLARED_BINDING` if passed to `prefix.run()`.
+   *
+   * The handlers provided here are the **default** implementations reused by
+   * any `prefix.run()` call that does not override them.
+   */
+  globals?: G
+
   imports?: ImportsConfig
 
   /**
@@ -111,8 +152,6 @@ export interface PrecompileOptions {
    * **Currently a no-op placeholder.** The field is sent over the wire but
    * silently discarded — no default limits are stored or propagated to
    * `prefix.run()` calls. Pass limits directly to each `prefix.run()` call.
-   * Storing precompile-time limits as per-prefix defaults is a planned
-   * future improvement.
    *
    * Limits that DO apply to `prefix.run()` calls:
    * - `cpuTimeMs` — active V8 execution time only (async host-call wait excluded)
@@ -128,14 +167,25 @@ export interface PrecompileOptions {
 }
 
 /**
- * Handle to a precompiled prefix. Run many dynamic code strings against
- * the same warm snapshot state.
+ * Handle to a precompiled prefix.
+ *
+ * `G` is the shape of globals declared at precompile time. `prefix.run()`
+ * accepts only `Partial<G>` for its `globals` field — you may override any
+ * declared global's implementation per run, but you cannot add names that
+ * were not declared at precompile time. TypeScript will catch this at the
+ * call site when G is a specific type.
+ *
+ * Run many dynamic code strings against the same warm snapshot state.
  */
-export interface DynamicPrefix {
+export interface DynamicPrefix<G extends HostGlobals> {
   readonly id: string
 
   /**
    * Execute dynamic code against this prefix's snapshot state.
+   *
+   * Globals declared at precompile time are active. You may rebind any subset
+   * of them via `options.globals`; the precompile-time handler is used for
+   * any name not overridden here.
    *
    * Typical pattern — dev wraps agent-generated code before passing it:
    * @example
@@ -143,7 +193,7 @@ export interface DynamicPrefix {
    *     code: `export default await (${agentFn})()`,
    *   })
    */
-  run: (options: PrefixRunOptions) => Promise<RunResult>
+  run: (options: PrefixRunOptions<G>) => Promise<RunResult>
 
   /**
    * Release the snapshot. Subsequent run() calls reject. Idempotent.
@@ -158,21 +208,40 @@ export interface DynamicPrefix {
   readonly alive: boolean
 }
 
-export interface PrefixRunOptions {
+/**
+ * Options for `prefix.run()`.
+ *
+ * `G` is the declared-globals shape from the matching `precompile()` call.
+ * The `globals` field is typed as `Partial<G>` — only names present in `G`
+ * (i.e. declared at precompile time) may be overridden. Passing any other
+ * name is a TypeScript error at compile time and `ERR_UNDECLARED_BINDING`
+ * at runtime.
+ *
+ * Omitting a declared name reuses the precompile-time default implementation.
+ */
+export interface PrefixRunOptions<G extends HostGlobals> {
   /**
    * Dynamic ESM source code to compile and run against the prefix state.
    */
   code: string
 
   /**
-   * Per-run implementations for globals declared at precompile time.
-   * Names not declared at precompile time fail with ERR_UNDECLARED_BINDING.
+   * Override implementations for a **subset** of globals declared at
+   * precompile time.
+   *
+   * - Only keys in `G` (declared via `precompile({ globals })`) are accepted.
+   * - Adding a name not declared at precompile time: TypeScript error + runtime
+   *   `ERR_UNDECLARED_BINDING`.
+   * - Omitted names use the precompile-time default handler.
+   * - Functions in return values are currently dropped (planned: callable
+   *   handles, see DESIGN.md §14).
    */
-  globals?: HostGlobals
+  globals?: Partial<G>
 
   /**
-   * Per-run implementations for host-module imports declared at precompile time.
-   * Source modules cannot be rebound (frozen in snapshot).
+   * Rebind host-module imports declared at precompile time.
+   * Source module imports are frozen in the snapshot and cannot be rebound.
+   * (Phase 6/7 — not yet implemented.)
    */
   imports?: ImportsConfig
 

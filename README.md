@@ -95,6 +95,71 @@ Releases use [changesets](https://github.com/changesets/changesets) for
 independent per-package versioning. See [`.changeset/README.md`](./.changeset/README.md)
 for the workflow.
 
+## Current status
+
+The runtime works end-to-end:
+
+- `runtime.run({ code, limits })` — direct sandboxed execution
+- `runtime.precompile()` + `prefix.run()` — snapshot-based prefix/postfix
+- CPU and wall-clock limits enforced, async wait excluded from CPU budget
+- Host-declared globals bridged into V8 (`fetch`, `myTool`, any name)
+- `ERR_UNDECLARED_BINDING` enforced on `prefix.run()` globals
+
+## How globals work
+
+`globals` in `run()` or `precompile()` wires any name directly into the
+sandbox's global object. The bridge is completely generic — the name
+`fetch` is not special:
+
+```ts
+const result = await runtime.run({
+  code: `
+    const res = await fetch('https://api.example.com/data')
+    // res is exactly what the handler returned — a plain object
+    const parsed = JSON.parse(res.body)
+    export default parsed.value
+  `,
+  globals: {
+    // handler receives whatever args the sandbox passed
+    fetch: async (url: string) => {
+      const nodeRes = await globalThis.fetch(url)
+      const body = await nodeRes.text()
+      return { status: nodeRes.status, body }
+    },
+  },
+})
+```
+
+The handler receives the raw arguments from sandbox code. The return value
+is serialised as plain data (WireValue). **Functions in return values are
+currently dropped** — a plain object comes back, not a `Response` class with
+`.json()` on it.
+
+### The recommended pattern: wrap your API
+
+For anything the agent-generated code should treat as a first-class API
+(like a fetch-compatible `Response` with `.json()`, or a database client
+with `.query()`), expose a wrapper global that returns the exact shape the
+sandbox needs — rather than hoping the sandbox adapts to a raw object.
+
+For example, instead of exposing `fetch` with a raw `{ status, body }`
+return, expose a higher-level tool that the agent calls directly:
+
+```ts
+globals: {
+  // agent code calls:  const data = await searchWeb('cats')
+  // not:               const res = await fetch(...) + JSON.parse(res.body)
+  searchWeb: async (query: string) => {
+    const res = await globalThis.fetch(`https://api.example.com/search?q=${encodeURIComponent(query)}`)
+    return res.json()
+  },
+}
+```
+
+This is idiomatic iso4: the host exposes a curated, domain-specific surface
+rather than leaking raw HTTP semantics into agent code. Agent code stays
+clean and the host retains full control over every network call.
+
 ## License
 
 [MIT](./LICENSE) © schplitt

@@ -12,6 +12,7 @@
 //!   parsing lands, the `run_id` will be read from the payload.
 
 use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,14 +21,22 @@ use crate::ipc;
 use crate::v8 as sandbox;
 use crate::wire;
 
+/// Snapshot + declared global names for one precompiled prefix.
+pub struct PrefixData {
+    pub snapshot: Vec<u8>,
+    /// Global names declared at precompile time. PrefixRun globals must be a
+    /// subset of this set; extras are rejected with ERR_UNDECLARED_BINDING.
+    pub declared_globals: Vec<String>,
+}
+
 /// State shared across all connection threads in the same Rust process.
 ///
 /// Using a single shared store means a prefix compiled on connection 0 is
 /// visible to connections 1, 2, … N — which is required for the TypeScript
 /// pool to route any run to any free slot.
 pub struct SharedState {
-    /// Snapshots keyed by their string PrefixId.
-    pub prefix_store: Mutex<HashMap<String, Vec<u8>>>,
+    /// Prefix data keyed by their string PrefixId.
+    pub prefix_store: Mutex<HashMap<String, PrefixData>>,
     /// Monotonically increasing counter for generating unique PrefixIds.
     pub next_prefix_id: AtomicU64,
     /// Auth token — must match the token sent in every Authenticate frame.
@@ -116,11 +125,19 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 };
 
                 eprintln!(
-                    "[iso4-v8] Run {} received ({} code bytes)",
+                    "[iso4-v8] Run {} received ({} code bytes, {} globals)",
                     payload.run_id,
-                    payload.code.len()
+                    payload.code.len(),
+                    payload.globals.len(),
                 );
 
+                let globals: Vec<String> = payload
+                    .globals.iter().map(|g| g.name.clone()).collect();
+                let stream_fd = if globals.is_empty() {
+                    None
+                } else {
+                    Some(stream.as_raw_fd())
+                };
                 let result_payload = match sandbox::execute(
                     &payload.code,
                     payload.filename.as_deref(),
@@ -129,6 +146,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         cpu_time_ms:  payload.limits.cpu_time_ms,
                         memory_mb:    payload.limits.memory_mb,
                     },
+                    &globals,
+                    stream_fd,
                 ) {
                     Ok(output) => {
                         eprintln!("[iso4-v8] run succeeded in {}ms", output.duration_ms);
@@ -184,10 +203,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 .next_prefix_id
                                 .fetch_add(1, Ordering::Relaxed)
                                 .to_string();
+                            let declared_globals: Vec<String> = payload
+                                .globals.iter().map(|g| g.name.clone()).collect();
                             eprintln!(
                                 "[iso4-v8] precompile succeeded — prefix_id={prefix_id} \
-                                 ({} snapshot bytes)",
-                                snapshot_bytes.len()
+                                 ({} snapshot bytes, {} declared globals)",
+                                snapshot_bytes.len(),
+                                declared_globals.len(),
                             );
                             // unwrap_or_else(|p| p.into_inner()): if a thread panicked
                             // while holding this lock, Rust marks the Mutex "poisoned"
@@ -201,7 +223,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 .prefix_store
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
-                                .insert(prefix_id.clone(), snapshot_bytes);
+                                .insert(prefix_id.clone(), PrefixData {
+                                    snapshot: snapshot_bytes,
+                                    declared_globals,
+                                });
                             wire::encode_precompile_result_payload(Some(&prefix_id), None)
                         }
                         Err(failure) => {
@@ -234,14 +259,14 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                 };
 
-                let snapshot_clone = shared
+                let prefix_data_clone = shared
                     .prefix_store
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) // see poison comment above
                     .get(&payload.prefix_id)
-                    .cloned();
+                    .map(|d| (d.snapshot.clone(), d.declared_globals.clone()));
 
-                let result_payload = match snapshot_clone {
+                let result_payload = match prefix_data_clone {
                     None => {
                         eprintln!(
                             "[iso4-v8] PrefixRun {} — prefix_id={} not found",
@@ -265,10 +290,51 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             }),
                         )
                     }
-                    Some(snapshot_bytes) => {
+                    Some((snapshot_bytes, declared_globals)) => {
+                        // ── ERR_UNDECLARED_BINDING check ─────────────────────────────────
+                        // Every global in payload.globals must have been declared at
+                        // precompile time. Adding a new name at run time would silently
+                        // mutate the snapshot's global object shape, breaking the
+                        // invariant that the prefix captures the full bridge surface.
+                        let declared_set: std::collections::HashSet<&str> =
+                            declared_globals.iter().map(String::as_str).collect();
+                        let undeclared: Vec<&str> = payload.globals.iter()
+                            .map(|g| g.name.as_str())
+                            .filter(|name| !declared_set.contains(name))
+                            .collect();
+                        if let Some(name) = undeclared.first() {
+                            let msg = format!(
+                                "global '{name}' was not declared at precompile time"
+                            );
+                            eprintln!("[iso4-v8] PrefixRun {} — ERR_UNDECLARED_BINDING: {msg}",
+                                payload.run_id);
+                            wire::encode_run_completion_payload(
+                                payload.run_id,
+                                wire::RunCompletion::Failure(wire::RunFailurePayload {
+                                    error: wire::RunErrorPayload {
+                                        code: "ERR_UNDECLARED_BINDING".to_string(),
+                                        name: "Error".to_string(),
+                                        message: msg,
+                                        stack: None,
+                                    },
+                                    stdout: Vec::new(),
+                                    stderr: Vec::new(),
+                                    duration_ms: 0.0,
+                                }),
+                            )
+                        } else {
+
+                        let run_globals: Vec<String> = payload
+                            .globals.iter().map(|g| g.name.clone()).collect();
+                        let stream_fd = if run_globals.is_empty() {
+                            None
+                        } else {
+                            Some(stream.as_raw_fd())
+                        };
                         eprintln!(
-                            "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes)",
-                            payload.run_id, payload.prefix_id, payload.code.len()
+                            "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals)",
+                            payload.run_id, payload.prefix_id, payload.code.len(),
+                            run_globals.len(),
                         );
                         match sandbox::execute_with_prefix(
                             &snapshot_bytes,
@@ -279,6 +345,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 cpu_time_ms:  payload.limits.cpu_time_ms,
                                 memory_mb:    payload.limits.memory_mb,
                             },
+                            &run_globals,
+                            stream_fd,
                         ) {
                             Ok(output) => {
                                 eprintln!(
@@ -311,6 +379,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 )
                             }
                         }
+                        } // end undeclared check else branch
                     }
                 };
 
@@ -344,8 +413,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 }
             }
             ipc::TsToRustMessageType::BridgeResponse => {
-                eprintln!("[iso4-v8] unexpected BridgeResponse outside of run — closing");
-                break;
+                // A late BridgeResponse arrives when a bridge handler resolves
+                // after the run's wall timeout already killed the run on the
+                // Rust side. The connection is reused for future runs, so we
+                // simply discard the late frame rather than closing.
+                eprintln!("[iso4-v8] ignoring late BridgeResponse (run already completed)");
             }
             ipc::TsToRustMessageType::Terminate => {
                 eprintln!("[iso4-v8] Terminate received — closing");

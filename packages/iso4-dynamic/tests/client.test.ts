@@ -97,26 +97,58 @@ describe('RuntimeIpcClient', () => {
     await client.dispose()
   })
 
-  test('rejects BridgeCall in the raw helper', async () => {
+  test('handles BridgeCall: dispatches to handler, sends BridgeResponse, awaits Result', async () => {
+    // Simulate Rust sending a BridgeCall mid-run, then sending a Result.
+    // Build the BridgeCall payload manually:
+    //   u32 callId=0, u8 targetKind=0, u8 specifierPresent=0,
+    //   String "greet" (u32 len + bytes), u32 argCount=1,
+    //   WireValue::String "world" (0x05 + u32 len + bytes)
+    const enc = (s: string) => {
+      const b = Buffer.from(s, 'utf8')
+      const h = Buffer.allocUnsafe(4); h.writeUInt32BE(b.byteLength, 0)
+      return Buffer.concat([h, b])
+    }
+    const bridgeCallPayload = Buffer.concat([
+      Buffer.from([0, 0, 0, 0]), // callId = 0
+      Buffer.from([0]), // targetKind = global
+      Buffer.from([0]), // specifier absent
+      enc('greet'), // exportName
+      Buffer.from([0, 0, 0, 1]), // argCount = 1
+      Buffer.from([0x05]), // WireValue::String tag
+      enc('world'), // string value
+    ])
+
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
       socket.on('data', (chunk) => reader.push(chunk))
       await reader.readFrame() // Authenticate
       await reader.readFrame() // Run
+
       socket.write(
-        encodeRustToTsFrame(RustToTsMessageTypes.BridgeCall, new Uint8Array()),
+        encodeRustToTsFrame(RustToTsMessageTypes.BridgeCall, bridgeCallPayload),
+      )
+
+      // Read the BridgeResponse the client sends back
+      const responseFrame = await reader.readFrame()
+      // BridgeResponse is TS→Rust type byte 0x06
+      expect(responseFrame.messageType).toBe(TsToRustMessageTypes.BridgeResponse)
+
+      // Send a Result frame to complete the run
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('payload')),
       )
     })
 
-    const client = await RuntimeIpcClient.connect({
-      socketPath,
-      token: 'dev-token',
+    const dispatched: unknown[] = []
+    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const raw = await client.runRawCode('export default 1', {
+      globals: ['greet'],
+      dispatcher: async (_name, args) => {
+        dispatched.push(args[0]); return 'hello'
+      },
     })
-
-    await expect(client.runRawCode('export default 1')).rejects.toThrow(
-      /BridgeCall is not implemented/,
-    )
-
+    expect(Buffer.from(raw.result).toString('utf8')).toBe('payload')
+    expect(dispatched).toEqual(['world'])
     await client.dispose()
   })
 })

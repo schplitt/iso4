@@ -1,5 +1,5 @@
 /**
- * Binary wire codec — decoder for the iso4 Rust → TypeScript protocol.
+ * Binary wire codec - decoder for the iso4 Rust → TypeScript protocol.
  *
  * Implements `WireValue` decoding per `docs/protocol.md` §4 and
  * `RunCompletionPayload` decoding per §5.6.
@@ -9,6 +9,7 @@
  * `decodeRunCompletionPayload` only.
  */
 
+import { Buffer } from 'node:buffer'
 import type { RunErrorCode, RunResult, SandboxExports } from './types'
 
 // ── Value tags ─────────────────────────────────────────────────────────────
@@ -163,7 +164,15 @@ function decodeWireValueFromReader(reader: WireReader): unknown {
     }
     case TAG_OBJECT: {
       const count = reader.readU32()
-      const obj: Record<string, unknown> = {}
+      // Object.create(null) — no prototype chain, so obj['__proto__'] = x
+      // is a plain data assignment rather than a [[Set]] that triggers the
+      // __proto__ setter on Object.prototype. Prevents sandbox-controlled
+      // keys from manipulating the decoded object's prototype chain.
+      // TODO: Object.create(null) has a known V8 hidden-class penalty vs {}.
+      // Profile before optimising — security comes first; a null-prototype
+      // map with string keys may eventually be replaced by a Map<string,unknown>
+      // or a dedicated typed decoder once the hot path is identified.
+      const obj = Object.create(null) as Record<string, unknown>
       for (let i = 0; i < count; i++) {
         const key = reader.readString()
         obj[key] = decodeWireValueFromReader(reader)
@@ -181,7 +190,7 @@ function decodeWireValueFromReader(reader: WireReader): unknown {
  * Decode a single `WireValue` from the entire buffer.
  *
  * Throws `WireDecodeError` on unknown tags, truncated data, or trailing bytes.
- * Exported for testing — normal callers use `decodeRunCompletionPayload`.
+ * Exported for testing - normal callers use `decodeRunCompletionPayload`.
  * @param buf
  */
 export function decodeWireValue(buf: Uint8Array): unknown {
@@ -189,6 +198,21 @@ export function decodeWireValue(buf: Uint8Array): unknown {
   const value = decodeWireValueFromReader(reader)
   reader.assertDone()
   return value
+}
+
+/**
+ * Decode a single `WireValue` from the start of `buf`, returning both the
+ * decoded value and the number of bytes consumed.
+ *
+ * Used by `decodeBridgeCallPayload` in `ipc.ts` where multiple values are
+ * packed sequentially in a larger payload buffer.
+ * @param buf
+ */
+export function decodeWireValueFromSlice(buf: Uint8Array): [unknown, number] {
+  const reader = new WireReader(buf)
+  const value = decodeWireValueFromReader(reader)
+  const consumed = buf.byteLength - reader.remaining
+  return [value, consumed]
 }
 
 // ── RunCompletionPayload decoder ───────────────────────────────────────────
@@ -328,6 +352,117 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+// ── WireValue encoder (host → Rust direction) ──────────────────────────────────
+//
+// Used to encode the host handler's return value in a BridgeResponse.
+
+const ENC_TAG_UNDEFINED = 0x00
+const ENC_TAG_NULL = 0x01
+const ENC_TAG_FALSE = 0x02
+const ENC_TAG_TRUE = 0x03
+const ENC_TAG_NUMBER = 0x04
+const ENC_TAG_STRING = 0x05
+const ENC_TAG_BIGINT = 0x06
+const ENC_TAG_BYTES = 0x07
+const ENC_TAG_ARRAY = 0x08
+const ENC_TAG_OBJECT = 0x09
+
+class WireWriter {
+  private readonly parts: Buffer[] = []
+
+  writeU8(n: number): this {
+    const b = Buffer.allocUnsafe(1)
+    b.writeUInt8(n, 0)
+    this.parts.push(b)
+    return this
+  }
+
+  writeU32(n: number): this {
+    const b = Buffer.allocUnsafe(4)
+    b.writeUInt32BE(n, 0)
+    this.parts.push(b)
+    return this
+  }
+
+  writeF64(n: number): this {
+    const b = Buffer.allocUnsafe(8)
+    b.writeDoubleBE(n, 0)
+    this.parts.push(b)
+    return this
+  }
+
+  writeString(s: string): this {
+    const encoded = Buffer.from(s, 'utf8')
+    this.writeU32(encoded.byteLength)
+    this.parts.push(encoded)
+    return this
+  }
+
+  writeValue(value: unknown): this {
+    if (value === undefined) {
+      return this.writeU8(ENC_TAG_UNDEFINED)
+    }
+    if (value === null) {
+      return this.writeU8(ENC_TAG_NULL)
+    }
+    if (typeof value === 'boolean') {
+      return this.writeU8(value ? ENC_TAG_TRUE : ENC_TAG_FALSE)
+    }
+    if (typeof value === 'number') {
+      return this.writeU8(ENC_TAG_NUMBER).writeF64(value)
+    }
+    if (typeof value === 'string') {
+      return this.writeU8(ENC_TAG_STRING).writeString(value)
+    }
+    if (typeof value === 'bigint') {
+      return this.writeU8(ENC_TAG_BIGINT).writeString(value.toString())
+    }
+    if (value instanceof Uint8Array) {
+      this.writeU8(ENC_TAG_BYTES)
+      this.writeU32(value.byteLength)
+      this.parts.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength))
+      return this
+    }
+    if (Array.isArray(value)) {
+      this.writeU8(ENC_TAG_ARRAY)
+      this.writeU32(value.length)
+      for (const item of value) {
+        this.writeValue(item)
+      }
+      return this
+    }
+    if (typeof value === 'object') {
+      const entries = Object.entries(value as Record<string, unknown>)
+      this.writeU8(ENC_TAG_OBJECT)
+      this.writeU32(entries.length)
+      for (const [k, v] of entries) {
+        this.writeString(k)
+        this.writeValue(v)
+      }
+      return this
+    }
+    // Unrepresentable: function, symbol, Date, Map, Set, RegExp, class instance, etc.
+    // Throw so the caller can send an error BridgeResponse rather than
+    // silently injecting undefined into the sandbox.
+    throw new TypeError(
+      `[iso4] encodeWireValue: cannot encode value of type "${typeof value}"`,
+    )
+  }
+
+  toBuffer(): Buffer {
+    return Buffer.concat(this.parts)
+  }
+}
+
+/**
+ * Encode a single JavaScript value as a `WireValue` byte sequence.
+ * Used to encode host bridge response return values.
+ * @param value
+ */
+export function encodeWireValue(value: unknown): Buffer {
+  return new WireWriter().writeValue(value).toBuffer()
+}
 
 function wireObjectToExports(raw: unknown): SandboxExports {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {

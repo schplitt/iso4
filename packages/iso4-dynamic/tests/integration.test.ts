@@ -452,24 +452,25 @@ describe('fetch bridge — real HTTP server (Phase 4)', () => {
   })
 
   test('fetch values from server, sum with for-loop, verify against main thread', async () => {
+    // fetch is a generic bridge global: handler receives (url: string).
+    // sandbox parses the response body with JSON.parse.
     const result = await runtime.run({
       code: `
         const res = await fetch('${serverUrl}')
-        const { values } = await res.json()
+        const { values } = JSON.parse(res.body)
         let sum = 0
         for (let i = 0; i < values.length; i++) sum += values[i]
         export default sum
         export const count = values.length
       `,
       globals: {
-        fetch: async (req: { url: string }) => {
-          const nodeRes = await globalThis.fetch(req.url)
+        fetch: async (url: unknown) => {
+          const nodeRes = await globalThis.fetch(url as string)
           const body = await nodeRes.text()
           return { status: nodeRes.status, headers: Object.fromEntries(nodeRes.headers.entries()), body }
         },
       },
     })
-    // Phase 4 not implemented: globals are ignored, sandbox has no fetch.
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
@@ -482,15 +483,15 @@ describe('fetch bridge — real HTTP server (Phase 4)', () => {
       code: `
         globalThis.fetchSum = async (url) => {
           const res = await fetch(url)
-          const { values } = await res.json()
+          const { values } = JSON.parse(res.body)
           let total = 0
           for (let i = 0; i < values.length; i++) total += values[i]
           return total
         }
       `,
       globals: {
-        fetch: async (req: { url: string }) => {
-          const nodeRes = await globalThis.fetch(req.url)
+        fetch: async (url: unknown) => {
+          const nodeRes = await globalThis.fetch(url as string)
           const body = await nodeRes.text()
           return { status: nodeRes.status, headers: Object.fromEntries(nodeRes.headers.entries()), body }
         },
@@ -530,21 +531,23 @@ describe('globals bridge (Phase 4)', () => {
   })
 
   test('fetch handler receives the request URL', async () => {
+    // fetch is a generic bridge global: handler receives raw arguments.
+    // sandbox calls fetch(url_string) → handler receives (url: string).
+    // handler returns plain data; sandbox accesses res.body directly.
     const requests: string[] = []
     const result = await runtime.run({
       code: `
         const res = await fetch('https://api.example.com/data')
-        const json = await res.json()
+        const json = JSON.parse(res.body)
         export default json.value
       `,
       globals: {
-        fetch: async (req: { url: string }) => {
-          requests.push(req.url)
+        fetch: async (url: unknown) => {
+          requests.push(url as string)
           return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ value: 42 }) }
         },
       },
     })
-    // Phase 4: globals not bridged yet. Fails with "fetch is not defined".
     expect(requests).toEqual(['https://api.example.com/data'])
     expect(result.ok).toBe(true)
     if (!result.ok)
@@ -614,8 +617,8 @@ describe('globals bridge (Phase 4)', () => {
         export default res.status
       `,
       globals: {
-        fetch: async (req: { url: string }) => {
-          callLog.push(req.url)
+        fetch: async (url: unknown) => {
+          callLog.push(url as string)
           return { status: 418, headers: {}, body: null }
         },
       },
@@ -935,8 +938,48 @@ describe('resource limits (Phase 3/8)', () => {
     expect(['ERR_CPU_TIMEOUT', 'ERR_WALL_TIMEOUT']).toContain(result.error.code)
   }, 5_000)
 
-  // wall timeout via async hang (e.g. await slowFetch()) requires Phase 4 bridge.
-  // Use a tight loop with wall_time_ms < cpu_time_ms to test wall timeout:
+  test('cpu budget excludes globals bridge wait time', async () => {
+    // cpuTimeMs is tight (50ms) but the global bridge call takes 300ms.
+    // The run must succeed because bridge-wait time (leave/enter bracketing)
+    // is excluded from the CPU budget — this is the Phase 3+4 contract.
+    const result = await runtime.run({
+      code: `
+        await sleep(300)
+        export default 'done'
+      `,
+      limits: { cpuTimeMs: 50, wallTimeMs: 5_000 },
+      globals: {
+        sleep: (ms: unknown) =>
+          new Promise<void>((resolve) => setTimeout(resolve, Number(ms))),
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe('done')
+  }, 10_000)
+
+  test('wall timeout fires while sandbox is blocked in globals bridge call', async () => {
+    // wallTimeMs is tight; the global bridge call hangs indefinitely.
+    // The wall-clock guard fires even while V8 is blocked waiting for a
+    // BridgeResponse (the guard runs on its own OS thread).
+    const result = await runtime.run({
+      code: 'await neverResolves(); export default 1',
+      limits: { cpuTimeMs: 30_000, wallTimeMs: 300 },
+      globals: {
+        neverResolves: () => new Promise<void>(() => {}), // deliberate hang
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    // The wall guard fires, but since V8 is blocked in a bridge read the
+    // termination is delivered when execution resumes. Either timeout code is
+    // acceptable; ERR_WALL_TIMEOUT is expected when the guard beats the bridge.
+    expect(['ERR_WALL_TIMEOUT', 'ERR_CPU_TIMEOUT']).toContain(result.error.code)
+  }, 10_000)
+
+  // wall timeout via tight loop (no bridge): use wall_time_ms < cpu_time_ms
   test('wall timeout fires before cpu timeout', async () => {
     const result = await runtime.run({
       code: 'let i = 0; while (true) { i++; }',
@@ -1626,8 +1669,7 @@ describe('precompile stress', () => {
     )
     for (const [i, result] of results.entries()) {
       expect(result.ok).toBe(true)
-      if (!result.ok)
-        continue
+      // @ts-expect-error exports present as it is a successful run
       expect(result.exports['default']).toBe(7 * (i + 1))
     }
   })

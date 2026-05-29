@@ -606,8 +606,9 @@ feature most users will rely on and shapes the IPC protocol.
 | 8     | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
 | 9     | Pre-warmed isolate pool (optional, behind a runtime option)                                                                               | Sub-2ms cold start for high-throughput workloads                           |
 | 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |
-| 11    | `prefix.openSession()` + `Session` API; `HostCall`/`HostCallResult` wire messages; persistent-isolate semantics                           | Analytics pipeline use case works end-to-end with the two-process backend  |
-| 12    | In-process (C++ NAPI) backend behind a `RuntimeOptions.backend` flag; same `Session` API; requires Docker/K8s outer isolation             | Sub-µs amortized per-call overhead for high-throughput analytics           |
+| 11    | Callable handles: functions in bridge return values assigned per-run IDs; sandbox calls them via `BridgeCall { targetKind: 2 }`           | `res.json()`, `cursor.next()`, any returned method callable from sandbox   |
+| 12    | `prefix.openSession()` + `Session` API; `HostCall`/`HostCallResult` wire messages; persistent-isolate semantics                           | Analytics pipeline use case works end-to-end with the two-process backend  |
+| 13    | In-process (C++ NAPI) backend behind a `RuntimeOptions.backend` flag; same `Session` API; requires Docker/K8s outer isolation             | Sub-µs amortized per-call overhead for high-throughput analytics           |
 
 Each phase is independently shippable. We stop and reassess at the end of
 each phase.
@@ -1050,3 +1051,247 @@ closes the session).
 | Per-row analytics      | impractical         | ✅                          |
 | Crash isolation        | ✅ always           | ✅ two-process only         |
 | Prompt-injection risk  | mitigated by limits | same                        |
+
+---
+
+## 14. Bridge call constraints and limitations
+
+This section documents the observable behaviour and known constraints of the
+host bridge. These are design decisions, not accidents.
+
+### 14.1 Sequential bridge calls (v1)
+
+Bridge calls are **sequential within a single run**: Rust sends one `BridgeCall`
+and blocks until the matching `BridgeResponse` arrives before JS resumes. At
+most one handler is active at a time per run. Concurrency across runs is fully
+parallel (each run owns its own connection slot); it is only within one run
+that bridge calls are serialised.
+
+This is sufficient because the sandbox is itself single-threaded, so there can
+only be one pending `await someGlobal()` at a time. A future phase (13+) may
+add intra-run multiplexing if needed for very deep async call trees.
+
+### 14.2 No callable return values (current)
+
+Bridge return values are plain data (`WireValue`). Functions on returned
+objects are **silently dropped** — the sandbox receives the plain data fields
+but no methods. This means the handler cannot return a `Response`-like object
+with `.json()` on it today.
+
+**Workaround**: design globals as high-level tools that return already-processed
+data:
+
+```ts
+// Good: tool returns processed data
+globals: {
+  searchWeb: async (q: string) => { const r = await fetch(`/search?q=${q}`); return r.json() },
+}
+
+// Bad: trying to mirror web-standard fetch API
+globals: {
+  fetch: async (url: string) => ({ status: 200, body: '...' }),
+  // sandbox must JSON.parse(res.body) — no .json() method
+}
+```
+
+Callable return values are planned in Phase 11 (callable handles). See §15.
+
+### 14.3 `prefix.run()` globals are rebind-only
+
+`prefix.run({ globals })` may only **rebind** globals declared at
+`precompile({ globals })` time. Adding a new name at run time results in
+`ERR_UNDECLARED_BINDING` at runtime and a TypeScript compile-time error (when
+the `DynamicPrefix<G>` type parameter is specific).
+
+Rationale: the snapshot captures the prefix’s heap shape. Silently installing
+an undeclared global into a restored snapshot context would mutate that shape
+in a way the snapshot doesn’t know about.
+
+Omitting a declared global at run time is allowed — the precompile-time
+default implementation is reused.
+
+### 14.4 Handler lifecycle when wall timeout fires
+
+When the run’s wall-clock budget expires while the sandbox is blocked inside a
+bridge call:
+
+1. **Rust side**: the socket read in the bridge callback has a read timeout set
+   to the remaining wall budget. When it fires, the callback explicitly calls
+   `terminate_execution()` on the isolate handle, sets `TerminationReason::Wall`,
+   and returns without a result. V8 terminates at the next safe point.
+2. **TypeScript side**: the `drainUntilResult` loop races each dispatcher
+   invocation against a timer equal to the remaining wall budget + 200 ms.
+   When the timer wins, the loop skips writing a `BridgeResponse` (which would
+   corrupt the next run’s session) and reads the `Result { ERR_WALL_TIMEOUT }`
+   frame that Rust sent.
+3. **Handler promise**: the host handler’s `Promise` is **orphaned** — it has
+   no listener and will be garbage-collected when it eventually settles. Any
+   in-flight I/O or timers inside the handler continue until they complete
+   naturally. Node.js cannot forcefully kill a live `Promise`.
+
+**Consequence**: if the handler starts a network request and the wall timeout
+fires, the network request continues in the background after the sandbox run
+has already returned. This is generally acceptable for short-lived handlers.
+For long-lived handlers (e.g. ones that open DB connections), the host author
+should design them to be safe to orphan.
+
+### 14.5 AbortSignal for handler self-cancellation (planned)
+
+In a future phase the bridge dispatcher will receive an `AbortSignal` that is
+aborted when the run terminates (wall timeout, explicit `.dispose()`, etc.).
+Handlers that accept the signal can cancel in-flight I/O cleanly:
+
+```ts
+// Future API (not implemented yet)
+globals: {
+  fetchData: async (url, { signal }) => {
+    const res = await globalThis.fetch(url, { signal })
+    return res.text()
+  },
+},
+```
+
+Until that lands, handlers should be written to be safe to orphan.
+
+### 14.6 Function arguments rejected
+
+Passing a function as an argument to a bridge global is rejected with
+`ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`. Only serialisable data values
+(`WireValue`) may cross the boundary in either direction in v1.
+
+This is a deliberate limitation — callbacks across the boundary would require
+a callback-handle protocol symmetric to callable return values. The same Phase
+11 work that adds callable return values will enable function arguments too.
+
+---
+
+## 15. Callable handles (Phase 11)
+
+### 14.1 The problem
+
+Bridge return values are plain data (`WireValue`). This means a host handler
+that wants to return a rich object with methods — the classic example is a
+fetch `Response` with `.json()` and `.text()` — cannot do so: functions are
+not serialisable. Currently the handler must return a flat data object and
+the sandbox must do its own parsing (e.g. `JSON.parse(res.body)`).
+
+The practical workaround is to design globals as high-level tools that return
+already-processed data, rather than trying to mirror web-standard APIs:
+
+```ts
+// Preferred: tool returns processed data directly
+globals: {
+  searchWeb: async (query: string) => (await fetch(`...${query}`)).json(),
+  readSecret: async (key: string) => vault.get(key),
+}
+
+// Avoid: trying to mirror raw Response API in sandbox
+globals: {
+  fetch: async (url: string) => ({ status: 200, body: '...' }),
+  // sandbox must then JSON.parse(res.body) manually
+}
+```
+
+For the web-standard `fetch` use case specifically, the host is expected to
+wrap `fetch` in a global that either returns processed data directly or
+returns a shape the agent can work with naturally. Phase 11 lifts this
+restriction for cases where the host genuinely needs to return objects with
+methods.
+
+### 14.2 Mechanism: per-run callable handle table
+
+The host handler returns a value that contains functions. The TypeScript
+serialiser detects functions in the return value and replaces each one with
+a plain-data marker `{ __iso4_fn__: <id> }` before encoding as `WireValue`.
+The original function is stored in a per-run `callableHandles` map keyed by
+the ID. The map is released when the run completes — no explicit disposal
+needed, no GC complexity.
+
+```
+TS handler returns:
+  { status: 200, body: '{...}', json: [Function], text: [Function] }
+
+Serializer produces:
+  { status: 200, body: '{...}',
+    json: { __iso4_fn__: 42 },
+    text: { __iso4_fn__: 43 } }
+
+callableHandles = { 42: originalJsonFn, 43: originalTextFn }
+```
+
+### 14.3 V8 side: callable stubs
+
+`wire_to_v8_value` (Rust) detects `{ __iso4_fn__: <id> }` objects and
+installs a real V8 `Function` in their place. The function's External data
+is the same `GlobalCallbackData` as all other bridge stubs (same
+`stream_fd`, `cpu_budget`, `call_id`, `bridge_error`), plus the callable ID.
+
+When the sandbox calls the function (e.g. `await res.json()`), a new
+`BridgeCall` is sent with `targetKind = 2` (callable) instead of
+`targetKind = 0` (global) or `1` (import). The payload carries the callable
+ID instead of an export name:
+
+```text
+BridgeCallPayload (targetKind = 2):
+  u32  callId       — monotonic, same counter as global bridge calls
+  u8   targetKind   — 2 = callable
+  u32  callableId   — handle from the per-run table
+  List<WireValue>  args
+```
+
+CPU budget bracketing (`leave()` / `enter()`) applies exactly as for global
+calls: host-side execution time does not count against the sandbox budget.
+
+### 14.4 TypeScript side: dispatch and cleanup
+
+The `drainUntilResult` loop in `client.ts` gains a `targetKind === 2` branch:
+
+```ts
+case 2: {  // callable ref
+  const fn = callableHandles.get(call.callableId)
+  if (fn === undefined) {
+    // unknown handle — send ERR_HOST_BRIDGE response
+  } else {
+    const result = await fn(...call.args)
+    // encode and send BridgeResponse
+  }
+  break
+}
+```
+
+The `callableHandles` map is created at the start of each run alongside the
+dispatcher, and discarded when the run's `Result` frame arrives.
+
+### 14.5 Nested callables
+
+The result of a callable method call is itself encoded via `encodeWireValue`.
+This means a callable can return another callable, and the sandbox can chain
+method calls:
+
+```js
+// sandbox code
+const conn = await db.connect()
+const rows = await conn.query('SELECT * FROM users')
+await conn.close()
+export default rows
+```
+
+Each step is one additional bridge round-trip. Deep chains add latency but
+work correctly — callables returned from callables get fresh IDs in the same
+per-run table.
+
+### 14.6 What callable handles are not
+
+- **Not a general object-capability system.** Handles are one-shot
+  per-run and cannot be passed to other runs or serialised into exports.
+  `export default someHandleObject` will export the plain marker
+  `{ __iso4_fn__: 42 }`, not a live stub — the export validator rejects
+  it (or strips it silently, TBD).
+- **Not a replacement for well-designed globals.** For most AI-agent use
+  cases, a flat API that returns processed data (`searchWeb`, `readFile`,
+  `queryDB`) is cleaner than returning method-bearing objects. Callable
+  handles exist for cases where the returned shape is out of the host
+  author's control (e.g. wrapping an existing library that returns a cursor
+  or a stream handle).
+- **Not persistent across runs.** Two `prefix.run()` calls cannot share
+  callable handles. Each run has its own isolated handle table.

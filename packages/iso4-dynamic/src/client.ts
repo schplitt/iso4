@@ -7,6 +7,8 @@ import {
 
   RustToTsMessageTypes,
   TsToRustMessageTypes,
+  decodeBridgeCallPayload,
+  encodeBridgeResponsePayload,
   encodeAuthenticatePayload,
   encodeDisposePrefixPayload,
   encodePrecompilePayload,
@@ -14,7 +16,9 @@ import {
   encodeRunPayload,
   encodeTsToRustFrame,
 } from './ipc'
-import type { PrecompilePayloadOptions, PrefixRunPayloadOptions, ResourceLimits, RunPayloadOptions } from './ipc'
+import type { HostGlobals } from '@iso4/core'
+import type { ResourceLimits } from './ipc'
+import { encodeWireValue } from './wire'
 
 export interface RuntimeIpcClientOptions {
   socketPath: string
@@ -25,7 +29,16 @@ export interface RawRunResult {
   result: Uint8Array
 }
 
-export type { ResourceLimits, RunPayloadOptions, PrecompilePayloadOptions, PrefixRunPayloadOptions }
+/**
+ * Dispatches a bridge call to the host-configured handler.
+ * Arguments are raw deserialized values; return value is re-serialized as WireValue.
+ */
+export type BridgeCallDispatcher = (
+  exportName: string,
+  args: unknown[],
+) => Promise<unknown>
+
+export type { ResourceLimits }
 
 export class RuntimeIpcClient {
   private readonly socket: Socket
@@ -68,18 +81,24 @@ export class RuntimeIpcClient {
 
   private nextRunId = 0
   private nextRunIdValue(): number {
+    // Wraps at 2³²-1 back to 0. Safe in v1 because runs are sequential per
+    // connection — no two runs share a connection simultaneously, so a
+    // rolled-over ID can never collide with a live one. When D11 (concurrent
+    // async bridge) lands, add a `do { ... } while (inFlightRuns.has(id))`
+    // guard here.
     this.nextRunId = (this.nextRunId + 1) & 0xffffffff
     return this.nextRunId
   }
 
   async runRawCode(
     code: string,
-    options?: { filename?: string, limits?: ResourceLimits },
+    options?: { filename?: string, limits?: ResourceLimits, globals?: HostGlobals },
   ): Promise<RawRunResult> {
-    if (this.disposed) {
+    if (this.disposed)
       throw new Error('runtime IPC client is disposed')
-    }
 
+    const globals = options?.globals ?? {}
+    const globalNames = Object.keys(globals)
     await this.write(
       encodeTsToRustFrame(
         TsToRustMessageTypes.Run,
@@ -88,30 +107,16 @@ export class RuntimeIpcClient {
           code,
           filename: options?.filename,
           limits: options?.limits,
+          globals: globalNames,
         }),
       ),
     )
 
-    for await (const frame of this.reader) {
-      switch (frame.messageType) {
-        case RustToTsMessageTypes.Result:
-          return { result: frame.payload }
-
-        case RustToTsMessageTypes.Log:
-          // Runtime diagnostics are intentionally ignored for the raw helper.
-          // The real Runtime can forward these to a configured logger later.
-          break
-
-        case RustToTsMessageTypes.BridgeCall:
-          throw new Error('BridgeCall is not implemented in raw IPC client')
-      }
-    }
-
-    throw new Error('connection closed before receiving a Result frame')
+    return this.drainUntilResult(makeDispatcher(globals))
   }
 
   async precompile(
-    options: PrecompilePayloadOptions,
+    options: { code: string, filename?: string, limits?: ResourceLimits, globals?: HostGlobals },
   ): Promise<Uint8Array> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
@@ -119,7 +124,12 @@ export class RuntimeIpcClient {
     await this.write(
       encodeTsToRustFrame(
         TsToRustMessageTypes.Precompile,
-        encodePrecompilePayload(options),
+        encodePrecompilePayload({
+          code: options.code,
+          filename: options.filename,
+          limits: options.limits,
+          globals: Object.keys(options.globals ?? {}),
+        }),
       ),
     )
 
@@ -135,33 +145,28 @@ export class RuntimeIpcClient {
   }
 
   async prefixRun(
-    options: PrefixRunPayloadOptions,
+    options: { prefixId: string, code: string, filename?: string, limits?: ResourceLimits, globals?: HostGlobals },
   ): Promise<RawRunResult> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
 
+    const globals = options.globals ?? {}
+    const globalNames = Object.keys(globals)
     await this.write(
       encodeTsToRustFrame(
         TsToRustMessageTypes.PrefixRun,
         encodePrefixRunPayload({
-          ...options,
+          prefixId: options.prefixId,
+          code: options.code,
+          filename: options.filename,
+          limits: options.limits,
+          globals: globalNames,
           runId: this.nextRunIdValue(),
         }),
       ),
     )
 
-    for await (const frame of this.reader) {
-      switch (frame.messageType) {
-        case RustToTsMessageTypes.Result:
-          return { result: frame.payload }
-        case RustToTsMessageTypes.Log:
-          break
-        case RustToTsMessageTypes.BridgeCall:
-          throw new Error('BridgeCall is not implemented in raw IPC client')
-      }
-    }
-
-    throw new Error('connection closed before receiving a Result frame')
+    return this.drainUntilResult(makeDispatcher(globals))
   }
 
   async disposePrefix(prefixId: string): Promise<void> {
@@ -192,6 +197,105 @@ export class RuntimeIpcClient {
     })
   }
 
+  /**
+   * Read frames until the `Result` frame arrives, dispatching `BridgeCall`
+   * frames to the handler in the meantime.
+   *
+   * Dispatches are fire-and-forget — the loop does NOT await the handler.
+   * This means the loop continues reading frames immediately. When the Rust
+   * side fires a wall timeout it sends a `Result` frame; the loop reads it
+   * and returns without waiting for the handler.
+   *
+   * The handler promise is then **orphaned**: it has no listener and will be
+   * garbage-collected when it eventually settles. Any in-flight I/O or timers
+   * continue to completion. Rust silently ignores any late `BridgeResponse`
+   * that arrives after the run has completed (see session.rs).
+   * @param dispatcher
+   */
+  private async drainUntilResult(
+    dispatcher: BridgeCallDispatcher | undefined,
+  ): Promise<RawRunResult> {
+    for await (const frame of this.reader) {
+      switch (frame.messageType) {
+        case RustToTsMessageTypes.Result:
+          return { result: frame.payload }
+
+        case RustToTsMessageTypes.Log:
+          break
+
+        case RustToTsMessageTypes.BridgeCall: {
+          const call = decodeBridgeCallPayload(frame.payload)
+
+          if (dispatcher === undefined) {
+            // No handler — send a synchronous error response.
+            await this.write(
+              encodeTsToRustFrame(
+                TsToRustMessageTypes.BridgeResponse,
+                encodeBridgeResponsePayload(
+                  call.callId,
+                  false,
+                  undefined,
+                  'no bridge dispatcher configured',
+                ),
+              ),
+            )
+          } else {
+            // Fire-and-forget the handler.
+            // Do NOT await it — the loop reads the next frame immediately.
+            // When the handler settles the response is written back.
+            // If the run timed out by then, Rust ignores the late frame.
+            const { callId } = call
+            dispatcher(call.exportName, call.args).then(
+              (value) => {
+                // encodeWireValue throws for unrepresentable types (function,
+                // symbol, Date, etc.). Catch and send an error response so the
+                // sandbox receives ERR_HOST_BRIDGE rather than hanging.
+                let encoded: Uint8Array
+                try {
+                  encoded = encodeWireValue(value)
+                } catch (e) {
+                  return this.write(
+                    encodeTsToRustFrame(
+                      TsToRustMessageTypes.BridgeResponse,
+                      encodeBridgeResponsePayload(
+                        callId,
+                        false,
+                        undefined,
+                        e instanceof Error ? e.message : String(e),
+                      ),
+                    ),
+                  )
+                }
+                return this.write(
+                  encodeTsToRustFrame(
+                    TsToRustMessageTypes.BridgeResponse,
+                    encodeBridgeResponsePayload(callId, true, encoded),
+                  ),
+                )
+              },
+              (err: unknown) => this.write(
+                encodeTsToRustFrame(
+                  TsToRustMessageTypes.BridgeResponse,
+                  encodeBridgeResponsePayload(
+                    callId,
+                    false,
+                    undefined,
+                    err instanceof Error ? err.message : String(err),
+                  ),
+                ),
+              ),
+            ).catch(() => {
+              // Connection may have closed — discard silently.
+            })
+          }
+          break
+        }
+      }
+    }
+
+    throw new Error('connection closed before receiving a Result frame')
+  }
+
   private async write(frame: Buffer): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       this.socket.write(frame, (error?: Error | null) => {
@@ -202,6 +306,22 @@ export class RuntimeIpcClient {
         resolve()
       })
     })
+  }
+}
+
+/**
+ * Build a dispatcher from a globals map; returns undefined when map is empty.
+ * @param globals
+ */
+function makeDispatcher(globals: HostGlobals): BridgeCallDispatcher | undefined {
+  const names = Object.keys(globals)
+  if (names.length === 0)
+    return undefined
+  return async (name, args) => {
+    const handler = globals[name]
+    if (handler === undefined)
+      throw new Error(`no handler configured for global '${name}'`)
+    return handler(...(args as any[]))
   }
 }
 

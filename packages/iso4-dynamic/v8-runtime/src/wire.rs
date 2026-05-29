@@ -34,7 +34,7 @@ const TAG_OBJECT: u8 = 0x09;
 ///
 /// Corresponds to `WireValue` in `docs/protocol.md` §4.
 /// Functions, Symbols, and unresolved Promises are rejected before reaching
-/// this type — only serializable data values are representable here.
+/// this type - only serializable data values are representable here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WireValue {
     Undefined,
@@ -368,7 +368,7 @@ pub fn encode_precompile_result_payload(
             encode_run_error_payload(err, &mut out);
         }
         (None, None) => {
-            panic!("encode_precompile_result_payload: must provide either prefix_id or error")
+            unreachable!("encode_precompile_result_payload: must provide either prefix_id or error")
         }
     }
     out
@@ -428,12 +428,120 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             message: "Memory limit exceeded".to_string(),
             stack: None,
         },
+        RunError::HostBridge(msg) => RunErrorPayload {
+            code: "ERR_HOST_BRIDGE".to_string(),
+            name: "Error".to_string(),
+            message: msg.clone(),
+            stack: None,
+        },
+        RunError::UndeclaredBinding(msg) => RunErrorPayload {
+            code: "ERR_UNDECLARED_BINDING".to_string(),
+            name: "Error".to_string(),
+            message: msg.clone(),
+            stack: None,
+        },
+        RunError::FunctionArgumentNotSupported => RunErrorPayload {
+            code: "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED".to_string(),
+            name: "Error".to_string(),
+            message: "function arguments cannot cross the host bridge".to_string(),
+            stack: None,
+        },
         RunError::Internal(msg) => RunErrorPayload {
             code: "ERR_INTERNAL".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
         },
+    }
+}
+
+// ── BridgeCall payload encoder ────────────────────────────────────────────────────
+
+/// Encode a `BridgeCallPayload` per `docs/protocol.md` §5.4.
+///
+/// Wire layout:
+/// ```text
+/// u32                callId
+/// u8                 targetKind  (0 = global, 1 = import)
+/// Optional<String>   specifier   (present when targetKind = 1)
+/// String             exportName
+/// List<WireValue>    args
+/// ```
+pub fn encode_bridge_call_payload(
+    call_id: u32,
+    target_kind: u8, // 0 = global
+    specifier: Option<&str>,
+    export_name: &str,
+    args: &[WireValue],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_u32(call_id, &mut out);
+    out.push(target_kind);
+    match specifier {
+        Some(s) => { out.push(1); encode_string(s, &mut out); }
+        None    => { out.push(0); }
+    }
+    encode_string(export_name, &mut out);
+    encode_u32(args.len() as u32, &mut out);
+    for arg in args {
+        encode_wire_value(arg, &mut out);
+    }
+    out
+}
+
+// ── BridgeResponse payload decoder ───────────────────────────────────────────────
+
+/// Decode a `BridgeResponsePayload` from TS per `docs/protocol.md` §5.4.
+///
+/// Returns `Ok(Ok(WireValue))` on success, `Ok(Err(message))` when the host
+/// handler reported an error, and `Err(io::Error)` on a protocol fault.
+///
+/// Wire layout:
+/// ```text
+/// u32                callId
+/// u8                 ok
+/// Optional<WireValue> value   (present when ok = true)
+/// Optional<error>    error   (present when ok = false)
+///   String code  String name  String message  Optional<String> stack
+/// ```
+pub fn parse_bridge_response_payload(
+    payload: &[u8],
+) -> io::Result<Result<WireValue, String>> {
+    let mut offset = 0;
+
+    // callId - read and discard; Rust already knows which call this is for
+    // since bridge calls are sequential in v1.
+    let _call_id = read_u32(payload, &mut offset)?;
+
+    let ok_byte = read_u8(payload, &mut offset)?;
+    match ok_byte {
+        1 => {
+            // ok = true - read Optional<WireValue>
+            let present = read_u8(payload, &mut offset)?;
+            let value = if present == 1 {
+                decode_wire_value(payload, &mut offset)?
+            } else {
+                WireValue::Undefined
+            };
+            Ok(Ok(value))
+        }
+        0 => {
+            // ok = false - read the error payload: code name message stack
+            let _code    = read_string(payload, &mut offset)?;
+            let _name    = read_string(payload, &mut offset)?;
+            let message  = read_string(payload, &mut offset)?;
+            let stack_present = read_u8(payload, &mut offset)?;
+            if stack_present == 1 {
+                // Consume the stack string so the parser leaves at the end of
+                // the payload. We don't use it — it's host-side context only.
+                let _ = read_string(payload, &mut offset)?;
+            }
+            Ok(Err(message))
+        }
+        b => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid BridgeResponse ok byte: {b:#04x}"),
+        )),
     }
 }
 

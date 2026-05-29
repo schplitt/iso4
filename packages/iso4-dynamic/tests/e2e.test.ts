@@ -237,10 +237,11 @@ describe('precompile + prefix.run()', () => {
   })
 
   test('prefix compiles and postfix runs', async () => {
+    // ESM top-level const is module-scoped; use globalThis to share across modules.
     const prefix = await runtime.precompile({
-      code: 'const base = 100',
+      code: 'globalThis.base = 100',
     })
-    const result = await prefix.run({ code: 'export default base + 1' })
+    const result = await prefix.run({ code: 'export default globalThis.base + 1' })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
@@ -250,12 +251,12 @@ describe('precompile + prefix.run()', () => {
 
   test('many postfix runs against the same prefix', async () => {
     const prefix = await runtime.precompile({
-      code: 'const multiplier = 10',
+      code: 'globalThis.multiplier = 10',
     })
 
     const results = await Promise.all(
       [1, 2, 3, 4, 5].map((n) =>
-        prefix.run({ code: `export default ${n} * multiplier` }),
+        prefix.run({ code: `export default ${n} * globalThis.multiplier` }),
       ),
     )
 
@@ -349,17 +350,19 @@ describe('globals', () => {
   })
 
   test('fetch with handler receives the request and returns response', async () => {
+    // fetch is a generic bridge global: handler receives raw args (url string).
+    // The handler returns a plain data object; sandbox accesses fields directly.
     const requests: string[] = []
 
     const result = await runtime.run({
       code: `
         const res = await fetch('https://api.example.com/data')
-        const json = await res.json()
+        const json = JSON.parse(res.body)
         export default json.value
       `,
       globals: {
-        fetch: async (req) => {
-          requests.push(req.url)
+        fetch: async (url: unknown) => {
+          requests.push(url as string)
           return {
             status: 200,
             headers: { 'content-type': 'application/json' },
@@ -378,7 +381,10 @@ describe('globals', () => {
 
   test('fetch handler can deny a request', async () => {
     const result = await runtime.run({
-      code: 'export default await fetch("https://denied.example.com")',
+      code: `
+        const res = await fetch('https://denied.example.com')
+        export default res.status
+      `,
       globals: {
         fetch: async () => ({ status: 403, headers: {}, body: 'forbidden' }),
       },
@@ -386,7 +392,6 @@ describe('globals', () => {
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    // sandbox gets the 403 back — no error thrown at the bridge level
     expect(result.exports.default).toBe(403)
   })
 
@@ -395,28 +400,30 @@ describe('globals', () => {
 
     const prefix = await runtime.precompile({
       code: `
-        export async function run(url) {
+        globalThis.run = async (url) => {
           const r = await fetch(url)
           return r.status
         }
       `,
+      // Declare fetch at precompile time so the prefix body can reference it.
+      globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
     })
 
     await prefix.run({
-      code: 'export default await run("https://run-a.example.com")',
+      code: 'export default await globalThis.run("https://run-a.example.com")',
       globals: {
-        fetch: async (req) => {
-          calls.push(`a:${req.url}`)
+        fetch: async (url: unknown) => {
+          calls.push(`a:${url as string}`)
           return { status: 200, headers: {}, body: null }
         },
       },
     })
 
     await prefix.run({
-      code: 'export default await run("https://run-b.example.com")',
+      code: 'export default await globalThis.run("https://run-b.example.com")',
       globals: {
-        fetch: async (req) => {
-          calls.push(`b:${req.url}`)
+        fetch: async (url: unknown) => {
+          calls.push(`b:${url as string}`)
           return { status: 200, headers: {}, body: null }
         },
       },
