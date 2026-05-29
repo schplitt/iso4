@@ -173,29 +173,39 @@ When working on this project:
     `AGENTS.md`, `DESIGN.md`, `MONOREPO.md`, or `types.ts`, explicitly
     call out the changes to the user at the end of your response so they
     can review and don't overlook them.
-11. **Use available workflow tools first** — When the user asks for
+11. **Keep protocol docs in sync with code** — Whenever a new `RunError`
+    variant or `ERR_*` code is added, all four of the following must be
+    updated in the same commit:
+    - `RunError` enum in `v8.rs` (+ `run_error_to_payload` in `wire.rs`)
+    - `RunErrorCode` union in `packages/iso4-dynamic/src/types.ts`
+    - Error-code table in `docs/protocol.md` §7
+    - Any relevant limits/semantics prose in `DESIGN.md` §4.1 (for limit
+      fields) or the appropriate design section (for new concepts)
+    Missing any of these is a documentation bug equivalent to a broken
+    API contract.
+12. **Use available workflow tools first** — When the user asks for
     branch/commit/PR workflow, use the available MCP/devtools first. Only
     fall back to `gh` CLI when those tools are not available.
-12. **Use conventional naming for git workflow** — Branch names should use
+13. **Use conventional naming for git workflow** — Branch names should use
     conventional prefixes where appropriate: `feat/`, `fix/`, `chore/`,
     `docs/`, `refactor/`, `test/`, `build/`, `types/`, `style/`, `perf/`,
     `examples/`, `ci/`. Commit subjects and PR titles should use
     conventional-commit style.
-13. **Default PR behavior** — If the current branch already contains the
+14. **Default PR behavior** — If the current branch already contains the
     related work, assume the PR should be opened from the current branch
     to `main` unless the user explicitly asks otherwise.
-14. **Always include a PR body** — PRs created for the user must include a
+15. **Always include a PR body** — PRs created for the user must include a
     body. If a related issue identifier is known, include the appropriate
     GitHub-style reference.
-15. **Ask when requirements are unclear** — If requirements are ambiguous,
+16. **Ask when requirements are unclear** — If requirements are ambiguous,
     ask a focused clarifying question instead of implementing a guessed
     solution. This project is in early design; many decisions are still
     open and the wrong choice is more expensive than a clarifying round trip.
-16. **Prefer simple inline logic over trivial helpers** — Do not introduce
+17. **Prefer simple inline logic over trivial helpers** — Do not introduce
     tiny one-line helper/utility functions or throwaway `parse*` helpers
     for trivial one-off logic. Inline unless there is real reuse or a clear
     API boundary.
-17. **Respect package boundaries** — Before adding code, check the "What
+18. **Respect package boundaries** — Before adding code, check the "What
     goes where" table in `MONOREPO.md` §6. If a change doesn't fit any
     row, the design needs a conversation before the code does.
 

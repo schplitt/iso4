@@ -290,15 +290,15 @@ socket immediately on version or token mismatch.
 
 `ResourceLimits`:
 
-| Field                   | Encoding |
-| ----------------------- | -------- |
-| `memoryMb`              | `u32`    |
-| `cpuTimeMs`             | `u32`    |
-| `wallTimeMs`            | `u32`    |
-| `maxExportBytes`        | `u32`    |
-| `maxStdoutBytes`        | `u32`    |
-| `maxStderrBytes`        | `u32`    |
-| `maxBridgePayloadBytes` | `u32`    |
+| Field                   | Encoding | Notes                                                                                   |
+| ----------------------- | -------- | --------------------------------------------------------------------------------------- |
+| `memoryMb`              | `u32`    | Zero = no limit.                                                                        |
+| `cpuTimeMs`             | `u32`    | Zero = no limit.                                                                        |
+| `wallTimeMs`            | `u32`    | Zero = no limit.                                                                        |
+| `maxExportBytes`        | `u32`    | Zero = no limit.                                                                        |
+| `maxStdoutBytes`        | `u32`    | Zero = no limit.                                                                        |
+| `maxStderrBytes`        | `u32`    | Zero = no limit.                                                                        |
+| `maxBridgePayloadBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` or `BridgeResponsePayload`. Zero = no limit (framing cap of 64 MiB applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
 
 `HostGlobalBinding`:
 
@@ -347,6 +347,14 @@ socket immediately on version or token mismatch.
 Bridge calls are sequential within a single run in v1: Rust sends one
 `BridgeCall` and waits for the matching `BridgeResponse` before continuing JS
 execution.
+
+**`maxBridgePayloadBytes` enforcement:** When non-zero, Rust checks the encoded
+`BridgeCallPayload` byte length before writing it to the socket. If the payload
+exceeds the limit the run terminates with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` without
+performing any I/O. Rust also checks the `BridgeResponsePayload` byte length
+immediately after reading the frame; if it exceeds the limit the run terminates
+with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` before decoding the payload. The fallback
+cap is the framing layer's 64 MiB `DEFAULT_MAX_FRAME_LENGTH`.
 
 ### 5.5 Diagnostic log payloads
 
@@ -456,6 +464,7 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                             |
 | `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                          |
 | `ERR_HOST_BRIDGE`                     | Configured host global/import handler threw or rejected.                    |
+| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call or response payload exceeded `limits.maxBridgePayloadBytes`.    |
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`. |
 | `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                    |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                             |

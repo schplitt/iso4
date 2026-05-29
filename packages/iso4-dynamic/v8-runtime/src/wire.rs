@@ -443,7 +443,13 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
         RunError::FunctionArgumentNotSupported => RunErrorPayload {
             code: "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED".to_string(),
             name: "Error".to_string(),
-            message: "function arguments cannot cross the host bridge".to_string(),
+            message: "function arguments are not supported across the bridge boundary".to_string(),
+            stack: None,
+        },
+        RunError::BridgePayloadTooLarge => RunErrorPayload {
+            code: "ERR_BRIDGE_PAYLOAD_TOO_LARGE".to_string(),
+            name: "Error".to_string(),
+            message: "bridge payload exceeds configured maxBridgePayloadBytes limit".to_string(),
             stack: None,
         },
         RunError::Internal(msg) => RunErrorPayload {

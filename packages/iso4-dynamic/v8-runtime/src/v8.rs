@@ -44,6 +44,10 @@ pub struct Limits {
     pub wall_time_ms: u32,
     pub cpu_time_ms:  u32,
     pub memory_mb:    u32, // reserved - enforced in Phase 8
+    /// Maximum byte length for a single bridge call payload (arguments) or
+    /// bridge response payload. Zero means no per-bridge limit; the framing
+    /// layer's 64 MiB cap is the only constraint.
+    pub max_bridge_payload_bytes: u32,
 }
 
 
@@ -169,6 +173,8 @@ pub enum RunError {
     UndeclaredBinding(String),
     /// A function value was passed as a bridge argument.
     FunctionArgumentNotSupported,
+    /// Bridge call or response payload exceeded `limits.maxBridgePayloadBytes`.
+    BridgePayloadTooLarge,
     /// Unexpected internal runtime failure.
     Internal(String),
 }
@@ -358,6 +364,7 @@ fn run_module(
             limits.wall_time_ms,
             cancel_handle.clone(), // thread-safe handle; cancel_handle is a clone
             Arc::clone(&reason),
+            limits.max_bridge_payload_bytes,
             &mut callback_data_boxes,
         )
         .map_err(|e| failure(e, &logs, start))?;
@@ -433,6 +440,7 @@ fn run_module(
                 let owned = match err {
                     RunError::HostBridge(m)              => RunError::HostBridge(m.clone()),
                     RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
+                    RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
                     other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                 };
                 return Err(failure(owned, &logs, start));
@@ -469,6 +477,7 @@ fn run_module(
                     let owned = match err {
                         RunError::HostBridge(m)               => RunError::HostBridge(m.clone()),
                         RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
+                        RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
                         other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                     };
                     return Err(failure(owned, &logs, start));
@@ -492,6 +501,7 @@ fn run_module(
                     let owned = match err {
                         RunError::HostBridge(m)               => RunError::HostBridge(m.clone()),
                         RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
+                        RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
                         other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                     };
                     return Err(failure(owned, &logs, start));
@@ -874,6 +884,10 @@ struct GlobalCallbackData {
     /// calling `terminate_execution()` so that `run_module` maps the result
     /// to `ERR_WALL_TIMEOUT` rather than a generic RuntimeError.
     termination_reason: Arc<OnceLock<TerminationReason>>,
+    /// Maximum allowed byte length for a bridge call payload (arguments) and
+    /// for a bridge response payload. Zero means no per-bridge limit — the
+    /// framing layer's 64 MiB cap is the only constraint.
+    max_bridge_payload_bytes: u32,
 }
 
 /// A single generic V8 FunctionCallback used for every host-declared global.
@@ -936,6 +950,16 @@ fn bridge_global_callback(
     // ── Send BridgeCall frame ──────────────────────────────────────────────
     let bridge_call_payload =
         wire::encode_bridge_call_payload(call_id, 0, None, &data.name, &wire_args);
+
+    // Enforce max_bridge_payload_bytes on outbound call payload.
+    if data.max_bridge_payload_bytes > 0
+        && bridge_call_payload.len() > data.max_bridge_payload_bytes as usize
+    {
+        data.bridge_error.set(RunError::BridgePayloadTooLarge).ok();
+        data.cpu_budget.enter();
+        throw_v8_error(scope, "[iso4] bridge: call payload exceeds maxBridgePayloadBytes");
+        return;
+    }
 
     if let Err(e) = ipc::write_rust_to_ts_frame(
         &mut *stream,
@@ -1006,6 +1030,15 @@ fn bridge_global_callback(
         }
     };
 
+    // Enforce max_bridge_payload_bytes on inbound response payload.
+    if data.max_bridge_payload_bytes > 0
+        && frame.payload.len() > data.max_bridge_payload_bytes as usize
+    {
+        data.bridge_error.set(RunError::BridgePayloadTooLarge).ok();
+        throw_v8_error(scope, "[iso4] bridge: response payload exceeds maxBridgePayloadBytes");
+        return;
+    }
+
     if frame.message_type != ipc::TsToRustMessageType::BridgeResponse {
         data.bridge_error
             .set(RunError::Internal(format!(
@@ -1060,6 +1093,7 @@ fn install_bridge_globals(
     wall_time_ms: u32,
     isolate_handle: v8::IsolateHandle,
     termination_reason: Arc<OnceLock<TerminationReason>>,
+    max_bridge_payload_bytes: u32,
     out_boxes: &mut Vec<Box<GlobalCallbackData>>,
 ) -> Result<(), RunError> {
     let global_obj = scope.get_current_context().global(scope);
@@ -1074,6 +1108,7 @@ fn install_bridge_globals(
             wall_time_ms,
             isolate_handle: isolate_handle.clone(),
             termination_reason: Arc::clone(&termination_reason),
+            max_bridge_payload_bytes,
         });
         // Pass a raw pointer to the Box's heap allocation as External data.
         // The Box is stored in out_boxes and outlives all V8 callbacks.
@@ -3004,6 +3039,114 @@ mod tests {
         responder.join().unwrap();
         assert!(matches!(err, RunError::FunctionArgumentNotSupported),
             "expected FunctionArgumentNotSupported, got {err:?}");
+    }
+
+    #[test]
+    fn bridge_call_outbound_payload_too_large_is_rejected() {
+        // A call payload larger than max_bridge_payload_bytes must be caught
+        // before writing to the socket and surface as BridgePayloadTooLarge.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        // The bridge aborts before writing to the socket, so no frame arrives.
+        server.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        let responder = std::thread::spawn(move || {
+            let _ = ipc::read_rust_to_ts_frame(&mut server); // may timeout — ignore
+        });
+
+        // Pass a 10-byte string argument but set the limit to 4 bytes.
+        let err = execute(
+            r#"export default await myTool("hello12345")"#,
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_payload_bytes: 4,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            Some(fd),
+        ).unwrap_err().error;
+
+        responder.join().unwrap();
+        assert!(matches!(err, RunError::BridgePayloadTooLarge),
+            "expected BridgePayloadTooLarge, got {err:?}");
+    }
+
+    #[test]
+    fn bridge_call_inbound_response_too_large_is_rejected() {
+        // A response payload larger than max_bridge_payload_bytes must be
+        // rejected after reading the frame and surface as BridgePayloadTooLarge.
+        //
+        // Limit is 32 bytes. The outbound BridgeCall payload for myTool() with
+        // no args is ~20 bytes (fits). The response for a 30-char string is
+        // ~41 bytes (exceeds the limit).
+        let long_str = "a".repeat(30); // 30-char string → response payload ~41 bytes
+        let long_str_clone = long_str.clone();
+        let (result, h) = run_with_bridge(
+            "export default await myTool()",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_payload_bytes: 32, // allows outbound (~20 B), rejects inbound (~41 B)
+                ..Default::default()
+            },
+            move |s| {
+                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::String(long_str_clone))).unwrap();
+            },
+        );
+        h.join().unwrap();
+        let err = result.unwrap_err().error;
+        assert!(matches!(err, RunError::BridgePayloadTooLarge),
+            "expected BridgePayloadTooLarge, got {err:?}");
+    }
+
+    #[test]
+    fn bridge_call_payload_within_limit_succeeds() {
+        // When the payload fits within max_bridge_payload_bytes the call
+        // should succeed normally.
+        let (out, h) = run_with_bridge(
+            "export default await myTool()",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_payload_bytes: 1024,
+                ..Default::default()
+            },
+            |s| {
+                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::Number(7.0))).unwrap();
+            },
+        );
+        h.join().unwrap();
+        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn bridge_call_zero_limit_means_no_limit() {
+        // max_bridge_payload_bytes = 0 disables the per-bridge cap entirely.
+        let (out, h) = run_with_bridge(
+            "export default await myTool()",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_payload_bytes: 0,
+                ..Default::default()
+            },
+            |s| {
+                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::String("big payload".into()))).unwrap();
+            },
+        );
+        h.join().unwrap();
+        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("big payload"));
     }
 
     #[test]

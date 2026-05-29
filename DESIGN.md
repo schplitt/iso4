@@ -246,12 +246,13 @@ Every call to `runtime.run(opts)`:
 
 ```ts
 {
-  memoryMb: 64,         // V8 heap + ArrayBuffer budget combined
-  cpuTimeMs: 100,       // Active execution only (await-free time)
-  wallTimeMs: 30_000,   // Hard backstop including async waits
+  memoryMb: 64,                   // V8 heap + ArrayBuffer budget combined
+  cpuTimeMs: 100,                 // Active execution only (await-free time)
+  wallTimeMs: 30_000,             // Hard backstop including async waits
   maxExportBytes: 16 * 1024 * 1024,
   maxStdoutBytes: 1 * 1024 * 1024,
   maxStderrBytes: 1 * 1024 * 1024,
+  maxBridgePayloadBytes: 0,       // 0 = no per-bridge cap (64 MiB framing cap applies)
 }
 ```
 
@@ -273,6 +274,15 @@ that calls `isolate.terminate_execution()` when the bracketed time exceeds
 
 **Wall time** is a single guard timer that fires regardless. Catches
 runaway-await cases (e.g., host fetch implementation never resolves).
+
+**Bridge payload size** (`maxBridgePayloadBytes`): when non-zero, Rust
+enforces the limit in both directions. The encoded `BridgeCallPayload`
+byte length is checked before writing it to the socket; if exceeded the
+run terminates immediately with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` before any
+I/O. The `BridgeResponsePayload` byte length is checked after reading the
+frame but before decoding; if exceeded the run terminates with the same
+error. The framing layer's 64 MiB `DEFAULT_MAX_FRAME_LENGTH` is the
+absolute backstop when this field is zero.
 
 ### 4.2 Globals (block-listed, not allowlisted)
 
