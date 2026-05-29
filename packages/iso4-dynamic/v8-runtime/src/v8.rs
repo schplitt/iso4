@@ -3,7 +3,9 @@
 //! Owns everything V8-related: platform init, isolate creation, compilation,
 //! evaluation, result extraction, console capture, and limit enforcement.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::io;
 use std::mem::ManuallyDrop;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
@@ -282,7 +284,11 @@ fn run_module(
             v8::Isolate::new(params)
         }
     };
-    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Auto);
+    // Explicit policy: microtasks only drain when we call
+    // perform_microtask_checkpoint() in the poll loop.  This gives us
+    // deterministic control and prevents microtasks from firing during
+    // export extraction (D9 hardening).
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
     // ── Limit guard threads ───────────────────────────────────────────────────
     //
@@ -351,19 +357,15 @@ fn run_module(
     // ── Bridge globals setup ─────────────────────────────────────────────────
     //
     // Shared state for all bridge callbacks in this run. All three are Arcs-
-    // no raw pointers to Rust objects:
-    //   • cpu_budget   - already an Arc; cloned into each callback data block
-    //   • call_id      - Arc<AtomicU32>, shared across all global stubs
-    //   • bridge_error - Arc<OnceLock<RunError>>, first error wins
-    //
-    // The socket is carried as a raw file descriptor (RawFd = i32). The
-    // callback reconstructs a ManuallyDrop<UnixStream> from it for the
-    // duration of one BridgeCall/BridgeResponse exchange and never closes it.
+    // call_id, bridge_error, and pending_resolvers are shared between the
+    // callback stubs (via GlobalCallbackData) and the poll loop below.
     let call_id = call_id_counter;
-    let bridge_call_count = Arc::new(AtomicU32::new(0));
+    let bridge_call_count  = Arc::new(AtomicU32::new(0));
     let bridge_error: Arc<OnceLock<RunError>> = Arc::new(OnceLock::new());
+    let pending_resolvers: PendingResolvers =
+        Arc::new(Mutex::new(HashMap::new()));
 
-    // Box-per-stub allocations; kept alive until after evaluate() returns.
+    // Box-per-stub allocations; kept alive until after the poll loop exits.
     let mut callback_data_boxes: Vec<Box<GlobalCallbackData>> = Vec::with_capacity(globals.len());
     if !globals.is_empty() {
         let fd = stream_fd.expect(
@@ -373,16 +375,12 @@ fn run_module(
             scope,
             globals,
             fd,
-            Arc::clone(&cpu_budget),
             Arc::clone(&call_id),
             Arc::clone(&bridge_error),
-            start,
-            limits.wall_time_ms,
-            cancel_handle.clone(), // thread-safe handle; cancel_handle is a clone
-            Arc::clone(&reason),
             limits.max_bridge_payload_bytes,
             Arc::clone(&bridge_call_count),
             limits.max_bridge_calls,
+            Arc::clone(&pending_resolvers),
             &mut callback_data_boxes,
         )
         .map_err(|e| failure(e, &logs, start))?;
@@ -443,23 +441,15 @@ fn run_module(
 
     cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
     let evaluation = match module.evaluate(scope) {
-        Some(value) => {
-            // Run completed - cancel guards before inspecting exports.
-            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-            // Clear any sticky termination flag a late-firing guard may have
-            // set after evaluate() returned, so export extraction succeeds.
-            cancel_handle.cancel_terminate_execution();
-            value
-        }
+        Some(value) => value,
         None => {
             cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-            // Check bridge error first - it takes priority over generic runtime errors.
             if let Some(err) = bridge_error.get() {
                 let owned = match err {
-                    RunError::HostBridge(m)              => RunError::HostBridge(m.clone()),
-                    RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
-                    RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
-                    RunError::BridgeCallLimitExceeded      => RunError::BridgeCallLimitExceeded,
+                    RunError::HostBridge(m)                => RunError::HostBridge(m.clone()),
+                    RunError::FunctionArgumentNotSupported  => RunError::FunctionArgumentNotSupported,
+                    RunError::BridgePayloadTooLarge         => RunError::BridgePayloadTooLarge,
+                    RunError::BridgeCallLimitExceeded       => RunError::BridgeCallLimitExceeded,
                     other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                 };
                 return Err(failure(owned, &logs, start));
@@ -476,67 +466,217 @@ fn run_module(
         }
     };
 
-    if evaluation.is_promise() {
-        let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
-            failure(
-                RunError::Internal("failed to inspect module evaluation promise".to_string()),
-                &logs,
-                start,
-            )
-        })?;
+    // ── Poll loop: drive microtasks until the module promise settles ──────────
+    //
+    // With MicrotasksPolicy::Explicit, microtasks do not run automatically.
+    // After each BridgeResponse is resolved we call perform_microtask_checkpoint()
+    // to advance the await chains.  When the module's top-level promise finally
+    // fulfils or rejects we exit the loop.
+    //
+    // This handles both:
+    //   • Sequential bridge calls  - Promise.all([a]) etc.
+    //   • Concurrent bridge calls  - Promise.all([a, b]) sends both BridgeCall
+    //     frames before yielding; both responses route by callId.
+    //   • No bridge calls          - pure `await Promise.resolve(42)` still
+    //     needs one checkpoint to propagate the already-resolved microtask.
+    // One checkpoint immediately after evaluate() so that:
+    //   • purely synchronous results (await Promise.resolve(42)) settle now,
+    //   • synchronous bridge errors (throw from callback) propagate to the
+    //     module's top-level Promise now,
+    //   • termination exceptions propagate now.
+    // For pending bridge calls nothing changes — resolvers aren't set yet.
+    scope.perform_microtask_checkpoint();
+
+    // ESM Module::Evaluate() always returns a Promise.  The try_from is a
+    // belt-and-suspenders guard; failure would be an internal V8 bug.
+    let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
+        cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+        failure(
+            RunError::Internal("module evaluation did not return a Promise".into()),
+            &logs, start,
+        )
+    })?;
+
+    // Helper: clones the bridge_error OnceLock into an owned RunError.
+    let owned_bridge_error = |err: &RunError| -> RunError {
+        match err {
+            RunError::HostBridge(m)                => RunError::HostBridge(m.clone()),
+            RunError::FunctionArgumentNotSupported  => RunError::FunctionArgumentNotSupported,
+            RunError::BridgePayloadTooLarge         => RunError::BridgePayloadTooLarge,
+            RunError::BridgeCallLimitExceeded       => RunError::BridgeCallLimitExceeded,
+            other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
+        }
+    };
+
+    // Socket for BridgeResponse reads in the poll loop.
+    // Only used when stream_fd is Some (i.e. there are globals).
+    let poll_stream_fd = stream_fd;
+
+    'poll: loop {
         match promise.state() {
-            v8::PromiseState::Fulfilled => {}
+            v8::PromiseState::Fulfilled => {
+                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+                cancel_handle.cancel_terminate_execution();
+                break 'poll;
+            }
             v8::PromiseState::Rejected => {
-                // Read the rejection value while the scope is still valid.
-                // Guards were already cancelled in the Some(value) arm above.
+                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
                 let rejection = promise.result(scope);
-                // Bridge error takes priority over the JS-level rejection
-                // (which is just the sentinel we threw to unwind the stack).
                 if let Some(err) = bridge_error.get() {
-                    let owned = match err {
-                        RunError::HostBridge(m)               => RunError::HostBridge(m.clone()),
-                        RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
-                        RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
-                        RunError::BridgeCallLimitExceeded      => RunError::BridgeCallLimitExceeded,
-                        other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
-                    };
-                    return Err(failure(owned, &logs, start));
+                    return Err(failure(owned_bridge_error(err), &logs, start));
                 }
+                return Err(failure(runtime_error_from_value(scope, rejection), &logs, start));
+            }
+            v8::PromiseState::Pending => {}
+        }
+
+        // ── Drain one BridgeResponse frame ──────────────────────────────────
+        //
+        // Peek at the socket: if a byte is available a full frame is likely
+        // ready (TS handlers write frames atomically).  If nothing is there
+        // yet we do a blocking wait respecting the remaining wall budget.
+        let frame_result: Result<ipc::TsToRustFrame, io::Error> = if let Some(fd) = poll_stream_fd {
+            // SAFETY: same ManuallyDrop pattern as bridge_global_callback.
+            let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
+
+            // Blocking read — pause CPU budget so host-handler latency is not
+            // charged against the sandbox.  Set a read timeout equal to the
+            // remaining wall budget so a stalled handler is caught here.
+            let timeout = if limits.wall_time_ms > 0 {
+                let budget    = Duration::from_millis(limits.wall_time_ms as u64);
+                let remaining = budget
+                    .saturating_sub(start.elapsed())
+                    .max(Duration::from_millis(1));
+                Some(remaining)
+            } else {
+                None
+            };
+            cpu_budget.leave();
+            if let Some(t) = timeout {
+                sock.set_read_timeout(Some(t)).ok();
+            }
+            let result = ipc::read_ts_to_rust_frame(&mut *sock);
+            if limits.wall_time_ms > 0 {
+                sock.set_read_timeout(None).ok();
+            }
+            cpu_budget.enter();
+            result
+        } else {
+            // No bridge globals — module is Pending with no socket means an
+            // un-awaited Promise was exported; break and surface the error.
+            break 'poll;
+        };
+
+        match frame_result {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+                   || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                // Wall budget exhausted during blocking wait.
+                reason.set(TerminationReason::Wall).ok();
+                return Err(failure(RunError::WallTimeout, &logs, start));
+            }
+            Err(e) => {
                 return Err(failure(
-                    runtime_error_from_value(scope, rejection),
-                    &logs,
-                    start,
+                    RunError::Internal(format!("poll loop socket read: {e}")),
+                    &logs, start,
                 ));
             }
-            v8::PromiseState::Pending => {
-                // Guards were already cancelled in the Some(value) arm above.
-                // A pending promise after evaluate() normally means user
-                // code exported an un-awaited Promise.  But it can also
-                // happen when terminate_execution() fires between the bridge
-                // callback's return and the microtask that runs the await
-                // continuation - V8 exits before the module fully settles.
-                // Check the termination reason first so we surface the
-                // correct error code instead of ExportNotSerializable.
-                if let Some(err) = bridge_error.get() {
-                    let owned = match err {
-                        RunError::HostBridge(m)               => RunError::HostBridge(m.clone()),
-                        RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
-                        RunError::BridgePayloadTooLarge        => RunError::BridgePayloadTooLarge,
-                        RunError::BridgeCallLimitExceeded      => RunError::BridgeCallLimitExceeded,
-                        other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
-                    };
-                    return Err(failure(owned, &logs, start));
+            Ok(frame) => {
+                // ── Validate and decode the BridgeResponse ───────────────
+                if frame.message_type != ipc::TsToRustMessageType::BridgeResponse {
+                    return Err(failure(
+                        RunError::Internal(format!(
+                            "poll loop: expected BridgeResponse, got {:?}",
+                            frame.message_type
+                        )),
+                        &logs, start,
+                    ));
                 }
-                let error = match reason.get().copied() {
-                    Some(TerminationReason::Wall) => RunError::WallTimeout,
-                    Some(TerminationReason::Cpu)  => RunError::CpuTimeout,
-                    None => RunError::ExportNotSerializable(
-                        "module evaluation promise is still pending".to_string(),
-                    ),
-                };
-                return Err(failure(error, &logs, start));
+                if limits.max_bridge_payload_bytes > 0
+                    && frame.payload.len() > limits.max_bridge_payload_bytes as usize
+                {
+                    return Err(failure(RunError::BridgePayloadTooLarge, &logs, start));
+                }
+                match wire::parse_bridge_response_payload(&frame.payload) {
+                    Err(e) => {
+                        return Err(failure(
+                            RunError::Internal(format!("poll loop: response decode: {e}")),
+                            &logs, start,
+                        ));
+                    }
+                    Ok((call_id, result)) => {
+                        // Route to the matching resolver.  An unknown callId
+                        // means a stale frame from a previous run — discard.
+                        let entry = pending_resolvers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&call_id);
+                        if let Some(PendingResolver(global_resolver)) = entry {
+                            let resolver = v8::Local::new(scope, global_resolver);
+                            match result {
+                                Ok(wire_value) => {
+                                    if let Some(v8_val) = wire_to_v8_value(scope, &wire_value) {
+                                        resolver.resolve(scope, v8_val);
+                                    } else {
+                                        let msg = v8::String::new(scope,
+                                            "[iso4] bridge: failed to convert response value")
+                                            .unwrap();
+                                        resolver.reject(scope, msg.into());
+                                    }
+                                }
+                                Err(msg) => {
+                                    // Record the host error so the Rejected
+                                    // arm below returns HostBridge, not RuntimeError.
+                                    bridge_error.set(RunError::HostBridge(msg.clone())).ok();
+                                    let err_str = v8::String::new(scope, &msg)
+                                        .unwrap_or_else(|| v8::String::new(scope, "host error").unwrap());
+                                    resolver.reject(scope, err_str.into());
+                                }
+                            }
+                        }
+                        // Unknown callId → silently discard (cross-run contamination guard).
+                    }
+                }
             }
         }
+
+        // ── Advance all pending await chains ─────────────────────────────────
+        // This is the only place microtasks run (Explicit policy).  After
+        // resolving the Promise above, the microtask queued by the `await`
+        // resumes execution until the module hits its next `await` (sending
+        // another BridgeCall) or completes.
+        scope.perform_microtask_checkpoint();
+
+        // Check for errors set during the checkpoint (inside bridge callbacks).
+        if let Some(err) = bridge_error.get() {
+            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+            return Err(failure(owned_bridge_error(err), &logs, start));
+        }
+        // Check if a guard thread fired termination during the checkpoint.
+        if let Some(r) = reason.get().copied() {
+            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+            let error = match r {
+                TerminationReason::Wall => RunError::WallTimeout,
+                TerminationReason::Cpu  => RunError::CpuTimeout,
+            };
+            return Err(failure(error, &logs, start));
+        }
+    } // end 'poll
+
+    // Verify the promise is truly Fulfilled after the poll loop.
+    // (It should be — Rejected and Pending break out differently above.)
+    if promise.state() != v8::PromiseState::Fulfilled {
+        if let Some(err) = bridge_error.get() {
+            return Err(failure(owned_bridge_error(err), &logs, start));
+        }
+        let error = match reason.get().copied() {
+            Some(TerminationReason::Wall) => RunError::WallTimeout,
+            Some(TerminationReason::Cpu)  => RunError::CpuTimeout,
+            None => RunError::ExportNotSerializable(
+                "module evaluation promise is still pending after poll loop".to_string(),
+            ),
+        };
+        return Err(failure(error, &logs, start));
     }
 
     let namespace = module
@@ -611,7 +751,7 @@ fn precompile_module(code: &str, filename: &str) -> Result<Vec<u8>, FailureOutpu
     let start = std::time::Instant::now();
 
     let mut isolate = v8::Isolate::snapshot_creator(None, None);
-    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Auto);
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
     // All V8 scopes must be dropped before create_blob is called.
     // The IIFE ensures the &mut isolate borrow ends when the closure returns.
@@ -873,61 +1013,60 @@ impl Drop for GuardCanceller<'_> {
 /// Per-stub heap allocation passed as External data to `bridge_global_callback`.
 /// One instance per declared global name, allocated as `Box<GlobalCallbackData>`
 /// and kept alive for the duration of `run_module`.
+// ── Async bridge resolver map ────────────────────────────────────────────────
+//
+// Each bridge_global_callback creates a PromiseResolver and stores it here
+// keyed by the callId it sent on the wire.  The run_module poll loop drains
+// BridgeResponse frames and routes each one to the correct resolver.
+//
+// Both the callbacks and the poll loop execute on the same V8 thread so the
+// Mutex is never actually contended — it exists solely to satisfy Rust's
+// Send bound so the map can live in an Arc.
+
+struct PendingResolver(v8::Global<v8::PromiseResolver>);
+// SAFETY: only ever accessed from the V8 isolate thread.
+unsafe impl Send for PendingResolver {}
+
+type PendingResolvers = Arc<Mutex<HashMap<u32, PendingResolver>>>;
+
 struct GlobalCallbackData {
-    /// Raw file descriptor for the session socket. Bridge callbacks reconstruct
-    /// a `ManuallyDrop<UnixStream>` from this for each round-trip. The fd is
-    /// never closed here - it remains owned by the session thread.
+    /// Raw file descriptor for the session socket.  The callback writes a
+    /// BridgeCall frame here (non-blocking in practice) and returns immediately;
+    /// it never reads from the socket.  The fd remains owned by the session thread.
     stream_fd: RawFd,
-    /// Shared CPU budget. Paused with `leave()` before bridge I/O, resumed
-    /// with `enter()` after - so host-wait time doesn't count against the
-    /// sandbox CPU budget.
-    cpu_budget: Arc<CpuBudget>,
     /// Monotonic bridge call-ID counter, shared across all stubs in one run.
     call_id: Arc<AtomicU32>,
     /// First bridge error wins. Written once, read after evaluate() returns.
     bridge_error: Arc<OnceLock<RunError>>,
     /// The global name this stub is registered for (e.g. "fetch", "myTool").
     name: String,
-    /// When the run started. Combined with `wall_time_ms` to compute the
-    /// remaining wall budget before each blocking bridge read.
-    wall_start: Instant,
-    /// Wall-clock budget for the whole run in milliseconds. When non-zero, a
-    /// socket read timeout equal to the remaining wall time is set before
-    /// every blocking bridge read. If the timeout fires the callback calls
-    /// `terminate_execution()` directly so termination is not racy.
-    /// Zero means no wall limit - blocking reads run without a timeout.
-    wall_time_ms: u32,
-    /// Thread-safe handle to the running isolate. Used to call
-    /// `terminate_execution()` when a wall-timeout fires mid-bridge-wait so
-    /// V8 is guaranteed to terminate even if the wall guard's own call races.
-    isolate_handle: v8::IsolateHandle,
-    /// Shared termination-reason slot. The callback writes `Wall` here before
-    /// calling `terminate_execution()` so that `run_module` maps the result
-    /// to `ERR_WALL_TIMEOUT` rather than a generic RuntimeError.
-    termination_reason: Arc<OnceLock<TerminationReason>>,
-    /// Maximum allowed byte length for a bridge call payload (arguments) and
-    /// for a bridge response payload. Zero means no per-bridge limit — the
-    /// framing layer's 64 MiB cap is the only constraint.
+    /// Maximum allowed byte length for a bridge call payload (arguments).
+    /// Zero means no per-bridge limit.
     max_bridge_payload_bytes: u32,
-    /// Shared counter of bridge calls made so far in this run, across all
-    /// stubs. Incremented before any I/O; checked against `max_bridge_calls`.
+    /// Shared counter of bridge calls made so far in this run.
     bridge_call_count: Arc<AtomicU32>,
     /// Maximum bridge calls allowed per run. Zero means no limit.
     max_bridge_calls: u32,
+    /// Map of in-flight resolvers keyed by callId.  The callback inserts here;
+    /// the poll loop in run_module removes and resolves/rejects.
+    resolver_map: PendingResolvers,
 }
 
 /// A single generic V8 FunctionCallback used for every host-declared global.
 ///
-/// Serialises arguments, does a synchronous BridgeCall/BridgeResponse round
-/// trip on the session socket, then injects the result back into V8.
+/// Non-blocking: serialises arguments, writes a BridgeCall frame, stores a
+/// PromiseResolver keyed by callId, and returns the pending Promise immediately.
+/// The run_module poll loop drives resolution by reading BridgeResponse frames
+/// and calling perform_microtask_checkpoint().
 fn bridge_global_callback(
     scope: &mut v8::HandleScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
     // Recover the per-stub data from the External attached at registration time.
-    // SAFETY: the pointer is valid for the lifetime of run_module; the callback
-    // is only called during module.evaluate() which is nested inside run_module.
+    // SAFETY: valid for the lifetime of run_module; the callback is only invoked
+    // during module.evaluate() or perform_microtask_checkpoint(), both nested
+    // inside run_module.
     let data_ptr = args.data();
     let data = match v8::Local::<v8::External>::try_from(data_ptr) {
         Ok(ext) => ext.value().cast::<GlobalCallbackData>(),
@@ -937,14 +1076,13 @@ fn bridge_global_callback(
         }
     };
     // SAFETY: `data_ptr` was placed in the External by `install_bridge_globals`
+    // SAFETY: `data_ptr` was placed in the External by `install_bridge_globals`
     // via `Box::as_ref() as *const _ as *mut c_void`. The owning Box lives in
     // `callback_data_boxes` inside `run_module`, which is kept alive until after
     // `module.evaluate()` returns. No callback fires after that.
     let data = unsafe { &*data };
 
     // ── Bridge call count limit ────────────────────────────────────────────
-    // Check and increment before any I/O so the counter is always accurate
-    // even when subsequent steps (payload check, socket write) fail early.
     if data.max_bridge_calls > 0 {
         let prev = data.bridge_call_count.fetch_add(1, Ordering::Relaxed);
         if prev >= data.max_bridge_calls {
@@ -973,32 +1111,23 @@ fn bridge_global_callback(
         }
     }
 
-    // ── CPU budget: stop counting during host wait ───────────────────────────
-    data.cpu_budget.leave();
-
-    // ── Assign a unique call ID ────────────────────────────────────────────
+    // ── Assign call ID and build BridgeCall payload ────────────────────────
     let call_id = data.call_id.fetch_add(1, Ordering::Relaxed);
-
-    // ── Reconstruct the socket for this bridge round-trip ────────────────────
-    // SAFETY: stream_fd is the file descriptor of the live session socket.
-    // We wrap it in ManuallyDrop so it is never closed by the local variable.
-    // V8 is blocked in this callback - no other reader/writer touches the fd.
-    let mut stream = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(data.stream_fd) });
-
-    // ── Send BridgeCall frame ──────────────────────────────────────────────
     let bridge_call_payload =
         wire::encode_bridge_call_payload(call_id, 0, None, &data.name, &wire_args);
 
-    // Enforce max_bridge_payload_bytes on outbound call payload.
     if data.max_bridge_payload_bytes > 0
         && bridge_call_payload.len() > data.max_bridge_payload_bytes as usize
     {
         data.bridge_error.set(RunError::BridgePayloadTooLarge).ok();
-        data.cpu_budget.enter();
         throw_v8_error(scope, "[iso4] bridge: call payload exceeds maxBridgePayloadBytes");
         return;
     }
 
+    // ── Write BridgeCall frame (non-blocking in practice) ─────────────────
+    // SAFETY: stream_fd is the live session socket owned by handle_client.
+    // ManuallyDrop prevents closing it here.
+    let mut stream = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(data.stream_fd) });
     if let Err(e) = ipc::write_rust_to_ts_frame(
         &mut *stream,
         ipc::RustToTsMessageType::BridgeCall,
@@ -1007,129 +1136,31 @@ fn bridge_global_callback(
         data.bridge_error
             .set(RunError::Internal(format!("bridge write failed: {e}")))
             .ok();
-        data.cpu_budget.enter();
         throw_v8_error(scope, "[iso4] bridge: send failed");
         return;
     }
 
-    // ── Block waiting for BridgeResponse ──────────────────────────────────
-    // The session socket has no other reader while V8 is blocked here (v1:
-    // bridge calls are sequential within a run).
-    //
-    // When a wall limit is configured, set the socket read timeout to the
-    // remaining wall budget so a stalled TS handler is killed by this callback
-    // rather than the wall guard thread (avoids a race). Without a wall limit
-    // we block indefinitely — the wall guard is the only termination signal.
-    // If the TS host crashes without a wall limit that is a larger ops problem;
-    // the process-level wall timeout from the host side handles it.
-    if data.wall_time_ms > 0 {
-        let elapsed   = data.wall_start.elapsed();
-        let budget    = Duration::from_millis(data.wall_time_ms as u64);
-        let remaining = budget.saturating_sub(elapsed).max(Duration::from_millis(1));
-        stream.set_read_timeout(Some(remaining)).ok();
-    }
-
-    let response_frame = ipc::read_ts_to_rust_frame(&mut *stream);
-
-    // Restore blocking mode so subsequent bridge calls on the same fd are
-    // not affected by the timeout we may have set above.
-    if data.wall_time_ms > 0 {
-        stream.set_read_timeout(None).ok();
-    }
-
-    // ── CPU budget: resume counting ──────────────────────────────────────────
-    data.cpu_budget.enter();
-
-    let frame = match response_frame {
-        Ok(f) => f,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut
-            {
-                // The wall budget was exhausted while we were waiting for the
-                // host handler. Explicitly set the termination reason and
-                // terminate V8 from this callback - we cannot rely on the
-                // wall guard thread's own call winning the race.
-                //
-                // The handler promise on the TypeScript side is now orphaned.
-                // Node.js cannot forcefully kill it; any in-flight I/O or
-                // timers inside the handler will run to natural completion.
-                // Handlers that accept an AbortSignal can self-cancel.
-                // See DESIGN.md §15.4.
-                data.termination_reason.set(TerminationReason::Wall).ok();
-                data.isolate_handle.terminate_execution();
-                return; // V8 will terminate at the next safe point
-            }
+    // ── Create PromiseResolver, store it, return the Promise ──────────────
+    // The run_module poll loop will resolve/reject this when the matching
+    // BridgeResponse frame arrives and callId routing finds this entry.
+    let resolver = match v8::PromiseResolver::new(scope) {
+        Some(r) => r,
+        None => {
             data.bridge_error
-                .set(RunError::Internal(format!("bridge read failed: {e}")))
+                .set(RunError::Internal("failed to create PromiseResolver".into()))
                 .ok();
-            throw_v8_error(scope, "[iso4] bridge: read failed");
+            throw_v8_error(scope, "[iso4] bridge: failed to create promise resolver");
             return;
         }
     };
+    let promise = resolver.get_promise(scope);
+    let global_resolver = v8::Global::new(scope, resolver);
+    data.resolver_map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(call_id, PendingResolver(global_resolver));
 
-    // Enforce max_bridge_payload_bytes on inbound response payload.
-    if data.max_bridge_payload_bytes > 0
-        && frame.payload.len() > data.max_bridge_payload_bytes as usize
-    {
-        data.bridge_error.set(RunError::BridgePayloadTooLarge).ok();
-        throw_v8_error(scope, "[iso4] bridge: response payload exceeds maxBridgePayloadBytes");
-        return;
-    }
-
-    if frame.message_type != ipc::TsToRustMessageType::BridgeResponse {
-        data.bridge_error
-            .set(RunError::Internal(format!(
-                "expected BridgeResponse, got {:?}", frame.message_type
-            )))
-            .ok();
-        throw_v8_error(scope, "[iso4] bridge: protocol error");
-        return;
-    }
-
-    // ── Decode BridgeResponse ──────────────────────────────────────────────
-    let (response_call_id, response) = match wire::parse_bridge_response_payload(&frame.payload) {
-        Ok(r) => r,
-        Err(e) => {
-            data.bridge_error
-                .set(RunError::Internal(format!("bridge response decode: {e}")))
-                .ok();
-            throw_v8_error(scope, "[iso4] bridge: response decode failed");
-            return;
-        }
-    };
-
-    // ── Validate callId ───────────────────────────────────────────────────
-    // The connection is reused across runs; a late BridgeResponse from a
-    // previous run's orphaned handler could arrive here after the per-
-    // connection counter has advanced past that run.  If the callId in the
-    // response does not match what we sent, reject it immediately so stale
-    // data is never injected into this run's sandbox.
-    if response_call_id != call_id {
-        data.bridge_error
-            .set(RunError::Internal(format!(
-                "bridge: unexpected callId in response (expected {call_id}, got {response_call_id})\
-                 — possible cross-run frame contamination"
-            )))
-            .ok();
-        throw_v8_error(scope, "[iso4] bridge: unexpected callId in response");
-        return;
-    }
-
-    match response {
-        Ok(wire_value) => {
-            match wire_to_v8_value(scope, &wire_value) {
-                Some(v8_val) => rv.set(v8_val),
-                None => throw_v8_error(scope, "[iso4] bridge: failed to convert return value"),
-            }
-        }
-        Err(error_message) => {
-            data.bridge_error
-                .set(RunError::HostBridge(error_message.clone()))
-                .ok();
-            throw_v8_error(scope, &format!("[iso4] host bridge error: {error_message}"));
-        }
-    }
+    rv.set(promise.into());
 }
 
 /// Install a bridge stub for each declared global name.
@@ -1141,33 +1172,25 @@ fn install_bridge_globals(
     scope: &mut v8::HandleScope,
     globals: &[String],
     stream_fd: RawFd,
-    cpu_budget: Arc<CpuBudget>,
     call_id: Arc<AtomicU32>,
     bridge_error: Arc<OnceLock<RunError>>,
-    wall_start: Instant,
-    wall_time_ms: u32,
-    isolate_handle: v8::IsolateHandle,
-    termination_reason: Arc<OnceLock<TerminationReason>>,
     max_bridge_payload_bytes: u32,
     bridge_call_count: Arc<AtomicU32>,
     max_bridge_calls: u32,
+    resolver_map: PendingResolvers,
     out_boxes: &mut Vec<Box<GlobalCallbackData>>,
 ) -> Result<(), RunError> {
     let global_obj = scope.get_current_context().global(scope);
     for name in globals {
         let data = Box::new(GlobalCallbackData {
             stream_fd,
-            cpu_budget: Arc::clone(&cpu_budget),
             call_id: Arc::clone(&call_id),
             bridge_error: Arc::clone(&bridge_error),
             name: name.clone(),
-            wall_start,
-            wall_time_ms,
-            isolate_handle: isolate_handle.clone(),
-            termination_reason: Arc::clone(&termination_reason),
             max_bridge_payload_bytes,
             bridge_call_count: Arc::clone(&bridge_call_count),
             max_bridge_calls,
+            resolver_map: Arc::clone(&resolver_map),
         });
         // Pass a raw pointer to the Box's heap allocation as External data.
         // The Box is stored in out_boxes and outlives all V8 callbacks.
@@ -3663,6 +3686,93 @@ mod tests {
             "run 2 callId ({run2_call_id}) must be > run 1 callId ({run1_call_id})");
         assert!(matches!(err, RunError::Internal(_)),
             "expected Internal (stale callId rejected), got {err:?}");
+    }
+
+    // ── Concurrent bridge calls (D11) ───────────────────────────────────────────────────
+
+    #[test]
+    fn promise_all_concurrent_bridge_calls_route_by_call_id() {
+        // Promise.all([toolA(), toolB()]) fires both bridge_global_callbacks
+        // synchronously before V8 yields, putting two BridgeCall frames on the
+        // wire at the same time.  The server responds in REVERSE order to prove
+        // the poll loop routes each response to the correct resolver by callId.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle = std::thread::spawn(move || {
+            // Read both BridgeCall frames (they arrive before V8 yields).
+            let f1 = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            let cid1 = u32::from_be_bytes(f1.payload[..4].try_into().unwrap());
+            let f2 = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            let cid2 = u32::from_be_bytes(f2.payload[..4].try_into().unwrap());
+
+            // Respond in reverse order: second call gets 20, first gets 10.
+            // The poll loop must route cid2 → toolB resolver (20)
+            // and cid1 → toolA resolver (10) regardless of order.
+            ipc::write_ts_to_rust_frame(&mut server,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(cid2, &WireValue::Number(20.0))).unwrap();
+            ipc::write_ts_to_rust_frame(&mut server,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(cid1, &WireValue::Number(10.0))).unwrap();
+        });
+
+        let out = execute(
+            // toolA resolves to 10, toolB resolves to 20; sum = 30.
+            "const [a, b] = await Promise.all([toolA(), toolB()]); \
+             export default a + b",
+            None,
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            &["toolA".to_string(), "toolB".to_string()],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        ).unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("30"));
+    }
+
+    #[test]
+    fn promise_all_three_concurrent_calls_all_resolve() {
+        // Three concurrent calls; responses arrive in reverse order.
+        // Validates callId routing across more than two in-flight resolvers.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle = std::thread::spawn(move || {
+            let mut call_ids = Vec::new();
+            for _ in 0..3 {
+                let f = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+                let cid = u32::from_be_bytes(f.payload[..4].try_into().unwrap());
+                call_ids.push(cid);
+            }
+            // Respond in reverse.
+            for (i, &cid) in call_ids.iter().rev().enumerate() {
+                ipc::write_ts_to_rust_frame(&mut server,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(cid, &WireValue::Number((i as f64 + 1.0) * 10.0))).unwrap();
+            }
+        });
+
+        // All three resolve — we just care the module completes without error.
+        let out = execute(
+            "const [a, b, c] = await Promise.all([tool(), tool(), tool()]); \
+             export default typeof a === 'number' && typeof b === 'number' && typeof c === 'number'",
+            None,
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            &["tool".to_string()],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        ).unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("true"));
     }
 
     #[test]

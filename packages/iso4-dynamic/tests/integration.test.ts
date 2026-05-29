@@ -646,6 +646,107 @@ describe('globals bridge (Phase 4)', () => {
   })
 })
 
+// ── Concurrent host callbacks (D11) ─────────────────────────────────────────
+//
+// These tests verify that Promise.all([toolA(), toolB()]) in sandbox code
+// causes the two host handlers to execute concurrently, not sequentially.
+// The proof is timing: if both 50 ms handlers run sequentially the total
+// wall time would be ≥ 100 ms; if they run concurrently it is ≈ 50 ms.
+
+describe('concurrent host bridge callbacks (D11)', () => {
+  test('Promise.all with two slow handlers runs them concurrently', async () => {
+    const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+    const HANDLER_DELAY_MS = 50
+    const started: number[] = []
+
+    const handler = async (_arg: unknown): Promise<number> => {
+      started.push(Date.now())
+      await sleep(HANDLER_DELAY_MS)
+      return 1
+    }
+
+    const wallStart = Date.now()
+    const result = await runtime.run({
+      code: `
+        const [a, b] = await Promise.all([tool(), tool()])
+        export default a + b
+      `,
+      globals: { tool: handler } as any,
+    })
+    const wallMs = Date.now() - wallStart
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.exports['default']).toBe(2)
+
+    // Both handlers must have started within a small window of each other.
+    // Sequential execution would start the second one ~50 ms after the first.
+    expect(started).toHaveLength(2)
+    const startDelta = Math.abs(started[1]! - started[0]!)
+    expect(startDelta).toBeLessThan(20) // started within 20 ms of each other
+
+    // Total wall time must be well under what sequential would cost (100 ms).
+    expect(wallMs).toBeLessThan(HANDLER_DELAY_MS * 2 - 10)
+  })
+
+  test('Promise.all with three slow handlers — all start concurrently', async () => {
+    const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+    const HANDLER_DELAY_MS = 50
+    const started: number[] = []
+
+    const handler = async (_arg: unknown): Promise<string> => {
+      started.push(Date.now())
+      await sleep(HANDLER_DELAY_MS)
+      return 'ok'
+    }
+
+    const wallStart = Date.now()
+    const result = await runtime.run({
+      code: `
+        const [a, b, c] = await Promise.all([tool(), tool(), tool()])
+        export default [a, b, c].every(v => v === 'ok')
+      `,
+      globals: { tool: handler } as any,
+    })
+    const wallMs = Date.now() - wallStart
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.exports['default']).toBe(true)
+    expect(started).toHaveLength(3)
+
+    // All three must have started within a small window.
+    const maxDelta = Math.max(...started) - Math.min(...started)
+    expect(maxDelta).toBeLessThan(20)
+
+    // Total wall time well under sequential cost (150 ms).
+    expect(wallMs).toBeLessThan(HANDLER_DELAY_MS * 3 - 20)
+  })
+
+  test('sequential bridge calls still return correct values', async () => {
+    // Sanity check: non-concurrent usage still works correctly.
+    const results: number[] = []
+    const result = await runtime.run({
+      code: `
+        const a = await tool(1)
+        const b = await tool(2)
+        const c = await tool(3)
+        export default a + b + c
+      `,
+      globals: {
+        tool: async (n: unknown) => {
+          results.push(n as number)
+          return (n as number) * 10
+        },
+      } as any,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.exports['default']).toBe(60) // 10 + 20 + 30
+    expect(results).toEqual([1, 2, 3]) // called in order
+  })
+})
+
 // ── Phase 6: source imports ────────────────────────────────────────────────
 // Tests host-provided JS source modules.
 // All FAIL until Phase 6 implements the module resolver.
