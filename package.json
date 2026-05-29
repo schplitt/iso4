@@ -16,9 +16,10 @@
     "url": "https://github.com/schplitt/iso4/issues"
   },
   "scripts": {
-    "build": "pnpm -r --filter=\"./packages/*\" build",
+    "build": "pnpm build:native && pnpm -r --filter=\"./packages/*\" build",
+    "build:dev": "pnpm build:native:dev && pnpm -r --filter=\"./packages/*\" build",
     "test": "pnpm -r --filter=\"./packages/*\" test",
-    "test:run": "pnpm -r --filter=\"./packages/*\" test:run",
+    "test:run": "pnpm test:native && pnpm -r --filter=\"./packages/*\" test:run",
     "lint": "eslint",
     "lint:fix": "eslint --fix",
     "typecheck": "pnpm -r --filter=\"./packages/*\" typecheck",

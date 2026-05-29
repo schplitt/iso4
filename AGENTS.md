@@ -79,15 +79,32 @@ rule for adding new ones.
 ## Development
 
 ```sh
-pnpm install        # bootstrap workspace
-pnpm build          # build all packages (tsdown)
-pnpm test:run       # run vitest once across all packages (use this in automation)
-pnpm test           # vitest in watch mode (developer use only)
-pnpm lint           # eslint
-pnpm lint:fix       # eslint --fix
-pnpm typecheck      # tsc --noEmit across packages
-pnpm changeset      # record a per-package version bump (use on every user-facing change)
+pnpm install           # bootstrap workspace
+pnpm build:dev         # build native binary (debug) + all TS packages — use for local dev
+pnpm build             # build native binary (release) + all TS packages — use for CI / release
+pnpm test:run          # cargo test (Rust unit tests) + vitest once across all TS packages
+pnpm test              # vitest in watch mode (developer use only, TS only)
+pnpm lint              # eslint
+pnpm lint:fix          # eslint --fix
+pnpm typecheck         # tsc --noEmit across packages
+pnpm changeset         # record a per-package version bump (use on every user-facing change)
+pnpm build:native      # build + copy release binary only (no TS build)
+pnpm build:native:dev  # build + copy debug binary only (no TS build)
+pnpm test:native       # cargo test only (Rust unit tests, no TS)
 ```
+
+**Important:** The TS integration tests (`integration.test.ts`, `e2e.test.ts`) spawn
+the native binary from the platform package (`packages/iso4-v8-<platform>/bin/iso4-v8`).
+That binary must be built and copied before running TS tests. `pnpm build:dev` (or
+`pnpm build`) does this. Running `pnpm test:run` without building first will use
+whatever binary was last installed/built.
+
+**Known pre-existing test failures (~29):** Several TS tests in `integration.test.ts`
+and `e2e.test.ts` fail because the features they cover are not yet implemented
+(source imports/resolver, host module imports, AbortSignal, BridgeCall TS-side
+dispatch, export/stdout size limits). These are tracked against the phase roadmap
+in `DESIGN.md`. Do not treat them as regressions — only fail the build if the
+count increases beyond the baseline.
 
 Toolchain:
 
@@ -161,7 +178,7 @@ When working on this project:
 3. **Run tests** after making changes: `pnpm test:run` (single-shot).
 4. **Run linting**: `pnpm lint` (or `pnpm lint:fix`).
 5. **Run type checking** before committing: `pnpm typecheck`.
-6. **Validation order**: `pnpm lint:fix` → `pnpm typecheck` → `pnpm test:run`.
+6. **Validation order**: `pnpm lint:fix` → `pnpm typecheck` → `pnpm build:native:dev` → `pnpm test:run`. The native build step is required so the TS integration tests use the current binary. Skip it only when the Rust source has not changed.
 7. **Public API stays in `packages/<pkg>/src/index.ts`.** All re-exports
    listed explicitly. No barrel-exports of `*`.
 8. **Add tests** for new functionality in `packages/<pkg>/tests/`.
@@ -181,8 +198,8 @@ When working on this project:
     - Error-code table in `docs/protocol.md` §7
     - Any relevant limits/semantics prose in `DESIGN.md` §4.1 (for limit
       fields) or the appropriate design section (for new concepts)
-    Missing any of these is a documentation bug equivalent to a broken
-    API contract.
+      Missing any of these is a documentation bug equivalent to a broken
+      API contract.
 12. **Use available workflow tools first** — When the user asks for
     branch/commit/PR workflow, use the available MCP/devtools first. Only
     fall back to `gh` CLI when those tools are not available.
@@ -218,11 +235,24 @@ learned during development.
 
 - Use `pnpm test:run` in automated/agent workflows. `pnpm test` starts watch
   mode and will hang automation.
+- Run `pnpm build:native:dev` before `pnpm test:run` whenever Rust source
+  has changed; the TS integration tests spawn the binary from the platform
+  package directory and will use a stale binary otherwise.
+- `pnpm test:run` now includes `pnpm test:native` (Rust unit tests via
+  `cargo test`) before the TS vitest run. The Rust unit tests use the debug
+  profile and are fast; no separate `cargo test` call is needed.
 - Prefer `pnpm lint:fix` before manual lint cleanup.
 - The pnpm catalog (`pnpm-workspace.yaml`) is the single source of truth
   for dev-dep versions. Reference deps as `"catalog:"` in package.json,
   not hard-coded versions.
 - Node 24+ is required; `mise.toml` pins to 26 for development. CI uses 26.
+- `@iso4/core` has no test files; `vitest run` exits non-zero when no test
+  files are found. This is a known gap — `pnpm test:run` will report it as
+  a failure. Ignore it until a test file is added to that package.
+- ~29 TS tests in `integration.test.ts` / `e2e.test.ts` are pre-existing
+  failures for unimplemented features (source imports, host module imports,
+  AbortSignal, BridgeCall TS dispatch, size limits). Do not treat these as
+  regressions. If the failure count rises above ~29 after a change, investigate.
 
 ### Patterns & Conventions
 
@@ -297,6 +327,11 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   format. V8 `ValueSerializer` is the only correct format for JS values
   crossing the sandbox boundary. The wire envelope (4-byte length + 1-byte
   type) is already minimal; don't wrap it in a schema library.
+- Do not use `num-bigint` (or any other arbitrary-precision crate) for BigInt
+  wire encoding. The `WireValue::BigInt(bool, Vec<u64>)` representation uses
+  V8's native word format directly (`new_from_words` / `to_words_array`); no
+  base conversion is needed. The TS side uses native `bigint` bitshift arithmetic.
+  Adding a crate for this is net overhead with zero benefit.
 - Do not add the in-process (NAPI) backend in v1. It is a Phase 12 concern.
   rusty_v8 cannot be used in-process with Node — it would need a C++ rewrite
   of `packages/iso4-static/`. That conversation happens at Phase 11, not before.

@@ -104,10 +104,20 @@ serializer so the TypeScript host can decode it without native APIs.
 | `0x03` | `True`      | none                | `true`        |
 | `0x04` | `Number`    | `f64`               | `number`      |
 | `0x05` | `String`    | `String`            | `string`      |
-| `0x06` | `BigInt`    | decimal `String`    | `bigint`      |
+| `0x06` | `BigInt`    | see below           | `bigint`      |
 | `0x07` | `Bytes`     | `Bytes`             | `Uint8Array`  |
 | `0x08` | `Array`     | `List<WireValue>`   | `unknown[]`   |
 | `0x09` | `Object`    | `List<ObjectField>` | plain object  |
+
+`BigInt` payload:
+
+| Field        | Encoding                                  | Notes                                                                         |
+| ------------ | ----------------------------------------- | ----------------------------------------------------------------------------- |
+| `sign_bit`   | `u8` (`0` = non-negative, `1` = negative) | Always `0` for zero.                                                          |
+| `word_count` | `u32`                                     | Number of 64-bit words that follow. `0` for zero.                             |
+| `words`      | `word_count × u64` (big-endian each)      | Least-significant word first (index 0 = bits 0–63, index 1 = bits 64–127, …). |
+
+This encoding maps directly to V8's `BigInt::new_from_words` / `to_words_array` API — no base conversion is needed on either side of the bridge. The TypeScript side uses native `bigint` bit-shift arithmetic to pack/unpack words.
 
 `ObjectField`:
 
@@ -290,14 +300,14 @@ socket immediately on version or token mismatch.
 
 `ResourceLimits`:
 
-| Field                   | Encoding | Notes                                                                                   |
-| ----------------------- | -------- | --------------------------------------------------------------------------------------- |
-| `memoryMb`              | `u32`    | Zero = no limit.                                                                        |
-| `cpuTimeMs`             | `u32`    | Zero = no limit.                                                                        |
-| `wallTimeMs`            | `u32`    | Zero = no limit.                                                                        |
-| `maxExportBytes`        | `u32`    | Zero = no limit.                                                                        |
-| `maxStdoutBytes`        | `u32`    | Zero = no limit.                                                                        |
-| `maxStderrBytes`        | `u32`    | Zero = no limit.                                                                        |
+| Field                   | Encoding | Notes                                                                                                                                                                    |
+| ----------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `memoryMb`              | `u32`    | Zero = no limit.                                                                                                                                                         |
+| `cpuTimeMs`             | `u32`    | Zero = no limit.                                                                                                                                                         |
+| `wallTimeMs`            | `u32`    | Zero = no limit.                                                                                                                                                         |
+| `maxExportBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
+| `maxStdoutBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
+| `maxStderrBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
 | `maxBridgePayloadBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` or `BridgeResponsePayload`. Zero = no limit (framing cap of 64 MiB applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
 
 `HostGlobalBinding`:

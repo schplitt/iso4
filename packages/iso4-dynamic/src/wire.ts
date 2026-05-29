@@ -79,6 +79,21 @@ class WireReader {
     return n
   }
 
+  /**
+   * Read a big-endian u64 as a JS `bigint`. Uses two u32 reads to avoid
+   *  floating-point precision loss from DataView.getBigUint64 on older runtimes
+   *  (though Node 18+ supports it; this is belt-and-suspenders).
+   */
+  readU64BE(): bigint {
+    if (this.remaining < 8) {
+      throw new WireDecodeError('unexpected end of data reading u64')
+    }
+    const hi = BigInt(this.view.getUint32(this.offset, false))
+    const lo = BigInt(this.view.getUint32(this.offset + 4, false))
+    this.offset += 8
+    return (hi << 32n) | lo
+  }
+
   readRawBytes(len: number): Uint8Array {
     if (this.remaining < len) {
       throw new WireDecodeError(
@@ -146,8 +161,13 @@ function decodeWireValueFromReader(reader: WireReader): unknown {
     case TAG_STRING:
       return reader.readString()
     case TAG_BIGINT: {
-      const s = reader.readString()
-      return BigInt(s)
+      const sign = reader.readU8() // 0 = non-negative, 1 = negative
+      const count = reader.readU32() // number of u64 words (LSW first)
+      let magnitude = 0n
+      for (let i = 0; i < count; i++) {
+        magnitude |= reader.readU64BE() << BigInt(i * 64)
+      }
+      return sign ? -magnitude : magnitude
     }
     case TAG_BYTES: {
       const len = reader.readU32()
@@ -179,7 +199,8 @@ function decodeWireValueFromReader(reader: WireReader): unknown {
         // Drop "__proto__" — defence-in-depth: Rust already elides it at
         // the encoding boundary (serialize_object_fields), but guard here
         // too so this decoder is self-contained and safe regardless.
-        if (key === '__proto__') continue
+        if (key === '__proto__')
+          continue
         obj[key] = val
       }
       return obj
@@ -397,6 +418,18 @@ class WireWriter {
     return this
   }
 
+  /**
+   * Write a JS `bigint` as a big-endian u64 (must fit in 64 bits).
+   * @param n
+   */
+  writeU64BE(n: bigint): this {
+    const b = Buffer.allocUnsafe(8)
+    b.writeUInt32BE(Number((n >> 32n) & 0xffffffffn), 0)
+    b.writeUInt32BE(Number(n & 0xffffffffn), 4)
+    this.parts.push(b)
+    return this
+  }
+
   writeString(s: string): this {
     const encoded = Buffer.from(s, 'utf8')
     this.writeU32(encoded.byteLength)
@@ -421,7 +454,20 @@ class WireWriter {
       return this.writeU8(ENC_TAG_STRING).writeString(value)
     }
     if (typeof value === 'bigint') {
-      return this.writeU8(ENC_TAG_BIGINT).writeString(value.toString())
+      // Encode as: sign_bit (u8) + word_count (u32) + words (u64 BE, LSW first).
+      // Matches V8's new_from_words / to_words_array representation exactly.
+      const sign = value < 0n ? 1 : 0
+      let magnitude = value < 0n ? -value : value
+      const words: bigint[] = []
+      while (magnitude > 0n) {
+        words.push(magnitude & 0xffffffffffffffffn)
+        magnitude >>= 64n
+      }
+      this.writeU8(ENC_TAG_BIGINT)
+      this.writeU8(sign)
+      this.writeU32(words.length)
+      for (const word of words) this.writeU64BE(word)
+      return this
     }
     if (value instanceof Uint8Array) {
       this.writeU8(ENC_TAG_BYTES)

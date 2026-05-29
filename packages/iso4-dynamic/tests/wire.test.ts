@@ -52,10 +52,18 @@ function encodeValue(value: unknown, out: number[]): void {
     return
   }
   if (typeof value === 'bigint') {
+    // New encoding: sign_bit (u8) + word_count (u32) + words (u64 BE, LSW first)
+    const sign = value < 0n ? 1 : 0
+    let magnitude = value < 0n ? -value : value
+    const words: bigint[] = []
+    while (magnitude > 0n) {
+      words.push(magnitude & 0xffffffffffffffffn)
+      magnitude >>= 64n
+    }
     out.push(0x06)
-    const bytes = new TextEncoder().encode(value.toString())
-    pushU32(out, bytes.length)
-    out.push(...bytes)
+    out.push(sign)
+    pushU32(out, words.length)
+    for (const word of words) pushU64BE(out, word)
     return
   }
   if (value instanceof Uint8Array) {
@@ -87,6 +95,11 @@ function encodeValue(value: unknown, out: number[]): void {
 
 function pushU32(out: number[], n: number): void {
   out.push((n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff)
+}
+
+function pushU64BE(out: number[], n: bigint): void {
+  pushU32(out, Number((n >> 32n) & 0xffffffffn))
+  pushU32(out, Number(n & 0xffffffffn))
 }
 
 function pushF64(out: number[], n: number): void {
@@ -234,6 +247,33 @@ describe('decodeWireValue — primitives', () => {
 
   test('bigint zero', () => {
     expect(decodeWireValue(encodeWireValue(0n))).toBe(0n)
+  })
+
+  test('bigint larger than u64 max roundtrips', () => {
+    const v = 2n ** 64n
+    expect(decodeWireValue(encodeWireValue(v))).toBe(v)
+  })
+
+  test('bigint negative larger than i64 min roundtrips', () => {
+    const v = -(2n ** 65n)
+    expect(decodeWireValue(encodeWireValue(v))).toBe(v)
+  })
+
+  test('bigint 2^128 roundtrips', () => {
+    const v = 2n ** 128n
+    expect(decodeWireValue(encodeWireValue(v))).toBe(v)
+  })
+
+  test('bigint production encoder matches test encoder', () => {
+    // Ensures the production WireWriter and the test encodeValue helper
+    // produce identical bytes for a range of BigInt values.
+    // Compare as Uint8Array — production returns Buffer (a Buffer subclass),
+    // test helper returns Uint8Array; normalise to avoid type-equality failure.
+    for (const v of [0n, 1n, -1n, 42n, -100n, 2n ** 64n, -(2n ** 65n), 2n ** 128n]) {
+      const prod = new Uint8Array(encodeWireValueProduction(v))
+      const test = encodeWireValue(v)
+      expect(prod).toEqual(test)
+    }
   })
 
   test('bytes', () => {

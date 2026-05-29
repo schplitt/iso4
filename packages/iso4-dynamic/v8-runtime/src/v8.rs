@@ -1150,18 +1150,11 @@ fn wire_to_v8_value<'s>(
         WireValue::Bool(b)   => Some(v8::Boolean::new(scope, *b).into()),
         WireValue::Number(n) => Some(v8::Number::new(scope, *n).into()),
         WireValue::String(s) => v8::String::new(scope, s).map(|s| s.into()),
-        WireValue::BigInt(s) => {
-            // Supports values in [i64::MIN, u64::MAX].
-            // Values outside this range return None (bridge injection fails).
-            // Full arbitrary-precision support via v8::BigInt::new_from_words
-            // is deferred - see notes/deferred-fixes.md.
-            if let Ok(n) = s.parse::<i64>() {
-                return Some(v8::BigInt::new_from_i64(scope, n).into());
-            }
-            if let Ok(n) = s.parse::<u64>() {
-                return Some(v8::BigInt::new_from_u64(scope, n).into());
-            }
-            None // out-of-range: signal injection failure to caller
+        WireValue::BigInt(sign, words) => {
+            // Directly maps to V8's new_from_words: no base conversion needed.
+            // Words are LSW-first (matching the wire encoding and V8's representation).
+            // An empty words slice represents zero.
+            v8::BigInt::new_from_words(scope, *sign, words).map(|b| b.into())
         }
         WireValue::Bytes(b) => {
             let len = b.len();
@@ -1478,18 +1471,12 @@ fn value_to_wire(
     if value.is_big_int() {
         let bigint = v8::Local::<v8::BigInt>::try_from(value)
             .map_err(|_| RunError::Internal("failed to cast to BigInt".to_string()))?;
-        let (i_val, fits_i64) = bigint.i64_value();
-        if fits_i64 {
-            return Ok(WireValue::BigInt(i_val.to_string()));
-        }
-        let (u_val, fits_u64) = bigint.u64_value();
-        if fits_u64 {
-            return Ok(WireValue::BigInt(u_val.to_string()));
-        }
-        return Err(RunError::ExportNotSerializable(
-            "BigInt value is out of the supported i64/u64 range for wire encoding"
-                .to_string(),
-        ));
+        // Use V8's word representation directly — no base conversion needed.
+        // word_count() returns 0 for zero, so an empty words slice encodes 0n.
+        let word_count = bigint.word_count();
+        let mut buf = vec![0u64; word_count];
+        let (sign, filled) = bigint.to_words_array(&mut buf);
+        return Ok(WireValue::BigInt(sign, filled.to_vec()));
     }
     if value.is_symbol() {
         return Err(RunError::ExportNotSerializable(
@@ -1665,6 +1652,32 @@ mod tests {
         }
     }
 
+    /// Convert a little-endian u64 word array plus a sign bit to a decimal
+    /// string. Used only in tests (avoids a `num-bigint` dependency).
+    ///
+    /// Algorithm: repeated division by 10 processing words MSW→LSW,
+    /// collecting remainder digits until the quotient is all-zeros.
+    /// Each step works in u128 to handle the 2⁴² carry from word to word.
+    fn words_to_decimal(sign: bool, words: &[u64]) -> String {
+        if words.is_empty() || words.iter().all(|&w| w == 0) {
+            return "0".to_string();
+        }
+        let mut buf = words.to_vec(); // LSW at index 0
+        let mut digits = String::new();
+        loop {
+            let mut rem: u128 = 0;
+            for w in buf.iter_mut().rev() {
+                let cur: u128 = (rem << 64) | (*w as u128);
+                *w = (cur / 10) as u64;
+                rem = cur % 10;
+            }
+            digits.push(char::from_digit(rem as u32, 10).unwrap());
+            if buf.iter().all(|&w| w == 0) { break; }
+        }
+        if sign { digits.push('-'); }
+        digits.chars().rev().collect()
+    }
+
     /// Render a `WireValue` as a human-readable string similar to what V8's
     /// `ToString()` / `JSON.stringify()` would produce. Used only in tests.
     fn wire_to_display_str(v: &WireValue) -> String {
@@ -1688,7 +1701,7 @@ mod tests {
                 }
             }
             WireValue::String(s) => s.clone(),
-            WireValue::BigInt(s) => s.clone(),
+            WireValue::BigInt(sign, words) => words_to_decimal(*sign, words),
             WireValue::Bytes(_) => "[Uint8Array]".to_string(),
             WireValue::Array(items) => {
                 let parts: Vec<String> =
@@ -2191,33 +2204,79 @@ mod tests {
     // ── BigInt ────────────────────────────────────────────────────────────
 
     #[test]
-    fn bigint_positive_encodes_as_decimal_string() {
+    fn bigint_positive_roundtrips() {
         let out = run_ok("export default 42n");
-        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt("42".to_string())));
+        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt(false, vec![42])));
+        assert_eq!(get_default(&out).as_deref(), Some("42"));
     }
 
     #[test]
-    fn bigint_negative_encodes_as_decimal_string() {
+    fn bigint_negative_roundtrips() {
         let out = run_ok("export default -100n");
-        assert_eq!(
-            get_field(&out, "default"),
-            Some(WireValue::BigInt("-100".to_string()))
-        );
+        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt(true, vec![100])));
+        assert_eq!(get_default(&out).as_deref(), Some("-100"));
     }
 
     #[test]
-    fn bigint_zero_encodes_correctly() {
+    fn bigint_zero_roundtrips() {
         let out = run_ok("export default 0n");
-        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt("0".to_string())));
+        // V8 word_count() for 0n is 0; words slice is empty.
+        let field = get_field(&out, "default").unwrap();
+        assert!(matches!(field, WireValue::BigInt(false, ref w) if w.is_empty() || w.iter().all(|&x| x == 0)));
+        assert_eq!(get_default(&out).as_deref(), Some("0"));
     }
 
     #[test]
-    fn bigint_inside_object_encodes_correctly() {
+    fn bigint_inside_object_roundtrips() {
+        // 1_000_000_000_000 = 0xE8D4A51000 which fits in a single u64 word.
         let out = run_ok("export default { count: 1000000000000n }");
         let default_val = get_field(&out, "default").unwrap();
         assert_eq!(
             wire_obj_get(&default_val, "count"),
-            Some(WireValue::BigInt("1000000000000".to_string()))
+            Some(WireValue::BigInt(false, vec![1_000_000_000_000u64]))
+        );
+    }
+
+    #[test]
+    fn bigint_larger_than_u64_max_roundtrips() {
+        // 2n**64n = 18446744073709551616 — needs 2 words: [0, 1] (LSW first).
+        let out = run_ok("export default 2n**64n");
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::BigInt(false, vec![0, 1]))
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("18446744073709551616"));
+    }
+
+    #[test]
+    fn bigint_negative_larger_than_i64_min_roundtrips() {
+        // -(2n**65n) — needs 2 words: [0, 2], sign=true.
+        let out = run_ok("export default -(2n**65n)");
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::BigInt(true, vec![0, 2]))
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("-36893488147419103232"));
+    }
+
+    #[test]
+    fn bigint_inject_via_bridge_roundtrips() {
+        // Host returns 2^128 as (sign=false, words=[0,0,1]) in a BridgeResponse.
+        // Sandbox exports it back; we verify the round-trip.
+        let large = WireValue::BigInt(false, vec![0, 0, 1]); // 2^128
+        let (out, h) = run_with_bridge(
+            "export default await getBig()",
+            "getBig",
+            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            move |s| {
+                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &large)).unwrap();
+            },
+        );
+        h.join().unwrap();
+        assert_eq!(
+            get_field(&out.unwrap(), "default"),
+            Some(WireValue::BigInt(false, vec![0, 0, 1]))
         );
     }
 

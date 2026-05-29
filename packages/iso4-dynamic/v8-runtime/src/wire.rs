@@ -43,8 +43,14 @@ pub enum WireValue {
     /// IEEE-754 double-precision float.
     Number(f64),
     String(String),
-    /// Decimal string representation of a BigInt (without the `n` suffix).
-    BigInt(String),
+    /// Arbitrary-precision integer.
+    ///
+    /// `sign` is `true` for negative values. `words` is a little-endian
+    /// sequence of 64-bit digits: `words[0]` holds bits 0–63, `words[1]`
+    /// bits 64–127, etc. An empty `words` slice represents zero (sign is
+    /// always `false` for zero). Matches V8's `new_from_words` / `to_words_array`
+    /// representation exactly — no base conversion needed on either end.
+    BigInt(bool, Vec<u64>),
     Bytes(Vec<u8>),
     Array(Vec<WireValue>),
     /// Ordered list of `(key, value)` pairs. Keys are own enumerable
@@ -96,9 +102,13 @@ pub fn encode_wire_value(value: &WireValue, out: &mut Vec<u8>) {
             out.push(TAG_STRING);
             encode_string(s, out);
         }
-        WireValue::BigInt(s) => {
+        WireValue::BigInt(sign, words) => {
             out.push(TAG_BIGINT);
-            encode_string(s, out);
+            out.push(u8::from(*sign));          // 0 = non-negative, 1 = negative
+            encode_u32(words.len() as u32, out); // word_count
+            for w in words {
+                out.extend_from_slice(&w.to_be_bytes()); // each word big-endian
+            }
         }
         WireValue::Bytes(b) => {
             out.push(TAG_BYTES);
@@ -146,6 +156,19 @@ fn read_u32(data: &[u8], offset: &mut usize) -> io::Result<u32> {
         ));
     }
     let n = u32::from_be_bytes(data[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(n)
+}
+
+fn read_u64(data: &[u8], offset: &mut usize) -> io::Result<u64> {
+    let end = *offset + 8;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected end of WireValue data",
+        ));
+    }
+    let n = u64::from_be_bytes(data[*offset..end].try_into().unwrap());
     *offset = end;
     Ok(n)
 }
@@ -210,8 +233,13 @@ pub fn decode_wire_value(data: &[u8], offset: &mut usize) -> io::Result<WireValu
             Ok(WireValue::String(s))
         }
         TAG_BIGINT => {
-            let s = read_string(data, offset)?;
-            Ok(WireValue::BigInt(s))
+            let sign = read_u8(data, offset)? != 0;
+            let word_count = read_u32(data, offset)? as usize;
+            let mut words = Vec::with_capacity(word_count);
+            for _ in 0..word_count {
+                words.push(read_u64(data, offset)?);
+            }
+            Ok(WireValue::BigInt(sign, words))
         }
         TAG_BYTES => {
             let len = read_u32(data, offset)? as usize;
