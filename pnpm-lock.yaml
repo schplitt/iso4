@@ -18,12 +18,18 @@ catalogs:
     eslint:
       specifier: ^10.2.1
       version: 10.4.0
+    rou3:
+      specifier: ^0.8.1
+      version: 0.8.1
     tsdown:
       specifier: ^0.21.10
       version: 0.21.10
     typescript:
       specifier: ^6.0.3
       version: 6.0.3
+    undici:
+      specifier: ^6.25.0
+      version: 6.25.0
     vitest:
       specifier: ^4.1.5
       version: 4.1.7
@@ -52,6 +58,13 @@ importers:
         version: 4.1.7(@types/node@24.12.4)(vite@8.0.14(@types/node@24.12.4)(yaml@2.9.0))
 
   packages/iso4-fetch:
+    dependencies:
+      rou3:
+        specifier: 'catalog:'
+        version: 0.8.1
+      undici:
+        specifier: 'catalog:'
+        version: 6.25.0
     devDependencies:
       '@changesets/cli':
         specifier: 'catalog:'
@@ -2675,6 +2688,9 @@ packages:
     resolution: {integrity: sha512-oZx5zVDtVB44AW3eaifgDml1gWRDZGvjcfdxonE4swNPG98PrrXjaO/KrnUjzlMnztCCRVlUueA1kCXhARGk6g==}
     engines: {node: ^20.19.0 || >=22.12.0}
     hasBin: true
+
+  rou3@0.8.1:
+    resolution: {integrity: sha512-ePa+XGk00/3HuCqrEnK3LxJW7I0SdNg6EFzKUJG73hMAdDcOUC/i/aSz7LSDwLrGr33kal/rqOGydzwl6U7zBA==}
 
   router@2.2.0:
     resolution: {integrity: sha512-nLTrUKm2UyiL7rlhapu/Zl45FwNgkZGaCpZbIHajDYgwlJCOzLSk+cIPAnsEqV955GjILJnKbdQC1nVPz+gAYQ==}
@@ -6162,6 +6178,8 @@ snapshots:
       '@rolldown/binding-wasm32-wasi': 1.0.2
       '@rolldown/binding-win32-arm64-msvc': 1.0.2
       '@rolldown/binding-win32-x64-msvc': 1.0.2
+
+  rou3@0.8.1: {}
 
   router@2.2.0:
     dependencies:
