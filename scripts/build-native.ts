@@ -19,8 +19,7 @@ if (targetArgIndex !== -1 && !target) {
 const platformPackage = currentPlatformPackage()
 const manifestPath = join(
   repoRoot,
-  'packages',
-  'iso4-dynamic',
+  'native',
   'v8-runtime',
   'Cargo.toml',
 )
@@ -43,8 +42,8 @@ if (cargo.status !== 0) {
 
 const profile = release ? 'release' : 'debug'
 const targetDir = target
-  ? join(repoRoot, 'packages', 'iso4-dynamic', 'v8-runtime', 'target', target, profile)
-  : join(repoRoot, 'packages', 'iso4-dynamic', 'v8-runtime', 'target', profile)
+  ? join(repoRoot, 'native', 'v8-runtime', 'target', target, profile)
+  : join(repoRoot, 'native', 'v8-runtime', 'target', profile)
 const sourceBinary = join(targetDir, 'iso4-v8')
 
 if (!existsSync(sourceBinary)) {
@@ -92,6 +91,6 @@ function currentPlatformPackage(): string {
 
   throw new Error(
     `Unsupported native build platform: ${process.platform}/${process.arch}. `
-    + 'Supported platforms are darwin/arm64, darwin/x64, linux/arm64, and linux/x64.',
+    + '@iso4/sandbox supports darwin/arm64, darwin/x64, linux/arm64, and linux/x64.',
   )
 }

@@ -1,5 +1,5 @@
 {
-  "rust-analyzer.linkedProjects": ["packages/iso4-dynamic/v8-runtime/Cargo.toml"],
+  "rust-analyzer.linkedProjects": ["native/v8-runtime/Cargo.toml"],
   "prettier.enable": false,
   "editor.formatOnSave": false,
   "editor.codeActionsOnSave": {

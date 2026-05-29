@@ -1,6 +1,6 @@
 # iso4 Wire Protocol
 
-Communication between the TypeScript host (`@iso4/dynamic`) and the Rust V8
+Communication between the TypeScript host (`@iso4/sandbox`) and the Rust V8
 binary (`iso4-v8`) happens over a Unix domain socket using length-prefixed
 binary frames. The frame envelope is small and stable; structured message
 payloads use the iso4 binary `WireValue` codec defined below.
@@ -300,15 +300,15 @@ socket immediately on version or token mismatch.
 
 `ResourceLimits`:
 
-| Field                   | Encoding | Notes                                                                                                                                                                    |
-| ----------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `memoryMb`              | `u32`    | Zero = no limit.                                                                                                                                                         |
-| `cpuTimeMs`             | `u32`    | Zero = no limit.                                                                                                                                                         |
-| `wallTimeMs`            | `u32`    | Zero = no limit.                                                                                                                                                         |
-| `maxExportBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
-| `maxStdoutBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
-| `maxStderrBytes`        | `u32`    | Zero = no limit.                                                                                                                                                         |
-| `maxBridgePayloadBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` or `BridgeResponsePayload`. Zero = no limit (framing cap of 64 MiB applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
+| Field                   | Encoding | Notes                                                                                                                                                                                                             |
+| ----------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memoryMb`              | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `cpuTimeMs`             | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `wallTimeMs`            | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `maxExportBytes`        | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `maxStdoutBytes`        | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `maxStderrBytes`        | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `maxBridgePayloadBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` or `BridgeResponsePayload`. Zero = no limit (framing cap of 64 MiB applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`.                                          |
 | `maxBridgeCalls`        | `u32`    | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. TS default: `10` when the host does not set an explicit value. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`. |
 
 `HostGlobalBinding`:
@@ -483,7 +483,7 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                          |
 | `ERR_HOST_BRIDGE`                     | Configured host global/import handler threw or rejected.                    |
 | `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call or response payload exceeded `limits.maxBridgePayloadBytes`.    |
-| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.           |
+| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.            |
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`. |
 | `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                    |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                             |
@@ -497,5 +497,5 @@ socket immediately on mismatch because the connection is untrusted before auth
 succeeds.
 
 Bump the protocol version whenever the frame envelope, message tables, or
-payload codecs change incompatibly. `@iso4/dynamic` and every `@iso4/v8-*`
+payload codecs change incompatibly. `@iso4/sandbox` and every `@iso4/v8-*`
 package must be released together on an incompatible protocol change.

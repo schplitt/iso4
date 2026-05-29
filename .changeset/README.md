@@ -40,6 +40,6 @@ the change itself, then the Version Packages PR.
   package bumps in a single changeset file.
 - `iso4` and the per-platform `@iso4/v8-*` packages must bump major
   together when the IPC wire protocol changes. (Cannot be enforced
-  mechanically — reviewers must catch it. See `MONOREPO.md` §4.)
+  mechanically — reviewers must catch it. 
 - The `iso4-monorepo` root package is private and is never published; do
   not include it in changesets.

@@ -33,13 +33,12 @@ export type {
  * destination IP.
  *
  * NOTE: Not yet implemented. The returned handler throws on every call.
- * @param options
+ * @param _options
  */
-export function createSafeFetch(options: SafeFetchOptions): FetchHandler {
+export function createSafeFetch(_options: SafeFetchOptions): FetchHandler {
   // Capture options so the (future) implementation can read them. The
   // explicit reference keeps TypeScript's `noUnusedParameters` happy
   // while preserving the public signature.
-  void options
 
   return async () => {
     throw new Error(

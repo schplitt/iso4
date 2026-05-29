@@ -21,7 +21,7 @@
  */
 // ─────────────────────────────────────────────────────────────────────────
 // FetchHandler — the typed interface for a fetch-compatible bridge handler.
-// These types live here, not in \@iso4/core, because fetch handling is not
+// These types live here, not a core bridge concern, because fetch handling is not
 // a core bridge concern. The core bridge is generic: HostExportFunction.
 // FetchHandler is a convenience wrapper with fetch-shaped request/response.
 // ─────────────────────────────────────────────────────────────────────────

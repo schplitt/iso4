@@ -1,0 +1,31 @@
+[package]
+name = "iso4-v8-runtime"
+version = "0.0.0"
+edition = "2021"
+description = "V8 host process for iso4 — runs sandboxed JavaScript with memory/CPU limits over a Unix domain socket"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "iso4-v8"
+path = "src/main.rs"
+
+[dependencies]
+# Embedded V8 via the official rusty_v8 crate
+v8 = "130"
+
+# Lock-free channels between session, writer, and timeout threads
+crossbeam-channel = "0.5"
+
+# Async-signal-safe SIGTERM/SIGINT handling via self-pipe
+signal-hook = "0.3"
+
+# POSIX bits: fcntl, pipe, poll, FD_CLOEXEC
+libc = "0.2"
+
+[profile.release]
+# LTO and panic=abort produce a smaller, faster binary with no unwinding tables
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

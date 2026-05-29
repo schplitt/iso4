@@ -80,7 +80,7 @@ where the code is not fully trusted or where crash isolation matters.
 **In-process backend** (Phase 12, opt-in): the V8 isolate runs inside the
 Node process via a C++ NAPI addon. No IPC overhead per call. An OOM can
 crash the host process. Requires Docker/Kubernetes (or equivalent) as the
-outer security boundary. Selected with `RuntimeOptions.backend: 'inprocess'`.
+outer security boundary. Selected with `SandboxOptions.backend: 'inprocess'`.
 
 The two axes are independent: static code with two-process backend works
 fine at moderate throughput; dynamic code with in-process backend is valid
@@ -113,7 +113,7 @@ because it requires no external security infrastructure.
     fetch hardening (`@iso4/fetch`), stdlib stubs (`@iso4/fs`,
     `@iso4/crypto`, …), and future extensions are siblings. Each one is a
     small factory that produces a `HostImport` or `FetchHandler` ready to
-    plug into the core. See `MONOREPO.md`.
+    plug into the core.
 
 Explicitly **out of scope**:
 
@@ -509,7 +509,7 @@ This means five agents calling `prefix.run()` simultaneously each get their
 own connection slot and run truly in parallel on separate isolate threads
 inside the Rust process — the fifth call does not wait on the first.
 
-`maxIsolates` in `RuntimeOptions` controls the pool ceiling.
+`maxIsolates` in `SandboxOptions` controls the pool ceiling.
 Additional callers queue behind it (backpressure). The Rust process
 spawns one OS thread per active isolate and enforces the same ceiling
 server-side; connection N+1 from an overloaded client is accepted but
@@ -569,17 +569,17 @@ Documented up front so we don't drift into rebuilding secure-exec:
 ## 8. Project layout
 
 Monorepo with pnpm workspaces. The canonical breakdown lives in
-`MONOREPO.md`; the short version:
+The short version:
 
 ```
 iso4/
   DESIGN.md                         ← this file
-  MONOREPO.md                       ← package boundary rules
-  packages/iso4-dynamic/src/types.ts ← canonical API shapes for @iso4/dynamic
-  packages/iso4-core/src/types.ts    ← shared types (@iso4/core)
+
+  packages/iso4-sandbox/src/types.ts ← canonical API shapes for @iso4/sandbox
+  packages/iso4-sandbox/src/types.ts    ← shared types (@iso4/sandbox)
   pnpm-workspace.yaml
   packages/
-    iso4/                           ← the runtime: createRuntime, run, precompile
+    iso4/                           ← the runtime: createSandbox, run, precompile
     iso4-fetch/                     ← @iso4/fetch — hardened fetch helpers
     iso4-fs/                        ← @iso4/fs    — (future) node:fs stub factory
     iso4-crypto/                    ← @iso4/crypto (future) node:crypto stub factory
@@ -594,7 +594,7 @@ Target sizes (when complete):
 
 - `iso4`: <1500 LoC TypeScript.
 - `@iso4/fetch`: <500 LoC TypeScript.
-- `@iso4/dynamic/v8-runtime`: <3000 LoC Rust.
+- `@iso4/sandbox/v8-runtime`: <3000 LoC Rust.
 - JS injected into each isolate: <300 LoC.
 
 ---
@@ -606,7 +606,7 @@ feature most users will rely on and shapes the IPC protocol.
 
 | Phase | Scope                                                                                                                                     | Deliverable                                                                |
 | ----- | ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| 0     | This doc + `packages/iso4-dynamic/src/types.ts` + `packages/iso4-core/src/types.ts` + `MONOREPO.md` + workspace scaffolding               | API committed before code                                                  |
+| 0     | This doc + `packages/iso4-sandbox/src/types.ts` + `packages/iso4-sandbox/src/types.ts` + workspace scaffolding                            | API committed before code                                                  |
 | 1     | Rust binary: spawn, UDS, single run, heap limit, CPU timeout (wall-clock), ESM compile + evaluate, captured console, export serialization | `runtime.run({ code, limits })` works end-to-end with no imports, no fetch |
 | 2     | Precompile + `PrecompiledPrefix.run()` via V8 startup snapshots                                                                           | The canonical AI-agent prefix/postfix loop works                           |
 | 3     | CPU budget enter/leave bracketing (async time exclusion)                                                                                  | Tight loops killed quickly; `await fetch` doesn't burn budget              |
@@ -619,14 +619,14 @@ feature most users will rely on and shapes the IPC protocol.
 | 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |
 | 11    | Callable handles: functions in bridge return values assigned per-run IDs; sandbox calls them via `BridgeCall { targetKind: 2 }`           | `res.json()`, `cursor.next()`, any returned method callable from sandbox   |
 | 12    | `prefix.openSession()` + `Session` API; `HostCall`/`HostCallResult` wire messages; persistent-isolate semantics                           | Analytics pipeline use case works end-to-end with the two-process backend  |
-| 13    | In-process (C++ NAPI) backend behind a `RuntimeOptions.backend` flag; same `Session` API; requires Docker/K8s outer isolation             | Sub-µs amortized per-call overhead for high-throughput analytics           |
+| 13    | In-process (C++ NAPI) backend behind a `SandboxOptions.backend` flag; same `Session` API; requires Docker/K8s outer isolation             | Sub-µs amortized per-call overhead for high-throughput analytics           |
 
 Each phase is independently shippable. We stop and reassess at the end of
 each phase.
 
 Phases 11–12 are post-v1. They are documented here because they constrain
 the v1 API shape: `prefix.openSession()` must be addable without breaking
-`prefix.run()`, and `RuntimeOptions` must accommodate a `backend` field
+`prefix.run()`, and `SandboxOptions` must accommodate a `backend` field
 without restructuring. No code changes needed now; just don't close those
 doors.
 
@@ -657,7 +657,7 @@ To be resolved as we build, not blocking the start:
 
 - **Snapshot cache LRU cap.** Snapshots live in the Rust process's memory.
   Each is tens-to-hundreds of KB. Default cap: 100 snapshots, LRU evicted.
-  Configurable via `RuntimeOptions.maxPrecompiledPrefixes`. Evicted handles
+  Configurable via `SandboxOptions.maxPrecompiledPrefixes`. Evicted handles
   fail `.run()` with `ERR_PREFIX_DISPOSED`; the host re-precompiles.
 
 - **Mandate `createSafeFetch` or recommend it?** The core `iso4` package's
@@ -767,7 +767,7 @@ precompile time and override only when needed per run.
 Even with snapshots, `v8::Isolate::new` + snapshot restore costs ~1–2 ms.
 For high-throughput workloads we keep a pool of N already-restored isolates
 per precompiled prefix, sitting idle until a run grabs one. Pool size,
-eviction policy, and warmup-on-precompile are all `RuntimeOptions`.
+eviction policy, and warmup-on-precompile are all `SandboxOptions`.
 
 Not in v1. Snapshots alone get steady-state cold start under 5 ms which is
 plenty for interactive agents. The pool is for sub-millisecond requirements.
@@ -847,10 +847,10 @@ the generic host-bridge error path.
 
 - **Host author** writes:
   ```ts
-  import { createRuntime } from "@iso4/dynamic";
+  import { createSandbox } from "@iso4/sandbox";
   import { createSafeFetch } from "@iso4/fetch";
 
-  const runtime = await createRuntime();
+  const runtime = await createSandbox();
   const prefix = await runtime.precompile({
     code: prefixSource,
     globals: { fetch: createSafeFetch({ allowedHosts: [...] }) },
@@ -1034,15 +1034,15 @@ Node process. An OOM inside the isolate can crash the Node process with the
 in-process backend. The two-process backend's crash isolation does not apply.
 
 **API compatibility:** The `Session` interface is identical regardless of
-backend. The backend is selected at `createRuntime()` time via
-`RuntimeOptions.backend`:
+backend. The backend is selected at `createSandbox()` time via
+`SandboxOptions.backend`:
 
 ```ts
 // Two-process (default, v1)
-const runtime = await createRuntime()
+const runtime = await createSandbox()
 
 // In-process (Phase 12, opt-in)
-const runtime = await createRuntime({ backend: 'inprocess' })
+const runtime = await createSandbox({ backend: 'inprocess' })
 ```
 
 Both produce the same `Runtime`, `PrecompiledPrefix`, and `Session` objects.
@@ -1112,7 +1112,7 @@ Callable return values are planned in Phase 11 (callable handles). See §15.
 `prefix.run({ globals })` may only **rebind** globals declared at
 `precompile({ globals })` time. Adding a new name at run time results in
 `ERR_UNDECLARED_BINDING` at runtime and a TypeScript compile-time error (when
-the `DynamicPrefix<G>` type parameter is specific).
+the `Prefix<G>` type parameter is specific).
 
 Rationale: the snapshot captures the prefix’s heap shape. Silently installing
 an undeclared global into a restored snapshot context would mutate that shape

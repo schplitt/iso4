@@ -2,7 +2,7 @@
   "name": "@iso4/fetch",
   "version": "0.0.0",
   "type": "module",
-  "description": "Hardened FetchHandler for the iso4 sandbox: DNS pinning, host allowlist, private-IP blocking, no auto-redirect",
+  "description": "Hardened FetchHandler for the @iso4/sandbox runtime: DNS pinning, host allowlist, private-IP blocking, no auto-redirect",
   "keywords": [
     "iso4",
     "sandbox",
@@ -44,15 +44,11 @@
   },
   "devDependencies": {
     "@changesets/cli": "catalog:",
-    "@iso4/core": "workspace:*",
     "@schplitt/eslint-config": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
-  },
-  "peerDependencies": {
-    "@iso4/core": "workspace:*"
   },
   "engines": {
     "node": ">=24.0.0"

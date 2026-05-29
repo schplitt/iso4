@@ -1,0 +1,65 @@
+{
+  "name": "@iso4/sandbox",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Fast, sandboxed V8 isolate runtime for agent-generated JavaScript. Two-process architecture for crash isolation.",
+  "keywords": [
+    "sandbox",
+    "isolate",
+    "v8",
+    "secure",
+    "ai",
+    "agent",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "schplitt",
+  "homepage": "https://github.com/schplitt/iso4/tree/main/packages/iso4-sandbox#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schplitt/iso4.git",
+    "directory": "packages/iso4-sandbox"
+  },
+  "bugs": {
+    "url": "https://github.com/schplitt/iso4/issues"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "bench": "vitest bench bench/runtime.bench.ts",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "devDependencies": {
+    "@changesets/cli": "catalog:",
+    "@schplitt/eslint-config": "catalog:",
+    "@types/node": "catalog:",
+    "eslint": "catalog:",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "optionalDependencies": {
+    "@iso4/v8-darwin-arm64": "workspace:*",
+    "@iso4/v8-darwin-x64": "workspace:*",
+    "@iso4/v8-linux-arm64-gnu": "workspace:*",
+    "@iso4/v8-linux-x64-gnu": "workspace:*"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}

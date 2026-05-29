@@ -1,7 +1,7 @@
 # Analytics Engine — Design Notes & Performance Reference
 
 Captured after the first round of benchmarking (debug build, macOS arm64,
-`packages/iso4-dynamic/bench/runtime.bench.ts`). Revisit these numbers once
+`packages/iso4-sandbox/bench/runtime.bench.ts`). Revisit these numbers once
 a release build lands.
 
 ---
@@ -45,7 +45,7 @@ roughly 32× faster per call for any workload with more than one run.
 
 ## 2. The two use cases
 
-### 2.1 AI agent / dynamic code (iso4-dynamic)
+### 2.1 AI agent / dynamic code (@iso4/sandbox)
 
 - Code changes per call (agent-generated).
 - Each run: postfix compiled fresh → execute → serialize exports → done.
@@ -59,7 +59,7 @@ roughly 32× faster per call for any workload with more than one run.
   `maxIsolates` equal to CPU count handles typical MCP multi-agent workloads
   without any additional complexity.
 
-### 2.2 Analytics / static transforms (iso4-static)
+### 2.2 Analytics / static transforms (@iso4/embed)
 
 - Code is **fixed** — a small set of known templates (e.g. `transform`,
   `aggregate`, `validate`). No dynamic code.
@@ -77,7 +77,7 @@ roughly 32× faster per call for any workload with more than one run.
 | ---------------------------------------- | ------------- | ---------------------- | ----------------------------- |
 | `runtime.run()` hot (current)            | ~0.5 ms       | ~16k calls/s           | IPC + ESM compile per call    |
 | `session.call()` two-process (Phase 11)  | ~50–150 µs    | ~50–160k calls/s       | IPC only, no compile per call |
-| `iso4-static` in-process NAPI (Phase 11) | ~1–5 µs       | ~1–8M calls/s          | No IPC, direct V8 invocation  |
+| `@iso4/embed` in-process NAPI (Phase 11) | ~1–5 µs       | ~1–8M calls/s          | No IPC, direct V8 invocation  |
 
 The IPC overhead (UDS round trip) is the fundamental ceiling for any
 two-process architecture. More workers parallelise the work but do not reduce
@@ -132,7 +132,7 @@ small relative to the call volume that follows.
 A cluster of Rust processes still crosses a UDS boundary per call. At 8
 workers each handling calls at ~150 µs (session model), you get ~50k calls/s.
 That may or may not be enough — see §3. If it isn't, the cluster buys
-operational complexity without reaching the target; go straight to `iso4-static`.
+operational complexity without reaching the target; go straight to `@iso4/embed`.
 
 ### API sketch
 
@@ -154,11 +154,11 @@ const result = await prefix.call('transform', row)
 
 ---
 
-## 5. iso4-static design intent
+## 5. @iso4/embed design intent
 
-`@iso4/static` (`createStaticRuntime`) is the right answer for the pure
+`@iso4/embed` (`createEmbedSandbox`) is the right answer for the pure
 analytics use case. Key design points already captured in
-`packages/iso4-static/src/types.ts`:
+`packages/iso4-embed/src/types.ts`:
 
 - **In-process via NAPI** — no UDS, no separate binary. Direct V8 function
   invocation inside the Node process.
@@ -174,7 +174,7 @@ analytics use case. Key design points already captured in
   instead of `prefix.run()`. Swappable behind the same options type.
 
 **Implementation prerequisite:** `rusty_v8` cannot be used in-process (it
-calls `v8::V8::initialize_platform()` which Node already did). `iso4-static`
+calls `v8::V8::initialize_platform()` which Node already did). `@iso4/embed`
 requires a C++ NAPI addon that uses Node's existing V8 headers — the same
 approach as `isolated-vm`. This is non-trivial but is the proven path.
 
@@ -182,12 +182,12 @@ approach as `isolated-vm`. This is non-trivial but is the proven path.
 
 ## 6. Recommended sequence
 
-1. **Now** — `iso4-dynamic` Phase 3–8 (CPU budget, fetch bridge, imports,
+1. **Now** — `@iso4/sandbox` Phase 3–8 (CPU budget, fetch bridge, imports,
    memory limits). Gets the dynamic runtime to v1.
 2. **Phase 11** — `session.call()` on the two-process backend. Unlocks the
    ~150 µs/call tier without any NAPI work. Evaluate whether this is fast
    enough for the target analytics workload.
-3. **Phase 11 / iso4-static** — NAPI in-process backend. Build if Phase 11
+3. **Phase 11 / @iso4/embed** — NAPI in-process backend. Build if Phase 11
    session model doesn't hit the throughput target. Start with a minimal C++
    addon (precompile + call, no bridge, no fetch).
 4. **Cluster (if needed)** — Design after Phase 11. Only build it if tenant
@@ -209,7 +209,7 @@ approach as `isolated-vm`. This is non-trivial but is the proven path.
 - **Input/output object size?** V8 `ValueSerializer` is fast for small
   objects but serialization cost grows with payload size. Large input rows
   (>10 KB) will shift the bottleneck from compute to serialization.
-- **Cluster vs iso4-static priority?** If the container boundary is acceptable
-  as the security model, skip the cluster and go straight to iso4-static.
+- **Cluster vs @iso4/embed priority?** If the container boundary is acceptable
+  as the security model, skip the cluster and go straight to @iso4/embed.
   If crash isolation at the process level is required even for analytics,
   the cluster is necessary.

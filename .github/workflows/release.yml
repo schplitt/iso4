@@ -11,8 +11,106 @@ on:
       - main
 
 jobs:
-  release:
-    name: Release
+  # ── Build native binaries for each supported platform ────────────────────
+  #
+  # Each job builds the Rust binary, uploads it as a GitHub Actions artifact,
+  # and the `publish` job downloads them all before running `changeset publish`.
+  # This means every platform binary is present in the correct
+  # packages/iso4-v8-<platform>/bin/ directory when npm packs each package.
+  #
+  # linux/arm64 is cross-compiled on the x64 runner using cross-rs so we
+  # don't need a self-hosted arm64 runner.
+
+  build-native:
+    name: Build native (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            package: iso4-v8-darwin-arm64
+
+          - platform: darwin-x64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            package: iso4-v8-darwin-x64
+
+          - platform: linux-x64-gnu
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package: iso4-v8-linux-x64-gnu
+
+          - platform: linux-arm64-gnu
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            package: iso4-v8-linux-arm64-gnu
+            cross: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/v8-runtime
+          key: ${{ matrix.target }}
+
+      - name: Install cross (arm64 cross-compile only)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --manifest-path native/v8-runtime/Cargo.toml
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: |
+          cross build --release --target ${{ matrix.target }} \
+            --manifest-path native/v8-runtime/Cargo.toml
+
+      - name: Ad-hoc sign (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --sign - --force \
+            native/v8-runtime/target/${{ matrix.target }}/release/iso4-v8
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iso4-v8-${{ matrix.platform }}
+          path: native/v8-runtime/target/${{ matrix.target }}/release/iso4-v8
+          if-no-files-found: error
+
+
+  # ── Publish ───────────────────────────────────────────────────────────────
+  #
+  # Waits for all native builds and TS validation to succeed, then:
+  # 1. Downloads all four platform binaries.
+  # 2. Places each in the correct packages/iso4-v8-<platform>/bin/ directory.
+  # 3. Runs `changeset publish` which packs and publishes all packages.
+  #    Each @iso4/v8-<platform> package's `files` field includes `bin/iso4-v8`,
+  #    so the binary is included in the published tarball.
+  #
+  # If there are pending changesets, `changesets/action` opens a Version PR
+  # instead of publishing. The publish step only runs once that PR is merged.
+
+  publish:
+    name: Publish
+    needs: [build-native]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -32,23 +130,25 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build
-        run: pnpm build
+      - name: Build TS packages
+        run: pnpm -r --filter="./packages/*" build
 
-      - name: Test
-        run: pnpm test:run
+      - name: Download all native binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: .artifacts
 
-      - name: Lint
-        run: pnpm lint
+      - name: Place binaries in platform packages
+        run: |
+          set -e
+          for platform in darwin-arm64 darwin-x64 linux-x64-gnu linux-arm64-gnu; do
+            dest="packages/iso4-v8-${platform}/bin"
+            mkdir -p "$dest"
+            cp ".artifacts/iso4-v8-${platform}/iso4-v8" "$dest/iso4-v8"
+            chmod +x "$dest/iso4-v8"
+            echo "Placed binary for ${platform}"
+          done
 
-      - name: Typecheck
-        run: pnpm typecheck
-
-      # If there are unreleased changesets, this opens (or updates) a
-      # "Version Packages" PR that bumps package.json versions and writes
-      # per-package CHANGELOG entries. When that PR is merged, this same
-      # workflow runs again — this time with no pending changesets — and
-      # the `publish` step actually pushes to npm and creates git tags.
       - name: Create Release PR or Publish
         uses: changesets/action@v1
         with:

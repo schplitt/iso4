@@ -13,12 +13,11 @@ exhaustively in three docs at the repo root:
 
 - **`DESIGN.md`** — architecture, execution model, limits, security model,
   phased build plan. Read this first for any non-trivial change.
-- **`MONOREPO.md`** — package layout, dependency direction, versioning,
   distribution. Read this before adding code to a new package or moving
   code between packages.
-- **`packages/iso4-dynamic/src/types.ts`** — canonical public API surface for
-  `@iso4/dynamic`. Changes here are API changes and must align with DESIGN.md.
-- **`packages/iso4-core/src/types.ts`** — shared types used by all packages.
+- **`packages/iso4-sandbox/src/types.ts`** — canonical public API surface for
+  `@iso4/sandbox`. Changes here are API changes and must align with DESIGN.md.
+- **`packages/iso4-sandbox/src/types.ts`** — shared types used by all packages.
   Changes here affect every package in the ecosystem.
 
 ## Architecture
@@ -26,7 +25,6 @@ exhaustively in three docs at the repo root:
 ```
 iso4/                              ← workspace root
   DESIGN.md
-  MONOREPO.md
   package.json                     ← workspace root (private)
   pnpm-workspace.yaml              ← packages glob + catalog
   eslint.config.js                 ← @schplitt/eslint-config
@@ -34,7 +32,7 @@ iso4/                              ← workspace root
   packages/
     iso4/                          ← `iso4` package (the runtime)
       src/
-        index.ts                   ← public re-exports + createRuntime
+        index.ts                   ← public re-exports + createSandbox
         types.ts                   ← canonical API types
       tests/
       package.json
@@ -47,11 +45,11 @@ iso4/                              ← workspace root
     v8-runtime/                    ← Rust source for the V8 host binary (planned)
 ```
 
-### `packages/iso4-dynamic`
+### `packages/iso4-sandbox`
 
-The two-process dynamic runtime package (`@iso4/dynamic`). Owns:
+The two-process dynamic runtime package (`@iso4/sandbox`). Owns:
 
-- Public API: `createRuntime`, `Runtime`, `PrecompiledPrefix`, the type
+- Public API: `createSandbox`, `Runtime`, `PrecompiledPrefix`, the type
   system declared in `src/types.ts`.
 - IPC client + binary frame codec talking to the Rust V8 process.
 - Bridge dispatch routing `_hostCall` frames to host-supplied handlers for
@@ -73,7 +71,6 @@ Does **not** own:
 
 `@iso4/fetch`, `@iso4/fs`, `@iso4/crypto`, etc. are tiny factory packages
 that produce `FetchHandler` or `HostImport` values ready to plug into the
-runtime's options. See `MONOREPO.md` §2 for the canonical list and the
 rule for adding new ones.
 
 ## Development
@@ -119,7 +116,7 @@ Toolchain:
 - **@changesets/cli** for per-package versioning + changelogs. See
   `.changeset/README.md` for the workflow.
 - **mise** pins the Node version (`mise.toml`).
-- **cargo** (Rust stable) for the V8 host binary under `packages/iso4-dynamic/v8-runtime/`.
+- **cargo** (Rust stable) for the V8 host binary under `native/v8-runtime/`.
 
 ## Code Style
 
@@ -148,12 +145,11 @@ When making changes to the project:
   resource-limit semantics, the security model, or the API surface changes.
   This is the design contract. Out-of-date design docs cost more than the
   code they describe.
-- **`MONOREPO.md`** — Update whenever package boundaries change, a new
   package is added, dependency direction shifts, or versioning policy
   changes.
-- **`packages/iso4-dynamic/src/types.ts`** — Update whenever the `@iso4/dynamic`
+- **`packages/iso4-sandbox/src/types.ts`** — Update whenever the `@iso4/sandbox`
   API changes. Any deviation between this and `DESIGN.md` is a bug.
-- **`packages/iso4-core/src/types.ts`** — Update whenever shared types change.
+- **`packages/iso4-sandbox/src/types.ts`** — Update whenever shared types change.
 - **`AGENTS.md`** (this file) — Update with technical details, architecture,
   and best practices for AI agents.
 - **`README.md`** — Update with user-facing documentation for end users:
@@ -171,7 +167,6 @@ When making changes to the project:
 When working on this project:
 
 1. **Read the design docs first.** Almost every non-trivial change touches
-   something already documented in `DESIGN.md` or `MONOREPO.md`. Use them.
 2. **Keep `types.ts` and `DESIGN.md` in sync.** If you change the API, both
    files change in the same commit. If you cannot match them, ask before
    committing.
@@ -187,14 +182,13 @@ When working on this project:
    Context & Learnings" section below if it's a recurring pattern (not a
    one-time fix).
 10. **Notify documentation changes** — When updating `README.md`,
-    `AGENTS.md`, `DESIGN.md`, `MONOREPO.md`, or `types.ts`, explicitly
     call out the changes to the user at the end of your response so they
     can review and don't overlook them.
 11. **Keep protocol docs in sync with code** — Whenever a new `RunError`
     variant or `ERR_*` code is added, all four of the following must be
     updated in the same commit:
     - `RunError` enum in `v8.rs` (+ `run_error_to_payload` in `wire.rs`)
-    - `RunErrorCode` union in `packages/iso4-dynamic/src/types.ts`
+    - `RunErrorCode` union in `packages/iso4-sandbox/src/types.ts`
     - Error-code table in `docs/protocol.md` §7
     - Any relevant limits/semantics prose in `DESIGN.md` §4.1 (for limit
       fields) or the appropriate design section (for new concepts)
@@ -223,7 +217,6 @@ When working on this project:
     for trivial one-off logic. Inline unless there is real reuse or a clear
     API boundary.
 18. **Respect package boundaries** — Before adding code, check the "What
-    goes where" table in `MONOREPO.md` §6. If a change doesn't fit any
     row, the design needs a conversation before the code does.
 
 ## Project Context & Learnings
@@ -247,7 +240,7 @@ learned during development.
   not hard-coded versions.
 - Node 24+ is required; `mise.toml` pins to 26 for development. CI uses 26.
 - `spawn_responder` in `v8.rs` tests reads and discards one frame before calling the `respond` closure. Tests using `run_with_bridge` where the respond closure needs to handle multiple calls must NOT try to read frames inside respond — use `drain_bridge_calls` with a direct socket pair instead (see `bridge_call_exactly_at_limit_succeeds` as the pattern to follow).
-- `@iso4/core` has no test files; `vitest run` exits non-zero when no test
+- `@iso4/sandbox` has no test files; `vitest run` exits non-zero when no test
   files are found. This is a known gap — `pnpm test:run` will report it as
   a failure. Ignore it until a test file is added to that package.
 - ~29 TS tests in `integration.test.ts` / `e2e.test.ts` are pre-existing
@@ -296,7 +289,7 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   The Rust subprocess provides crash isolation critical for untrusted code.
   The in-process C++ NAPI backend (Phase 12) is for high-throughput analytics
   inside Docker/K8s where the container is the outer security boundary.
-  Both backends expose the same TypeScript API via `RuntimeOptions.backend`.
+  Both backends expose the same TypeScript API via `SandboxOptions.backend`.
   Do not conflate the two; do not add in-process code in v1.
 - **V8 `ValueSerializer` is irreplaceable for JS values.** Cap'n Proto,
   MessagePack, and similar cannot replace it for bridge/export payloads
@@ -335,4 +328,4 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   Adding a crate for this is net overhead with zero benefit.
 - Do not add the in-process (NAPI) backend in v1. It is a Phase 12 concern.
   rusty_v8 cannot be used in-process with Node — it would need a C++ rewrite
-  of `packages/iso4-static/`. That conversation happens at Phase 11, not before.
+  of `packages/iso4-embed/`. That conversation happens at Phase 11, not before.
