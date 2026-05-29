@@ -25,7 +25,7 @@
     "typecheck": "pnpm -r --filter=\"./packages/*\" typecheck",
     "changeset": "changeset",
     "changeset:version": "changeset version && pnpm install --lockfile-only",
-    "changeset:publish": "pnpm -r --filter=\"./packages/*\" publish --access public --no-git-checks && changeset tag",
+    "changeset:publish": "changeset publish",
     "prerelease": "pnpm lint && pnpm typecheck && pnpm build && pnpm test:run",
     "build:native": "node scripts/build-native.ts --release",
     "build:native:dev": "node scripts/build-native.ts",
