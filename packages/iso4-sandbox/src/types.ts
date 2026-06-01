@@ -75,9 +75,104 @@ export interface ResourceLimits {
  * ```
  *
  * `fetch` is not special — it goes through the same bridge path as any
- * other entry. See DESIGN.md §4.2 and §12.1.
+ * other entry.
+ *
+ * Three value shapes are supported — see `HostGlobalValue`.
  */
-export type HostGlobals = Record<string, HostExportFunction>
+export type HostGlobals = Record<string, HostGlobalValue>
+
+/**
+ * The value types accepted for a named global.
+ *
+ * - `HostExportFunction` — bridge call: every sandbox invocation dispatches
+ *   to the host handler.
+ * - `string` — a JS expression installed once at prefix setup:
+ *   `globalThis.<name> = <expr>`. Use for pure sandbox utilities that need
+ *   no host involvement.
+ * - `BridgeWithShim` — bridge call + in-sandbox result wrapper. The handler
+ *   can be rebound per `prefix.run()`; the shim is compiled into the snapshot.
+ */
+
+export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any>
+
+/**
+ * A global that pairs a bridge handler with an in-sandbox shim that wraps
+ * its return value. Typical use: adding `.json()` / `.text()` convenience
+ * methods to a fetch response without extra bridge round-trips.
+ *
+ * The TS layer:
+ *  1. Registers `handler` as a bridge stub under `__iso4_<name>_h`.
+ *  2. Prepends to the prefix source:
+ *     ```js
+ *     globalThis.<name> = async (...args) =>
+ *       await (<shim>)(await __iso4_<name>_h(...args))
+ *     ```
+ *
+ * The shim is a JS function expression `(result) => transformedResult` (sync
+ * or async). Sandbox built-ins (TextDecoder, JSON, …) are available in scope.
+ * The private stub `__iso4_<name>_h` stays on globalThis so the handler can
+ * be rebound per `prefix.run()` while the shim stays fixed in the snapshot.
+ */
+/**
+ * `H` is the specific handler function type. Carried through the type system
+ * so `RebindGlobals` can enforce that any per-run replacement has the same
+ * return type, keeping it compatible with the shim that is already compiled
+ * into the prefix snapshot.
+ */
+export interface BridgeWithShim<
+  H extends (...args: unknown[]) => unknown = (...args: unknown[]) => unknown,
+> {
+  kind: 'bridge-with-shim'
+  /**
+   * Bridge handler — registered as `__iso4_<name>_h` for rebinding.
+   */
+  handler: H
+  /**
+   * JS function expression that transforms the bridge return value.
+   * Runs in the sandbox. May be async.
+   *
+   * @example
+   * ```ts
+   * shim: `(result) => ({
+   *   ...result,
+   *   ok:   result.status >= 200 && result.status < 300,
+   *   json: () => JSON.parse(new TextDecoder().decode(result.body)),
+   *   text: () => new TextDecoder().decode(result.body),
+   * })`
+   * ```
+   */
+  shim: string
+}
+
+/**
+ * What can be supplied as a per-run override for a global declared at
+ * precompile time:
+ *
+ * - `BridgeWithShim<H>` global — only the handler `H` itself. The shim is
+ *   fixed in the snapshot; rebinding must preserve the return type so the
+ *   shim keeps working.
+ * - `HostExportFunction` global — any compatible `HostExportFunction`.
+ * - `string` global — cannot be rebound (compiled into the snapshot).
+ */
+export type RebindValue<V extends HostGlobalValue>
+  = V extends BridgeWithShim<infer H> ? H
+    : V extends HostExportFunction ? V
+      : never
+
+/**
+ * The per-run globals override map for a `Prefix<G>`.
+ *
+ * String-valued globals are filtered out entirely (key remapping to `never`)
+ * rather than mapped to `?: never` — they cannot be rebound because their
+ * expression is compiled into the snapshot, and they should not appear as
+ * valid keys at all.
+ *
+ * Each remaining key is optional and typed as `RebindValue<G[K]>`, which
+ * enforces the correct constraint per global kind.
+ */
+export type RebindGlobals<G extends HostGlobals> = {
+  [K in keyof G as G[K] extends string ? never : K]?: RebindValue<G[K]>
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Imports (source modules and host-implemented modules)
@@ -119,6 +214,10 @@ export interface HostExports {
 
 export type HostExportValue = HostExportData | HostExportFunction
 
+/**
+ * Represents the plain-data values that cross the bridge.
+ * Kept for `HostExports` / import system typing.
+ */
 export type HostExportData
   = | null
     | undefined
@@ -130,9 +229,18 @@ export type HostExportData
     | HostExportData[]
     | { [key: string]: HostExportData }
 
-export type HostExportFunction = (
-  ...args: HostExportData[]
-) => (Promise<HostExportData | void> | HostExportData | void)
+/**
+ * A host-side function exposed as a global or import export.
+ *
+ * Args and return are `unknown` — the bridge serialises/deserialises values
+ * with V8 ValueSerializer; we don't try to model that at the type level.
+ * The one invariant that matters (functions cannot cross the boundary) is
+ * enforced at runtime by the V8 layer, not here.
+ *
+ * Use specific function types for your handlers and let TypeScript infer
+ * them through `HostGlobals` and `RebindGlobals<G>`.
+ */
+export type HostExportFunction = (...args: unknown[]) => unknown
 
 // ─────────────────────────────────────────────────────────────────────────
 // Sandbox (runtime)
@@ -320,7 +428,7 @@ export interface PrefixRunOptions<G extends HostGlobals> {
    * function signature does not need to match the precompile-time handler
    * exactly — any `HostExportFunction`-compatible value is accepted.
    */
-  globals?: { [K in keyof G]?: HostExportFunction }
+  globals?: RebindGlobals<G>
 
   /**
    * Rebind host-module imports declared at precompile time.

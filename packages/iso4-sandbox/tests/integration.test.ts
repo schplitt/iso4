@@ -1850,3 +1850,224 @@ describe('precompile stress', () => {
     expect(good.exports['default']).toBe(99)
   })
 })
+
+// ── BridgeWithShim integration ───────────────────────────────────────────
+// Tests that the three HostGlobalValue shapes all work end-to-end with the
+// real V8 binary.
+
+describe('globals bridge — BridgeWithShim (Phase 4)', () => {
+  test('string global is available as a constant in the sandbox', async () => {
+    const result = await runtime.run({
+      code: 'export default API_URL',
+      globals: {
+        API_URL: `'https://api.example.com'`,
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe('https://api.example.com')
+  })
+
+  test('string global expression is evaluated — not just a string literal', async () => {
+    const result = await runtime.run({
+      code: 'export default DOUBLE',
+      globals: {
+        DOUBLE: `21 * 2`,
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe(42)
+  })
+
+  test('BridgeWithShim: sandbox sees the shimmed wrapper, not the raw return value', async () => {
+    // The handler returns { status, body }; the shim adds .ok and .data
+    const result = await runtime.run({
+      code: `
+        const res = await myApi('hello')
+        export default { ok: res.ok, data: res.data, status: res.status }
+      `,
+      globals: {
+        myApi: {
+          kind: 'bridge-with-shim',
+          handler: async (arg: unknown) => ({ status: 200, raw: arg }),
+          shim: `(result) => ({
+            ...result,
+            ok: result.status >= 200 && result.status < 300,
+            data: result.raw,
+          })`,
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const exp = result.exports['default'] as Record<string, unknown>
+    expect(exp['ok']).toBe(true)
+    expect(exp['data']).toBe('hello')
+    expect(exp['status']).toBe(200)
+  })
+
+  test('BridgeWithShim: async shim is awaited correctly', async () => {
+    const result = await runtime.run({
+      code: `
+        const res = await compute(10)
+        export default res.doubled
+      `,
+      globals: {
+        compute: {
+          kind: 'bridge-with-shim',
+          handler: async (n: unknown) => ({ value: n }),
+          shim: `async (result) => ({
+            ...result,
+            doubled: result.value * 2,
+          })`,
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe(20)
+  })
+
+  test('BridgeWithShim: shim uses JSON.parse on string body (fetch-style)', async () => {
+    // Uses a pre-serialised string body — Uint8Array cross-bridge support is a later phase.
+    const result = await runtime.run({
+      code: `
+        const res = await fetch('https://api.example.com/data')
+        export default { status: res.status, ok: res.ok, value: res.json().value }
+      `,
+      globals: {
+        fetch: {
+          kind: 'bridge-with-shim',
+          handler: async () => ({
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ value: 42 }),
+          }),
+          shim: `(result) => ({
+            ...result,
+            ok:   result.status >= 200 && result.status < 300,
+            json: () => JSON.parse(result.body),
+            text: () => result.body,
+          })`,
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const exp = result.exports['default'] as Record<string, unknown>
+    expect(exp['status']).toBe(200)
+    expect(exp['ok']).toBe(true)
+    expect(exp['value']).toBe(42)
+  })
+
+  test('BridgeWithShim: handler can be rebound per prefix.run() while shim stays fixed', async () => {
+    const callLog: string[] = []
+
+    await using prefix = await runtime.precompile({
+      code: '',
+      globals: {
+        fetch: {
+          kind: 'bridge-with-shim',
+          handler: async (url: unknown) => {
+            callLog.push(`default:${url}`)
+            return { status: 200, body: JSON.stringify({ from: 'default' }) }
+          },
+          shim: `(result) => ({
+            ...result,
+            ok:   result.status >= 200 && result.status < 300,
+            json: () => JSON.parse(result.body),
+          })`,
+        },
+      },
+    })
+
+    // First run — uses default handler
+    const r1 = await prefix.run({
+      code: `
+        const res = await fetch('https://api.example.com/first')
+        export default res.json().from
+      `,
+    })
+    expect(r1.ok).toBe(true)
+    if (!r1.ok)
+      return
+    expect(r1.exports['default']).toBe('default')
+
+    // Second run — rebind handler only; shim (.json()) must still work
+    const r2 = await prefix.run({
+      code: `
+        const res = await fetch('https://api.example.com/second')
+        export default res.json().from
+      `,
+      globals: {
+        fetch: async (url: unknown) => {
+          callLog.push(`rebound:${url}`)
+          return { status: 201, body: JSON.stringify({ from: 'rebound' }) }
+        },
+      },
+    })
+    expect(r2.ok).toBe(true)
+    if (!r2.ok)
+      return
+    expect(r2.exports['default']).toBe('rebound')
+
+    expect(callLog).toEqual([
+      'default:https://api.example.com/first',
+      'rebound:https://api.example.com/second',
+    ])
+  })
+
+  test('string global in prefix is available across all postfix runs', async () => {
+    await using prefix = await runtime.precompile({
+      code: '',
+      globals: { BASE_URL: `'https://api.example.com'` },
+    })
+
+    for (let i = 0; i < 3; i++) {
+      const result = await prefix.run({ code: 'export default BASE_URL' })
+      expect(result.ok).toBe(true)
+      if (!result.ok)
+        return
+      expect(result.exports['default']).toBe('https://api.example.com')
+    }
+  })
+
+  test('plain function global and BridgeWithShim can coexist', async () => {
+    const toolCalls: string[] = []
+
+    const result = await runtime.run({
+      code: `
+        const [toolResult, fetchResult] = await Promise.all([
+          myTool('ping'),
+          myFetch('https://api.example.com/data'),
+        ])
+        export default { tool: toolResult, fetchOk: fetchResult.ok }
+      `,
+      globals: {
+        myTool: async (arg: unknown) => {
+          toolCalls.push(arg as string)
+          return `pong:${arg}`
+        },
+        myFetch: {
+          kind: 'bridge-with-shim',
+          handler: async () => ({ status: 200, body: null }),
+          shim: `(r) => ({ ...r, ok: r.status < 300 })`,
+        },
+      },
+    })
+
+    expect(toolCalls).toEqual(['ping'])
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const exp = result.exports['default'] as Record<string, unknown>
+    expect(exp['tool']).toBe('pong:ping')
+    expect(exp['fetchOk']).toBe(true)
+  })
+})

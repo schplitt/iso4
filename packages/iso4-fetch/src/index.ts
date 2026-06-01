@@ -19,6 +19,7 @@ import type {
   HostFetchRequest,
   HostFetchResponse,
   SafeFetchFn,
+  SafeFetchGlobal,
   SafeFetchOptions,
   SafeFetchRequest,
 } from './types.js'
@@ -33,6 +34,7 @@ export type {
   HostFetchResponse,
   Next,
   SafeFetchFn,
+  SafeFetchGlobal,
   SafeFetchOptions,
   SafeFetchPolicy,
   SafeFetchRequest,
@@ -448,7 +450,43 @@ function parseFetchArgs(args: unknown[]): HostFetchRequest {
   }
 }
 
-export function createSafeFetch(options: SafeFetchOptions): SafeFetchFn {
+/**
+ * Build a `BridgeWithShim` global that the sandbox layer wires into the
+ * prefix as both a secure bridge handler and a sandbox-side response wrapper.
+ *
+ * Pass directly as a global value:
+ * ```ts
+ * await sandbox.precompile({
+ *   code: prefixSource,
+ *   globals: { fetch: createSafeFetch({ rules: [...] }) },
+ * })
+ * ```
+ *
+ * Inside the sandbox the agent calls `fetch(url, init)` and gets back a
+ * response object with `.ok`, `.json()`, `.text()`, and `.bytes()`.
+ * @param options
+ */
+export function createSafeFetch(options: SafeFetchOptions): SafeFetchGlobal {
+  return {
+    kind: 'bridge-with-shim',
+    handler: buildSafeFetchHandler(options),
+    shim: `(result) => ({
+      ...result,
+      ok:    result.status >= 200 && result.status < 300,
+      json:  () => JSON.parse(new TextDecoder().decode(result.body)),
+      text:  () => new TextDecoder().decode(result.body),
+      bytes: () => result.body instanceof Uint8Array
+                 ? result.body
+                 : new TextEncoder().encode(String(result.body ?? '')),
+    })`,
+  }
+}
+
+/**
+ * Internal: builds the bridge handler (SafeFetchFn) without the shim.
+ * @param options
+ */
+function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
   if (options.rules === undefined && options.policy === undefined)
     throw new TypeError('createSafeFetch: at least one of `rules` or `policy` must be provided')
 

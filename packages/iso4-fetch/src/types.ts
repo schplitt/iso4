@@ -44,14 +44,27 @@ export interface HostFetchResponse {
 }
 
 /**
- * A function returned by `createSafeFetch`, conforming to the bridge's
- * `HostExportFunction` calling convention: receives raw deserialized
- * arguments from the sandbox, validates them, and returns plain data.
+ * The internal bridge handler produced by `createSafeFetch`. Validates raw
+ * bridge args, runs allow/deny, makes the HTTP call, and returns plain data.
  *
- * Plug into a global name or a host module export — do NOT name it `fetch`
- * unless you want the sandbox agent using the raw web fetch signature.
+ * Returned as the `handler` field of `BridgeWithShim` — not meant to be
+ * used directly. Assign `createSafeFetch({...})` to a global and the sandbox
+ * layer handles wiring.
  */
 export type SafeFetchFn = (...args: unknown[]) => Promise<HostFetchResponse>
+
+/**
+ * What `createSafeFetch` returns. Conforms to `BridgeWithShim` from
+ * `@iso4/sandbox` so it can be passed directly as a global value.
+ *
+ * Declared locally to avoid a cross-package type dependency — structurally
+ * compatible with the sandbox type.
+ */
+export interface SafeFetchGlobal {
+  kind: 'bridge-with-shim'
+  handler: SafeFetchFn
+  shim: string
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Middleware

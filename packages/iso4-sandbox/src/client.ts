@@ -16,7 +16,7 @@ import {
   encodeRunPayload,
   encodeTsToRustFrame,
 } from './ipc'
-import type { HostGlobals } from './types.js'
+import type { HostExportFunction } from './types.js'
 import type { ResourceLimits } from './ipc'
 import { encodeWireValue } from './wire'
 
@@ -90,9 +90,14 @@ export class RuntimeIpcClient {
     return this.nextRunId
   }
 
+  // globals here is always `Record<string, HostExportFunction>` — the
+  // processed bridge map produced by `processGlobals()` in index.ts.
+  // String globals become preamble code prepended to `code`; BridgeWithShim
+  // handlers are unwrapped to private `__iso4_<name>_h` keys. The client
+  // layer only ever sees plain bridge functions.
   async runRawCode(
     code: string,
-    options?: { filename?: string, limits?: ResourceLimits, globals?: HostGlobals },
+    options?: { filename?: string, limits?: ResourceLimits, globals?: Record<string, HostExportFunction> },
   ): Promise<RawRunResult> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
@@ -116,7 +121,7 @@ export class RuntimeIpcClient {
   }
 
   async precompile(
-    options: { code: string, filename?: string, limits?: ResourceLimits, globals?: HostGlobals },
+    options: { code: string, filename?: string, limits?: ResourceLimits, globals?: Record<string, HostExportFunction> },
   ): Promise<Uint8Array> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
@@ -145,7 +150,7 @@ export class RuntimeIpcClient {
   }
 
   async prefixRun(
-    options: { prefixId: string, code: string, filename?: string, limits?: ResourceLimits, globals?: HostGlobals },
+    options: { prefixId: string, code: string, filename?: string, limits?: ResourceLimits, globals?: Record<string, HostExportFunction> },
   ): Promise<RawRunResult> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
@@ -313,7 +318,7 @@ export class RuntimeIpcClient {
  * Build a dispatcher from a globals map; returns undefined when map is empty.
  * @param globals
  */
-function makeDispatcher(globals: HostGlobals): BridgeCallDispatcher | undefined {
+function makeDispatcher(globals: Record<string, HostExportFunction>): BridgeCallDispatcher | undefined {
   const names = Object.keys(globals)
   if (names.length === 0)
     return undefined

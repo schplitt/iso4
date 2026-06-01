@@ -25,6 +25,7 @@ import type {
   HostGlobals,
   PrecompileOptions,
   PrefixRunOptions,
+  RebindGlobals,
   Prefix,
   ResourceLimits,
   RunOptions,
@@ -33,9 +34,17 @@ import type {
   SandboxOptions,
 } from './types'
 
+// ── Global processing (imported from globals.ts for testability) ──────────
+
+import { extractBridgeGlobals, processGlobals } from './globals.js'
+
 export type {
   ResourceLimits,
   HostGlobals,
+  HostGlobalValue,
+  BridgeWithShim,
+  RebindValue,
+  RebindGlobals,
   ImportsConfig,
   ImportDefinition,
   SourceImport,
@@ -166,11 +175,13 @@ class SandboxImpl implements Sandbox {
     if (options.signal?.aborted) {
       return { ok: false, error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' }, stdout: [], stderr: [], durationMs: 0 }
     }
+    const { bridgeGlobals, preamble } = processGlobals(options.globals ?? {})
+    const code = preamble ? `${preamble}\n${options.code}` : options.code
     return this.pool.withClient(async (client) => {
-      const raw = await client.runRawCode(options.code, {
+      const raw = await client.runRawCode(code, {
         filename: options.filename,
         limits: toWireLimits(options.limits),
-        globals: options.globals,
+        globals: bridgeGlobals,
       })
       return decodeRunCompletionPayload(raw.result).result
     })
@@ -181,11 +192,14 @@ class SandboxImpl implements Sandbox {
     options: PrecompileOptions<G>,
   ): Promise<Prefix<G>> {
     return this.pool.withClient(async (client) => {
+      const rawGlobals = options.globals ?? {} as G
+      const { bridgeGlobals, preamble } = processGlobals(rawGlobals)
+      const code = preamble ? `${preamble}\n${options.code}` : options.code
       const raw = await client.precompile({
-        code: options.code,
+        code,
         filename: options.filename,
         limits: toWireLimits(options.limits),
-        globals: options.globals,
+        globals: bridgeGlobals,
       })
       const result = decodePrecompileResultPayload(raw)
 
@@ -202,7 +216,7 @@ class SandboxImpl implements Sandbox {
         throw err
       }
 
-      return new PrefixImpl<G>(result.prefixId, this.pool, options.globals ?? {} as G)
+      return new PrefixImpl<G>(result.prefixId, this.pool, rawGlobals)
     })
   }
 
@@ -270,15 +284,19 @@ implements Prefix<G> {
     if (options.signal?.aborted) {
       return { ok: false, error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' }, stdout: [], stderr: [], durationMs: 0 }
     }
-    // Merge: run-time globals override precompile-time defaults (DESIGN.md §11.4).
-    const globals: HostGlobals = { ...this.defaultGlobals as HostGlobals, ...options.globals as HostGlobals }
+    // Extract bridge globals, routing shimmed overrides to their private keys.
+    // The preamble is already compiled into the snapshot — not re-injected.
+    const bridgeGlobals = extractBridgeGlobals(
+      (options.globals ?? {}) as RebindGlobals<HostGlobals>,
+      this.defaultGlobals as HostGlobals,
+    )
     return this.pool.withClient(async (client) => {
       const raw = await client.prefixRun({
         prefixId: this.id,
         code: options.code,
         filename: options.filename,
         limits: toWireLimits(options.limits),
-        globals,
+        globals: bridgeGlobals,
       })
       return decodeRunCompletionPayload(raw.result).result
     })

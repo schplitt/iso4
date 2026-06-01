@@ -134,20 +134,20 @@ describe('createSafeFetch construction', () => {
 
 describe('policy-only mode', () => {
   it('allows when policy returns true', async () => {
-    const handler = createSafeFetch({ policy: () => true, pinDns: false })
+    const { handler } = createSafeFetch({ policy: () => true, pinDns: false })
     const result = await handler('https://example.com/', { method: 'GET', headers: {}, body: null })
     expect(result.status).toBe(200)
   })
 
   it('denies when policy returns false', async () => {
-    const handler = createSafeFetch({ policy: () => false, pinDns: false })
+    const { handler } = createSafeFetch({ policy: () => false, pinDns: false })
     await expect(
       handler('https://example.com/', { method: 'GET', headers: {}, body: null }),
     ).rejects.toThrow(/denied by policy/)
   })
 
   it('surfaces custom reason when policy throws', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       policy: () => {
         throw new Error('custom deny reason')
       },
@@ -159,7 +159,7 @@ describe('policy-only mode', () => {
   })
 
   it('supports async policy', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       policy: async ({ host }) => host === 'api.example.com',
       pinDns: false,
     })
@@ -178,7 +178,7 @@ describe('policy-only mode', () => {
 
 describe('rules: origin matching', () => {
   const makeHandler = (rule: FetchOriginRule) =>
-    createSafeFetch({ rules: rule, pinDns: false })
+    createSafeFetch({ rules: rule, pinDns: false }).handler
 
   it('allows a matching exact hostname', async () => {
     const handler = makeHandler({
@@ -277,7 +277,7 @@ describe('rules: route matching', () => {
     createSafeFetch({
       rules: { host: 'api.example.com', routes },
       pinDns: false,
-    })
+    }).handler
 
   it('empty routes denies all paths on a matching origin', async () => {
     const handler = makeHandler([])
@@ -392,7 +392,7 @@ describe('rules: route matching', () => {
 describe('rules: origin match without route match does not fall through to policy', () => {
   it('denies even if policy would allow', async () => {
     const policySpy = vi.fn(() => true)
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: {
         host: 'api.example.com',
         routes: [{ path: '/public/**' }],
@@ -415,7 +415,7 @@ describe('rules: origin match without route match does not fall through to polic
 describe('rules + policy: fallback semantics', () => {
   it('calls policy when no origin rule matches', async () => {
     const policySpy = vi.fn(() => true)
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       policy: policySpy,
       pinDns: false,
@@ -426,7 +426,7 @@ describe('rules + policy: fallback semantics', () => {
 
   it('does not call policy when rules already allow', async () => {
     const policySpy = vi.fn(() => false) // would deny if called
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       policy: policySpy,
       pinDns: false,
@@ -447,7 +447,7 @@ describe('composing multiple origin rules', () => {
     { host: 'api.weather.com', routes: [{ path: '/v1/**', methods: 'GET' }] },
     { host: 'api.github.com', routes: [{ path: '/repos/**', methods: ['GET', 'POST'] }] },
   ]
-  const handler = createSafeFetch({ rules, pinDns: false })
+  const { handler } = createSafeFetch({ rules, pinDns: false })
 
   it('allows a request matching the first rule', async () => {
     await expect(
@@ -482,7 +482,7 @@ describe('composing multiple origin rules', () => {
         { host: 'api.example.com', routes: [{ path: '/private/**' }] },
       ],
       pinDns: false,
-    })
+    }).handler
     // api.example.com exact rule applies — /private/** is allowed
     await expect(
       h('https://api.example.com/private/secret', { method: 'GET' }),
@@ -501,7 +501,7 @@ describe('composing multiple origin rules', () => {
     const h = createSafeFetch({
       rules: [{ host: 'weather.com', routes: [{ path: '/**' }] }],
       pinDns: false,
-    })
+    }).handler
     await expect(
       h('https://api.weather.com/v1/forecast', { method: 'GET' }),
     ).rejects.toThrow()
@@ -513,7 +513,7 @@ describe('composing multiple origin rules', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('path security', () => {
-  const handler = createSafeFetch({
+  const { handler } = createSafeFetch({
     rules: { host: 'api.example.com', routes: [{ path: '/public/**' }] },
     pinDns: false,
   })
@@ -551,7 +551,7 @@ describe('path security', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('header injection hardening', () => {
-  const handler = createSafeFetch({
+  const { handler } = createSafeFetch({
     rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
     pinDns: false,
   })
@@ -621,7 +621,7 @@ describe('header injection hardening', () => {
 describe('DNS pinning (pinDns: true)', () => {
   // The handler is created once; DNS results are controlled per-test via
   // mockDnsPromiseLookup (node:dns/promises, used by resolveAndCheckIp).
-  const handler = createSafeFetch({
+  const { handler } = createSafeFetch({
     rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
   })
 
@@ -663,7 +663,7 @@ describe('DNS pinning (pinDns: true)', () => {
   })
 
   it('skips DNS lookup for IP literals', async () => {
-    const handlerPublicIp = createSafeFetch({
+    const { handler: handlerPublicIp } = createSafeFetch({
       rules: { host: '1.2.3.4', routes: [{ path: '/**' }] },
     })
     await expect(
@@ -675,7 +675,7 @@ describe('DNS pinning (pinDns: true)', () => {
   it('passes resolvedIp to the policy callback', async () => {
     mockDnsPromiseLookup.mockResolvedValue([{ address: '1.2.3.4', family: 4 }])
     const resolvedIpSeen: string[] = []
-    const handlerWithPolicy = createSafeFetch({
+    const { handler: handlerWithPolicy } = createSafeFetch({
       policy: (req) => {
         resolvedIpSeen.push(req.resolvedIp ?? 'null')
         return req.host === 'api.example.com'
@@ -693,7 +693,7 @@ describe('DNS pinning (pinDns: true)', () => {
 describe('hooks', () => {
   it('calls onDenied when a request is denied by rules', async () => {
     const onDenied = vi.fn()
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/public/**' }] },
       onDenied,
       pinDns: false,
@@ -707,7 +707,7 @@ describe('hooks', () => {
 
   it('calls onDenied when a request is denied by policy', async () => {
     const onDenied = vi.fn()
-    const handler = createSafeFetch({ policy: () => false, onDenied, pinDns: false })
+    const { handler } = createSafeFetch({ policy: () => false, onDenied, pinDns: false })
     await expect(
       handler('https://example.com/', { method: 'GET', headers: {}, body: null }),
     ).rejects.toThrow()
@@ -715,7 +715,7 @@ describe('hooks', () => {
   })
 
   it('onDenied errors are silently ignored', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       policy: () => false,
       onDenied: () => {
         throw new Error('hook error')
@@ -734,7 +734,7 @@ describe('hooks', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('response handling', () => {
-  const handler = createSafeFetch({
+  const { handler } = createSafeFetch({
     rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
     pinDns: false,
   })
@@ -767,7 +767,7 @@ describe('response handling', () => {
   })
 
   it('sets Accept-Encoding: identity when allowCompressedResponses is false (default)', async () => {
-    const handler2 = createSafeFetch({
+    const { handler: handler2 } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       pinDns: false,
     })
@@ -784,7 +784,7 @@ describe('response handling', () => {
 describe('redirect following (maxRedirects > 0)', () => {
   it('follows a redirect and re-checks policy', async () => {
     const seenHops: number[] = []
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       policy: (req) => {
         seenHops.push(req.hop)
         return req.host === 'api.example.com'
@@ -804,7 +804,7 @@ describe('redirect following (maxRedirects > 0)', () => {
   })
 
   it('denies a redirect that points to a disallowed origin', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       maxRedirects: 1,
       pinDns: false,
@@ -818,7 +818,7 @@ describe('redirect following (maxRedirects > 0)', () => {
   })
 
   it('converts POST to GET on 303', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       maxRedirects: 1,
       pinDns: false,
@@ -836,7 +836,7 @@ describe('redirect following (maxRedirects > 0)', () => {
   })
 
   it('passes the redirect response through when the hop limit is hit', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       maxRedirects: 1,
       pinDns: false,
@@ -860,7 +860,7 @@ describe('redirect following (maxRedirects > 0)', () => {
 
 describe('middleware', () => {
   it('runs global middleware before the HTTP call', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: async (ctx, next) => {
         ctx.req.header('x-injected', 'yes')
@@ -875,7 +875,7 @@ describe('middleware', () => {
 
   it('runs origin middleware after global', async () => {
     const order: string[] = []
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: {
         host: 'api.example.com',
         middleware: async (_ctx, next) => {
@@ -896,7 +896,7 @@ describe('middleware', () => {
 
   it('runs route middleware last', async () => {
     const order: string[] = []
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: {
         host: 'api.example.com',
         middleware: async (_ctx, next) => {
@@ -922,7 +922,7 @@ describe('middleware', () => {
   })
 
   it('route middleware can override headers set by origin middleware', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: {
         host: 'api.example.com',
         middleware: async (ctx, next) => {
@@ -945,7 +945,7 @@ describe('middleware', () => {
   })
 
   it('middleware can rewrite the URL', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: async (ctx, next) => {
         ctx.req.setUrl(ctx.req.url.replace('/v1/', '/v2/'))
@@ -959,7 +959,7 @@ describe('middleware', () => {
   })
 
   it('middleware can replace the body', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: async (ctx, next) => {
         ctx.req.setBody('injected body')
@@ -974,7 +974,7 @@ describe('middleware', () => {
 
   it('middleware sees route params', async () => {
     const seenParams: Record<string, string>[] = []
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: {
         host: 'api.example.com',
         routes: [{
@@ -993,7 +993,7 @@ describe('middleware', () => {
 
   it('middleware does not run for policy-only allowed requests that have no matching rule', async () => {
     const middlewareSpy = vi.fn((_ctx: unknown, next: () => Promise<unknown>) => next())
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       policy: () => true,
       middleware: middlewareSpy as Parameters<typeof createSafeFetch>[0]['middleware'],
       pinDns: false,
@@ -1005,7 +1005,7 @@ describe('middleware', () => {
 
   it('middleware does not run for denied requests', async () => {
     const middlewareSpy = vi.fn((_ctx: unknown, next: () => Promise<unknown>) => next())
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: middlewareSpy as Parameters<typeof createSafeFetch>[0]['middleware'],
       pinDns: false,
@@ -1018,7 +1018,7 @@ describe('middleware', () => {
 
   it('middleware can read the response from next()', async () => {
     const seenStatuses: number[] = []
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: async (ctx, next) => {
         await next()
@@ -1032,7 +1032,7 @@ describe('middleware', () => {
   })
 
   it('middleware can synthesise a response without calling next() (no HTTP made)', async () => {
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/queue/**' }] },
       middleware: async (ctx, _next) => ({
         status: 202,
@@ -1053,7 +1053,7 @@ describe('middleware', () => {
       status: 200,
       headers: { 'content-type': 'application/json' },
     }))
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: async (ctx, next) => {
         await next()
@@ -1068,14 +1068,13 @@ describe('middleware', () => {
 
   it('async middleware is awaited before the HTTP call', async () => {
     let tokenResolved = false
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: async (ctx, next) => {
-        await new Promise<void>((resolve) => 
-          {
-            setTimeout(resolve, 1)
-          }
-      )
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 1)
+        },
+        )
         tokenResolved = true
         ctx.req.header('authorization', 'Bearer token')
         await next()
@@ -1090,7 +1089,7 @@ describe('middleware', () => {
 
   it('ctx.req.raw preserves the original unmodified request', async () => {
     const seenRaw: any[] = []
-    const handler = createSafeFetch({
+    const { handler } = createSafeFetch({
       rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
       middleware: async (ctx, next) => {
         seenRaw.push(ctx.req.raw)
