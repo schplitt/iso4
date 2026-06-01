@@ -330,11 +330,7 @@ impl<'a> PayloadReader<'a> {
                 "payload too short reading u32",
             ));
         }
-        let n = u32::from_be_bytes(
-            self.data[self.offset..self.offset + 4]
-                .try_into()
-                .unwrap(),
-        );
+        let n = u32::from_be_bytes(self.data[self.offset..self.offset + 4].try_into().unwrap());
         self.offset += 4;
         Ok(n)
     }
@@ -349,7 +345,10 @@ impl<'a> PayloadReader<'a> {
         }
         let bytes = &self.data[self.offset..self.offset + len];
         let s = String::from_utf8(bytes.to_vec()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "string payload is not valid UTF-8")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "string payload is not valid UTF-8",
+            )
         })?;
         self.offset += len;
         Ok(s)
@@ -405,7 +404,9 @@ fn parse_code_fields(
     let globals_count = r.read_u32()? as usize;
     let mut globals = Vec::with_capacity(globals_count);
     for _ in 0..globals_count {
-        globals.push(HostGlobalBinding { name: r.read_string()? });
+        globals.push(HostGlobalBinding {
+            name: r.read_string()?,
+        });
     }
     let imports_count = r.read_u32()? as usize;
     let mut imports = Vec::with_capacity(imports_count);
@@ -429,7 +430,12 @@ fn parse_code_fields(
                 ))
             }
         };
-        imports.push(ImportBinding { specifier, kind, source, host_exports });
+        imports.push(ImportBinding {
+            specifier,
+            kind,
+            source,
+            host_exports,
+        });
     }
     Ok((code, filename, limits, globals, imports))
 }
@@ -440,7 +446,14 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
     let run_id = r.read_u32()?;
     let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
     r.assert_done()?;
-    Ok(RunPayload { run_id, code, filename, limits, globals, imports })
+    Ok(RunPayload {
+        run_id,
+        code,
+        filename,
+        limits,
+        globals,
+        imports,
+    })
 }
 
 /// Fully parsed `Precompile` frame payload per `docs/protocol.md` §5.2.
@@ -459,7 +472,13 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
     let mut r = PayloadReader::new(payload);
     let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
     r.assert_done()?;
-    Ok(PrecompilePayload { code, filename, limits, globals, imports })
+    Ok(PrecompilePayload {
+        code,
+        filename,
+        limits,
+        globals,
+        imports,
+    })
 }
 
 /// Fully parsed `PrefixRun` frame payload per `docs/protocol.md` §5.2.
@@ -481,7 +500,15 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
     let prefix_id = r.read_string()?;
     let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
     r.assert_done()?;
-    Ok(PrefixRunPayload { run_id, prefix_id, code, filename, limits, globals, imports })
+    Ok(PrefixRunPayload {
+        run_id,
+        prefix_id,
+        code,
+        filename,
+        limits,
+        globals,
+        imports,
+    })
 }
 
 /// Parse the payload bytes of a `DisposePrefix` frame.
@@ -683,18 +710,19 @@ mod tests {
     // ── parse_run_payload ──────────────────────────────────────────────
 
     /// Build a minimal valid RunPayload byte vector.
-    fn encode_run_payload(
-        run_id: u32,
-        code: &str,
-        filename: Option<&str>,
-    ) -> Vec<u8> {
+    fn encode_run_payload(run_id: u32, code: &str, filename: Option<&str>) -> Vec<u8> {
         let mut v = Vec::new();
         push_u32(&mut v, run_id);
         push_string(&mut v, code);
         // filename: Optional<String>
         match filename {
-            Some(f) => { v.push(1); push_string(&mut v, f); }
-            None => { v.push(0); }
+            Some(f) => {
+                v.push(1);
+                push_string(&mut v, f);
+            }
+            None => {
+                v.push(0);
+            }
         }
         // ResourceLimits: 8 × u32, all zero
         v.extend_from_slice(&[0u8; 32]);
@@ -735,19 +763,19 @@ mod tests {
     #[test]
     fn parse_run_payload_with_limits() {
         let mut v = Vec::new();
-        push_u32(&mut v, 42);         // run_id
+        push_u32(&mut v, 42); // run_id
         push_string(&mut v, "code"); // code
-        v.push(0);                    // no filename
-        push_u32(&mut v, 128);        // memory_mb
-        push_u32(&mut v, 5000);       // cpu_time_ms
-        push_u32(&mut v, 10000);      // wall_time_ms
+        v.push(0); // no filename
+        push_u32(&mut v, 128); // memory_mb
+        push_u32(&mut v, 5000); // cpu_time_ms
+        push_u32(&mut v, 10000); // wall_time_ms
         push_u32(&mut v, 1024 * 1024); // max_export_bytes
-        push_u32(&mut v, 512 * 1024);  // max_stdout_bytes
-        push_u32(&mut v, 512 * 1024);  // max_stderr_bytes
-        push_u32(&mut v, 64 * 1024);   // max_bridge_payload_bytes
-        push_u32(&mut v, 1_000);       // max_bridge_calls
-        push_u32(&mut v, 0);          // globals count
-        push_u32(&mut v, 0);          // imports count
+        push_u32(&mut v, 512 * 1024); // max_stdout_bytes
+        push_u32(&mut v, 512 * 1024); // max_stderr_bytes
+        push_u32(&mut v, 64 * 1024); // max_bridge_payload_bytes
+        push_u32(&mut v, 1_000); // max_bridge_calls
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 0); // imports count
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.run_id, 42);
@@ -759,14 +787,14 @@ mod tests {
     #[test]
     fn parse_run_payload_with_globals() {
         let mut v = Vec::new();
-        push_u32(&mut v, 1);             // run_id
-        push_string(&mut v, "x");       // code
-        v.push(0);                       // no filename
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "x"); // code
+        v.push(0); // no filename
         v.extend_from_slice(&[0u8; 28]); // limits (all zero)
-        push_u32(&mut v, 2);             // 2 globals
+        push_u32(&mut v, 2); // 2 globals
         push_string(&mut v, "fetch");
         push_string(&mut v, "myTool");
-        push_u32(&mut v, 0);             // 0 imports
+        push_u32(&mut v, 0); // 0 imports
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.globals.len(), 2);
@@ -777,15 +805,15 @@ mod tests {
     #[test]
     fn parse_run_payload_with_source_import() {
         let mut v = Vec::new();
-        push_u32(&mut v, 1);          // run_id
+        push_u32(&mut v, 1); // run_id
         push_string(&mut v, "code"); // code
-        v.push(0);                    // no filename
+        v.push(0); // no filename
         v.extend_from_slice(&[0u8; 28]); // limits
-        push_u32(&mut v, 0);          // globals count
-        push_u32(&mut v, 1);          // 1 import
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "lib:math"); // specifier
-        v.push(0);                    // kind = source
-        v.push(1);                    // source present
+        v.push(0); // kind = source
+        v.push(1); // source present
         push_string(&mut v, "export const add = (a, b) => a + b");
 
         let p = parse_run_payload(&v).unwrap();
@@ -804,13 +832,13 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 1);
         push_string(&mut v, "code");
-        v.push(0);                    // no filename
+        v.push(0); // no filename
         v.extend_from_slice(&[0u8; 28]); // limits
-        push_u32(&mut v, 0);          // globals count
-        push_u32(&mut v, 1);          // 1 import
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "host:tools"); // specifier
-        v.push(1);                    // kind = host
-        push_u32(&mut v, 2);          // 2 host exports
+        v.push(1); // kind = host
+        push_u32(&mut v, 2); // 2 host exports
         push_string(&mut v, "search");
         push_string(&mut v, "fetch");
 
@@ -835,12 +863,12 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 1);
         push_string(&mut v, "code");
-        v.push(0);                    // no filename
+        v.push(0); // no filename
         v.extend_from_slice(&[0u8; 28]); // limits
-        push_u32(&mut v, 0);          // globals count
-        push_u32(&mut v, 1);          // 1 import
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "x:y");
-        v.push(0xff);                 // unknown kind byte
+        v.push(0xff); // unknown kind byte
 
         assert_eq!(
             parse_run_payload(&v).unwrap_err().kind(),

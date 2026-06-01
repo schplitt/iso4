@@ -900,21 +900,35 @@ describe('resource limits', () => {
     expect(['ERR_CPU_TIMEOUT', 'ERR_WALL_TIMEOUT']).toContain(result.error.code)
   })
 
-  test.skip('memory limit is enforced (Phase 8)', async () => {
-    // Heap + ArrayBuffer limit enforcement requires a custom V8 allocator
-    // (Phase 8). Running this test without enforcement would OOM the process.
+  test('memory limit is enforced — TypedArray', async () => {
     const result = await runtime.run({
       code: `
         const arrays = []
         while (true) { arrays.push(new Uint8Array(1024 * 1024)) }
       `,
-      limits: { memoryMb: 32 },
+      limits: { memoryMb: 32, wallTimeMs: 10_000, cpuTimeMs: 10_000 },
     })
     expect(result.ok).toBe(false)
     if (result.ok)
       return
     expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
-  })
+  }, 15_000)
+
+  test('memory limit is enforced — logs emitted before OOM are preserved', async () => {
+    const result = await runtime.run({
+      code: `
+        console.log('before oom')
+        const arrays = []
+        while (true) { arrays.push(new Uint8Array(1024 * 1024)) }
+      `,
+      limits: { memoryMb: 32, wallTimeMs: 10_000, cpuTimeMs: 10_000 },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
+    expect(result.stdout.some((l: string) => l.includes('before oom'))).toBe(true)
+  }, 15_000)
 
   test('wall guard fires before cpu guard (tight loop)', async () => {
     // Pure async hang (await neverResolvingPromise) requires Phase 4 bridge.

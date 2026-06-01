@@ -608,7 +608,7 @@ describe('globals bridge (Phase 4)', () => {
     const callLog: string[] = []
     const prefix = await runtime.precompile({
       code: '',
-      globals: { fetch: async () => ({ status: 200, headers: {}, body: 'default' }) },
+      globals: { fetch: async () => ({ status: 200, headers: {}, body: 'default' as string | null }) },
     })
 
     const result = await prefix.run({
@@ -1101,17 +1101,16 @@ describe('resource limits (Phase 3/8)', () => {
     expect(result.error.code).toBe('ERR_WALL_TIMEOUT')
   }, 5_000)
 
-  // Skipped: memory exhaustion OOMs the process until Phase 8 enforces heap limit
-  test.skip('heap limit kills memory hog (Phase 8)', async () => {
+  test('heap limit kills memory hog via TypedArray', async () => {
     const result = await runtime.run({
       code: 'const bufs = []; while(true) bufs.push(new Uint8Array(512*1024))',
-      limits: { memoryMb: 16 },
+      limits: { memoryMb: 16, wallTimeMs: 10_000, cpuTimeMs: 10_000 },
     })
     expect(result.ok).toBe(false)
     if (result.ok)
       return
     expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
-  })
+  }, 15_000)
 
   test('cpu budget excludes bridge wait time (Phase 3)', async () => {
     // cpuTimeMs is tight but the bridge call takes much longer.

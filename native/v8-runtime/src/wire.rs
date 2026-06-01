@@ -104,7 +104,7 @@ pub fn encode_wire_value(value: &WireValue, out: &mut Vec<u8>) {
         }
         WireValue::BigInt(sign, words) => {
             out.push(TAG_BIGINT);
-            out.push(u8::from(*sign));          // 0 = non-negative, 1 = negative
+            out.push(u8::from(*sign)); // 0 = non-negative, 1 = negative
             encode_u32(words.len() as u32, out); // word_count
             for w in words {
                 out.extend_from_slice(&w.to_be_bytes()); // each word big-endian
@@ -518,8 +518,13 @@ pub fn encode_bridge_call_payload(
     encode_u32(call_id, &mut out);
     out.push(target_kind);
     match specifier {
-        Some(s) => { out.push(1); encode_string(s, &mut out); }
-        None    => { out.push(0); }
+        Some(s) => {
+            out.push(1);
+            encode_string(s, &mut out);
+        }
+        None => {
+            out.push(0);
+        }
     }
     encode_string(export_name, &mut out);
     encode_u32(args.len() as u32, &mut out);
@@ -569,9 +574,9 @@ pub fn parse_bridge_response_payload(
         }
         0 => {
             // ok = false - read the error payload: code name message stack
-            let _code    = read_string(payload, &mut offset)?;
-            let _name    = read_string(payload, &mut offset)?;
-            let message  = read_string(payload, &mut offset)?;
+            let _code = read_string(payload, &mut offset)?;
+            let _name = read_string(payload, &mut offset)?;
+            let message = read_string(payload, &mut offset)?;
             let stack_present = read_u8(payload, &mut offset)?;
             if stack_present == 1 {
                 // Consume the stack string so the parser leaves at the end of
@@ -637,7 +642,10 @@ mod tests {
         let bytes = enc(&WireValue::Number(123.0));
         assert_eq!(bytes[0], TAG_NUMBER);
         assert_eq!(bytes.len(), 9);
-        assert_eq!(&bytes[1..], &[0x40, 0x5e, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            &bytes[1..],
+            &[0x40, 0x5e, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
     }
 
     #[test]
@@ -696,14 +704,8 @@ mod tests {
     #[test]
     fn number_roundtrips() {
         assert_eq!(roundtrip(&WireValue::Number(42.0)), WireValue::Number(42.0));
-        assert_eq!(
-            roundtrip(&WireValue::Number(3.14)),
-            WireValue::Number(3.14)
-        );
-        assert_eq!(
-            roundtrip(&WireValue::Number(-0.5)),
-            WireValue::Number(-0.5)
-        );
+        assert_eq!(roundtrip(&WireValue::Number(3.14)), WireValue::Number(3.14));
+        assert_eq!(roundtrip(&WireValue::Number(-0.5)), WireValue::Number(-0.5));
     }
 
     #[test]
@@ -745,10 +747,7 @@ mod tests {
     fn nested_object_roundtrips() {
         let v = WireValue::Object(vec![(
             "outer".to_string(),
-            WireValue::Object(vec![(
-                "inner".to_string(),
-                WireValue::Number(99.0),
-            )]),
+            WireValue::Object(vec![("inner".to_string(), WireValue::Number(99.0))]),
         )]);
         assert_eq!(roundtrip(&v), v);
     }
@@ -978,8 +977,7 @@ mod tests {
 
     #[test]
     fn export_not_serializable_maps_to_err_export_not_serializable() {
-        let payload =
-            run_error_to_payload(&RunError::ExportNotSerializable("fn".to_string()));
+        let payload = run_error_to_payload(&RunError::ExportNotSerializable("fn".to_string()));
         assert_eq!(payload.code, "ERR_EXPORT_NOT_SERIALIZABLE");
     }
 

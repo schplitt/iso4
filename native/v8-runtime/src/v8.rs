@@ -7,12 +7,14 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem::ManuallyDrop;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{FromRawFd, RawFd};
+#[cfg(test)]
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Once;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::RecvTimeoutError;
@@ -44,8 +46,10 @@ pub fn init_platform() {
 #[derive(Clone, Copy, Default)]
 pub struct Limits {
     pub wall_time_ms: u32,
-    pub cpu_time_ms:  u32,
-    pub memory_mb:    u32, // reserved - enforced in Phase 8
+    pub cpu_time_ms: u32,
+    /// V8 heap cap enforced via `CreateParams::heap_limits` +
+    /// `add_near_heap_limit_callback`. Zero means no limit.
+    pub memory_mb: u32,
     /// Maximum byte length for a single bridge call payload (arguments) or
     /// bridge response payload. Zero means no per-bridge limit; the framing
     /// layer's 64 MiB cap is the only constraint.
@@ -57,7 +61,6 @@ pub struct Limits {
     pub max_bridge_calls: u32,
 }
 
-
 /// Termination reason set by the first limit-guard thread to fire.
 ///
 /// Stored in a `OnceLock` - first write wins, subsequent writes are no-ops.
@@ -67,6 +70,152 @@ pub struct Limits {
 enum TerminationReason {
     Wall,
     Cpu,
+    Memory,
+}
+
+/// Heap data passed to [`near_heap_limit_cb`] as a raw pointer.
+///
+/// Lives on the heap for the duration of the run (see safety note on the
+/// callback). Declaring it after `isolate` in [`run_module`] means it drops
+/// before the isolate, which is safe because V8 never invokes near-heap
+/// callbacks during `Isolate::Dispose()`.
+struct NearHeapData {
+    handle: v8::IsolateHandle,
+    reason: Arc<OnceLock<TerminationReason>>,
+}
+
+// ── ArrayBuffer budget allocator ─────────────────────────────────────────────
+//
+// V8's `heap_limits` only caps the JS heap (strings, plain objects, closures).
+// TypedArray / ArrayBuffer backing stores are allocated through a separate
+// allocator interface and would otherwise bypass the cap entirely.  This
+// custom allocator tracks every backing-store byte and fires
+// `terminate_execution()` the moment the cumulative total exceeds the budget.
+//
+// The state is heap-allocated via `Arc` so it can be shared between the
+// allocator (which is registered in `CreateParams` *before* the isolate
+// exists) and the run context (which sets the `IsolateHandle` *after* the
+// isolate is created via the `OnceLock<IsolateHandle>` field).
+
+struct BudgetAllocState {
+    /// Currently allocated ArrayBuffer bytes (may briefly exceed budget while
+    /// terminate_execution propagates to the next JS safepoint).
+    used: AtomicUsize,
+    /// Hard cap in bytes.  Always > 0 when the allocator is active.
+    budget: usize,
+    /// Set once, immediately after `Isolate::new` returns.
+    handle: OnceLock<v8::IsolateHandle>,
+    /// Shared with wall / cpu guards — first writer wins.
+    reason: Arc<OnceLock<TerminationReason>>,
+}
+
+impl BudgetAllocState {
+    /// Called on every allocation path: if adding `n` bytes would exceed the
+    /// budget, fire termination.  We always service the allocation so V8 does
+    /// not crash — JS stops at the next safepoint.
+    #[inline]
+    fn check_and_maybe_terminate(&self, n: usize) {
+        let prev = self.used.fetch_add(n, Ordering::Relaxed);
+        if prev.saturating_add(n) > self.budget {
+            if let Some(h) = self.handle.get() {
+                self.reason.set(TerminationReason::Memory).ok();
+                h.terminate_execution();
+            }
+        }
+    }
+}
+
+/// Vtable functions must be `unsafe extern "C"` free functions.
+unsafe extern "C" fn budget_alloc_alloc(state: &BudgetAllocState, n: usize) -> *mut c_void {
+    if n == 0 {
+        return std::ptr::null_mut();
+    }
+    state.check_and_maybe_terminate(n);
+    Box::into_raw(vec![0u8; n].into_boxed_slice()) as *mut c_void
+}
+
+unsafe extern "C" fn budget_alloc_alloc_uninit(state: &BudgetAllocState, n: usize) -> *mut c_void {
+    if n == 0 {
+        return std::ptr::null_mut();
+    }
+    state.check_and_maybe_terminate(n);
+    let mut v: Vec<std::mem::MaybeUninit<u8>> = Vec::with_capacity(n);
+    // SAFETY: MaybeUninit<u8> requires no initialization.
+    v.set_len(n);
+    Box::into_raw(v.into_boxed_slice()) as *mut c_void
+}
+
+unsafe extern "C" fn budget_alloc_free(state: &BudgetAllocState, data: *mut c_void, n: usize) {
+    if data.is_null() || n == 0 {
+        return;
+    }
+    state.used.fetch_sub(n, Ordering::Relaxed);
+    let slice = std::ptr::slice_from_raw_parts_mut(data as *mut u8, n);
+    drop(Box::from_raw(slice));
+}
+
+unsafe extern "C" fn budget_alloc_realloc(
+    state: &BudgetAllocState,
+    prev: *mut c_void,
+    old_len: usize,
+    new_len: usize,
+) -> *mut c_void {
+    if new_len == 0 {
+        budget_alloc_free(state, prev, old_len);
+        return std::ptr::null_mut();
+    }
+    // Track the delta.  wrapping_sub produces the correct two's-complement
+    // delta for both growth and shrinkage on an AtomicUsize.
+    state
+        .used
+        .fetch_add(new_len.wrapping_sub(old_len), Ordering::Relaxed);
+    if new_len > old_len {
+        let prev_used = state.used.load(Ordering::Relaxed);
+        if prev_used > state.budget {
+            if let Some(h) = state.handle.get() {
+                state.reason.set(TerminationReason::Memory).ok();
+                h.terminate_execution();
+            }
+        }
+    }
+    let old_slice = Box::from_raw(std::ptr::slice_from_raw_parts_mut(prev as *mut u8, old_len));
+    let mut new_vec = Vec::with_capacity(new_len);
+    new_vec.extend_from_slice(&old_slice[..old_len.min(new_len)]);
+    new_vec.resize(new_len, 0u8);
+    Box::into_raw(new_vec.into_boxed_slice()) as *mut c_void
+}
+
+unsafe extern "C" fn budget_alloc_drop(state: *const BudgetAllocState) {
+    // Reconstruct + drop the Arc reference that was created via Arc::into_raw.
+    drop(Arc::from_raw(state));
+}
+
+static BUDGET_ALLOC_VTABLE: v8::RustAllocatorVtable<BudgetAllocState> = v8::RustAllocatorVtable {
+    allocate: budget_alloc_alloc,
+    allocate_uninitialized: budget_alloc_alloc_uninit,
+    free: budget_alloc_free,
+    reallocate: budget_alloc_realloc,
+    drop: budget_alloc_drop,
+};
+
+/// Near-heap-limit callback registered when `limits.memory_mb > 0`.
+///
+/// # Safety
+/// `data` is a `*mut NearHeapData` kept alive in `run_module` for the
+/// duration of active JS execution. This callback only fires during V8 GC,
+/// which only occurs during `module.evaluate()` /
+/// `perform_microtask_checkpoint()` — never during `Isolate::Dispose()`.
+extern "C" fn near_heap_limit_cb(
+    data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    _initial_heap_limit: usize,
+) -> usize {
+    let d = unsafe { &*(data as *const NearHeapData) };
+    d.reason.set(TerminationReason::Memory).ok();
+    d.handle.terminate_execution();
+    // Return a larger limit so V8 has headroom to unwind the stack cleanly
+    // after terminate_execution() without immediately crashing the process.
+    current_heap_limit + 32 * 1024 * 1024
 }
 
 /// Tracks how much active V8 execution time has elapsed.
@@ -81,14 +230,14 @@ enum TerminationReason {
 /// excluded).
 pub struct CpuBudget {
     accumulated_ns: AtomicU64,
-    epoch_start:    Mutex<Option<Instant>>,
+    epoch_start: Mutex<Option<Instant>>,
 }
 
 impl CpuBudget {
     pub fn new() -> Self {
         Self {
             accumulated_ns: AtomicU64::new(0),
-            epoch_start:    Mutex::new(None),
+            epoch_start: Mutex::new(None),
         }
     }
 
@@ -101,17 +250,16 @@ impl CpuBudget {
     pub fn leave(&self) {
         let mut g = self.epoch_start.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(t) = g.take() {
-            self.accumulated_ns.fetch_add(
-                t.elapsed().as_nanos() as u64,
-                Ordering::Relaxed,
-            );
+            self.accumulated_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
     }
 
     /// Total accumulated CPU time in milliseconds.
     pub fn elapsed_ms(&self) -> u64 {
-        let base   = self.accumulated_ns.load(Ordering::Relaxed);
-        let active = self.epoch_start
+        let base = self.accumulated_ns.load(Ordering::Relaxed);
+        let active = self
+            .epoch_start
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .map(|t| t.elapsed().as_nanos() as u64)
@@ -156,6 +304,8 @@ pub struct FailureOutput {
 #[derive(Debug)]
 pub enum RunError {
     /// Payload bytes are not valid UTF-8.
+    /// Raised in session.rs when ipc parsing fails — not yet wired up.
+    #[allow(dead_code)]
     InvalidPayload(String),
     /// JS syntax error or compile-time error.
     CompileError(String),
@@ -177,6 +327,8 @@ pub enum RunError {
     /// Configured host global/import handler threw or rejected.
     HostBridge(String),
     /// PrefixRun attempted to bind a global not declared by Precompile.
+    /// Raised in session.rs when a PrefixRun global was not declared in Precompile.
+    #[allow(dead_code)]
     UndeclaredBinding(String),
     /// A function value was passed as a bridge argument.
     FunctionArgumentNotSupported,
@@ -205,7 +357,15 @@ pub fn execute(
     call_id_counter: Arc<AtomicU32>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename.unwrap_or("<iso4>"), None, limits, globals, stream_fd, call_id_counter)
+    run_module(
+        code,
+        filename.unwrap_or("<iso4>"),
+        None,
+        limits,
+        globals,
+        stream_fd,
+        call_id_counter,
+    )
 }
 
 /// Execute a postfix against a pre-compiled prefix snapshot.
@@ -223,7 +383,15 @@ pub fn execute_with_prefix(
     call_id_counter: Arc<AtomicU32>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(code, filename.unwrap_or("<iso4>"), Some(snapshot_bytes), limits, globals, stream_fd, call_id_counter)
+    run_module(
+        code,
+        filename.unwrap_or("<iso4>"),
+        Some(snapshot_bytes),
+        limits,
+        globals,
+        stream_fd,
+        call_id_counter,
+    )
 }
 
 /// Compile prefix code into a V8 startup snapshot blob.
@@ -238,19 +406,11 @@ pub fn execute_with_prefix(
 /// No execution-time limits are applied: prefix code is host-authored and
 /// trusted. If execution limits are needed for snapshot creation in future,
 /// add an optional `limits: Limits` parameter here.
-pub fn precompile(
-    code: &str,
-    filename: Option<&str>,
-) -> Result<Vec<u8>, FailureOutput> {
+pub fn precompile(code: &str, filename: Option<&str>) -> Result<Vec<u8>, FailureOutput> {
     init_platform();
     precompile_module(code, filename.unwrap_or("<prefix>"))
 }
 
-/// Core execution without bridge - used by tests.
-fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
-    init_platform();
-    run_module(code, filename, None, limits, &[], None, Arc::new(AtomicU32::new(0)))
-}
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
 /// inspect the module namespace object for `default` and named exports.
@@ -277,13 +437,59 @@ fn run_module(
     let start = std::time::Instant::now();
     let mut logs = LogBuffers::default();
 
-    let mut isolate = match snapshot {
-        None => v8::Isolate::new(Default::default()),
-        Some(bytes) => {
-            let params = v8::Isolate::create_params().snapshot_blob(bytes.to_vec());
-            v8::Isolate::new(params)
-        }
+    // `reason` is created before the isolate so it can be shared with the
+    // ArrayBuffer allocator (which is registered in CreateParams, before the
+    // isolate exists).
+    let reason = Arc::new(OnceLock::<TerminationReason>::new());
+
+    // ── ArrayBuffer budget allocator ──────────────────────────────────────────
+    // Built before the isolate so we can pass it into CreateParams.
+    // The IsolateHandle is set on the state right after Isolate::new returns.
+    let alloc_state: Option<Arc<BudgetAllocState>> = if limits.memory_mb > 0 {
+        Some(Arc::new(BudgetAllocState {
+            used: AtomicUsize::new(0),
+            budget: limits.memory_mb as usize * 1024 * 1024,
+            handle: OnceLock::new(),
+            reason: Arc::clone(&reason),
+        }))
+    } else {
+        None
     };
+
+    let mut isolate = {
+        let params = match snapshot {
+            None => v8::Isolate::create_params(),
+            Some(bytes) => v8::Isolate::create_params().snapshot_blob(bytes.to_vec()),
+        };
+        // Cap the V8 heap (strings, plain objects). The near-heap callback
+        // converts a heap-OOM into a clean terminate_execution().
+        let params = if limits.memory_mb > 0 {
+            params.heap_limits(0, limits.memory_mb as usize * 1024 * 1024)
+        } else {
+            params
+        };
+        // Plug in the custom allocator to track ArrayBuffer/TypedArray memory.
+        let params = match &alloc_state {
+            Some(state) => {
+                // Arc::into_raw gives the allocator its own reference count.
+                // budget_alloc_drop reconstructs and drops it when V8 disposes.
+                let raw = Arc::into_raw(Arc::clone(state));
+                unsafe {
+                    params.array_buffer_allocator(v8::new_rust_allocator(raw, &BUDGET_ALLOC_VTABLE))
+                }
+            }
+            None => params,
+        };
+        v8::Isolate::new(params)
+    };
+
+    // Wire the IsolateHandle into the allocator state now that the isolate
+    // exists.  Allocations made before this point (during isolate init) would
+    // have no handle to terminate, but none of those are user-code allocations.
+    if let Some(state) = &alloc_state {
+        state.handle.set(isolate.thread_safe_handle()).ok();
+    }
+
     // Explicit policy: microtasks only drain when we call
     // perform_microtask_checkpoint() in the poll loop.  This gives us
     // deterministic control and prevents microtasks from firing during
@@ -334,18 +540,39 @@ fn run_module(
     //
     // Both guards are set up before entering V8 scopes so the IsolateHandle
     // is obtained while we still hold a plain &Isolate borrow.
-    let reason         = Arc::new(OnceLock::<TerminationReason>::new());
-    let handle         = isolate.thread_safe_handle();
-    let cancel_handle  = handle.clone(); // for cancel_terminate_execution on success
-    let cpu_budget     = Arc::new(CpuBudget::new());
-    let cancel_wall    = start_wall_guard(handle.clone(), Arc::clone(&reason), limits.wall_time_ms);
-    let cancel_cpu     = start_cpu_guard(handle, Arc::clone(&reason), Arc::clone(&cpu_budget), limits.cpu_time_ms);
+    let handle = isolate.thread_safe_handle();
+    let cancel_handle = handle.clone(); // for cancel_terminate_execution on success
+    let cpu_budget = Arc::new(CpuBudget::new());
+    let cancel_wall = start_wall_guard(handle.clone(), Arc::clone(&reason), limits.wall_time_ms);
+    let cancel_cpu = start_cpu_guard(
+        handle.clone(),
+        Arc::clone(&reason),
+        Arc::clone(&cpu_budget),
+        limits.cpu_time_ms,
+    );
+
+    // ── Near-heap callback (V8 heap objects: strings, plain objects) ──────────
+    // Complements the ArrayBuffer allocator above.  Together they cover all
+    // memory sources.  The Box must outlive active JS execution; safe because
+    // V8 never invokes near-heap callbacks during Isolate::Dispose().
+    let _near_heap: Option<Box<NearHeapData>> = if limits.memory_mb > 0 {
+        let data = Box::new(NearHeapData {
+            handle,
+            reason: Arc::clone(&reason),
+        });
+        let raw = &*data as *const NearHeapData as *mut std::ffi::c_void;
+        isolate.add_near_heap_limit_callback(near_heap_limit_cb, raw);
+        Some(data)
+    } else {
+        drop(handle);
+        None
+    };
     // cpu_budget.enter() is called immediately before module.evaluate() so
     // compilation and scope setup time is not charged against the CPU budget.
     let _guard_canceller = GuardCanceller {
         cancel_wall: &cancel_wall,
-        cancel_cpu:  &cancel_cpu,
-        budget:      &cpu_budget,
+        cancel_cpu: &cancel_cpu,
+        budget: &cpu_budget,
     };
 
     let scope = &mut v8::HandleScope::new(&mut isolate);
@@ -360,17 +587,18 @@ fn run_module(
     // call_id, bridge_error, and pending_resolvers are shared between the
     // callback stubs (via GlobalCallbackData) and the poll loop below.
     let call_id = call_id_counter;
-    let bridge_call_count  = Arc::new(AtomicU32::new(0));
+    let bridge_call_count = Arc::new(AtomicU32::new(0));
     let bridge_error: Arc<OnceLock<RunError>> = Arc::new(OnceLock::new());
-    let pending_resolvers: PendingResolvers =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending_resolvers: PendingResolvers = Arc::new(Mutex::new(HashMap::new()));
 
     // Box-per-stub allocations; kept alive until after the poll loop exits.
+    // Vec<Box<>> is intentional: raw pointers into each Box are passed to V8
+    // as External data — the address must not move on Vec reallocation.
+    #[allow(clippy::vec_box)]
     let mut callback_data_boxes: Vec<Box<GlobalCallbackData>> = Vec::with_capacity(globals.len());
     if !globals.is_empty() {
-        let fd = stream_fd.expect(
-            "install_bridge_globals called with non-empty globals but no stream_fd"
-        );
+        let fd = stream_fd
+            .expect("install_bridge_globals called with non-empty globals but no stream_fd");
         install_bridge_globals(
             scope,
             globals,
@@ -446,20 +674,23 @@ fn run_module(
             cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
             if let Some(err) = bridge_error.get() {
                 let owned = match err {
-                    RunError::HostBridge(m)                => RunError::HostBridge(m.clone()),
-                    RunError::FunctionArgumentNotSupported  => RunError::FunctionArgumentNotSupported,
-                    RunError::BridgePayloadTooLarge         => RunError::BridgePayloadTooLarge,
-                    RunError::BridgeCallLimitExceeded       => RunError::BridgeCallLimitExceeded,
+                    RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
+                    RunError::FunctionArgumentNotSupported => {
+                        RunError::FunctionArgumentNotSupported
+                    }
+                    RunError::BridgePayloadTooLarge => RunError::BridgePayloadTooLarge,
+                    RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
                     other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                 };
                 return Err(failure(owned, &logs, start));
             }
             let error = match reason.get().copied() {
                 Some(TerminationReason::Wall) => RunError::WallTimeout,
-                Some(TerminationReason::Cpu)  => RunError::CpuTimeout,
+                Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                Some(TerminationReason::Memory) => RunError::MemoryLimit,
                 None => RunError::RuntimeError {
                     message: exception_message(scope),
-                    stack:   exception_stack(scope),
+                    stack: exception_stack(scope),
                 },
             };
             return Err(failure(error, &logs, start));
@@ -493,17 +724,18 @@ fn run_module(
         cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
         failure(
             RunError::Internal("module evaluation did not return a Promise".into()),
-            &logs, start,
+            &logs,
+            start,
         )
     })?;
 
     // Helper: clones the bridge_error OnceLock into an owned RunError.
     let owned_bridge_error = |err: &RunError| -> RunError {
         match err {
-            RunError::HostBridge(m)                => RunError::HostBridge(m.clone()),
-            RunError::FunctionArgumentNotSupported  => RunError::FunctionArgumentNotSupported,
-            RunError::BridgePayloadTooLarge         => RunError::BridgePayloadTooLarge,
-            RunError::BridgeCallLimitExceeded       => RunError::BridgeCallLimitExceeded,
+            RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
+            RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
+            RunError::BridgePayloadTooLarge => RunError::BridgePayloadTooLarge,
+            RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
             other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
         }
     };
@@ -525,7 +757,11 @@ fn run_module(
                 if let Some(err) = bridge_error.get() {
                     return Err(failure(owned_bridge_error(err), &logs, start));
                 }
-                return Err(failure(runtime_error_from_value(scope, rejection), &logs, start));
+                return Err(failure(
+                    runtime_error_from_value(scope, rejection),
+                    &logs,
+                    start,
+                ));
             }
             v8::PromiseState::Pending => {}
         }
@@ -543,7 +779,7 @@ fn run_module(
             // charged against the sandbox.  Set a read timeout equal to the
             // remaining wall budget so a stalled handler is caught here.
             let timeout = if limits.wall_time_ms > 0 {
-                let budget    = Duration::from_millis(limits.wall_time_ms as u64);
+                let budget = Duration::from_millis(limits.wall_time_ms as u64);
                 let remaining = budget
                     .saturating_sub(start.elapsed())
                     .max(Duration::from_millis(1));
@@ -568,8 +804,8 @@ fn run_module(
         };
 
         match frame_result {
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                   || e.kind() == io::ErrorKind::TimedOut =>
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 // Wall budget exhausted during blocking wait.
                 reason.set(TerminationReason::Wall).ok();
@@ -578,7 +814,8 @@ fn run_module(
             Err(e) => {
                 return Err(failure(
                     RunError::Internal(format!("poll loop socket read: {e}")),
-                    &logs, start,
+                    &logs,
+                    start,
                 ));
             }
             Ok(frame) => {
@@ -589,7 +826,8 @@ fn run_module(
                             "poll loop: expected BridgeResponse, got {:?}",
                             frame.message_type
                         )),
-                        &logs, start,
+                        &logs,
+                        start,
                     ));
                 }
                 if limits.max_bridge_payload_bytes > 0
@@ -601,7 +839,8 @@ fn run_module(
                     Err(e) => {
                         return Err(failure(
                             RunError::Internal(format!("poll loop: response decode: {e}")),
-                            &logs, start,
+                            &logs,
+                            start,
                         ));
                     }
                     Ok((call_id, result)) => {
@@ -618,9 +857,11 @@ fn run_module(
                                     if let Some(v8_val) = wire_to_v8_value(scope, &wire_value) {
                                         resolver.resolve(scope, v8_val);
                                     } else {
-                                        let msg = v8::String::new(scope,
-                                            "[iso4] bridge: failed to convert response value")
-                                            .unwrap();
+                                        let msg = v8::String::new(
+                                            scope,
+                                            "[iso4] bridge: failed to convert response value",
+                                        )
+                                        .unwrap();
                                         resolver.reject(scope, msg.into());
                                     }
                                 }
@@ -628,8 +869,10 @@ fn run_module(
                                     // Record the host error so the Rejected
                                     // arm below returns HostBridge, not RuntimeError.
                                     bridge_error.set(RunError::HostBridge(msg.clone())).ok();
-                                    let err_str = v8::String::new(scope, &msg)
-                                        .unwrap_or_else(|| v8::String::new(scope, "host error").unwrap());
+                                    let err_str =
+                                        v8::String::new(scope, &msg).unwrap_or_else(|| {
+                                            v8::String::new(scope, "host error").unwrap()
+                                        });
                                     resolver.reject(scope, err_str.into());
                                 }
                             }
@@ -657,7 +900,8 @@ fn run_module(
             cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
             let error = match r {
                 TerminationReason::Wall => RunError::WallTimeout,
-                TerminationReason::Cpu  => RunError::CpuTimeout,
+                TerminationReason::Cpu => RunError::CpuTimeout,
+                TerminationReason::Memory => RunError::MemoryLimit,
             };
             return Err(failure(error, &logs, start));
         }
@@ -671,7 +915,8 @@ fn run_module(
         }
         let error = match reason.get().copied() {
             Some(TerminationReason::Wall) => RunError::WallTimeout,
-            Some(TerminationReason::Cpu)  => RunError::CpuTimeout,
+            Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+            Some(TerminationReason::Memory) => RunError::MemoryLimit,
             None => RunError::ExportNotSerializable(
                 "module evaluation promise is still pending after poll loop".to_string(),
             ),
@@ -756,7 +1001,7 @@ fn precompile_module(code: &str, filename: &str) -> Result<Vec<u8>, FailureOutpu
     // All V8 scopes must be dropped before create_blob is called.
     // The IIFE ensures the &mut isolate borrow ends when the closure returns.
     let compile_result: Result<(), FailureOutput> = (|| {
-        let mut logs = LogBuffers::default();
+        let logs = LogBuffers::default();
 
         let scope = &mut v8::HandleScope::new(&mut isolate);
         let context = v8::Context::new(scope, Default::default());
@@ -834,16 +1079,13 @@ fn precompile_module(code: &str, filename: &str) -> Result<Vec<u8>, FailureOutpu
         };
 
         if evaluation.is_promise() {
-            let promise =
-                v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
-                    failure(
-                        RunError::Internal(
-                            "failed to inspect module evaluation promise".to_string(),
-                        ),
-                        &logs,
-                        start,
-                    )
-                })?;
+            let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
+                failure(
+                    RunError::Internal("failed to inspect module evaluation promise".to_string()),
+                    &logs,
+                    start,
+                )
+            })?;
             match promise.state() {
                 v8::PromiseState::Fulfilled => {}
                 v8::PromiseState::Rejected => {
@@ -879,9 +1121,7 @@ fn precompile_module(code: &str, filename: &str) -> Result<Vec<u8>, FailureOutpu
     snapshot_opt
         .map(|s| s.to_vec())
         .ok_or_else(|| FailureOutput {
-            error: RunError::Internal(
-                "V8 snapshot creation returned an empty blob".to_string(),
-            ),
+            error: RunError::Internal("V8 snapshot creation returned an empty blob".to_string()),
             stdout: Vec::new(),
             stderr: Vec::new(),
             duration_ms: start.elapsed().as_millis() as u64,
@@ -981,8 +1221,8 @@ fn cancel_guards(
 /// cancellation; this struct is defence-in-depth for error-path returns.
 struct GuardCanceller<'a> {
     cancel_wall: &'a crossbeam_channel::Sender<()>,
-    cancel_cpu:  &'a crossbeam_channel::Sender<()>,
-    budget:      &'a CpuBudget,
+    cancel_cpu: &'a crossbeam_channel::Sender<()>,
+    budget: &'a CpuBudget,
 }
 
 impl Drop for GuardCanceller<'_> {
@@ -990,7 +1230,6 @@ impl Drop for GuardCanceller<'_> {
         cancel_guards(self.cancel_wall, self.cancel_cpu, self.budget);
     }
 }
-
 
 // ── Bridge globals ───────────────────────────────────────────────────────────
 //
@@ -1010,9 +1249,10 @@ impl Drop for GuardCanceller<'_> {
 // fetch is NOT special. It gets the same callback as every other global.
 // The host handler decides what the arguments mean and what to return.
 
-/// Per-stub heap allocation passed as External data to `bridge_global_callback`.
-/// One instance per declared global name, allocated as `Box<GlobalCallbackData>`
-/// and kept alive for the duration of `run_module`.
+// Per-stub heap allocation passed as External data to `bridge_global_callback`.
+// One instance per declared global name, allocated as `Box<GlobalCallbackData>`
+// and kept alive for the duration of `run_module`.
+
 // ── Async bridge resolver map ────────────────────────────────────────────────
 //
 // Each bridge_global_callback creates a PromiseResolver and stores it here
@@ -1086,7 +1326,9 @@ fn bridge_global_callback(
     if data.max_bridge_calls > 0 {
         let prev = data.bridge_call_count.fetch_add(1, Ordering::Relaxed);
         if prev >= data.max_bridge_calls {
-            data.bridge_error.set(RunError::BridgeCallLimitExceeded).ok();
+            data.bridge_error
+                .set(RunError::BridgeCallLimitExceeded)
+                .ok();
             throw_v8_error(scope, "[iso4] bridge: maxBridgeCalls limit exceeded");
             return;
         }
@@ -1097,7 +1339,9 @@ fn bridge_global_callback(
     for i in 0..args.length() {
         let arg = args.get(i);
         if arg.is_function() {
-            data.bridge_error.set(RunError::FunctionArgumentNotSupported).ok();
+            data.bridge_error
+                .set(RunError::FunctionArgumentNotSupported)
+                .ok();
             throw_v8_error(scope, "[iso4] bridge: function arguments are not supported");
             return;
         }
@@ -1120,7 +1364,10 @@ fn bridge_global_callback(
         && bridge_call_payload.len() > data.max_bridge_payload_bytes as usize
     {
         data.bridge_error.set(RunError::BridgePayloadTooLarge).ok();
-        throw_v8_error(scope, "[iso4] bridge: call payload exceeds maxBridgePayloadBytes");
+        throw_v8_error(
+            scope,
+            "[iso4] bridge: call payload exceeds maxBridgePayloadBytes",
+        );
         return;
     }
 
@@ -1147,7 +1394,9 @@ fn bridge_global_callback(
         Some(r) => r,
         None => {
             data.bridge_error
-                .set(RunError::Internal("failed to create PromiseResolver".into()))
+                .set(RunError::Internal(
+                    "failed to create PromiseResolver".into(),
+                ))
                 .ok();
             throw_v8_error(scope, "[iso4] bridge: failed to create promise resolver");
             return;
@@ -1168,6 +1417,7 @@ fn bridge_global_callback(
 /// Each stub is an identical `bridge_global_callback` function with per-name
 /// `GlobalCallbackData` attached as External data. The boxes are pushed into
 /// `out_boxes` so their heap allocations outlive the V8 evaluation.
+#[allow(clippy::too_many_arguments)] // bridge setup genuinely needs all these params
 fn install_bridge_globals(
     scope: &mut v8::HandleScope,
     globals: &[String],
@@ -1178,6 +1428,9 @@ fn install_bridge_globals(
     bridge_call_count: Arc<AtomicU32>,
     max_bridge_calls: u32,
     resolver_map: PendingResolvers,
+    // Vec<Box<>> is intentional: raw pointers into each Box are passed to V8
+    // as External data — the address must not move on Vec reallocation.
+    #[allow(clippy::vec_box)]
     out_boxes: &mut Vec<Box<GlobalCallbackData>>,
 ) -> Result<(), RunError> {
     let global_obj = scope.get_current_context().global(scope);
@@ -1201,19 +1454,15 @@ fn install_bridge_globals(
         let function = v8::Function::builder(bridge_global_callback)
             .data(external.into())
             .build(scope)
-            .ok_or_else(|| RunError::Internal(
-                format!("failed to build bridge stub for '{name}'"),
-            ))?;
+            .ok_or_else(|| {
+                RunError::Internal(format!("failed to build bridge stub for '{name}'"))
+            })?;
 
         let key = v8::String::new(scope, name)
-            .ok_or_else(|| RunError::Internal(
-                format!("failed to intern global name '{name}'"),
-            ))?;
+            .ok_or_else(|| RunError::Internal(format!("failed to intern global name '{name}'")))?;
         global_obj
             .set(scope, key.into(), function.into())
-            .ok_or_else(|| RunError::Internal(
-                format!("failed to install global '{name}'"),
-            ))?;
+            .ok_or_else(|| RunError::Internal(format!("failed to install global '{name}'")))?;
     }
     Ok(())
 }
@@ -1228,8 +1477,8 @@ fn wire_to_v8_value<'s>(
 ) -> Option<v8::Local<'s, v8::Value>> {
     match value {
         WireValue::Undefined => Some(v8::undefined(scope).into()),
-        WireValue::Null      => Some(v8::null(scope).into()),
-        WireValue::Bool(b)   => Some(v8::Boolean::new(scope, *b).into()),
+        WireValue::Null => Some(v8::null(scope).into()),
+        WireValue::Bool(b) => Some(v8::Boolean::new(scope, *b).into()),
         WireValue::Number(n) => Some(v8::Number::new(scope, *n).into()),
         WireValue::String(s) => v8::String::new(scope, s).map(|s| s.into()),
         WireValue::BigInt(sign, words) => {
@@ -1240,9 +1489,7 @@ fn wire_to_v8_value<'s>(
         }
         WireValue::Bytes(b) => {
             let len = b.len();
-            let store =
-                v8::ArrayBuffer::new_backing_store_from_vec(b.to_vec())
-                    .make_shared();
+            let store = v8::ArrayBuffer::new_backing_store_from_vec(b.to_vec()).make_shared();
             let ab = v8::ArrayBuffer::with_backing_store(scope, &store);
             v8::Uint8Array::new(scope, ab, 0, len).map(|a| a.into())
         }
@@ -1250,9 +1497,7 @@ fn wire_to_v8_value<'s>(
             let array = v8::Array::new(scope, items.len() as i32);
             for (i, item) in items.iter().enumerate() {
                 let v = wire_to_v8_value(scope, item)?;
-                if array.set_index(scope, i as u32, v).is_none() {
-                    return None;
-                }
+                array.set_index(scope, i as u32, v)?;
             }
             Some(array.into())
         }
@@ -1271,9 +1516,7 @@ fn wire_to_v8_value<'s>(
                 }
                 let k = v8::String::new(scope, key)?;
                 let v = wire_to_v8_value(scope, val)?;
-                if obj.create_data_property(scope, k.into(), v).is_none() {
-                    return None;
-                }
+                obj.create_data_property(scope, k.into(), v)?;
             }
             Some(obj.into())
         }
@@ -1443,8 +1686,7 @@ fn check_and_push(
         let visited_local = v8::Local::new(scope.as_mut(), visited_global);
         if value.strict_equals(visited_local) {
             return Err(RunError::ExportNotSerializable(
-                "cyclic or self-referential structure detected in export value"
-                    .to_string(),
+                "cyclic or self-referential structure detected in export value".to_string(),
             ));
         }
     }
@@ -1488,9 +1730,7 @@ fn serialize_object_fields(
         let name = name_value
             .to_string(scope)
             .map(|s| s.to_rust_string_lossy(scope))
-            .ok_or_else(|| {
-                RunError::Internal("failed to stringify property name".to_string())
-            })?;
+            .ok_or_else(|| RunError::Internal("failed to stringify property name".to_string()))?;
         // Drop "__proto__" before it crosses the bridge.  Protocol policy:
         // "__proto__" keys are silently elided in both directions — here
         // (sandbox→host) and in `wire_to_v8_value` (host→sandbox).
@@ -1545,9 +1785,7 @@ fn value_to_wire(
         let s = value
             .to_string(scope)
             .map(|s| s.to_rust_string_lossy(scope))
-            .ok_or_else(|| {
-                RunError::Internal("failed to convert V8 string value".to_string())
-            })?;
+            .ok_or_else(|| RunError::Internal("failed to convert V8 string value".to_string()))?;
         return Ok(WireValue::String(s));
     }
     if value.is_big_int() {
@@ -1675,6 +1913,12 @@ mod tests {
     use crate::wire::WireValue;
 
     /// Shorthand: run a code string and return the full Output or RunError.
+    /// Run code with explicit limits. Used for limit-enforcement tests.
+    fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
+        init_platform();
+        run_module(code, filename, None, limits, &[], None, Arc::new(AtomicU32::new(0)))
+    }
+
     fn run(code: &str) -> Result<Output, RunError> {
         run_code(code, "<iso4>", Limits::default()).map_err(|failure| failure.error)
     }
@@ -1709,7 +1953,10 @@ mod tests {
     /// Look up a field in the top-level exports Object by name.
     fn get_field(out: &Output, key: &str) -> Option<WireValue> {
         if let WireValue::Object(fields) = &out.exports {
-            fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
         } else {
             None
         }
@@ -1754,9 +2001,13 @@ mod tests {
                 rem = cur % 10;
             }
             digits.push(char::from_digit(rem as u32, 10).unwrap());
-            if buf.iter().all(|&w| w == 0) { break; }
+            if buf.iter().all(|&w| w == 0) {
+                break;
+            }
         }
-        if sign { digits.push('-'); }
+        if sign {
+            digits.push('-');
+        }
         digits.chars().rev().collect()
     }
 
@@ -1786,8 +2037,7 @@ mod tests {
             WireValue::BigInt(sign, words) => words_to_decimal(*sign, words),
             WireValue::Bytes(_) => "[Uint8Array]".to_string(),
             WireValue::Array(items) => {
-                let parts: Vec<String> =
-                    items.iter().map(wire_to_display_str).collect();
+                let parts: Vec<String> = items.iter().map(wire_to_display_str).collect();
                 format!("[{}]", parts.join(","))
             }
             WireValue::Object(fields) => {
@@ -2083,7 +2333,10 @@ mod tests {
     /// Helper: look up a key inside a `WireValue::Object`, returning the value.
     fn wire_obj_get(v: &WireValue, key: &str) -> Option<WireValue> {
         if let WireValue::Object(fields) = v {
-            fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
         } else {
             None
         }
@@ -2103,13 +2356,19 @@ mod tests {
             "#,
         );
         let default_val = get_field(&out, "default").unwrap();
-        assert_eq!(wire_obj_get(&default_val, "result"), Some(WireValue::Number(5050.0)));
+        assert_eq!(
+            wire_obj_get(&default_val, "result"),
+            Some(WireValue::Number(5050.0))
+        );
         let meta = wire_obj_get(&default_val, "metadata").unwrap();
         assert_eq!(
             wire_obj_get(&meta, "label"),
             Some(WireValue::String("sum_1_to_100".to_string()))
         );
-        assert_eq!(wire_obj_get(&meta, "iterations"), Some(WireValue::Number(100.0)));
+        assert_eq!(
+            wire_obj_get(&meta, "iterations"),
+            Some(WireValue::Number(100.0))
+        );
     }
 
     #[test]
@@ -2129,9 +2388,7 @@ mod tests {
     #[test]
     fn object_in_second_object_in_array() {
         // Array → Object → Object nesting.
-        let out = run_ok(
-            r#"export default [{ outer: { inner: 42 } }, { x: [1, 2, 3] }]"#,
-        );
+        let out = run_ok(r#"export default [{ outer: { inner: 42 } }, { x: [1, 2, 3] }]"#);
         let val = get_field(&out, "default").unwrap();
         if let WireValue::Array(items) = val {
             let inner = wire_obj_get(&wire_obj_get(&items[0], "outer").unwrap(), "inner");
@@ -2153,15 +2410,16 @@ mod tests {
     #[test]
     fn deep_alternating_nesting_array_object_array_object() {
         // Object → Array → Object → Array → Number
-        let out = run_ok(
-            r#"export default { a: [{ b: [{ c: 42 }, { d: "hello" }] }] }"#,
-        );
+        let out = run_ok(r#"export default { a: [{ b: [{ c: 42 }, { d: "hello" }] }] }"#);
         let default_val = get_field(&out, "default").unwrap();
         let a = wire_obj_get(&default_val, "a").unwrap();
         if let WireValue::Array(a_items) = a {
             let b = wire_obj_get(&a_items[0], "b").unwrap();
             if let WireValue::Array(b_items) = b {
-                assert_eq!(wire_obj_get(&b_items[0], "c"), Some(WireValue::Number(42.0)));
+                assert_eq!(
+                    wire_obj_get(&b_items[0], "c"),
+                    Some(WireValue::Number(42.0))
+                );
                 assert_eq!(
                     wire_obj_get(&b_items[1], "d"),
                     Some(WireValue::String("hello".to_string()))
@@ -2261,8 +2519,14 @@ mod tests {
             "#,
         );
         let default_val = get_field(&out, "default").unwrap();
-        assert_eq!(wire_obj_get(&wire_obj_get(&default_val, "a").unwrap(), "x"), Some(WireValue::Number(1.0)));
-        assert_eq!(wire_obj_get(&wire_obj_get(&default_val, "b").unwrap(), "x"), Some(WireValue::Number(1.0)));
+        assert_eq!(
+            wire_obj_get(&wire_obj_get(&default_val, "a").unwrap(), "x"),
+            Some(WireValue::Number(1.0))
+        );
+        assert_eq!(
+            wire_obj_get(&wire_obj_get(&default_val, "b").unwrap(), "x"),
+            Some(WireValue::Number(1.0))
+        );
     }
 
     #[test]
@@ -2279,7 +2543,10 @@ mod tests {
             WireValue::Number(2.0),
             WireValue::Number(3.0),
         ]);
-        assert_eq!(wire_obj_get(&default_val, "first"), Some(expected_arr.clone()));
+        assert_eq!(
+            wire_obj_get(&default_val, "first"),
+            Some(expected_arr.clone())
+        );
         assert_eq!(wire_obj_get(&default_val, "second"), Some(expected_arr));
     }
 
@@ -2288,14 +2555,20 @@ mod tests {
     #[test]
     fn bigint_positive_roundtrips() {
         let out = run_ok("export default 42n");
-        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt(false, vec![42])));
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::BigInt(false, vec![42]))
+        );
         assert_eq!(get_default(&out).as_deref(), Some("42"));
     }
 
     #[test]
     fn bigint_negative_roundtrips() {
         let out = run_ok("export default -100n");
-        assert_eq!(get_field(&out, "default"), Some(WireValue::BigInt(true, vec![100])));
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::BigInt(true, vec![100]))
+        );
         assert_eq!(get_default(&out).as_deref(), Some("-100"));
     }
 
@@ -2304,7 +2577,9 @@ mod tests {
         let out = run_ok("export default 0n");
         // V8 word_count() for 0n is 0; words slice is empty.
         let field = get_field(&out, "default").unwrap();
-        assert!(matches!(field, WireValue::BigInt(false, ref w) if w.is_empty() || w.iter().all(|&x| x == 0)));
+        assert!(
+            matches!(field, WireValue::BigInt(false, ref w) if w.is_empty() || w.iter().all(|&x| x == 0))
+        );
         assert_eq!(get_default(&out).as_deref(), Some("0"));
     }
 
@@ -2349,10 +2624,18 @@ mod tests {
         let (out, h) = run_with_bridge(
             "export default await getBig()",
             "getBig",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             move |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &large)).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &large),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
@@ -2463,7 +2746,11 @@ mod tests {
         let err = run_code(
             "while(true) {}",
             "<test>",
-            Limits { cpu_time_ms: 200, wall_time_ms: 1_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 200,
+                wall_time_ms: 1_000,
+                ..Default::default()
+            },
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -2478,8 +2765,13 @@ mod tests {
         let out = run_code(
             "export default 42",
             "<test>",
-            Limits { cpu_time_ms: 0, wall_time_ms: 0, ..Default::default() },
-        ).unwrap();
+            Limits {
+                cpu_time_ms: 0,
+                wall_time_ms: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42"));
     }
 
@@ -2488,8 +2780,13 @@ mod tests {
         let out = run_code(
             "let s = 0; for (let i = 0; i < 10_000; i++) s += i; export default s",
             "<test>",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
-        ).unwrap();
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("49995000"));
     }
 
@@ -2500,7 +2797,11 @@ mod tests {
             &snapshot,
             "while (true) {}",
             None,
-            Limits { cpu_time_ms: 200, wall_time_ms: 1_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 200,
+                wall_time_ms: 1_000,
+                ..Default::default()
+            },
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
@@ -2518,7 +2819,11 @@ mod tests {
         let err = run_code(
             "for (let i = 0;;) i++",
             "<test>",
-            Limits { cpu_time_ms: 200, wall_time_ms: 1_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 200,
+                wall_time_ms: 1_000,
+                ..Default::default()
+            },
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -2530,7 +2835,11 @@ mod tests {
         let err = run_code(
             "function inf(n) { return inf(n + 1); } export default inf(0)",
             "<test>",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -2545,7 +2854,11 @@ mod tests {
         let err = run_code(
             "while (true) {}",
             "<test>",
-            Limits { cpu_time_ms: 30_000, wall_time_ms: 1, ..Default::default() },
+            Limits {
+                cpu_time_ms: 30_000,
+                wall_time_ms: 1,
+                ..Default::default()
+            },
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -2556,15 +2869,51 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires memory limit (Phase 8)"]
-    fn allocating_too_much_memory_is_memory_limit() {
-        let err = run_err(
+    fn allocating_too_much_memory_via_heap_is_memory_limit() {
+        // V8 heap objects (strings): covered by heap_limits + near-heap callback.
+        let err = run_code(
+            r#"
+            const arrays = [];
+            while (true) { arrays.push('x'.repeat(1_000_000)); }
+            "#,
+            "<test>",
+            Limits {
+                memory_mb: 32,
+                wall_time_ms: 10_000,
+                cpu_time_ms: 10_000,
+                ..Default::default()
+            },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::MemoryLimit),
+            "expected MemoryLimit, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn allocating_too_much_memory_via_typed_array_is_memory_limit() {
+        // ArrayBuffer backing stores: covered by the custom BudgetAllocState.
+        let err = run_code(
             r#"
             const arrays = [];
             while (true) { arrays.push(new Uint8Array(1024 * 1024)); }
             "#,
+            "<test>",
+            Limits {
+                memory_mb: 32,
+                wall_time_ms: 10_000,
+                cpu_time_ms: 10_000,
+                ..Default::default()
+            },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::MemoryLimit),
+            "expected MemoryLimit, got {err:?}"
         );
-        assert!(matches!(err, RunError::MemoryLimit));
     }
 
     #[test]
@@ -2580,7 +2929,11 @@ mod tests {
         let err = run_code(
             "let i = 0; while (true) { i++; }",
             "<test>",
-            Limits { wall_time_ms: 200, cpu_time_ms: 30_000, ..Default::default() },
+            Limits {
+                wall_time_ms: 200,
+                cpu_time_ms: 30_000,
+                ..Default::default()
+            },
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -2814,15 +3167,32 @@ mod tests {
         // Module-scoped `const` stays in the prefix module's scope.
         // Use globalThis to share values with the postfix module.
         let snapshot = precompile("globalThis.base = 100", None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.base + 1", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0)))
-            .unwrap();
+        let out = execute_with_prefix(
+            &snapshot,
+            "export default globalThis.base + 1",
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("101"));
     }
 
     #[test]
     fn execute_with_prefix_global_mutation_visible_in_postfix() {
         let snapshot = precompile("globalThis.answer = 42", None).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.answer", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
+        let out = execute_with_prefix(
+            &snapshot,
+            "export default globalThis.answer",
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42"));
     }
 
@@ -2830,9 +3200,36 @@ mod tests {
     fn execute_with_prefix_multiple_postfixes_are_independent() {
         let snapshot = precompile("globalThis.base = 10", None).unwrap();
         let b = "globalThis.base";
-        let out1 = execute_with_prefix(&snapshot, &format!("export default {b} * 2"), None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
-        let out2 = execute_with_prefix(&snapshot, &format!("export default {b} * 3"), None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
-        let out3 = execute_with_prefix(&snapshot, &format!("export default {b} * 4"), None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
+        let out1 = execute_with_prefix(
+            &snapshot,
+            &format!("export default {b} * 2"),
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        let out2 = execute_with_prefix(
+            &snapshot,
+            &format!("export default {b} * 3"),
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        let out3 = execute_with_prefix(
+            &snapshot,
+            &format!("export default {b} * 4"),
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
         assert_eq!(get_default(&out1).as_deref(), Some("20"));
         assert_eq!(get_default(&out2).as_deref(), Some("30"));
         assert_eq!(get_default(&out3).as_deref(), Some("40"));
@@ -2841,8 +3238,26 @@ mod tests {
     #[test]
     fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
         let snapshot = precompile("globalThis.counter = 0", None).unwrap();
-        execute_with_prefix(&snapshot, "globalThis.counter = 99; export default 1", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.counter", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
+        execute_with_prefix(
+            &snapshot,
+            "globalThis.counter = 99; export default 1",
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        let out = execute_with_prefix(
+            &snapshot,
+            "export default globalThis.counter",
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("0"));
     }
 
@@ -2851,8 +3266,18 @@ mod tests {
         let snapshot = precompile(
             r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
             None,
-        ).unwrap();
-        let out = execute_with_prefix(&snapshot, "export default globalThis.sq[7]", None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0))).unwrap();
+        )
+        .unwrap();
+        let out = execute_with_prefix(
+            &snapshot,
+            "export default globalThis.sq[7]",
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("49"));
     }
 
@@ -2867,15 +3292,24 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(out.stdout.iter().any(|l| l.contains("hello from postfix")));
     }
 
     #[test]
     fn execute_with_prefix_postfix_runtime_error_is_reported() {
         let snapshot = precompile("", None).unwrap();
-        let err = execute_with_prefix(&snapshot, r#"throw new Error("postfix failed")"#, None, Limits::default(), &[], None, Arc::new(AtomicU32::new(0)))
-            .unwrap_err();
+        let err = execute_with_prefix(
+            &snapshot,
+            r#"throw new Error("postfix failed")"#,
+            None,
+            Limits::default(),
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError { .. }));
     }
 
@@ -2987,20 +3421,28 @@ mod tests {
                 &mut server,
                 ipc::TsToRustMessageType::BridgeResponse,
                 &payload,
-            ).unwrap();
+            )
+            .unwrap();
         });
 
         let out = execute(
             "export default await myTool()",
             None,
-            Limits { cpu_time_ms: 50, wall_time_ms: 5_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 50,
+                wall_time_ms: 5_000,
+                ..Default::default()
+            },
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
         );
         responder.join().unwrap();
-        assert!(out.is_ok(), "expected Ok (bridge wait excluded from cpu), got: {:?}",
-            out.map_err(|f| f.error));
+        assert!(
+            out.is_ok(),
+            "expected Ok (bridge wait excluded from cpu), got: {:?}",
+            out.map_err(|f| f.error)
+        );
     }
 
     #[test]
@@ -3008,10 +3450,18 @@ mod tests {
         let err = run_code(
             "let x = 0; while (true) x++;",
             "<test>",
-            Limits { cpu_time_ms: 100, wall_time_ms: 5_000, ..Default::default() },
-        ).map_err(|f| f.error).unwrap_err();
-        assert!(matches!(err, RunError::CpuTimeout),
-            "expected CpuTimeout, got {err:?}");
+            Limits {
+                cpu_time_ms: 100,
+                wall_time_ms: 5_000,
+                ..Default::default()
+            },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CpuTimeout),
+            "expected CpuTimeout, got {err:?}"
+        );
     }
 
     // ── Bridge tests ───────────────────────────────────────────────────────────────────
@@ -3071,7 +3521,11 @@ mod tests {
         let fd = client.as_raw_fd();
         let handle = spawn_responder(server, respond);
         let result = execute(
-            code, None, limits, &[global.to_string()], Some(fd),
+            code,
+            None,
+            limits,
+            &[global.to_string()],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         );
         (result, handle)
@@ -3082,10 +3536,18 @@ mod tests {
         let (out, h) = run_with_bridge(
             "export default await myTool()",
             "myTool",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Number(42.0))).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::Number(42.0)),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
@@ -3097,10 +3559,18 @@ mod tests {
         let (out, h) = run_with_bridge(
             "export default await myTool()",
             "myTool",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::String("hello bridge".into()))).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::String("hello bridge".into())),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
@@ -3125,18 +3595,27 @@ mod tests {
             // Spot-check the arg count field (offset 13)
             let arg_count = u32::from_be_bytes(frame.payload[13..17].try_into().unwrap());
             assert_eq!(arg_count, 1);
-            ipc::write_ts_to_rust_frame(&mut server, ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(0, &WireValue::Number(99.0))).unwrap();
+            ipc::write_ts_to_rust_frame(
+                &mut server,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(0, &WireValue::Number(99.0)),
+            )
+            .unwrap();
         });
 
         let out = execute(
             "export default await add(7)",
             None,
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             &["add".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap();
+        )
+        .unwrap();
         responder.join().unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("99"));
     }
@@ -3146,16 +3625,26 @@ mod tests {
         let (result, h) = run_with_bridge(
             "export default await myTool()",
             "myTool",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err(0, "handler blew up")).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_err(0, "handler blew up"),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
         let err = result.unwrap_err().error;
-        assert!(matches!(err, RunError::HostBridge(ref m) if m.contains("handler blew up")),
-            "expected HostBridge, got {err:?}");
+        assert!(
+            matches!(err, RunError::HostBridge(ref m) if m.contains("handler blew up")),
+            "expected HostBridge, got {err:?}"
+        );
     }
 
     #[test]
@@ -3169,7 +3658,9 @@ mod tests {
 
         // The bridge errors before writing to the socket, so no frame arrives.
         // Give the server a short read timeout to avoid hanging.
-        server.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        server
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
         let responder = std::thread::spawn(move || {
             let _ = ipc::read_rust_to_ts_frame(&mut server); // may timeout — ignore
         });
@@ -3177,15 +3668,23 @@ mod tests {
         let err = execute(
             "export default await myTool(() => 42)",
             None,
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
 
         responder.join().unwrap();
-        assert!(matches!(err, RunError::FunctionArgumentNotSupported),
-            "expected FunctionArgumentNotSupported, got {err:?}");
+        assert!(
+            matches!(err, RunError::FunctionArgumentNotSupported),
+            "expected FunctionArgumentNotSupported, got {err:?}"
+        );
     }
 
     #[test]
@@ -3199,7 +3698,9 @@ mod tests {
         let fd = client.as_raw_fd();
 
         // The bridge aborts before writing to the socket, so no frame arrives.
-        server.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        server
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
         let responder = std::thread::spawn(move || {
             let _ = ipc::read_rust_to_ts_frame(&mut server); // may timeout — ignore
         });
@@ -3217,11 +3718,15 @@ mod tests {
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
 
         responder.join().unwrap();
-        assert!(matches!(err, RunError::BridgePayloadTooLarge),
-            "expected BridgePayloadTooLarge, got {err:?}");
+        assert!(
+            matches!(err, RunError::BridgePayloadTooLarge),
+            "expected BridgePayloadTooLarge, got {err:?}"
+        );
     }
 
     #[test]
@@ -3244,14 +3749,20 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::String(long_str_clone))).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::String(long_str_clone)),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
         let err = result.unwrap_err().error;
-        assert!(matches!(err, RunError::BridgePayloadTooLarge),
-            "expected BridgePayloadTooLarge, got {err:?}");
+        assert!(
+            matches!(err, RunError::BridgePayloadTooLarge),
+            "expected BridgePayloadTooLarge, got {err:?}"
+        );
     }
 
     #[test]
@@ -3268,8 +3779,12 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Number(7.0))).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::Number(7.0)),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
@@ -3289,8 +3804,12 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::String("big payload".into()))).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::String("big payload".into())),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
@@ -3310,14 +3829,22 @@ mod tests {
         let err = execute(
             "export default await myTool()",
             None,
-            Limits { cpu_time_ms: 10_000, wall_time_ms: 300, ..Default::default() },
+            Limits {
+                cpu_time_ms: 10_000,
+                wall_time_ms: 300,
+                ..Default::default()
+            },
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
 
-        assert!(matches!(err, RunError::WallTimeout),
-            "expected WallTimeout, got {err:?}");
+        assert!(
+            matches!(err, RunError::WallTimeout),
+            "expected WallTimeout, got {err:?}"
+        );
     }
 
     #[test]
@@ -3325,13 +3852,24 @@ mod tests {
         let (out, h) = run_with_bridge(
             "const r = await myTool(); export default r.x + r.y",
             "myTool",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             |s| {
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Object(vec![
-                        ("x".to_string(), WireValue::Number(3.0)),
-                        ("y".to_string(), WireValue::Number(4.0)),
-                    ]))).unwrap();
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(
+                        0,
+                        &WireValue::Object(vec![
+                            ("x".to_string(), WireValue::Number(3.0)),
+                            ("y".to_string(), WireValue::Number(4.0)),
+                        ]),
+                    ),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
@@ -3352,11 +3890,17 @@ mod tests {
         let err = execute(
             "export default await myTool()",
             None,
-            Limits { wall_time_ms: 200, cpu_time_ms: 30_000, ..Default::default() },
+            Limits {
+                wall_time_ms: 200,
+                cpu_time_ms: 30_000,
+                ..Default::default()
+            },
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
         assert!(matches!(err, RunError::WallTimeout), "got {err:?}");
     }
 
@@ -3372,17 +3916,25 @@ mod tests {
             "const r = await myTool(); \
              export default Object.getOwnPropertyNames(r).sort().join(',')",
             "myTool",
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             |s| {
                 ipc::write_ts_to_rust_frame(
                     s,
                     ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Object(vec![
-                        ("x".to_string(),         WireValue::Number(1.0)),
-                        ("__proto__".to_string(), WireValue::Number(99.0)),
-                        ("y".to_string(),         WireValue::Number(2.0)),
-                    ])),
-                ).unwrap();
+                    &bridge_resp_ok(
+                        0,
+                        &WireValue::Object(vec![
+                            ("x".to_string(), WireValue::Number(1.0)),
+                            ("__proto__".to_string(), WireValue::Number(99.0)),
+                            ("y".to_string(), WireValue::Number(2.0)),
+                        ]),
+                    ),
+                )
+                .unwrap();
             },
         );
         h.join().unwrap();
@@ -3401,7 +3953,9 @@ mod tests {
         value: WireValue,
     ) -> usize {
         let mut count = 0;
-        server.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        server
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
         while count < max {
             match ipc::read_rust_to_ts_frame(&mut server) {
                 Ok(frame) if frame.message_type == ipc::RustToTsMessageType::BridgeCall => {
@@ -3412,7 +3966,9 @@ mod tests {
                         &mut server,
                         ipc::TsToRustMessageType::BridgeResponse,
                         &resp,
-                    ).is_err() {
+                    )
+                    .is_err()
+                    {
                         break;
                     }
                     count += 1;
@@ -3433,9 +3989,8 @@ mod tests {
         let client = ManuallyDrop::new(client);
         let fd = client.as_raw_fd();
 
-        let handle = std::thread::spawn(move || {
-            drain_bridge_calls(server, 10, WireValue::Number(1.0))
-        });
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
 
         let err = execute(
             // 5 sequential awaited calls
@@ -3456,13 +4011,20 @@ mod tests {
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
 
         let calls_handled = handle.join().unwrap();
-        assert!(matches!(err, RunError::BridgeCallLimitExceeded),
-            "expected BridgeCallLimitExceeded, got {err:?}");
+        assert!(
+            matches!(err, RunError::BridgeCallLimitExceeded),
+            "expected BridgeCallLimitExceeded, got {err:?}"
+        );
         // Exactly 3 calls should have reached the host before the 4th was blocked.
-        assert_eq!(calls_handled, 3, "expected 3 calls to reach host, got {calls_handled}");
+        assert_eq!(
+            calls_handled, 3,
+            "expected 3 calls to reach host, got {calls_handled}"
+        );
     }
 
     #[test]
@@ -3475,9 +4037,8 @@ mod tests {
         let client = ManuallyDrop::new(client);
         let fd = client.as_raw_fd();
 
-        let handle = std::thread::spawn(move || {
-            drain_bridge_calls(server, 5, WireValue::Number(10.0))
-        });
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 5, WireValue::Number(10.0)));
 
         let out = execute(
             "let n = 0; \
@@ -3497,7 +4058,8 @@ mod tests {
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap();
+        )
+        .unwrap();
 
         handle.join().unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("50"));
@@ -3512,9 +4074,8 @@ mod tests {
         let client = ManuallyDrop::new(client);
         let fd = client.as_raw_fd();
 
-        let handle = std::thread::spawn(move || {
-            drain_bridge_calls(server, 10, WireValue::Number(1.0))
-        });
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
 
         let out = execute(
             "let n = 0; \
@@ -3532,7 +4093,8 @@ mod tests {
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap();
+        )
+        .unwrap();
 
         handle.join().unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("3"));
@@ -3549,9 +4111,8 @@ mod tests {
         let fd = client.as_raw_fd();
 
         // Respond to up to 4 bridge calls, regardless of which global.
-        let handle = std::thread::spawn(move || {
-            drain_bridge_calls(server, 4, WireValue::Number(1.0))
-        });
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 4, WireValue::Number(1.0)));
 
         let err = execute(
             // 2 calls to toolA + 2 calls to toolB = 4 total; limit = 3
@@ -3567,12 +4128,19 @@ mod tests {
             &["toolA".to_string(), "toolB".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
 
         let calls_handled = handle.join().unwrap();
-        assert!(matches!(err, RunError::BridgeCallLimitExceeded),
-            "expected BridgeCallLimitExceeded, got {err:?}");
-        assert_eq!(calls_handled, 3, "expected 3 calls before limit, got {calls_handled}");
+        assert!(
+            matches!(err, RunError::BridgeCallLimitExceeded),
+            "expected BridgeCallLimitExceeded, got {err:?}"
+        );
+        assert_eq!(
+            calls_handled, 3,
+            "expected 3 calls before limit, got {calls_handled}"
+        );
     }
 
     // ── callId validation ──────────────────────────────────────────────────
@@ -3598,21 +4166,30 @@ mod tests {
                 &mut server,
                 ipc::TsToRustMessageType::BridgeResponse,
                 &bridge_resp_ok(wrong_call_id, &WireValue::Number(1.0)),
-            ).unwrap();
+            )
+            .unwrap();
         });
 
         let err = execute(
             "export default await myTool()",
             None,
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             &["myTool".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
 
         handle.join().unwrap();
-        assert!(matches!(err, RunError::Internal(_)),
-            "expected Internal (callId mismatch), got {err:?}");
+        assert!(
+            matches!(err, RunError::Internal(_)),
+            "expected Internal (callId mismatch), got {err:?}"
+        );
     }
 
     #[test]
@@ -3638,18 +4215,24 @@ mod tests {
                 &mut server1,
                 ipc::TsToRustMessageType::BridgeResponse,
                 &bridge_resp_ok(cid, &WireValue::Number(1.0)),
-            ).unwrap();
+            )
+            .unwrap();
             cid // return the callId run 1 used
         });
 
         let out = execute(
             "export default await myTool()",
             None,
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             &["myTool".to_string()],
             Some(fd1),
             Arc::clone(&counter),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("1"));
         let run1_call_id = h1.join().unwrap();
         assert_eq!(run1_call_id, 0, "run 1 should use callId=0");
@@ -3668,24 +4251,35 @@ mod tests {
                 &mut server2,
                 ipc::TsToRustMessageType::BridgeResponse,
                 &bridge_resp_ok(run1_call_id, &WireValue::Number(99.0)), // stale callId=0
-            ).unwrap();
+            )
+            .unwrap();
             cid // return callId run 2 expected
         });
 
         let err = execute(
             "export default await myTool()",
             None,
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             &["myTool".to_string()],
             Some(fd2),
             Arc::clone(&counter),
-        ).unwrap_err().error;
+        )
+        .unwrap_err()
+        .error;
 
         let run2_call_id = h2.join().unwrap();
-        assert!(run2_call_id > run1_call_id,
-            "run 2 callId ({run2_call_id}) must be > run 1 callId ({run1_call_id})");
-        assert!(matches!(err, RunError::Internal(_)),
-            "expected Internal (stale callId rejected), got {err:?}");
+        assert!(
+            run2_call_id > run1_call_id,
+            "run 2 callId ({run2_call_id}) must be > run 1 callId ({run1_call_id})"
+        );
+        assert!(
+            matches!(err, RunError::Internal(_)),
+            "expected Internal (stale callId rejected), got {err:?}"
+        );
     }
 
     // ── Concurrent bridge calls (D11) ───────────────────────────────────────────────────
@@ -3712,12 +4306,18 @@ mod tests {
             // Respond in reverse order: second call gets 20, first gets 10.
             // The poll loop must route cid2 → toolB resolver (20)
             // and cid1 → toolA resolver (10) regardless of order.
-            ipc::write_ts_to_rust_frame(&mut server,
+            ipc::write_ts_to_rust_frame(
+                &mut server,
                 ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(cid2, &WireValue::Number(20.0))).unwrap();
-            ipc::write_ts_to_rust_frame(&mut server,
+                &bridge_resp_ok(cid2, &WireValue::Number(20.0)),
+            )
+            .unwrap();
+            ipc::write_ts_to_rust_frame(
+                &mut server,
                 ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(cid1, &WireValue::Number(10.0))).unwrap();
+                &bridge_resp_ok(cid1, &WireValue::Number(10.0)),
+            )
+            .unwrap();
         });
 
         let out = execute(
@@ -3725,11 +4325,16 @@ mod tests {
             "const [a, b] = await Promise.all([toolA(), toolB()]); \
              export default a + b",
             None,
-            Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
             &["toolA".to_string(), "toolB".to_string()],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-        ).unwrap();
+        )
+        .unwrap();
 
         handle.join().unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("30"));
@@ -3754,9 +4359,12 @@ mod tests {
             }
             // Respond in reverse.
             for (i, &cid) in call_ids.iter().rev().enumerate() {
-                ipc::write_ts_to_rust_frame(&mut server,
+                ipc::write_ts_to_rust_frame(
+                    &mut server,
                     ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(cid, &WireValue::Number((i as f64 + 1.0) * 10.0))).unwrap();
+                    &bridge_resp_ok(cid, &WireValue::Number((i as f64 + 1.0) * 10.0)),
+                )
+                .unwrap();
             }
         });
 
@@ -3781,12 +4389,14 @@ mod tests {
         // enumerable property via Object.defineProperty (a plain object
         // literal `{ __proto__: x }` sets the prototype instead).
         // serialize_object_fields must drop it before crossing to the host.
-        let out = run_ok(r#"
+        let out = run_ok(
+            r#"
             const obj = {};
             Object.defineProperty(obj, '__proto__', { value: 99, enumerable: true });
             obj.x = 1;
             export default obj;
-        "#);
+        "#,
+        );
         let default_val = get_field(&out, "default").unwrap();
         if let WireValue::Object(fields) = default_val {
             let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
