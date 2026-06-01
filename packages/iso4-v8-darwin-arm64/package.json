@@ -5,6 +5,11 @@
   "description": "Native iso4 V8 runtime binary for darwin-arm64",
   "license": "MIT",
   "author": "schplitt",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schplitt/iso4.git",
+    "directory": "packages/iso4-v8-darwin-arm64"
+  },
   "exports": {
     ".": "./index.js",
     "./bin/iso4-v8": "./bin/iso4-v8"

@@ -23,16 +23,14 @@
     "lint": "eslint",
     "lint:fix": "eslint --fix",
     "typecheck": "pnpm -r --filter=\"./packages/*\" typecheck",
-    "changeset": "changeset",
-    "changeset:version": "changeset version && pnpm install --lockfile-only",
-    "changeset:publish": "changeset publish",
-    "prerelease": "pnpm lint && pnpm typecheck && pnpm build && pnpm test:run",
+    "release": "pnpm fmt:native:check && pnpm lint:native && pnpm lint && pnpm typecheck && pnpm build:dev && pnpm test:run && changeset",
     "build:native": "node scripts/build-native.ts --release",
     "build:native:dev": "node scripts/build-native.ts",
     "check:native": "cargo check --manifest-path native/v8-runtime/Cargo.toml",
     "test:native": "cargo test --manifest-path native/v8-runtime/Cargo.toml",
     "lint:native": "cargo clippy --manifest-path native/v8-runtime/Cargo.toml -- -D warnings",
-    "fmt:native": "cargo fmt --manifest-path native/v8-runtime/Cargo.toml"
+    "fmt:native": "cargo fmt --manifest-path native/v8-runtime/Cargo.toml",
+    "fmt:native:check": "cargo fmt --check --manifest-path native/v8-runtime/Cargo.toml"
   },
   "devDependencies": {
     "@changesets/cli": "catalog:",
