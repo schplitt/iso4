@@ -1,6 +1,6 @@
 {
   "name": "@iso4/sandbox",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "type": "module",
   "description": "Fast, sandboxed V8 isolate runtime for agent-generated JavaScript. Two-process architecture for crash isolation.",
   "keywords": [
