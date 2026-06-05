@@ -143,10 +143,11 @@ describe('RuntimeIpcClient', () => {
     const dispatched: unknown[] = []
     const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
     const raw = await client.runRawCode('export default 1', {
-      globals: { greet: () => null },
-      dispatcher: async (_name: any, args: any) => {
-        dispatched.push(args[0])
-        return 'hello'
+      globals: {
+        greet: (...args: unknown[]) => {
+          dispatched.push(args[0])
+          return 'hello'
+        },
       },
     })
     expect(Buffer.from(raw.result).toString('utf8')).toBe('payload')
