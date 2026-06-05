@@ -300,16 +300,16 @@ socket immediately on version or token mismatch.
 
 `ResourceLimits`:
 
-| Field                   | Encoding | Notes                                                                                                                                                                                                             |
-| ----------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memoryMb`              | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `cpuTimeMs`             | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `wallTimeMs`            | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `maxExportBytes`        | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `maxStdoutBytes`        | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `maxStderrBytes`        | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `maxBridgePayloadBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` or `BridgeResponsePayload`. Zero = no limit (framing cap of 64 MiB applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`.                                          |
-| `maxBridgeCalls`        | `u32`    | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. TS default: `10` when the host does not set an explicit value. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`. |
+| Field                | Encoding | Notes                                                                                                                                                                                                             |
+| -------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memoryMb`           | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `cpuTimeMs`          | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `wallTimeMs`         | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
+| `maxExportBytes`     | `u32`    | Max serialised byte length of the export `WireValue`. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                                                                        |
+| `maxStdoutBytes`     | `u32`    | Max bytes captured across all stdout lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                                                                                |
+| `maxStderrBytes`     | `u32`    | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                                                                                |
+| `maxBridgeCallBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`.                                                  |
+| `maxBridgeCalls`     | `u32`    | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. TS default: `10` when the host does not set an explicit value. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`. |
 
 `HostGlobalBinding`:
 
@@ -359,13 +359,26 @@ Bridge calls are sequential within a single run in v1: Rust sends one
 `BridgeCall` and waits for the matching `BridgeResponse` before continuing JS
 execution.
 
-**`maxBridgePayloadBytes` enforcement:** When non-zero, Rust checks the encoded
+**`maxBridgeCallBytes` enforcement:** When non-zero, Rust checks the encoded
 `BridgeCallPayload` byte length before writing it to the socket. If the payload
 exceeds the limit the run terminates with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` without
-performing any I/O. Rust also checks the `BridgeResponsePayload` byte length
-immediately after reading the frame; if it exceeds the limit the run terminates
-with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` before decoding the payload. The fallback
-cap is the framing layer's 64 MiB `DEFAULT_MAX_FRAME_LENGTH`.
+performing any I/O.
+
+**BridgeResponse frame cap:** `BridgeResponse` frames are read with
+`read_frame_with_limit(memoryMb × 1 MiB)`. The sandbox cannot hold a response
+larger than its own memory budget, so `memoryMb` is the natural and only limit.
+When `memoryMb = 0` (unconstrained) the fallback is the global 64 MiB
+`DEFAULT_MAX_FRAME_LENGTH`. There is no separate per-response configuration
+field — to allow responses larger than 64 MiB, increase `memoryMb`.
+
+**`maxExportBytes` enforcement:** After all exports are serialised to a `WireValue`,
+Rust encodes the value to bytes and checks the length against `maxExportBytes`.
+If exceeded the run terminates with `ERR_EXPORT_TOO_LARGE` before the `Result`
+frame is written.
+
+**`maxStdoutBytes` / `maxStderrBytes` enforcement:** Rust tracks running byte
+totals in `LogBuffers`. Any console line whose addition would push the total
+over the cap is silently dropped. The run itself continues normally.
 
 **`maxBridgeCalls` enforcement:** When non-zero, Rust maintains a per-run
 call counter shared across all bridge stubs. On each bridge call entry the
@@ -482,7 +495,7 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                             |
 | `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                          |
 | `ERR_HOST_BRIDGE`                     | Configured host global/import handler threw or rejected.                    |
-| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call or response payload exceeded `limits.maxBridgePayloadBytes`.    |
+| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                   |
 | `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.            |
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`. |
 | `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                    |

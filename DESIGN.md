@@ -252,8 +252,12 @@ Every call to `runtime.run(opts)`:
   maxExportBytes: 16 * 1024 * 1024,
   maxStdoutBytes: 1 * 1024 * 1024,
   maxStderrBytes: 1 * 1024 * 1024,
-  maxBridgePayloadBytes: 0,       // 0 = no per-bridge cap (64 MiB framing cap applies)
-  maxBridgeCalls: 10,             // 0 = unlimited; default 10 protects against runaway loops
+  maxBridgeCallBytes: 16 * 1024 * 1024,     // sandbox → host args per call
+  maxBridgeResponseBytes: 16 * 1024 * 1024, // host → sandbox return per call; must be ≤ memoryMb
+  maxExportBytes: 16 * 1024 * 1024,         // serialised exports total
+  maxStdoutBytes: 1 * 1024 * 1024,          // console.log lines; over-limit lines silently dropped
+  maxStderrBytes: 1 * 1024 * 1024,          // console.warn/error lines; same truncation rule
+  maxBridgeCalls: 10,                       // 0 = unlimited; default 10 protects against runaway loops
 }
 ```
 
@@ -276,14 +280,26 @@ that calls `isolate.terminate_execution()` when the bracketed time exceeds
 **Wall time** is a single guard timer that fires regardless. Catches
 runaway-await cases (e.g., host fetch implementation never resolves).
 
-**Bridge payload size** (`maxBridgePayloadBytes`): when non-zero, Rust
-enforces the limit in both directions. The encoded `BridgeCallPayload`
-byte length is checked before writing it to the socket; if exceeded the
-run terminates immediately with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` before any
-I/O. The `BridgeResponsePayload` byte length is checked after reading the
-frame but before decoding; if exceeded the run terminates with the same
-error. The framing layer's 64 MiB `DEFAULT_MAX_FRAME_LENGTH` is the
-absolute backstop when this field is zero.
+**Bridge payload sizes** (`maxBridgeCallBytes`, `maxBridgeResponseBytes`):
+the two directions are capped independently. `maxBridgeCallBytes` limits
+what untrusted sandbox code can send to host handlers; `maxBridgeResponseBytes`
+limits what the host can return per call. Both violations surface as
+`ERR_BRIDGE_PAYLOAD_TOO_LARGE`. `maxBridgeResponseBytes` must be ≤
+`memoryMb × 1 MiB` (a response larger than the sandbox's memory budget cannot
+be used); the TS layer validates this at `run()`/`precompile()` time. The Rust
+poll loop additionally reads `BridgeResponse` frames with a cap of
+`min(maxBridgeResponseBytes, memoryMb × 1 MiB)`, ensuring the memory budget
+acts as a natural inbound frame limit.
+
+**Export size** (`maxExportBytes`): after all exports are serialised to a
+`WireValue`, Rust measures the encoded byte length. If it exceeds
+`maxExportBytes` the run fails with `ERR_EXPORT_TOO_LARGE` before the
+`Result` frame is written.
+
+**Stdout/stderr sizes** (`maxStdoutBytes`, `maxStderrBytes`): Rust tracks
+running byte totals during console capture. Any line whose addition would
+push the total over the configured cap is silently dropped; the run continues
+normally. Zero disables the cap.
 
 ### 4.2 Globals (block-listed, not allowlisted)
 

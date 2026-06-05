@@ -323,7 +323,7 @@ class PayloadWriter {
     this.writeU32(limits.maxExportBytes ?? 0)
     this.writeU32(limits.maxStdoutBytes ?? 0)
     this.writeU32(limits.maxStderrBytes ?? 0)
-    this.writeU32(limits.maxBridgePayloadBytes ?? 0)
+    this.writeU32(limits.maxBridgeCallBytes ?? 0)
     // Default to 10 when not explicitly set so the door is never accidentally
     // left open. Pass 0 to disable the limit entirely.
     this.writeU32(limits.maxBridgeCalls ?? 10)
@@ -363,9 +363,9 @@ export interface ResourceLimits {
    */
   maxStderrBytes?: number
   /**
-   * Max bridge call/response payload in bytes. Zero = no limit (64 MiB framing cap applies). \@default 0
+   * Max bridge call payload in bytes (sandbox → host args). Zero = no limit. \@default 0
    */
-  maxBridgePayloadBytes?: number
+  maxBridgeCallBytes?: number
   /**
    * Max total bridge calls per run. Zero = no limit. \@default 10
    */

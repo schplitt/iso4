@@ -151,7 +151,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         wall_time_ms: payload.limits.wall_time_ms,
                         cpu_time_ms: payload.limits.cpu_time_ms,
                         memory_mb: payload.limits.memory_mb,
-                        max_bridge_payload_bytes: payload.limits.max_bridge_payload_bytes,
+                        max_export_bytes: payload.limits.max_export_bytes,
+                        max_stdout_bytes: payload.limits.max_stdout_bytes,
+                        max_stderr_bytes: payload.limits.max_stderr_bytes,
+                        max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
                         max_bridge_calls: payload.limits.max_bridge_calls,
                     },
                     &globals,
@@ -359,9 +362,12 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                         wall_time_ms: payload.limits.wall_time_ms,
                                         cpu_time_ms: payload.limits.cpu_time_ms,
                                         memory_mb: payload.limits.memory_mb,
-                                        max_bridge_payload_bytes: payload
+                                        max_export_bytes: payload.limits.max_export_bytes,
+                                        max_stdout_bytes: payload.limits.max_stdout_bytes,
+                                        max_stderr_bytes: payload.limits.max_stderr_bytes,
+                                        max_bridge_call_bytes: payload
                                             .limits
-                                            .max_bridge_payload_bytes,
+                                            .max_bridge_call_bytes,
                                         max_bridge_calls: payload.limits.max_bridge_calls,
                                     },
                                     &run_globals,

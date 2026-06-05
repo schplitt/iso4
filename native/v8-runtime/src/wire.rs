@@ -474,10 +474,17 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             message: "function arguments are not supported across the bridge boundary".to_string(),
             stack: None,
         },
-        RunError::BridgePayloadTooLarge => RunErrorPayload {
+        RunError::BridgeCallPayloadTooLarge => RunErrorPayload {
             code: "ERR_BRIDGE_PAYLOAD_TOO_LARGE".to_string(),
             name: "Error".to_string(),
-            message: "bridge payload exceeds configured maxBridgePayloadBytes limit".to_string(),
+            message: "bridge call payload exceeds configured maxBridgeCallBytes limit".to_string(),
+            stack: None,
+        },
+        RunError::ExportTooLarge => RunErrorPayload {
+            code: "ERR_EXPORT_TOO_LARGE".to_string(),
+            name: "Error".to_string(),
+            message: "serialised export payload exceeds configured maxExportBytes limit"
+                .to_string(),
             stack: None,
         },
         RunError::BridgeCallLimitExceeded => RunErrorPayload {

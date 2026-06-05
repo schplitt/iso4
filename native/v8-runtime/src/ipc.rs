@@ -161,6 +161,21 @@ pub fn read_rust_to_ts_frame(reader: &mut impl Read) -> io::Result<RustToTsFrame
     })
 }
 
+/// Read a single TS->Rust frame with an explicit frame-length cap.
+/// Use this when per-run limits are available (e.g. when reading BridgeResponse
+/// frames inside the poll loop where `memory_mb` and `max_bridge_response_bytes`
+/// are known).
+pub fn read_ts_to_rust_frame_with_limit(
+    reader: &mut impl Read,
+    max_frame_length: u32,
+) -> io::Result<TsToRustFrame> {
+    let frame = read_frame_with_limit(reader, max_frame_length)?;
+    Ok(TypedFrame {
+        message_type: parse_ts_to_rust_message_type(frame.message_type)?,
+        payload: frame.payload,
+    })
+}
+
 /// Write a single raw frame to `writer` using the default frame-length cap.
 pub fn write_frame(writer: &mut impl Write, message_type: u8, payload: &[u8]) -> io::Result<()> {
     write_frame_with_limit(writer, message_type, payload, DEFAULT_MAX_FRAME_LENGTH)
@@ -250,7 +265,9 @@ pub struct ResourceLimits {
     pub max_export_bytes: u32,
     pub max_stdout_bytes: u32,
     pub max_stderr_bytes: u32,
-    pub max_bridge_payload_bytes: u32,
+    /// Maximum bytes the sandbox may send as arguments in a single bridge call
+    /// (sandbox → host). Zero means no per-call cap.
+    pub max_bridge_call_bytes: u32,
     /// Maximum number of bridge calls (globals + host imports combined) allowed
     /// per run. Zero means no limit on the Rust side; the TS side defaults
     /// to 10 when the host leaves this unset.
@@ -398,7 +415,7 @@ fn parse_code_fields(
         max_export_bytes: r.read_u32()?,
         max_stdout_bytes: r.read_u32()?,
         max_stderr_bytes: r.read_u32()?,
-        max_bridge_payload_bytes: r.read_u32()?,
+        max_bridge_call_bytes: r.read_u32()?,
         max_bridge_calls: r.read_u32()?,
     };
     let globals_count = r.read_u32()? as usize;
@@ -772,7 +789,7 @@ mod tests {
         push_u32(&mut v, 1024 * 1024); // max_export_bytes
         push_u32(&mut v, 512 * 1024); // max_stdout_bytes
         push_u32(&mut v, 512 * 1024); // max_stderr_bytes
-        push_u32(&mut v, 64 * 1024); // max_bridge_payload_bytes
+        push_u32(&mut v, 64 * 1024); // max_bridge_call_bytes
         push_u32(&mut v, 1_000); // max_bridge_calls
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
@@ -790,7 +807,7 @@ mod tests {
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 28]); // limits (all zero)
+        v.extend_from_slice(&[0u8; 32]); // limits (all zero)
         push_u32(&mut v, 2); // 2 globals
         push_string(&mut v, "fetch");
         push_string(&mut v, "myTool");
@@ -808,7 +825,7 @@ mod tests {
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "code"); // code
         v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 28]); // limits
+        v.extend_from_slice(&[0u8; 32]); // limits
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "lib:math"); // specifier
@@ -833,7 +850,7 @@ mod tests {
         push_u32(&mut v, 1);
         push_string(&mut v, "code");
         v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 28]); // limits
+        v.extend_from_slice(&[0u8; 32]); // limits
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "host:tools"); // specifier
@@ -864,7 +881,7 @@ mod tests {
         push_u32(&mut v, 1);
         push_string(&mut v, "code");
         v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 28]); // limits
+        v.extend_from_slice(&[0u8; 32]); // limits
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "x:y");

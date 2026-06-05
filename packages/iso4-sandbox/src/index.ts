@@ -135,16 +135,18 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
   maxExportBytes: number
   maxStdoutBytes: number
   maxStderrBytes: number
-  maxBridgePayloadBytes: number
+  maxBridgeCallBytes: number
+  maxBridgeCalls: number
 } {
   return {
-    memoryMb: limits?.memoryMb ?? 0,
-    cpuTimeMs: limits?.cpuTimeMs ?? 0,
-    wallTimeMs: limits?.wallTimeMs ?? 0,
-    maxExportBytes: 0,
-    maxStdoutBytes: 0,
-    maxStderrBytes: 0,
-    maxBridgePayloadBytes: 0,
+    memoryMb:          limits?.memoryMb          ?? 64,
+    cpuTimeMs:         limits?.cpuTimeMs         ?? 5_000,
+    wallTimeMs:        limits?.wallTimeMs         ?? 30_000,
+    maxExportBytes:    limits?.maxExportBytes     ?? 16 * 1024 * 1024,
+    maxStdoutBytes:    limits?.maxStdoutBytes     ?? 1 * 1024 * 1024,
+    maxStderrBytes:    limits?.maxStderrBytes     ?? 1 * 1024 * 1024,
+    maxBridgeCallBytes: limits?.maxBridgeCallBytes ?? 16 * 1024 * 1024,
+    maxBridgeCalls:    limits?.maxBridgeCalls     ?? 10,
   }
 }
 
