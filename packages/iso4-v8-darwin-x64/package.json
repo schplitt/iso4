@@ -10,6 +10,9 @@
     "url": "https://github.com/schplitt/iso4.git",
     "directory": "packages/iso4-v8-darwin-x64"
   },
+  "scripts": {
+    "prepack": "chmod +x bin/iso4-v8 || true"
+  },
   "exports": {
     ".": "./index.js",
     "./bin/iso4-v8": "./bin/iso4-v8"
