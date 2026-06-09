@@ -54,10 +54,10 @@
     "vitest": "catalog:"
   },
   "optionalDependencies": {
-    "@iso4/v8-darwin-arm64": "workspace:*",
-    "@iso4/v8-darwin-x64": "workspace:*",
-    "@iso4/v8-linux-arm64-gnu": "workspace:*",
-    "@iso4/v8-linux-x64-gnu": "workspace:*"
+    "@iso4/v8-darwin-arm64": "workspace:^",
+    "@iso4/v8-darwin-x64": "workspace:^",
+    "@iso4/v8-linux-arm64-gnu": "workspace:^",
+    "@iso4/v8-linux-x64-gnu": "workspace:^"
   },
   "engines": {
     "node": ">=24.0.0"
