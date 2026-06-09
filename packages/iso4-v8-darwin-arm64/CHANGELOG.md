@@ -1,5 +1,11 @@
 # @iso4/v8-darwin-arm64
 
+## 0.0.3
+
+### Patch Changes
+
+- 7c943af: chore: add bin field to native packages
+
 ## 0.0.2
 
 ### Patch Changes
