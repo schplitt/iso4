@@ -369,6 +369,7 @@ describe('RebindImports type constraints (compile-time)', () => {
   })
 
   it('undeclared specifier is a TypeScript error', () => {
+    // @ts-expect-error — undeclared specifiers are excluded from RebindImports<M>.
     const _invalid: Rebind = {
       'host:never-declared': { fn: () => 1 },
     }

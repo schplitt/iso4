@@ -569,26 +569,6 @@ describe('source imports', () => {
       return
     expect(result.error.code).toBe('ERR_MODULE_NOT_FOUND')
   })
-
-  test.skip('dynamic resolver can provide source modules on demand', async () => {
-    const result = await runtime.run({
-      code: `
-        import { add } from 'dynamic:math'
-        export default add(10, 5)
-      `,
-      imports: {
-        resolve: (specifier) => {
-          if (specifier === 'dynamic:math')
-            return MATH_UTILS_SOURCE
-          return null
-        },
-      },
-    })
-    expect(result.ok).toBe(true)
-    if (!result.ok)
-      return
-    expect(result.exports.default).toBe(15)
-  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
