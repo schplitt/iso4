@@ -36,7 +36,7 @@ import type { ImportBindingPayload } from './ipc.js'
 import type {
   HostExportData,
   HostExportFunction,
-  HostModuleDescription,
+  HostModuleObject,
   HostModuleValue,
   Imports,
 } from './types.js'
