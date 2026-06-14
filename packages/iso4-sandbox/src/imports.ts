@@ -286,7 +286,7 @@ function walkRebind(
  */
 function generateHostModuleSource(
   specifier: string,
-  desc: HostModuleDescription,
+  desc: HostModuleObject,
   registry: HandleRegistry,
   allocId: () => number,
   fnIds: Record<string, number>,
