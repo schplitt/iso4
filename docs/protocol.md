@@ -319,12 +319,17 @@ socket immediately on version or token mismatch.
 
 `ImportBinding`:
 
-| Field         | Encoding           | Notes                                                    |
-| ------------- | ------------------ | -------------------------------------------------------- |
-| `specifier`   | `String`           | Import specifier.                                        |
-| `kind`        | `u8`               | `0 = source`, `1 = host`.                                |
-| `source`      | `Optional<String>` | Present only when `kind = source`.                       |
-| `hostExports` | `List<String>`     | Export names for host import modules when `kind = host`. |
+The wire only carries source-form imports. The public TypeScript API
+discriminates string-valued specifiers (source modules) from object-valued
+specifiers (host modules), but the TS-side import processor lowers the
+object form to generated ESM source that calls bridge globals at function
+leaves (see DESIGN.md §4.3). Both flavors therefore reach the wire as a
+flat `(specifier, source)` pair.
+
+| Field       | Encoding | Notes                                                                                             |
+| ----------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `specifier` | `String` | Import specifier.                                                                                 |
+| `source`    | `String` | ESM source text. Compiled fresh per isolate; transitive `import`s recurse back into the resolver. |
 
 ### 5.3 Prefix identifiers
 

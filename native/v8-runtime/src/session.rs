@@ -21,12 +21,19 @@ use crate::ipc;
 use crate::v8 as sandbox;
 use crate::wire;
 
-/// Snapshot + declared global names for one precompiled prefix.
+/// Snapshot + declared global / import shape for one precompiled prefix.
 pub struct PrefixData {
     pub snapshot: Vec<u8>,
     /// Global names declared at precompile time. PrefixRun globals must be a
     /// subset of this set; extras are rejected with ERR_UNDECLARED_BINDING.
     pub declared_globals: Vec<String>,
+    /// Imports declared at precompile time. Re-used as-is on PrefixRun: source
+    /// modules and host data exports are frozen, and host import function
+    /// shape (specifier + name) must match what the snapshot was compiled
+    /// against. Run-time `imports` in the PrefixRun payload only carry
+    /// re-binding of host function handlers (TS dispatch); the wire-level
+    /// binding shape comes from here.
+    pub declared_imports: Vec<ipc::ImportBinding>,
 }
 
 /// State shared across all connection threads in the same Rust process.
@@ -139,6 +146,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 );
 
                 let globals: Vec<String> = payload.globals.iter().map(|g| g.name.clone()).collect();
+                // Any host-side bridge capability is exposed to V8 as "globals".
+                // Host-module import function leaves now route through the single reserved
+                // dispatcher global `__iso4_call`, so a non-empty globals list is the full
+                // "needs bridge" check.
                 let stream_fd = if globals.is_empty() {
                     None
                 } else {
@@ -158,6 +169,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         max_bridge_calls: payload.limits.max_bridge_calls,
                     },
                     &globals,
+                    &payload.imports,
                     stream_fd,
                     Arc::clone(&call_id_counter),
                 ) {
@@ -209,7 +221,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 };
 
                 let result_payload =
-                    match sandbox::precompile(&payload.code, payload.filename.as_deref()) {
+                    match sandbox::precompile(
+                        &payload.code,
+                        payload.filename.as_deref(),
+                        &payload.imports,
+                    ) {
                         Ok(snapshot_bytes) => {
                             let prefix_id = shared
                                 .next_prefix_id
@@ -217,11 +233,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 .to_string();
                             let declared_globals: Vec<String> =
                                 payload.globals.iter().map(|g| g.name.clone()).collect();
+                            let declared_imports = payload.imports.clone();
                             eprintln!(
                                 "[iso4-v8] precompile succeeded — prefix_id={prefix_id} \
-                                 ({} snapshot bytes, {} declared globals)",
+                                 ({} snapshot bytes, {} declared globals, {} declared imports)",
                                 snapshot_bytes.len(),
                                 declared_globals.len(),
+                                declared_imports.len(),
                             );
                             // unwrap_or_else(|p| p.into_inner()): if a thread panicked
                             // while holding this lock, Rust marks the Mutex "poisoned"
@@ -240,6 +258,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     PrefixData {
                                         snapshot: snapshot_bytes,
                                         declared_globals,
+                                        declared_imports,
                                     },
                                 );
                             wire::encode_precompile_result_payload(Some(&prefix_id), None)
@@ -279,7 +298,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) // see poison comment above
                     .get(&payload.prefix_id)
-                    .map(|d| (d.snapshot.clone(), d.declared_globals.clone()));
+                    .map(|d| (
+                        d.snapshot.clone(),
+                        d.declared_globals.clone(),
+                        d.declared_imports.clone(),
+                    ));
 
                 let result_payload =
                     match prefix_data_clone {
@@ -306,7 +329,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 }),
                             )
                         }
-                        Some((snapshot_bytes, declared_globals)) => {
+                        Some((snapshot_bytes, declared_globals, declared_imports)) => {
                             // ── ERR_UNDECLARED_BINDING check ─────────────────────────────────
                             // Every global in payload.globals must have been declared at
                             // precompile time. Adding a new name at run time would silently
@@ -344,15 +367,22 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             } else {
                                 let run_globals: Vec<String> =
                                     payload.globals.iter().map(|g| g.name.clone()).collect();
+                                // PrefixRun reuses the declared imports shape
+                                // verbatim. The TS side enforces that run-time
+                                // overrides only update host function handlers
+                                // (data exports + source modules are frozen in
+                                // the snapshot), so the wire-level shape that
+                                // matters for bridge dispatch here is the one
+                                // captured at precompile.
                                 let stream_fd = if run_globals.is_empty() {
                                     None
                                 } else {
                                     Some(stream.as_raw_fd())
                                 };
                                 eprintln!(
-                            "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals)",
+                            "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports)",
                             payload.run_id, payload.prefix_id, payload.code.len(),
-                            run_globals.len(),
+                            run_globals.len(), declared_imports.len(),
                         );
                                 match sandbox::execute_with_prefix(
                                     &snapshot_bytes,
@@ -371,6 +401,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                         max_bridge_calls: payload.limits.max_bridge_calls,
                                     },
                                     &run_globals,
+                                    &declared_imports,
                                     stream_fd,
                                     Arc::clone(&call_id_counter),
                                 ) {

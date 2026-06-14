@@ -59,33 +59,31 @@ export async function transform(row) {
 }
 ```
 
-`session.call('transform', row)` handles this (Phase 11). The isolate is
-reused across calls: no recompilation, no snapshot restore per call. In v1
-before Phase 11, the same result can be achieved through `prefix.run()` with
-a per-run host import that provides the input data, at the cost of snapshot
-restore overhead per call.
+The static-code shape above is achievable in `@iso4/sandbox` via
+`prefix.run()` with a per-run host import that provides the input data —
+at the cost of a snapshot restore per call. A persistent-session API
+(`session.call('transform', row)`) that reuses the isolate across calls
+is **not** part of `@iso4/sandbox`; it belongs to the future analytics
+product (see §9.1 and §13.1).
 
-Both modes use the same `PrecompiledPrefix`. The prefix author declares
+Both shapes use the same `PrecompiledPrefix`. The prefix author declares
 tools, globals, and libraries once. Dynamic vs static is a decision at
 call time, not at precompile time.
 
 ### 1.2 Isolation level
 
-**Two-process backend** (default, v1): the V8 isolate runs in a separate
-Rust process communicating over UDS. A crash or OOM in the isolate kills
-the subprocess; the host process and all other concurrent runs are
+`@iso4/sandbox` runs the V8 isolate in a **separate Rust process**
+communicating over UDS. A crash or OOM in the isolate kills the
+subprocess; the host process and all other concurrent runs are
 unaffected. Adds ~30–100 µs per bridge call. Right for any deployment
 where the code is not fully trusted or where crash isolation matters.
 
-**In-process backend** (Phase 12, opt-in): the V8 isolate runs inside the
-Node process via a C++ NAPI addon. No IPC overhead per call. An OOM can
-crash the host process. Requires Docker/Kubernetes (or equivalent) as the
-outer security boundary. Selected with `SandboxOptions.backend: 'inprocess'`.
+An in-process embedding (V8 inside the host process via NAPI / napi-rs)
+for sub-µs call overhead is the analytics product's concern, not this
+product's. See §9.1.
 
-The two axes are independent: static code with two-process backend works
-fine at moderate throughput; dynamic code with in-process backend is valid
-for trusted-code deployments. The two-process backend is always the default
-because it requires no external security infrastructure.
+There is no `SandboxOptions.backend` flag and no plan to add one. The
+analytics use case is served by a separate package, not a backend swap.
 
 ### 1.3 In-scope goals
 
@@ -326,44 +324,158 @@ they are statically greppable and cannot accidentally shadow a built-in.
 
 ### 4.3 Imports
 
-The full extension point. Each specifier resolves to one of:
+The full extension point. `imports` is a flat map keyed by specifier; the
+value type is the discriminator:
 
-- **Source module** — host provides JS source as a string. Compiled by V8
-  once, evaluated in-isolate, cached for the lifetime of the runtime. Runs
-  with zero per-call bridge cost.
-- **Host module** — host provides an object of functions. The sandbox sees
-  an ESM module whose exports are stubs that bridge each call back to the
-  host. Slower (bridge roundtrip per call) but fully dynamic.
+- **String value — source module.** The host provides ESM source as a
+  string. V8 compiles and evaluates it inside the isolate; transitive
+  `import`s resolve back through the same map. Zero per-call bridge cost.
+- **Object value — host module.** The host provides a JS object whose
+  shape becomes the module's exports. The runtime walks the object
+  recursively and auto-generates ESM source: data leaves become JS
+  literals, function leaves become async stubs that call a single
+  **ID-addressed dispatcher**:
+
+  ```js
+  // generated for { search: fn } — fn assigned handle ID 0
+  export const search = async (...args) => await globalThis.__iso4_call(0, ...args);
+  ```
+
+  `__iso4_call` is one ordinary host global whose handler peels the
+  leading integer handle ID and routes to a per-run registry
+  (`Map<id, fn>`). This means there are **no generated bridge-global
+  names** — nothing to sanitise, no collision class (two specifiers like
+  `host:tools` and `host_tools` can never clash because there are no
+  derived names, only integer IDs). The wire format and the Rust side are
+  unchanged: `__iso4_call` is dispatched like any other named global.
+  Nested objects mixing data and functions are walked recursively and
+  Just Work — `db.users.create()` is a single dispatcher call to one
+  handle ID, no more expensive than a flat call.
+
+  The same registry + dispatcher is the foundation for **callable handles**
+  (Phase 13): functions *returned* from a bridge call get registered the
+  same way and materialise into the same `__iso4_call` stubs, so
+  request/response objects (`res.json()`) become purely additive.
 
 ```ts
 imports: {
-  static: {
-    "lodash-es": { kind: "source", source: lodashEsmBundle },
-    "secrets":   { kind: "host",   exports: { get: (k) => mySecrets[k] } },
-  },
-  // optional dynamic resolver, runs if static map misses
-  async resolve(specifier, importer) {
-    if (specifier.startsWith("npm:")) {
-      return { kind: "source", source: await fetchNpmEsm(specifier) };
-    }
-    return null;
+  // string → source module
+  "lodash-es": lodashEsmBundle,
+
+  // object → host module (auto-generated source + bridge globals)
+  "host:tools": {
+    search: async (q) => mySearch(q),
+    version: "1.0",
+    cfg: { mode: "prod", helpers: { greet: () => "hi" } }, // nested mix is fine
   },
 }
 ```
 
-Resolution order: static map → resolver → throw `ModuleNotFound`.
+Both flavors are submitted to V8 as standard ESM modules; the only
+difference is who wrote the source string. The runtime resolver looks up
+each specifier in `imports`. Anything missing surfaces as
+`ERR_MODULE_NOT_FOUND`.
 
-Host modules can only export **functions that take serializable data and
-return serializable data**. They cannot export:
+The object form imposes these restrictions on the value tree:
 
-- Class instances with prototype methods (methods stripped on cross).
-- Functions that themselves take function arguments (no callback support
-  in v1).
-- Stateful object handles (`createReadStream` returning a stream).
+- **Function leaves** must take serialisable data and return serialisable
+  data. In v1 the generated stub is always `async` because bridge calls
+  cross a UDS round trip; the sandbox always `await`s the result.
+  Synchronous delivery is Phase 11 (see the sync-codegen note below).
+- **Function arguments may not themselves be functions** (no callback
+  support in v1). Bridge rejects with `FunctionArgumentNotSupported`.
+  Passing host functions back to the sandbox via *return values* is
+  Phase 13 (callable handles).
+- **Data leaves** must be representable as JS literals: primitives,
+  strings, plain objects, arrays, `Date`, `BigInt`, `Uint8Array`.
+  `Map` / `Set` / circular references throw at registration with a
+  pointer to the eventual "lazy data load" mechanism, if it becomes
+  needed.
+- **Stateful object handles** (`createReadStream` returning a stream)
+  remain unsupported; nothing changes there.
+- **Class instances with prototype methods** — methods on the prototype
+  are *not* discovered by the walker (own enumerable properties only).
+  Copy methods onto the instance explicitly if you want them exposed.
 
-If the user code calls a host module function with a function argument, the
-bridge rejects the call with `FunctionArgumentNotSupported`. This is a
-deliberate v1 limitation.
+Rebinding on `prefix.run()` is keyed on the same shape: only function
+leaves declared at `precompile()` time may be rebound, and only with the
+same signature. TypeScript enforces this via `RebindImports<I>`; the
+runtime fallback for `as any` shenanigans returns
+`ERR_UNDECLARED_BINDING` symmetrically with the globals path.
+
+#### Implementation note: why generated source instead of synthetic V8 modules
+
+An earlier version of Phase 7 used V8 synthetic modules
+(`v8::Module::create_synthetic_module` + `set_synthetic_module_export`) to
+bind host-module exports natively. Pre-v1 it was rewritten to the
+source-generation approach because:
+
+1. The public API simplifies dramatically (`Record<string, string |
+   object>` instead of a discriminated union with `kind`, `exports`,
+   `source` fields).
+2. Nested objects mixing data and functions fall out for free — the
+   recursive walker emits literal source with bridge-global references at
+   the function leaves.
+3. The implementation reduces to two primitives already present (source
+   imports + globals) instead of a third (synthetic modules) carrying its
+   own wire-format fields, callback shapes, and `Box` lifetime
+   management.
+4. Generated source is a real ESM module: debuggable, code-cacheable by
+   V8, and present in stack traces under a sanitised filename.
+
+The native-binding mechanism is preserved as **Phase 12** ("Native
+host-module binding") if performance, stack-trace polish, or in-process
+integration ever justify it. Until then the source-gen path is the
+shipping implementation.
+
+#### Implementation note: sync codegen (Phase 11)
+
+The source generator decides per function leaf whether to emit an async
+stub (`__iso4_call`, returns a Promise) or a sync stub (`__iso4_call_sync`,
+blocks the isolate and returns the value directly):
+
+```js
+// async leaf
+export const search = async (...args) => await globalThis.__iso4_call(0, ...args);
+// sync leaf
+export const readFileSync = (...args) => globalThis.__iso4_call_sync(1, ...args);
+```
+
+**How a leaf is classified.** Default by inspecting the host handler:
+`fn.constructor === AsyncFunction` (the robust check). **Do not** use
+`fn.toString()` parsing for the `async` keyword — it silently misclassifies
+bound async functions, which stringify to `function () { [native code] }`
+with the keyword stripped (verified). A sync handler (`() => x`) → sync
+stub; an async handler (`async () => x`) → async stub.
+
+**Important semantic caveats this classification does not capture, so an
+explicit per-leaf override must remain available:**
+
+- Detection only chooses the **sandbox-side calling convention** (Promise
+  vs blocking value). It does not change host-side behaviour: the host
+  dispatcher always `await`s the handler before replying, so an async
+  handler can back a sync sandbox stub and vice versa. `readFileSync` in
+  the sandbox can be backed by `async (p) => await fs.readFile(p)`.
+- A sync function that returns a Promise (`() => Promise.resolve(1)`) is
+  classified "sync" by the constructor check but behaves async. The host
+  awaits the result regardless, so this still works; the only effect is
+  the sandbox sees a blocking stub.
+- Sync stubs **block the isolate** (no concurrency, no `Promise.all`
+  parallelism, microtasks paused during the wait). That is the point of
+  sync, but it means auto-classifying every plain arrow function as sync
+  could surprise authors who wrote `() => x` without intending blocking
+  semantics. **Open question for Phase 11:** is the constructor-based
+  default the right policy, or should sync be strictly opt-in
+  (`{ sync: true, handler }`) with async the default for everything? The
+  CPU-budget bracketing and wall-clock preemption from Phase 3 already
+  make blocking safe; the question is purely ergonomic.
+
+Mechanically this is purely additive over today's design: a second
+reserved global (`__iso4_call_sync`), a non-`async` generated stub for
+sync leaves, and one blocking bridge callback in Rust. The handle
+registry (`Map<id, fn>`), the ID assignment, and the walker are unchanged
+— sync-ness is a property of the emitted *stub*, not of the registry
+entry.
 
 ---
 
@@ -628,23 +740,83 @@ feature most users will rely on and shapes the IPC protocol.
 | 3 ✅   | CPU budget enter/leave bracketing (async time exclusion)                                                                                  | Tight loops killed quickly; `await fetch` doesn't burn budget              |
 | 4 ✅   | Generic host-bridge dispatch for globals (string / function / shimmed); `fetch` is just one allowed name on this path                     | Hosts can expose any allowlisted global; `fetch` works as a regular global |
 | 5 ✅   | `@iso4/fetch` package: `createSafeFetch` with allowlist, DNS pin, private-IP blocking, no-auto-redirect                                   | Hardened default users can opt into in two lines                           |
-| 6      | Imports: source modules (Flavor B) with V8 code cache                                                                                     | `import * as z from "zod"` works when host provides source                 |
-| 7      | Imports: host modules (Flavor A) with synthetic V8 modules                                                                                | `import fs from "node:fs"` works when host provides functions              |
+| 6 ✅   | Imports: source modules (Flavor B); host-supplied ESM strings compiled per-isolate. No separate code-cache LRU — the precompile snapshot is the cache.   | `import { add } from "lib:math"` works when the host declares the source     |
+| 7 ✅   | Imports: host modules — host provides a JS object; the runtime generates ESM source that exposes the object's structure (function leaves call bridge globals, data leaves are JS literals). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for arbitrarily-nested mixed data/function shapes; the synthetic-module native-binding path is preserved as Phase 12 |
 | 8     | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
 | 9     | Pre-warmed isolate pool (optional, behind a runtime option)                                                                               | Sub-2ms cold start for high-throughput workloads                           |
 | 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |
-| 11    | Callable handles: functions in bridge return values assigned per-run IDs; sandbox calls them via `BridgeCall { targetKind: 2 }`           | `res.json()`, `cursor.next()`, any returned method callable from sandbox   |
-| 12    | `prefix.openSession()` + `Session` API; `HostCall`/`HostCallResult` wire messages; persistent-isolate semantics                           | Analytics pipeline use case works end-to-end with the two-process backend  |
-| 13    | In-process (C++ NAPI) backend behind a `SandboxOptions.backend` flag; same `Session` API; requires Docker/K8s outer isolation             | Sub-µs amortized per-call overhead for high-throughput analytics           |
+| 11    | **Sync bridge calls.** Per-leaf codegen emits a sync stub (`__iso4_call_sync`, blocks the isolate on UDS read) instead of the async stub. Leaf classification + the opt-in-vs-auto policy question are covered in the §4.3 "sync codegen" note. CPU budget bracketed; wall guard preempts via `terminate_execution`. | `import { readFileSync } from "host:fs"` works without `await`. Foundational for a future node-compat layer. |
+| 12    | **Native host-module binding.** Replace the source-generation path (§4.3) with synthetic `v8::Module` export slots filled at evaluation. Recursive Rust walker, per-leaf `BridgeCall { targetKind: 1 }` (revived), `Box` lifetime registry. Supports both sync (from Phase 11) and async stubs. | Lower per-run overhead for import-heavy code; cleaner stack traces. No behaviour change visible to sandbox code. |
+| 13    | **Callable handles for return values.** Functions crossing back from a bridge call get a per-run integer ID; sandbox invokes via `BridgeCall { targetKind: 2 }`. Host-side handle registry, GC on run end. | `await fetch().then(r => r.json())`, `cursor.next()`, any host-returned method callable from sandbox. |
 
-Each phase is independently shippable. We stop and reassess at the end of
-each phase.
+Each phase is independently shippable. Phases 11–13 are post-v1; nothing
+in Phases 1–10 needs to know about them.
 
-Phases 11–12 are post-v1. They are documented here because they constrain
-the v1 API shape: `prefix.openSession()` must be addable without breaking
-`prefix.run()`, and `SandboxOptions` must accommodate a `backend` field
-without restructuring. No code changes needed now; just don't close those
-doors.
+**End of the two-process sandbox roadmap.** Everything beyond this line
+belongs to separate products with their own design passes (see §9.1).
+
+### 9.1 Future products (separate roadmaps, design TBD)
+
+What used to be Phase 12 (session API on two-process) and Phase 13 (in-process
+NAPI backend behind a `SandboxOptions.backend` flag) have been removed from
+the `@iso4/sandbox` plan. The two-process backend cannot reach the
+call-overhead target that an analytics use case needs, and pretending one
+TypeScript API spans both transports hides real design decisions (shared
+`ArrayBuffer`s, threading model, lifecycle, type surface).
+
+The iso4 ecosystem after Phases 1–13 looks like this:
+
+- **`@iso4/sandbox`** — the two-process AI-agent product. Done at Phase 13.
+- **An analytics runtime** (package name TBD) — a separate product designed
+  after `@iso4/sandbox` is finished.
+- **`@iso4/node-stdlib`** (or similar) — optional add-on packaging curated
+  `fs` / `path` / `process` / etc. as host imports. Sits on top of sync
+  bridge calls (Phase 11) and callable handles (Phase 13).
+
+#### Analytics runtime
+
+Deliberately not specified now. What is known:
+
+- **In-process** (NAPI / napi-rs). No UDS, no auth, no subprocess.
+- **Shared `ArrayBuffer`s / typed-array views** across host ↔ sandbox
+  without copy. Per-row analytics cannot afford copy cost.
+- **Sub-µs amortized call overhead.** Two-process cannot reach this with
+  any amount of tuning; this is the reason analytics is its own product.
+- **Persistent isolate, sequential calls.** Different lifecycle from
+  `@iso4/sandbox`'s pool of one-shot isolates.
+- **Outer isolation boundary is the container** (Docker / K8s). The
+  sandbox provides memory-safety + API curation, not adversarial-code
+  containment.
+
+What is shared with `@iso4/sandbox`:
+
+- The wire-frame types (`WireValue`, the bridge payload conventions).
+- The "only data crosses" rule and `ValueSerializer`-based contract.
+- The host-import declaration shape (`Imports<…>` from §4.3) — the
+  developer experience of describing the bridge surface stays uniform.
+- The limits semantics and error vocabulary.
+
+What is **not** shared:
+
+- The runtime API. `Sandbox` / `Prefix` / `prefix.run()` solves a different
+  problem than analytics' eventual `Pipeline` / `Session` / `processBatch`.
+- The transport.
+- The lifecycle and concurrency model.
+
+Open design questions that can only be answered once Phases 1–13 ship:
+
+- How does the host hand row batches to the sandbox without copy? Shared
+  `ArrayBuffer` + a typed schema description? Apache Arrow? A custom
+  zero-copy view layer?
+- What replaces `prefix.run()` for an analytics loop —
+  `pipeline.process(batch)`? `session.call(fn, args)`?
+- Are bridge calls even the right primitive, or does direct V8 function
+  pointer invocation (possible in NAPI) replace them?
+- Where does the type-level surface live — same package as the sandbox,
+  or a sibling `@iso4/analytics`?
+
+These will be resolved in their own design pass, not retrofitted onto
+`@iso4/sandbox`.
 
 ---
 
@@ -656,7 +828,7 @@ To be resolved as we build, not blocking the start:
   from the start**. The Runtime manages a connection pool; each slot has its
   own UDS connection and its own isolate thread in the Rust process. Pool
   size = `maxIsolates` (default: CPU count). This is required for MCP
-  multi-agent parallelism and for the analytics session model.
+  multi-agent parallelism.
 
 - **How aggressive should the export validator be?** Strict-throw on
   functions is a hard requirement. Question: do we also throw on
@@ -683,17 +855,17 @@ To be resolved as we build, not blocking the start:
   Documented strongly.
 
 - **`Session.call()` input/output serialization contract.** For the
-  persistent-session API (Phase 11), the host calls a function that was
+  persistent-session API of the analytics product, the host calls a function that was
   exported by the prefix. What can be passed as `input`? V8 `ValueSerializer`
   is the natural choice (same as exports today), but typed arrays could be
-  transferred zero-copy if needed for bulk data. Decide when designing Phase 11.
+  transferred zero-copy if needed for bulk data. Decide when designing the analytics product (§9.1).
 
 - **In-process backend: C++ NAPI addon or Rust NAPI with Node's V8
   headers?** `rusty_v8` cannot be used in-process because it calls
   `v8::V8::initialize_platform()`, which Node already did. A C++ NAPI
   addon (like `isolated-vm`) is the proven path. Rust via raw `bindgen`
   to Node's V8 headers is possible but undocumented territory. Decide
-  when Phase 12 is prioritised.
+  when the analytics product is designed (§9.1).
 
 ## 11. Performance and the prefix/postfix pattern
 
@@ -880,13 +1052,9 @@ want. A host author who isn't an HTTP-security expert should reach for
 
 ---
 
-## 13. Two execution models
+## 13. Execution model
 
-This section makes the §1.1/§1.2 distinction concrete at the API and
-protocol level. It is forward-looking — only Model 1 is built in v1. Model
-2 is designed here so that v1 decisions don't accidentally close the door.
-
-### 13.1 Model 1 — One-shot runs (v1)
+`@iso4/sandbox` ships exactly one execution model: **one-shot runs**.
 
 ```
 prefix.run({ code }) → RunResult
@@ -894,12 +1062,52 @@ prefix.run({ code }) → RunResult
 
 The isolate is created from the snapshot, executes a code string, returns
 named exports, and is torn down. Every run is independent. IPC cost: one
-round trip (Run → ... → Result). Suitable when the work per run is
-non-trivial and async (fetch, host imports).
+round trip (Run → … → Result). Suitable when the work per run is
+non-trivial and async (fetch, host imports). This is the AI-agent
+prefix/postfix pattern described in §11.
 
-This is the AI-agent prefix/postfix pattern described in §11.
+### 13.1 Persistent sessions are a separate product
 
-### 13.2 Model 2 — Persistent sessions (Phase 11+)
+Earlier revisions of this document specified a second execution model in
+`@iso4/sandbox` — `prefix.openSession()` + `session.call(fn, input)` for
+persistent isolates — plus an in-process NAPI backend behind a
+`SandboxOptions.backend` flag. Both have been **removed from the
+`@iso4/sandbox` plan** (see §9.1).
+
+The short version: the call-overhead target that motivates persistent
+sessions (“per-row analytics”) is unreachable over UDS, and pretending one
+TypeScript API spans both transports hides real design decisions —
+shared `ArrayBuffer`s, threading model, lifecycle, the type surface.
+
+The analytics use case is its own product with its own design pass,
+built after Phases 1–13 ship. It will share wire-frame types,
+`ValueSerializer` contracts, limits vocabulary, and the `Imports<…>`
+declaration shape with `@iso4/sandbox`, but it will not be a backend
+flag on `createSandbox`.
+
+When the analytics product is designed, the comparison below is what it
+needs to beat:
+
+|                        | `@iso4/sandbox` (this product) | Analytics runtime (future)  |
+| ---------------------- | ------------------------------ | --------------------------- |
+| Call shape             | `prefix.run({ code })`         | TBD (`pipeline.process`?)   |
+| Isolate lifetime       | per-call                       | persistent                  |
+| Async / fetch          | ✅                             | TBD                         |
+| Imports (host modules) | ✅                             | shared declaration shape    |
+| Transport              | UDS subprocess                 | NAPI / napi-rs in-process   |
+| Memory model           | copy via `ValueSerializer`     | shared ArrayBuffer + schema |
+| Per-row analytics      | impractical                    | the whole point             |
+| Crash isolation        | ✅ always                      | container is the boundary   |
+| Outer security model   | subprocess                     | Docker/K8s                  |
+
+### 13.2 Historical session-API sketch (archived; not implemented)
+
+The paragraphs below are kept as **design notes for the future analytics
+product**. They are not part of `@iso4/sandbox` and the wire-protocol
+opcodes mentioned (`OpenSession`, `Call`, `CloseSession`,…) are not
+allocated in this codebase.
+
+The original session sketch:
 
 ```
 const session = await prefix.openSession(options)
@@ -1066,7 +1274,11 @@ The one-shot `prefix.run()` also works with the in-process backend (it
 creates a session, runs the code as the session's body, returns exports,
 closes the session).
 
-### 13.4 Choosing between the models
+### 13.4 Choosing between the models (archived)
+
+No choice to make in this product — `@iso4/sandbox` ships only one
+execution model. The table below is the original comparison, kept for
+the future analytics design pass.
 
 |                        | One-shot `run()`    | Persistent `session.call()` |
 | ---------------------- | ------------------- | --------------------------- |
@@ -1121,7 +1333,7 @@ globals: {
 }
 ```
 
-Callable return values are planned in Phase 11 (callable handles). See §15.
+Callable return values are planned in Phase 13 (callable handles). See §15.
 
 ### 14.3 `prefix.run()` globals are rebind-only
 
@@ -1192,7 +1404,7 @@ a callback-handle protocol symmetric to callable return values. The same Phase
 
 ---
 
-## 15. Callable handles (Phase 11)
+## 15. Callable handles (Phase 13)
 
 ### 14.1 The problem
 
@@ -1221,7 +1433,7 @@ globals: {
 
 For the web-standard `fetch` use case specifically, the host is expected to
 wrap `fetch` in a global that either returns processed data directly or
-returns a shape the agent can work with naturally. Phase 11 lifts this
+returns a shape the agent can work with naturally. Phase 13 lifts this
 restriction for cases where the host genuinely needs to return objects with
 methods.
 

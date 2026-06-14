@@ -210,48 +210,66 @@ export type RebindGlobals<G extends HostGlobals> = {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Imports (source modules and host-implemented modules)
+// Imports
 // ─────────────────────────────────────────────────────────────────────────
+//
+// `imports` is a flat map keyed by specifier. The value type discriminates:
+//
+//   string → source module: host provides ESM source. V8 compiles it inside
+//     the isolate; transitive `import`s resolve back through the same map.
+//     Zero per-call bridge cost.
+//
+//   object → host module: host provides a JS object describing the module
+//     shape. The runtime walks the object recursively and generates ESM
+//     source that exposes the structure: function leaves become async
+//     stubs that issue bridge calls to a host-side handler, data leaves
+//     become JS literals. Nested objects mixing data and functions are
+//     supported natively.
 
 /**
- * Resolution order: static map → dynamic resolver → ERR_MODULE_NOT_FOUND.
+ * Top-level `imports` shape. Keys are import specifiers; values are either
+ * a source string or a host-module description object.
+ *
+ * `M` is the literal shape of the map. `precompile()` infers it from the
+ * object literal so the declared specifiers and their value shapes flow
+ * into `Prefix<G, M>` and feed `RebindImports<M>`.
  */
-export interface ImportsConfig {
-  static?: Record<string, ImportDefinition>
-  resolve?: (
-    specifier: string,
-    importer: string | null,
-  ) => Promise<ImportDefinition | null> | ImportDefinition | null
-}
-
-export type ImportDefinition = SourceImport | HostImport
+export type Imports<M extends Record<string, ImportValue> = Record<string, ImportValue>> = M
 
 /**
- * Host provides ESM source; V8 compiles and caches it in-isolate.
+ * A single import value. String = source module. Object = host module
+ * description (the recursive walker handles all nesting).
  */
-export interface SourceImport {
-  kind: 'source'
-  source: string
-}
+export type ImportValue = string | HostModuleObject
 
 /**
- * Host provides an object; each function becomes a bridge-call stub.
+ * A host-module description object. Each property is either:
+ *
+ *   - A function — becomes an async bridge stub in the generated module.
+ *   - A plain data value (primitive, plain object/array, `Date`, `BigInt`,
+ *     `Uint8Array`) — becomes a JS literal in the generated module.
+ *   - A nested object that itself contains a mix of functions and data —
+ *     walked recursively.
+ *
+ * `Map`, `Set`, circular references, class instances with prototype
+ * methods, and stateful handles (streams, sockets) are rejected at
+ * registration with a clear error.
  */
-export interface HostImport {
-  kind: 'host'
-  exports: HostExports
+export interface HostModuleObject {
+  [name: string]: HostModuleValue
 }
-
-export interface HostExports {
-  default?: HostExportValue
-  [name: string]: HostExportValue | undefined
-}
-
-export type HostExportValue = HostExportData | HostExportFunction
 
 /**
- * Represents the plain-data values that cross the bridge.
- * Kept for `HostExports` / import system typing.
+ * Any node the recursive walker may encounter inside a `HostModuleObject`.
+ */
+export type HostModuleValue
+  = | HostExportFunction
+    | HostExportData
+    | HostModuleObject
+
+/**
+ * The set of plain-data values supported as data leaves in the host-module
+ * shape. The JS-literal emitter knows how to emit each of these.
  */
 export type HostExportData
   = | null
@@ -261,21 +279,72 @@ export type HostExportData
     | bigint
     | string
     | Uint8Array
+    | Date
     | HostExportData[]
     | { [key: string]: HostExportData }
 
 /**
- * A host-side function exposed as a global or import export.
+ * A host-side function exposed as a global or import-tree leaf.
  *
  * Args and return are `unknown` — the bridge serialises/deserialises values
  * with V8 ValueSerializer; we don't try to model that at the type level.
- * The one invariant that matters (functions cannot cross the boundary) is
- * enforced at runtime by the V8 layer, not here.
+ * The one invariant that matters (functions cannot cross the boundary as
+ * argument values) is enforced at runtime by the V8 layer, not here.
  *
  * Use specific function types for your handlers and let TypeScript infer
- * them through `HostGlobals` and `RebindGlobals<G>`.
+ * them through `HostGlobals`, `RebindGlobals<G>`, and `RebindImports<M>`.
  */
 export type HostExportFunction = (...args: unknown[]) => unknown
+
+/**
+ * The rebindable subset of an `Imports<M>` declared at precompile time.
+ *
+ * Mirrors `RebindGlobals<G>` over the recursive host-module shape:
+ *
+ * - **Source imports** (string values) are compiled into the snapshot and
+ *   cannot be rebound — their keys are excluded from the result.
+ * - **Host imports** (object values) are walked recursively. Only function
+ *   leaves survive; data leaves are excluded because their values are
+ *   emitted as JS literals into the generated module.
+ *
+ * Passing a specifier or export name that was not declared at precompile
+ * is a TypeScript error at compile time and `ERR_UNDECLARED_BINDING` at
+ * runtime.
+ *
+ * When `M` is left at its wide default (no `imports` declared, or no
+ * literal shape inferred), the rebind keyspace collapses to
+ * `Record<string, never>` — the walker only kicks in for literal shapes,
+ * which have finite depth.
+ */
+export type RebindImports<M extends Record<string, ImportValue>>
+  = Record<string, ImportValue> extends M
+    ? Record<string, never>
+    : {
+        [K in keyof M as M[K] extends string ? never : K]?:
+        M[K] extends HostModuleObject ? RebindHostModule<M[K]> : never
+      }
+
+/**
+ * Recursive walker over a `HostModuleObject`. Function leaves keep
+ * their declared signature; nested objects recurse; data leaves drop out
+ * entirely. Only used against literal shapes inferred by `precompile`, so
+ * the recursion is always finite.
+ */
+export type RebindHostModule<T> = T extends HostExportFunction
+  ? T
+  : T extends HostModuleObject
+    ? {
+        [K in keyof T as T[K] extends HostExportFunction
+          ? K
+          : T[K] extends HostModuleObject
+            ? K
+            : never]?: T[K] extends HostExportFunction
+          ? T[K]
+          : T[K] extends HostModuleObject
+            ? RebindHostModule<T[K]>
+            : never
+      }
+    : never
 
 // ─────────────────────────────────────────────────────────────────────────
 // Sandbox (runtime)
@@ -328,10 +397,18 @@ export interface Sandbox {
    * Globals declared here serve as **default** implementations for all runs.
    * `prefix.run()` may override any subset; omitted names reuse the default.
    */
-  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
-  precompile: <G extends HostGlobals = {}>(
-    options: PrecompileOptions<G>,
-  ) => Promise<Prefix<G>>
+
+  /**
+   * eslint-disable \@typescript-eslint/no-empty-object-type
+   */
+  precompile: <
+    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+    G extends HostGlobals = {},
+    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+    M extends Imports = {},
+  >(
+    options: PrecompileOptions<G, M>,
+  ) => Promise<Prefix<G, M>>
 
   /**
    * Tear down the Rust process. Outstanding prefixes are invalidated.
@@ -359,7 +436,10 @@ export type CreateSandbox = (options?: SandboxOptions) => Promise<Sandbox>
  * from the `globals` field, so the returned `Prefix<G>` is typed to allow
  * only those names to be rebound in subsequent `prefix.run()` calls.
  */
-export interface PrecompileOptions<G extends HostGlobals> {
+export interface PrecompileOptions<
+  G extends HostGlobals,
+  M extends Imports,
+> {
   /**
    * ESM source code to evaluate before snapshotting. Top-level await works.
    *
@@ -385,7 +465,13 @@ export interface PrecompileOptions<G extends HostGlobals> {
    */
   globals?: G
 
-  imports?: ImportsConfig
+  /**
+   * Declares the imports the sandbox code may resolve.
+   *
+   * The inferred shape feeds `Prefix<G, M>` so `prefix.run()` knows which
+   * specifiers exist and which exports may be rebound.
+   */
+  imports?: M
 
   /**
    * Resource limits applied to prefix code evaluation.
@@ -412,7 +498,10 @@ export interface PrecompileOptions<G extends HostGlobals> {
  * declared global's implementation per run, but you cannot add names that
  * were not declared at precompile time.
  */
-export interface Prefix<G extends HostGlobals> {
+export interface Prefix<
+  G extends HostGlobals,
+  M extends Imports,
+> {
   readonly id: string
 
   /**
@@ -420,14 +509,15 @@ export interface Prefix<G extends HostGlobals> {
    *
    * Globals declared at precompile time are active. You may rebind any subset
    * of them via `options.globals`; the precompile-time handler is used for
-   * any name not overridden here.
+   * any name not overridden here. Same rule for `imports`, restricted to
+   * host-import function exports declared in `I`.
    *
    * @example
    *   const result = await prefix.run({
    *     code: `export default await (${agentFn})()`,
    *   })
    */
-  run: (options: PrefixRunOptions<G>) => Promise<RunResult>
+  run: (options: PrefixRunOptions<G, M>) => Promise<RunResult>
 
   /**
    * Release the snapshot. Subsequent run() calls reject. Idempotent.
@@ -450,7 +540,10 @@ export interface Prefix<G extends HostGlobals> {
  * may be overridden. Passing any other name is a TypeScript error at compile
  * time and `ERR_UNDECLARED_BINDING` at runtime.
  */
-export interface PrefixRunOptions<G extends HostGlobals> {
+export interface PrefixRunOptions<
+  G extends HostGlobals,
+  M extends Imports,
+> {
   /**
    * Dynamic ESM source code to compile and run against the prefix state.
    */
@@ -466,11 +559,13 @@ export interface PrefixRunOptions<G extends HostGlobals> {
   globals?: RebindGlobals<G>
 
   /**
-   * Rebind host-module imports declared at precompile time.
-   * Source module imports are frozen in the snapshot and cannot be rebound.
-   * (Phase 6/7 — not yet implemented.)
+   * Rebind host-module function exports declared at precompile time.
+   * Source module imports are frozen in the snapshot and cannot be rebound;
+   * data exports are baked into the synthetic module. TypeScript enforces
+   * this at the type level via `RebindImports<M>`; the runtime rejects
+   * anything that slips through with `ERR_UNDECLARED_BINDING`.
    */
-  imports?: ImportsConfig
+  imports?: RebindImports<M>
 
   limits?: Partial<ResourceLimits>
   signal?: AbortSignal
@@ -485,7 +580,7 @@ export interface RunOptions {
   code: string
   limits?: Partial<ResourceLimits>
   globals?: HostGlobals
-  imports?: ImportsConfig
+  imports?: Imports
   signal?: AbortSignal
   filename?: string
 }

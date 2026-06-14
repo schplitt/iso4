@@ -280,23 +280,16 @@ pub struct HostGlobalBinding {
     pub name: String,
 }
 
-#[derive(Debug, PartialEq)]
-pub enum ImportKind {
-    /// Host provides the full JS source for this specifier.
-    Source,
-    /// Host provides a bridge object whose exports are callable from the sandbox.
-    Host,
-}
-
-/// One entry in the `imports` list of a `Run` request.
-#[derive(Debug)]
+/// One entry in the `imports` list of a `Run` / `Precompile` / `PrefixRun`
+/// request. Always carries a source string: the TS-side import processor
+/// lowers "host modules" (object form) to generated ESM source that calls
+/// bridge globals at function leaves, so by the time a binding reaches the
+/// wire it's source-form regardless of which public API flavor the host
+/// used. See DESIGN.md §4.3.
+#[derive(Debug, Clone)]
 pub struct ImportBinding {
     pub specifier: String,
-    pub kind: ImportKind,
-    /// ESM source text. Present when `kind = Source`.
-    pub source: Option<String>,
-    /// Export names exposed by the bridge. Present when `kind = Host`.
-    pub host_exports: Vec<String>,
+    pub source: String,
 }
 
 /// Fully parsed `Run` frame payload per `docs/protocol.md` §5.2.
@@ -371,6 +364,18 @@ impl<'a> PayloadReader<'a> {
         Ok(s)
     }
 
+    fn read_bytes(&mut self, len: usize) -> io::Result<Vec<u8>> {
+        if self.remaining() < len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "payload too short reading byte slice",
+            ));
+        }
+        let out = self.data[self.offset..self.offset + len].to_vec();
+        self.offset += len;
+        Ok(out)
+    }
+
     fn read_optional_string(&mut self) -> io::Result<Option<String>> {
         match self.read_u8()? {
             0 => Ok(None),
@@ -429,30 +434,8 @@ fn parse_code_fields(
     let mut imports = Vec::with_capacity(imports_count);
     for _ in 0..imports_count {
         let specifier = r.read_string()?;
-        let kind_byte = r.read_u8()?;
-        let (kind, source, host_exports) = match kind_byte {
-            0 => (ImportKind::Source, r.read_optional_string()?, vec![]),
-            1 => {
-                let count = r.read_u32()? as usize;
-                let mut exports = Vec::with_capacity(count);
-                for _ in 0..count {
-                    exports.push(r.read_string()?);
-                }
-                (ImportKind::Host, None, exports)
-            }
-            b => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown import kind byte: {b:#04x}"),
-                ))
-            }
-        };
-        imports.push(ImportBinding {
-            specifier,
-            kind,
-            source,
-            host_exports,
-        });
+        let source = r.read_string()?;
+        imports.push(ImportBinding { specifier, source });
     }
     Ok((code, filename, limits, globals, imports))
 }
@@ -820,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_payload_with_source_import() {
+    fn parse_run_payload_with_one_import() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "code"); // code
@@ -829,40 +812,34 @@ mod tests {
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "lib:math"); // specifier
-        v.push(0); // kind = source
-        v.push(1); // source present
         push_string(&mut v, "export const add = (a, b) => a + b");
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 1);
         assert_eq!(p.imports[0].specifier, "lib:math");
-        assert_eq!(p.imports[0].kind, ImportKind::Source);
-        assert_eq!(
-            p.imports[0].source.as_deref(),
-            Some("export const add = (a, b) => a + b")
-        );
-        assert!(p.imports[0].host_exports.is_empty());
+        assert_eq!(p.imports[0].source, "export const add = (a, b) => a + b");
     }
 
     #[test]
-    fn parse_run_payload_with_host_import() {
+    fn parse_run_payload_with_multiple_imports() {
         let mut v = Vec::new();
         push_u32(&mut v, 1);
         push_string(&mut v, "code");
         v.push(0); // no filename
         v.extend_from_slice(&[0u8; 32]); // limits
         push_u32(&mut v, 0); // globals count
-        push_u32(&mut v, 1); // 1 import
-        push_string(&mut v, "host:tools"); // specifier
-        v.push(1); // kind = host
-        push_u32(&mut v, 2); // 2 host exports
-        push_string(&mut v, "search");
-        push_string(&mut v, "fetch");
+        push_u32(&mut v, 2); // 2 imports
+        push_string(&mut v, "lib:a");
+        push_string(&mut v, "export const a = 1");
+        push_string(&mut v, "lib:b");
+        push_string(&mut v, "export const b = 2");
 
         let p = parse_run_payload(&v).unwrap();
-        assert_eq!(p.imports[0].kind, ImportKind::Host);
-        assert!(p.imports[0].source.is_none());
-        assert_eq!(p.imports[0].host_exports, vec!["search", "fetch"]);
+        assert_eq!(p.imports.len(), 2);
+        assert_eq!(p.imports[0].specifier, "lib:a");
+        assert_eq!(p.imports[0].source, "export const a = 1");
+        assert_eq!(p.imports[1].specifier, "lib:b");
+        assert_eq!(p.imports[1].source, "export const b = 2");
     }
 
     #[test]
@@ -872,24 +849,6 @@ mod tests {
         assert_eq!(
             parse_run_payload(&v).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof,
-        );
-    }
-
-    #[test]
-    fn parse_run_payload_rejects_unknown_import_kind() {
-        let mut v = Vec::new();
-        push_u32(&mut v, 1);
-        push_string(&mut v, "code");
-        v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 32]); // limits
-        push_u32(&mut v, 0); // globals count
-        push_u32(&mut v, 1); // 1 import
-        push_string(&mut v, "x:y");
-        v.push(0xff); // unknown kind byte
-
-        assert_eq!(
-            parse_run_payload(&v).unwrap_err().kind(),
-            io::ErrorKind::InvalidData,
         );
     }
 

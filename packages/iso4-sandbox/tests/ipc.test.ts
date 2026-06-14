@@ -226,4 +226,66 @@ describe('payload encoders', () => {
     expect(value).toBe('99')
     expect(buf.byteLength).toBe(4 + 2) // u32 len + '99'
   })
+
+  // ── imports field wire encoding ────────────────────────────────────────
+  // The wire only carries source-form imports: the TS-side import processor
+  // lowers "host module" (object) imports to generated ESM source before
+  // encoding. The Rust parser is in `native/v8-runtime/src/ipc.rs`; the
+  // round-trip tests there mirror the layout asserted below.
+
+  test('encodeRunPayload with one import lays out specifier then source', () => {
+    const buf = encodeRunPayload({
+      runId: 1,
+      code: 'x',
+      imports: [
+        { specifier: 'lib:math', source: 'export const add = (a, b) => a + b' },
+      ],
+    })
+    // Skip runId(4) + code(4+1) + filename absent(1) + limits(32) + globals count(4)
+    let off = 4 + 4 + 1 + 1 + 32 + 4
+    expect(readU32BE(buf, off)).toBe(1) // imports count
+    off += 4
+    const { value: specifier, end: e1 } = readString(buf, off)
+    expect(specifier).toBe('lib:math')
+    const { value: source, end: e2 } = readString(buf, e1)
+    expect(source).toBe('export const add = (a, b) => a + b')
+    expect(e2).toBe(buf.byteLength)
+  })
+
+  test('encodeRunPayload with multiple imports preserves order', () => {
+    const buf = encodeRunPayload({
+      runId: 1,
+      code: 'x',
+      imports: [
+        { specifier: 'lib:a', source: 'export const a = 1' },
+        { specifier: 'lib:b', source: 'export const b = 2' },
+      ],
+    })
+    let off = 4 + 4 + 1 + 1 + 32 + 4
+    expect(readU32BE(buf, off)).toBe(2) // imports count
+    off += 4
+    const { value: s1, end: e1 } = readString(buf, off)
+    expect(s1).toBe('lib:a')
+    const { value: src1, end: e2 } = readString(buf, e1)
+    expect(src1).toBe('export const a = 1')
+    const { value: s2, end: e3 } = readString(buf, e2)
+    expect(s2).toBe('lib:b')
+    const { value: src2, end: e4 } = readString(buf, e3)
+    expect(src2).toBe('export const b = 2')
+    expect(e4).toBe(buf.byteLength)
+  })
+
+  test('encodePrecompilePayload and encodePrefixRunPayload both carry the imports field', () => {
+    const imports = [{ specifier: 'lib:zod', source: 'export const z = {}' }] as const
+    const pre = encodePrecompilePayload({ code: 'x', imports })
+    const pref = encodePrefixRunPayload({ runId: 1, prefixId: 'p', code: 'x', imports })
+    expect(pre.toString('utf8')).toContain('lib:zod')
+    expect(pref.toString('utf8')).toContain('lib:zod')
+  })
+
+  test('imports field defaults to empty list when omitted', () => {
+    const buf = encodeRunPayload({ runId: 1, code: 'x' })
+    // Last 4 bytes should be u32(0) (imports count).
+    expect(readU32BE(buf, buf.byteLength - 4)).toBe(0)
+  })
 })
