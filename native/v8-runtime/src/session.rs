@@ -146,10 +146,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 );
 
                 let globals: Vec<String> = payload.globals.iter().map(|g| g.name.clone()).collect();
-                // Host-module function leaves reach the bridge through the
-                // generated `__iso4__import__…` global names (registered by
-                // the TS-side import processor) and show up in `globals`, so
-                // a non-empty globals list is the full "needs bridge" check.
+                // Any host-side bridge capability is exposed to V8 as "globals".
+                // Host-module import function leaves now route through the single reserved
+                // dispatcher global `__iso4_call`, so a non-empty globals list is the full
+                // "needs bridge" check.
                 let stream_fd = if globals.is_empty() {
                     None
                 } else {
