@@ -1228,9 +1228,9 @@ fn no_import_resolver<'a>(
 //                      instantiate_module recurses through our resolver to
 //                      satisfy transitive imports, so source modules can
 //                      themselves import other source modules.
-//   - Host modules:    we synthesise a v8::Module whose exports are bridge
-//                      stubs (for functions) and frozen data values (for
-//                      `HostExportData`, decoded from `WireValue` bytes).
+//   - Host modules:    the public TS API accepts an object form, but it is lowered
+//                      on the TS side to generated ESM source. By the time the
+//                      binding reaches this resolver, it's still just (specifier, source).
 //
 // V8's module resolver callback has no user-data slot. The state lives in a
 // thread-local that is set before `instantiate_module` and cleared once both
