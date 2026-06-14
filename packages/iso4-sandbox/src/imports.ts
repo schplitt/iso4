@@ -152,7 +152,7 @@ export function processImports(imports: Imports | undefined): ProcessedImports {
       shape.sourceSpecifiers.add(specifier)
       continue
     }
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    if (!isPlainObject(value)) {
       throw new Error(
         `[@iso4/sandbox] imports['${specifier}'] must be a string (source module) `
         + `or a plain object (host module); got ${describeKind(value)}`,
