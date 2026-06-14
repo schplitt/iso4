@@ -1589,11 +1589,10 @@ fn bridge_global_callback(
 
     // ── Assign call ID and build BridgeCall payload ────────────────────────
     let call_id = data.call_id.fetch_add(1, Ordering::Relaxed);
-    // All bridge calls in v1 are globals (targetKind = 0). Host-module
-    // function leaves reach the bridge via a regular global stub whose name
-    // is the generated `__iso4__import__…` identifier. Native binding
-    // (Phase 12) and callable handles (Phase 13) will revive targetKind = 1
-    // and 2 respectively.
+    // All bridge calls in v1 are globals (targetKind = 0).
+    // Host-module import function leaves reach the bridge via the single reserved
+    // dispatcher global `__iso4_call`, with the first argument being an integer
+    // handle ID that the host-side dispatcher uses to route the call.
     let bridge_call_payload =
         wire::encode_bridge_call_payload(call_id, 0, None, &data.name, &wire_args);
 
