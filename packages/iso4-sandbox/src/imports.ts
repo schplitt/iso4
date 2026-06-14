@@ -222,7 +222,7 @@ export function extractRebindImports(
 
 function walkRebind(
   specifier: string,
-  node: HostModuleDescription,
+  node: HostModuleObject,
   path: string[],
   shape: DeclaredImportShape,
   merged: HandleRegistry,
