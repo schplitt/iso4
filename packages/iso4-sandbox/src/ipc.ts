@@ -316,6 +316,18 @@ class PayloadWriter {
     return this
   }
 
+  writeImports(imports: readonly ImportBindingPayload[]): this {
+    // Wire layout per docs/protocol.md §5.2 and the Rust parser in `ipc.rs`:
+    //   u32                count
+    //   for each: String specifier, String source
+    this.writeU32(imports.length)
+    for (const imp of imports) {
+      this.writeString(imp.specifier)
+      this.writeString(imp.source)
+    }
+    return this
+  }
+
   writeResourceLimits(limits: ResourceLimits): this {
     this.writeU32(limits.memoryMb ?? 0)
     this.writeU32(limits.cpuTimeMs ?? 0)
@@ -372,6 +384,20 @@ export interface ResourceLimits {
   maxBridgeCalls?: number
 }
 
+// ── ImportBinding (wire form) ───────────────────────────────────────────────
+
+/**
+ * Wire-shaped import declaration for `Run`/`Precompile`/`PrefixRun` payloads.
+ *
+ * This is the flat, serialisable form. The richer `ImportDefinition` in
+ * `types.ts` (with resolver callbacks, host export functions, etc.) is
+ * flattened to this shape by the client before encoding.
+ */
+export interface ImportBindingPayload {
+  specifier: string
+  source: string
+}
+
 // ── RunPayload ──────────────────────────────────────────────────────────────
 
 export interface RunPayloadOptions {
@@ -380,6 +406,7 @@ export interface RunPayloadOptions {
   filename?: string
   limits?: ResourceLimits
   globals?: string[]
+  imports?: readonly ImportBindingPayload[]
 }
 
 /**
@@ -395,17 +422,18 @@ export function encodeRunPayload(options: RunPayloadOptions): Buffer {
   const globals = options.globals ?? []
   w.writeU32(globals.length)
   for (const name of globals) w.writeString(name)
-  w.writeU32(0) // imports count (Phase 6+)
+  w.writeImports(options.imports ?? [])
   return w.toBuffer()
 }
 
-// ── PrecompilePayload ───────────────────────────────────────────────────────
+// ── PrecompilePayload ──────────────────────────────────────────
 
 export interface PrecompilePayloadOptions {
   code: string
   filename?: string
   limits?: ResourceLimits
   globals?: string[]
+  imports?: readonly ImportBindingPayload[]
 }
 
 /**
@@ -421,11 +449,11 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buff
   const globals = options.globals ?? []
   w.writeU32(globals.length)
   for (const name of globals) w.writeString(name)
-  w.writeU32(0) // imports count (Phase 6+)
+  w.writeImports(options.imports ?? [])
   return w.toBuffer()
 }
 
-// ── PrefixRunPayload ────────────────────────────────────────────────────────
+// ── PrefixRunPayload ────────────────────────────────────────────
 
 export interface PrefixRunPayloadOptions {
   prefixId: string
@@ -433,6 +461,7 @@ export interface PrefixRunPayloadOptions {
   filename?: string
   limits?: ResourceLimits
   globals?: string[]
+  imports?: readonly ImportBindingPayload[]
 }
 
 /**
@@ -453,7 +482,7 @@ export function encodePrefixRunPayload(
   const globals = options.globals ?? []
   w.writeU32(globals.length)
   for (const name of globals) w.writeString(name)
-  w.writeU32(0) // imports count (Phase 6+)
+  w.writeImports(options.imports ?? [])
   return w.toBuffer()
 }
 

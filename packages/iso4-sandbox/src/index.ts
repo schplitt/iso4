@@ -32,11 +32,20 @@ import type {
   RunResult,
   Sandbox,
   SandboxOptions,
+  Imports,
 } from './types'
 
 // ── Global processing (imported from globals.ts for testability) ──────────
 
 import { extractBridgeGlobals, processGlobals } from './globals.js'
+import {
+  BRIDGE_DISPATCH_GLOBAL,
+  UndeclaredImportBindingError,
+  createDispatchGlobal,
+  extractRebindImports,
+  processImports,
+} from './imports.js'
+import type { DeclaredImportShape, HandleRegistry } from './imports.js'
 
 export type {
   ResourceLimits,
@@ -45,14 +54,14 @@ export type {
   BridgeWithShim,
   RebindValue,
   RebindGlobals,
-  ImportsConfig,
-  ImportDefinition,
-  SourceImport,
-  HostImport,
-  HostExports,
-  HostExportValue,
+  Imports,
+  ImportValue,
+  HostModuleObject,
+  HostModuleValue,
   HostExportData,
   HostExportFunction,
+  RebindImports,
+  RebindHostModule,
   CreateSandbox,
   Sandbox,
   SandboxOptions,
@@ -139,14 +148,14 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
   maxBridgeCalls: number
 } {
   return {
-    memoryMb:          limits?.memoryMb          ?? 64,
-    cpuTimeMs:         limits?.cpuTimeMs         ?? 5_000,
-    wallTimeMs:        limits?.wallTimeMs         ?? 30_000,
-    maxExportBytes:    limits?.maxExportBytes     ?? 16 * 1024 * 1024,
-    maxStdoutBytes:    limits?.maxStdoutBytes     ?? 1 * 1024 * 1024,
-    maxStderrBytes:    limits?.maxStderrBytes     ?? 1 * 1024 * 1024,
+    memoryMb: limits?.memoryMb ?? 64,
+    cpuTimeMs: limits?.cpuTimeMs ?? 5_000,
+    wallTimeMs: limits?.wallTimeMs ?? 30_000,
+    maxExportBytes: limits?.maxExportBytes ?? 16 * 1024 * 1024,
+    maxStdoutBytes: limits?.maxStdoutBytes ?? 1 * 1024 * 1024,
+    maxStderrBytes: limits?.maxStderrBytes ?? 1 * 1024 * 1024,
     maxBridgeCallBytes: limits?.maxBridgeCallBytes ?? 16 * 1024 * 1024,
-    maxBridgeCalls:    limits?.maxBridgeCalls     ?? 10,
+    maxBridgeCalls: limits?.maxBridgeCalls ?? 10,
   }
 }
 
@@ -178,30 +187,52 @@ class SandboxImpl implements Sandbox {
       return { ok: false, error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' }, stdout: [], stderr: [], durationMs: 0 }
     }
     const { bridgeGlobals, preamble } = processGlobals(options.globals ?? {})
+    const { bindings, registry, shape: _shape } = processImports(options.imports)
+    // Host-module function leaves are reached through the single
+    // `__iso4_call` dispatcher global, which routes by handle ID. Install it
+    // alongside the user globals when any function leaves exist.
+    const allGlobals = registry.size > 0
+      ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
+      : bridgeGlobals
     const code = preamble ? `${preamble}\n${options.code}` : options.code
     return this.pool.withClient(async (client) => {
       const raw = await client.runRawCode(code, {
         filename: options.filename,
         limits: toWireLimits(options.limits),
-        globals: bridgeGlobals,
+        globals: allGlobals,
+        imports: bindings,
       })
       return decodeRunCompletionPayload(raw.result).result
     })
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-empty-object-type
-  async precompile<G extends HostGlobals = {}>(
-    options: PrecompileOptions<G>,
-  ): Promise<Prefix<G>> {
+  /**
+   * @param options
+   */
+  async precompile<
+    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+    G extends HostGlobals = {},
+    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+    M extends Imports = {},
+  >(
+    options: PrecompileOptions<G, M>,
+  ): Promise<Prefix<G, M>> {
     return this.pool.withClient(async (client) => {
       const rawGlobals = options.globals ?? {} as G
       const { bridgeGlobals, preamble } = processGlobals(rawGlobals)
+      const { bindings, registry, shape } = processImports(options.imports)
+      // See the comment in `run` — host-module function leaves reach the
+      // bridge through the single `__iso4_call` dispatcher global.
+      const allGlobals = registry.size > 0
+        ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
+        : bridgeGlobals
       const code = preamble ? `${preamble}\n${options.code}` : options.code
       const raw = await client.precompile({
         code,
         filename: options.filename,
         limits: toWireLimits(options.limits),
-        globals: bridgeGlobals,
+        globals: allGlobals,
+        imports: bindings,
       })
       const result = decodePrecompileResultPayload(raw)
 
@@ -218,7 +249,7 @@ class SandboxImpl implements Sandbox {
         throw err
       }
 
-      return new PrefixImpl<G>(result.prefixId, this.pool, rawGlobals)
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, registry, shape)
     })
   }
 
@@ -245,8 +276,8 @@ class SandboxImpl implements Sandbox {
 // ── PrefixImpl ───────────────────────────────────────────────────────────────
 
 // eslint-disable-next-line @typescript-eslint/no-empty-object-type
-class PrefixImpl<G extends HostGlobals = {}>
-implements Prefix<G> {
+class PrefixImpl<G extends HostGlobals = {}, M extends Imports = {}>
+implements Prefix<G, M> {
   readonly id: string
   private readonly pool: ConnectionPool
   /**
@@ -256,19 +287,41 @@ implements Prefix<G> {
    * precompile-time implementation is reused."
    */
   private readonly defaultGlobals: G
+  /**
+   * Handle registry declared at precompile time: handle ID → host function.
+   * Same rebinding rules as `defaultGlobals` — a `prefix.run()` may override
+   * a subset of function leaves; everything else falls back to these. Source
+   * modules and data leaves are frozen in the snapshot and not represented
+   * here.
+   */
+  private readonly defaultRegistry: HandleRegistry
+  /**
+   * Declared shape captured at precompile time. Drives type-level rebinding
+   * via `RebindImports<M>` and runtime `ERR_UNDECLARED_BINDING` enforcement
+   * inside `extractRebindImports`.
+   */
+  private readonly declaredImportShape: DeclaredImportShape
   private _alive = true
 
-  constructor(id: string, pool: ConnectionPool, defaultGlobals: G) {
+  constructor(
+    id: string,
+    pool: ConnectionPool,
+    defaultGlobals: G,
+    defaultRegistry: HandleRegistry,
+    declaredImportShape: DeclaredImportShape,
+  ) {
     this.id = id
     this.pool = pool
     this.defaultGlobals = defaultGlobals
+    this.defaultRegistry = defaultRegistry
+    this.declaredImportShape = declaredImportShape
   }
 
   get alive(): boolean {
     return this._alive
   }
 
-  async run(options: PrefixRunOptions<G>): Promise<RunResult> {
+  async run(options: PrefixRunOptions<G, M>): Promise<RunResult> {
     if (!this._alive) {
       return {
         ok: false,
@@ -292,13 +345,39 @@ implements Prefix<G> {
       (options.globals ?? {}) as RebindGlobals<HostGlobals>,
       this.defaultGlobals as HostGlobals,
     )
+    let registry: HandleRegistry
+    try {
+      registry = extractRebindImports(
+        options.imports as unknown as Parameters<typeof extractRebindImports>[0],
+        this.defaultRegistry,
+        this.declaredImportShape,
+      )
+    } catch (e) {
+      if (e instanceof UndeclaredImportBindingError) {
+        // Symmetric with the Rust-side ERR_UNDECLARED_BINDING path for globals:
+        // surface the error as a RunResult failure rather than a thrown promise.
+        return {
+          ok: false,
+          error: { code: 'ERR_UNDECLARED_BINDING', name: 'Error', message: e.message },
+          stdout: [],
+          stderr: [],
+          durationMs: 0,
+        }
+      }
+      throw e
+    }
+    // Host-module function leaves reach the bridge through the single
+    // `__iso4_call` dispatcher global, keyed by handle ID.
+    const allGlobals = registry.size > 0
+      ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
+      : bridgeGlobals
     return this.pool.withClient(async (client) => {
       const raw = await client.prefixRun({
         prefixId: this.id,
         code: options.code,
         filename: options.filename,
         limits: toWireLimits(options.limits),
-        globals: bridgeGlobals,
+        globals: allGlobals,
       })
       return decodeRunCompletionPayload(raw.result).result
     })

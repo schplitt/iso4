@@ -287,13 +287,12 @@ describe('precompile + prefix.run()', () => {
     await prefix.dispose()
   })
 
-  test.skip('prefix with source library available in postfix', async () => {
+  test('prefix with source library available in postfix', async () => {
     const prefix = await runtime.precompile({
       code: `import { add } from 'lib:math'; globalThis.add = add`,
       imports: {
-        static: {
-          'lib:math': { kind: 'source', source: MATH_UTILS_SOURCE },
-        },
+
+        'lib:math': MATH_UTILS_SOURCE,
       },
     })
 
@@ -453,14 +452,14 @@ describe('source imports', () => {
     await runtime?.dispose()
   })
 
-  test.skip('import from host-provided source module', async () => {
+  test('import from host-provided source module', async () => {
     const result = await runtime.run({
       code: `
         import { add } from 'lib:math'
         export default add(3, 4)
       `,
       imports: {
-        static: { 'lib:math': { kind: 'source', source: MATH_UTILS_SOURCE } },
+        'lib:math': MATH_UTILS_SOURCE,
       },
     })
     expect(result.ok).toBe(true)
@@ -469,14 +468,14 @@ describe('source imports', () => {
     expect(result.exports.default).toBe(7)
   })
 
-  test.skip('import multiple functions from source module', async () => {
+  test('import multiple functions from source module', async () => {
     const result = await runtime.run({
       code: `
         import { clamp, sum, lerp } from 'lib:math'
         export default sum(clamp(5, 0, 10), lerp(0, 100, 0.5))
       `,
       imports: {
-        static: { 'lib:math': { kind: 'source', source: MATH_UTILS_SOURCE } },
+        'lib:math': MATH_UTILS_SOURCE,
       },
     })
     expect(result.ok).toBe(true)
@@ -485,7 +484,7 @@ describe('source imports', () => {
     expect(result.exports.default).toBe(55) // clamp(5,0,10)=5, lerp(0,100,0.5)=50 → 55
   })
 
-  test.skip('zod-like schema validation — happy path', async () => {
+  test('zod-like schema validation — happy path', async () => {
     const result = await runtime.run({
       code: `
         import { z } from 'lib:zod'
@@ -493,7 +492,7 @@ describe('source imports', () => {
         export default schema.parse({ name: 'Alice', age: 30 })
       `,
       imports: {
-        static: { 'lib:zod': { kind: 'source', source: ZOD_LIKE_SOURCE } },
+        'lib:zod': ZOD_LIKE_SOURCE,
       },
     })
     expect(result.ok).toBe(true)
@@ -502,7 +501,7 @@ describe('source imports', () => {
     expect(result.exports.default).toEqual({ name: 'Alice', age: 30 })
   })
 
-  test.skip('zod-like schema validation — missing key throws', async () => {
+  test('zod-like schema validation — missing key throws', async () => {
     const result = await runtime.run({
       code: `
         import { z } from 'lib:zod'
@@ -510,7 +509,7 @@ describe('source imports', () => {
         export default schema.parse({ wrong: true })
       `,
       imports: {
-        static: { 'lib:zod': { kind: 'source', source: ZOD_LIKE_SOURCE } },
+        'lib:zod': ZOD_LIKE_SOURCE,
       },
     })
     expect(result.ok).toBe(false)
@@ -520,7 +519,7 @@ describe('source imports', () => {
     expect(result.error.message).toContain('missing required key')
   })
 
-  test.skip('zod-like safeParse returns error shape instead of throwing', async () => {
+  test('zod-like safeParse returns error shape instead of throwing', async () => {
     const result = await runtime.run({
       code: `
         import { z } from 'lib:zod'
@@ -528,7 +527,7 @@ describe('source imports', () => {
         export default schema.safeParse({ wrong: true })
       `,
       imports: {
-        static: { 'lib:zod': { kind: 'source', source: ZOD_LIKE_SOURCE } },
+        'lib:zod': ZOD_LIKE_SOURCE,
       },
     })
     expect(result.ok).toBe(true)
@@ -537,16 +536,21 @@ describe('source imports', () => {
     expect(result.exports.default).toMatchObject({ success: false })
   })
 
-  test.skip('source module used in precompiled prefix is available in postfix', async () => {
+  test('source module declared on prefix is reachable from postfix import', async () => {
+    // ESM bindings don't cross module boundaries: postfix code that wants a
+    // source-module function must import it itself. The precompiled prefix's
+    // role is to declare the binding so the postfix's import resolves
+    // against the same source. (DESIGN.md §4.3.)
     const prefix = await runtime.precompile({
       code: `import { add, multiply } from 'lib:math'`,
       imports: {
-        static: { 'lib:math': { kind: 'source', source: MATH_UTILS_SOURCE } },
+        'lib:math': MATH_UTILS_SOURCE,
       },
     })
 
     const result = await prefix.run({
-      code: 'export default multiply(add(1, 2), 4)',
+      code: `import { add, multiply } from 'lib:math'
+             export default multiply(add(1, 2), 4)`,
     })
     expect(result.ok).toBe(true)
     if (!result.ok)
@@ -575,7 +579,7 @@ describe('source imports', () => {
       imports: {
         resolve: (specifier) => {
           if (specifier === 'dynamic:math')
-            return { kind: 'source', source: MATH_UTILS_SOURCE }
+            return MATH_UTILS_SOURCE
           return null
         },
       },
@@ -602,7 +606,7 @@ describe('host imports', () => {
     await runtime?.dispose()
   })
 
-  test.skip('host function is callable from sandbox', async () => {
+  test('host function is callable from sandbox', async () => {
     const calls: unknown[] = []
     const result = await runtime.run({
       code: `
@@ -610,15 +614,11 @@ describe('host imports', () => {
         export default await echo('ping')
       `,
       imports: {
-        static: {
-          'host:utils': {
-            kind: 'host',
-            exports: {
-              echo: (msg) => {
-                calls.push(msg)
-                return String(msg).toUpperCase()
-              },
-            },
+
+        'host:utils': {
+          echo: (msg) => {
+            calls.push(msg)
+            return String(msg).toUpperCase()
           },
         },
       },
@@ -630,22 +630,18 @@ describe('host imports', () => {
     expect(result.exports.default).toBe('PING')
   })
 
-  test.skip('async host function is awaited correctly', async () => {
+  test('async host function is awaited correctly', async () => {
     const result = await runtime.run({
       code: `
         import { fetchData } from 'host:api'
         export default await fetchData('users')
       `,
       imports: {
-        static: {
-          'host:api': {
-            kind: 'host',
-            exports: {
-              fetchData: async (resource: unknown) => {
-                // simulate async work
-                return `data for ${resource}`
-              },
-            },
+
+        'host:api': {
+          fetchData: async (resource: unknown) => {
+            // simulate async work
+            return `data for ${resource}`
           },
         },
       },
@@ -656,7 +652,7 @@ describe('host imports', () => {
     expect(result.exports.default).toBe('data for users')
   })
 
-  test.skip('host module tools bridge called via source wrapper', async () => {
+  test('host module tools bridge called via source wrapper', async () => {
     const searchResults = [{ title: 'result 1' }, { title: 'result 2' }]
     const result = await runtime.run({
       code: `
@@ -665,16 +661,12 @@ describe('host imports', () => {
         export default results.length
       `,
       imports: {
-        static: {
-          'lib:tools': { kind: 'source', source: TOOLS_WRAPPER_SOURCE },
-          'host:tools-bridge': {
-            kind: 'host',
-            exports: {
-              _search: async (query: unknown, limit: unknown) =>
-                JSON.stringify(searchResults.slice(0, Number(limit))),
-              _weather: async () => JSON.stringify({ temp: 20 }),
-            },
-          },
+
+        'lib:tools': TOOLS_WRAPPER_SOURCE,
+        'host:tools-bridge': {
+          _search: async (query: unknown, limit: unknown) =>
+            JSON.stringify(searchResults.slice(0, Number(limit))),
+          _weather: async () => JSON.stringify({ temp: 20 }),
         },
       },
     })
@@ -684,7 +676,7 @@ describe('host imports', () => {
     expect(result.exports.default).toBe(2)
   })
 
-  test.skip('host function receives correct argument types', async () => {
+  test('host function receives correct argument types', async () => {
     const received: unknown[] = []
     await runtime.run({
       code: `
@@ -693,15 +685,11 @@ describe('host imports', () => {
         export default 1
       `,
       imports: {
-        static: {
-          'host:spy': {
-            kind: 'host',
-            exports: {
-              record: (...args: unknown[]) => {
-                received.push(...args)
-                return null
-              },
-            },
+
+        'host:spy': {
+          record: (...args: unknown[]) => {
+            received.push(...args)
+            return null
           },
         },
       },
@@ -709,19 +697,15 @@ describe('host imports', () => {
     expect(received).toEqual([42, true, 'hello', null])
   })
 
-  test.skip('host function passed a function argument fails with ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED', async () => {
+  test('host function passed a function argument fails with ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED', async () => {
     const result = await runtime.run({
       code: `
         import { call } from 'host:cb'
         export default await call(() => 42)
       `,
       imports: {
-        static: {
-          'host:cb': {
-            kind: 'host',
-            exports: { call: (fn: unknown) => fn },
-          },
-        },
+
+        'host:cb': { call: (fn: unknown) => fn },
       },
     })
     expect(result.ok).toBe(false)
@@ -991,16 +975,12 @@ describe('AbortSignal cancellation', () => {
       `,
       signal: controller.signal,
       imports: {
-        static: {
-          'host:slow': {
-            kind: 'host',
-            exports: {
-              slowCall: () =>
-                new Promise((resolve) => {
-                  setTimeout(resolve, 10_000)
-                }),
-            },
-          },
+
+        'host:slow': {
+          slowCall: () =>
+            new Promise((resolve) => {
+              setTimeout(resolve, 10_000)
+            }),
         },
       },
     })
@@ -1168,21 +1148,17 @@ describe('host bridge error propagation', () => {
     await runtime?.dispose()
   })
 
-  test.skip('host import function throwing is ERR_HOST_BRIDGE', async () => {
+  test('host import function throwing is ERR_HOST_BRIDGE', async () => {
     const result = await runtime.run({
       code: `
         import { boom } from 'host:broken'
         export default await boom()
       `,
       imports: {
-        static: {
-          'host:broken': {
-            kind: 'host',
-            exports: {
-              boom: () => {
-                throw new Error('host function exploded')
-              },
-            },
+
+        'host:broken': {
+          boom: () => {
+            throw new Error('host function exploded')
           },
         },
       },
@@ -1193,21 +1169,17 @@ describe('host bridge error propagation', () => {
     expect(result.error.code).toBe('ERR_HOST_BRIDGE')
   })
 
-  test.skip('host import async function rejecting is ERR_HOST_BRIDGE', async () => {
+  test('host import async function rejecting is ERR_HOST_BRIDGE', async () => {
     const result = await runtime.run({
       code: `
         import { fail } from 'host:broken'
         export default await fail()
       `,
       imports: {
-        static: {
-          'host:broken': {
-            kind: 'host',
-            exports: {
-              fail: async () => {
-                throw new Error('async rejection')
-              },
-            },
+
+        'host:broken': {
+          fail: async () => {
+            throw new Error('async rejection')
           },
         },
       },
@@ -1292,16 +1264,12 @@ describe('CPU budget vs wall time', () => {
       `,
       limits: { cpuTimeMs: 100, wallTimeMs: 5000 },
       imports: {
-        static: {
-          'host:time': {
-            kind: 'host',
-            exports: {
-              sleep: (ms: unknown) =>
-                new Promise((r) => {
-                  setTimeout(r, Number(ms))
-                }),
-            },
-          },
+
+        'host:time': {
+          sleep: (ms: unknown) =>
+            new Promise((r) => {
+              setTimeout(r, Number(ms))
+            }),
         },
       },
     })

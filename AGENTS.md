@@ -280,17 +280,19 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 - **No callbacks across the boundary** in v1. No `setTimeout`, no
   event listeners on host objects. Functions passed as host-import
   arguments are rejected with `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`.
-- **Two execution models, one API surface.** iso4 serves two distinct use
-  cases: AI-agent one-shot runs (`prefix.run()`) and analytics persistent
-  sessions (`prefix.openSession()` / `session.call()`). Both use the same
-  `PrecompiledPrefix` and the same snapshot mechanism. The session API is
-  post-v1 but must not be precluded by v1 API decisions.
-- **Two-process is the default backend; in-process is a future opt-in.**
-  The Rust subprocess provides crash isolation critical for untrusted code.
-  The in-process C++ NAPI backend (Phase 12) is for high-throughput analytics
-  inside Docker/K8s where the container is the outer security boundary.
-  Both backends expose the same TypeScript API via `SandboxOptions.backend`.
-  Do not conflate the two; do not add in-process code in v1.
+- **One execution model in this product.** `@iso4/sandbox` ships one API
+  shape: AI-agent one-shot runs (`prefix.run()`). The persistent-session
+  / per-row-analytics use case is its own product (`@iso4/analytics` or
+  similar, name TBD), not a `SandboxOptions.backend` flag. They will
+  share wire-frame types, the `Imports<…>` declaration shape, and the
+  `ValueSerializer`-based "only data crosses" rule, but the runtime API,
+  transport, lifecycle, and memory model differ. Do not retrofit a
+  session API or an in-process backend onto `@iso4/sandbox`. See
+  DESIGN.md §9.1 and §13.
+- **Two-process is the only backend.** The Rust subprocess provides
+  crash isolation critical for untrusted code. There is no
+  `SandboxOptions.backend` flag and no plan to add one in this package.
+  In-process embedding is the analytics product's concern.
 - **V8 `ValueSerializer` is irreplaceable for JS values.** Cap'n Proto,
   MessagePack, and similar cannot replace it for bridge/export payloads
   because they don't know V8's type system. They can only wrap V8 bytes as
@@ -326,6 +328,9 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   V8's native word format directly (`new_from_words` / `to_words_array`); no
   base conversion is needed. The TS side uses native `bigint` bitshift arithmetic.
   Adding a crate for this is net overhead with zero benefit.
-- Do not add the in-process (NAPI) backend in v1. It is a Phase 12 concern.
-  rusty_v8 cannot be used in-process with Node — it would need a C++ rewrite
-  of `packages/iso4-embed/`. That conversation happens at Phase 11, not before.
+- Do not add an in-process (NAPI) backend to `@iso4/sandbox`. It belongs
+  to the future analytics product (DESIGN.md §9.1), not as a
+  `SandboxOptions.backend` flag. rusty_v8 cannot be used in-process with
+  Node and would need a separate C++ embedding. That conversation
+  happens in the analytics product's design pass, after Phases 1–13 of
+  this product ship.

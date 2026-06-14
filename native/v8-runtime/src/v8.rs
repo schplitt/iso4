@@ -3,6 +3,7 @@
 //! Owns everything V8-related: platform init, isolate creation, compilation,
 //! evaluation, result extraction, console capture, and limit enforcement.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::RecvTimeoutError;
 
 use crate::ipc;
+use crate::ipc::ImportBinding;
 use crate::wire::{self, WireValue};
 
 static INIT: Once = Once::new();
@@ -371,6 +373,7 @@ pub fn execute(
     filename: Option<&str>,
     limits: Limits,
     globals: &[String],
+    imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
 ) -> Result<Output, FailureOutput> {
@@ -381,6 +384,7 @@ pub fn execute(
         None,
         limits,
         globals,
+        imports,
         stream_fd,
         call_id_counter,
     )
@@ -397,6 +401,7 @@ pub fn execute_with_prefix(
     filename: Option<&str>,
     limits: Limits,
     globals: &[String],
+    imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
 ) -> Result<Output, FailureOutput> {
@@ -407,6 +412,7 @@ pub fn execute_with_prefix(
         Some(snapshot_bytes),
         limits,
         globals,
+        imports,
         stream_fd,
         call_id_counter,
     )
@@ -424,9 +430,13 @@ pub fn execute_with_prefix(
 /// No execution-time limits are applied: prefix code is host-authored and
 /// trusted. If execution limits are needed for snapshot creation in future,
 /// add an optional `limits: Limits` parameter here.
-pub fn precompile(code: &str, filename: Option<&str>) -> Result<Vec<u8>, FailureOutput> {
+pub fn precompile(
+    code: &str,
+    filename: Option<&str>,
+    imports: &[ImportBinding],
+) -> Result<Vec<u8>, FailureOutput> {
     init_platform();
-    precompile_module(code, filename.unwrap_or("<prefix>"))
+    precompile_module(code, filename.unwrap_or("<prefix>"), imports)
 }
 
 
@@ -444,6 +454,7 @@ fn run_module(
     snapshot: Option<&[u8]>,
     limits: Limits,
     globals: &[String],
+    imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     // Per-connection call-ID counter. Shared across all runs on the same
     // connection so callIds are monotonically increasing and never reset to 0
@@ -678,15 +689,24 @@ fn run_module(
         }
     };
 
+    // ── Install module resolver for this run (Phase 6) ──────────────────────
+    // After `instantiate_module` returns we inspect `resolve_error` for any
+    // non-V8-throwable error recorded inside the resolver (e.g. a source
+    // module that failed to compile).
+    let _resolver_guard = install_resolver(ResolverContext {
+        bindings: imports.to_vec(),
+        module_cache: HashMap::new(),
+        resolve_error: None,
+    });
+
     if module
-        .instantiate_module(scope, no_import_resolver)
+        .instantiate_module(scope, module_resolver_callback)
         .is_none()
     {
-        return Err(failure(
-            RunError::ModuleNotFound(exception_message(scope)),
-            &logs,
-            start,
-        ));
+        let err = take_resolver()
+            .and_then(|ctx| ctx.resolve_error)
+            .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
+        return Err(failure(err, &logs, start));
     }
 
     cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
@@ -1033,7 +1053,11 @@ fn run_module(
 /// Uses `Isolate::snapshot_creator` instead of `Isolate::new`. The scope
 /// block must drop before `create_blob` is called, so compilation runs inside
 /// an immediately-invoked closure that borrows `&mut isolate`.
-fn precompile_module(code: &str, filename: &str) -> Result<Vec<u8>, FailureOutput> {
+fn precompile_module(
+    code: &str,
+    filename: &str,
+    imports: &[ImportBinding],
+) -> Result<Vec<u8>, FailureOutput> {
     let start = std::time::Instant::now();
 
     let mut isolate = v8::Isolate::snapshot_creator(None, None);
@@ -1094,15 +1118,24 @@ fn precompile_module(code: &str, filename: &str) -> Result<Vec<u8>, FailureOutpu
             }
         };
 
+        // Precompile-time resolver: source imports are compiled and evaluated
+        // inside the snapshot's context. Bridge globals (including those
+        // backing host-module function leaves) are *not* installed here —
+        // bridge stubs are recreated per `execute_with_prefix` call.
+        let _resolver_guard = install_resolver(ResolverContext {
+            bindings: imports.to_vec(),
+            module_cache: HashMap::new(),
+            resolve_error: None,
+        });
+
         if module
-            .instantiate_module(scope, no_import_resolver)
+            .instantiate_module(scope, module_resolver_callback)
             .is_none()
         {
-            return Err(failure(
-                RunError::ModuleNotFound(exception_message(scope)),
-                &logs,
-                start,
-            ));
+            let err = take_resolver()
+                .and_then(|ctx| ctx.resolve_error)
+                .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
+            return Err(failure(err, &logs, start));
         }
 
         let evaluation = match module.evaluate(scope) {
@@ -1185,6 +1218,164 @@ fn no_import_resolver<'a>(
     _referrer: v8::Local<'a, v8::Module>,
 ) -> Option<v8::Local<'a, v8::Module>> {
     None
+}
+
+// ── Module resolver (Phases 6 + 7) ──────────────────────────────────────────
+//
+// Two flavours per DESIGN.md §4.3:
+//   - Source modules:  host supplies ESM source. We compile it with
+//                      script_compiler::compile_module. The top-level
+//                      instantiate_module recurses through our resolver to
+//                      satisfy transitive imports, so source modules can
+//                      themselves import other source modules.
+//   - Host modules:    we synthesise a v8::Module whose exports are bridge
+//                      stubs (for functions) and frozen data values (for
+//                      `HostExportData`, decoded from `WireValue` bytes).
+//
+// V8's module resolver callback has no user-data slot. The state lives in a
+// thread-local that is set before `instantiate_module` and cleared once both
+// `instantiate_module` and `evaluate` have returned (synthetic-module
+// evaluation steps also dip into it). Each `run_module` invocation runs on
+// one thread with one isolate, so this is safe.
+
+struct ResolverContext {
+    /// Specifiers the host declared for this run, in wire-order. Every
+    /// binding is source-form: the TS-side import processor lowered any
+    /// object-shape ("host") imports to generated source that calls bridge
+    /// globals at function leaves.
+    bindings: Vec<ImportBinding>,
+    /// Per-isolate module cache so transitive imports resolve to the same
+    /// `v8::Module` instance and import diamonds collapse correctly.
+    module_cache: HashMap<String, v8::Global<v8::Module>>,
+    /// First resolver error wins. V8's callback ABI can't carry a
+    /// `RunError`, so the caller inspects this after `instantiate_module`.
+    resolve_error: Option<RunError>,
+}
+
+thread_local! {
+    static RESOLVER_CTX: RefCell<Option<ResolverContext>> = const { RefCell::new(None) };
+}
+
+/// Drop guard that takes the resolver context back out of the thread-local
+/// when it goes out of scope, regardless of how the caller exits.
+struct ResolverGuard;
+impl Drop for ResolverGuard {
+    fn drop(&mut self) {
+        RESOLVER_CTX.with(|c| {
+            c.borrow_mut().take();
+        });
+    }
+}
+
+/// Install a resolver context for the duration of `f` (instantiate + evaluate).
+/// Returns the context back so the caller can drain `pending_boxes` and inspect
+/// `resolve_error`.
+fn install_resolver(ctx: ResolverContext) -> ResolverGuard {
+    RESOLVER_CTX.with(|c| {
+        *c.borrow_mut() = Some(ctx);
+    });
+    ResolverGuard
+}
+
+fn take_resolver() -> Option<ResolverContext> {
+    RESOLVER_CTX.with(|c| c.borrow_mut().take())
+}
+
+/// Find the wire binding for `specifier`, cloning the relevant fields so we
+/// don't hold a borrow across `scope` calls.
+fn lookup_binding(specifier: &str) -> Option<ImportBinding> {
+    RESOLVER_CTX.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|ctx| ctx.bindings.iter().find(|b| b.specifier == specifier).cloned())
+    })
+}
+
+fn cache_get(specifier: &str) -> Option<v8::Global<v8::Module>> {
+    RESOLVER_CTX.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|ctx| ctx.module_cache.get(specifier).cloned())
+    })
+}
+
+fn cache_put(specifier: String, module: v8::Global<v8::Module>) {
+    RESOLVER_CTX.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            ctx.module_cache.insert(specifier, module);
+        }
+    });
+}
+
+fn record_resolve_error(err: RunError) {
+    RESOLVER_CTX.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            if ctx.resolve_error.is_none() {
+                ctx.resolve_error = Some(err);
+            }
+        }
+    });
+}
+
+/// The module resolver V8 calls during `instantiate_module`.
+///
+/// Returning `None` causes V8 to throw "Cannot find module …"; the outer
+/// instantiate path converts that into `RunError::ModuleNotFound`.
+fn module_resolver_callback<'a>(
+    context: v8::Local<'a, v8::Context>,
+    specifier: v8::Local<'a, v8::String>,
+    _import_assertions: v8::Local<'a, v8::FixedArray>,
+    _referrer: v8::Local<'a, v8::Module>,
+) -> Option<v8::Local<'a, v8::Module>> {
+    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    let scope = &mut v8::EscapableHandleScope::new(scope);
+    let specifier_str = specifier.to_rust_string_lossy(scope);
+
+    if let Some(g) = cache_get(&specifier_str) {
+        let local = v8::Local::new(scope, &g);
+        return Some(scope.escape(local));
+    }
+
+    let binding = lookup_binding(&specifier_str)?;
+    let module = compile_source_module(scope, &specifier_str, &binding)?;
+
+    let global = v8::Global::new(scope, module);
+    cache_put(specifier_str, global);
+    Some(scope.escape(module))
+}
+
+fn compile_source_module<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    specifier: &str,
+    binding: &ImportBinding,
+) -> Option<v8::Local<'s, v8::Module>> {
+    let source_string = v8::String::new(scope, &binding.source)?;
+    let filename = v8::String::new(scope, specifier)?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        filename.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        true, // is_module
+        None,
+    );
+    let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
+    let tc = &mut v8::TryCatch::new(scope);
+    match v8::script_compiler::compile_module(tc, &mut source) {
+        Some(m) => Some(m),
+        None => {
+            record_resolve_error(RunError::CompileError(format!(
+                "failed to compile source import '{specifier}': {}",
+                exception_message(tc)
+            )));
+            None
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1398,6 +1589,11 @@ fn bridge_global_callback(
 
     // ── Assign call ID and build BridgeCall payload ────────────────────────
     let call_id = data.call_id.fetch_add(1, Ordering::Relaxed);
+    // All bridge calls in v1 are globals (targetKind = 0). Host-module
+    // function leaves reach the bridge via a regular global stub whose name
+    // is the generated `__iso4__import__…` identifier. Native binding
+    // (Phase 12) and callable handles (Phase 13) will revive targetKind = 1
+    // and 2 respectively.
     let bridge_call_payload =
         wire::encode_bridge_call_payload(call_id, 0, None, &data.name, &wire_args);
 
@@ -1968,11 +2164,40 @@ mod tests {
     /// Run code with explicit limits. Used for limit-enforcement tests.
     fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
         init_platform();
-        run_module(code, filename, None, limits, &[], None, Arc::new(AtomicU32::new(0)))
+        run_module(code, filename, None, limits, &[], &[], None, Arc::new(AtomicU32::new(0)))
     }
 
     fn run(code: &str) -> Result<Output, RunError> {
         run_code(code, "<iso4>", Limits::default()).map_err(|failure| failure.error)
+    }
+
+    /// Build an `ImportBinding` for tests. The wire is always source-form;
+    /// the public API's "host module" flavor is lowered to generated source
+    /// on the TS side before reaching the runtime.
+    fn source_import(specifier: &str, source: &str) -> ImportBinding {
+        ImportBinding {
+            specifier: specifier.to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    /// Run user code with a fixed set of source imports; no host bridge.
+    fn run_with_source_imports(
+        code: &str,
+        imports: &[ImportBinding],
+    ) -> Result<Output, RunError> {
+        init_platform();
+        run_module(
+            code,
+            "<iso4>",
+            None,
+            Limits::default(),
+            &[],
+            imports,
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .map_err(|failure| failure.error)
     }
 
     /// Shorthand: expect success and return the Output, panic otherwise.
@@ -2752,38 +2977,44 @@ mod tests {
     }
 
     // ── Imports ───────────────────────────────────────────────────────────
-    // Requires the module resolver (Phase 6+).
+    // Real module resolver wired up: source modules compile through V8 directly,
+    // host modules become synthetic v8::Modules whose exports are bridge stubs.
+    // Host-import bridge call tests live further down with the other
+    // bridge-call integration tests because they need a session socket.
 
     #[test]
     fn unknown_import_is_module_not_found() {
+        // With no host-declared bindings, every specifier is unknown.
         let err = run_err(r#"import { foo } from "unknown:module"; export default foo"#);
         assert!(matches!(err, RunError::ModuleNotFound(_)));
     }
 
     #[test]
     fn source_import_provided_by_host_works() {
-        // Host provides the source for "math:add". Once imports are wired up
-        // this should resolve and run the provided source.
-        let err = run_err(
-            r#"
-            import { add } from "math:add";
-            export default add(1, 2)
-            "#,
-        );
-        // For now it fails with ModuleNotFound because no resolver exists.
-        // Once Phase 6 lands this test body will change to assert Ok(3).
-        assert!(matches!(err, RunError::ModuleNotFound(_)));
+        let imports = [source_import(
+            "math:add",
+            "export const add = (a, b) => a + b;",
+        )];
+        let out = run_with_source_imports(
+            r#"import { add } from "math:add"; export default add(1, 2)"#,
+            &imports,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("3"));
     }
 
     #[test]
-    fn host_module_function_callable() {
-        // Host provides a function under "host:tools". Phase 7+.
-        let err = run_err(
-            r#"
-            import { search } from "host:tools";
-            export default await search("query")
-            "#,
-        );
+    fn source_import_unknown_specifier_with_declared_bindings_is_module_not_found() {
+        // A binding for "math:add" exists, but the user imports "math:sub".
+        let imports = [source_import(
+            "math:add",
+            "export const add = (a, b) => a + b;",
+        )];
+        let err = run_with_source_imports(
+            r#"import { sub } from "math:sub"; export default sub(1, 2)"#,
+            &imports,
+        )
+        .unwrap_err();
         assert!(matches!(err, RunError::ModuleNotFound(_)));
     }
 
@@ -2844,7 +3075,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_infinite_loop_is_killed() {
-        let snapshot = precompile("globalThis.base = 10", None).unwrap();
+        let snapshot = precompile("globalThis.base = 10", None, &[]).unwrap();
         let err = execute_with_prefix(
             &snapshot,
             "while (true) {}",
@@ -2855,7 +3086,7 @@ mod tests {
                 ..Default::default()
             },
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .map_err(|f| f.error)
@@ -2999,99 +3230,119 @@ mod tests {
     // The host supplies raw JS source for an import specifier. V8 compiles
     // it once per isolate and caches it. Phase 6+.
 
+    const ZOD_SOURCE: &str = r#"
+        export const z = {
+          object: (shape) => ({
+            parse: (data) => {
+              for (const key of Object.keys(shape)) {
+                if (!(key in data)) throw new Error(`missing key: ${key}`);
+              }
+              return data;
+            }
+          }),
+          string: () => ({}),
+          number: () => ({}),
+        };
+    "#;
+
     #[test]
     fn source_module_basic_function_import() {
-        // Host provides source for "lib:math". The module exports an `add`
-        // function. User code imports and calls it.
-        //
-        // When Phase 6 lands: wire up a source import for "lib:math" that
-        // contains `export function add(a, b) { return a + b; }` and assert
-        // the result is 3.
-        let err = run_err(
-            r#"
-            import { add } from "lib:math";
-            export default add(1, 2)
-            "#,
-        );
-        assert!(matches!(err, RunError::ModuleNotFound(_)));
+        let imports = [source_import(
+            "lib:math",
+            "export function add(a, b) { return a + b; }",
+        )];
+        let out = run_with_source_imports(
+            r#"import { add } from "lib:math"; export default add(1, 2)"#,
+            &imports,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("3"));
     }
 
     #[test]
     fn source_module_mimicking_zod_schema_validation() {
-        // The host provides a simplified zod-like schema library as source.
-        // This is the canonical use-case: precompile the library into the
-        // prefix snapshot once, then validate data in every postfix run.
-        //
-        // Mock source the host would supply for "lib:zod":
-        //
-        //   export const z = {
-        //     object: (shape) => ({
-        //       parse: (data) => {
-        //         for (const key of Object.keys(shape)) {
-        //           if (!(key in data)) throw new Error(`missing key: ${key}`);
-        //         }
-        //         return data;
-        //       }
-        //     }),
-        //     string: () => ({}),
-        //     number: () => ({}),
-        //   };
-        //
-        // When Phase 6 lands: provide that source, assert parse succeeds.
-        let err = run_err(
+        // Canonical AI-agent use case: host ships a mini-zod as source.
+        let imports = [source_import("lib:zod", ZOD_SOURCE)];
+        let out = run_with_source_imports(
             r#"
             import { z } from "lib:zod";
             const schema = z.object({ name: z.string(), age: z.number() });
             export default schema.parse({ name: "Alice", age: 30 })
             "#,
-        );
-        assert!(matches!(err, RunError::ModuleNotFound(_)));
+            &imports,
+        )
+        .unwrap();
+        let default_export = get_default(&out).expect("default export missing");
+        assert!(default_export.contains("Alice"));
+        assert!(default_export.contains("30"));
     }
 
     #[test]
     fn source_module_zod_schema_fails_on_bad_data() {
-        // Same setup as above, but pass data that fails validation.
-        // When Phase 6 lands: assert this surfaces as RuntimeError (the
-        // schema throws), not ModuleNotFound.
-        let err = run_err(
+        // Same setup as above, but pass data that fails validation — the
+        // schema's own `throw` should surface as RuntimeError, not as a
+        // ModuleNotFound from the resolver.
+        let imports = [source_import("lib:zod", ZOD_SOURCE)];
+        let err = run_with_source_imports(
             r#"
             import { z } from "lib:zod";
             const schema = z.object({ name: z.string() });
             export default schema.parse({ wrong: true })
             "#,
+            &imports,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::RuntimeError { .. }),
+            "expected RuntimeError, got {err:?}"
         );
-        // Pre-phase-6: ModuleNotFound. Post-phase-6: RuntimeError.
-        assert!(matches!(
-            err,
-            RunError::ModuleNotFound(_) | RunError::RuntimeError { .. }
-        ));
     }
 
     #[test]
     fn source_module_utility_library_used_across_multiple_exports() {
-        // A utility lib is imported and used in both the default and a named
-        // export. Verifies the module is only compiled once and shared.
-        let err = run_err(
+        // A utility lib imported and used in both default and named export.
+        // Verifies the module cache works: the resolver returns the same
+        // v8::Module instance for both `clamp` and `lerp` references.
+        let imports = [source_import(
+            "lib:math-utils",
+            "export const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));\n\
+             export const lerp = (a, b, t) => a + (b - a) * t;",
+        )];
+        let out = run_with_source_imports(
             r#"
             import { clamp, lerp } from "lib:math-utils";
             export default clamp(5, 0, 10);
             export const interpolated = lerp(0, 100, 0.5);
             "#,
-        );
-        assert!(matches!(err, RunError::ModuleNotFound(_)));
+            &imports,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("5"));
+        assert_eq!(get_named(&out, "interpolated").as_deref(), Some("50"));
     }
 
     #[test]
     fn source_module_can_import_another_source_module() {
         // Transitive source imports: "lib:app" imports from "lib:utils".
-        // Phase 6+: module resolver must handle transitive resolution.
-        let err = run_err(
-            r#"
-            import { formatResult } from "lib:app";
-            export default formatResult(42)
-            "#,
-        );
-        assert!(matches!(err, RunError::ModuleNotFound(_)));
+        // Module resolver must recurse into the second binding to satisfy
+        // the first.
+        let imports = [
+            source_import(
+                "lib:utils",
+                "export const double = (n) => n * 2;",
+            ),
+            source_import(
+                "lib:app",
+                "import { double } from \"lib:utils\";\n\
+                 export const formatResult = (n) => `result=${double(n)}`;",
+            ),
+        ];
+        let out = run_with_source_imports(
+            r#"import { formatResult } from "lib:app"; export default formatResult(42)"#,
+            &imports,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("result=84"));
     }
 
     // ── Custom globals ────────────────────────────────────────────────────
@@ -3198,19 +3449,19 @@ mod tests {
 
     #[test]
     fn precompile_returns_non_empty_snapshot_bytes() {
-        let bytes = precompile("const x = 1", None).unwrap();
+        let bytes = precompile("const x = 1", None, &[]).unwrap();
         assert!(!bytes.is_empty());
     }
 
     #[test]
     fn precompile_compile_error_is_reported() {
-        let err = precompile("export default (((", None).unwrap_err();
+        let err = precompile("export default (((", None, &[]).unwrap_err();
         assert!(matches!(err.error, RunError::CompileError(_)));
     }
 
     #[test]
     fn precompile_runtime_error_is_reported() {
-        let err = precompile(r#"throw new Error("prefix failed")"#, None).unwrap_err();
+        let err = precompile(r#"throw new Error("prefix failed")"#, None, &[]).unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError { .. }));
     }
 
@@ -3218,14 +3469,14 @@ mod tests {
     fn execute_with_prefix_basic_postfix() {
         // Module-scoped `const` stays in the prefix module's scope.
         // Use globalThis to share values with the postfix module.
-        let snapshot = precompile("globalThis.base = 100", None).unwrap();
+        let snapshot = precompile("globalThis.base = 100", None, &[]).unwrap();
         let out = execute_with_prefix(
             &snapshot,
             "export default globalThis.base + 1",
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3234,14 +3485,14 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_global_mutation_visible_in_postfix() {
-        let snapshot = precompile("globalThis.answer = 42", None).unwrap();
+        let snapshot = precompile("globalThis.answer = 42", None, &[]).unwrap();
         let out = execute_with_prefix(
             &snapshot,
             "export default globalThis.answer",
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3250,7 +3501,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_multiple_postfixes_are_independent() {
-        let snapshot = precompile("globalThis.base = 10", None).unwrap();
+        let snapshot = precompile("globalThis.base = 10", None, &[]).unwrap();
         let b = "globalThis.base";
         let out1 = execute_with_prefix(
             &snapshot,
@@ -3258,7 +3509,7 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3268,7 +3519,7 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3278,7 +3529,7 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3289,14 +3540,14 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
-        let snapshot = precompile("globalThis.counter = 0", None).unwrap();
+        let snapshot = precompile("globalThis.counter = 0", None, &[]).unwrap();
         execute_with_prefix(
             &snapshot,
             "globalThis.counter = 99; export default 1",
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3306,7 +3557,7 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3318,6 +3569,7 @@ mod tests {
         let snapshot = precompile(
             r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
             None,
+            &[],
         )
         .unwrap();
         let out = execute_with_prefix(
@@ -3326,7 +3578,7 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3335,14 +3587,14 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_console_is_available_in_postfix() {
-        let snapshot = precompile("const x = 1", None).unwrap();
+        let snapshot = precompile("const x = 1", None, &[]).unwrap();
         let out = execute_with_prefix(
             &snapshot,
             r#"console.log("hello from postfix"); export default 1"#,
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3351,14 +3603,14 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_postfix_runtime_error_is_reported() {
-        let snapshot = precompile("", None).unwrap();
+        let snapshot = precompile("", None, &[]).unwrap();
         let err = execute_with_prefix(
             &snapshot,
             r#"throw new Error("postfix failed")"#,
             None,
             Limits::default(),
             &[],
-            None,
+            &[], None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err();
@@ -3506,17 +3758,6 @@ mod tests {
         assert_eq!(out.stdout.len(), 100);
     }
 
-    // ── Host bridge error propagation ─────────────────────────────────────
-    // Phase 7+.
-
-    #[test]
-    #[ignore = "requires host import bridge (Phase 7)"]
-    fn host_import_function_throws_is_err_host_import() {
-        // A host-provided import function throws. The error must surface as
-        // ERR_HOST_BRIDGE in the result, not crash the runtime.
-        todo!()
-    }
-
     // ── ERR_UNDECLARED_BINDING ────────────────────────────────────────────
     // Phase 2+ (requires precompile / snapshots).
 
@@ -3571,7 +3812,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         );
         responder.join().unwrap();
@@ -3662,7 +3903,7 @@ mod tests {
             None,
             limits,
             &[global.to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         );
         (result, handle)
@@ -3749,7 +3990,7 @@ mod tests {
                 ..Default::default()
             },
             &["add".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3811,7 +4052,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -3853,7 +4094,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -3977,7 +4218,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4038,7 +4279,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4151,7 +4392,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4198,7 +4439,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -4233,7 +4474,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -4268,7 +4509,7 @@ mod tests {
                 ..Default::default()
             },
             &["toolA".to_string(), "toolB".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4321,7 +4562,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4371,7 +4612,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd1),
+            &[], Some(fd1),
             Arc::clone(&counter),
         )
         .unwrap();
@@ -4407,7 +4648,7 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            Some(fd2),
+            &[], Some(fd2),
             Arc::clone(&counter),
         )
         .unwrap_err()
@@ -4473,6 +4714,7 @@ mod tests {
                 ..Default::default()
             },
             &["toolA".to_string(), "toolB".to_string()],
+            &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
@@ -4517,7 +4759,7 @@ mod tests {
             None,
             Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
             &["tool".to_string()],
-            Some(fd),
+            &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         ).unwrap();
 

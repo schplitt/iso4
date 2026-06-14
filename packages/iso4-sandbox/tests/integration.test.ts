@@ -785,13 +785,13 @@ describe('source imports (Phase 6)', () => {
     }
   `
 
-  test.skip('import single function from source module', async () => {
+  test('import single function from source module', async () => {
     const result = await runtime.run({
       code: `
         import { add } from 'lib:math'
         export default add(3, 4)
       `,
-      imports: { static: { 'lib:math': { kind: 'source', source: mathSource } } },
+      imports: { 'lib:math': mathSource },
     })
     // Phase 6: fails with ERR_MODULE_NOT_FOUND until resolver is implemented
     expect(result.ok).toBe(true)
@@ -800,13 +800,13 @@ describe('source imports (Phase 6)', () => {
     expect(result.exports['default']).toBe(7)
   })
 
-  test.skip('import multiple functions from source module', async () => {
+  test('import multiple functions from source module', async () => {
     const result = await runtime.run({
       code: `
         import { clamp, sum } from 'lib:math'
         export default sum(clamp(5, 0, 10), clamp(20, 0, 10))
       `,
-      imports: { static: { 'lib:math': { kind: 'source', source: mathSource } } },
+      imports: { 'lib:math': mathSource },
     })
     expect(result.ok).toBe(true)
     if (!result.ok)
@@ -814,14 +814,14 @@ describe('source imports (Phase 6)', () => {
     expect(result.exports['default']).toBe(15) // clamp(5)=5 + clamp(20)=10
   })
 
-  test.skip('zod-like schema validation — happy path', async () => {
+  test('zod-like schema validation — happy path', async () => {
     const result = await runtime.run({
       code: `
         import { z } from 'lib:zod'
         const schema = z.object({ name: z.string(), age: z.number() })
         export default schema.parse({ name: 'Alice', age: 30 })
       `,
-      imports: { static: { 'lib:zod': { kind: 'source', source: zodLikeSource } } },
+      imports: { 'lib:zod': zodLikeSource },
     })
     expect(result.ok).toBe(true)
     if (!result.ok)
@@ -829,14 +829,14 @@ describe('source imports (Phase 6)', () => {
     expect(result.exports['default']).toEqual({ name: 'Alice', age: 30 })
   })
 
-  test.skip('zod-like schema validation — missing key throws', async () => {
+  test('zod-like schema validation — missing key throws', async () => {
     const result = await runtime.run({
       code: `
         import { z } from 'lib:zod'
         const schema = z.object({ name: z.string() })
         export default schema.parse({ wrong: true })
       `,
-      imports: { static: { 'lib:zod': { kind: 'source', source: zodLikeSource } } },
+      imports: { 'lib:zod': zodLikeSource },
     })
     expect(result.ok).toBe(false)
     if (result.ok)
@@ -855,16 +855,19 @@ describe('source imports (Phase 6)', () => {
     expect(result.error.code).toBe('ERR_MODULE_NOT_FOUND')
   })
 
-  test('source module available in precompiled prefix postfix', async () => {
+  test('source module declared on prefix is reachable from postfix import', async () => {
+    // ESM bindings don't cross module boundaries: a postfix that wants to use
+    // a source module must import it itself. The prefix's role here is to
+    // declare the binding so the postfix's `import` resolves against the
+    // same source. (DESIGN.md §4.3.)
     const prefix = await runtime.precompile({
-      code: `import { multiply } from 'lib:math'`,
-      imports: { static: { 'lib:math': { kind: 'source', source: mathSource } } },
-    }).catch(() => null)
-    if (prefix === null)
-      return // Phase 6 not ready — precompile itself fails
-
+      code: `import { multiply } from 'lib:math'; globalThis.__primed = true`,
+      imports: { 'lib:math': mathSource },
+    })
     await using p = prefix
-    const result = await p.run({ code: 'export default multiply(6, 7)' })
+    const result = await p.run({
+      code: `import { multiply } from 'lib:math'; export default multiply(6, 7)`,
+    })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
@@ -877,7 +880,7 @@ describe('source imports (Phase 6)', () => {
 // All FAIL until Phase 7 implements synthetic host modules.
 
 describe('host imports (Phase 7)', () => {
-  test.skip('host function callable from sandbox', async () => {
+  test('host function callable from sandbox', async () => {
     const calls: unknown[] = []
     const result = await runtime.run({
       code: `
@@ -885,15 +888,11 @@ describe('host imports (Phase 7)', () => {
         export default await echo('ping')
       `,
       imports: {
-        static: {
-          'host:utils': {
-            kind: 'host',
-            exports: {
-              echo: (msg: unknown) => {
-                calls.push(msg)
-                return String(msg).toUpperCase()
-              },
-            },
+
+        'host:utils': {
+          echo: (msg: unknown) => {
+            calls.push(msg)
+            return String(msg).toUpperCase()
           },
         },
       },
@@ -906,19 +905,15 @@ describe('host imports (Phase 7)', () => {
     expect(result.exports['default']).toBe('PING')
   })
 
-  test.skip('async host function is awaited', async () => {
+  test('async host function is awaited', async () => {
     const result = await runtime.run({
       code: `
         import { fetchData } from 'host:api'
         export default await fetchData('users')
       `,
       imports: {
-        static: {
-          'host:api': {
-            kind: 'host',
-            exports: { fetchData: async (r: unknown) => `data for ${r}` },
-          },
-        },
+
+        'host:api': { fetchData: async (r: unknown) => `data for ${r}` },
       },
     })
     expect(result.ok).toBe(true)
@@ -927,7 +922,7 @@ describe('host imports (Phase 7)', () => {
     expect(result.exports['default']).toBe('data for users')
   })
 
-  test.skip('host function receives correct argument types', async () => {
+  test('host function receives correct argument types', async () => {
     const received: unknown[] = []
     await runtime.run({
       code: `
@@ -936,15 +931,11 @@ describe('host imports (Phase 7)', () => {
         export default 1
       `,
       imports: {
-        static: {
-          'host:spy': {
-            kind: 'host',
-            exports: {
-              record: (...args: unknown[]) => {
-                received.push(...args)
-                return null
-              },
-            },
+
+        'host:spy': {
+          record: (...args: unknown[]) => {
+            received.push(...args)
+            return null
           },
         },
       },
@@ -952,16 +943,15 @@ describe('host imports (Phase 7)', () => {
     expect(received).toEqual([42, true, 'hello', null])
   })
 
-  test.skip('function argument to host function → ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED', async () => {
+  test('function argument to host function → ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED', async () => {
     const result = await runtime.run({
       code: `
         import { call } from 'host:cb'
         export default await call(() => 42)
       `,
       imports: {
-        static: {
-          'host:cb': { kind: 'host', exports: { call: (fn) => fn } },
-        },
+
+        'host:cb': { call: (fn) => fn },
       },
     })
     expect(result.ok).toBe(false)
@@ -970,20 +960,277 @@ describe('host imports (Phase 7)', () => {
     expect(result.error.code).toBe('ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED')
   })
 
-  test.skip('host function throwing → ERR_HOST_BRIDGE', async () => {
+  test('host function throwing → ERR_HOST_BRIDGE', async () => {
     const result = await runtime.run({
       code: `
         import { boom } from 'host:broken'
         export default await boom()
       `,
       imports: {
-        static: {
-          'host:broken': {
-            kind: 'host',
-            exports: { boom: () => {
-              throw new Error('handler exploded')
-            } },
+
+        'host:broken': { boom: () => {
+          throw new Error('handler exploded')
+        } },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+  })
+
+  test('nested object exports: 2-level method is callable (users.create)', async () => {
+    const created: unknown[] = []
+    const result = await runtime.run({
+      code: `
+        import { users } from 'host:db'
+        export default await users.create({ name: 'Alice' })
+      `,
+      imports: {
+        'host:db': {
+          users: {
+            create: async (row: unknown) => {
+              created.push(row)
+              return { id: 1, ...(row as object) }
+            },
           },
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(created).toEqual([{ name: 'Alice' }])
+    expect(result.exports['default']).toEqual({ id: 1, name: 'Alice' })
+  })
+
+  test('nested object exports: mixed data + function leaves coexist', async () => {
+    const result = await runtime.run({
+      code: `
+        import { client } from 'host:sdk'
+        export default {
+          version: client.version,
+          mode: client.config.mode,
+          result: await client.search('q'),
+        }
+      `,
+      imports: {
+        'host:sdk': {
+          client: {
+            version: '2.1.0',
+            config: { mode: 'prod' },
+            search: async (q: string) => `results for ${q}`,
+          },
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual({
+      version: '2.1.0',
+      mode: 'prod',
+      result: 'results for q',
+    })
+  })
+
+  test('3-level deep method is callable', async () => {
+    const result = await runtime.run({
+      code: `
+        import { a } from 'host:deep'
+        export default await a.b.c.run(21)
+      `,
+      imports: {
+        'host:deep': {
+          a: { b: { c: { run: async (n: number) => n * 2 } } },
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe(42)
+  })
+
+  test('two host modules with same-named methods do not collide', async () => {
+    // Both modules export `get`; ID-based dispatch keeps them distinct.
+    const result = await runtime.run({
+      code: `
+        import { get as getA } from 'host:a'
+        import { get as getB } from 'host:b'
+        export default [await getA(), await getB()]
+      `,
+      imports: {
+        'host:a': { get: async () => 'A' },
+        'host:b': { get: async () => 'B' },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual(['A', 'B'])
+  })
+
+  test('specifiers with weird characters resolve without name collisions', async () => {
+    // 'host:tools/v2' and 'host_tools_v2' would have collided under the old
+    // name-sanitising scheme; ID-based dispatch makes them independent.
+    const result = await runtime.run({
+      code: `
+        import { ping as p1 } from 'host:tools/v2'
+        import { ping as p2 } from 'host_tools_v2'
+        export default [await p1(), await p2()]
+      `,
+      imports: {
+        'host:tools/v2': { ping: async () => 'slash' },
+        'host_tools_v2': { ping: async () => 'underscore' },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual(['slash', 'underscore'])
+  })
+})
+
+// ── Imports: rebinding enforcement on prefix.run() ────────────────────
+// Mirrors the globals path: anything not declared at precompile becomes
+// ERR_UNDECLARED_BINDING at run time. TypeScript catches most of this
+// statically via `RebindImports<I>`; these tests verify the runtime
+// fallback when callers bypass the type system with `as any` / dynamic data.
+
+describe('imports rebinding enforcement (runtime)', () => {
+  test('rebinding an undeclared specifier on prefix.run() → ERR_UNDECLARED_BINDING', async () => {
+    await using prefix = await runtime.precompile({
+      code: `globalThis.__primed = true`,
+      imports: {
+
+        'host:declared': { fn: () => 1 },
+      },
+    })
+    const result = await prefix.run({
+      code: 'export default 1',
+      // Bypass the type system the way a JS caller might.
+      imports: {
+
+        'host:never-declared': { fn: () => 2 },
+      } as any,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.message).toMatch(/host:never-declared/)
+  })
+
+  test('rebinding an undeclared function export on a declared specifier → ERR_UNDECLARED_BINDING', async () => {
+    await using prefix = await runtime.precompile({
+      code: `globalThis.__primed = true`,
+      imports: {
+
+        'host:tools': { search: () => 'a' },
+      },
+    })
+    const result = await prefix.run({
+      code: 'export default 1',
+      imports: {
+
+        'host:tools': { undeclared: () => 1 },
+      } as any,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.message).toMatch(/undeclared/)
+  })
+
+  test('rebinding a source-module specifier on prefix.run() → ERR_UNDECLARED_BINDING', async () => {
+    await using prefix = await runtime.precompile({
+      code: `globalThis.__primed = true`,
+      imports: {
+
+        'lib:math': 'export const x = 1',
+      },
+    })
+    const result = await prefix.run({
+      code: 'export default 1',
+      imports: {
+        'lib:math': 'export const x = 2',
+      } as any,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.message).toMatch(/source imports are frozen/)
+  })
+
+  test('rebinding a data export on prefix.run() → ERR_UNDECLARED_BINDING', async () => {
+    await using prefix = await runtime.precompile({
+      code: `globalThis.__primed = true`,
+      imports: {
+
+        'host:cfg': { version: '1.0.0' },
+      },
+    })
+    const result = await prefix.run({
+      code: 'export default 1',
+      imports: {
+
+        'host:cfg': { version: '2.0.0' },
+      } as any,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.message).toMatch(/can only be rebound with a function/)
+  })
+})
+
+// ── Imports: failure paths in the resolver itself ──────────────────────
+// Errors that originate inside compile / evaluate of a source or host import
+// must surface as a typed RunResult, not as a thrown promise.
+
+describe('imports failure paths', () => {
+  test('source module with a syntax error → ERR_COMPILE', async () => {
+    const result = await runtime.run({
+      code: `import { x } from 'lib:broken'; export default x`,
+      imports: {
+
+        'lib:broken': 'export const x =',
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_COMPILE')
+  })
+
+  test('source module that throws at top level → ERR_USER_CODE', async () => {
+    const result = await runtime.run({
+      code: `import { x } from 'lib:bomb'; export default x`,
+      imports: {
+
+        'lib:bomb': `throw new Error('module init failed'); export const x = 1`,
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.message).toMatch(/module init failed/)
+  })
+
+  test('host import handler that returns a non-serialisable value → ERR_HOST_BRIDGE', async () => {
+    // Functions are the canonical non-serialisable value. The TS encoder
+    // throws on them and converts to an error response on the bridge.
+    const result = await runtime.run({
+      code: `import { broken } from 'host:tools'; export default await broken()`,
+      imports: {
+        'host:tools': {
+          // Override the inferred return type so TS lets us return a function.
+          broken: ((() => () => 1) as unknown as (...args: unknown[]) => unknown),
         },
       },
     })
@@ -1123,16 +1370,12 @@ describe('resource limits (Phase 3/8)', () => {
       `,
       limits: { cpuTimeMs: 50, wallTimeMs: 5_000 },
       imports: {
-        static: {
-          'host:time': {
-            kind: 'host',
-            exports: {
-              sleep: (ms) => {
-                return new Promise<void>((resolve) => {
-                  setTimeout(resolve, Number(ms))
-                })
-              },
-            },
+
+        'host:time': {
+          sleep: (ms) => {
+            return new Promise<void>((resolve) => {
+              setTimeout(resolve, Number(ms))
+            })
           },
         },
       },

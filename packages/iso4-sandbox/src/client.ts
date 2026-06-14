@@ -17,7 +17,7 @@ import {
   encodeTsToRustFrame,
 } from './ipc'
 import type { HostExportFunction } from './types.js'
-import type { ResourceLimits } from './ipc'
+import type { ImportBindingPayload, ResourceLimits } from './ipc'
 import { encodeWireValue } from './wire'
 
 export interface RuntimeIpcClientOptions {
@@ -30,13 +30,16 @@ export interface RawRunResult {
 }
 
 /**
- * Dispatches a bridge call to the host-configured handler.
- * Arguments are raw deserialized values; return value is re-serialized as WireValue.
+ * Dispatches a bridge call to the host-configured handler. Resolves the
+ * handler by the call's `exportName` against the per-run globals map.
+ * Host-module imports route through the same map via a single reserved
+ * global, `__iso4_call`, whose handler peels a leading integer handle ID
+ * and routes to the import registry (see `imports.ts`).
  */
-export type BridgeCallDispatcher = (
-  exportName: string,
-  args: unknown[],
-) => Promise<unknown>
+export type BridgeCallDispatcher = (call: {
+  exportName: string
+  args: unknown[]
+}) => Promise<unknown>
 
 export type { ResourceLimits }
 
@@ -97,7 +100,12 @@ export class RuntimeIpcClient {
   // layer only ever sees plain bridge functions.
   async runRawCode(
     code: string,
-    options?: { filename?: string, limits?: ResourceLimits, globals?: Record<string, HostExportFunction> },
+    options?: {
+      filename?: string
+      limits?: ResourceLimits
+      globals?: Record<string, HostExportFunction>
+      imports?: readonly ImportBindingPayload[]
+    },
   ): Promise<RawRunResult> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
@@ -113,6 +121,7 @@ export class RuntimeIpcClient {
           filename: options?.filename,
           limits: options?.limits,
           globals: globalNames,
+          imports: options?.imports,
         }),
       ),
     )
@@ -121,7 +130,13 @@ export class RuntimeIpcClient {
   }
 
   async precompile(
-    options: { code: string, filename?: string, limits?: ResourceLimits, globals?: Record<string, HostExportFunction> },
+    options: {
+      code: string
+      filename?: string
+      limits?: ResourceLimits
+      globals?: Record<string, HostExportFunction>
+      imports?: readonly ImportBindingPayload[]
+    },
   ): Promise<Uint8Array> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
@@ -134,6 +149,7 @@ export class RuntimeIpcClient {
           filename: options.filename,
           limits: options.limits,
           globals: Object.keys(options.globals ?? {}),
+          imports: options.imports,
         }),
       ),
     )
@@ -150,7 +166,14 @@ export class RuntimeIpcClient {
   }
 
   async prefixRun(
-    options: { prefixId: string, code: string, filename?: string, limits?: ResourceLimits, globals?: Record<string, HostExportFunction> },
+    options: {
+      prefixId: string
+      code: string
+      filename?: string
+      limits?: ResourceLimits
+      globals?: Record<string, HostExportFunction>
+      imports?: readonly ImportBindingPayload[]
+    },
   ): Promise<RawRunResult> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
@@ -166,6 +189,7 @@ export class RuntimeIpcClient {
           filename: options.filename,
           limits: options.limits,
           globals: globalNames,
+          imports: options.imports,
           runId: this.nextRunIdValue(),
         }),
       ),
@@ -250,7 +274,10 @@ export class RuntimeIpcClient {
             // When the handler settles the response is written back.
             // If the run timed out by then, Rust ignores the late frame.
             const { callId } = call
-            dispatcher(call.exportName, call.args).then(
+            dispatcher({
+              exportName: call.exportName,
+              args: call.args,
+            }).then(
               (value) => {
                 // encodeWireValue throws for unrepresentable types (function,
                 // symbol, Date, etc.). Catch and send an error response so the
@@ -315,17 +342,24 @@ export class RuntimeIpcClient {
 }
 
 /**
- * Build a dispatcher from a globals map; returns undefined when map is empty.
+ * Build a dispatcher that looks up a handler by `exportName` in the
+ * per-run globals map. Host-module imports are bridged through the same
+ * map via the reserved `__iso4_call` global, so a single lookup table
+ * handles every bridge call.
+ *
+ * Returns `undefined` when the map is empty so the loop short-circuits to
+ * an "unconfigured bridge" error response.
  * @param globals
  */
-function makeDispatcher(globals: Record<string, HostExportFunction>): BridgeCallDispatcher | undefined {
-  const names = Object.keys(globals)
-  if (names.length === 0)
+function makeDispatcher(
+  globals: Record<string, HostExportFunction>,
+): BridgeCallDispatcher | undefined {
+  if (Object.keys(globals).length === 0)
     return undefined
-  return async (name, args) => {
-    const handler = globals[name]
+  return async ({ exportName, args }) => {
+    const handler = globals[exportName]
     if (handler === undefined)
-      throw new Error(`no handler configured for global '${name}'`)
+      throw new Error(`no handler configured for bridge global '${exportName}'`)
     return handler(...(args as any[]))
   }
 }
