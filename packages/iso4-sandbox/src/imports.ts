@@ -454,7 +454,7 @@ function emitDataLiteral(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────
 
-function isPlainObject(value: unknown): value is HostModuleDescription {
+function isPlainObject(value: unknown): value is HostModuleObject {
   if (value === null || typeof value !== 'object')
     return false
   if (Array.isArray(value))
