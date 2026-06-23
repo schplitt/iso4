@@ -1,5 +1,11 @@
 # @iso4/v8-darwin-arm64
 
+## 0.0.4
+
+### Patch Changes
+
+- fbe4332: feat: import support
+
 ## 0.0.3
 
 ### Patch Changes

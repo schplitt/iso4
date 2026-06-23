@@ -1,6 +1,6 @@
 {
   "name": "@iso4/v8-linux-arm64-gnu",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "type": "module",
   "description": "Native iso4 V8 runtime binary for linux-arm64-gnu",
   "license": "MIT",
