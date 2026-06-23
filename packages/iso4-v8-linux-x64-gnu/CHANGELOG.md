@@ -1,5 +1,11 @@
 # @iso4/v8-linux-x64-gnu
 
+## 0.0.4
+
+### Patch Changes
+
+- fbe4332: feat: import support
+
 ## 0.0.3
 
 ### Patch Changes
