@@ -714,7 +714,8 @@ describe('decodeRunCompletionPayload — failure', () => {
     })
     const { result } = decodeRunCompletionPayload(buf)
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.name).toBe('TypeError')
   })
 
@@ -731,7 +732,8 @@ describe('decodeRunCompletionPayload — failure', () => {
     })
     const { result } = decodeRunCompletionPayload(buf)
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.data).toMatchObject({ kind: 'waitForEvent', stepId: 'approval' })
   })
 
@@ -747,7 +749,8 @@ describe('decodeRunCompletionPayload — failure', () => {
     })
     const { result } = decodeRunCompletionPayload(buf)
     expect(result.ok).toBe(false)
-    if (result.ok) return
+    if (result.ok)
+      return
     expect(result.error.data).toBeUndefined()
   })
 })

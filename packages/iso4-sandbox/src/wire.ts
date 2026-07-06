@@ -376,7 +376,8 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   const stackPresent = reader.readU8()
   const stack = stackPresent === 1 ? reader.readString() : undefined
   const dataPresent = reader.readU8()
-  if (dataPresent === 1) decodeWireValueFromReader(reader) // consume; precompile errors never carry data
+  if (dataPresent === 1)
+    decodeWireValueFromReader(reader) // consume; precompile errors never carry data
   reader.assertDone()
   return { ok: false, error: { code, name, message, stack } }
 }
