@@ -430,12 +430,12 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: None,
             data: None,
         },
-        RunError::RuntimeError { name, message, stack, data } => RunErrorPayload {
+        RunError::RuntimeError(inner) => RunErrorPayload {
             code: "ERR_USER_CODE".to_string(),
-            name: name.clone(),
-            message: message.clone(),
-            stack: stack.clone(),
-            data: data.clone(),
+            name: inner.name.clone(),
+            message: inner.message.clone(),
+            stack: inner.stack.clone(),
+            data: inner.data.clone(),
         },
         RunError::ModuleNotFound(msg) => RunErrorPayload {
             code: "ERR_MODULE_NOT_FOUND".to_string(),
@@ -998,12 +998,13 @@ mod tests {
 
     #[test]
     fn runtime_error_maps_to_err_user_code() {
-        let payload = run_error_to_payload(&RunError::RuntimeError {
+        use crate::v8::RuntimeErrorData;
+        let payload = run_error_to_payload(&RunError::RuntimeError(Box::new(RuntimeErrorData {
             name: "TypeError".to_string(),
             message: "boom".to_string(),
             stack: Some("at line 1".to_string()),
             data: None,
-        });
+        })));
         assert_eq!(payload.code, "ERR_USER_CODE");
         assert_eq!(payload.name, "TypeError");
         assert_eq!(payload.stack, Some("at line 1".to_string()));
