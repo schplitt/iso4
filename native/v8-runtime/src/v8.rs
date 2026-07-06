@@ -329,8 +329,10 @@ pub enum RunError {
     CompileError(String),
     /// Uncaught exception thrown during execution.
     RuntimeError {
+        name: String,
         message: String,
         stack: Option<String>,
+        data: Option<WireValue>,
     },
     /// `import` specifier not found in the host imports map.
     ModuleNotFound(String),
@@ -731,8 +733,10 @@ fn run_module(
                 Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                 Some(TerminationReason::Memory) => RunError::MemoryLimit,
                 None => RunError::RuntimeError {
+                    name: exception_name(scope),
                     message: exception_message(scope),
                     stack: exception_stack(scope),
+                    data: exception_data(scope),
                 },
             };
             return Err(failure(error, &logs, start));
@@ -1143,8 +1147,10 @@ fn precompile_module(
             None => {
                 return Err(failure(
                     RunError::RuntimeError {
+                        name: exception_name(scope),
                         message: exception_message(scope),
                         stack: exception_stack(scope),
+                        data: exception_data(scope),
                     },
                     &logs,
                     start,
@@ -2090,6 +2096,8 @@ fn runtime_error_from_value(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
 ) -> RunError {
+    let name = error_name_from_value(scope, value)
+        .unwrap_or_else(|| "Error".to_string());
     let message = error_message_from_value(scope, value)
         .or_else(|| {
             value
@@ -2097,9 +2105,13 @@ fn runtime_error_from_value(
                 .map(|s| s.to_rust_string_lossy(scope))
         })
         .unwrap_or_else(|| "JavaScript error".to_string());
+    let stack = stack_from_value(scope, value);
+    let data = error_data_from_value(scope, value);
     RunError::RuntimeError {
+        name,
         message,
-        stack: stack_from_value(scope, value),
+        stack,
+        data,
     }
 }
 
@@ -2142,6 +2154,72 @@ fn exception_message(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
 fn exception_stack(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<String> {
     let exception = scope.exception()?;
     stack_from_value(scope, exception)
+}
+
+fn error_name_from_value(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    value: v8::Local<v8::Value>,
+) -> Option<String> {
+    let obj = value.to_object(scope)?;
+    let key = v8::String::new(scope, "name")?;
+    let name_val = obj.get(scope, key.into())?;
+    if !name_val.is_string() {
+        return None;
+    }
+    name_val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+}
+
+fn exception_name(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
+    scope
+        .exception()
+        .and_then(|e| error_name_from_value(scope, e))
+        .unwrap_or_else(|| "Error".to_string())
+}
+
+/// Extract own enumerable properties from the thrown value, skipping `name`,
+/// `message`, and `stack` (already captured in dedicated fields). Non-
+/// serializable properties (functions, symbols, unresolved promises) are
+/// silently dropped. Returns `None` for non-object throws or when no
+/// serializable own properties remain.
+fn error_data_from_value(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    value: v8::Local<v8::Value>,
+) -> Option<WireValue> {
+    let obj = value.to_object(scope)?;
+    let names = obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())?;
+    let skip = ["name", "message", "stack", "__proto__"];
+    let mut fields: Vec<(String, WireValue)> = Vec::new();
+    let mut visiting = Vec::new();
+    for i in 0..names.length() {
+        let name_val = match names.get_index(scope, i) {
+            Some(v) => v,
+            None => continue,
+        };
+        let name = match name_val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) {
+            Some(s) => s,
+            None => continue,
+        };
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        let prop = match obj.get(scope, name_val) {
+            Some(v) => v,
+            None => continue,
+        };
+        if let Ok(wire) = value_to_wire(scope, prop, &mut visiting) {
+            fields.push((name, wire));
+        }
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(WireValue::Object(fields))
+    }
+}
+
+fn exception_data(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<WireValue> {
+    let exception = scope.exception()?;
+    error_data_from_value(scope, exception)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -279,6 +279,7 @@ pub struct RunErrorPayload {
     pub name: String,
     pub message: String,
     pub stack: Option<String>,
+    pub data: Option<WireValue>,
 }
 
 /// Payload for a successful run.
@@ -363,6 +364,13 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
         }
         None => out.push(0),
     }
+    match &error.data {
+        Some(d) => {
+            out.push(1);
+            encode_wire_value(d, out);
+        }
+        None => out.push(0),
+    }
 }
 
 // ── PrecompileResultPayload encoder ──────────────────────────────────────────
@@ -413,72 +421,84 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
+            data: None,
         },
         RunError::CompileError(msg) => RunErrorPayload {
             code: "ERR_COMPILE".to_string(),
             name: "SyntaxError".to_string(),
             message: msg.clone(),
             stack: None,
+            data: None,
         },
-        RunError::RuntimeError { message, stack } => RunErrorPayload {
+        RunError::RuntimeError { name, message, stack, data } => RunErrorPayload {
             code: "ERR_USER_CODE".to_string(),
-            name: "Error".to_string(),
+            name: name.clone(),
             message: message.clone(),
             stack: stack.clone(),
+            data: data.clone(),
         },
         RunError::ModuleNotFound(msg) => RunErrorPayload {
             code: "ERR_MODULE_NOT_FOUND".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
+            data: None,
         },
         RunError::ExportNotSerializable(msg) => RunErrorPayload {
             code: "ERR_EXPORT_NOT_SERIALIZABLE".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
+            data: None,
         },
         RunError::CpuTimeout => RunErrorPayload {
             code: "ERR_CPU_TIMEOUT".to_string(),
             name: "Error".to_string(),
             message: "CPU time limit exceeded".to_string(),
             stack: None,
+            data: None,
         },
         RunError::WallTimeout => RunErrorPayload {
             code: "ERR_WALL_TIMEOUT".to_string(),
             name: "Error".to_string(),
             message: "Wall time limit exceeded".to_string(),
             stack: None,
+            data: None,
         },
         RunError::MemoryLimit => RunErrorPayload {
             code: "ERR_MEMORY_LIMIT".to_string(),
             name: "Error".to_string(),
             message: "Memory limit exceeded".to_string(),
             stack: None,
+            data: None,
         },
         RunError::HostBridge(msg) => RunErrorPayload {
             code: "ERR_HOST_BRIDGE".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
+            data: None,
         },
         RunError::UndeclaredBinding(msg) => RunErrorPayload {
             code: "ERR_UNDECLARED_BINDING".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
+            data: None,
         },
         RunError::FunctionArgumentNotSupported => RunErrorPayload {
             code: "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED".to_string(),
             name: "Error".to_string(),
             message: "function arguments are not supported across the bridge boundary".to_string(),
             stack: None,
+            data: None,
         },
         RunError::BridgeCallPayloadTooLarge => RunErrorPayload {
             code: "ERR_BRIDGE_PAYLOAD_TOO_LARGE".to_string(),
             name: "Error".to_string(),
             message: "bridge call payload exceeds configured maxBridgeCallBytes limit".to_string(),
             stack: None,
+            data: None,
         },
         RunError::ExportTooLarge => RunErrorPayload {
             code: "ERR_EXPORT_TOO_LARGE".to_string(),
@@ -486,18 +506,21 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             message: "serialised export payload exceeds configured maxExportBytes limit"
                 .to_string(),
             stack: None,
+            data: None,
         },
         RunError::BridgeCallLimitExceeded => RunErrorPayload {
             code: "ERR_BRIDGE_CALL_LIMIT_EXCEEDED".to_string(),
             name: "Error".to_string(),
             message: "run exceeded the configured maxBridgeCalls limit".to_string(),
             stack: None,
+            data: None,
         },
         RunError::Internal(msg) => RunErrorPayload {
             code: "ERR_INTERNAL".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
+            data: None,
         },
     }
 }
@@ -880,6 +903,7 @@ mod tests {
                     name: "SyntaxError".to_string(),
                     message: "bad syntax".to_string(),
                     stack: None,
+                    data: None,
                 },
                 stdout: vec![],
                 stderr: vec![],
@@ -975,10 +999,13 @@ mod tests {
     #[test]
     fn runtime_error_maps_to_err_user_code() {
         let payload = run_error_to_payload(&RunError::RuntimeError {
+            name: "TypeError".to_string(),
             message: "boom".to_string(),
             stack: Some("at line 1".to_string()),
+            data: None,
         });
         assert_eq!(payload.code, "ERR_USER_CODE");
+        assert_eq!(payload.name, "TypeError");
         assert_eq!(payload.stack, Some("at line 1".to_string()));
     }
 

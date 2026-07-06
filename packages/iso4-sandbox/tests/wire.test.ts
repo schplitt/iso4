@@ -135,6 +135,7 @@ interface FailureCompletion {
   name: string
   message: string
   stack?: string
+  data?: unknown
   stdout: string[]
   stderr: string[]
   durationMs: number
@@ -165,6 +166,12 @@ function encodeCompletionPayload(
     if (completion.stack !== undefined) {
       parts.push(1)
       encodeString(completion.stack, parts)
+    } else {
+      parts.push(0)
+    }
+    if (completion.data !== undefined) {
+      parts.push(1)
+      encodeValue(completion.data, parts)
     } else {
       parts.push(0)
     }
@@ -694,6 +701,55 @@ describe('decodeRunCompletionPayload — failure', () => {
       return
     expect(result.durationMs).toBeCloseTo(42.5)
   })
+
+  test('error name is preserved', () => {
+    const buf = encodeCompletionPayload(0, {
+      ok: false,
+      code: 'ERR_USER_CODE',
+      name: 'TypeError',
+      message: 'bad type',
+      stdout: [],
+      stderr: [],
+      durationMs: 0,
+    })
+    const { result } = decodeRunCompletionPayload(buf)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.name).toBe('TypeError')
+  })
+
+  test('error data round-trips as structured object', () => {
+    const buf = encodeCompletionPayload(0, {
+      ok: false,
+      code: 'ERR_USER_CODE',
+      name: 'WorkflowSuspend',
+      message: 'suspend',
+      data: { kind: 'waitForEvent', stepId: 'approval' },
+      stdout: [],
+      stderr: [],
+      durationMs: 0,
+    })
+    const { result } = decodeRunCompletionPayload(buf)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.data).toMatchObject({ kind: 'waitForEvent', stepId: 'approval' })
+  })
+
+  test('absent data field decodes as undefined', () => {
+    const buf = encodeCompletionPayload(0, {
+      ok: false,
+      code: 'ERR_USER_CODE',
+      name: 'Error',
+      message: 'plain',
+      stdout: [],
+      stderr: [],
+      durationMs: 0,
+    })
+    const { result } = decodeRunCompletionPayload(buf)
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.data).toBeUndefined()
+  })
 })
 
 // ── decodeRunCompletionPayload — error cases ───────────────────────────────
@@ -744,6 +800,7 @@ describe('decodePrecompileResultPayload', () => {
     } else {
       parts.push(0)
     }
+    parts.push(0) // dataPresent = 0
     return Uint8Array.from(parts)
   }
 

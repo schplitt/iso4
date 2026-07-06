@@ -836,6 +836,61 @@ describe('error handling', () => {
       return
     expect(good.exports.default).toBe(42)
   })
+
+  test('TypeError propagates name', async () => {
+    const result = await runtime.run({ code: 'throw new TypeError("bad type")' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('TypeError')
+    expect(result.error.message).toContain('bad type')
+  })
+
+  test('RangeError propagates name', async () => {
+    const result = await runtime.run({ code: 'throw new RangeError("out of range")' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.name).toBe('RangeError')
+  })
+
+  test('custom error name propagates', async () => {
+    const result = await runtime.run({
+      code: 'const e = new Error("suspend"); e.name = "WorkflowSuspend"; throw e',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.name).toBe('WorkflowSuspend')
+  })
+
+  test('non-Error throw keeps name as Error', async () => {
+    const result = await runtime.run({ code: 'throw "oops"' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.name).toBe('Error')
+  })
+
+  test('error data carries own enumerable properties', async () => {
+    const result = await runtime.run({
+      code: `
+        const e = new Error("suspend")
+        e.name = "WorkflowSuspend"
+        e.kind = "waitForEvent"
+        e.stepId = "approval"
+        throw e
+      `,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.name).toBe('WorkflowSuspend')
+    expect(result.error.data).toMatchObject({ kind: 'waitForEvent', stepId: 'approval' })
+  })
+
+  test('plain Error has no data (standard properties are non-enumerable)', async () => {
+    const result = await runtime.run({ code: 'throw new Error("plain")' })
+    expect(result.ok).toBe(false)
+    if (result.ok) return
+    expect(result.error.data).toBeUndefined()
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

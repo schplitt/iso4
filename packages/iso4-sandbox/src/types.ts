@@ -624,6 +624,10 @@ export interface RunError {
   name: string
   message: string
   stack?: string
+  /**
+   * Own enumerable properties of the thrown error, excluding name/message/stack. Present only for ERR_USER_CODE when the thrown value is an object with serializable own properties.
+   */
+  data?: unknown
 }
 
 export type RunErrorCode
