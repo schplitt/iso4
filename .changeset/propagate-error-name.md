@@ -1,5 +1,9 @@
 ---
 "@iso4/sandbox": minor
+"@iso4/v8-darwin-arm64": minor
+"@iso4/v8-darwin-x64": minor
+"@iso4/v8-linux-arm64-gnu": minor
+"@iso4/v8-linux-x64-gnu": minor
 ---
 
 feat: propagate JS error name and structured data across the sandbox bridge
