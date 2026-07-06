@@ -318,6 +318,8 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
   const message = reader.readString()
   const stackPresent = reader.readU8()
   const stack = stackPresent === 1 ? reader.readString() : undefined
+  const dataPresent = reader.readU8()
+  const data = dataPresent === 1 ? decodeWireValueFromReader(reader) : undefined
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
   const durationMs = reader.readF64()
@@ -325,7 +327,7 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
   reader.assertDone()
   return {
     runId,
-    result: { ok: false, error: { code, name, message, stack }, stdout, stderr, durationMs },
+    result: { ok: false, error: { code, name, message, stack, data }, stdout, stderr, durationMs },
   }
 }
 
@@ -373,6 +375,9 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   const message = reader.readString()
   const stackPresent = reader.readU8()
   const stack = stackPresent === 1 ? reader.readString() : undefined
+  const dataPresent = reader.readU8()
+  if (dataPresent === 1)
+    decodeWireValueFromReader(reader) // consume; precompile errors never carry data
   reader.assertDone()
   return { ok: false, error: { code, name, message, stack } }
 }

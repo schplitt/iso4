@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem::ManuallyDrop;
-use std::os::unix::io::{FromRawFd, RawFd};
 #[cfg(test)]
 use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
@@ -318,6 +318,17 @@ pub struct FailureOutput {
     pub duration_ms: u64,
 }
 
+/// Payload carried by `RunError::RuntimeError`. Kept in a separate struct so
+/// the variant can be boxed and the enum stays small (avoids
+/// `clippy::result_large_err` on callers).
+#[derive(Debug)]
+pub struct RuntimeErrorData {
+    pub name: String,
+    pub message: String,
+    pub stack: Option<String>,
+    pub data: Option<WireValue>,
+}
+
 /// All the ways an execution can fail.
 #[derive(Debug)]
 pub enum RunError {
@@ -328,10 +339,7 @@ pub enum RunError {
     /// JS syntax error or compile-time error.
     CompileError(String),
     /// Uncaught exception thrown during execution.
-    RuntimeError {
-        message: String,
-        stack: Option<String>,
-    },
+    RuntimeError(Box<RuntimeErrorData>),
     /// `import` specifier not found in the host imports map.
     ModuleNotFound(String),
     /// An export value is a function or an unresolved Promise.
@@ -438,7 +446,6 @@ pub fn precompile(
     init_platform();
     precompile_module(code, filename.unwrap_or("<prefix>"), imports)
 }
-
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
 /// inspect the module namespace object for `default` and named exports.
@@ -730,10 +737,12 @@ fn run_module(
                 Some(TerminationReason::Wall) => RunError::WallTimeout,
                 Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                 Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                None => RunError::RuntimeError {
+                None => RunError::RuntimeError(Box::new(RuntimeErrorData {
+                    name: exception_name(scope),
                     message: exception_message(scope),
                     stack: exception_stack(scope),
-                },
+                    data: exception_data(scope),
+                })),
             };
             return Err(failure(error, &logs, start));
         }
@@ -842,8 +851,7 @@ fn run_module(
             } else {
                 ipc::DEFAULT_MAX_FRAME_LENGTH
             };
-            let result =
-                ipc::read_ts_to_rust_frame_with_limit(&mut *sock, bridge_frame_limit);
+            let result = ipc::read_ts_to_rust_frame_with_limit(&mut *sock, bridge_frame_limit);
             if limits.wall_time_ms > 0 {
                 sock.set_read_timeout(None).ok();
             }
@@ -1142,10 +1150,12 @@ fn precompile_module(
             Some(v) => v,
             None => {
                 return Err(failure(
-                    RunError::RuntimeError {
+                    RunError::RuntimeError(Box::new(RuntimeErrorData {
+                        name: exception_name(scope),
                         message: exception_message(scope),
                         stack: exception_stack(scope),
-                    },
+                        data: exception_data(scope),
+                    })),
                     &logs,
                     start,
                 ))
@@ -1285,9 +1295,12 @@ fn take_resolver() -> Option<ResolverContext> {
 /// don't hold a borrow across `scope` calls.
 fn lookup_binding(specifier: &str) -> Option<ImportBinding> {
     RESOLVER_CTX.with(|c| {
-        c.borrow()
-            .as_ref()
-            .and_then(|ctx| ctx.bindings.iter().find(|b| b.specifier == specifier).cloned())
+        c.borrow().as_ref().and_then(|ctx| {
+            ctx.bindings
+                .iter()
+                .find(|b| b.specifier == specifier)
+                .cloned()
+        })
     })
 }
 
@@ -1668,8 +1681,7 @@ fn install_bridge_globals(
     resolver_map: PendingResolvers,
     // Vec<Box<>> is intentional: raw pointers into each Box are passed to V8
     // as External data — the address must not move on Vec reallocation.
-    #[allow(clippy::vec_box)]
-    out_boxes: &mut Vec<Box<GlobalCallbackData>>,
+    #[allow(clippy::vec_box)] out_boxes: &mut Vec<Box<GlobalCallbackData>>,
 ) -> Result<(), RunError> {
     let global_obj = scope.get_current_context().global(scope);
     for name in globals {
@@ -2090,6 +2102,7 @@ fn runtime_error_from_value(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
 ) -> RunError {
+    let name = error_name_from_value(scope, value).unwrap_or_else(|| "Error".to_string());
     let message = error_message_from_value(scope, value)
         .or_else(|| {
             value
@@ -2097,10 +2110,12 @@ fn runtime_error_from_value(
                 .map(|s| s.to_rust_string_lossy(scope))
         })
         .unwrap_or_else(|| "JavaScript error".to_string());
-    RunError::RuntimeError {
+    RunError::RuntimeError(Box::new(RuntimeErrorData {
+        name,
         message,
         stack: stack_from_value(scope, value),
-    }
+        data: error_data_from_value(scope, value),
+    }))
 }
 
 fn error_message_from_value(
@@ -2144,6 +2159,77 @@ fn exception_stack(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<String> 
     stack_from_value(scope, exception)
 }
 
+fn error_name_from_value(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    value: v8::Local<v8::Value>,
+) -> Option<String> {
+    let obj = value.to_object(scope)?;
+    let key = v8::String::new(scope, "name")?;
+    let name_val = obj.get(scope, key.into())?;
+    if !name_val.is_string() {
+        return None;
+    }
+    name_val
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+}
+
+fn exception_name(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
+    scope
+        .exception()
+        .and_then(|e| error_name_from_value(scope, e))
+        .unwrap_or_else(|| "Error".to_string())
+}
+
+/// Extract own enumerable properties from the thrown value, skipping `name`,
+/// `message`, and `stack` (already captured in dedicated fields). Non-
+/// serializable properties (functions, symbols, unresolved promises) are
+/// silently dropped. Returns `None` for non-object throws or when no
+/// serializable own properties remain.
+fn error_data_from_value(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    value: v8::Local<v8::Value>,
+) -> Option<WireValue> {
+    let obj = value.to_object(scope)?;
+    let names = obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())?;
+    let skip = ["name", "message", "stack", "__proto__"];
+    let mut fields: Vec<(String, WireValue)> = Vec::new();
+    let mut visiting = Vec::new();
+    for i in 0..names.length() {
+        let name_val = match names.get_index(scope, i) {
+            Some(v) => v,
+            None => continue,
+        };
+        let name = match name_val
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+        {
+            Some(s) => s,
+            None => continue,
+        };
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        let prop = match obj.get(scope, name_val) {
+            Some(v) => v,
+            None => continue,
+        };
+        if let Ok(wire) = value_to_wire(scope, prop, &mut visiting) {
+            fields.push((name, wire));
+        }
+    }
+    if fields.is_empty() {
+        None
+    } else {
+        Some(WireValue::Object(fields))
+    }
+}
+
+fn exception_data(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<WireValue> {
+    let exception = scope.exception()?;
+    error_data_from_value(scope, exception)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
 // TDD suite for the full Phase 1-8 surface. Tests are grouped by concern.
@@ -2163,7 +2249,16 @@ mod tests {
     /// Run code with explicit limits. Used for limit-enforcement tests.
     fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
         init_platform();
-        run_module(code, filename, None, limits, &[], &[], None, Arc::new(AtomicU32::new(0)))
+        run_module(
+            code,
+            filename,
+            None,
+            limits,
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
     }
 
     fn run(code: &str) -> Result<Output, RunError> {
@@ -2181,10 +2276,7 @@ mod tests {
     }
 
     /// Run user code with a fixed set of source imports; no host bridge.
-    fn run_with_source_imports(
-        code: &str,
-        imports: &[ImportBinding],
-    ) -> Result<Output, RunError> {
+    fn run_with_source_imports(code: &str, imports: &[ImportBinding]) -> Result<Output, RunError> {
         init_platform();
         run_module(
             code,
@@ -2442,7 +2534,7 @@ mod tests {
     #[test]
     fn top_level_await_rejected_promise_is_runtime_error() {
         let err = run_err("export default await Promise.reject(new Error('oops'))");
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     // ── Console capture ───────────────────────────────────────────────────
@@ -2518,14 +2610,14 @@ mod tests {
     #[test]
     fn thrown_error_is_runtime_error() {
         let err = run_err(r#"throw new Error("boom")"#);
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     #[test]
     fn thrown_error_message_is_preserved() {
         let err = run_err(r#"throw new Error("specific message")"#);
-        if let RunError::RuntimeError { message, .. } = err {
-            assert!(message.contains("specific message"));
+        if let RunError::RuntimeError(inner) = err {
+            assert!(inner.message.contains("specific message"));
         } else {
             panic!("expected RuntimeError");
         }
@@ -2544,7 +2636,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(failure.error, RunError::RuntimeError { .. }));
+        assert!(matches!(failure.error, RunError::RuntimeError(_)));
         assert!(has_line(&failure.stdout, "before stdout"));
         assert!(has_line(&failure.stderr, "before stderr"));
     }
@@ -2552,7 +2644,7 @@ mod tests {
     #[test]
     fn thrown_string_is_runtime_error() {
         let err = run_err(r#"throw "raw string error""#);
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     #[test]
@@ -2564,8 +2656,8 @@ mod tests {
             outer();
             "#,
         );
-        if let RunError::RuntimeError { stack, .. } = err {
-            assert!(stack.is_some(), "expected a stack trace");
+        if let RunError::RuntimeError(inner) = err {
+            assert!(inner.stack.is_some(), "expected a stack trace");
         } else {
             panic!("expected RuntimeError");
         }
@@ -2574,13 +2666,13 @@ mod tests {
     #[test]
     fn reference_error_is_runtime_error() {
         let err = run_err("export default undeclaredVariable");
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     #[test]
     fn type_error_is_runtime_error() {
         let err = run_err("null.property");
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     // ── Export validation ─────────────────────────────────────────────────
@@ -2940,7 +3032,7 @@ mod tests {
     #[test]
     fn unconfigured_fetch_is_just_a_missing_global_runtime_error() {
         let err = run_err(r#"export default await fetch("https://example.com")"#);
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     #[test]
@@ -3085,7 +3177,8 @@ mod tests {
                 ..Default::default()
             },
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .map_err(|f| f.error)
@@ -3126,7 +3219,7 @@ mod tests {
         .map_err(|f| f.error)
         .unwrap_err();
         assert!(
-            matches!(err, RunError::RuntimeError { .. }),
+            matches!(err, RunError::RuntimeError(_)),
             "expected RuntimeError (stack overflow), got {err:?}"
         );
     }
@@ -3292,7 +3385,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, RunError::RuntimeError { .. }),
+            matches!(err, RunError::RuntimeError(_)),
             "expected RuntimeError, got {err:?}"
         );
     }
@@ -3326,10 +3419,7 @@ mod tests {
         // Module resolver must recurse into the second binding to satisfy
         // the first.
         let imports = [
-            source_import(
-                "lib:utils",
-                "export const double = (n) => n * 2;",
-            ),
+            source_import("lib:utils", "export const double = (n) => n * 2;"),
             source_import(
                 "lib:app",
                 "import { double } from \"lib:utils\";\n\
@@ -3391,7 +3481,7 @@ mod tests {
         // When globals injection is implemented: assert the call resolves.
         let err = run_err(r#"export default await globalThis.searchTool("cats")"#);
         // Pre-implementation: TypeError (searchTool is not a function).
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     #[test]
@@ -3407,7 +3497,7 @@ mod tests {
             export default b
             "#,
         );
-        assert!(matches!(err, RunError::RuntimeError { .. }));
+        assert!(matches!(err, RunError::RuntimeError(_)));
     }
 
     #[test]
@@ -3461,7 +3551,7 @@ mod tests {
     #[test]
     fn precompile_runtime_error_is_reported() {
         let err = precompile(r#"throw new Error("prefix failed")"#, None, &[]).unwrap_err();
-        assert!(matches!(err.error, RunError::RuntimeError { .. }));
+        assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
     #[test]
@@ -3475,7 +3565,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3491,7 +3582,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3508,7 +3600,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3518,7 +3611,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3528,7 +3622,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3546,7 +3641,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3556,7 +3652,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3577,7 +3674,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3593,7 +3691,8 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -3609,11 +3708,12 @@ mod tests {
             None,
             Limits::default(),
             &[],
-            &[], None,
+            &[],
+            None,
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err();
-        assert!(matches!(err.error, RunError::RuntimeError { .. }));
+        assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
     // ── AbortSignal / cancellation ────────────────────────────────────────
@@ -3648,13 +3748,9 @@ mod tests {
             max_export_bytes: 64, // tiny — any non-trivial export will exceed it
             ..Limits::default()
         };
-        let err = run_code(
-            r#"export default "x".repeat(100)"#,
-            "<iso4>",
-            limits,
-        )
-        .unwrap_err()
-        .error;
+        let err = run_code(r#"export default "x".repeat(100)"#, "<iso4>", limits)
+            .unwrap_err()
+            .error;
         assert!(
             matches!(err, RunError::ExportTooLarge),
             "expected ExportTooLarge, got {err:?}"
@@ -3680,12 +3776,7 @@ mod tests {
             ..Limits::default()
         };
         // Export a reasonably large value — should succeed when cap is off.
-        let out = run_code(
-            r#"export default "x".repeat(10_000)"#,
-            "<iso4>",
-            limits,
-        )
-        .unwrap();
+        let out = run_code(r#"export default "x".repeat(10_000)"#, "<iso4>", limits).unwrap();
         assert!(get_default(&out).is_some());
     }
 
@@ -3715,7 +3806,10 @@ mod tests {
         let total: usize = out.stdout.iter().map(|s| s.len()).sum();
         assert!(total <= 50, "stdout bytes {total} exceeded limit 50");
         // At least some output must have been captured.
-        assert!(!out.stdout.is_empty(), "expected some stdout to be captured");
+        assert!(
+            !out.stdout.is_empty(),
+            "expected some stdout to be captured"
+        );
     }
 
     #[test]
@@ -3735,7 +3829,10 @@ mod tests {
         .unwrap();
         let total: usize = out.stderr.iter().map(|s| s.len()).sum();
         assert!(total <= 50, "stderr bytes {total} exceeded limit 50");
-        assert!(!out.stderr.is_empty(), "expected some stderr to be captured");
+        assert!(
+            !out.stderr.is_empty(),
+            "expected some stderr to be captured"
+        );
     }
 
     #[test]
@@ -3811,7 +3908,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         );
         responder.join().unwrap();
@@ -3902,7 +4000,8 @@ mod tests {
             None,
             limits,
             &[global.to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         );
         (result, handle)
@@ -3989,7 +4088,8 @@ mod tests {
                 ..Default::default()
             },
             &["add".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -4051,7 +4151,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4093,7 +4194,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4217,7 +4319,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4278,7 +4381,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4391,7 +4495,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4438,7 +4543,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -4473,7 +4579,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
@@ -4508,7 +4615,8 @@ mod tests {
                 ..Default::default()
             },
             &["toolA".to_string(), "toolB".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4561,7 +4669,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd),
+            &[],
+            Some(fd),
             Arc::new(AtomicU32::new(0)),
         )
         .unwrap_err()
@@ -4611,7 +4720,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd1),
+            &[],
+            Some(fd1),
             Arc::clone(&counter),
         )
         .unwrap();
@@ -4647,7 +4757,8 @@ mod tests {
                 ..Default::default()
             },
             &["myTool".to_string()],
-            &[], Some(fd2),
+            &[],
+            Some(fd2),
             Arc::clone(&counter),
         )
         .unwrap_err()
