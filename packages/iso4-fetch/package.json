@@ -1,6 +1,6 @@
 {
   "name": "@iso4/fetch",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "type": "module",
   "description": "Hardened FetchHandler for the @iso4/sandbox runtime: DNS pinning, host allowlist, private-IP blocking, no auto-redirect",
   "keywords": [
