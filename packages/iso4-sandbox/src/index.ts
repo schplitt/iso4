@@ -166,12 +166,16 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
  * The `RunResult` returned when a run is aborted — whether the signal was
  * already aborted at run entry or fired mid-flight (surfaced as a
  * `RunAbortedError` from the client). Shared so both paths produce an
- * identical shape.
+ * identical shape. `error` (code `ERR_ABORTED`) is retained for backward
+ * compatibility; `reason` carries whatever was passed to `abort(reason)`.
+ * @param reason
  */
-function abortedResult(): RunResult {
+function abortedResult(reason?: unknown): RunResult {
   return {
+    status: 'aborted',
     ok: false,
     error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' },
+    reason,
     stdout: [],
     stderr: [],
     durationMs: 0,
@@ -203,7 +207,7 @@ class SandboxImpl implements Sandbox {
 
   async run(options: RunOptions): Promise<RunResult> {
     if (options.signal?.aborted) {
-      return abortedResult()
+      return abortedResult(options.signal.reason)
     }
     const { bridgeGlobals, preamble } = processGlobals(options.globals ?? {})
     const { bindings, registry, shape: _shape } = processImports(options.imports)
@@ -227,7 +231,7 @@ class SandboxImpl implements Sandbox {
       })
     } catch (error) {
       if (error instanceof RunAbortedError)
-        return abortedResult()
+        return abortedResult(error.reason)
       throw error
     }
   }
@@ -350,6 +354,7 @@ implements Prefix<G, M> {
   async run(options: PrefixRunOptions<G, M>): Promise<RunResult> {
     if (!this._alive) {
       return {
+        status: 'failed',
         ok: false,
         error: {
           code: 'ERR_PREFIX_DISPOSED',
@@ -363,7 +368,7 @@ implements Prefix<G, M> {
     }
 
     if (options.signal?.aborted) {
-      return abortedResult()
+      return abortedResult(options.signal.reason)
     }
     // Extract bridge globals, routing shimmed overrides to their private keys.
     // The preamble is already compiled into the snapshot — not re-injected.
@@ -383,6 +388,7 @@ implements Prefix<G, M> {
         // Symmetric with the Rust-side ERR_UNDECLARED_BINDING path for globals:
         // surface the error as a RunResult failure rather than a thrown promise.
         return {
+          status: 'failed',
           ok: false,
           error: { code: 'ERR_UNDECLARED_BINDING', name: 'Error', message: e.message },
           stdout: [],
@@ -411,7 +417,7 @@ implements Prefix<G, M> {
       })
     } catch (error) {
       if (error instanceof RunAbortedError)
-        return abortedResult()
+        return abortedResult(error.reason)
       throw error
     }
   }

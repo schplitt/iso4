@@ -1002,7 +1002,78 @@ describe('AbortSignal cancellation', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
+    // status discriminant and legacy error code both identify the abort.
+    expect(result.status).toBe('aborted')
     expect(result.error.code).toBe('ERR_ABORTED')
+  })
+
+  test('aborted result has status "aborted" and is not a "failed"', async () => {
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 50)
+    const result = await runtime.run({
+      code: `
+        import { slowCall } from 'host:slow'
+        export default await slowCall()
+      `,
+      signal: controller.signal,
+      imports: {
+        'host:slow': {
+          slowCall: () =>
+            new Promise((resolve) => {
+              setTimeout(resolve, 10_000)
+            }),
+        },
+      },
+    })
+    expect(result.status).toBe('aborted')
+    // A deliberate abort must be distinguishable from a genuine failure.
+    expect(result.status).not.toBe('failed')
+  })
+
+  test('abort reason is surfaced on the result (pre-aborted and in-flight)', async () => {
+    // Pre-aborted with an explicit reason.
+    const c1 = new AbortController()
+    const reason1 = { kind: 'suspend', stepId: 'approval' }
+    c1.abort(reason1)
+    const pre = await runtime.run({ code: 'export default 1', signal: c1.signal })
+    expect(pre.status).toBe('aborted')
+    if (pre.status === 'aborted')
+      expect(pre.reason).toEqual(reason1)
+
+    // Aborted mid-flight with an explicit reason.
+    const c2 = new AbortController()
+    const reason2 = { kind: 'suspend', stepId: 'wait-2' }
+    setTimeout(() => c2.abort(reason2), 50)
+    const mid = await runtime.run({
+      code: `
+        import { slowCall } from 'host:slow'
+        export default await slowCall()
+      `,
+      signal: c2.signal,
+      imports: {
+        'host:slow': {
+          slowCall: () =>
+            new Promise((resolve) => {
+              setTimeout(resolve, 10_000)
+            }),
+        },
+      },
+    })
+    expect(mid.status).toBe('aborted')
+    if (mid.status === 'aborted')
+      expect(mid.reason).toEqual(reason2)
+  })
+
+  test('completed and failed runs carry the matching status', async () => {
+    const okResult = await runtime.run({ code: 'export default 1 + 1' })
+    expect(okResult.status).toBe('completed')
+    expect(okResult.ok).toBe(true)
+
+    const failResult = await runtime.run({ code: 'throw new Error("boom")' })
+    expect(failResult.status).toBe('failed')
+    expect(failResult.ok).toBe(false)
+    if (!failResult.ok && failResult.status === 'failed')
+      expect(failResult.error.code).toBe('ERR_USER_CODE')
   })
 
   test('signal aborted during async execution produces ERR_ABORTED', async () => {

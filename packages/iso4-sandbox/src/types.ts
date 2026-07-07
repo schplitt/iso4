@@ -589,9 +589,24 @@ export interface RunOptions {
 // Result
 // ─────────────────────────────────────────────────────────────────────────
 
-export type RunResult = RunSuccess | RunFailure
+/**
+ * Why a run was aborted — whatever value was passed to the aborting
+ * `AbortController.abort(reason)` (or left `undefined`). Opaque to iso4 and
+ * surfaced verbatim on {@link RunAborted.reason}; a consumer built on top
+ * (e.g. a durable-workflow kernel expressing "suspend") gives it meaning.
+ */
+export type AbortReason = unknown
 
+export type RunResult = RunSuccess | RunFailure | RunAborted
+
+/**
+ * `status` is the primary discriminant across all three outcomes; `ok` is kept
+ * as a convenience alias for `status === 'completed'`, so the common guard
+ * stays `if (result.ok)`. Reach for `switch (result.status)` when a deliberate
+ * abort must be told apart from a genuine failure.
+ */
 export interface RunSuccess {
+  status: 'completed'
   ok: true
   exports: SandboxExports
   stdout: string[]
@@ -600,8 +615,26 @@ export interface RunSuccess {
 }
 
 export interface RunFailure {
+  status: 'failed'
   ok: false
   error: RunError
+  stdout: string[]
+  stderr: string[]
+  durationMs: number
+}
+
+/**
+ * The run was stopped by an abort — a pre-aborted or mid-run `signal` passed to
+ * `run()`, or a host handler that aborted the run. A deliberate outcome, not a
+ * crash: `error` is retained (its `code` is always `ERR_ABORTED`) so existing
+ * `!result.ok` / `error.code` checks keep working, and `reason` carries the
+ * value handed to `abort(reason)`.
+ */
+export interface RunAborted {
+  status: 'aborted'
+  ok: false
+  error: RunError
+  reason?: AbortReason
   stdout: string[]
   stderr: string[]
   durationMs: number
