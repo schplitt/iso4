@@ -558,6 +558,17 @@ If the runtime kills the isolate (memory, CPU, wall):
 }
 ```
 
+If the host aborts the run via `run({ signal })` — either a pre-aborted signal
+at entry or an abort that fires mid-run (see §14.7):
+
+```ts
+{
+  ok: false,
+  error: { code: "ERR_ABORTED", name: "AbortError", message: "run was aborted" },
+  ...
+}
+```
+
 The result is _always_ an object; `ok: true | false` discriminates. `run()`
 does not throw for sandboxed failures — only for infrastructure failures
 (e.g., the Rust process crashed).
@@ -1401,6 +1412,45 @@ Passing a function as an argument to a bridge global is rejected with
 This is a deliberate limitation — callbacks across the boundary would require
 a callback-handle protocol symmetric to callable return values. The same Phase
 11 work that adds callable return values will enable function arguments too.
+
+### 14.7 In-flight run abort via `AbortSignal`
+
+`run({ signal })` and `prefix.run({ signal })` honor an `AbortSignal` that
+fires **at any point during a run**, not just at entry. A pre-aborted signal
+short-circuits to `ERR_ABORTED` before any frame is sent; an abort that lands
+mid-run tears the run down promptly.
+
+Mechanism (TypeScript-only — no Rust control message is required):
+
+1. **Interrupt the drain**: `drainUntilResult` subscribes to the signal. On
+   abort it closes the connection's frame reader (so the read loop throws) and
+   destroys the socket.
+2. **Reclaim the isolate**: destroying the socket makes the Rust session's
+   blocking bridge-response read observe EOF; it returns an error, `run_code`
+   unwinds, and the isolate is dropped — promptly, rather than waiting for
+   `wallTimeMs`.
+3. **Drop the late response**: an orphaned bridge handler that resolves *after*
+   the abort tries to write its `BridgeResponse` to a socket that is already
+   gone; the write fails silently. The sandbox therefore never observes a
+   return value for the call that was in flight when the abort landed. This
+   makes `controller.abort()` from inside a bridge handler a spoof-proof way to
+   stop a run: sandbox code cannot catch or swallow it, and no error name has
+   to propagate through the isolate. (This is the mechanism the
+   `durable-isolates` replay kernel uses to implement durable suspension.)
+4. **Keep the pool healthy**: a connection torn down this way is marked unusable
+   and is **not** returned to the free list. `ConnectionPool` disposes it and
+   opens a fresh replacement, so the pool keeps its full `maxIsolates`
+   complement and other/subsequent runs are unaffected.
+
+The `run()` promise resolves with `ERR_ABORTED` (see §5.2) in all cases.
+
+**CPU-bound caveat**: a purely CPU-bound run (no bridge call in flight) is
+spinning inside `module.evaluate()` and does not observe the socket close.
+The `run()` promise still resolves with `ERR_ABORTED` immediately, but the
+abandoned isolate is only reclaimed when its **CPU guard** fires — bounded by
+`cpuTimeMs`, not `wallTimeMs`. Promptly interrupting a busy isolate would
+require a Rust-side `terminate_execution` triggered by a control message; this
+is deferred until a consumer needs it.
 
 ---
 

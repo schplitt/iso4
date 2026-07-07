@@ -1005,10 +1005,11 @@ describe('AbortSignal cancellation', () => {
     expect(result.error.code).toBe('ERR_ABORTED')
   })
 
-  test.skip('signal aborted during async execution produces ERR_ABORTED', async () => {
+  test('signal aborted during async execution produces ERR_ABORTED', async () => {
     const controller = new AbortController()
     // abort after 100ms; the run waits on a slow bridge call
     setTimeout(() => controller.abort(), 100)
+    const start = Date.now()
     const result = await runtime.run({
       code: `
         import { slowCall } from 'host:slow'
@@ -1025,11 +1026,65 @@ describe('AbortSignal cancellation', () => {
         },
       },
     })
+    // Resolves promptly on abort — not after the 10s bridge call or wallTimeMs.
+    expect(Date.now() - start).toBeLessThan(2_000)
     expect(result.ok).toBe(false)
     if (result.ok)
       return
     expect(result.error.code).toBe('ERR_ABORTED')
   })
+
+  test('a late BridgeResponse after abort is not observed by the sandbox', async () => {
+    // The bridge handler resolves *after* the abort lands. The run must still
+    // resolve ERR_ABORTED and the sandbox must never see the returned value.
+    let resolveCall: ((v: unknown) => void) | undefined
+    const controller = new AbortController()
+    const result = await runtime.run({
+      code: `
+        import { slowCall } from 'host:slow'
+        export default await slowCall()
+      `,
+      signal: controller.signal,
+      imports: {
+        'host:slow': {
+          slowCall: () =>
+            new Promise((resolve) => {
+              resolveCall = resolve
+              // Abort while this call is in flight, then resolve it late.
+              setTimeout(() => controller.abort(), 50)
+              setTimeout(() => resolve(123), 150)
+            }),
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_ABORTED')
+    // Ensure the late resolution has fired; it must have had no effect.
+    expect(resolveCall).toBeDefined()
+    await new Promise<void>((r) => {
+      setTimeout(r, 200)
+    })
+  })
+
+  test('signal aborted during a CPU-bound loop produces ERR_ABORTED without waiting for wallTimeMs', async () => {
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 100)
+    const start = Date.now()
+    const result = await runtime.run({
+      // No bridge calls — a pure CPU spin. wallTimeMs is large so the only
+      // prompt exit is via the abort.
+      code: 'while (true) {}',
+      limits: { cpuTimeMs: 30_000, wallTimeMs: 30_000 },
+      signal: controller.signal,
+    })
+    expect(Date.now() - start).toBeLessThan(2_000)
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_ABORTED')
+  }, 10_000)
 
   test('signal aborted on one run does not affect a subsequent run', async () => {
     const controller = new AbortController()
@@ -1041,6 +1096,236 @@ describe('AbortSignal cancellation', () => {
     if (!result.ok)
       return
     expect(result.exports.default).toBe(42)
+  })
+
+  test('in-flight abort leaves the pool healthy for subsequent runs', async () => {
+    // Abort a mid-flight run (torn-down connection), then confirm the pool
+    // replaced the slot and later runs still succeed.
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 50)
+    const aborted = await runtime.run({
+      code: `
+        import { slowCall } from 'host:slow'
+        export default await slowCall()
+      `,
+      signal: controller.signal,
+      imports: {
+        'host:slow': {
+          slowCall: () =>
+            new Promise((resolve) => {
+              setTimeout(resolve, 10_000)
+            }),
+        },
+      },
+    })
+    expect(aborted.ok).toBe(false)
+
+    // Run enough follow-up work to exercise every pool slot, including the
+    // freshly reconnected one.
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) =>
+        runtime.run({ code: `export default ${i}` })),
+    )
+    for (const [i, r] of results.entries()) {
+      expect(r.ok).toBe(true)
+      if (r.ok)
+        expect(r.exports.default).toBe(i)
+    }
+  }, 15_000)
+
+  test('single-isolate pool: a run after an in-flight abort still works (slot is reconnected)', async () => {
+    // maxIsolates: 1 means there is exactly ONE connection. If the aborted
+    // connection were not replaced, the pool would be permanently empty and
+    // this second run could never acquire a slot. Success here proves the
+    // dead slot was torn down and a fresh one reconnected in its place.
+    const solo = await createRuntime({ maxIsolates: 1 })
+    try {
+      const controller = new AbortController()
+      setTimeout(() => controller.abort(), 50)
+      const aborted = await solo.run({
+        code: `
+          import { slowCall } from 'host:slow'
+          export default await slowCall()
+        `,
+        signal: controller.signal,
+        imports: {
+          'host:slow': {
+            slowCall: () =>
+              new Promise((resolve) => {
+                setTimeout(resolve, 10_000)
+              }),
+          },
+        },
+      })
+      expect(aborted.ok).toBe(false)
+      if (!aborted.ok)
+        expect(aborted.error.code).toBe('ERR_ABORTED')
+
+      // The only slot must have been reconnected — otherwise this hangs until
+      // the test times out.
+      const result = await solo.run({ code: 'export default 42' })
+      expect(result.ok).toBe(true)
+      if (result.ok)
+        expect(result.exports.default).toBe(42)
+
+      // And it keeps working for more than one follow-up run.
+      const again = await solo.run({ code: 'export default 43' })
+      expect(again.ok).toBe(true)
+      if (again.ok)
+        expect(again.exports.default).toBe(43)
+    } finally {
+      await solo.dispose()
+    }
+  }, 15_000)
+
+  test('abort triggered synchronously from within a bridge handler (durable-isolates pattern)', async () => {
+    // The motivating consumer: a host bridge handler decides to stop the run
+    // and calls controller.abort() itself. The run must resolve ERR_ABORTED
+    // and the value the handler goes on to return must never reach the sandbox.
+    const controller = new AbortController()
+    let sandboxSawValue = false
+    const result = await runtime.run({
+      code: `
+        const v = await suspend()
+        // Must be unreachable — the run is torn down before this resolves.
+        markObserved(v)
+        export default v
+      `,
+      signal: controller.signal,
+      globals: {
+        suspend: () => {
+          // Abort from inside the handler, then resolve late.
+          controller.abort()
+          return new Promise((resolve) => {
+            setTimeout(() => resolve('leaked'), 50)
+          })
+        },
+        markObserved: () => {
+          sandboxSawValue = true
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_ABORTED')
+    // Give the late resolution time to (wrongly) fire.
+    await new Promise<void>((r) => {
+      setTimeout(r, 150)
+    })
+    expect(sandboxSawValue).toBe(false)
+  })
+
+  test('prefix.run honors an in-flight abort and keeps the prefix usable', async () => {
+    const prefix = await runtime.precompile({
+      code: '',
+      globals: { slow: () => Promise.resolve('unused') },
+    })
+
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 50)
+    const aborted = await prefix.run({
+      code: `
+        export default await slow()
+      `,
+      signal: controller.signal,
+      globals: {
+        // Rebind the declared global to one that never resolves in time.
+        slow: () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve('late'), 10_000)
+          }),
+      },
+    })
+    expect(aborted.ok).toBe(false)
+    if (!aborted.ok)
+      expect(aborted.error.code).toBe('ERR_ABORTED')
+
+    // The prefix (and the pool) survive: a subsequent run on the same prefix
+    // still works.
+    const ok = await prefix.run({ code: 'export default 7' })
+    expect(ok.ok).toBe(true)
+    if (ok.ok)
+      expect(ok.exports.default).toBe(7)
+
+    await prefix.dispose()
+  }, 15_000)
+
+  test('aborting one in-flight run does not disturb a concurrent run', async () => {
+    const abortController = new AbortController()
+
+    const abortedPromise = runtime.run({
+      code: `
+        import { slowCall } from 'host:slow'
+        export default await slowCall()
+      `,
+      signal: abortController.signal,
+      imports: {
+        'host:slow': {
+          slowCall: () =>
+            new Promise((resolve) => {
+              setTimeout(resolve, 10_000)
+            }),
+        },
+      },
+    })
+
+    // A second run that completes normally while the first is mid-flight.
+    const healthyPromise = runtime.run({
+      code: `
+        import { quickCall } from 'host:quick'
+        export default await quickCall()
+      `,
+      imports: {
+        'host:quick': {
+          quickCall: () =>
+            new Promise((resolve) => {
+              setTimeout(() => resolve(99), 200)
+            }),
+        },
+      },
+    })
+
+    setTimeout(() => abortController.abort(), 50)
+
+    const [aborted, healthy] = await Promise.all([abortedPromise, healthyPromise])
+    expect(aborted.ok).toBe(false)
+    if (!aborted.ok)
+      expect(aborted.error.code).toBe('ERR_ABORTED')
+    expect(healthy.ok).toBe(true)
+    if (healthy.ok)
+      expect(healthy.exports.default).toBe(99)
+  }, 15_000)
+
+  test('aborting after the run already completed is a no-op', async () => {
+    const controller = new AbortController()
+    const result = await runtime.run({
+      code: 'export default 1 + 1',
+      signal: controller.signal,
+    })
+    // Run finished successfully; a late abort must not change the result.
+    controller.abort()
+    expect(result.ok).toBe(true)
+    if (result.ok)
+      expect(result.exports.default).toBe(2)
+
+    // And the runtime is still usable afterwards.
+    const next = await runtime.run({ code: 'export default 5' })
+    expect(next.ok).toBe(true)
+  })
+
+  test('a fresh signal on a later run is unaffected by an earlier abort', async () => {
+    const first = new AbortController()
+    first.abort()
+    const abortedResult = await runtime.run({ code: 'export default 1', signal: first.signal })
+    expect(abortedResult.ok).toBe(false)
+
+    // A brand-new, un-aborted signal must allow the run to complete.
+    const second = new AbortController()
+    const result = await runtime.run({ code: 'export default 123', signal: second.signal })
+    expect(result.ok).toBe(true)
+    if (result.ok)
+      expect(result.exports.default).toBe(123)
   })
 })
 

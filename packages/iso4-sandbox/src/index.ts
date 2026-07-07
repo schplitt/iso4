@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 
 import { resolveRuntimeBinary } from './binary'
-import { RuntimeIpcClient } from './client'
+import { RunAbortedError, RuntimeIpcClient } from './client'
 
 import { ConnectionPool } from './pool'
 import {
@@ -102,12 +102,15 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   await waitForSocket(socketPath)
 
   // Open all pool connections in parallel.
+  const connect = (): Promise<RuntimeIpcClient> =>
+    RuntimeIpcClient.connect({ socketPath, token })
   const clients = await Promise.all(
-    Array.from({ length: maxIsolates }, () =>
-      RuntimeIpcClient.connect({ socketPath, token })),
+    Array.from({ length: maxIsolates }, () => connect()),
   )
 
-  const pool = new ConnectionPool(clients)
+  // The pool uses `connect` to reopen any slot torn down by an in-flight abort,
+  // keeping the pool at `maxIsolates`.
+  const pool = new ConnectionPool(clients, connect)
   return new SandboxImpl(proc, pool, socketPath)
 }
 
@@ -159,6 +162,22 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
   }
 }
 
+/**
+ * The `RunResult` returned when a run is aborted — whether the signal was
+ * already aborted at run entry or fired mid-flight (surfaced as a
+ * `RunAbortedError` from the client). Shared so both paths produce an
+ * identical shape.
+ */
+function abortedResult(): RunResult {
+  return {
+    ok: false,
+    error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' },
+    stdout: [],
+    stderr: [],
+    durationMs: 0,
+  }
+}
+
 // ── Bridge dispatcher factory ─────────────────────────────────────────────
 
 // ── SandboxImpl ─────────────────────────────────────────────────────────────
@@ -184,7 +203,7 @@ class SandboxImpl implements Sandbox {
 
   async run(options: RunOptions): Promise<RunResult> {
     if (options.signal?.aborted) {
-      return { ok: false, error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' }, stdout: [], stderr: [], durationMs: 0 }
+      return abortedResult()
     }
     const { bridgeGlobals, preamble } = processGlobals(options.globals ?? {})
     const { bindings, registry, shape: _shape } = processImports(options.imports)
@@ -195,15 +214,22 @@ class SandboxImpl implements Sandbox {
       ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
       : bridgeGlobals
     const code = preamble ? `${preamble}\n${options.code}` : options.code
-    return this.pool.withClient(async (client) => {
-      const raw = await client.runRawCode(code, {
-        filename: options.filename,
-        limits: toWireLimits(options.limits),
-        globals: allGlobals,
-        imports: bindings,
+    try {
+      return await this.pool.withClient(async (client) => {
+        const raw = await client.runRawCode(code, {
+          filename: options.filename,
+          limits: toWireLimits(options.limits),
+          globals: allGlobals,
+          imports: bindings,
+          signal: options.signal,
+        })
+        return decodeRunCompletionPayload(raw.result).result
       })
-      return decodeRunCompletionPayload(raw.result).result
-    })
+    } catch (error) {
+      if (error instanceof RunAbortedError)
+        return abortedResult()
+      throw error
+    }
   }
 
   /**
@@ -337,7 +363,7 @@ implements Prefix<G, M> {
     }
 
     if (options.signal?.aborted) {
-      return { ok: false, error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' }, stdout: [], stderr: [], durationMs: 0 }
+      return abortedResult()
     }
     // Extract bridge globals, routing shimmed overrides to their private keys.
     // The preamble is already compiled into the snapshot — not re-injected.
@@ -371,16 +397,23 @@ implements Prefix<G, M> {
     const allGlobals = registry.size > 0
       ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
       : bridgeGlobals
-    return this.pool.withClient(async (client) => {
-      const raw = await client.prefixRun({
-        prefixId: this.id,
-        code: options.code,
-        filename: options.filename,
-        limits: toWireLimits(options.limits),
-        globals: allGlobals,
+    try {
+      return await this.pool.withClient(async (client) => {
+        const raw = await client.prefixRun({
+          prefixId: this.id,
+          code: options.code,
+          filename: options.filename,
+          limits: toWireLimits(options.limits),
+          globals: allGlobals,
+          signal: options.signal,
+        })
+        return decodeRunCompletionPayload(raw.result).result
       })
-      return decodeRunCompletionPayload(raw.result).result
-    })
+    } catch (error) {
+      if (error instanceof RunAbortedError)
+        return abortedResult()
+      throw error
+    }
   }
 
   async dispose(): Promise<void> {
