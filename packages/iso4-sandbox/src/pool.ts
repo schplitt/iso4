@@ -14,13 +14,22 @@ interface Waiter {
   reject: (error: Error) => void
 }
 
+/**
+ * Opens a fresh connection to replace one that was torn down (e.g. by an
+ * in-flight abort). Supplied by `createSandbox`, which holds the socket path
+ * and auth token.
+ */
+export type ConnectFn = () => Promise<RuntimeIpcClient>
+
 export class ConnectionPool {
   private readonly free: RuntimeIpcClient[]
   private readonly waiters: Waiter[] = []
+  private readonly connect: ConnectFn | undefined
   private disposed = false
 
-  constructor(clients: RuntimeIpcClient[]) {
+  constructor(clients: RuntimeIpcClient[], connect?: ConnectFn) {
     this.free = [...clients]
+    this.connect = connect
   }
 
   /**
@@ -76,11 +85,47 @@ export class ConnectionPool {
       return
     }
 
+    // A client torn down by an in-flight abort must not be reused. Drop it and
+    // open a replacement so the pool keeps its full complement of slots.
+    if (!client.usable) {
+      // `replace` never rejects (it swallows its own errors); the trailing
+      // catch is a belt-and-suspenders guard against an unhandled rejection.
+      this.replace(client).catch(() => {})
+      return
+    }
+
     const next = this.waiters.shift()
     if (next !== undefined) {
       next.resolve(client)
     } else {
       this.free.push(client)
     }
+  }
+
+  /**
+   * Dispose a dead slot and connect a fresh one in its place. If reconnection
+   * fails (or no factory was supplied) the pool simply runs with one fewer
+   * slot rather than handing back a broken connection; any waiter still gets
+   * served by other slots as they free up.
+   * @param dead
+   */
+  private async replace(dead: RuntimeIpcClient): Promise<void> {
+    await dead.dispose().catch(() => {})
+    if (this.connect === undefined)
+      return
+    let fresh: RuntimeIpcClient
+    try {
+      fresh = await this.connect()
+    } catch {
+      // Could not reopen the slot — leave the pool one short. Subsequent runs
+      // still succeed on the remaining slots.
+      return
+    }
+    if (this.disposed) {
+      // Pool was disposed while reconnecting — don't leak the new connection.
+      await fresh.dispose().catch(() => {})
+      return
+    }
+    this.release(fresh)
   }
 }

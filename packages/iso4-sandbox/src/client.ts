@@ -43,10 +43,30 @@ export type BridgeCallDispatcher = (call: {
 
 export type { ResourceLimits }
 
+/**
+ * Thrown out of a run when its `AbortSignal` fires mid-flight. The connection
+ * is torn down (so the Rust isolate is reclaimed) before this propagates, and
+ * the client is marked unusable so the pool replaces it rather than reusing a
+ * half-dead slot. `index.ts` catches this and synthesizes the `ERR_ABORTED`
+ * `RunResult`.
+ */
+export class RunAbortedError extends Error {
+  constructor(message = 'run was aborted') {
+    super(message)
+    this.name = 'RunAbortedError'
+  }
+}
+
 export class RuntimeIpcClient {
   private readonly socket: Socket
   private readonly reader: FrameReader
   private disposed = false
+  /**
+   * Set when an in-flight abort tore this connection down. A broken client
+   * must not be returned to the pool's free list — `ConnectionPool.release`
+   * checks `usable` and replaces it with a fresh connection instead.
+   */
+  private broken = false
 
   private constructor(socket: Socket) {
     this.socket = socket
@@ -63,6 +83,15 @@ export class RuntimeIpcClient {
     socket.once('close', () => {
       this.reader.close(new Error('socket closed'))
     })
+  }
+
+  /**
+   * A client is usable while its connection is intact. Once an in-flight abort
+   * (or a dispose) tears the socket down it becomes unusable and the pool must
+   * replace it.
+   */
+  get usable(): boolean {
+    return !this.disposed && !this.broken
   }
 
   static async connect(options: RuntimeIpcClientOptions): Promise<RuntimeIpcClient> {
@@ -105,6 +134,7 @@ export class RuntimeIpcClient {
       limits?: ResourceLimits
       globals?: Record<string, HostExportFunction>
       imports?: readonly ImportBindingPayload[]
+      signal?: AbortSignal
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -126,7 +156,7 @@ export class RuntimeIpcClient {
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(globals))
+    return this.drainUntilResult(makeDispatcher(globals), options?.signal)
   }
 
   async precompile(
@@ -173,6 +203,7 @@ export class RuntimeIpcClient {
       limits?: ResourceLimits
       globals?: Record<string, HostExportFunction>
       imports?: readonly ImportBindingPayload[]
+      signal?: AbortSignal
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -195,7 +226,7 @@ export class RuntimeIpcClient {
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(globals))
+    return this.drainUntilResult(makeDispatcher(globals), options.signal)
   }
 
   async disposePrefix(prefixId: string): Promise<void> {
@@ -239,9 +270,64 @@ export class RuntimeIpcClient {
    * garbage-collected when it eventually settles. Any in-flight I/O or timers
    * continue to completion. Rust silently ignores any late `BridgeResponse`
    * that arrives after the run has completed (see session.rs).
+   *
+   * ── In-flight abort ──────────────────────────────────────────────────────
+   * When `signal` fires mid-run — including while a bridge call is in flight —
+   * we tear the connection down immediately (`abortConnection`): the reader is
+   * closed so this loop throws, and the socket is destroyed so the Rust side
+   * observes EOF and reclaims the isolate promptly (rather than waiting for
+   * `wallTimeMs`). The loop then throws `RunAbortedError`, which `index.ts`
+   * maps to an `ERR_ABORTED` `RunResult`. Any late `BridgeResponse` written by
+   * an orphaned handler after this point fails silently (the socket is gone),
+   * so the sandbox never observes a return value for the in-flight call.
    * @param dispatcher
+   * @param signal
    */
   private async drainUntilResult(
+    dispatcher: BridgeCallDispatcher | undefined,
+    signal?: AbortSignal,
+  ): Promise<RawRunResult> {
+    // If the signal aborted between the run-entry check in index.ts and here,
+    // tear down before we start reading frames.
+    if (signal?.aborted) {
+      this.abortConnection()
+      throw new RunAbortedError()
+    }
+
+    const onAbort = (): void => {
+      this.abortConnection()
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    try {
+      return await this.drainFrames(dispatcher)
+    } catch (error) {
+      // `abortConnection` closes the reader, which makes the frame loop reject.
+      // Translate that (or any error observed once the signal has fired) into a
+      // distinguishable abort so the caller resolves ERR_ABORTED.
+      if (signal?.aborted)
+        throw new RunAbortedError()
+      throw error
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /**
+   * Tear down the connection in response to an in-flight abort. Idempotent.
+   * Marks the client `broken` (so the pool replaces it), closes the frame
+   * reader (so `drainFrames` stops awaiting), and destroys the socket (so the
+   * Rust session sees EOF and drops the isolate).
+   */
+  private abortConnection(): void {
+    if (this.broken)
+      return
+    this.broken = true
+    this.reader.close(new RunAbortedError())
+    this.socket.destroy()
+  }
+
+  private async drainFrames(
     dispatcher: BridgeCallDispatcher | undefined,
   ): Promise<RawRunResult> {
     for await (const frame of this.reader) {
