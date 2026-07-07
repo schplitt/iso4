@@ -531,15 +531,29 @@ crosses", and dropping methods is the same behavior as `structuredClone`.
 
 ### 5.2 Errors
 
-If user code throws (uncaught), the result is:
+Every run resolves to one of three outcomes, discriminated by `status`:
+`'completed' | 'failed' | 'aborted'`. `ok` is kept as a convenience alias for
+`status === 'completed'`, so the common guard stays `if (result.ok)`; reach for
+`switch (result.status)` when a deliberate abort must be told apart from a
+genuine failure.
+
+A completed run:
+
+```ts
+{ status: "completed", ok: true, exports: { … }, stdout, stderr, durationMs }
+```
+
+If user code throws (uncaught), or the runtime kills the isolate (memory, CPU,
+wall), the run **fails**:
 
 ```ts
 {
+  status: "failed",
   ok: false,
   error: {
     name: "TypeError",
     message: "Cannot read property 'x' of undefined",
-    code: "ERR_USER_CODE",
+    code: "ERR_USER_CODE",  // or ERR_MEMORY_LIMIT | ERR_CPU_TIMEOUT | ERR_WALL_TIMEOUT | …
     stack: "...",
   },
   stdout: "...",  // whatever was emitted before the throw
@@ -548,29 +562,25 @@ If user code throws (uncaught), the result is:
 }
 ```
 
-If the runtime kills the isolate (memory, CPU, wall):
+If the host aborts the run via `run({ signal })` — a pre-aborted signal at entry
+or an abort that fires mid-run (see §14.7) — the run is **aborted**. This is a
+deliberate outcome, not a failure, so it gets its own `status`. `error` is
+retained (its `code` is always `ERR_ABORTED`) so existing `!result.ok` /
+`error.code` checks keep working, and `reason` carries whatever value was passed
+to `AbortController.abort(reason)`:
 
 ```ts
 {
-  ok: false,
-  error: { code: "ERR_MEMORY_LIMIT" | "ERR_CPU_TIMEOUT" | "ERR_WALL_TIMEOUT", ... },
-  ...
-}
-```
-
-If the host aborts the run via `run({ signal })` — either a pre-aborted signal
-at entry or an abort that fires mid-run (see §14.7):
-
-```ts
-{
+  status: "aborted",
   ok: false,
   error: { code: "ERR_ABORTED", name: "AbortError", message: "run was aborted" },
-  ...
+  reason,   // the value passed to abort(reason), or undefined
+  stdout, stderr, durationMs,
 }
 ```
 
-The result is _always_ an object; `ok: true | false` discriminates. `run()`
-does not throw for sandboxed failures — only for infrastructure failures
+The result is _always_ an object; `status` (or the `ok` alias) discriminates.
+`run()` does not throw for sandboxed failures — only for infrastructure failures
 (e.g., the Rust process crashed).
 
 ---
@@ -1442,12 +1452,14 @@ Mechanism (TypeScript-only — no Rust control message is required):
    opens a fresh replacement, so the pool keeps its full `maxIsolates`
    complement and other/subsequent runs are unaffected.
 
-The `run()` promise resolves with `ERR_ABORTED` (see §5.2) in all cases.
+The `run()` promise resolves with `status: 'aborted'` (see §5.2) in all cases —
+carrying the value passed to `abort(reason)`, and retaining `error.code:
+'ERR_ABORTED'` for backward compatibility.
 
 **CPU-bound caveat**: a purely CPU-bound run (no bridge call in flight) is
 spinning inside `module.evaluate()` and does not observe the socket close.
-The `run()` promise still resolves with `ERR_ABORTED` immediately, but the
-abandoned isolate is only reclaimed when its **CPU guard** fires — bounded by
+The `run()` promise still resolves as aborted immediately, but the abandoned
+isolate is only reclaimed when its **CPU guard** fires — bounded by
 `cpuTimeMs`, not `wallTimeMs`. Promptly interrupting a busy isolate would
 require a Rust-side `terminate_execution` triggered by a control message; this
 is deferred until a consumer needs it.

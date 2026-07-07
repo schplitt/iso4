@@ -297,6 +297,7 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
     return {
       runId,
       result: {
+        status: 'completed',
         ok: true,
         exports: wireObjectToExports(exportsRaw),
         stdout,
@@ -327,7 +328,7 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
   reader.assertDone()
   return {
     runId,
-    result: { ok: false, error: { code, name, message, stack, data }, stdout, stderr, durationMs },
+    result: { status: 'failed', ok: false, error: { code, name, message, stack, data }, stdout, stderr, durationMs },
   }
 }
 

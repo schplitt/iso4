@@ -51,9 +51,12 @@ export type { ResourceLimits }
  * `RunResult`.
  */
 export class RunAbortedError extends Error {
-  constructor(message = 'run was aborted') {
+  /** The value passed to `AbortController.abort(reason)`, if any. */
+  readonly reason?: unknown
+  constructor(reason?: unknown, message = 'run was aborted') {
     super(message)
     this.name = 'RunAbortedError'
+    this.reason = reason
   }
 }
 
@@ -291,7 +294,7 @@ export class RuntimeIpcClient {
     // tear down before we start reading frames.
     if (signal?.aborted) {
       this.abortConnection()
-      throw new RunAbortedError()
+      throw new RunAbortedError(signal.reason)
     }
 
     const onAbort = (): void => {
@@ -304,9 +307,10 @@ export class RuntimeIpcClient {
     } catch (error) {
       // `abortConnection` closes the reader, which makes the frame loop reject.
       // Translate that (or any error observed once the signal has fired) into a
-      // distinguishable abort so the caller resolves ERR_ABORTED.
+      // distinguishable abort — carrying the abort reason — so the caller
+      // resolves an aborted RunResult.
       if (signal?.aborted)
-        throw new RunAbortedError()
+        throw new RunAbortedError(signal.reason)
       throw error
     } finally {
       signal?.removeEventListener('abort', onAbort)
