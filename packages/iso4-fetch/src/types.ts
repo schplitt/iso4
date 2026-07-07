@@ -54,16 +54,68 @@ export interface HostFetchResponse {
 export type SafeFetchFn = (...args: unknown[]) => Promise<HostFetchResponse>
 
 /**
+ * A host-side request passed to {@link SafeFetchInvoke}. Mirrors the web
+ * `fetch(url, init)` shape — `method`, `headers`, and `body` are optional and
+ * default the same way the bridge path defaults them.
+ */
+export interface SafeFetchInvokeRequest {
+  url: string
+  /**
+   * HTTP method. Case-insensitive; defaults to `GET`.
+   */
+  method?: string
+  /**
+   * Request headers. Names are lowercased; a `host` header is stripped.
+   */
+  headers?: Record<string, string>
+  /**
+   * Request body. `null`/omitted for bodyless methods.
+   */
+  body?: Uint8Array | string | null
+  /**
+   * Optional abort signal for this request.
+   */
+  signal?: AbortSignal
+}
+
+/**
+ * Host-side per-call entry point. Runs the same allow/deny + middleware
+ * pipeline as the bridge {@link SafeFetchFn}, but takes a structured request
+ * and a typed per-invocation `context` that is surfaced on
+ * {@link FetchContext} (`ctx.context`) for middleware to read.
+ *
+ * The `context` is strictly per-call — concurrent invocations never observe
+ * each other's context.
+ */
+export type SafeFetchInvoke<TCtx = undefined> = (
+  request: SafeFetchInvokeRequest,
+  context: TCtx,
+) => Promise<HostFetchResponse>
+
+/**
  * What `createSafeFetch` returns. Conforms to `BridgeWithShim` from
  * `@iso4/sandbox` so it can be passed directly as a global value.
  *
  * Declared locally to avoid a cross-package type dependency — structurally
  * compatible with the sandbox type.
+ *
+ * `TCtx` is the type of the per-call context threaded through {@link invoke}
+ * onto {@link FetchContext} (`ctx.context`).
  */
-export interface SafeFetchGlobal {
+export interface SafeFetchGlobal<TCtx = undefined> {
   kind: 'bridge-with-shim'
   handler: SafeFetchFn
   shim: string
+  /**
+   * Host-side per-call entry. Invoke the hardened fetch pipeline directly
+   * (bypassing the sandbox bridge) with a typed per-invocation `context`
+   * readable from every middleware level via `ctx.context`.
+   *
+   * ```ts
+   * await safeFetch.invoke({ url, method, headers, body }, ctx)
+   * ```
+   */
+  invoke: SafeFetchInvoke<TCtx>
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -135,8 +187,11 @@ export interface FetchContextReq {
  * `res` is the response being built (`null` until `next()` completes or a
  * middleware returns a response directly). Read and reassign after `next()`
  * to inspect or replace the response.
+ *
+ * `TCtx` is the per-invocation context type supplied by the host caller via
+ * {@link SafeFetchGlobal.invoke}.
  */
-export interface FetchContext {
+export interface FetchContext<TCtx = undefined> {
   readonly req: FetchContextReq
   /**
    * The response. `null` before `next()` is called.
@@ -148,6 +203,12 @@ export interface FetchContext {
    * ```
    */
   res: HostFetchResponse | null
+  /**
+   * Per-invocation context supplied by the host caller through
+   * {@link SafeFetchGlobal.invoke}. `undefined` on the sandbox-driven bridge
+   * path (there is no host caller to supply it).
+   */
+  readonly context: TCtx
 }
 
 /**
@@ -229,8 +290,8 @@ export type Next = () => Promise<void>
  * }
  * ```
  */
-export type FetchMiddleware = (
-  ctx: FetchContext,
+export type FetchMiddleware<TCtx = undefined> = (
+  ctx: FetchContext<TCtx>,
   next: Next,
 ) => HostFetchResponse | void | Promise<HostFetchResponse | void>
 
@@ -247,7 +308,7 @@ export type FetchMiddleware = (
  *   `/reports/**`           — zero-or-more sub-path segments
  *   `/files/:ext(png|jpg)`  — constrained parameter
  */
-export interface FetchRouteRule {
+export interface FetchRouteRule<TCtx = undefined> {
   /**
    * Path pattern. Must start with `/`.
    * `/**` and `/prefix/**` both match the prefix itself (zero-segment wildcard).
@@ -265,13 +326,13 @@ export interface FetchRouteRule {
    * after global and origin middleware. Route middleware runs last so it
    * can override anything set at broader levels.
    */
-  middleware?: FetchMiddleware
+  middleware?: FetchMiddleware<TCtx>
 }
 
 /**
  * Per-origin set of allowed routes.
  */
-export interface FetchOriginRule {
+export interface FetchOriginRule<TCtx = undefined> {
   /**
    * Hostname(s) to match.
    * - Exact: `'api.example.com'`
@@ -298,13 +359,13 @@ export interface FetchOriginRule {
    * Route rules for this origin. Method + path must match at least one entry.
    * First match wins. An empty array denies all paths on this origin.
    */
-  routes: FetchRouteRule[]
+  routes: FetchRouteRule<TCtx>[]
 
   /**
    * Middleware that runs for every matched request on this origin, after
    * global middleware and before route middleware.
    */
-  middleware?: FetchMiddleware
+  middleware?: FetchMiddleware<TCtx>
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -368,7 +429,7 @@ export type SafeFetchPolicy = (
 // createSafeFetch options
 // ─────────────────────────────────────────────────────────────────────────
 
-export interface SafeFetchOptions {
+export interface SafeFetchOptions<TCtx = undefined> {
   /**
    * Declarative origin + route allowlist. At least one of `rules` or
    * `policy` is required.
@@ -376,7 +437,7 @@ export interface SafeFetchOptions {
    * If an origin matches but no route does → DENY (does not fall through to
    * `policy`). If no origin matches → falls through to `policy` if provided.
    */
-  rules?: FetchOriginRule | FetchOriginRule[]
+  rules?: FetchOriginRule<TCtx> | FetchOriginRule<TCtx>[]
 
   /**
    * Allow/deny callback — fallback for requests not matched by any rule, or
@@ -388,7 +449,7 @@ export interface SafeFetchOptions {
    * Global middleware that runs for every allowed request, before origin and
    * route middleware.
    */
-  middleware?: FetchMiddleware
+  middleware?: FetchMiddleware<TCtx>
 
   /**
    * Pre-resolve DNS and pin the connection to the resolved IP.

@@ -20,6 +20,7 @@ import type {
   HostFetchResponse,
   SafeFetchFn,
   SafeFetchGlobal,
+  SafeFetchInvoke,
   SafeFetchOptions,
   SafeFetchRequest,
 } from './types.js'
@@ -35,6 +36,8 @@ export type {
   Next,
   SafeFetchFn,
   SafeFetchGlobal,
+  SafeFetchInvoke,
+  SafeFetchInvokeRequest,
   SafeFetchOptions,
   SafeFetchPolicy,
   SafeFetchRequest,
@@ -126,10 +129,10 @@ function hostWildcard(requestHost: string, ruleHost: string): boolean {
 // rou3 router — stores FetchRouteRule as data so we can retrieve it on match
 // ─────────────────────────────────────────────────────────────────────────
 
-interface CompiledRule {
-  rule: FetchOriginRule
+interface CompiledRule<TCtx> {
+  rule: FetchOriginRule<TCtx>
   hosts: string[]
-  router: RouterContext<FetchRouteRule>
+  router: RouterContext<FetchRouteRule<TCtx>>
 }
 
 function routeMethodsToRou3(methods: FetchRouteRule['methods']): string[] {
@@ -140,8 +143,8 @@ function routeMethodsToRou3(methods: FetchRouteRule['methods']): string[] {
   return methods.map((m) => m.toUpperCase())
 }
 
-function buildRouter(routes: FetchRouteRule[]): RouterContext<FetchRouteRule> {
-  const router = createRouter<FetchRouteRule>()
+function buildRouter<TCtx>(routes: FetchRouteRule<TCtx>[]): RouterContext<FetchRouteRule<TCtx>> {
+  const router = createRouter<FetchRouteRule<TCtx>>()
   for (const route of routes) {
     for (const method of routeMethodsToRou3(route.methods)) {
       addRoute(router, method, route.path, route)
@@ -150,7 +153,7 @@ function buildRouter(routes: FetchRouteRule[]): RouterContext<FetchRouteRule> {
   return router
 }
 
-function compileRules(rawRules: FetchOriginRule | FetchOriginRule[]): CompiledRule[] {
+function compileRules<TCtx>(rawRules: FetchOriginRule<TCtx> | FetchOriginRule<TCtx>[]): CompiledRule<TCtx>[] {
   const rules = Array.isArray(rawRules) ? rawRules : [rawRules]
   return rules.map((rule) => ({
     rule,
@@ -175,8 +178,8 @@ function decodePath(rawPath: string): string {
 // Origin + route matching
 // ─────────────────────────────────────────────────────────────────────────
 
-type MatchResult
-  = | { kind: 'allow', originRule: FetchOriginRule, matchedRule: FetchRouteRule, params: Record<string, string> }
+type MatchResult<TCtx>
+  = | { kind: 'allow', originRule: FetchOriginRule<TCtx>, matchedRule: FetchRouteRule<TCtx>, params: Record<string, string> }
     | { kind: 'deny-route' }
     | { kind: 'no-origin' }
 
@@ -188,7 +191,7 @@ type MatchResult
  * @param req
  * @param compiled
  */
-function matchRules(req: SafeFetchRequest, compiled: CompiledRule[]): MatchResult {
+function matchRules<TCtx>(req: SafeFetchRequest, compiled: CompiledRule<TCtx>[]): MatchResult<TCtx> {
   for (const pass of ['exact', 'wildcard'] as const) {
     for (const { rule, hosts, router } of compiled) {
       // Only consider rules that match at the current specificity level
@@ -235,7 +238,7 @@ function matchRules(req: SafeFetchRequest, compiled: CompiledRule[]): MatchResul
 // FetchContext — mutable request-side context for middleware
 // ─────────────────────────────────────────────────────────────────────────
 
-function makeFetchContext(
+function makeFetchContext<TCtx>(
   initialUrl: string,
   method: string,
   initialHeaders: Record<string, string>,
@@ -243,7 +246,8 @@ function makeFetchContext(
   params: Record<string, string>,
   hop: number,
   raw: HostFetchRequest,
-): FetchContext {
+  context: TCtx,
+): FetchContext<TCtx> {
   let _url = initialUrl
   const _headers: Record<string, string> = { ...initialHeaders }
 
@@ -270,7 +274,7 @@ function makeFetchContext(
     },
   }
 
-  return { req, res: null }
+  return { req, res: null, context }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -466,10 +470,12 @@ function parseFetchArgs(args: unknown[]): HostFetchRequest {
  * response object with `.ok`, `.json()`, `.text()`, and `.bytes()`.
  * @param options
  */
-export function createSafeFetch(options: SafeFetchOptions): SafeFetchGlobal {
+export function createSafeFetch<TCtx = undefined>(options: SafeFetchOptions<TCtx>): SafeFetchGlobal<TCtx> {
+  const { handler, invoke } = buildSafeFetchHandler(options)
   return {
     kind: 'bridge-with-shim',
-    handler: buildSafeFetchHandler(options),
+    handler,
+    invoke,
     shim: `(result) => ({
       ...result,
       ok:    result.status >= 200 && result.status < 300,
@@ -483,14 +489,26 @@ export function createSafeFetch(options: SafeFetchOptions): SafeFetchGlobal {
 }
 
 /**
- * Internal: builds the bridge handler (SafeFetchFn) without the shim.
+ * Internal: builds the host-side entry points without the shim.
+ *
+ * Returns both:
+ * - `handler` — the bridge `SafeFetchFn` (`(...args)` from the sandbox; no
+ *   host context, so `ctx.context` is `undefined`).
+ * - `invoke` — the typed host-side entry that threads a per-call `context`
+ *   onto the `FetchContext`.
+ *
+ * Both share the same compiled rules, DNS agent, and middleware pipeline —
+ * only the per-call `HostFetchRequest` + `context` differ, so concurrent
+ * invocations never observe each other's context.
  * @param options
  */
-function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
+function buildSafeFetchHandler<TCtx>(
+  options: SafeFetchOptions<TCtx>,
+): { handler: SafeFetchFn, invoke: SafeFetchInvoke<TCtx> } {
   if (options.rules === undefined && options.policy === undefined)
     throw new TypeError('createSafeFetch: at least one of `rules` or `policy` must be provided')
 
-  const compiled = options.rules !== undefined ? compileRules(options.rules) : []
+  const compiled: CompiledRule<TCtx>[] = options.rules !== undefined ? compileRules(options.rules) : []
   const doPinDns = options.pinDns !== false
   const maxRedirects = options.maxRedirects ?? 0
   const timeoutMs = options.timeoutMs ?? 30_000
@@ -532,7 +550,7 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
 
   async function checkRequest(
     req: SafeFetchRequest,
-  ): Promise<{ originRule: FetchOriginRule, matchedRule: FetchRouteRule, params: Record<string, string> } | null> {
+  ): Promise<{ originRule: FetchOriginRule<TCtx>, matchedRule: FetchRouteRule<TCtx>, params: Record<string, string> } | null> {
     if (compiled.length > 0) {
       const result = matchRules(req, compiled)
       if (result.kind === 'allow')
@@ -576,11 +594,11 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
    * @param finalNext
    */
   function runMiddlewareChain(
-    middlewares: Array<FetchMiddleware | undefined>,
-    ctx: FetchContext,
+    middlewares: Array<FetchMiddleware<TCtx> | undefined>,
+    ctx: FetchContext<TCtx>,
     finalNext: () => Promise<void>,
   ): Promise<HostFetchResponse> {
-    const active = middlewares.filter((m): m is FetchMiddleware => m !== undefined)
+    const active = middlewares.filter((m): m is FetchMiddleware<TCtx> => m !== undefined)
 
     const dispatch = async (i: number): Promise<void> => {
       if (i >= active.length) {
@@ -602,9 +620,9 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
     })
   }
 
-  return async (...args: unknown[]): Promise<HostFetchResponse> => {
-    const hostRequest = parseFetchArgs(args)
-
+  // Core pipeline shared by both entry points. `context` is threaded onto the
+  // FetchContext so middleware can read it; it is per-call, never shared state.
+  const core = async (hostRequest: HostFetchRequest, context: TCtx): Promise<HostFetchResponse> => {
     let parsedUrl: URL
     try {
       parsedUrl = new URL(hostRequest.url)
@@ -632,7 +650,7 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
     const match = await checkRequest(req)
 
     // Build mutable context — middleware sees and mutates this
-    const ctx = makeFetchContext(
+    const ctx = makeFetchContext<TCtx>(
       parsedUrl.toString(),
       method,
       baseHeaders,
@@ -640,10 +658,11 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
       match?.params ?? {},
       0,
       hostRequest,
+      context,
     )
 
     // Collect middleware layers: global → origin → route
-    const middlewares: Array<FetchMiddleware | undefined> = [
+    const middlewares: Array<FetchMiddleware<TCtx> | undefined> = [
       options.middleware,
       match?.originRule.middleware,
       match?.matchedRule.middleware,
@@ -703,4 +722,23 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
 
     return runMiddlewareChain(middlewares, ctx, finalNext)
   }
+
+  // Bridge path: the sandbox supplies `(url, init)`; there is no host caller,
+  // so `context` is `undefined`. `async` so a `parseFetchArgs` throw surfaces
+  // as a rejected promise rather than a synchronous throw.
+  const handler: SafeFetchFn = async (...args: unknown[]): Promise<HostFetchResponse> =>
+    core(parseFetchArgs(args), undefined as unknown as TCtx)
+
+  // Host-side path: a structured request plus the typed per-call context.
+  const invoke: SafeFetchInvoke<TCtx> = async (request, context): Promise<HostFetchResponse> => {
+    const hostRequest = parseFetchArgs([
+      request.url,
+      { method: request.method, headers: request.headers, body: request.body },
+    ])
+    if (request.signal !== undefined)
+      hostRequest.signal = request.signal
+    return core(hostRequest, context)
+  }
+
+  return { handler, invoke }
 }
