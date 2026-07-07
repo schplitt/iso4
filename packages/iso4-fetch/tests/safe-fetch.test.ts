@@ -6,7 +6,7 @@
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { createSafeFetch } from '../src/index.js'
-import type { FetchOriginRule, SafeFetchPolicy } from '../src/index.js'
+import type { FetchOriginRule, HostFetchResponse, SafeFetchPolicy } from '../src/index.js'
 
 // ─────────────────────────────────────────────────────────────────────────
 // Mock undici (fetch) and both dns modules so no real network calls happen.
@@ -1101,5 +1101,121 @@ describe('middleware', () => {
     await handler('https://api.example.com/users', { method: 'GET', headers: { 'x-original': 'yes' }, body: null })
     expect(seenRaw[0]?.headers['x-original']).toBe('yes')
     expect(seenRaw[0]?.headers['authorization']).toBeUndefined()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// Per-call context (host-side invoke)
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('per-call context via invoke()', () => {
+  interface Ctx {
+    tenant: string
+    suspend: () => HostFetchResponse
+  }
+
+  it('middleware reads ctx.context supplied host-side', async () => {
+    const seen: string[] = []
+    const safeFetch = createSafeFetch<Ctx>({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      middleware: async (ctx, next) => {
+        seen.push(ctx.context.tenant)
+        await next()
+      },
+      pinDns: false,
+    })
+    await safeFetch.invoke(
+      { url: 'https://api.example.com/users', method: 'GET' },
+      { tenant: 'acme', suspend: () => ({ status: 0, headers: {}, body: null }) },
+    )
+    expect(seen).toEqual(['acme'])
+  })
+
+  it('context is readable at all three middleware levels', async () => {
+    const seen: string[] = []
+    const record = (level: string) => async (ctx: { context: Ctx }, next: () => Promise<void>) => {
+      seen.push(`${level}:${ctx.context.tenant}`)
+      await next()
+    }
+    const safeFetch = createSafeFetch<Ctx>({
+      rules: {
+        host: 'api.example.com',
+        middleware: record('origin'),
+        routes: [{ path: '/**', middleware: record('route') }],
+      },
+      middleware: record('global'),
+      pinDns: false,
+    })
+    await safeFetch.invoke(
+      { url: 'https://api.example.com/users', method: 'GET' },
+      { tenant: 'acme', suspend: () => ({ status: 0, headers: {}, body: null }) },
+    )
+    expect(seen).toEqual(['global:acme', 'origin:acme', 'route:acme'])
+  })
+
+  it('concurrent invocations each observe their own context (race-safe)', async () => {
+    const safeFetch = createSafeFetch<Ctx>({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      middleware: async (ctx, next) => {
+        // Yield to interleave the two in-flight calls before reading context.
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 1)
+        })
+        ctx.req.header('x-tenant', ctx.context.tenant)
+        await next()
+      },
+      pinDns: false,
+    })
+
+    await Promise.all([
+      safeFetch.invoke(
+        { url: 'https://api.example.com/a', method: 'GET' },
+        { tenant: 'acme', suspend: () => ({ status: 0, headers: {}, body: null }) },
+      ),
+      safeFetch.invoke(
+        { url: 'https://api.example.com/b', method: 'GET' },
+        { tenant: 'globex', suspend: () => ({ status: 0, headers: {}, body: null }) },
+      ),
+    ])
+
+    // Each outgoing request must carry the tenant from its own invocation.
+    const byUrl = new Map<string, string>()
+    for (const call of mockFetch.mock.calls) {
+      const url = call[0] as string
+      const headers = call[1]?.headers as Record<string, string>
+      byUrl.set(url, headers['x-tenant']!)
+    }
+    expect(byUrl.get('https://api.example.com/a')).toBe('acme')
+    expect(byUrl.get('https://api.example.com/b')).toBe('globex')
+  })
+
+  it('context can drive a synthetic response (e.g. suspension)', async () => {
+    const safeFetch = createSafeFetch<Ctx>({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      middleware: async (ctx) => ctx.context.suspend(),
+      pinDns: false,
+    })
+    const res = await safeFetch.invoke(
+      { url: 'https://api.example.com/users', method: 'GET' },
+      { tenant: 'acme', suspend: () => ({ status: 202, headers: {}, body: { suspended: true } }) },
+    )
+    expect(res.status).toBe(202)
+    expect((res.body as { suspended: boolean }).suspended).toBe(true)
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('bridge path (handler) leaves context undefined', async () => {
+    let seenContext: unknown = 'unset'
+    const safeFetch = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      middleware: async (ctx, next) => {
+        seenContext = ctx.context
+        await next()
+      },
+      pinDns: false,
+    })
+    // The sandbox bridge calls the handler with (url, init) — no host context.
+    await safeFetch.handler('https://api.example.com/users', { method: 'GET', headers: {}, body: null })
+    expect(seenContext).toBeUndefined()
   })
 })

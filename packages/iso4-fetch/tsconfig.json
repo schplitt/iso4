@@ -13,6 +13,7 @@
     "moduleResolution": "bundler",
     "noUncheckedSideEffectImports": true,
     "resolveJsonModule": true,
+    "types": ["node"],
     "declaration": true,
     "noEmit": true,
     "erasableSyntaxOnly": true,
