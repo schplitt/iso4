@@ -1,5 +1,7 @@
 # @iso4/v8-darwin-x64
 
+## 0.2.0
+
 ## 0.1.0
 
 ### Minor Changes
