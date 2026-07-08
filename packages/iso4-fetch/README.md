@@ -169,48 +169,6 @@ async function someSyntheticResponseMiddleware(ctx, _next) {
 }
 ```
 
-### Per-call context (host-side `invoke`)
-
-Build `createSafeFetch` **once** (it owns the router and DNS setup) but pass a
-**typed, per-invocation context** each time you call it host-side. The context
-lands on `ctx.context` and is readable from all three middleware levels. It is
-strictly per-call — concurrent invocations never observe each other's context,
-so there is no shared mutable state to race on.
-
-Make the context type generic with `createSafeFetch<TCtx>` and call the
-returned object's `invoke(request, context)`:
-
-```ts
-interface HandlerCtx {
-  delivery?: { approved: boolean }
-  suspend: (opts: unknown) => HostFetchResponse
-}
-
-const safeFetch = createSafeFetch<HandlerCtx>({
-  rules: {
-    host: 'api.example.com',
-    httpsOnly: true,
-    routes: [{ path: '/**' }],
-    middleware: async (ctx, next) => {
-      // the interesting decision happens after routing/parsing:
-      if (ctx.context.delivery === undefined)
-        return ctx.context.suspend({ /* ... */ }) // suspend for async approval
-      if (!ctx.context.delivery.approved)
-        throw new Error('declined')
-      await next()
-    },
-  },
-})
-
-// host-side, per call — thread the per-call context in as an argument
-await safeFetch.invoke({ url, method, headers, body }, ctx)
-```
-
-On the sandbox bridge path (`safeFetch.handler`, wired automatically when you
-pass `safeFetch` as a global) there is no host caller, so `ctx.context` is
-`undefined`. Existing `createSafeFetch({...})` usage without a type parameter
-is unchanged.
-
 ## Policy callback
 
 For dynamic allow/deny logic that can't be expressed as static rules —

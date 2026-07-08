@@ -72,9 +72,6 @@ importers:
       '@schplitt/eslint-config':
         specifier: 'catalog:'
         version: 1.5.1(@angular/cli@21.2.12(@types/node@24.12.4))(@vue/compiler-sfc@3.5.34)(typescript-eslint@8.59.4(eslint@10.4.0)(typescript@6.0.3))(typescript@6.0.3)
-      '@types/node':
-        specifier: 'catalog:'
-        version: 24.12.4
       eslint:
         specifier: 'catalog:'
         version: 10.4.0
