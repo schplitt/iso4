@@ -96,12 +96,11 @@ That binary must be built and copied before running TS tests. `pnpm build:dev` (
 `pnpm build`) does this. Running `pnpm test:run` without building first will use
 whatever binary was last installed/built.
 
-**Test baseline:** As of phases 0–5 complete, `pnpm test:run` reports
-`292 passed | 26 skipped (318)` with **0 failures**. The skipped tests cover
-features not yet implemented (source imports/resolver, host module imports,
-AbortSignal, BridgeCall TS-side dispatch, export/stdout size limits) and are
-tracked against the phase roadmap in `DESIGN.md`. Any new failure is a
-regression; the skipped count should only drop as later phases land.
+**Test baseline:** `pnpm test:run` should report **0 failures**. Run it for the
+live pass/skip counts — don't rely on a number recorded here, it goes stale as
+PRs land. The remaining skips cover features not yet implemented and are tracked
+against the phase roadmap in `DESIGN.md`. Any new failure is a regression; the
+skipped count should only drop as later phases land.
 
 Toolchain:
 
@@ -240,13 +239,11 @@ learned during development.
   not hard-coded versions.
 - Node 24+ is required; `mise.toml` pins to 26 for development. CI uses 26.
 - `spawn_responder` in `v8.rs` tests reads and discards one frame before calling the `respond` closure. Tests using `run_with_bridge` where the respond closure needs to handle multiple calls must NOT try to read frames inside respond — use `drain_bridge_calls` with a direct socket pair instead (see `bridge_call_exactly_at_limit_succeeds` as the pattern to follow).
-- `@iso4/sandbox` has no test files; `vitest run` exits non-zero when no test
-  files are found. This is a known gap — `pnpm test:run` will report it as
-  a failure. Ignore it until a test file is added to that package.
-- The TS test suite is green: `292 passed | 26 skipped (318)`, 0 failing.
-  Skipped tests cover unimplemented features (source imports, host module
-  imports, AbortSignal, BridgeCall TS dispatch, size limits) and will be
-  unskipped as Phases 6+ land. Any failure after a change is a regression.
+- The TS test suite should be green with zero failing tests. Run
+  `pnpm test:run` for the live pass/skip counts — do not trust a hard-coded
+  number here, it goes stale as PRs land. Any failure after a change is a
+  regression. Remaining skips cover features not yet implemented and are
+  unskipped as the corresponding phases land.
 
 ### Patterns & Conventions
 
