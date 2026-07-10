@@ -322,7 +322,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                         payload.prefix_id
                                     ),
                                     stack: None,
-                                    data: None,
+                                    fields: None,
                                 },
                                 stdout: Vec::new(),
                                 stderr: Vec::new(),
@@ -359,7 +359,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                         name: "Error".to_string(),
                                         message: msg,
                                         stack: None,
-                                        data: None,
+                                        fields: None,
                                     },
                                     stdout: Vec::new(),
                                     stderr: Vec::new(),

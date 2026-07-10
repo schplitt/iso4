@@ -300,10 +300,10 @@ describe('bridgeErrorPayloadFromUnknown', () => {
     const payload = bridgeErrorPayloadFromUnknown(new TypeError('bad input'))
     expect(payload.name).toBe('TypeError')
     expect(payload.message).toBe('bad input')
-    expect(payload.encodedData).toBeUndefined()
+    expect(payload.encodedFields).toBeUndefined()
   })
 
-  test('collects own-enumerable props as data, dropping non-serializable ones', () => {
+  test('collects own-enumerable props as fields, dropping non-serializable ones', () => {
     const err = Object.assign(new Error('x'), {
       code: 'E_FOO',
       attempt: 2,
@@ -311,16 +311,16 @@ describe('bridgeErrorPayloadFromUnknown', () => {
     })
     const payload = bridgeErrorPayloadFromUnknown(err)
     expect(payload.name).toBe('Error')
-    expect(payload.encodedData).toBeDefined()
-    const [data] = decodeWireValueFromSlice(payload.encodedData!)
+    expect(payload.encodedFields).toBeDefined()
+    const [data] = decodeWireValueFromSlice(payload.encodedFields!)
     expect(data).toEqual({ code: 'E_FOO', attempt: 2 })
   })
 
-  test('never carries name/message/stack inside data', () => {
+  test('never carries name/message/stack inside fields', () => {
     const err = new Error('x')
     Object.defineProperty(err, 'stack', { value: 'secret host stack', enumerable: true })
     const payload = bridgeErrorPayloadFromUnknown(err)
-    expect(payload.encodedData).toBeUndefined()
+    expect(payload.encodedFields).toBeUndefined()
   })
 
   test('thrown primitives become a generic Error payload', () => {
@@ -338,17 +338,17 @@ describe('bridgeErrorPayloadFromUnknown', () => {
     })
     const payload = bridgeErrorPayloadFromUnknown(err)
     expect(payload.message).toBe('x')
-    expect(payload.encodedData).toBeUndefined()
+    expect(payload.encodedFields).toBeUndefined()
   })
 })
 
 describe('encodeBridgeResponsePayload error layout', () => {
-  test('writes code, name, message, absent stack, and data per §5.4', () => {
-    const encodedData = encodeWireValue({ code: 'E_FOO' })
+  test('writes code, name, message, absent stack, and fields per §5.4', () => {
+    const encodedFields = encodeWireValue({ code: 'E_FOO' })
     const buf = encodeBridgeResponsePayload(7, false, undefined, {
       name: 'WorkflowTimeout',
       message: 'took too long',
-      encodedData,
+      encodedFields,
     })
     let off = 0
     expect(readU32BE(buf, off)).toBe(7) // callId
@@ -362,16 +362,16 @@ describe('encodeBridgeResponsePayload error layout', () => {
     const { value: message, end: e3 } = readString(buf, e2)
     expect(message).toBe('took too long')
     expect(buf[e3]).toBe(0) // stack: always absent host → sandbox
-    expect(buf[e3 + 1]).toBe(1) // data present
+    expect(buf[e3 + 1]).toBe(1) // fields present
     const [data] = decodeWireValueFromSlice(buf.subarray(e3 + 2))
     expect(data).toEqual({ code: 'E_FOO' })
   })
 
-  test('omits data when the error has none', () => {
+  test('omits fields when the error has none', () => {
     const buf = encodeBridgeResponsePayload(1, false, undefined, {
       name: 'Error',
       message: 'plain failure',
     })
-    expect(buf[buf.byteLength - 1]).toBe(0) // data absent is the last byte
+    expect(buf[buf.byteLength - 1]).toBe(0) // fields absent is the last byte
   })
 })

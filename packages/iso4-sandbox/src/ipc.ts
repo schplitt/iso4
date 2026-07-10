@@ -575,17 +575,20 @@ export interface BridgeErrorPayload {
   message: string
   /**
    * Pre-encoded WireValue bytes for the error's own-enumerable properties
-   * beyond `name`/`message`/`stack`. Absent when there are none.
+   * beyond `name`/`message`/`stack` (reserved keys). Absent when there are
+   * none. The Rust side re-attaches these as direct own properties on the
+   * Error it rejects the sandbox promise with.
    */
-  encodedData?: Uint8Array
+  encodedFields?: Uint8Array
 }
 
 /**
  * Build a `BridgeErrorPayload` from whatever a host handler threw.
  *
- * Own-enumerable properties beyond `name`/`message`/`stack` travel as `data`;
+ * Own-enumerable properties beyond `name`/`message`/`stack` travel as
+ * `fields` and reappear as direct own properties on the sandbox-side Error;
  * properties that cannot be wire-encoded (functions, symbols, cycles, …) are
- * silently dropped, mirroring the sandbox → host direction (`RunError.data`).
+ * silently dropped, mirroring the sandbox → host direction (`RunError.fields`).
  * @param err
  */
 export function bridgeErrorPayloadFromUnknown(err: unknown): BridgeErrorPayload {
@@ -615,7 +618,7 @@ export function bridgeErrorPayloadFromUnknown(err: unknown): BridgeErrorPayload 
     }
     if (!hasFields)
       return { name, message }
-    return { name, message, encodedData: encodeWireValue(fields) }
+    return { name, message, encodedFields: encodeWireValue(fields) }
   } catch {
     return { name: 'Error', message: 'host handler failed' }
   }
@@ -654,11 +657,11 @@ export function encodeBridgeResponsePayload(
     w.writeString(error?.name ?? 'Error')
     w.writeString(error?.message ?? 'host handler failed')
     w.writeU8(0) // stack: never carried host → sandbox
-    if (error?.encodedData !== undefined && error.encodedData.byteLength > 0) {
-      w.writeU8(1) // data present
-      w.writeBytes(error.encodedData)
+    if (error?.encodedFields !== undefined && error.encodedFields.byteLength > 0) {
+      w.writeU8(1) // fields present
+      w.writeBytes(error.encodedFields)
     } else {
-      w.writeU8(0) // no data
+      w.writeU8(0) // no fields
     }
   }
   return w.toBuffer()

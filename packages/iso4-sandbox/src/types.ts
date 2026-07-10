@@ -656,11 +656,20 @@ export interface RunError {
   code: RunErrorCode
   name: string
   message: string
+  /**
+   * Stack trace of the thrown error. `name`/`message`/`stack` are reserved:
+   * they are always read from the error's dedicated properties and never
+   * appear inside `fields`, so a thrown object cannot spoof them there.
+   */
   stack?: string
   /**
-   * Own enumerable properties of the thrown error, excluding name/message/stack. Present only for ERR_USER_CODE when the thrown value is an object with serializable own properties.
+   * All other own enumerable properties of the thrown error (everything
+   * except name/message/stack), e.g. `status`, `reason`, or a `data` payload
+   * from a custom error class — nested here so nothing can collide with
+   * `code`. Present for ERR_USER_CODE and ERR_HOST_BRIDGE when the thrown
+   * value is an object with serializable own properties.
    */
-  data?: unknown
+  fields?: Record<string, unknown>
 }
 
 export type RunErrorCode

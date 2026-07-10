@@ -135,7 +135,7 @@ interface FailureCompletion {
   name: string
   message: string
   stack?: string
-  data?: unknown
+  fields?: Record<string, unknown>
   stdout: string[]
   stderr: string[]
   durationMs: number
@@ -169,9 +169,9 @@ function encodeCompletionPayload(
     } else {
       parts.push(0)
     }
-    if (completion.data !== undefined) {
+    if (completion.fields !== undefined) {
       parts.push(1)
-      encodeValue(completion.data, parts)
+      encodeValue(completion.fields, parts)
     } else {
       parts.push(0)
     }
@@ -719,13 +719,13 @@ describe('decodeRunCompletionPayload — failure', () => {
     expect(result.error.name).toBe('TypeError')
   })
 
-  test('error data round-trips as structured object', () => {
+  test('error fields round-trip as structured object', () => {
     const buf = encodeCompletionPayload(0, {
       ok: false,
       code: 'ERR_USER_CODE',
       name: 'WorkflowSuspend',
       message: 'suspend',
-      data: { kind: 'waitForEvent', stepId: 'approval' },
+      fields: { kind: 'waitForEvent', stepId: 'approval' },
       stdout: [],
       stderr: [],
       durationMs: 0,
@@ -734,10 +734,10 @@ describe('decodeRunCompletionPayload — failure', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.data).toMatchObject({ kind: 'waitForEvent', stepId: 'approval' })
+    expect(result.error.fields).toMatchObject({ kind: 'waitForEvent', stepId: 'approval' })
   })
 
-  test('absent data field decodes as undefined', () => {
+  test('absent fields value decodes as undefined', () => {
     const buf = encodeCompletionPayload(0, {
       ok: false,
       code: 'ERR_USER_CODE',
@@ -751,7 +751,7 @@ describe('decodeRunCompletionPayload — failure', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.data).toBeUndefined()
+    expect(result.error.fields).toBeUndefined()
   })
 })
 
@@ -803,7 +803,7 @@ describe('decodePrecompileResultPayload', () => {
     } else {
       parts.push(0)
     }
-    parts.push(0) // dataPresent = 0
+    parts.push(0) // fieldsPresent = 0
     return Uint8Array.from(parts)
   }
 
