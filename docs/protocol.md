@@ -360,6 +360,25 @@ flat `(specifier, source)` pair.
 | `value`  | `Optional<WireValue>`       | Present when `ok = true`.            |
 | `error`  | `Optional<RunErrorPayload>` | Present when `ok = false`.           |
 
+The `error` field uses the `RunErrorPayload` layout with `code` always
+`ERR_HOST_BRIDGE` and the `stack` slot always absent: the host stack never
+crosses into the sandbox because it can expose host file paths and
+infrastructure details. `name`, `message`, and `data` (own-enumerable
+properties of the thrown error beyond `name`/`message`/`stack`) are carried —
+whatever a handler attaches to an error is the host's responsibility, same as
+a returned value.
+
+**Host handler errors are catchable.** Rust rejects the pending bridge Promise
+with a real `Error` object rebuilt from the payload (`name`, `message`,
+`data`; built-in names like `TypeError` use the matching intrinsic
+constructor, so `instanceof` works). Sandbox code may catch it and continue
+running. Only if the rejection reaches the module's top-level promise
+uncaught does the run fail with `ERR_HOST_BRIDGE`, with the same fields
+preserved on the `RunErrorPayload`. Limit violations
+(`ERR_BRIDGE_CALL_LIMIT_EXCEEDED`, `ERR_BRIDGE_PAYLOAD_TOO_LARGE`,
+`ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`) remain fatal to the run even when
+caught.
+
 Bridge calls are sequential within a single run in v1: Rust sends one
 `BridgeCall` and waits for the matching `BridgeResponse` before continuing JS
 execution.
@@ -439,12 +458,13 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 
 `RunErrorPayload`:
 
-| Field     | Encoding           |
-| --------- | ------------------ |
-| `code`    | `String`           |
-| `name`    | `String`           |
-| `message` | `String`           |
-| `stack`   | `Optional<String>` |
+| Field     | Encoding              | Notes                                                 |
+| --------- | --------------------- | ----------------------------------------------------- |
+| `code`    | `String`              |                                                       |
+| `name`    | `String`              |                                                       |
+| `message` | `String`              |                                                       |
+| `stack`   | `Optional<String>`    | Always absent host → sandbox (BridgeResponse).        |
+| `data`    | `Optional<WireValue>` | Own-enumerable props beyond `name`/`message`/`stack`. |
 
 `PrecompileResultPayload`:
 
@@ -499,7 +519,7 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_EXPORT_NOT_SERIALIZABLE`         | Export contains unsupported value or cycle.                                 |
 | `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                             |
 | `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                          |
-| `ERR_HOST_BRIDGE`                     | Configured host global/import handler threw or rejected.                    |
+| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.     |
 | `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                   |
 | `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.            |
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`. |

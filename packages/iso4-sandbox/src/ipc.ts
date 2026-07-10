@@ -1,5 +1,5 @@
 import { Buffer } from 'node:buffer'
-import { decodeWireValueFromSlice } from './wire.js'
+import { decodeWireValueFromSlice, encodeWireValue } from './wire.js'
 
 export const PROTOCOL_VERSION: 1 = 1
 
@@ -565,20 +565,78 @@ export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
 // ── BridgeResponse encoder (TS → Rust) ──────────────────────────────────────
 
 /**
+ * Error reported to the sandbox when a host bridge handler throws or rejects.
+ * Mirrors `RunErrorPayload` minus `code` (always `ERR_HOST_BRIDGE`) and
+ * `stack` — the host stack is never carried across the bridge because it can
+ * expose host file paths and infrastructure details to sandbox code.
+ */
+export interface BridgeErrorPayload {
+  name: string
+  message: string
+  /**
+   * Pre-encoded WireValue bytes for the error's own-enumerable properties
+   * beyond `name`/`message`/`stack`. Absent when there are none.
+   */
+  encodedData?: Uint8Array
+}
+
+/**
+ * Build a `BridgeErrorPayload` from whatever a host handler threw.
+ *
+ * Own-enumerable properties beyond `name`/`message`/`stack` travel as `data`;
+ * properties that cannot be wire-encoded (functions, symbols, cycles, …) are
+ * silently dropped, mirroring the sandbox → host direction (`RunError.data`).
+ * @param err
+ */
+export function bridgeErrorPayloadFromUnknown(err: unknown): BridgeErrorPayload {
+  // Must never throw: it runs inside a rejection handler whose own failure
+  // would be swallowed, leaving the sandbox blocked until the wall timeout.
+  try {
+    if (typeof err !== 'object' || err === null)
+      return { name: 'Error', message: String(err) }
+
+    const obj = err as Record<string, unknown>
+    const name = typeof obj.name === 'string' && obj.name.length > 0 ? obj.name : 'Error'
+    const message = typeof obj.message === 'string' ? obj.message : String(err)
+
+    const fields: Record<string, unknown> = {}
+    let hasFields = false
+    for (const key of Object.keys(obj)) {
+      if (key === 'name' || key === 'message' || key === 'stack')
+        continue
+      try {
+        const value = obj[key] // may invoke a throwing getter
+        encodeWireValue(value)
+        fields[key] = value
+        hasFields = true
+      } catch {
+        continue // non-serializable property — drop it
+      }
+    }
+    if (!hasFields)
+      return { name, message }
+    return { name, message, encodedData: encodeWireValue(fields) }
+  } catch {
+    return { name: 'Error', message: 'host handler failed' }
+  }
+}
+
+/**
  * Encode a `BridgeResponsePayload` per `docs/protocol.md` §5.4.
  *
  * When `ok = true`, `encodedValue` contains pre-encoded WireValue bytes.
- * When `ok = false`, `errorMessage` is the handler rejection message.
+ * When `ok = false`, `error` describes the handler rejection. The stack slot
+ * is always written as absent — host stacks must not leak into the sandbox.
  * @param callId
  * @param ok
  * @param encodedValue
- * @param errorMessage
+ * @param error the handler rejection, when `ok = false`
  */
 export function encodeBridgeResponsePayload(
   callId: number,
   ok: boolean,
   encodedValue?: Uint8Array,
-  errorMessage?: string,
+  error?: BridgeErrorPayload,
 ): Buffer {
   const w = new PayloadWriter()
   w.writeU32(callId)
@@ -593,9 +651,15 @@ export function encodeBridgeResponsePayload(
   } else {
     w.writeU8(0) // ok = false
     w.writeString('ERR_HOST_BRIDGE')
-    w.writeString('Error')
-    w.writeString(errorMessage ?? 'host handler failed')
-    w.writeU8(0) // no stack
+    w.writeString(error?.name ?? 'Error')
+    w.writeString(error?.message ?? 'host handler failed')
+    w.writeU8(0) // stack: never carried host → sandbox
+    if (error?.encodedData !== undefined && error.encodedData.byteLength > 0) {
+      w.writeU8(1) // data present
+      w.writeBytes(error.encodedData)
+    } else {
+      w.writeU8(0) // no data
+    }
   }
   return w.toBuffer()
 }

@@ -472,12 +472,14 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: None,
             data: None,
         },
-        RunError::HostBridge(msg) => RunErrorPayload {
+        RunError::HostBridge(err) => RunErrorPayload {
             code: "ERR_HOST_BRIDGE".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
+            name: err.name.clone(),
+            message: err.message.clone(),
+            // Host stacks never cross the boundary — they may expose host
+            // file paths and infrastructure details.
             stack: None,
-            data: None,
+            data: err.data.clone(),
         },
         RunError::UndeclaredBinding(msg) => RunErrorPayload {
             code: "ERR_UNDECLARED_BINDING".to_string(),
@@ -566,10 +568,21 @@ pub fn encode_bridge_call_payload(
 
 // ── BridgeResponse payload decoder ───────────────────────────────────────────────
 
+/// Error reported by a host bridge handler, as carried on a `BridgeResponse`
+/// frame. Mirrors `RunErrorPayload` minus `code` (always `ERR_HOST_BRIDGE`)
+/// and `stack` (the host stack is never exposed to sandbox code).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeErrorPayload {
+    pub name: String,
+    pub message: String,
+    pub data: Option<WireValue>,
+}
+
 /// Decode a `BridgeResponsePayload` from TS per `docs/protocol.md` §5.4.
 ///
-/// Returns `Ok(Ok(WireValue))` on success, `Ok(Err(message))` when the host
-/// handler reported an error, and `Err(io::Error)` on a protocol fault.
+/// Returns `Ok(Ok(WireValue))` on success, `Ok(Err(BridgeErrorPayload))` when
+/// the host handler reported an error, and `Err(io::Error)` on a protocol
+/// fault.
 ///
 /// Wire layout:
 /// ```text
@@ -577,11 +590,12 @@ pub fn encode_bridge_call_payload(
 /// u8                 ok
 /// Optional<WireValue> value   (present when ok = true)
 /// Optional<error>    error   (present when ok = false)
-///   String code  String name  String message  Optional<String> stack
+///   String code  String name  String message
+///   Optional<String> stack  Optional<WireValue> data
 /// ```
 pub fn parse_bridge_response_payload(
     payload: &[u8],
-) -> io::Result<(u32, Result<WireValue, String>)> {
+) -> io::Result<(u32, Result<WireValue, BridgeErrorPayload>)> {
     let mut offset = 0;
 
     // callId - returned to the caller for validation.  In v1 bridge calls are
@@ -603,17 +617,32 @@ pub fn parse_bridge_response_payload(
             Ok((call_id, Ok(value)))
         }
         0 => {
-            // ok = false - read the error payload: code name message stack
+            // ok = false - read the error payload: code name message stack data
             let _code = read_string(payload, &mut offset)?;
-            let _name = read_string(payload, &mut offset)?;
+            let name = read_string(payload, &mut offset)?;
             let message = read_string(payload, &mut offset)?;
             let stack_present = read_u8(payload, &mut offset)?;
             if stack_present == 1 {
-                // Consume the stack string so the parser leaves at the end of
-                // the payload. We don't use it — it's host-side context only.
+                // Consume the stack string so the parser leaves positioned at
+                // the data field. The TS encoder never sends a host stack
+                // (host internals must not leak into the sandbox), but the
+                // wire slot exists for layout symmetry with RunErrorPayload.
                 let _ = read_string(payload, &mut offset)?;
             }
-            Ok((call_id, Err(message)))
+            let data_present = read_u8(payload, &mut offset)?;
+            let data = if data_present == 1 {
+                Some(decode_wire_value(payload, &mut offset)?)
+            } else {
+                None
+            };
+            Ok((
+                call_id,
+                Err(BridgeErrorPayload {
+                    name,
+                    message,
+                    data,
+                }),
+            ))
         }
         b => Err(io::Error::new(
             io::ErrorKind::InvalidData,

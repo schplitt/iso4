@@ -8,6 +8,7 @@ import {
   RustToTsMessageTypes,
   TsToRustMessageTypes,
   decodeBridgeCallPayload,
+  bridgeErrorPayloadFromUnknown,
   encodeBridgeResponsePayload,
   encodeAuthenticatePayload,
   encodeDisposePrefixPayload,
@@ -51,7 +52,9 @@ export type { ResourceLimits }
  * `RunResult`.
  */
 export class RunAbortedError extends Error {
-  /** The value passed to `AbortController.abort(reason)`, if any. */
+  /**
+   * The value passed to `AbortController.abort(reason)`, if any.
+   */
   readonly reason?: unknown
   constructor(reason?: unknown, message = 'run was aborted') {
     super(message)
@@ -354,7 +357,7 @@ export class RuntimeIpcClient {
                   call.callId,
                   false,
                   undefined,
-                  'no bridge dispatcher configured',
+                  { name: 'Error', message: 'no bridge dispatcher configured' },
                 ),
               ),
             )
@@ -383,7 +386,10 @@ export class RuntimeIpcClient {
                         callId,
                         false,
                         undefined,
-                        e instanceof Error ? e.message : String(e),
+                        {
+                          name: 'Error',
+                          message: e instanceof Error ? e.message : String(e),
+                        },
                       ),
                     ),
                   )
@@ -402,7 +408,7 @@ export class RuntimeIpcClient {
                     callId,
                     false,
                     undefined,
-                    err instanceof Error ? err.message : String(err),
+                    bridgeErrorPayloadFromUnknown(err),
                   ),
                 ),
               ),

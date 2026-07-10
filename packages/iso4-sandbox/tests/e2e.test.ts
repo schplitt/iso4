@@ -1586,6 +1586,372 @@ describe('host bridge error propagation', () => {
       return
     expect(result.error.code).toBe('ERR_HOST_BRIDGE')
   })
+
+  test('host handler error name and message are preserved on the run error', async () => {
+    const result = await runtime.run({
+      code: 'export default await boom()',
+      globals: {
+        boom: async () => {
+          throw new TypeError('bad type')
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+    expect(result.error.name).toBe('TypeError')
+    expect(result.error.message).toBe('bad type')
+    // The host stack never crosses the boundary.
+    expect(result.error.stack).toBeUndefined()
+  })
+
+  test('host handler error own props arrive as error.data', async () => {
+    const result = await runtime.run({
+      code: 'export default await boom()',
+      globals: {
+        boom: async () => {
+          throw Object.assign(new Error('with props'), {
+            code: 'E_FOO',
+            attempt: 2,
+            onRetry: () => {}, // non-serializable — dropped
+          })
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+    expect(result.error.data).toEqual({ code: 'E_FOO', attempt: 2 })
+  })
+
+  test('host handler error is catchable in the sandbox and preserves identity', async () => {
+    const result = await runtime.run({
+      code: `
+        let out
+        try {
+          await boom()
+          out = 'did not throw'
+        } catch (e) {
+          out = {
+            name: e.name,
+            message: e.message,
+            code: e.data?.code,
+            isTypeError: e instanceof TypeError,
+            isError: e instanceof Error,
+          }
+        }
+        export default out
+      `,
+      globals: {
+        boom: async () => {
+          throw Object.assign(new TypeError('bad input'), { code: 'E_BAD' })
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      name: 'TypeError',
+      message: 'bad input',
+      code: 'E_BAD',
+      isTypeError: true,
+      isError: true,
+    })
+  })
+
+  test('custom error names cross the bridge for sandbox catch logic', async () => {
+    class WorkflowTimeout extends Error {
+      timeoutMs: number
+      constructor(message: string, timeoutMs: number) {
+        super(message)
+        this.name = 'WorkflowTimeout'
+        this.timeoutMs = timeoutMs
+      }
+    }
+    const result = await runtime.run({
+      code: `
+        let out
+        try {
+          await runStep()
+        } catch (e) {
+          out = e.name === 'WorkflowTimeout' ? \`timeout after \${e.data?.timeoutMs}ms\` : 'unexpected'
+        }
+        export default out
+      `,
+      globals: {
+        runStep: async () => {
+          throw new WorkflowTimeout('step timed out', 5000)
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('timeout after 5000ms')
+  })
+
+  test('host stack does not leak into the sandbox', async () => {
+    const result = await runtime.run({
+      code: `
+        let out
+        try {
+          await boom()
+        } catch (e) {
+          out = String(e.stack ?? '')
+        }
+        export default out
+      `,
+      globals: {
+        boom: async () => {
+          throw new Error('host-side failure')
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    // Whatever stack the sandbox-side Error carries is sandbox-local; the
+    // host frames (this test file) must not appear in it.
+    expect(result.exports.default).not.toContain('e2e.test')
+  })
+
+  test('sandbox continues after catching a host handler error', async () => {
+    const result = await runtime.run({
+      code: `
+        let recovered
+        try {
+          await flaky()
+        } catch {
+          recovered = await stable()
+        }
+        export default recovered
+      `,
+      globals: {
+        flaky: async () => {
+          throw new Error('transient failure')
+        },
+        stable: async () => 'fallback value',
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('fallback value')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13b. Custom error classes end-to-end — full fidelity in both directions
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A realistic rich error (an HTTP failure with status, code, reason, nested
+// headers, retryable flag) thrown on either side of the bridge, asserting
+// exactly which fields arrive on the other side:
+//
+//   host → sandbox:  name + message + own props via `e.data`; host stack
+//                    NEVER crosses (only a sandbox-local stack exists).
+//   sandbox → host:  name + message + own props via `error.data`; the
+//                    sandbox stack IS exposed to the host (host is trusted).
+
+/** Rich host-side error, as a host HTTP client library would define it. */
+class HttpError extends Error {
+  status: number
+  code: string
+  reason: string
+  headers: Record<string, string>
+  retryable: boolean
+
+  constructor(status: number, code: string, reason: string, retryable: boolean) {
+    super(`HTTP ${status}: ${reason}`)
+    this.name = 'HttpError'
+    this.status = status
+    this.code = code
+    this.reason = reason
+    this.headers = { 'retry-after': '30', 'x-request-id': 'req_123' }
+    this.retryable = retryable
+  }
+}
+
+describe('custom error classes end-to-end', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('host-thrown HttpError: sandbox catch sees name, message, and full data', async () => {
+    const result = await runtime.run({
+      code: `
+        let caught
+        try {
+          await fetchUser(42)
+        } catch (e) {
+          caught = {
+            name: e.name,
+            message: e.message,
+            data: e.data,
+            isError: e instanceof Error,
+            stackHasHostFrames: String(e.stack ?? '').includes('e2e.test'),
+          }
+        }
+        export default caught
+      `,
+      globals: {
+        fetchUser: async () => {
+          throw new HttpError(503, 'E_UPSTREAM', 'upstream unavailable', true)
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      name: 'HttpError',
+      message: 'HTTP 503: upstream unavailable',
+      data: {
+        status: 503,
+        code: 'E_UPSTREAM',
+        reason: 'upstream unavailable',
+        headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
+        retryable: true,
+      },
+      isError: true,
+      stackHasHostFrames: false,
+    })
+  })
+
+  test('host-thrown HttpError: sandbox retry logic can branch on data', async () => {
+    let attempts = 0
+    const result = await runtime.run({
+      code: `
+        let response
+        for (let i = 0; i < 3; i++) {
+          try {
+            response = await fetchUser(42)
+            break
+          } catch (e) {
+            if (e.name !== 'HttpError' || !e.data.retryable)
+              throw e
+          }
+        }
+        export default response
+      `,
+      globals: {
+        fetchUser: async () => {
+          attempts += 1
+          if (attempts < 3)
+            throw new HttpError(503, 'E_UPSTREAM', 'upstream unavailable', true)
+          return { id: 42, name: 'jakob' }
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(attempts).toBe(3)
+    expect(result.exports.default).toEqual({ id: 42, name: 'jakob' })
+  })
+
+  test('host-thrown HttpError uncaught: RunResult error carries name and data, no stack', async () => {
+    const result = await runtime.run({
+      code: 'export default await fetchUser(42)',
+      globals: {
+        fetchUser: async () => {
+          throw new HttpError(404, 'E_NOT_FOUND', 'no such user', false)
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+    expect(result.error.name).toBe('HttpError')
+    expect(result.error.message).toBe('HTTP 404: no such user')
+    expect(result.error.data).toEqual({
+      status: 404,
+      code: 'E_NOT_FOUND',
+      reason: 'no such user',
+      headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
+      retryable: false,
+    })
+    expect(result.error.stack).toBeUndefined()
+  })
+
+  test('sandbox-thrown HttpError: RunResult error carries name, data, and the sandbox stack', async () => {
+    const result = await runtime.run({
+      code: `
+        class HttpError extends Error {
+          constructor(status, code, reason, retryable) {
+            super(\`HTTP \${status}: \${reason}\`)
+            this.name = 'HttpError'
+            this.status = status
+            this.code = code
+            this.reason = reason
+            this.headers = { 'retry-after': '30', 'x-request-id': 'req_123' }
+            this.retryable = retryable
+          }
+        }
+        throw new HttpError(429, 'E_RATE_LIMIT', 'too many requests', true)
+      `,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('HttpError')
+    expect(result.error.message).toBe('HTTP 429: too many requests')
+    expect(result.error.data).toEqual({
+      status: 429,
+      code: 'E_RATE_LIMIT',
+      reason: 'too many requests',
+      headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
+      retryable: true,
+    })
+    // The sandbox stack IS exposed to the host — the host is the trusted side.
+    expect(result.error.stack).toContain('HttpError')
+  })
+
+  test('round-trip: sandbox rebuilds and rethrows a host HttpError without losing fields', async () => {
+    // The durable-execution pattern from #22: catch a host failure, rethrow
+    // it in-sandbox with identical identity, and let it surface to the host.
+    const result = await runtime.run({
+      code: `
+        try {
+          await fetchUser(42)
+        } catch (e) {
+          const rebuilt = Object.assign(new Error(e.message), { name: e.name, ...e.data })
+          throw rebuilt
+        }
+      `,
+      globals: {
+        fetchUser: async () => {
+          throw new HttpError(503, 'E_UPSTREAM', 'upstream unavailable', true)
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    // Rethrown by sandbox code, so it surfaces as user code — with the
+    // original host error's identity fully intact.
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('HttpError')
+    expect(result.error.message).toBe('HTTP 503: upstream unavailable')
+    expect(result.error.data).toEqual({
+      status: 503,
+      code: 'E_UPSTREAM',
+      reason: 'upstream unavailable',
+      headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
+      retryable: true,
+    })
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

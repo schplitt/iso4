@@ -18,7 +18,10 @@ import {
   encodePrecompilePayload,
   encodePrefixRunPayload,
   encodeDisposePrefixPayload,
+  bridgeErrorPayloadFromUnknown,
+  encodeBridgeResponsePayload,
 } from '../src/ipc'
+import { decodeWireValueFromSlice, encodeWireValue } from '../src/wire'
 
 import { Buffer } from 'node:buffer'
 
@@ -287,5 +290,88 @@ describe('payload encoders', () => {
     const buf = encodeRunPayload({ runId: 1, code: 'x' })
     // Last 4 bytes should be u32(0) (imports count).
     expect(readU32BE(buf, buf.byteLength - 4)).toBe(0)
+  })
+})
+
+// ── BridgeResponse error payloads ────────────────────────────────────────────
+
+describe('bridgeErrorPayloadFromUnknown', () => {
+  test('preserves the real error name and message', () => {
+    const payload = bridgeErrorPayloadFromUnknown(new TypeError('bad input'))
+    expect(payload.name).toBe('TypeError')
+    expect(payload.message).toBe('bad input')
+    expect(payload.encodedData).toBeUndefined()
+  })
+
+  test('collects own-enumerable props as data, dropping non-serializable ones', () => {
+    const err = Object.assign(new Error('x'), {
+      code: 'E_FOO',
+      attempt: 2,
+      onRetry: () => {}, // function — dropped
+    })
+    const payload = bridgeErrorPayloadFromUnknown(err)
+    expect(payload.name).toBe('Error')
+    expect(payload.encodedData).toBeDefined()
+    const [data] = decodeWireValueFromSlice(payload.encodedData!)
+    expect(data).toEqual({ code: 'E_FOO', attempt: 2 })
+  })
+
+  test('never carries name/message/stack inside data', () => {
+    const err = new Error('x')
+    Object.defineProperty(err, 'stack', { value: 'secret host stack', enumerable: true })
+    const payload = bridgeErrorPayloadFromUnknown(err)
+    expect(payload.encodedData).toBeUndefined()
+  })
+
+  test('thrown primitives become a generic Error payload', () => {
+    expect(bridgeErrorPayloadFromUnknown('boom')).toEqual({ name: 'Error', message: 'boom' })
+    expect(bridgeErrorPayloadFromUnknown(42)).toEqual({ name: 'Error', message: '42' })
+  })
+
+  test('throwing getters are dropped without failing the payload', () => {
+    const err = new Error('x')
+    Object.defineProperty(err, 'evil', {
+      enumerable: true,
+      get() {
+        throw new Error('gotcha')
+      },
+    })
+    const payload = bridgeErrorPayloadFromUnknown(err)
+    expect(payload.message).toBe('x')
+    expect(payload.encodedData).toBeUndefined()
+  })
+})
+
+describe('encodeBridgeResponsePayload error layout', () => {
+  test('writes code, name, message, absent stack, and data per §5.4', () => {
+    const encodedData = encodeWireValue({ code: 'E_FOO' })
+    const buf = encodeBridgeResponsePayload(7, false, undefined, {
+      name: 'WorkflowTimeout',
+      message: 'took too long',
+      encodedData,
+    })
+    let off = 0
+    expect(readU32BE(buf, off)).toBe(7) // callId
+    off += 4
+    expect(buf[off]).toBe(0) // ok = false
+    off += 1
+    const { value: code, end: e1 } = readString(buf, off)
+    expect(code).toBe('ERR_HOST_BRIDGE')
+    const { value: name, end: e2 } = readString(buf, e1)
+    expect(name).toBe('WorkflowTimeout')
+    const { value: message, end: e3 } = readString(buf, e2)
+    expect(message).toBe('took too long')
+    expect(buf[e3]).toBe(0) // stack: always absent host → sandbox
+    expect(buf[e3 + 1]).toBe(1) // data present
+    const [data] = decodeWireValueFromSlice(buf.subarray(e3 + 2))
+    expect(data).toEqual({ code: 'E_FOO' })
+  })
+
+  test('omits data when the error has none', () => {
+    const buf = encodeBridgeResponsePayload(1, false, undefined, {
+      name: 'Error',
+      message: 'plain failure',
+    })
+    expect(buf[buf.byteLength - 1]).toBe(0) // data absent is the last byte
   })
 })

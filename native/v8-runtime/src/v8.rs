@@ -22,7 +22,7 @@ use crossbeam_channel::RecvTimeoutError;
 
 use crate::ipc;
 use crate::ipc::ImportBinding;
-use crate::wire::{self, WireValue};
+use crate::wire::{self, BridgeErrorPayload, WireValue};
 
 static INIT: Once = Once::new();
 
@@ -350,8 +350,10 @@ pub enum RunError {
     WallTimeout,
     /// V8 heap + ArrayBuffer exceeded `limits.memoryMb`.
     MemoryLimit,
-    /// Configured host global/import handler threw or rejected.
-    HostBridge(String),
+    /// Configured host global/import handler threw or rejected and the
+    /// sandbox did not catch it. Carries the handler error's `name`,
+    /// `message`, and own-enumerable `data` (never the host stack).
+    HostBridge(Box<BridgeErrorPayload>),
     /// PrefixRun attempted to bind a global not declared by Precompile.
     /// Raised in session.rs when a PrefixRun global was not declared in Precompile.
     #[allow(dead_code)]
@@ -805,6 +807,11 @@ fn run_module(
             v8::PromiseState::Rejected => {
                 cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
                 let rejection = promise.result(scope);
+                // A rejection tagged as a host bridge error surfaces as
+                // ERR_HOST_BRIDGE with the handler's name/message/data intact.
+                if let Some(err) = host_bridge_error_from_rejection(scope, rejection) {
+                    return Err(failure(err, &logs, start));
+                }
                 if let Some(err) = bridge_error.get() {
                     return Err(failure(owned_bridge_error(err), &logs, start));
                 }
@@ -923,15 +930,15 @@ fn run_module(
                                         resolver.reject(scope, msg.into());
                                     }
                                 }
-                                Err(msg) => {
-                                    // Record the host error so the Rejected
-                                    // arm below returns HostBridge, not RuntimeError.
-                                    bridge_error.set(RunError::HostBridge(msg.clone())).ok();
-                                    let err_str =
-                                        v8::String::new(scope, &msg).unwrap_or_else(|| {
-                                            v8::String::new(scope, "host error").unwrap()
-                                        });
-                                    resolver.reject(scope, err_str.into());
+                                Err(bridge_err) => {
+                                    // Reject with a real Error carrying the
+                                    // handler's name/message/data, tagged with
+                                    // a private symbol so the Rejected arm can
+                                    // classify an *uncaught* one as HostBridge.
+                                    // Sandbox code may catch it and continue —
+                                    // host handler errors are not run-fatal.
+                                    let error_obj = host_bridge_error_to_v8(scope, &bridge_err);
+                                    resolver.reject(scope, error_obj);
                                 }
                             }
                         }
@@ -1487,9 +1494,12 @@ impl Drop for GuardCanceller<'_> {
 //      in the host callback, so no V8 activity can happen during this wait).
 //   5. Calls cpu_budget.enter() to resume counting.
 //   6. On success: deserialises the WireValue result back to a V8 value.
-//   7. On error: stores RunError::HostBridge in the shared OnceLock,
-//      throws a JS exception to unwind the module, and lets run_module
-//      surface the correct error code.
+//   7. On handler error: rejects the pending Promise with a real Error
+//      carrying the handler's name/message/data (tagged via a private
+//      symbol). Sandbox code may catch it and continue; uncaught it
+//      surfaces as ERR_HOST_BRIDGE. Only limit violations (maxBridgeCalls,
+//      payload too large, function args) store a RunError in the shared
+//      OnceLock and remain fatal to the run.
 //
 // fetch is NOT special. It gets the same callback as every other global.
 // The host handler decides what the arguments mean and what to return.
@@ -1781,6 +1791,104 @@ fn throw_v8_error(scope: &mut v8::HandleScope, message: &str) {
         let exc = v8::Exception::error(scope, s);
         scope.throw_exception(exc);
     }
+}
+
+/// Private-symbol key marking Error objects that originate from a host bridge
+/// handler failure. Lets the poll loop distinguish an uncaught host error
+/// (→ `ERR_HOST_BRIDGE`) from an uncaught sandbox error (→ `ERR_USER_CODE`).
+const HOST_BRIDGE_ERROR_TAG: &str = "iso4::hostBridgeError";
+
+fn host_bridge_tag<'s>(scope: &mut v8::HandleScope<'s>) -> Option<v8::Local<'s, v8::Private>> {
+    let key = v8::String::new(scope, HOST_BRIDGE_ERROR_TAG)?;
+    Some(v8::Private::for_api(scope, Some(key)))
+}
+
+/// Error names with a matching V8 intrinsic constructor. Using the intrinsic
+/// makes `instanceof TypeError` etc. work in the sandbox; any other name is
+/// carried as an own `name` property on a plain Error.
+const INTRINSIC_ERROR_NAMES: [&str; 5] = [
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "ReferenceError",
+];
+
+/// Materialise a host bridge handler error as a real sandbox Error object:
+/// `name` (via the matching intrinsic constructor where one exists), `message`,
+/// and structured `data`. The host stack is deliberately never carried across
+/// the bridge. The object is tagged with [`HOST_BRIDGE_ERROR_TAG`] so an
+/// uncaught rejection classifies as `ERR_HOST_BRIDGE`.
+fn host_bridge_error_to_v8<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    err: &BridgeErrorPayload,
+) -> v8::Local<'s, v8::Value> {
+    let message = v8::String::new(scope, &err.message).unwrap_or_else(|| v8::String::empty(scope));
+    let exception = match err.name.as_str() {
+        "TypeError" => v8::Exception::type_error(scope, message),
+        "RangeError" => v8::Exception::range_error(scope, message),
+        "SyntaxError" => v8::Exception::syntax_error(scope, message),
+        "ReferenceError" => v8::Exception::reference_error(scope, message),
+        _ => v8::Exception::error(scope, message),
+    };
+    let Some(obj) = exception.to_object(scope) else {
+        return exception;
+    };
+    if !INTRINSIC_ERROR_NAMES.contains(&err.name.as_str()) {
+        if let (Some(key), Some(name)) = (
+            v8::String::new(scope, "name"),
+            v8::String::new(scope, &err.name),
+        ) {
+            obj.set(scope, key.into(), name.into());
+        }
+    }
+    if let Some(data) = &err.data {
+        if let (Some(key), Some(value)) = (
+            v8::String::new(scope, "data"),
+            wire_to_v8_value(scope, data),
+        ) {
+            obj.set(scope, key.into(), value);
+        }
+    }
+    if let Some(tag) = host_bridge_tag(scope) {
+        let marker = v8::Boolean::new(scope, true);
+        obj.set_private(scope, tag, marker.into());
+    }
+    exception
+}
+
+/// If `value` is a rejection produced by [`host_bridge_error_to_v8`], rebuild
+/// the structured `RunError::HostBridge` from it; otherwise `None`.
+///
+/// Fields are re-read from the object (not stashed host-side) because several
+/// bridge errors can be in flight and sandbox code may catch some of them —
+/// only the object that actually rejected the module promise matters.
+fn host_bridge_error_from_rejection(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    value: v8::Local<v8::Value>,
+) -> Option<RunError> {
+    let obj = value.to_object(scope)?;
+    let tag = host_bridge_tag(scope)?;
+    if !obj.has_private(scope, tag).unwrap_or(false) {
+        return None;
+    }
+    let name = error_name_from_value(scope, value).unwrap_or_else(|| "Error".to_string());
+    let message =
+        error_message_from_value(scope, value).unwrap_or_else(|| "host handler failed".to_string());
+    let data_key = v8::String::new(scope, "data")?;
+    let data = obj.get(scope, data_key.into()).and_then(|d| {
+        if d.is_undefined() || d.is_null() {
+            None
+        } else {
+            let mut visiting = Vec::new();
+            value_to_wire(scope, d, &mut visiting).ok()
+        }
+    });
+    Some(RunError::HostBridge(Box::new(BridgeErrorPayload {
+        name,
+        message,
+        data,
+    })))
 }
 
 /// Serialise a V8 value for use as a bridge call argument.
@@ -3955,18 +4063,35 @@ mod tests {
         p
     }
 
-    /// Encode an error BridgeResponse payload (callId, ok=0, message).
-    fn bridge_resp_err(call_id: u32, message: &str) -> Vec<u8> {
+    /// Encode an error BridgeResponse payload (callId, ok=0, name/message/data).
+    fn bridge_resp_err_full(
+        call_id: u32,
+        name: &str,
+        message: &str,
+        data: Option<&WireValue>,
+    ) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&call_id.to_be_bytes());
         p.push(0); // ok = false
-        for s in &["ERR_HOST_BRIDGE", "Error", message] {
+        for s in &["ERR_HOST_BRIDGE", name, message] {
             let b = s.as_bytes();
             p.extend_from_slice(&(b.len() as u32).to_be_bytes());
             p.extend_from_slice(b);
         }
         p.push(0); // no stack
+        match data {
+            Some(d) => {
+                p.push(1);
+                wire::encode_wire_value(d, &mut p);
+            }
+            None => p.push(0),
+        }
         p
+    }
+
+    /// Encode an error BridgeResponse payload (callId, ok=0, message).
+    fn bridge_resp_err(call_id: u32, message: &str) -> Vec<u8> {
+        bridge_resp_err_full(call_id, "Error", message, None)
     }
 
     /// Spawn a single-response bridge responder thread.
@@ -4119,8 +4244,128 @@ mod tests {
         h.join().unwrap();
         let err = result.unwrap_err().error;
         assert!(
-            matches!(err, RunError::HostBridge(ref m) if m.contains("handler blew up")),
+            matches!(err, RunError::HostBridge(ref e) if e.message.contains("handler blew up")),
             "expected HostBridge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_host_error_preserves_name_and_data_when_uncaught() {
+        let data = WireValue::Object(vec![(
+            "code".to_string(),
+            WireValue::String("E_FOO".into()),
+        )]);
+        let (result, h) = run_with_bridge(
+            "export default await myTool()",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            move |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_err_full(0, "WorkflowTimeout", "took too long", Some(&data)),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let err = result.unwrap_err().error;
+        match err {
+            RunError::HostBridge(e) => {
+                assert_eq!(e.name, "WorkflowTimeout");
+                assert_eq!(e.message, "took too long");
+                assert_eq!(
+                    e.data,
+                    Some(WireValue::Object(vec![(
+                        "code".to_string(),
+                        WireValue::String("E_FOO".into())
+                    )]))
+                );
+            }
+            other => panic!("expected HostBridge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_host_error_is_catchable_in_sandbox() {
+        // Sandbox catches the host error and inspects it: the run succeeds
+        // and the caught error exposes name, message, data, and instanceof.
+        let data = WireValue::Object(vec![("code".to_string(), WireValue::String("E_T".into()))]);
+        let (result, h) = run_with_bridge(
+            r#"
+            let out;
+            try {
+              await myTool();
+              out = "did not throw";
+            } catch (e) {
+              out = [
+                e.name,
+                e.message,
+                e.data && e.data.code,
+                e instanceof TypeError,
+                e instanceof Error,
+              ].join("|");
+            }
+            export default out;
+            "#,
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            move |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_err_full(0, "TypeError", "bad input", Some(&data)),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let out = result.expect("caught host error must not fail the run");
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("TypeError|bad input|E_T|true|true")
+        );
+    }
+
+    #[test]
+    fn bridge_host_error_custom_name_is_carried() {
+        let (result, h) = run_with_bridge(
+            r#"
+            let out;
+            try { await myTool() } catch (e) { out = `${e.name}:${e.stack === undefined}` }
+            export default out;
+            "#,
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_err_full(0, "NonRetryableError", "nope", None),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let out = result.expect("caught host error must not fail the run");
+        // Custom name is carried; the stack is sandbox-local (V8 attaches one
+        // at Exception::error creation), so we only assert the name here.
+        let val = get_default(&out).unwrap();
+        assert!(
+            val.starts_with("NonRetryableError:"),
+            "expected custom error name, got {val}"
         );
     }
 
