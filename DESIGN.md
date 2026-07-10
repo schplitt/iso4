@@ -555,12 +555,19 @@ wall), the run **fails**:
     message: "Cannot read property 'x' of undefined",
     code: "ERR_USER_CODE",  // or ERR_MEMORY_LIMIT | ERR_CPU_TIMEOUT | ERR_WALL_TIMEOUT | …
     stack: "...",
+    fields: { … },  // all other own-enumerable props of the thrown error, if any
   },
   stdout: "...",  // whatever was emitted before the throw
   stderr: "...",
   durationMs: 42,
 }
 ```
+
+`name`/`message`/`stack` are reserved: always read from the error's dedicated
+properties, never mixed into `fields` — so a thrown object's own `code` or
+`stack`-named field can't collide with or spoof the top-level values. Thrown
+primitives normalise to `{ name: "Error", message: String(value) }` with no
+stack and no fields.
 
 If the host aborts the run via `run({ signal })` — a pre-aborted signal at entry
 or an abort that fires mid-run (see §14.7) — the run is **aborted**. This is a
@@ -1013,6 +1020,19 @@ This means `FetchHandler`, `HostFetchRequest`, and `HostFetchResponse` are
 describe the expected call shape for a `fetch`-compatible handler. Core only
 knows `HostExportFunction` — a function that takes `HostExportData` arguments
 and returns `HostExportData`.
+
+**When the handler throws or rejects**, the sandbox call rejects with a real
+`Error` rebuilt from the thrown value: same `name` (built-in names use the
+matching intrinsic constructor, so `instanceof TypeError` works), same
+`message`, and every other own-enumerable property re-attached as a direct own
+property (`e.status`, `e.reason`, …). The **host stack never crosses** into
+the sandbox — it can expose host file paths and infrastructure details — and
+`name`/`message`/`stack` cannot be injected through the carried fields.
+Sandbox code can catch the error and continue running; if it stays uncaught it
+fails the run as `ERR_HOST_BRIDGE` with the same identity preserved on
+`RunError` (extra props under `error.fields`). Bridge *limit* violations
+(`maxBridgeCalls`, `maxBridgeCallBytes`, function arguments) are different:
+they stay fatal to the run even when caught.
 
 ### 12.2 Attack categories and where each is mitigated
 

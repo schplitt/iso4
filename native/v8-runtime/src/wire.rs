@@ -279,7 +279,7 @@ pub struct RunErrorPayload {
     pub name: String,
     pub message: String,
     pub stack: Option<String>,
-    pub data: Option<WireValue>,
+    pub fields: Option<WireValue>,
 }
 
 /// Payload for a successful run.
@@ -364,7 +364,7 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
         }
         None => out.push(0),
     }
-    match &error.data {
+    match &error.fields {
         Some(d) => {
             out.push(1);
             encode_wire_value(d, out);
@@ -421,56 +421,56 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::CompileError(msg) => RunErrorPayload {
             code: "ERR_COMPILE".to_string(),
             name: "SyntaxError".to_string(),
             message: msg.clone(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::RuntimeError(inner) => RunErrorPayload {
             code: "ERR_USER_CODE".to_string(),
             name: inner.name.clone(),
             message: inner.message.clone(),
             stack: inner.stack.clone(),
-            data: inner.data.clone(),
+            fields: inner.fields.clone(),
         },
         RunError::ModuleNotFound(msg) => RunErrorPayload {
             code: "ERR_MODULE_NOT_FOUND".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::ExportNotSerializable(msg) => RunErrorPayload {
             code: "ERR_EXPORT_NOT_SERIALIZABLE".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::CpuTimeout => RunErrorPayload {
             code: "ERR_CPU_TIMEOUT".to_string(),
             name: "Error".to_string(),
             message: "CPU time limit exceeded".to_string(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::WallTimeout => RunErrorPayload {
             code: "ERR_WALL_TIMEOUT".to_string(),
             name: "Error".to_string(),
             message: "Wall time limit exceeded".to_string(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::MemoryLimit => RunErrorPayload {
             code: "ERR_MEMORY_LIMIT".to_string(),
             name: "Error".to_string(),
             message: "Memory limit exceeded".to_string(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::HostBridge(err) => RunErrorPayload {
             code: "ERR_HOST_BRIDGE".to_string(),
@@ -479,28 +479,28 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             // Host stacks never cross the boundary — they may expose host
             // file paths and infrastructure details.
             stack: None,
-            data: err.data.clone(),
+            fields: err.fields.clone(),
         },
         RunError::UndeclaredBinding(msg) => RunErrorPayload {
             code: "ERR_UNDECLARED_BINDING".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::FunctionArgumentNotSupported => RunErrorPayload {
             code: "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED".to_string(),
             name: "Error".to_string(),
             message: "function arguments are not supported across the bridge boundary".to_string(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::BridgeCallPayloadTooLarge => RunErrorPayload {
             code: "ERR_BRIDGE_PAYLOAD_TOO_LARGE".to_string(),
             name: "Error".to_string(),
             message: "bridge call payload exceeds configured maxBridgeCallBytes limit".to_string(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::ExportTooLarge => RunErrorPayload {
             code: "ERR_EXPORT_TOO_LARGE".to_string(),
@@ -508,21 +508,21 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             message: "serialised export payload exceeds configured maxExportBytes limit"
                 .to_string(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::BridgeCallLimitExceeded => RunErrorPayload {
             code: "ERR_BRIDGE_CALL_LIMIT_EXCEEDED".to_string(),
             name: "Error".to_string(),
             message: "run exceeded the configured maxBridgeCalls limit".to_string(),
             stack: None,
-            data: None,
+            fields: None,
         },
         RunError::Internal(msg) => RunErrorPayload {
             code: "ERR_INTERNAL".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,
-            data: None,
+            fields: None,
         },
     }
 }
@@ -575,7 +575,7 @@ pub fn encode_bridge_call_payload(
 pub struct BridgeErrorPayload {
     pub name: String,
     pub message: String,
-    pub data: Option<WireValue>,
+    pub fields: Option<WireValue>,
 }
 
 /// Decode a `BridgeResponsePayload` from TS per `docs/protocol.md` §5.4.
@@ -591,7 +591,7 @@ pub struct BridgeErrorPayload {
 /// Optional<WireValue> value   (present when ok = true)
 /// Optional<error>    error   (present when ok = false)
 ///   String code  String name  String message
-///   Optional<String> stack  Optional<WireValue> data
+///   Optional<String> stack  Optional<WireValue> fields
 /// ```
 pub fn parse_bridge_response_payload(
     payload: &[u8],
@@ -617,20 +617,20 @@ pub fn parse_bridge_response_payload(
             Ok((call_id, Ok(value)))
         }
         0 => {
-            // ok = false - read the error payload: code name message stack data
+            // ok = false - read the error payload: code name message stack fields
             let _code = read_string(payload, &mut offset)?;
             let name = read_string(payload, &mut offset)?;
             let message = read_string(payload, &mut offset)?;
             let stack_present = read_u8(payload, &mut offset)?;
             if stack_present == 1 {
                 // Consume the stack string so the parser leaves positioned at
-                // the data field. The TS encoder never sends a host stack
+                // the fields value. The TS encoder never sends a host stack
                 // (host internals must not leak into the sandbox), but the
                 // wire slot exists for layout symmetry with RunErrorPayload.
                 let _ = read_string(payload, &mut offset)?;
             }
-            let data_present = read_u8(payload, &mut offset)?;
-            let data = if data_present == 1 {
+            let fields_present = read_u8(payload, &mut offset)?;
+            let fields = if fields_present == 1 {
                 Some(decode_wire_value(payload, &mut offset)?)
             } else {
                 None
@@ -640,7 +640,7 @@ pub fn parse_bridge_response_payload(
                 Err(BridgeErrorPayload {
                     name,
                     message,
-                    data,
+                    fields,
                 }),
             ))
         }
@@ -932,7 +932,7 @@ mod tests {
                     name: "SyntaxError".to_string(),
                     message: "bad syntax".to_string(),
                     stack: None,
-                    data: None,
+                    fields: None,
                 },
                 stdout: vec![],
                 stderr: vec![],
@@ -1032,7 +1032,7 @@ mod tests {
             name: "TypeError".to_string(),
             message: "boom".to_string(),
             stack: Some("at line 1".to_string()),
-            data: None,
+            fields: None,
         })));
         assert_eq!(payload.code, "ERR_USER_CODE");
         assert_eq!(payload.name, "TypeError");

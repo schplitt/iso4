@@ -111,12 +111,32 @@ type RunResult
   = | { ok: true, exports: SandboxExports, stdout: string[], stderr: string[], durationMs: number }
     | { ok: false, error: RunError, stdout: string[], stderr: string[], durationMs: number }
 
-interface RunError { code: RunErrorCode, name: string, message: string, stack?: string }
+interface RunError {
+  code: RunErrorCode
+  name: string
+  message: string
+  stack?: string
+  fields?: Record<string, unknown> // all other own-enumerable props of the thrown error
+}
 ```
 
 `run()` never throws for sandboxed failures — only for infrastructure errors
 (subprocess crashed, binary not found). `ok: false` with an error code is the
 normal failure path.
+
+Thrown errors keep their identity across the bridge, in both directions:
+
+- **Sandbox → host**: an uncaught sandbox throw surfaces as `ERR_USER_CODE`
+  with the error's real `name`, `message`, `stack`, and every other
+  own-enumerable property under `error.fields` (namespaced so a custom `code`
+  property can't collide with the iso4 `error.code`). `name`/`message`/`stack`
+  are reserved and never appear inside `fields`.
+- **Host → sandbox**: a host handler that throws rejects the sandbox call with
+  a real `Error` carrying the same `name` (`instanceof TypeError` works for
+  built-ins) and its extra properties re-attached directly (`e.status`,
+  `e.reason`, …). Sandbox code can catch it and continue; uncaught it fails
+  the run with `ERR_HOST_BRIDGE`. The **host stack never crosses** into the
+  sandbox.
 
 ## Architecture
 

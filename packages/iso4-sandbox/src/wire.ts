@@ -269,6 +269,7 @@ export interface DecodedRunCompletion {
  *   String  name
  *   String  message
  *   Optional<String>  stack
+ *   Optional<WireValue>  fields
  *   List<String>  stdout
  *   List<String>  stderr
  *   f64  durationMs
@@ -319,8 +320,10 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
   const message = reader.readString()
   const stackPresent = reader.readU8()
   const stack = stackPresent === 1 ? reader.readString() : undefined
-  const dataPresent = reader.readU8()
-  const data = dataPresent === 1 ? decodeWireValueFromReader(reader) : undefined
+  const fieldsPresent = reader.readU8()
+  const fields = fieldsPresent === 1
+    ? decodeWireValueFromReader(reader) as Record<string, unknown>
+    : undefined
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
   const durationMs = reader.readF64()
@@ -328,7 +331,7 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
   reader.assertDone()
   return {
     runId,
-    result: { status: 'failed', ok: false, error: { code, name, message, stack, data }, stdout, stderr, durationMs },
+    result: { status: 'failed', ok: false, error: { code, name, message, stack, fields }, stdout, stderr, durationMs },
   }
 }
 
@@ -376,9 +379,9 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   const message = reader.readString()
   const stackPresent = reader.readU8()
   const stack = stackPresent === 1 ? reader.readString() : undefined
-  const dataPresent = reader.readU8()
-  if (dataPresent === 1)
-    decodeWireValueFromReader(reader) // consume; precompile errors never carry data
+  const fieldsPresent = reader.readU8()
+  if (fieldsPresent === 1)
+    decodeWireValueFromReader(reader) // consume; precompile errors never carry fields
   reader.assertDone()
   return { ok: false, error: { code, name, message, stack } }
 }

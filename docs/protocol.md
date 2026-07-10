@@ -363,18 +363,22 @@ flat `(specifier, source)` pair.
 The `error` field uses the `RunErrorPayload` layout with `code` always
 `ERR_HOST_BRIDGE` and the `stack` slot always absent: the host stack never
 crosses into the sandbox because it can expose host file paths and
-infrastructure details. `name`, `message`, and `data` (own-enumerable
-properties of the thrown error beyond `name`/`message`/`stack`) are carried —
-whatever a handler attaches to an error is the host's responsibility, same as
-a returned value.
+infrastructure details. `name`, `message`, and `fields` (all own-enumerable
+properties of the thrown error beyond the reserved `name`/`message`/`stack`)
+are carried — whatever a handler attaches to an error is the host's
+responsibility, same as a returned value. Thrown primitives normalise to
+`name = "Error"`, `message = String(value)`, no fields.
 
 **Host handler errors are catchable.** Rust rejects the pending bridge Promise
-with a real `Error` object rebuilt from the payload (`name`, `message`,
-`data`; built-in names like `TypeError` use the matching intrinsic
-constructor, so `instanceof` works). Sandbox code may catch it and continue
-running. Only if the rejection reaches the module's top-level promise
-uncaught does the run fail with `ERR_HOST_BRIDGE`, with the same fields
-preserved on the `RunErrorPayload`. Limit violations
+with a real `Error` object rebuilt from the payload: built-in names like
+`TypeError` use the matching intrinsic constructor (so `instanceof` works),
+and every entry in `fields` is re-attached as a **direct own property** — the
+caught error has the same shape the handler threw (`e.status`, `e.reason`, …).
+Reserved keys (`name`/`message`/`stack`/`__proto__`) inside `fields` are
+ignored so Error identity cannot be spoofed through the payload. Sandbox code
+may catch it and continue running. Only if the rejection reaches the module's
+top-level promise uncaught does the run fail with `ERR_HOST_BRIDGE`, with the
+same fields preserved on the `RunErrorPayload`. Limit violations
 (`ERR_BRIDGE_CALL_LIMIT_EXCEEDED`, `ERR_BRIDGE_PAYLOAD_TOO_LARGE`,
 `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`) remain fatal to the run even when
 caught.
@@ -464,7 +468,7 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 | `name`    | `String`              |                                                       |
 | `message` | `String`              |                                                       |
 | `stack`   | `Optional<String>`    | Always absent host → sandbox (BridgeResponse).        |
-| `data`    | `Optional<WireValue>` | Own-enumerable props beyond `name`/`message`/`stack`. |
+| `fields`  | `Optional<WireValue>` | Own-enumerable props beyond `name`/`message`/`stack`. |
 
 `PrecompileResultPayload`:
 

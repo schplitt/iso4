@@ -873,7 +873,7 @@ describe('error handling', () => {
     expect(result.error.name).toBe('Error')
   })
 
-  test('error data carries own enumerable properties', async () => {
+  test('error fields carry own enumerable properties', async () => {
     const result = await runtime.run({
       code: `
         const e = new Error("suspend")
@@ -887,15 +887,15 @@ describe('error handling', () => {
     if (result.ok)
       return
     expect(result.error.name).toBe('WorkflowSuspend')
-    expect(result.error.data).toMatchObject({ kind: 'waitForEvent', stepId: 'approval' })
+    expect(result.error.fields).toMatchObject({ kind: 'waitForEvent', stepId: 'approval' })
   })
 
-  test('plain Error has no data (standard properties are non-enumerable)', async () => {
+  test('plain Error has no fields (standard properties are non-enumerable)', async () => {
     const result = await runtime.run({ code: 'throw new Error("plain")' })
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.data).toBeUndefined()
+    expect(result.error.fields).toBeUndefined()
   })
 })
 
@@ -1606,7 +1606,7 @@ describe('host bridge error propagation', () => {
     expect(result.error.stack).toBeUndefined()
   })
 
-  test('host handler error own props arrive as error.data', async () => {
+  test('host handler error own props arrive as error.fields', async () => {
     const result = await runtime.run({
       code: 'export default await boom()',
       globals: {
@@ -1623,7 +1623,7 @@ describe('host bridge error propagation', () => {
     if (result.ok)
       return
     expect(result.error.code).toBe('ERR_HOST_BRIDGE')
-    expect(result.error.data).toEqual({ code: 'E_FOO', attempt: 2 })
+    expect(result.error.fields).toEqual({ code: 'E_FOO', attempt: 2 })
   })
 
   test('host handler error is catchable in the sandbox and preserves identity', async () => {
@@ -1637,7 +1637,7 @@ describe('host bridge error propagation', () => {
           out = {
             name: e.name,
             message: e.message,
-            code: e.data?.code,
+            code: e.code,
             isTypeError: e instanceof TypeError,
             isError: e instanceof Error,
           }
@@ -1677,7 +1677,7 @@ describe('host bridge error propagation', () => {
         try {
           await runStep()
         } catch (e) {
-          out = e.name === 'WorkflowTimeout' ? \`timeout after \${e.data?.timeoutMs}ms\` : 'unexpected'
+          out = e.name === 'WorkflowTimeout' ? \`timeout after \${e.timeoutMs}ms\` : 'unexpected'
         }
         export default out
       `,
@@ -1751,9 +1751,11 @@ describe('host bridge error propagation', () => {
 // headers, retryable flag) thrown on either side of the bridge, asserting
 // exactly which fields arrive on the other side:
 //
-//   host → sandbox:  name + message + own props via `e.data`; host stack
+//   host → sandbox:  name + message + own props re-attached DIRECTLY on the
+//                    caught Error (`e.status`, `e.reason`, …); host stack
 //                    NEVER crosses (only a sandbox-local stack exists).
-//   sandbox → host:  name + message + own props via `error.data`; the
+//   sandbox → host:  name + message + own props under `error.fields`
+//                    (namespaced so nothing collides with `error.code`); the
 //                    sandbox stack IS exposed to the host (host is trusted).
 
 /** Rich host-side error, as a host HTTP client library would define it. */
@@ -1786,7 +1788,7 @@ describe('custom error classes end-to-end', () => {
     await runtime?.dispose()
   })
 
-  test('host-thrown HttpError: sandbox catch sees name, message, and full data', async () => {
+  test('host-thrown HttpError: sandbox catch sees name, message, and direct props', async () => {
     const result = await runtime.run({
       code: `
         let caught
@@ -1796,7 +1798,12 @@ describe('custom error classes end-to-end', () => {
           caught = {
             name: e.name,
             message: e.message,
-            data: e.data,
+            status: e.status,
+            code: e.code,
+            reason: e.reason,
+            reasoning: e.reasoning,
+            headers: e.headers,
+            retryable: e.retryable,
             isError: e instanceof Error,
             stackHasHostFrames: String(e.stack ?? '').includes('e2e.test'),
           }
@@ -1805,7 +1812,10 @@ describe('custom error classes end-to-end', () => {
       `,
       globals: {
         fetchUser: async () => {
-          throw new HttpError(503, 'E_UPSTREAM', 'upstream unavailable', true)
+          throw Object.assign(
+            new HttpError(503, 'E_UPSTREAM', 'upstream unavailable', true),
+            { reasoning: 'circuit breaker open' },
+          )
         },
       },
     })
@@ -1815,19 +1825,18 @@ describe('custom error classes end-to-end', () => {
     expect(result.exports.default).toEqual({
       name: 'HttpError',
       message: 'HTTP 503: upstream unavailable',
-      data: {
-        status: 503,
-        code: 'E_UPSTREAM',
-        reason: 'upstream unavailable',
-        headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
-        retryable: true,
-      },
+      status: 503,
+      code: 'E_UPSTREAM',
+      reason: 'upstream unavailable',
+      reasoning: 'circuit breaker open',
+      headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
+      retryable: true,
       isError: true,
       stackHasHostFrames: false,
     })
   })
 
-  test('host-thrown HttpError: sandbox retry logic can branch on data', async () => {
+  test('host-thrown HttpError: sandbox retry logic can branch on direct props', async () => {
     let attempts = 0
     const result = await runtime.run({
       code: `
@@ -1837,7 +1846,7 @@ describe('custom error classes end-to-end', () => {
             response = await fetchUser(42)
             break
           } catch (e) {
-            if (e.name !== 'HttpError' || !e.data.retryable)
+            if (e.name !== 'HttpError' || !e.retryable)
               throw e
           }
         }
@@ -1859,7 +1868,7 @@ describe('custom error classes end-to-end', () => {
     expect(result.exports.default).toEqual({ id: 42, name: 'jakob' })
   })
 
-  test('host-thrown HttpError uncaught: RunResult error carries name and data, no stack', async () => {
+  test('host-thrown HttpError uncaught: RunResult error carries name and fields, no stack', async () => {
     const result = await runtime.run({
       code: 'export default await fetchUser(42)',
       globals: {
@@ -1874,7 +1883,7 @@ describe('custom error classes end-to-end', () => {
     expect(result.error.code).toBe('ERR_HOST_BRIDGE')
     expect(result.error.name).toBe('HttpError')
     expect(result.error.message).toBe('HTTP 404: no such user')
-    expect(result.error.data).toEqual({
+    expect(result.error.fields).toEqual({
       status: 404,
       code: 'E_NOT_FOUND',
       reason: 'no such user',
@@ -1884,7 +1893,7 @@ describe('custom error classes end-to-end', () => {
     expect(result.error.stack).toBeUndefined()
   })
 
-  test('sandbox-thrown HttpError: RunResult error carries name, data, and the sandbox stack', async () => {
+  test('sandbox-thrown HttpError: RunResult error carries name, fields, and the sandbox stack', async () => {
     const result = await runtime.run({
       code: `
         class HttpError extends Error {
@@ -1907,7 +1916,7 @@ describe('custom error classes end-to-end', () => {
     expect(result.error.code).toBe('ERR_USER_CODE')
     expect(result.error.name).toBe('HttpError')
     expect(result.error.message).toBe('HTTP 429: too many requests')
-    expect(result.error.data).toEqual({
+    expect(result.error.fields).toEqual({
       status: 429,
       code: 'E_RATE_LIMIT',
       reason: 'too many requests',
@@ -1918,16 +1927,13 @@ describe('custom error classes end-to-end', () => {
     expect(result.error.stack).toContain('HttpError')
   })
 
-  test('round-trip: sandbox rebuilds and rethrows a host HttpError without losing fields', async () => {
-    // The durable-execution pattern from #22: catch a host failure, rethrow
-    // it in-sandbox with identical identity, and let it surface to the host.
+  test('round-trip: rethrowing the caught host error keeps ERR_HOST_BRIDGE and all fields', async () => {
     const result = await runtime.run({
       code: `
         try {
           await fetchUser(42)
         } catch (e) {
-          const rebuilt = Object.assign(new Error(e.message), { name: e.name, ...e.data })
-          throw rebuilt
+          throw e
         }
       `,
       globals: {
@@ -1939,17 +1945,120 @@ describe('custom error classes end-to-end', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    // Rethrown by sandbox code, so it surfaces as user code — with the
-    // original host error's identity fully intact.
-    expect(result.error.code).toBe('ERR_USER_CODE')
+    // The rethrown object is still the host bridge error, so it keeps its
+    // classification — nothing is lost across the full cycle.
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
     expect(result.error.name).toBe('HttpError')
     expect(result.error.message).toBe('HTTP 503: upstream unavailable')
-    expect(result.error.data).toEqual({
+    expect(result.error.fields).toEqual({
       status: 503,
       code: 'E_UPSTREAM',
       reason: 'upstream unavailable',
       headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
       retryable: true,
+    })
+  })
+
+  test('fields added by the sandbox before rethrowing survive to the host', async () => {
+    const result = await runtime.run({
+      code: `
+        try {
+          await fetchUser(42)
+        } catch (e) {
+          e.attemptsMade = 3
+          throw e
+        }
+      `,
+      globals: {
+        fetchUser: async () => {
+          throw new HttpError(503, 'E_UPSTREAM', 'upstream unavailable', true)
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+    expect(result.error.fields).toMatchObject({
+      code: 'E_UPSTREAM',
+      attemptsMade: 3,
+    })
+  })
+
+  test('round-trip: sandbox rebuilds a fresh error from the caught one (durable-execution pattern)', async () => {
+    // The pattern from #22: rebuild an equivalent error in-sandbox. Since
+    // carried fields are direct own-enumerable props, a plain spread copies
+    // them all; the fresh object is user code's own, so ERR_USER_CODE.
+    const result = await runtime.run({
+      code: `
+        try {
+          await fetchUser(42)
+        } catch (e) {
+          throw Object.assign(new Error(e.message), { ...e })
+        }
+      `,
+      globals: {
+        fetchUser: async () => {
+          throw new HttpError(503, 'E_UPSTREAM', 'upstream unavailable', true)
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('HttpError')
+    expect(result.error.message).toBe('HTTP 503: upstream unavailable')
+    expect(result.error.fields).toEqual({
+      status: 503,
+      code: 'E_UPSTREAM',
+      reason: 'upstream unavailable',
+      headers: { 'retry-after': '30', 'x-request-id': 'req_123' },
+      retryable: true,
+    })
+  })
+
+  test('sandbox throw of a bare string arrives as a clean Error result', async () => {
+    const result = await runtime.run({
+      code: 'throw "some string"',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('Error')
+    expect(result.error.message).toBe('some string')
+    // No wrapper-object garbage: neither a literal "undefined" stack nor
+    // the string's character indices as fields.
+    expect(result.error.stack).toBeUndefined()
+    expect(result.error.fields).toBeUndefined()
+  })
+
+  test('host throw of a bare string reaches the sandbox as an Error with that message', async () => {
+    const result = await runtime.run({
+      code: `
+        let caught
+        try {
+          await boom()
+        } catch (e) {
+          caught = { isError: e instanceof Error, name: e.name, message: e.message }
+        }
+        export default caught
+      `,
+      globals: {
+        boom: async () => {
+          // eslint-disable-next-line no-throw-literal
+          throw 'host string'
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      isError: true,
+      name: 'Error',
+      message: 'host string',
     })
   })
 })

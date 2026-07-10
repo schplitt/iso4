@@ -326,7 +326,7 @@ pub struct RuntimeErrorData {
     pub name: String,
     pub message: String,
     pub stack: Option<String>,
-    pub data: Option<WireValue>,
+    pub fields: Option<WireValue>,
 }
 
 /// All the ways an execution can fail.
@@ -352,7 +352,7 @@ pub enum RunError {
     MemoryLimit,
     /// Configured host global/import handler threw or rejected and the
     /// sandbox did not catch it. Carries the handler error's `name`,
-    /// `message`, and own-enumerable `data` (never the host stack).
+    /// `message`, and own-enumerable `fields` (never the host stack).
     HostBridge(Box<BridgeErrorPayload>),
     /// PrefixRun attempted to bind a global not declared by Precompile.
     /// Raised in session.rs when a PrefixRun global was not declared in Precompile.
@@ -743,7 +743,7 @@ fn run_module(
                     name: exception_name(scope),
                     message: exception_message(scope),
                     stack: exception_stack(scope),
-                    data: exception_data(scope),
+                    fields: exception_fields(scope),
                 })),
             };
             return Err(failure(error, &logs, start));
@@ -808,7 +808,7 @@ fn run_module(
                 cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
                 let rejection = promise.result(scope);
                 // A rejection tagged as a host bridge error surfaces as
-                // ERR_HOST_BRIDGE with the handler's name/message/data intact.
+                // ERR_HOST_BRIDGE with the handler's name/message/fields intact.
                 if let Some(err) = host_bridge_error_from_rejection(scope, rejection) {
                     return Err(failure(err, &logs, start));
                 }
@@ -932,7 +932,7 @@ fn run_module(
                                 }
                                 Err(bridge_err) => {
                                     // Reject with a real Error carrying the
-                                    // handler's name/message/data, tagged with
+                                    // handler's name/message/fields, tagged
                                     // a private symbol so the Rejected arm can
                                     // classify an *uncaught* one as HostBridge.
                                     // Sandbox code may catch it and continue —
@@ -1161,7 +1161,7 @@ fn precompile_module(
                         name: exception_name(scope),
                         message: exception_message(scope),
                         stack: exception_stack(scope),
-                        data: exception_data(scope),
+                        fields: exception_fields(scope),
                     })),
                     &logs,
                     start,
@@ -1495,7 +1495,7 @@ impl Drop for GuardCanceller<'_> {
 //   5. Calls cpu_budget.enter() to resume counting.
 //   6. On success: deserialises the WireValue result back to a V8 value.
 //   7. On handler error: rejects the pending Promise with a real Error
-//      carrying the handler's name/message/data (tagged via a private
+//      carrying the handler's name/message/fields (tagged via a private
 //      symbol). Sandbox code may catch it and continue; uncaught it
 //      surfaces as ERR_HOST_BRIDGE. Only limit violations (maxBridgeCalls,
 //      payload too large, function args) store a RunError in the shared
@@ -1816,9 +1816,12 @@ const INTRINSIC_ERROR_NAMES: [&str; 5] = [
 
 /// Materialise a host bridge handler error as a real sandbox Error object:
 /// `name` (via the matching intrinsic constructor where one exists), `message`,
-/// and structured `data`. The host stack is deliberately never carried across
-/// the bridge. The object is tagged with [`HOST_BRIDGE_ERROR_TAG`] so an
-/// uncaught rejection classifies as `ERR_HOST_BRIDGE`.
+/// and every carried field re-attached as a direct own property — so the
+/// caught error has the same shape the host handler threw. The host stack is
+/// deliberately never carried across the bridge, and `name`/`message`/`stack`
+/// can never be overridden through the fields payload. The object is tagged
+/// with [`HOST_BRIDGE_ERROR_TAG`] so an uncaught rejection classifies as
+/// `ERR_HOST_BRIDGE`.
 fn host_bridge_error_to_v8<'s>(
     scope: &mut v8::HandleScope<'s>,
     err: &BridgeErrorPayload,
@@ -1842,12 +1845,20 @@ fn host_bridge_error_to_v8<'s>(
             obj.set(scope, key.into(), name.into());
         }
     }
-    if let Some(data) = &err.data {
-        if let (Some(key), Some(value)) = (
-            v8::String::new(scope, "data"),
-            wire_to_v8_value(scope, data),
-        ) {
-            obj.set(scope, key.into(), value);
+    // Re-attach carried fields as direct own properties. The TS encoder only
+    // ever sends an Object here; skip reserved keys defensively so a crafted
+    // payload cannot override Error identity or inject a fake stack, and drop
+    // "__proto__" per the protocol-wide policy (it never crosses either way).
+    if let Some(WireValue::Object(entries)) = &err.fields {
+        for (key, value) in entries {
+            if matches!(key.as_str(), "name" | "message" | "stack" | "__proto__") {
+                continue;
+            }
+            if let (Some(k), Some(v)) =
+                (v8::String::new(scope, key), wire_to_v8_value(scope, value))
+            {
+                obj.create_data_property(scope, k.into(), v);
+            }
         }
     }
     if let Some(tag) = host_bridge_tag(scope) {
@@ -1862,7 +1873,9 @@ fn host_bridge_error_to_v8<'s>(
 ///
 /// Fields are re-read from the object (not stashed host-side) because several
 /// bridge errors can be in flight and sandbox code may catch some of them —
-/// only the object that actually rejected the module promise matters.
+/// only the object that actually rejected the module promise matters. Reading
+/// own-enumerable properties also means a field added by sandbox code before
+/// rethrowing survives to the host.
 fn host_bridge_error_from_rejection(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
@@ -1875,19 +1888,10 @@ fn host_bridge_error_from_rejection(
     let name = error_name_from_value(scope, value).unwrap_or_else(|| "Error".to_string());
     let message =
         error_message_from_value(scope, value).unwrap_or_else(|| "host handler failed".to_string());
-    let data_key = v8::String::new(scope, "data")?;
-    let data = obj.get(scope, data_key.into()).and_then(|d| {
-        if d.is_undefined() || d.is_null() {
-            None
-        } else {
-            let mut visiting = Vec::new();
-            value_to_wire(scope, d, &mut visiting).ok()
-        }
-    });
     Some(RunError::HostBridge(Box::new(BridgeErrorPayload {
         name,
         message,
-        data,
+        fields: error_fields_from_value(scope, value),
     })))
 }
 
@@ -2222,7 +2226,7 @@ fn runtime_error_from_value(
         name,
         message,
         stack: stack_from_value(scope, value),
-        data: error_data_from_value(scope, value),
+        fields: error_fields_from_value(scope, value),
     }))
 }
 
@@ -2248,8 +2252,13 @@ fn stack_from_value(
 ) -> Option<String> {
     let object = value.to_object(scope)?;
     let key = v8::String::new(scope, "stack")?;
-    object
-        .get(scope, key.into())?
+    let stack = object.get(scope, key.into())?;
+    // Skip undefined/null — thrown primitives produce a wrapper object whose
+    // .stack is undefined, which would stringify to the literal "undefined".
+    if stack.is_undefined() || stack.is_null() {
+        return None;
+    }
+    stack
         .to_string(scope)
         .map(|s| s.to_rust_string_lossy(scope))
 }
@@ -2290,14 +2299,20 @@ fn exception_name(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
 }
 
 /// Extract own enumerable properties from the thrown value, skipping `name`,
-/// `message`, and `stack` (already captured in dedicated fields). Non-
+/// `message`, and `stack` (reserved — captured in dedicated fields). Non-
 /// serializable properties (functions, symbols, unresolved promises) are
 /// silently dropped. Returns `None` for non-object throws or when no
 /// serializable own properties remain.
-fn error_data_from_value(
+fn error_fields_from_value(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
 ) -> Option<WireValue> {
+    // Thrown primitives have no own properties of their own; to_object()
+    // would create a wrapper (a String wrapper enumerates its character
+    // indices) — never collect fields from those.
+    if !value.is_object() {
+        return None;
+    }
     let obj = value.to_object(scope)?;
     let names = obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())?;
     let skip = ["name", "message", "stack", "__proto__"];
@@ -2333,9 +2348,9 @@ fn error_data_from_value(
     }
 }
 
-fn exception_data(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<WireValue> {
+fn exception_fields(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<WireValue> {
     let exception = scope.exception()?;
-    error_data_from_value(scope, exception)
+    error_fields_from_value(scope, exception)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4063,12 +4078,12 @@ mod tests {
         p
     }
 
-    /// Encode an error BridgeResponse payload (callId, ok=0, name/message/data).
+    /// Encode an error BridgeResponse payload (callId, ok=0, name/message/fields).
     fn bridge_resp_err_full(
         call_id: u32,
         name: &str,
         message: &str,
-        data: Option<&WireValue>,
+        fields: Option<&WireValue>,
     ) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&call_id.to_be_bytes());
@@ -4079,10 +4094,10 @@ mod tests {
             p.extend_from_slice(b);
         }
         p.push(0); // no stack
-        match data {
-            Some(d) => {
+        match fields {
+            Some(f) => {
                 p.push(1);
-                wire::encode_wire_value(d, &mut p);
+                wire::encode_wire_value(f, &mut p);
             }
             None => p.push(0),
         }
@@ -4250,8 +4265,8 @@ mod tests {
     }
 
     #[test]
-    fn bridge_host_error_preserves_name_and_data_when_uncaught() {
-        let data = WireValue::Object(vec![(
+    fn bridge_host_error_preserves_name_and_fields_when_uncaught() {
+        let fields = WireValue::Object(vec![(
             "code".to_string(),
             WireValue::String("E_FOO".into()),
         )]);
@@ -4267,7 +4282,7 @@ mod tests {
                 ipc::write_ts_to_rust_frame(
                     s,
                     ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err_full(0, "WorkflowTimeout", "took too long", Some(&data)),
+                    &bridge_resp_err_full(0, "WorkflowTimeout", "took too long", Some(&fields)),
                 )
                 .unwrap();
             },
@@ -4279,7 +4294,7 @@ mod tests {
                 assert_eq!(e.name, "WorkflowTimeout");
                 assert_eq!(e.message, "took too long");
                 assert_eq!(
-                    e.data,
+                    e.fields,
                     Some(WireValue::Object(vec![(
                         "code".to_string(),
                         WireValue::String("E_FOO".into())
@@ -4293,8 +4308,9 @@ mod tests {
     #[test]
     fn bridge_host_error_is_catchable_in_sandbox() {
         // Sandbox catches the host error and inspects it: the run succeeds
-        // and the caught error exposes name, message, data, and instanceof.
-        let data = WireValue::Object(vec![("code".to_string(), WireValue::String("E_T".into()))]);
+        // and the caught error exposes name, message, direct fields, and
+        // instanceof.
+        let fields = WireValue::Object(vec![("code".to_string(), WireValue::String("E_T".into()))]);
         let (result, h) = run_with_bridge(
             r#"
             let out;
@@ -4305,7 +4321,7 @@ mod tests {
               out = [
                 e.name,
                 e.message,
-                e.data && e.data.code,
+                e.code,
                 e instanceof TypeError,
                 e instanceof Error,
               ].join("|");
@@ -4322,7 +4338,7 @@ mod tests {
                 ipc::write_ts_to_rust_frame(
                     s,
                     ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err_full(0, "TypeError", "bad input", Some(&data)),
+                    &bridge_resp_err_full(0, "TypeError", "bad input", Some(&fields)),
                 )
                 .unwrap();
             },
@@ -4333,6 +4349,73 @@ mod tests {
             get_default(&out).as_deref(),
             Some("TypeError|bad input|E_T|true|true")
         );
+    }
+
+    #[test]
+    fn bridge_host_error_reserved_keys_cannot_be_injected_via_fields() {
+        // A crafted fields payload must not override Error identity.
+        let fields = WireValue::Object(vec![
+            ("name".to_string(), WireValue::String("Spoofed".into())),
+            ("message".to_string(), WireValue::String("spoofed".into())),
+            ("stack".to_string(), WireValue::String("fake stack".into())),
+            ("ok".to_string(), WireValue::String("legit".into())),
+        ]);
+        let (result, h) = run_with_bridge(
+            r#"
+            let out;
+            try { await myTool() } catch (e) {
+              out = [e.name, e.message, e.ok, String(e.stack).includes("fake stack")].join("|");
+            }
+            export default out;
+            "#,
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            move |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_err_full(0, "Error", "real message", Some(&fields)),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let out = result.expect("caught host error must not fail the run");
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("Error|real message|legit|false")
+        );
+    }
+
+    #[test]
+    fn sandbox_thrown_primitive_has_no_stack_and_no_fields() {
+        let err = run_code(
+            r#"throw "some string""#,
+            "<test>",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        match err {
+            RunError::RuntimeError(e) => {
+                assert_eq!(e.name, "Error");
+                assert_eq!(e.message, "some string");
+                assert_eq!(e.stack, None, "primitive throw must not carry a stack");
+                assert_eq!(
+                    e.fields, None,
+                    "primitive throw must not enumerate wrapper chars"
+                );
+            }
+            other => panic!("expected RuntimeError, got {other:?}"),
+        }
     }
 
     #[test]
