@@ -99,4 +99,9 @@ jobs:
             cp ".artifacts/iso4-v8-${platform}/iso4-v8" "$dest/iso4-v8"
             chmod +x "$dest/iso4-v8"
           done
-      - run: pnpm exec changeset publish
+      - name: Publish to npm + create GitHub Releases
+        uses: changesets/action@v1
+        with:
+          publish: pnpm exec changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
