@@ -35,14 +35,20 @@ const prefix = await sandbox.precompile({
     globalThis.config = config
   `,
   globals: {
-    fetch: createSafeFetch({ policy: ({ host }) => host === 'api.example.com' }),
+    fetch: createSafeFetch({
+      rules: {
+        host: 'api.example.com',
+        routes: [{ path: '/users/**', methods: 'GET' }],
+      },
+    }),
   },
 })
 
 const result = await prefix.run({
   code: `
     const res = await fetch(config.apiBase + '/users')
-    export default { count: res.length }
+    const users = res.json()
+    export default { count: users.length }
   `,
   limits: { cpuTimeMs: 200, memoryMb: 64 },
 })
@@ -56,14 +62,14 @@ await sandbox.dispose()
 
 ## Packages
 
-| Package                                    | Status      | Description                                                                       |
-| ------------------------------------------ | ----------- | --------------------------------------------------------------------------------- |
-| [`@iso4/sandbox`](./packages/iso4-sandbox) | working     | Subprocess V8 sandbox — crash-isolated, host bridge, snapshot-based prefixes      |
-| [`@iso4/fetch`](./packages/iso4-fetch)     | scaffolding | Hardened `FetchHandler` with DNS pin, allowlist, SSRF blocks                      |
-| `@iso4/embed`                              | future      | In-process V8 sandbox for high-throughput trusted code (NAPI, no crash isolation) |
-| `@iso4/fs`                                 | future      | `node:fs` stub factory with configurable root + permissions                       |
-| `@iso4/crypto`                             | future      | `node:crypto` stub factory (safe subset)                                          |
-| `@iso4/v8-<platform>`                      | working     | Per-platform Rust binaries for `@iso4/sandbox` (built in CI, not committed)       |
+| Package                                    | Status  | Description                                                                                                               |
+| ------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| [`@iso4/sandbox`](./packages/iso4-sandbox) | working | Subprocess V8 sandbox — crash-isolated, host bridge, snapshot-based prefixes                                              |
+| [`@iso4/fetch`](./packages/iso4-fetch)     | working | Hardened `fetch` for sandbox globals: DNS pinning, SSRF blocking, route-based allowlist, middleware, redirect re-checking |
+| `@iso4/embed`                              | future  | In-process V8 sandbox for high-throughput trusted code (NAPI, no crash isolation)                                         |
+| `@iso4/fs`                                 | future  | `node:fs` stub factory with configurable root + permissions                                                               |
+| `@iso4/crypto`                             | future  | `node:crypto` stub factory (safe subset)                                                                                  |
+| `@iso4/v8-<platform>`                      | working | Per-platform Rust binaries for `@iso4/sandbox` (built in CI, not committed)                                               |
 
 ## Development
 
@@ -87,6 +93,11 @@ pnpm changeset          # record a per-package version bump
 - CPU and wall-clock limits enforced, async wait excluded from CPU budget ✅
 - Host-declared globals bridged into V8 (`fetch`, `myTool`, any name) ✅
 - `ERR_UNDECLARED_BINDING` enforced on `prefix.run()` globals ✅
+- Host-provided imports — source modules (`string`) and host modules (objects with function/data leaves) resolved via `import` in sandbox code ✅
+- `AbortSignal` support — cancel in-flight runs; `RunResult.status` discriminates `'completed'` | `'failed'` | `'aborted'`, with `reason` on abort ✅
+- Error propagation — thrown error `name`, `stack`, and extra enumerable properties (`error.fields`) survive the bridge in both directions ✅
+- Bridge call limits — `maxBridgeCalls`, `maxBridgeCallBytes`, `maxExportBytes` per run ✅
+- `@iso4/fetch` — rules-based origin + route allowlist, three-level middleware, DNS pinning, SSRF/redirect protection ✅
 
 ## How globals work
 
