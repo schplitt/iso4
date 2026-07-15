@@ -623,6 +623,11 @@ fn run_module(
     install_console(scope, &mut logs as *mut LogBuffers)
         .map_err(|error| failure(error, &logs, start))?;
 
+    // Install AsyncLocalStorage (importable via `node:async_hooks`) for this
+    // run. Always installed: it registers no promise hooks, so runs that never
+    // use it pay only for the class setup, not per-promise overhead.
+    install_async_context(scope).map_err(|error| failure(error, &logs, start))?;
+
     // ── Bridge globals setup ─────────────────────────────────────────────────
     //
     // Shared state for all bridge callbacks in this run. All three are Arcs-
@@ -706,6 +711,7 @@ fn run_module(
         bindings: imports.to_vec(),
         module_cache: HashMap::new(),
         resolve_error: None,
+        async_context_builtin: true,
     });
 
     if module
@@ -1063,148 +1069,159 @@ fn run_module(
     })
 }
 
+/// Compile, instantiate, and evaluate prefix `code` as an ESM module in the
+/// current context, returning `Ok(())` once it settles successfully.
+///
+/// Shared by both precompile passes (the validation isolate and the snapshot
+/// creator) so their behavior — crucially, *which imports resolve* — is
+/// identical. Bridge globals are not installed here (bridge stubs are recreated
+/// per `execute_with_prefix`), and `node:async_hooks` is not resolvable because
+/// the native async-context bindings cannot be captured in a snapshot.
+fn evaluate_prefix_module(
+    scope: &mut v8::TryCatch<v8::HandleScope>,
+    code: &str,
+    filename: &str,
+    imports: &[ImportBinding],
+) -> Result<(), RunError> {
+    let source_string = v8::String::new(scope, code)
+        .ok_or_else(|| RunError::Internal("failed to intern module source".to_string()))?;
+    let filename_str = v8::String::new(scope, filename)
+        .ok_or_else(|| RunError::Internal("failed to intern filename".to_string()))?;
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        filename_str.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        true,
+        None,
+    );
+    let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
+
+    let module = match v8::script_compiler::compile_module(scope, &mut source) {
+        Some(m) => m,
+        None => return Err(RunError::CompileError(exception_message(scope))),
+    };
+
+    let _resolver_guard = install_resolver(ResolverContext {
+        bindings: imports.to_vec(),
+        module_cache: HashMap::new(),
+        resolve_error: None,
+        async_context_builtin: false,
+    });
+
+    if module
+        .instantiate_module(scope, module_resolver_callback)
+        .is_none()
+    {
+        let err = take_resolver()
+            .and_then(|ctx| ctx.resolve_error)
+            .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
+        return Err(err);
+    }
+
+    let evaluation = match module.evaluate(scope) {
+        Some(v) => v,
+        None => {
+            return Err(RunError::RuntimeError(Box::new(RuntimeErrorData {
+                name: exception_name(scope),
+                message: exception_message(scope),
+                stack: exception_stack(scope),
+                fields: exception_fields(scope),
+            })))
+        }
+    };
+
+    if evaluation.is_promise() {
+        let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
+            RunError::Internal("failed to inspect module evaluation promise".to_string())
+        })?;
+        match promise.state() {
+            v8::PromiseState::Fulfilled => {}
+            v8::PromiseState::Rejected => {
+                let rejection = promise.result(scope);
+                return Err(runtime_error_from_value(scope, rejection));
+            }
+            v8::PromiseState::Pending => {
+                return Err(RunError::ExportNotSerializable(
+                    "module evaluation promise is still pending".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Compile and snapshot prefix code into a raw V8 startup blob.
 ///
-/// Uses `Isolate::snapshot_creator` instead of `Isolate::new`. The scope
-/// block must drop before `create_blob` is called, so compilation runs inside
-/// an immediately-invoked closure that borrows `&mut isolate`.
+/// Runs in two passes:
+///   1. **Validation** in a throwaway regular isolate: compile + instantiate +
+///      evaluate exactly as the snapshot pass will. Any failure (syntax error,
+///      unresolved import, throwing top-level code) returns a clean error here.
+///   2. **Snapshot** in a `snapshot_creator` isolate, only reached if pass 1
+///      succeeded.
+///
+/// The two passes exist because `create_blob` **must** be called before a
+/// snapshot-creator isolate is dropped (the binding asserts it), yet calling it
+/// after a failed `instantiate_module` segfaults V8 — the creator must only
+/// ever see code known to be valid. A regular isolate, by contrast, fails an
+/// instantiate as a recoverable error, so it's the only safe place to find out
+/// whether the prefix is snapshot-able. Prefix code is host-authored setup with
+/// no bridge/network side effects, so evaluating it twice is safe.
+///
+/// TODO(async-context PR): revisit whether the validation pass can be made
+/// cheaper (e.g. compile + resolve the full import graph without a second
+/// eval, or recover a snapshot creator after a failed instantiate) instead of
+/// running the prefix twice. Blocked on there being no V8 "dry-run instantiate"
+/// and imports being transitive, so a static check can't see the whole graph.
 fn precompile_module(
     code: &str,
     filename: &str,
     imports: &[ImportBinding],
 ) -> Result<Vec<u8>, FailureOutput> {
     let start = std::time::Instant::now();
+    let logs = LogBuffers::default();
 
-    let mut isolate = v8::Isolate::snapshot_creator(None, None);
-    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+    // Pass 1 creates a regular isolate, which requires the platform to be
+    // initialized. `precompile()` already does this, but call it here too so
+    // direct callers (tests) work; it is idempotent.
+    init_platform();
 
-    // All V8 scopes must be dropped before create_blob is called.
-    // The IIFE ensures the &mut isolate borrow ends when the closure returns.
-    let compile_result: Result<(), FailureOutput> = (|| {
-        let logs = LogBuffers::default();
-
+    // ── Pass 1: validate in a throwaway regular isolate ──────────────────────
+    {
+        let mut isolate = v8::Isolate::new(Default::default());
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         let scope = &mut v8::HandleScope::new(&mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-
-        // Mark this context as the snapshot default BEFORE creating TryCatch.
-        // Must be called while the context Local is still alive.
-        scope.set_default_context(context);
-
         let scope = &mut v8::TryCatch::new(scope);
+        evaluate_prefix_module(scope, code, filename, imports)
+            .map_err(|error| failure(error, &logs, start))?;
+    }
 
-        let source_string = v8::String::new(scope, code).ok_or_else(|| {
-            failure(
-                RunError::Internal("failed to intern module source".to_string()),
-                &logs,
-                start,
-            )
-        })?;
-        let filename_str = v8::String::new(scope, filename).ok_or_else(|| {
-            failure(
-                RunError::Internal("failed to intern filename".to_string()),
-                &logs,
-                start,
-            )
-        })?;
-        let origin = v8::ScriptOrigin::new(
-            scope,
-            filename_str.into(),
-            0,
-            0,
-            false,
-            0,
-            None,
-            false,
-            false,
-            true,
-            None,
-        );
-        let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
+    // ── Pass 2: build the snapshot ───────────────────────────────────────────
+    // Validation passed, so instantiate/evaluate succeed here and create_blob
+    // is safe. All V8 scopes must drop before create_blob, hence the IIFE.
+    let mut isolate = v8::Isolate::snapshot_creator(None, None);
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
-        let module = match v8::script_compiler::compile_module(scope, &mut source) {
-            Some(m) => m,
-            None => {
-                return Err(failure(
-                    RunError::CompileError(exception_message(scope)),
-                    &logs,
-                    start,
-                ))
-            }
-        };
-
-        // Precompile-time resolver: source imports are compiled and evaluated
-        // inside the snapshot's context. Bridge globals (including those
-        // backing host-module function leaves) are *not* installed here —
-        // bridge stubs are recreated per `execute_with_prefix` call.
-        let _resolver_guard = install_resolver(ResolverContext {
-            bindings: imports.to_vec(),
-            module_cache: HashMap::new(),
-            resolve_error: None,
-        });
-
-        if module
-            .instantiate_module(scope, module_resolver_callback)
-            .is_none()
-        {
-            let err = take_resolver()
-                .and_then(|ctx| ctx.resolve_error)
-                .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
-            return Err(failure(err, &logs, start));
-        }
-
-        let evaluation = match module.evaluate(scope) {
-            Some(v) => v,
-            None => {
-                return Err(failure(
-                    RunError::RuntimeError(Box::new(RuntimeErrorData {
-                        name: exception_name(scope),
-                        message: exception_message(scope),
-                        stack: exception_stack(scope),
-                        fields: exception_fields(scope),
-                    })),
-                    &logs,
-                    start,
-                ))
-            }
-        };
-
-        if evaluation.is_promise() {
-            let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
-                failure(
-                    RunError::Internal("failed to inspect module evaluation promise".to_string()),
-                    &logs,
-                    start,
-                )
-            })?;
-            match promise.state() {
-                v8::PromiseState::Fulfilled => {}
-                v8::PromiseState::Rejected => {
-                    let rejection = promise.result(scope);
-                    return Err(failure(
-                        runtime_error_from_value(scope, rejection),
-                        &logs,
-                        start,
-                    ));
-                }
-                v8::PromiseState::Pending => {
-                    return Err(failure(
-                        RunError::ExportNotSerializable(
-                            "module evaluation promise is still pending".to_string(),
-                        ),
-                        &logs,
-                        start,
-                    ));
-                }
-            }
-        }
-
-        Ok(())
+    let compile_result: Result<(), FailureOutput> = (|| {
+        let scope = &mut v8::HandleScope::new(&mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        // Mark this context as the snapshot default BEFORE creating TryCatch.
+        scope.set_default_context(context);
+        let scope = &mut v8::TryCatch::new(scope);
+        evaluate_prefix_module(scope, code, filename, imports)
+            .map_err(|error| failure(error, &logs, start))
     })();
 
-    // V8 requires create_blob to be called before dropping a snapshot-creator
-    // isolate, even when compilation failed. We call it unconditionally and
-    // only use the blob on the success path.
+    // V8 requires create_blob before dropping a snapshot-creator isolate.
     let snapshot_opt = isolate.create_blob(v8::FunctionCodeHandling::Keep);
 
     compile_result?;
@@ -1267,6 +1284,12 @@ struct ResolverContext {
     /// First resolver error wins. V8's callback ABI can't carry a
     /// `RunError`, so the caller inspects this after `instantiate_module`.
     resolve_error: Option<RunError>,
+    /// When true, the reserved specifier `node:async_hooks` resolves to the
+    /// built-in `AsyncLocalStorage` module (see [`install_async_context`]).
+    /// Enabled for runs (`run_module`), disabled for snapshot creation
+    /// (`precompile_module`) because the native async-context bindings cannot
+    /// be captured in a V8 startup snapshot.
+    async_context_builtin: bool,
 }
 
 thread_local! {
@@ -1308,6 +1331,15 @@ fn lookup_binding(specifier: &str) -> Option<ImportBinding> {
                 .find(|b| b.specifier == specifier)
                 .cloned()
         })
+    })
+}
+
+fn async_context_builtin_enabled() -> bool {
+    RESOLVER_CTX.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|ctx| ctx.async_context_builtin)
+            .unwrap_or(false)
     })
 }
 
@@ -1356,7 +1388,19 @@ fn module_resolver_callback<'a>(
         return Some(scope.escape(local));
     }
 
-    let binding = lookup_binding(&specifier_str)?;
+    // Host-declared bindings take precedence, so a host that ships its own
+    // `node:async_hooks` shim can still override the built-in. Only when no
+    // binding matches do we fall back to the built-in async-context module.
+    let binding = match lookup_binding(&specifier_str) {
+        Some(b) => b,
+        None if specifier_str == ASYNC_HOOKS_SPECIFIER && async_context_builtin_enabled() => {
+            ImportBinding {
+                specifier: specifier_str.clone(),
+                source: ASYNC_HOOKS_MODULE_SRC.to_string(),
+            }
+        }
+        None => return None,
+    };
     let module = compile_source_module(scope, &specifier_str, &binding)?;
 
     let global = v8::Global::new(scope, module);
@@ -2015,6 +2059,133 @@ fn append_console_line(
             buffers.stderr.push(line);
         }
     }
+}
+
+// ── Async context (AsyncLocalStorage) ────────────────────────────────────────
+//
+// A minimal, Node-compatible `AsyncLocalStorage` (`run` + `getStore`), surfaced
+// to run/postfix code via `import { AsyncLocalStorage } from 'node:async_hooks'`.
+//
+// Mechanism: V8's *continuation-preserved embedder data* (CPED) — the same
+// primitive modern Node's `AsyncContextFrame` rides on. V8 automatically saves
+// the CPED slot with each promise continuation and restores it when that
+// continuation runs, so an ambient value follows `async`/`await` chains without
+// being threaded through call signatures, and concurrent chains stay isolated.
+//
+// The runtime installs two native functions (get/set CPED) and hands them to a
+// small JS factory that returns the `AsyncLocalStorage` class closing over
+// them. The class is stashed on `globalThis` under `Symbol.for(...)`; the
+// built-in `node:async_hooks` module re-exports it. The native get/set are
+// never exposed to user code — they live only in the factory closure.
+//
+// No promise hooks are registered, so runs that never construct an
+// `AsyncLocalStorage` pay nothing beyond V8's own (cheap) CPED bookkeeping.
+// State resets between runs naturally (fresh isolate per run). CPED is runtime
+// state, not part of the snapshot, which is why the feature is unavailable to
+// prefix/precompile code (see `async_context_builtin` on `ResolverContext`).
+
+/// Reserved module specifier that resolves to the built-in async-context module.
+const ASYNC_HOOKS_SPECIFIER: &str = "node:async_hooks";
+
+/// Global-registry symbol description under which the `AsyncLocalStorage` class
+/// is stashed. Must match `Symbol.for(...)` in [`ASYNC_HOOKS_MODULE_SRC`].
+const ASYNC_CONTEXT_SYMBOL: &str = "iso4.async_hooks.AsyncLocalStorage";
+
+/// Classic script evaluated once per run. Returns the `AsyncLocalStorage`
+/// constructor, closing over the native `getContext`/`setContext` bindings.
+///
+/// Contexts are singly-linked frames (`{ p: parent, k: instance, v: value }`)
+/// carried in the CPED slot. Reads walk the chain by instance identity. Only
+/// object literals and own-property reads are used, so user code tampering with
+/// builtin prototypes cannot subvert propagation. `run`'s `finally` restores the
+/// parent for the synchronous tail; V8 restores the per-continuation frame for
+/// the asynchronous tail.
+const ASYNC_CONTEXT_FACTORY_SRC: &str = r#"
+(function (getContext, setContext) {
+  'use strict';
+  class AsyncLocalStorage {
+    run(store, callback, ...args) {
+      const parent = getContext();
+      const frame = { p: parent, k: this, v: store };
+      setContext(frame);
+      try {
+        return callback(...args);
+      } finally {
+        setContext(parent);
+      }
+    }
+    getStore() {
+      let frame = getContext();
+      while (frame != null) {
+        if (frame.k === this) return frame.v;
+        frame = frame.p;
+      }
+      return undefined;
+    }
+  }
+  return AsyncLocalStorage;
+})
+"#;
+
+/// ESM source of the built-in `node:async_hooks` module. Re-exports the class
+/// installed by [`install_async_context`].
+const ASYNC_HOOKS_MODULE_SRC: &str = "export const AsyncLocalStorage = \
+    globalThis[Symbol.for('iso4.async_hooks.AsyncLocalStorage')];\n";
+
+/// Native getter for the continuation-preserved embedder data slot.
+fn async_context_get_callback(
+    scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let data = scope.get_continuation_preserved_embedder_data();
+    rv.set(data);
+}
+
+/// Native setter for the continuation-preserved embedder data slot.
+fn async_context_set_callback(
+    scope: &mut v8::HandleScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    scope.set_continuation_preserved_embedder_data(args.get(0));
+    rv.set_undefined();
+}
+
+/// Install the `AsyncLocalStorage` class on `globalThis` under
+/// `Symbol.for(ASYNC_CONTEXT_SYMBOL)`. Called once per run before module
+/// instantiation so the built-in `node:async_hooks` module can read it.
+fn install_async_context(scope: &mut v8::HandleScope) -> Result<(), RunError> {
+    let get_fn = v8::Function::builder(async_context_get_callback)
+        .build(scope)
+        .ok_or_else(|| RunError::Internal("failed to build async-context getter".to_string()))?;
+    let set_fn = v8::Function::builder(async_context_set_callback)
+        .build(scope)
+        .ok_or_else(|| RunError::Internal("failed to build async-context setter".to_string()))?;
+
+    let factory_src = v8::String::new(scope, ASYNC_CONTEXT_FACTORY_SRC)
+        .ok_or_else(|| RunError::Internal("failed to intern async-context factory".to_string()))?;
+    let script = v8::Script::compile(scope, factory_src, None)
+        .ok_or_else(|| RunError::Internal("failed to compile async-context factory".to_string()))?;
+    let factory_val = script
+        .run(scope)
+        .ok_or_else(|| RunError::Internal("failed to run async-context factory".to_string()))?;
+    let factory = v8::Local::<v8::Function>::try_from(factory_val)
+        .map_err(|_| RunError::Internal("async-context factory is not a function".to_string()))?;
+
+    let undefined = v8::undefined(scope).into();
+    let class = factory
+        .call(scope, undefined, &[get_fn.into(), set_fn.into()])
+        .ok_or_else(|| RunError::Internal("async-context factory call failed".to_string()))?;
+
+    let symbol_desc = v8::String::new(scope, ASYNC_CONTEXT_SYMBOL)
+        .ok_or_else(|| RunError::Internal("failed to intern async-context symbol".to_string()))?;
+    let symbol = v8::Symbol::for_key(scope, symbol_desc);
+    let global = scope.get_current_context().global(scope);
+    global
+        .set(scope, symbol.into(), class)
+        .ok_or_else(|| RunError::Internal("failed to install AsyncLocalStorage".to_string()))?;
+    Ok(())
 }
 
 /// Convert a top-level module export value to a `WireValue`.
@@ -5230,5 +5401,163 @@ mod tests {
         } else {
             panic!("expected WireValue::Object");
         }
+    }
+
+    // ── Async context (AsyncLocalStorage) ─────────────────────────────────
+
+    #[test]
+    fn async_context_available_via_node_async_hooks() {
+        let out = run(r#"
+            import { AsyncLocalStorage } from 'node:async_hooks';
+            export default typeof AsyncLocalStorage;
+        "#)
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn async_context_propagates_across_awaits() {
+        // The store set by `run` is visible several awaits deep, through a
+        // nested async function that never received it as an argument.
+        let out = run(r#"
+            import { AsyncLocalStorage } from 'node:async_hooks';
+            const als = new AsyncLocalStorage();
+            async function deep() {
+                await Promise.resolve();
+                await Promise.resolve();
+                return als.getStore();
+            }
+            export default await als.run('trace-42', async () => {
+                await Promise.resolve();
+                return deep();
+            });
+        "#)
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("trace-42"));
+    }
+
+    #[test]
+    fn async_context_getstore_undefined_outside_run() {
+        let out = run(r#"
+            import { AsyncLocalStorage } from 'node:async_hooks';
+            const als = new AsyncLocalStorage();
+            export default als.getStore() === undefined ? 'undef' : 'defined';
+        "#)
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("undef"));
+    }
+
+    #[test]
+    fn async_context_nested_run_breadcrumb() {
+        // The durable-workflow `step.do` pattern: each nested scope appends a
+        // segment to the key, and the inner scope sees the accumulated path
+        // while the outer scope is restored afterwards.
+        let out = run(r#"
+            import { AsyncLocalStorage } from 'node:async_hooks';
+            const keyScope = new AsyncLocalStorage();
+            function step(name, body) {
+                const parent = keyScope.getStore() ?? '';
+                const key = parent ? parent + '/' + name : name;
+                return keyScope.run(key, body);
+            }
+            const seen = [];
+            await step('charge', async () => {
+                await step('validate', async () => {
+                    await Promise.resolve();
+                    seen.push(keyScope.getStore());
+                });
+                seen.push(keyScope.getStore());
+            });
+            export default seen.join(',');
+        "#)
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("charge/validate,charge"));
+    }
+
+    #[test]
+    fn async_context_concurrent_branches_isolated() {
+        // Two branches run concurrently with interleaved awaits; each must see
+        // only its own store. This is the case a plain module variable gets
+        // wrong.
+        let out = run(r#"
+            import { AsyncLocalStorage } from 'node:async_hooks';
+            const als = new AsyncLocalStorage();
+            async function branch(label) {
+                return als.run(label, async () => {
+                    await Promise.resolve();
+                    await Promise.resolve();
+                    const a = als.getStore();
+                    await Promise.resolve();
+                    const b = als.getStore();
+                    return a + ':' + b;
+                });
+            }
+            const [x, y] = await Promise.all([branch('A'), branch('B')]);
+            export default x + '|' + y;
+        "#)
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("A:A|B:B"));
+    }
+
+    #[test]
+    fn async_context_two_instances_independent() {
+        let out = run(r#"
+            import { AsyncLocalStorage } from 'node:async_hooks';
+            const a = new AsyncLocalStorage();
+            const b = new AsyncLocalStorage();
+            export default await a.run('AA', async () => {
+                return b.run('BB', async () => {
+                    await Promise.resolve();
+                    return a.getStore() + ',' + b.getStore();
+                });
+            });
+        "#)
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("AA,BB"));
+    }
+
+    #[test]
+    fn async_context_not_available_in_prefix_code() {
+        // Snapshot creation cannot capture the native async-context bindings,
+        // so importing `node:async_hooks` from prefix code does not resolve.
+        // It returns a clean ModuleNotFound (no crash — see the two-pass
+        // validation in precompile_module).
+        let err = precompile_module(
+            "import { AsyncLocalStorage } from 'node:async_hooks'; export default 1;",
+            "<prefix>",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.error, RunError::ModuleNotFound(_)),
+            "expected ModuleNotFound, got {:?}",
+            err.error
+        );
+    }
+
+    #[test]
+    fn precompile_unresolved_import_is_clean_error_not_crash() {
+        // Regression: precompiling prefix code with any unresolvable import
+        // used to segfault (unconditional create_blob after a failed
+        // instantiate). It must now return a clean ModuleNotFound.
+        let err = precompile_module(
+            "import x from 'totally-nonexistent-xyz'; export default x;",
+            "<prefix>",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err.error, RunError::ModuleNotFound(_)),
+            "expected ModuleNotFound, got {:?}",
+            err.error
+        );
+    }
+
+    #[test]
+    fn precompile_still_succeeds_for_valid_prefix() {
+        // The two-pass validation must not break the happy path.
+        let snapshot =
+            precompile_module("globalThis.base = 100; export default 1;", "<prefix>", &[]).unwrap();
+        assert!(!snapshot.is_empty());
     }
 }

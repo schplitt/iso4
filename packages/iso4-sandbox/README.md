@@ -104,6 +104,30 @@ prefix.run({
 })
 ```
 
+## Async context (`AsyncLocalStorage`)
+
+Run/postfix code can import a minimal, Node-compatible `AsyncLocalStorage` to
+carry an ambient value across `await` points — concurrency-safe, unlike a
+module variable:
+
+```ts
+prefix.run({
+  code: `
+    import { AsyncLocalStorage } from 'node:async_hooks'
+    const als = new AsyncLocalStorage()
+    export default await als.run('trace-42', async () => {
+      await somethingAsync()
+      return als.getStore()   // 'trace-42', even several awaits deep
+    })
+  `,
+})
+```
+
+Only `run(store, callback, ...args)` and `getStore()` are provided. Built on
+V8's continuation-preserved embedder data; no promise hooks, so it's free
+unless used. Not available in `precompile()` (prefix) code — it's for the
+postfix. See DESIGN.md §16.
+
 ## Result shape
 
 ```ts

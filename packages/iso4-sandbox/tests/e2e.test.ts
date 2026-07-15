@@ -1758,7 +1758,9 @@ describe('host bridge error propagation', () => {
 //                    (namespaced so nothing collides with `error.code`); the
 //                    sandbox stack IS exposed to the host (host is trusted).
 
-/** Rich host-side error, as a host HTTP client library would define it. */
+/**
+ * Rich host-side error, as a host HTTP client library would define it.
+ */
 class HttpError extends Error {
   status: number
   code: string
@@ -2356,5 +2358,285 @@ describe('maxBridgeCalls limit', () => {
     expect(result.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
     expect(calls).toBe(2)
     await prefix.dispose()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Async context — AsyncLocalStorage via `node:async_hooks`
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('async context — node:async_hooks', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('AsyncLocalStorage is importable from node:async_hooks', async () => {
+    const result = await runtime.run({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        export default typeof AsyncLocalStorage
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('function')
+  })
+
+  test('store propagates across await points into nested functions', async () => {
+    const result = await runtime.run({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        const als = new AsyncLocalStorage()
+        async function deep() {
+          await Promise.resolve()
+          await Promise.resolve()
+          return als.getStore()
+        }
+        export default await als.run('trace-42', async () => {
+          await Promise.resolve()
+          return deep()
+        })
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('trace-42')
+  })
+
+  test('getStore() is undefined outside any run()', async () => {
+    const result = await runtime.run({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        const als = new AsyncLocalStorage()
+        export default als.getStore() === undefined
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe(true)
+  })
+
+  test('nested run() builds a durable-workflow breadcrumb key', async () => {
+    // step.do(name, fn): each nested scope appends a path segment; the inner
+    // scope sees the accumulated key and the outer scope is restored after.
+    const result = await runtime.run({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        const keyScope = new AsyncLocalStorage()
+        function step(name, body) {
+          const parent = keyScope.getStore() ?? ''
+          const key = parent ? parent + '/' + name : name
+          return keyScope.run(key, body)
+        }
+        const seen = []
+        await step('charge', async () => {
+          await step('validate', async () => {
+            await Promise.resolve()
+            seen.push(keyScope.getStore())
+          })
+          await step('capture', async () => {
+            await Promise.resolve()
+            seen.push(keyScope.getStore())
+          })
+          seen.push(keyScope.getStore())
+        })
+        export default seen
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual([
+      'charge/validate',
+      'charge/capture',
+      'charge',
+    ])
+  })
+
+  test('concurrent branches keep isolated stores (the module-variable trap)', async () => {
+    const result = await runtime.run({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        const als = new AsyncLocalStorage()
+        async function branch(label) {
+          return als.run(label, async () => {
+            await Promise.resolve()
+            await Promise.resolve()
+            const a = als.getStore()
+            await Promise.resolve()
+            const b = als.getStore()
+            return a + ':' + b
+          })
+        }
+        export default await Promise.all([branch('A'), branch('B'), branch('C')])
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual(['A:A', 'B:B', 'C:C'])
+  })
+
+  test('works in postfix code against a precompiled prefix', async () => {
+    const prefix = await runtime.precompile({
+      code: 'globalThis.workflowRoot = "wf"',
+    })
+    const result = await prefix.run({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        const als = new AsyncLocalStorage()
+        export default await als.run(globalThis.workflowRoot, async () => {
+          await Promise.resolve()
+          return als.getStore()
+        })
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      await prefix.dispose()
+      return
+    }
+    expect(result.exports.default).toBe('wf')
+    await prefix.dispose()
+  })
+
+  // ── WORKS: the durable-workflow shape ──────────────────────────────────────
+  // The `step.do(name, fn)` shim lives in a declared IMPORT that the postfix
+  // pulls in. Because the prefix code never imports it, the shim (and its
+  // module-global `AsyncLocalStorage`) is resolved at RUN time — where
+  // `node:async_hooks` is available — not baked into the snapshot.
+
+  const STEP_SHIM_SOURCE = /* js */ `
+    import { AsyncLocalStorage } from 'node:async_hooks'
+    const keyScope = new AsyncLocalStorage()
+    export function step(name, fn) {
+      const parent = keyScope.getStore() ?? ''
+      return keyScope.run(parent ? parent + '/' + name : name, fn)
+    }
+    export function currentKey() { return keyScope.getStore() ?? '' }
+  `
+
+  test('WORKS: step.do shim provided as a run-time import, used by the postfix', async () => {
+    const result = await runtime.run({
+      imports: { 'workflow:steps': STEP_SHIM_SOURCE },
+      code: /* js */ `
+        import { step, currentKey } from 'workflow:steps'
+        const seen = []
+        await step('charge', async () => {
+          await step('validate', async () => {
+            await Promise.resolve()
+            seen.push(currentKey())      // 'charge/validate'
+          })
+          await step('refund', async () => {
+            await step('validate', async () => {   // same name, different path
+              await Promise.resolve()
+              seen.push(currentKey())    // 'charge/refund/validate' — no collision
+            })
+          })
+          seen.push(currentKey())        // 'charge'
+        })
+        export default seen
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual([
+      'charge/validate',
+      'charge/refund/validate',
+      'charge',
+    ])
+  })
+
+  test('WORKS: prefix pre-warms heavy setup; postfix uses BOTH it and the step shim', async () => {
+    // The expensive setup (tools/data) is compiled once into the snapshot and
+    // restored cheaply per run. The async-context shim is a run-time import.
+    // Both are available to the postfix at the same time.
+    const prefix = await runtime.precompile({
+      code: 'globalThis.tools = { rate: (n) => n * 2 }',
+      imports: { 'workflow:steps': STEP_SHIM_SOURCE },
+    })
+    const result = await prefix.run({
+      code: /* js */ `
+        import { step, currentKey } from 'workflow:steps'
+        export default await step('order', async () => {
+          const doubled = globalThis.tools.rate(21)   // prefix-provided (pre-warmed)
+          return await step('price', async () => {
+            await Promise.resolve()
+            return { key: currentKey(), doubled }      // shim-provided (run-time)
+          })
+        })
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) {
+      await prefix.dispose()
+      return
+    }
+    expect(result.exports.default).toEqual({ key: 'order/price', doubled: 42 })
+    await prefix.dispose()
+  })
+
+  // ── DOES NOT WORK: async context in prefix (snapshot) code ──────────────────
+  // The native bindings can't be captured in a V8 startup snapshot, so
+  // `node:async_hooks` does not resolve during precompile(). It fails cleanly
+  // with ERR_MODULE_NOT_FOUND (a rejected precompile) — not a crash.
+
+  test('DOES NOT WORK: importing node:async_hooks in prefix code', async () => {
+    await expect(
+      runtime.precompile({
+        code: /* js */ `
+          import { AsyncLocalStorage } from 'node:async_hooks'
+          globalThis.als = new AsyncLocalStorage()
+        `,
+      }),
+    ).rejects.toMatchObject({ code: 'ERR_MODULE_NOT_FOUND' })
+  })
+
+  test('DOES NOT WORK: baking the step shim into the prefix (prefix imports it)', async () => {
+    // Same reason: if the PREFIX imports the shim, the shim's own
+    // `import ... from 'node:async_hooks'` must resolve at snapshot time, which
+    // it can't. Keep the shim as a postfix import instead.
+    await expect(
+      runtime.precompile({
+        code: `import { step } from 'workflow:steps'; globalThis.step = step`,
+        imports: { 'workflow:steps': STEP_SHIM_SOURCE },
+      }),
+    ).rejects.toMatchObject({ code: 'ERR_MODULE_NOT_FOUND' })
+  })
+
+  // ── BOUNDARY: only run + getStore are implemented ───────────────────────────
+
+  test('BOUNDARY: only run() and getStore() exist (no enterWith/exit)', async () => {
+    const result = await runtime.run({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        const als = new AsyncLocalStorage()
+        export default {
+          run: typeof als.run,
+          getStore: typeof als.getStore,
+          enterWith: typeof als.enterWith,
+          exit: typeof als.exit,
+        }
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      run: 'function',
+      getStore: 'function',
+      enterWith: 'undefined',
+      exit: 'undefined',
+    })
   })
 })

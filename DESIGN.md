@@ -683,10 +683,13 @@ wait anyway.
 
 Documented up front so we don't drift into rebuilding secure-exec:
 
-1. **No `node:*` builtins.** If a user does `import fs from "node:fs"`, it
-   throws `ModuleNotFound` unless the host explicitly provided it via
-   `imports`. The host can ship a curated `node:fs` if they want; the
-   runtime won't.
+1. **No `node:*` builtins** (one exception). If a user does
+   `import fs from "node:fs"`, it throws `ModuleNotFound` unless the host
+   explicitly provided it via `imports`. The host can ship a curated
+   `node:fs` if they want; the runtime won't. The sole runtime-provided
+   `node:*` module is `node:async_hooks`, which exposes a minimal
+   `AsyncLocalStorage` (run/postfix code only). See §16. A host-declared
+   import of the same specifier takes precedence over the built-in.
 
 2. **No callbacks across the boundary.** No `setTimeout`, no event
    listeners on host objects, no `array.forEach` style host callbacks. Pure
@@ -1616,3 +1619,91 @@ per-run table.
   or a stream handle).
 - **Not persistent across runs.** Two `prefix.run()` calls cannot share
   callable handles. Each run has its own isolated handle table.
+
+---
+
+## 16. Async context (`AsyncLocalStorage`)
+
+Sandboxed code can carry an ambient value across `await` points — a request
+or trace id, a durable-workflow step key, "what context am I running in" —
+without threading it through every function signature, and without concurrent
+async chains mis-attributing each other's context.
+
+### 16.1 Surface
+
+A minimal, Node-compatible subset of `AsyncLocalStorage`, imported the same way
+as in Node:
+
+```js
+import { AsyncLocalStorage } from 'node:async_hooks'
+
+const als = new AsyncLocalStorage()
+als.run(store, callback, ...args) // run callback with `store` as the current
+                                  // value; auto-restores on scope exit
+als.getStore()                    // read the current value (or undefined)
+```
+
+Only `run` and `getStore` are implemented — the concurrency-safe core. `run`
+already takes a callback, so it scopes cleanly and composes for nested use.
+`enterWith`/`exit`/`disable`/`snapshot` are intentionally omitted (`enterWith`
+in particular is unsafe under concurrent branches and unnecessary when a
+callback boundary exists). They can be added later if a concrete need appears.
+
+The canonical use case is a durable-workflow `step.do(name, fn)` shim: each
+nested step appends a segment to a key held in an `AsyncLocalStorage`, so a
+step nested inside another produces `parent/child` and the same step name used
+elsewhere never collides.
+
+### 16.2 Mechanism
+
+Built on V8's **continuation-preserved embedder data** (CPED) — the same
+primitive modern Node's `AsyncContextFrame` uses, exposed by the `v8` crate as
+`Context::{Get,Set}ContinuationPreservedEmbedderData`. V8 automatically saves
+the CPED slot with each promise continuation and restores it when that
+continuation runs, so the ambient value follows `async`/`await` chains and
+concurrent chains stay isolated.
+
+The runtime installs two native functions (get/set the CPED slot) and hands
+them to a small JS factory that returns the `AsyncLocalStorage` class closing
+over them. The class is stashed on `globalThis` under `Symbol.for(...)`; the
+built-in `node:async_hooks` module re-exports it. The native get/set are never
+exposed to user code — they live only in the factory closure. Contexts are
+singly-linked frames (`{ parent, instance, value }`) carried in the CPED slot,
+built from object literals and read by own-property access, so user code
+tampering with builtin prototypes cannot subvert propagation.
+
+**No promise hooks are registered.** A run that never constructs an
+`AsyncLocalStorage` pays nothing beyond V8's own (cheap) CPED bookkeeping. The
+per-`await` cost of using it is small in-sandbox JS time, billed to
+`cpuTimeMs`/`wallTimeMs` like any other work — never to the bridge-call budget.
+
+### 16.3 Interaction with the rest of the model
+
+- **Always available at run time, no opt-in flag.** Because it registers no
+  hooks, it can be always-on like `console`; matches Node's "importable
+  always, cheap unless used" behavior.
+- **Per-run isolation.** State lives in the per-run isolate's CPED slot and
+  resets between runs with everything else.
+- **Only `await`-based async is covered.** CPED propagates across promise
+  continuations, not timers/callbacks — and the sandbox has neither
+  (limitations §7.2, §7.8), so this covers the entire async surface.
+- **Not available in prefix/precompile code.** The native bindings cannot be
+  captured in a V8 startup snapshot, so `node:async_hooks` does not resolve
+  during `precompile()`; it fails cleanly with `ERR_MODULE_NOT_FOUND`. Setup
+  code is the prefix; async context is for the postfix (agent/workflow code).
+  The durable-workflow pattern is to keep the `step`/`AsyncLocalStorage` shim
+  in a **run-time import** the postfix pulls in (resolved per run, where
+  `node:async_hooks` is available), while the expensive tool/data setup lives
+  in the prefix and is pre-warmed into the snapshot. See §7.1.
+
+### 16.4 Precompile validates before it snapshots
+
+`precompile()` runs the prefix in two passes: it first compiles, instantiates,
+and evaluates the prefix in a throwaway regular isolate, and only builds the
+snapshot if that succeeds. This exists because a V8 snapshot creator *must*
+serialize its blob before being dropped, yet doing so after a failed module
+instantiation segfaults — so the creator must only ever see code already known
+to be valid. The upshot: any bad prefix (syntax error, unresolved import such
+as `node:async_hooks`, throwing top-level code) returns a clean error instead
+of crashing the process. Prefix code is host-authored setup with no
+bridge/network side effects, so evaluating it twice is safe.
