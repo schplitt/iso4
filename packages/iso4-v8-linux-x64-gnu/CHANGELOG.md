@@ -1,5 +1,7 @@
 # @iso4/v8-linux-x64-gnu
 
+## 0.3.0
+
 ## 0.2.2
 
 ### Patch Changes

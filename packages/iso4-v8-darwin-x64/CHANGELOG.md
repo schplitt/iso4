@@ -1,5 +1,7 @@
 # @iso4/v8-darwin-x64
 
+## 0.3.0
+
 ## 0.2.2
 
 ### Patch Changes
