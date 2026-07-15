@@ -111,6 +111,45 @@ const result = await sandbox.run({
 The handler receives the raw arguments from sandbox code and must return
 plain serializable data. **Functions in return values are currently dropped.**
 
+## Async context (`AsyncLocalStorage`)
+
+Sandboxed code can carry an ambient value across `await` points without
+threading it through every call — and, unlike a module-level variable,
+concurrent async chains stay isolated. Imported the Node way:
+
+```ts
+const result = await sandbox.run({
+  code: `
+    import { AsyncLocalStorage } from 'node:async_hooks'
+    const keyScope = new AsyncLocalStorage()
+
+    // A durable-workflow style step: each nested step appends to the key,
+    // so a step nested inside another never collides with the same name used
+    // elsewhere.
+    function step(name, body) {
+      const parent = keyScope.getStore() ?? ''
+      return keyScope.run(parent ? parent + '/' + name : name, body)
+    }
+
+    let innerKey
+    await step('charge', async () => {
+      await step('validate', async () => {
+        await Promise.resolve()
+        innerKey = keyScope.getStore()   // 'charge/validate'
+      })
+    })
+    export default innerKey
+  `,
+})
+// result.exports.default === 'charge/validate'
+```
+
+Only `run(store, callback, ...args)` and `getStore()` are provided — the
+concurrency-safe core. It's built on V8's continuation-preserved embedder data
+(the same primitive modern Node uses), registers no promise hooks, and is
+always available to run code at no cost unless used. It is **not** available in
+`precompile()` (prefix) code — it's for the postfix. See DESIGN.md §16.
+
 ## License
 
 [MIT](./LICENSE) © schplitt
