@@ -102,8 +102,8 @@ analytics use case is served by a separate package, not a backend swap.
      calls from the sandbox cross a bridge to the host and return data.
 7. **Result extraction via ESM `export`**. User code is always wrapped so
    its return value becomes `export default`. Results cross the boundary
-   through V8 `ValueSerializer`, which naturally restricts results to plain
-   data (no functions, no methods).
+   through the `WireValue` codec, which restricts results to plain data
+   (no functions, no methods — see §5.1).
 8. **Captured stdout/stderr** via a runtime-owned `console`.
 9. **Pre-compilable prefix code** via V8 startup snapshots. Snapshotting
    the prefix once cuts cold start from ~30–80 ms to ~2–5 ms steady-state.
@@ -218,10 +218,11 @@ Every call to `runtime.run(opts)`:
    - For host-implemented modules: builds a synthetic module whose
      exports are stubs that bridge to the host.
 5. Rust evaluates the module. Top-level `await` works.
-6. Once evaluation settles, Rust reads the module namespace, runs V8
-   `ValueSerializer` on `default` and each named export. Function values
-   throw `ExportNotSerializable`. Methods on class instances are stripped
-   silently (serializer copies own enumerable properties only).
+6. Once evaluation settles, Rust reads the module namespace and encodes
+   `default` and each named export as `WireValue`s. Functions, promises,
+   symbols, and non-plain objects (`Date`, `Map`, `Set`, `RegExp`, typed
+   arrays other than `Uint8Array`, class instances) throw
+   `ExportNotSerializable` (see §5.1).
 7. Rust sends back: serialized exports, captured stdout/stderr, error if
    any, duration.
 
@@ -234,7 +235,7 @@ Every call to `runtime.run(opts)`:
 | Host-implemented modules (Flavor A) | Stubs in V8 call across bridge → host                 |
 | `fetch`                             | Stub in V8, host implements with permission check     |
 | `console.*`                         | Captured in Rust, streamed back as stdout/stderr      |
-| Result serialization                | V8 `ValueSerializer` (Rust side), constrained to data |
+| Result serialization                | `WireValue` codec (Rust side), data only              |
 
 ---
 
@@ -507,27 +508,38 @@ export const fetchedAt = Date.now()
 
 ### 5.1 What can be exported
 
-Whatever V8 `ValueSerializer` can serialize:
+The boundary carries **data, not behavior**. The hand-rolled `WireValue`
+codec (`docs/protocol.md` §4) supports exactly:
 
-- Primitives, strings, BigInt
-- Arrays (including holey)
-- Plain objects (own enumerable properties only — class methods stripped)
-- `Date`, `RegExp`, `Map`, `Set`
-- `Error` objects (name, message, stack preserved)
-- Typed arrays (`Uint8Array`, etc.) and raw `ArrayBuffer`
-- Circular references
+- Primitives: `undefined`, `null`, booleans, numbers
+- Strings
+- `BigInt` (arbitrary precision)
+- `Uint8Array` — the wire's binary primitive (`WireValue::Bytes`)
+- Arrays of supported values
+- Plain objects (`Object.prototype` or `null` prototype) of supported values
 
-What cannot be exported (throws `ExportNotSerializable`):
+Everything else is rejected loudly with `ERR_EXPORT_NOT_SERIALIZABLE`
+(sandbox → host) or a `TypeError` in the host encoder / `ERR_HOST_BRIDGE`
+(host → sandbox):
 
-- Functions
+- Functions, classes, and class instances
 - Promises (must be `await`ed before exporting)
-- Symbols other than well-known ones
-- Sandbox-internal handles (host-module proxy stubs, for example)
+- Symbols
+- `Date`, `Map`, `Set`, `RegExp`, `Error`
+- Typed arrays other than `Uint8Array`, `DataView`, `ArrayBuffer`,
+  `SharedArrayBuffer`
+- Circular references (diamond sharing is fine; true cycles throw)
 
-The serializer rejects functions automatically — no explicit check needed.
-Methods on class instances are silently dropped because they live on the
-prototype, not as own properties. This is acceptable: the goal is "only data
-crosses", and dropping methods is the same behavior as `structuredClone`.
+The same contract applies in both directions — bridge call arguments,
+bridge return values, host-module data leaves, and exports. Rejecting
+non-plain builtins loudly (rather than serializing their own-enumerable
+properties, which is usually `{}`) is deliberate: silent corruption is
+worse than an error. Send a `Date` as an epoch number or ISO string, a
+`Map`/`Set` as a plain object/array, binary data as `Uint8Array`.
+
+Note for hosts: Node `Buffer` is a `Uint8Array` subclass, so it crosses
+fine — but it always comes back as a plain `Uint8Array` (data preserved,
+subclass identity not).
 
 ### 5.2 Errors
 
@@ -635,8 +647,9 @@ direction. Both tables start at `0x01`.
 
 ### 6.3 Payload encoding
 
-Structured data (arguments, results, exports) uses V8 `ValueSerializer`
-wire format. Raw bytes for stdio chunks. Plain UTF-8 for log strings.
+Structured data (arguments, results, exports) uses the `WireValue`
+encoding (`docs/protocol.md` §4). Raw bytes for stdio chunks. Plain UTF-8
+for log strings.
 
 ### 6.4 Session lifecycle and concurrency
 
@@ -822,7 +835,7 @@ Deliberately not specified now. What is known:
 What is shared with `@iso4/sandbox`:
 
 - The wire-frame types (`WireValue`, the bridge payload conventions).
-- The "only data crosses" rule and `ValueSerializer`-based contract.
+- The "only data crosses" rule and the `WireValue`-based contract.
 - The host-import declaration shape (`Imports<…>` from §4.3) — the
   developer experience of describing the bridge surface stays uniform.
 - The limits semantics and error vocabulary.
@@ -887,8 +900,8 @@ To be resolved as we build, not blocking the start:
 
 - **`Session.call()` input/output serialization contract.** For the
   persistent-session API of the analytics product, the host calls a function that was
-  exported by the prefix. What can be passed as `input`? V8 `ValueSerializer`
-  is the natural choice (same as exports today), but typed arrays could be
+  exported by the prefix. What can be passed as `input`? The `WireValue`
+  codec is the natural choice (same as exports today), but bytes could be
   transferred zero-copy if needed for bulk data. Decide when designing the analytics product (§9.1).
 
 - **In-process backend: C++ NAPI addon or Rust NAPI with Node's V8

@@ -900,6 +900,104 @@ describe('error handling', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 7b. Wire boundary contract — data, not behavior (GH #9)
+//
+// Supported across the boundary: primitives, bigint, string, Uint8Array,
+// plain objects/arrays. Everything else fails loudly in BOTH directions
+// instead of silently corrupting to `{}`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('wire boundary contract', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('exported Uint8Array round-trips as a Uint8Array', async () => {
+    const result = await runtime.run({
+      code: 'export default new Uint8Array([1, 2, 3])',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBeInstanceOf(Uint8Array)
+    expect(Array.from(result.exports.default as Uint8Array)).toEqual([1, 2, 3])
+  })
+
+  test('Uint8Array survives host → sandbox → host unchanged', async () => {
+    const payload = new Uint8Array([0, 127, 255, 42])
+    const result = await runtime.run({
+      code: `
+        const bytes = await getBytes()
+        export default { echoed: bytes, sum: bytes.reduce((a, b) => a + b, 0) }
+      `,
+      globals: { getBytes: async () => payload },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const exported = result.exports.default as { echoed: Uint8Array, sum: number }
+    expect(Array.from(exported.echoed)).toEqual([0, 127, 255, 42])
+    expect(exported.sum).toBe(424)
+  })
+
+  test.each([
+    ['Date', 'new Date(1700000000000)'],
+    ['Map', 'new Map([["a", 1]])'],
+    ['Set', 'new Set([1, 2, 3])'],
+    ['RegExp', '/abc/g'],
+    ['ArrayBuffer', 'new ArrayBuffer(8)'],
+    ['Float32Array', 'new Float32Array([1, 2])'],
+  ])('exporting a %s → ERR_EXPORT_NOT_SERIALIZABLE', async (_name, expr) => {
+    const result = await runtime.run({ code: `export default ${expr}` })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+  })
+
+  test('builtin nested inside a plain object also fails loudly', async () => {
+    const result = await runtime.run({
+      code: 'export default { when: new Date() }',
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+  })
+
+  test('host handler returning a Date → ERR_HOST_BRIDGE', async () => {
+    const result = await runtime.run({
+      code: 'export default await now()',
+      globals: { now: async () => new Date() },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+  })
+
+  test('host handler returning a class instance → ERR_HOST_BRIDGE', async () => {
+    class Row {
+      value = 1
+    }
+    const result = await runtime.run({
+      code: 'export default await fetchRow()',
+      globals: { fetchRow: async () => new Row() },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 8. Resource limits
 // ─────────────────────────────────────────────────────────────────────────────
 

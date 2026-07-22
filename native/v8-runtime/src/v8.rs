@@ -2356,6 +2356,54 @@ fn value_to_wire(
             "unresolved Promise values cannot be serialized".to_string(),
         ));
     }
+    // Uint8Array is the wire's binary primitive (WireValue::Bytes). Must be
+    // checked before the generic object branch — typed arrays are objects and
+    // would otherwise serialize as index-keyed fields.
+    if value.is_uint8_array() {
+        let view = v8::Local::<v8::ArrayBufferView>::try_from(value)
+            .map_err(|_| RunError::Internal("failed to cast to Uint8Array".to_string()))?;
+        let mut buf = vec![0u8; view.byte_length()];
+        let copied = view.copy_contents(&mut buf);
+        buf.truncate(copied);
+        return Ok(WireValue::Bytes(buf));
+    }
+    // Other binary containers are rejected rather than coerced to bytes:
+    // silently dropping the element type (e.g. Float32Array) would corrupt.
+    if value.is_array_buffer_view() {
+        return Err(RunError::ExportNotSerializable(
+            "typed array views other than Uint8Array cannot be serialized; \
+             send a Uint8Array of the underlying bytes"
+                .to_string(),
+        ));
+    }
+    if value.is_array_buffer() || value.is_shared_array_buffer() {
+        return Err(RunError::ExportNotSerializable(
+            "ArrayBuffer values cannot be serialized; wrap the buffer in a Uint8Array".to_string(),
+        ));
+    }
+    // Non-plain builtins are rejected loudly instead of silently serializing
+    // as their (usually empty) own-enumerable properties.
+    if value.is_date() {
+        return Err(RunError::ExportNotSerializable(
+            "Date values cannot be serialized; send an epoch number or ISO string".to_string(),
+        ));
+    }
+    if value.is_map() {
+        return Err(RunError::ExportNotSerializable(
+            "Map values cannot be serialized; copy the entries into a plain object or array"
+                .to_string(),
+        ));
+    }
+    if value.is_set() {
+        return Err(RunError::ExportNotSerializable(
+            "Set values cannot be serialized; copy the items into an array".to_string(),
+        ));
+    }
+    if value.is_reg_exp() {
+        return Err(RunError::ExportNotSerializable(
+            "RegExp values cannot be serialized; send the pattern as a string".to_string(),
+        ));
+    }
     // Arrays must be checked before the generic object path (arrays are objects).
     if value.is_array() {
         check_and_push(scope, value, visiting)?;
@@ -2988,6 +3036,75 @@ mod tests {
         // A Promise that is never awaited should be rejected at the boundary.
         let err = run_err("export default new Promise(() => {})");
         assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    }
+
+    #[test]
+    fn exporting_non_plain_builtins_is_an_error() {
+        // Previously these silently serialized as `{}` (own enumerable
+        // properties of a Date/Map/Set/RegExp are empty).
+        for code in [
+            "export default new Date(1700000000000)",
+            "export default new Map([['a', 1]])",
+            "export default new Set([1, 2, 3])",
+            "export default /abc/g",
+            "export default new ArrayBuffer(8)",
+        ] {
+            let err = run_err(code);
+            assert!(
+                matches!(err, RunError::ExportNotSerializable(_)),
+                "expected ExportNotSerializable for {code}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exporting_a_nested_builtin_is_an_error() {
+        // Nested corruption case: `{ when: new Date() }` must fail loudly,
+        // not decode as `{ when: {} }`.
+        let err = run_err("export default { when: new Date() }");
+        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    }
+
+    #[test]
+    fn exporting_a_non_uint8_typed_array_is_an_error() {
+        for code in [
+            "export default new Float32Array([1, 2])",
+            "export default new Int32Array([1, 2])",
+            "export default new DataView(new ArrayBuffer(4))",
+        ] {
+            let err = run_err(code);
+            assert!(
+                matches!(err, RunError::ExportNotSerializable(_)),
+                "expected ExportNotSerializable for {code}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exporting_a_uint8_array_roundtrips_as_bytes() {
+        let out = run_ok("export default new Uint8Array([1, 2, 3])");
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Bytes(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn exporting_a_uint8_array_subarray_respects_byte_offset() {
+        // A subarray view must serialize only its window, not the whole
+        // backing buffer.
+        let out =
+            run_ok("const b = new Uint8Array([0, 1, 2, 3, 4]); export default b.subarray(1, 4)");
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Bytes(vec![1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn exporting_an_empty_uint8_array_roundtrips_as_empty_bytes() {
+        let out = run_ok("export default new Uint8Array(0)");
+        assert_eq!(get_field(&out, "default"), Some(WireValue::Bytes(vec![])));
     }
 
     // ── Complex value structures ───────────────────────────────────────────

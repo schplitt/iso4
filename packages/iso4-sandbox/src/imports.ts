@@ -365,8 +365,9 @@ function emitValue(
 /**
  * Emit a `HostExportData` value as a JS expression that reproduces the
  * original value in the sandbox. Supports primitives, plain objects/arrays,
- * `Date`, `BigInt`, `Uint8Array`. `Map`, `Set`, circular refs, and class
- * instances throw with a clear pointer.
+ * `BigInt`, `Uint8Array` — the same set the wire codec can carry back out.
+ * `Date`, `Map`, `Set`, circular refs, and class instances throw with a
+ * clear pointer.
  *
  * @param specifier
  * @param value
@@ -400,13 +401,13 @@ function emitDataLiteral(
   if (value instanceof Uint8Array) {
     return `new Uint8Array([${Array.from(value).join(', ')}])`
   }
-  if (value instanceof Date) {
-    return `new Date(${value.getTime()})`
-  }
-  if (value instanceof Map || value instanceof Set) {
+  if (value instanceof Date || value instanceof Map || value instanceof Set) {
+    // Deliberately unsupported: the wire codec cannot carry these back out
+    // of the sandbox, so accepting them here would be a one-way asymmetry.
     throw new Error(
       `[@iso4/sandbox] imports['${specifier}'].${path.join('.')}: `
-      + `Map / Set values are not yet supported as data leaves`,
+      + `${value.constructor.name} values are not supported as data leaves; `
+      + `supported: primitives, bigint, string, Uint8Array, plain objects/arrays`,
     )
   }
   if (typeof value === 'object') {
