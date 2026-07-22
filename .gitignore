@@ -8,6 +8,9 @@ target
 # Native binaries copied into platform packages — built in CI, never committed
 packages/iso4-v8-*/bin/iso4-v8
 
+# Local-only notes, never committed
+internal
+
 # OS / editor
 .DS_Store
 *.swp

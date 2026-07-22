@@ -508,6 +508,19 @@ class WireWriter {
       return this
     }
     if (typeof value === 'object') {
+      // Only plain objects cross the boundary. Date/Map/Set/RegExp/
+      // ArrayBuffer/class instances would otherwise serialize as their
+      // own-enumerable properties — usually `{}` — which silently corrupts.
+      // (Uint8Array and Array are handled above.)
+      const proto = Object.getPrototypeOf(value)
+      if (proto !== null && proto !== Object.prototype) {
+        const name = (value as object).constructor?.name ?? '(unknown)'
+        throw new TypeError(
+          `[iso4] encodeWireValue: cannot encode ${name} instance; only `
+          + 'primitives, bigint, string, Uint8Array, and plain objects/arrays '
+          + 'cross the boundary — copy the data into a plain object',
+        )
+      }
       if (this.visiting.has(value)) {
         throw new TypeError(
           '[iso4] encodeWireValue: cyclic or self-referential structure',

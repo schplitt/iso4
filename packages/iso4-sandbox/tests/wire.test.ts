@@ -975,3 +975,47 @@ describe('encodeWireValue — cycle detection', () => {
     expect(() => encodeWireValueProduction(a)).toThrow(TypeError)
   })
 })
+
+// ── encodeWireValue — non-plain objects are rejected loudly ────────────────
+//
+// The wire carries data, not behavior: primitives, bigint, string,
+// Uint8Array, and plain objects/arrays. Anything else must throw instead of
+// silently serializing as its (usually empty) own-enumerable properties.
+
+describe('encodeWireValue — non-plain object rejection', () => {
+  test.each([
+    ['Date', new Date(1700000000000)],
+    ['Map', new Map([['a', 1]])],
+    ['Set', new Set([1, 2, 3])],
+    ['RegExp', /abc/g],
+    ['ArrayBuffer', new ArrayBuffer(8)],
+    ['SharedArrayBuffer', new SharedArrayBuffer(8)],
+    ['Float32Array', new Float32Array([1, 2])],
+    ['DataView', new DataView(new ArrayBuffer(4))],
+  ])('%s instance throws TypeError naming the constructor', (name, value) => {
+    expect(() => encodeWireValueProduction(value)).toThrow(TypeError)
+    expect(() => encodeWireValueProduction(value)).toThrow(name)
+  })
+
+  test('class instance throws TypeError naming the class', () => {
+    class Thing {
+      x = 1
+    }
+    expect(() => encodeWireValueProduction(new Thing())).toThrow(TypeError)
+    expect(() => encodeWireValueProduction(new Thing())).toThrow('Thing')
+  })
+
+  test('non-plain object nested inside a plain object throws', () => {
+    expect(() => encodeWireValueProduction({ when: new Date() })).toThrow(TypeError)
+  })
+
+  test('null-prototype object still encodes (decoder output shape)', () => {
+    const obj = Object.create(null) as Record<string, unknown>
+    obj['a'] = 1
+    expect(decodeWireValue(encodeWireValueProduction(obj))).toEqual({ a: 1 })
+  })
+
+  test('plain object and Uint8Array still encode', () => {
+    expect(() => encodeWireValueProduction({ bytes: new Uint8Array([1]) })).not.toThrow()
+  })
+})

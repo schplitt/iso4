@@ -246,14 +246,15 @@ export type ImportValue = string | HostModuleObject
  * A host-module description object. Each property is either:
  *
  *   - A function — becomes an async bridge stub in the generated module.
- *   - A plain data value (primitive, plain object/array, `Date`, `BigInt`,
+ *   - A plain data value (primitive, plain object/array, `BigInt`,
  *     `Uint8Array`) — becomes a JS literal in the generated module.
  *   - A nested object that itself contains a mix of functions and data —
  *     walked recursively.
  *
- * `Map`, `Set`, circular references, class instances with prototype
- * methods, and stateful handles (streams, sockets) are rejected at
- * registration with a clear error.
+ * `Date`, `Map`, `Set`, circular references, class instances with
+ * prototype methods, and stateful handles (streams, sockets) are rejected
+ * at registration with a clear error. The supported set deliberately
+ * matches what the wire codec can carry back out of the sandbox.
  */
 export interface HostModuleObject {
   [name: string]: HostModuleValue
@@ -279,7 +280,6 @@ export type HostExportData
     | bigint
     | string
     | Uint8Array
-    | Date
     | HostExportData[]
     | { [key: string]: HostExportData }
 

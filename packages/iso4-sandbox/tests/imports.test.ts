@@ -111,18 +111,24 @@ describe('processImports', () => {
     expect(shape.hostFunctionIds['host:default']).toEqual({ 'default.handler': 0 })
   })
 
-  it('emits Date, BigInt, and Uint8Array as proper literals', () => {
+  it('emits BigInt and Uint8Array as proper literals', () => {
     const { bindings } = processImports({
       'host:data': {
-        when: new Date(1700000000000),
         big: 9007199254740993n,
         bytes: new Uint8Array([1, 2, 3]),
       },
     })
     const src = bindings[0]!.source
-    expect(src).toContain('new Date(1700000000000)')
     expect(src).toContain('9007199254740993n')
     expect(src).toContain('new Uint8Array([1, 2, 3])')
+  })
+
+  it('rejects Date as a data leaf (wire cannot carry it back out)', () => {
+    expect(() =>
+      processImports({
+        'host:data': { when: new Date(1700000000000) as unknown as never },
+      }),
+    ).toThrow(/Date values are not supported as data leaves/)
   })
 })
 
@@ -148,7 +154,7 @@ describe('processImports — rejected configurations', () => {
       processImports({
         'host:bad': { config: new Map([['a', 1]]) as unknown as never },
       }),
-    ).toThrow(/Map \/ Set values are not yet supported/)
+    ).toThrow(/Map values are not supported as data leaves/)
   })
 
   it('rejects circular references in data leaves', () => {
