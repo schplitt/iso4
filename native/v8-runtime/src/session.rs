@@ -174,20 +174,20 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     Arc::clone(&call_id_counter),
                 ) {
                     Ok(output) => {
-                        eprintln!("[iso4-v8] run succeeded in {}ms", output.duration_ms);
+                        eprintln!("[iso4-v8] run succeeded in {:.3}ms", output.duration_ms);
                         wire::encode_run_completion_payload(
                             payload.run_id,
                             wire::RunCompletion::Success(wire::RunSuccessPayload {
                                 exports: output.exports,
                                 stdout: output.stdout,
                                 stderr: output.stderr,
-                                duration_ms: output.duration_ms as f64,
+                                duration_ms: output.duration_ms,
                             }),
                         )
                     }
                     Err(failure) => {
                         eprintln!(
-                            "[iso4-v8] run failed in {}ms: {:?}",
+                            "[iso4-v8] run failed in {:.3}ms: {:?}",
                             failure.duration_ms, failure.error
                         );
                         wire::encode_run_completion_payload(
@@ -196,7 +196,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 error: wire::run_error_to_payload(&failure.error),
                                 stdout: failure.stdout,
                                 stderr: failure.stderr,
-                                duration_ms: failure.duration_ms as f64,
+                                duration_ms: failure.duration_ms,
                             }),
                         )
                     }
@@ -264,7 +264,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                     Err(failure) => {
                         eprintln!(
-                            "[iso4-v8] precompile failed in {}ms: {:?}",
+                            "[iso4-v8] precompile failed in {:.3}ms: {:?}",
                             failure.duration_ms, failure.error
                         );
                         wire::encode_precompile_result_payload(
@@ -407,7 +407,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             ) {
                                 Ok(output) => {
                                     eprintln!(
-                                        "[iso4-v8] PrefixRun {} succeeded in {}ms",
+                                        "[iso4-v8] PrefixRun {} succeeded in {:.3}ms",
                                         payload.run_id, output.duration_ms
                                     );
                                     wire::encode_run_completion_payload(
@@ -416,13 +416,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                             exports: output.exports,
                                             stdout: output.stdout,
                                             stderr: output.stderr,
-                                            duration_ms: output.duration_ms as f64,
+                                            duration_ms: output.duration_ms,
                                         }),
                                     )
                                 }
                                 Err(failure) => {
                                     eprintln!(
-                                        "[iso4-v8] PrefixRun {} failed in {}ms: {:?}",
+                                        "[iso4-v8] PrefixRun {} failed in {:.3}ms: {:?}",
                                         payload.run_id, failure.duration_ms, failure.error
                                     );
                                     wire::encode_run_completion_payload(
@@ -431,7 +431,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                             error: wire::run_error_to_payload(&failure.error),
                                             stdout: failure.stdout,
                                             stderr: failure.stderr,
-                                            duration_ms: failure.duration_ms as f64,
+                                            duration_ms: failure.duration_ms,
                                         }),
                                     )
                                 }

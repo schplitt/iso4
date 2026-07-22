@@ -302,8 +302,9 @@ pub struct Output {
     /// Lines written to console.warn / console.error.
     pub stderr: Vec<String>,
 
-    /// Wall-clock time from start of execution to result, in milliseconds.
-    pub duration_ms: u64,
+    /// Wall-clock time from start of execution to result, in milliseconds
+    /// with microsecond resolution (three decimal places).
+    pub duration_ms: f64,
 }
 
 /// The result of a failed JavaScript execution.
@@ -315,7 +316,7 @@ pub struct FailureOutput {
     pub error: RunError,
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
-    pub duration_ms: u64,
+    pub duration_ms: f64,
 }
 
 /// Payload carried by `RunError::RuntimeError`. Kept in a separate struct so
@@ -1065,7 +1066,7 @@ fn run_module(
         exports,
         stdout: logs.stdout.clone(),
         stderr: logs.stderr.clone(),
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_ms(start),
     })
 }
 
@@ -1232,8 +1233,15 @@ fn precompile_module(
             error: RunError::Internal("V8 snapshot creation returned an empty blob".to_string()),
             stdout: Vec::new(),
             stderr: Vec::new(),
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms: elapsed_ms(start),
         })
+}
+
+/// Wall-clock elapsed time since `start` in milliseconds, rounded to
+/// microsecond resolution (three decimal places). The wire carries
+/// durations as f64, so sub-millisecond runs stay visible.
+fn elapsed_ms(start: std::time::Instant) -> f64 {
+    (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1_000.0
 }
 
 fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> FailureOutput {
@@ -1241,7 +1249,7 @@ fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> Fai
         error,
         stdout: logs.stdout.clone(),
         stderr: logs.stderr.clone(),
-        duration_ms: start.elapsed().as_millis() as u64,
+        duration_ms: elapsed_ms(start),
     }
 }
 
@@ -3942,7 +3950,10 @@ mod tests {
     #[test]
     fn duration_ms_is_populated() {
         let out = run_ok("export default 1 + 1");
-        assert!(out.duration_ms < 5_000);
+        // Sub-millisecond runs must report a non-zero fractional duration
+        // (microsecond resolution) instead of truncating to 0.
+        assert!(out.duration_ms > 0.0);
+        assert!(out.duration_ms < 5_000.0);
     }
 
     // ── Precompile / snapshots ──────────────────────────────────────────────
