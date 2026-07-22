@@ -1,5 +1,12 @@
 # @iso4/v8-darwin-arm64
 
+## 0.3.1
+
+### Patch Changes
+
+- e7e0004: `result.durationMs` now has microsecond resolution (e.g. `0.347`) instead of being truncated to whole milliseconds. Sub-millisecond runs previously reported `0`.
+- 7ee7e57: Exported `Uint8Array` values now arrive on the host as a real `Uint8Array` instead of an index-keyed object. Unsupported types (`Date`, `Map`, `Set`, `RegExp`, `ArrayBuffer`, typed arrays other than `Uint8Array`, class instances) now fail with a clear error in both directions instead of silently turning into `{}`. `Date` was also removed from host-module data leaves so what goes in matches what can come back out.
+
 ## 0.3.0
 
 ## 0.2.2
