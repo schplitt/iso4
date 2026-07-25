@@ -182,6 +182,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 stdout: output.stdout,
                                 stderr: output.stderr,
                                 duration_ms: output.duration_ms,
+                                cpu_time_ms: output.cpu_time_ms,
+                                bridge_calls: output.bridge_calls,
                             }),
                         )
                     }
@@ -197,6 +199,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 stdout: failure.stdout,
                                 stderr: failure.stderr,
                                 duration_ms: failure.duration_ms,
+                                cpu_time_ms: failure.cpu_time_ms,
+                                bridge_calls: failure.bridge_calls,
                             }),
                         )
                     }
@@ -327,6 +331,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 stdout: Vec::new(),
                                 stderr: Vec::new(),
                                 duration_ms: 0.0,
+                                cpu_time_ms: 0.0,
+                                bridge_calls: Vec::new(),
                             }),
                         )
                     }
@@ -364,6 +370,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     stdout: Vec::new(),
                                     stderr: Vec::new(),
                                     duration_ms: 0.0,
+                                    cpu_time_ms: 0.0,
+                                    bridge_calls: Vec::new(),
                                 }),
                             )
                         } else {
@@ -417,6 +425,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                             stdout: output.stdout,
                                             stderr: output.stderr,
                                             duration_ms: output.duration_ms,
+                                            cpu_time_ms: output.cpu_time_ms,
+                                            bridge_calls: output.bridge_calls,
                                         }),
                                     )
                                 }
@@ -432,6 +442,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                             stdout: failure.stdout,
                                             stderr: failure.stderr,
                                             duration_ms: failure.duration_ms,
+                                            cpu_time_ms: failure.cpu_time_ms,
+                                            bridge_calls: failure.bridge_calls,
                                         }),
                                     )
                                 }

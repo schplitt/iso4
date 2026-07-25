@@ -121,12 +121,25 @@ function encodeStringList(items: string[], out: number[]): void {
   for (const s of items) encodeString(s, out)
 }
 
+interface TestBridgeRecord {
+  rawName: string
+  importHandleId?: number
+  startMs: number
+  durationMs: number
+  argBytes: number
+  responseBytes: number
+  ok: boolean
+  blocked: boolean
+}
+
 interface SuccessCompletion {
   ok: true
   exports: unknown
   stdout: string[]
   stderr: string[]
   durationMs: number
+  cpuTimeMs?: number
+  bridgeCalls?: TestBridgeRecord[]
 }
 
 interface FailureCompletion {
@@ -139,6 +152,27 @@ interface FailureCompletion {
   stdout: string[]
   stderr: string[]
   durationMs: number
+  cpuTimeMs?: number
+  bridgeCalls?: TestBridgeRecord[]
+}
+
+function encodeBridgeRecords(records: TestBridgeRecord[], out: number[]): void {
+  pushU32(out, records.length)
+  for (const r of records) {
+    encodeString(r.rawName, out)
+    if (r.importHandleId !== undefined) {
+      out.push(1)
+      pushU32(out, r.importHandleId)
+    } else {
+      out.push(0)
+    }
+    pushF64(out, r.startMs)
+    pushF64(out, r.durationMs)
+    pushU32(out, r.argBytes)
+    pushU32(out, r.responseBytes)
+    out.push(r.ok ? 1 : 0)
+    out.push(r.blocked ? 1 : 0)
+  }
 }
 
 function encodeCompletionPayload(
@@ -155,6 +189,8 @@ function encodeCompletionPayload(
     encodeStringList(completion.stdout, parts)
     encodeStringList(completion.stderr, parts)
     pushF64(parts, completion.durationMs)
+    pushF64(parts, completion.cpuTimeMs ?? 0)
+    encodeBridgeRecords(completion.bridgeCalls ?? [], parts)
     parts.push(0) // failurePresent = 0
   } else {
     parts.push(0) // ok = false
@@ -178,6 +214,8 @@ function encodeCompletionPayload(
     encodeStringList(completion.stdout, parts)
     encodeStringList(completion.stderr, parts)
     pushF64(parts, completion.durationMs)
+    pushF64(parts, completion.cpuTimeMs ?? 0)
+    encodeBridgeRecords(completion.bridgeCalls ?? [], parts)
   }
 
   return Uint8Array.from(parts)
@@ -500,6 +538,89 @@ describe('decodeRunCompletionPayload — success', () => {
     expect(result.stdout).toEqual([])
     expect(result.stderr).toEqual([])
     expect(result.durationMs).toBeCloseTo(1.5)
+    expect(result.cpuTimeMs).toBe(0)
+    expect(result.bridgeCalls).toEqual([])
+  })
+
+  test('cpuTimeMs and bridge call records decoded on success and failure', () => {
+    const records: TestBridgeRecord[] = [
+      {
+        rawName: 'fetch',
+        startMs: 0.5,
+        durationMs: 2.25,
+        argBytes: 180,
+        responseBytes: 4096,
+        ok: true,
+        blocked: false,
+      },
+      {
+        rawName: '__iso4_call',
+        importHandleId: 3,
+        startMs: 3,
+        durationMs: 0.5,
+        argBytes: 64,
+        responseBytes: 0,
+        ok: false,
+        blocked: false,
+      },
+    ]
+    const success = decodeRunCompletionPayload(
+      encodeCompletionPayload(0, {
+        ok: true,
+        exports: {},
+        stdout: [],
+        stderr: [],
+        durationMs: 5,
+        cpuTimeMs: 1.25,
+        bridgeCalls: records,
+      }),
+      // Resolver receives the raw name + handle ID exactly as decoded.
+      (rawName, handleId) => (handleId !== undefined ? `resolved.${handleId}` : rawName),
+    )
+    expect(success.result.cpuTimeMs).toBeCloseTo(1.25)
+    expect(success.result.bridgeCalls).toEqual([
+      {
+        name: 'fetch',
+        startMs: 0.5,
+        durationMs: 2.25,
+        argBytes: 180,
+        responseBytes: 4096,
+        ok: true,
+        blocked: false,
+      },
+      {
+        name: 'resolved.3',
+        startMs: 3,
+        durationMs: 0.5,
+        argBytes: 64,
+        responseBytes: 0,
+        ok: false,
+        blocked: false,
+      },
+    ])
+
+    const failure = decodeRunCompletionPayload(encodeCompletionPayload(0, {
+      ok: false,
+      code: 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED',
+      name: 'Error',
+      message: 'limit',
+      stdout: [],
+      stderr: [],
+      durationMs: 1,
+      cpuTimeMs: 0.75,
+      bridgeCalls: [{
+        rawName: 'tool',
+        startMs: 0.1,
+        durationMs: 0,
+        argBytes: 0,
+        responseBytes: 0,
+        ok: false,
+        blocked: true,
+      }],
+    }))
+    expect(failure.result.cpuTimeMs).toBeCloseTo(0.75)
+    expect(failure.result.bridgeCalls).toHaveLength(1)
+    expect(failure.result.bridgeCalls[0].blocked).toBe(true)
   })
 
   test('named exports decoded correctly', () => {

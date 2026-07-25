@@ -132,8 +132,21 @@ postfix. See DESIGN.md §16.
 
 ```ts
 type RunResult
-  = | { ok: true, exports: SandboxExports, stdout: string[], stderr: string[], durationMs: number }
-    | { ok: false, error: RunError, stdout: string[], stderr: string[], durationMs: number }
+  = | { ok: true, exports: SandboxExports, stdout: string[], stderr: string[], durationMs: number, cpuTimeMs: number, bridgeCalls: BridgeCallEntry[] }
+    | { ok: false, error: RunError, stdout: string[], stderr: string[], durationMs: number, cpuTimeMs: number, bridgeCalls: BridgeCallEntry[] }
+
+// durationMs — wall-clock time of the run; cpuTimeMs — active V8 execution
+// time (bridge waits excluded). Both measured in the runtime, µs resolution.
+
+interface BridgeCallEntry { // recorded in the Rust runtime; one per attempt, in order
+  name: string // 'fetch', 'myTool', or '<specifier>.<path>' for host-module imports
+  startMs: number // offset from run start (same clock as durationMs)
+  durationMs: number // round-trip the sandbox waited (handler + IPC)
+  argBytes: number // serialized call payload size
+  responseBytes: number // serialized response value size (0 on handler error)
+  ok: boolean
+  blocked: boolean // blocked by a limit runtime-side; never reached the host
+}
 
 interface RunError {
   code: RunErrorCode

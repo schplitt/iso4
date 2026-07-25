@@ -444,21 +444,38 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 
 `RunSuccessPayload`:
 
-| Field        | Encoding            | Notes                                                       |
-| ------------ | ------------------- | ----------------------------------------------------------- |
-| `exports`    | `WireValue::Object` | Contains `default` plus named exports as direct properties. |
-| `stdout`     | `List<String>`      | Captured stdout log lines.                                  |
-| `stderr`     | `List<String>`      | Captured stderr log lines.                                  |
-| `durationMs` | `f64`               | Total runtime duration.                                     |
+| Field         | Encoding                 | Notes                                                       |
+| ------------- | ------------------------ | ----------------------------------------------------------- |
+| `exports`     | `WireValue::Object`      | Contains `default` plus named exports as direct properties. |
+| `stdout`      | `List<String>`           | Captured stdout log lines.                                  |
+| `stderr`      | `List<String>`           | Captured stderr log lines.                                  |
+| `durationMs`  | `f64`                    | Wall-clock runtime duration.                                |
+| `cpuTimeMs`   | `f64`                    | Active V8 execution time; bridge waits excluded.            |
+| `bridgeCalls` | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.       |
 
 `RunFailurePayload`:
 
-| Field        | Encoding          |
-| ------------ | ----------------- |
-| `error`      | `RunErrorPayload` |
-| `stdout`     | `List<String>`    |
-| `stderr`     | `List<String>`    |
-| `durationMs` | `f64`             |
+| Field         | Encoding                 |
+| ------------- | ------------------------ |
+| `error`       | `RunErrorPayload`        |
+| `stdout`      | `List<String>`           |
+| `stderr`      | `List<String>`           |
+| `durationMs`  | `f64`                    |
+| `cpuTimeMs`   | `f64`                    |
+| `bridgeCalls` | `List<BridgeCallRecord>` |
+
+`BridgeCallRecord` — per-call metadata (names, timing, sizes; never payloads):
+
+| Field            | Encoding        | Notes                                                                            |
+| ---------------- | --------------- | -------------------------------------------------------------------------------- |
+| `rawName`        | `String`        | Wire-level export name (`fetch`, `__iso4_fetch_h`, `__iso4_call`).               |
+| `importHandleId` | `Optional<u32>` | Host-module function handle for `__iso4_call` dispatches; client resolves names. |
+| `startMs`        | `f64`           | Offset from run start (same clock as `durationMs`).                              |
+| `durationMs`     | `f64`           | Round-trip the sandbox waited; time-until-run-end for calls that never settled.  |
+| `argBytes`       | `u32`           | Serialized call payload size — what `maxBridgeCallBytes` is enforced against.    |
+| `responseBytes`  | `u32`           | Serialized response value size; `0` on handler error or unsettled.               |
+| `ok`             | `bool`          | Handler resolved and the response reached the sandbox.                           |
+| `blocked`        | `bool`          | Blocked runtime-side (limit, oversized payload, function argument); never sent.  |
 
 `RunErrorPayload`:
 
