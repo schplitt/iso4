@@ -267,14 +267,14 @@ socket immediately on version or token mismatch.
 
 `RunPayload`:
 
-| Field      | Encoding                  | Notes                                  |
-| ---------- | ------------------------- | -------------------------------------- |
-| `runId`    | `u32`                     | Unique on this connection.             |
-| `code`     | `String`                  | ESM source.                            |
-| `filename` | `Optional<String>`        | Used in stack traces.                  |
-| `limits`   | `ResourceLimits`          | Fully normalized by TS before sending. |
-| `globals`  | `List<HostGlobalBinding>` | Names configured for this run.         |
-| `imports`  | `List<ImportBinding>`     | Source or host import declarations.    |
+| Field      | Encoding                  | Notes                                                |
+| ---------- | ------------------------- | ---------------------------------------------------- |
+| `runId`    | `u32`                     | Unique on this connection.                           |
+| `code`     | `String`                  | ESM source.                                          |
+| `filename` | `Optional<String>`        | Used in stack traces.                                |
+| `limits`   | `ResourceLimits`          | Only caller-set fields sent; runtime fills defaults. |
+| `globals`  | `List<HostGlobalBinding>` | Names configured for this run.                       |
+| `imports`  | `List<ImportBinding>`     | Source or host import declarations.                  |
 
 `PrefixRunPayload`:
 
@@ -300,16 +300,23 @@ socket immediately on version or token mismatch.
 
 `ResourceLimits`:
 
-| Field                | Encoding | Notes                                                                                                                                                                                                             |
-| -------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memoryMb`           | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `cpuTimeMs`          | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `wallTimeMs`         | `u32`    | Zero = no limit.                                                                                                                                                                                                  |
-| `maxExportBytes`     | `u32`    | Max serialised byte length of the export `WireValue`. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                                                                        |
-| `maxStdoutBytes`     | `u32`    | Max bytes captured across all stdout lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                                                                                |
-| `maxStderrBytes`     | `u32`    | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                                                                                |
-| `maxBridgeCallBytes` | `u32`    | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`.                                                  |
-| `maxBridgeCalls`     | `u32`    | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. TS default: `10` when the host does not set an explicit value. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`. |
+Every field is `Optional<u32>`. The client sends only the limits the caller
+explicitly set; the runtime fills any absent field from its own defaults (it
+owns the default safety posture — the numbers below live in
+`native/v8-runtime/src/ipc.rs` as the source of truth). An **absent** field
+means "apply the runtime default"; an **explicit `0`** means "no limit" and is
+distinct from absent.
+
+| Field                | Encoding        | Default  | Notes                                                                                                                                                            |
+| -------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memoryMb`           | `Optional<u32>` | `64`     | Zero = no limit.                                                                                                                                                 |
+| `cpuTimeMs`          | `Optional<u32>` | `5000`   | Zero = no limit.                                                                                                                                                 |
+| `wallTimeMs`         | `Optional<u32>` | `30000`  | Zero = no limit.                                                                                                                                                 |
+| `maxExportBytes`     | `Optional<u32>` | `16 MiB` | Max serialised byte length of the export `WireValue`. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                       |
+| `maxStdoutBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stdout lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
+| `maxStderrBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
+| `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
+| `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.               |
 
 `HostGlobalBinding`:
 
@@ -412,8 +419,9 @@ over the cap is silently dropped. The run itself continues normally.
 call counter shared across all bridge stubs. On each bridge call entry the
 counter is incremented before any I/O. If the pre-increment value is already
 at the limit, the run terminates with `ERR_BRIDGE_CALL_LIMIT_EXCEEDED` before
-any frame is written to the socket. The TS encoder sends `10` when the host
-does not set an explicit value, so the limit is always active by default.
+any frame is written to the socket. The runtime applies the default of `10`
+when the caller leaves the field absent, so the limit is always active by
+default; an explicit `0` disables it.
 
 ### 5.5 Diagnostic log payloads
 

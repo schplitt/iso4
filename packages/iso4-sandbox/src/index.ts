@@ -27,7 +27,6 @@ import type {
   PrefixRunOptions,
   RebindGlobals,
   Prefix,
-  ResourceLimits,
   RunOptions,
   RunResult,
   Sandbox,
@@ -139,32 +138,6 @@ async function waitForSocket(
 }
 
 /**
- * Map user-facing ResourceLimits to the wire-level encoding fields.
- * @param limits
- */
-function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
-  memoryMb: number
-  cpuTimeMs: number
-  wallTimeMs: number
-  maxExportBytes: number
-  maxStdoutBytes: number
-  maxStderrBytes: number
-  maxBridgeCallBytes: number
-  maxBridgeCalls: number
-} {
-  return {
-    memoryMb: limits?.memoryMb ?? 64,
-    cpuTimeMs: limits?.cpuTimeMs ?? 5_000,
-    wallTimeMs: limits?.wallTimeMs ?? 30_000,
-    maxExportBytes: limits?.maxExportBytes ?? 16 * 1024 * 1024,
-    maxStdoutBytes: limits?.maxStdoutBytes ?? 1 * 1024 * 1024,
-    maxStderrBytes: limits?.maxStderrBytes ?? 1 * 1024 * 1024,
-    maxBridgeCallBytes: limits?.maxBridgeCallBytes ?? 16 * 1024 * 1024,
-    maxBridgeCalls: limits?.maxBridgeCalls ?? 10,
-  }
-}
-
-/**
  * The `RunResult` returned when a run is aborted — whether the signal was
  * already aborted at run entry or fired mid-flight. `error` (code `ERR_ABORTED`)
  * is retained for backward compatibility; `reason` carries whatever was passed
@@ -234,7 +207,7 @@ class SandboxImpl implements Sandbox {
       return await this.pool.withClient(async (client) => {
         const raw = await client.runRawCode(code, {
           filename: options.filename,
-          limits: toWireLimits(options.limits),
+          limits: options.limits,
           globals: allGlobals,
           imports: bindings,
           signal: options.signal,
@@ -279,7 +252,7 @@ class SandboxImpl implements Sandbox {
       const raw = await client.precompile({
         code,
         filename: options.filename,
-        limits: toWireLimits(options.limits),
+        limits: options.limits,
         globals: allGlobals,
         imports: bindings,
       })
@@ -433,7 +406,7 @@ implements Prefix<G, M> {
           prefixId: this.id,
           code: options.code,
           filename: options.filename,
-          limits: toWireLimits(options.limits),
+          limits: options.limits,
           globals: allGlobals,
           signal: options.signal,
         })

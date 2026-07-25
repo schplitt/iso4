@@ -12,6 +12,18 @@
 // Resource limits
 // ─────────────────────────────────────────────────────────────────────────
 
+/**
+ * Per-run resource caps. Every field is optional at the call site
+ * (`limits?: ResourceLimits`): pass only the limits you want to
+ * override. The client sends just those over the wire and the **runtime owns
+ * the defaults** — it fills in any field you leave unset. The `@default` values
+ * documented below mirror the runtime's defaults (defined in
+ * `native/v8-runtime/src/ipc.rs`, the source of truth); if they ever drift, the
+ * runtime wins.
+ *
+ * A field set to `0` is not the same as leaving it unset: `0` explicitly
+ * disables that limit, whereas unset yields the runtime default.
+ */
 export interface ResourceLimits {
   /**
    * Hard cap on memory the isolate can use, in megabytes.
@@ -23,20 +35,20 @@ export interface ResourceLimits {
    * Zero means no cap.
    * @default 64
    */
-  memoryMb: number
+  memoryMb?: number
 
   /**
    * Maximum *active* execution time in milliseconds. Time spent waiting on
    * host bridge calls (globals, host imports) is excluded.
    * @default 5_000
    */
-  cpuTimeMs: number
+  cpuTimeMs?: number
 
   /**
    * Hard wall-clock cap including async waits.
    * @default 30_000
    */
-  wallTimeMs: number
+  wallTimeMs?: number
 
   /**
    * Maximum bytes the sandbox may send as arguments in a single bridge call
@@ -53,7 +65,7 @@ export interface ResourceLimits {
    * Zero disables the per-call cap.
    * @default 16 * 1024 * 1024
    */
-  maxBridgeCallBytes: number
+  maxBridgeCallBytes?: number
 
   /**
    * Maximum bytes allowed for the serialised export payload (all named exports
@@ -61,7 +73,7 @@ export interface ResourceLimits {
    * Zero disables the cap.
    * @default 16 * 1024 * 1024
    */
-  maxExportBytes: number
+  maxExportBytes?: number
 
   /**
    * Maximum bytes captured from `console.log` / `console.debug` / `console.info`
@@ -69,7 +81,7 @@ export interface ResourceLimits {
    * Zero disables the cap.
    * @default 1 * 1024 * 1024
    */
-  maxStdoutBytes: number
+  maxStdoutBytes?: number
 
   /**
    * Maximum bytes captured from `console.warn` / `console.error` combined.
@@ -77,7 +89,7 @@ export interface ResourceLimits {
    * Zero disables the cap.
    * @default 1 * 1024 * 1024
    */
-  maxStderrBytes: number
+  maxStderrBytes?: number
 
   /**
    * Maximum number of bridge calls (globals + host imports combined) a
@@ -93,7 +105,7 @@ export interface ResourceLimits {
    *
    * @default 10
    */
-  maxBridgeCalls: number
+  maxBridgeCalls?: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -489,7 +501,7 @@ export interface PrecompileOptions<
    * **Currently a no-op placeholder.** Pass limits directly to each
    * `prefix.run()` call.
    */
-  limits?: Partial<ResourceLimits>
+  limits?: ResourceLimits
 
   /**
    * Optional filename for stack traces. Default: "<prefix>".
@@ -574,7 +586,7 @@ export interface PrefixRunOptions<
    */
   imports?: RebindImports<M>
 
-  limits?: Partial<ResourceLimits>
+  limits?: ResourceLimits
   signal?: AbortSignal
   filename?: string
 }
@@ -585,7 +597,7 @@ export interface PrefixRunOptions<
 
 export interface RunOptions {
   code: string
-  limits?: Partial<ResourceLimits>
+  limits?: ResourceLimits
   globals?: HostGlobals
   imports?: Imports
   signal?: AbortSignal

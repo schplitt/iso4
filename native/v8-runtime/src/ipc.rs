@@ -255,9 +255,27 @@ pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
 
 // ── RunPayload types ─────────────────────────────────────────────────────────
 
-/// Resource limits sent with every `Run` request.
-/// All fields are zero if the TS host did not set an explicit limit.
-#[derive(Debug, Clone, Default)]
+/// Default resource limits. The runtime owns its safety posture: the TS client
+/// sends only the limits the caller explicitly set (each wire field is
+/// `Optional<u32>`), and any absent field is filled from these constants. An
+/// explicit `0` on the wire is preserved as-is and disables that limit.
+///
+/// The public `ResourceLimits` jsdoc in `packages/iso4-sandbox/src/types.ts`
+/// documents these same numbers, pointing here as the source of truth.
+pub const DEFAULT_MEMORY_MB: u32 = 64;
+pub const DEFAULT_CPU_TIME_MS: u32 = 5_000;
+pub const DEFAULT_WALL_TIME_MS: u32 = 30_000;
+pub const DEFAULT_MAX_EXPORT_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_STDOUT_BYTES: u32 = 1024 * 1024;
+pub const DEFAULT_MAX_STDERR_BYTES: u32 = 1024 * 1024;
+pub const DEFAULT_MAX_BRIDGE_CALL_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_BRIDGE_CALLS: u32 = 10;
+
+/// Resource limits applied to a `Run` request, with runtime defaults already
+/// resolved: each field is the caller's explicit value or, when the caller left
+/// it unset on the wire, the corresponding `DEFAULT_*` constant. A field of
+/// zero means the limit is explicitly disabled (no cap).
+#[derive(Debug, Clone)]
 pub struct ResourceLimits {
     pub memory_mb: u32,
     pub cpu_time_ms: u32,
@@ -269,9 +287,25 @@ pub struct ResourceLimits {
     /// (sandbox → host). Zero means no per-call cap.
     pub max_bridge_call_bytes: u32,
     /// Maximum number of bridge calls (globals + host imports combined) allowed
-    /// per run. Zero means no limit on the Rust side; the TS side defaults
-    /// to 10 when the host leaves this unset.
+    /// per run. Zero means no limit.
     pub max_bridge_calls: u32,
+}
+
+impl Default for ResourceLimits {
+    /// The runtime defaults — the posture applied when the client sends no
+    /// explicit limits at all.
+    fn default() -> Self {
+        Self {
+            memory_mb: DEFAULT_MEMORY_MB,
+            cpu_time_ms: DEFAULT_CPU_TIME_MS,
+            wall_time_ms: DEFAULT_WALL_TIME_MS,
+            max_export_bytes: DEFAULT_MAX_EXPORT_BYTES,
+            max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
+            max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
+            max_bridge_call_bytes: DEFAULT_MAX_BRIDGE_CALL_BYTES,
+            max_bridge_calls: DEFAULT_MAX_BRIDGE_CALLS,
+        }
+    }
 }
 
 /// A host global the sandbox is allowed to reference.
@@ -387,6 +421,44 @@ impl<'a> PayloadReader<'a> {
         }
     }
 
+    fn read_optional_u32(&mut self) -> io::Result<Option<u32>> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_u32()?)),
+            b => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid optional presence byte: {b:#04x}"),
+            )),
+        }
+    }
+
+    /// Read a `ResourceLimits` block: eight `Optional<u32>` fields. Any field
+    /// the client left absent is filled from the runtime default, so the
+    /// returned struct is fully resolved. An explicit `0` is preserved (it
+    /// disables that limit). See `docs/protocol.md` §5.2.
+    fn read_resource_limits(&mut self) -> io::Result<ResourceLimits> {
+        Ok(ResourceLimits {
+            memory_mb: self.read_optional_u32()?.unwrap_or(DEFAULT_MEMORY_MB),
+            cpu_time_ms: self.read_optional_u32()?.unwrap_or(DEFAULT_CPU_TIME_MS),
+            wall_time_ms: self.read_optional_u32()?.unwrap_or(DEFAULT_WALL_TIME_MS),
+            max_export_bytes: self
+                .read_optional_u32()?
+                .unwrap_or(DEFAULT_MAX_EXPORT_BYTES),
+            max_stdout_bytes: self
+                .read_optional_u32()?
+                .unwrap_or(DEFAULT_MAX_STDOUT_BYTES),
+            max_stderr_bytes: self
+                .read_optional_u32()?
+                .unwrap_or(DEFAULT_MAX_STDERR_BYTES),
+            max_bridge_call_bytes: self
+                .read_optional_u32()?
+                .unwrap_or(DEFAULT_MAX_BRIDGE_CALL_BYTES),
+            max_bridge_calls: self
+                .read_optional_u32()?
+                .unwrap_or(DEFAULT_MAX_BRIDGE_CALLS),
+        })
+    }
+
     fn assert_done(&self) -> io::Result<()> {
         if self.remaining() != 0 {
             return Err(io::Error::new(
@@ -413,16 +485,7 @@ fn parse_code_fields(
 )> {
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
-    let limits = ResourceLimits {
-        memory_mb: r.read_u32()?,
-        cpu_time_ms: r.read_u32()?,
-        wall_time_ms: r.read_u32()?,
-        max_export_bytes: r.read_u32()?,
-        max_stdout_bytes: r.read_u32()?,
-        max_stderr_bytes: r.read_u32()?,
-        max_bridge_call_bytes: r.read_u32()?,
-        max_bridge_calls: r.read_u32()?,
-    };
+    let limits = r.read_resource_limits()?;
     let globals_count = r.read_u32()? as usize;
     let mut globals = Vec::with_capacity(globals_count);
     for _ in 0..globals_count {
@@ -733,8 +796,8 @@ mod tests {
                 v.push(0);
             }
         }
-        // ResourceLimits: 8 × u32, all zero
-        v.extend_from_slice(&[0u8; 32]);
+        // ResourceLimits: 8 × Optional<u32>, all absent → runtime defaults.
+        push_absent_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v
@@ -742,6 +805,21 @@ mod tests {
 
     fn push_u32(v: &mut Vec<u8>, n: u32) {
         v.extend_from_slice(&n.to_be_bytes());
+    }
+
+    fn push_optional_u32(v: &mut Vec<u8>, n: Option<u32>) {
+        match n {
+            Some(x) => {
+                v.push(1);
+                push_u32(v, x);
+            }
+            None => v.push(0),
+        }
+    }
+
+    /// Eight absent `Optional<u32>` limit fields (one presence byte each).
+    fn push_absent_limits(v: &mut Vec<u8>) {
+        v.extend_from_slice(&[0u8; 8]);
     }
 
     fn push_string(v: &mut Vec<u8>, s: &str) {
@@ -775,14 +853,14 @@ mod tests {
         push_u32(&mut v, 42); // run_id
         push_string(&mut v, "code"); // code
         v.push(0); // no filename
-        push_u32(&mut v, 128); // memory_mb
-        push_u32(&mut v, 5000); // cpu_time_ms
-        push_u32(&mut v, 10000); // wall_time_ms
-        push_u32(&mut v, 1024 * 1024); // max_export_bytes
-        push_u32(&mut v, 512 * 1024); // max_stdout_bytes
-        push_u32(&mut v, 512 * 1024); // max_stderr_bytes
-        push_u32(&mut v, 64 * 1024); // max_bridge_call_bytes
-        push_u32(&mut v, 1_000); // max_bridge_calls
+        push_optional_u32(&mut v, Some(128)); // memory_mb
+        push_optional_u32(&mut v, Some(5000)); // cpu_time_ms
+        push_optional_u32(&mut v, Some(10000)); // wall_time_ms
+        push_optional_u32(&mut v, Some(1024 * 1024)); // max_export_bytes
+        push_optional_u32(&mut v, Some(512 * 1024)); // max_stdout_bytes
+        push_optional_u32(&mut v, Some(512 * 1024)); // max_stderr_bytes
+        push_optional_u32(&mut v, Some(64 * 1024)); // max_bridge_call_bytes
+        push_optional_u32(&mut v, Some(1_000)); // max_bridge_calls
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
 
@@ -791,6 +869,53 @@ mod tests {
         assert_eq!(p.limits.memory_mb, 128);
         assert_eq!(p.limits.cpu_time_ms, 5000);
         assert_eq!(p.limits.wall_time_ms, 10000);
+        assert_eq!(p.limits.max_bridge_calls, 1_000);
+    }
+
+    #[test]
+    fn parse_run_payload_absent_limits_resolve_to_defaults() {
+        // All eight limit fields absent → the runtime fills each from its
+        // DEFAULT_* constant. This is the whole point of the optional wire
+        // encoding: the client no longer ships the default numbers.
+        let bytes = encode_run_payload(1, "export default 1", None);
+        let p = parse_run_payload(&bytes).unwrap();
+        assert_eq!(p.limits.memory_mb, DEFAULT_MEMORY_MB);
+        assert_eq!(p.limits.cpu_time_ms, DEFAULT_CPU_TIME_MS);
+        assert_eq!(p.limits.wall_time_ms, DEFAULT_WALL_TIME_MS);
+        assert_eq!(p.limits.max_export_bytes, DEFAULT_MAX_EXPORT_BYTES);
+        assert_eq!(p.limits.max_stdout_bytes, DEFAULT_MAX_STDOUT_BYTES);
+        assert_eq!(p.limits.max_stderr_bytes, DEFAULT_MAX_STDERR_BYTES);
+        assert_eq!(
+            p.limits.max_bridge_call_bytes,
+            DEFAULT_MAX_BRIDGE_CALL_BYTES
+        );
+        assert_eq!(p.limits.max_bridge_calls, DEFAULT_MAX_BRIDGE_CALLS);
+    }
+
+    #[test]
+    fn parse_run_payload_explicit_zero_limit_disables_not_defaults() {
+        // An explicit 0 must survive as 0 (limit disabled), NOT be replaced by
+        // the default — the client uses 0 to opt out of a cap.
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "x"); // code
+        v.push(0); // no filename
+        push_optional_u32(&mut v, Some(0)); // memory_mb: explicitly unlimited
+        push_optional_u32(&mut v, None); // cpu_time_ms: default
+        push_optional_u32(&mut v, None); // wall_time_ms
+        push_optional_u32(&mut v, None); // max_export_bytes
+        push_optional_u32(&mut v, None); // max_stdout_bytes
+        push_optional_u32(&mut v, None); // max_stderr_bytes
+        push_optional_u32(&mut v, None); // max_bridge_call_bytes
+        push_optional_u32(&mut v, Some(0)); // max_bridge_calls: explicitly unlimited
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 0); // imports count
+
+        let p = parse_run_payload(&v).unwrap();
+        assert_eq!(p.limits.memory_mb, 0);
+        assert_eq!(p.limits.max_bridge_calls, 0);
+        // Untouched fields still resolve to their defaults.
+        assert_eq!(p.limits.cpu_time_ms, DEFAULT_CPU_TIME_MS);
     }
 
     #[test]
@@ -799,7 +924,7 @@ mod tests {
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 32]); // limits (all zero)
+        push_absent_limits(&mut v); // limits (all absent → defaults)
         push_u32(&mut v, 2); // 2 globals
         push_string(&mut v, "fetch");
         push_string(&mut v, "myTool");
@@ -817,7 +942,7 @@ mod tests {
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "code"); // code
         v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 32]); // limits
+        push_absent_limits(&mut v); // limits
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "lib:math"); // specifier
@@ -835,7 +960,7 @@ mod tests {
         push_u32(&mut v, 1);
         push_string(&mut v, "code");
         v.push(0); // no filename
-        v.extend_from_slice(&[0u8; 32]); // limits
+        push_absent_limits(&mut v); // limits
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 2); // 2 imports
         push_string(&mut v, "lib:a");
