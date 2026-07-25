@@ -502,7 +502,11 @@ export const fetchedAt = Date.now()
   },
   stdout: "",
   stderr: "",
-  durationMs: 142,
+  durationMs: 142,      // wall-clock, measured in the runtime
+  cpuTimeMs: 12.4,      // active V8 execution; bridge waits excluded
+  bridgeCalls: [        // recorded in the runtime; metadata only, never payloads
+    { name: "fetch", startMs: 0.4, durationMs: 2.3, argBytes: 180, responseBytes: 41208, ok: true, blocked: false },
+  ],
 }
 ```
 
@@ -552,8 +556,15 @@ genuine failure.
 A completed run:
 
 ```ts
-{ status: "completed", ok: true, exports: { … }, stdout, stderr, durationMs }
+{ status: "completed", ok: true, exports: { … }, stdout, stderr, durationMs, cpuTimeMs, bridgeCalls }
 ```
+
+All three outcomes carry the run's timings (`durationMs` wall, `cpuTimeMs`
+active execution) and `bridgeCalls` — per-attempt metadata recorded inside
+the Rust runtime, including attempts blocked by limits (`blocked: true`); see
+§5 above. Exception: aborted runs report zeros and an empty `bridgeCalls`,
+because the abort tears the connection down before the runtime can send its
+result frame — graceful termination (#36) will close that gap.
 
 If user code throws (uncaught), or the runtime kills the isolate (memory, CPU,
 wall), the run **fails**:
@@ -572,6 +583,8 @@ wall), the run **fails**:
   stdout: "...",  // whatever was emitted before the throw
   stderr: "...",
   durationMs: 42,
+  cpuTimeMs: 3.7,
+  bridgeCalls: [ … ],
 }
 ```
 
@@ -595,6 +608,8 @@ to `AbortController.abort(reason)`:
   error: { code: "ERR_ABORTED", name: "AbortError", message: "run was aborted" },
   reason,   // the value passed to abort(reason), or undefined
   stdout, stderr, durationMs,
+  cpuTimeMs,    // 0 — no result frame arrives from Rust on abort
+  bridgeCalls,  // [] — same reason; graceful termination (#36) will fill these
 }
 ```
 

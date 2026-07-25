@@ -46,11 +46,13 @@ import {
   processImports,
 } from './imports.js'
 import type { DeclaredImportShape, HandleRegistry } from './imports.js'
+import { makeBridgeNameResolver } from './bridge-report.js'
 
 export type {
   ResourceLimits,
   HostGlobals,
   HostGlobalValue,
+  BridgeCallEntry,
   BridgeWithShim,
   RebindValue,
   RebindGlobals,
@@ -168,6 +170,9 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
  * `RunAbortedError` from the client). Shared so both paths produce an
  * identical shape. `error` (code `ERR_ABORTED`) is retained for backward
  * compatibility; `reason` carries whatever was passed to `abort(reason)`.
+ *
+ * An abort teardown means no Result frame from Rust, so timings and
+ * `bridgeCalls` are empty — graceful termination (#36) will fill them in.
  * @param reason
  */
 function abortedResult(reason?: unknown): RunResult {
@@ -179,6 +184,8 @@ function abortedResult(reason?: unknown): RunResult {
     stdout: [],
     stderr: [],
     durationMs: 0,
+    cpuTimeMs: 0,
+    bridgeCalls: [],
   }
 }
 
@@ -210,7 +217,7 @@ class SandboxImpl implements Sandbox {
       return abortedResult(options.signal.reason)
     }
     const { bridgeGlobals, preamble } = processGlobals(options.globals ?? {})
-    const { bindings, registry, shape: _shape } = processImports(options.imports)
+    const { bindings, registry, shape } = processImports(options.imports)
     // Host-module function leaves are reached through the single
     // `__iso4_call` dispatcher global, which routes by handle ID. Install it
     // alongside the user globals when any function leaves exist.
@@ -218,6 +225,7 @@ class SandboxImpl implements Sandbox {
       ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
       : bridgeGlobals
     const code = preamble ? `${preamble}\n${options.code}` : options.code
+    const resolveName = makeBridgeNameResolver(shape)
     try {
       return await this.pool.withClient(async (client) => {
         const raw = await client.runRawCode(code, {
@@ -227,7 +235,7 @@ class SandboxImpl implements Sandbox {
           imports: bindings,
           signal: options.signal,
         })
-        return decodeRunCompletionPayload(raw.result).result
+        return decodeRunCompletionPayload(raw.result, resolveName).result
       })
     } catch (error) {
       if (error instanceof RunAbortedError)
@@ -364,6 +372,8 @@ implements Prefix<G, M> {
         stdout: [],
         stderr: [],
         durationMs: 0,
+        cpuTimeMs: 0,
+        bridgeCalls: [],
       }
     }
 
@@ -394,6 +404,8 @@ implements Prefix<G, M> {
           stdout: [],
           stderr: [],
           durationMs: 0,
+          cpuTimeMs: 0,
+          bridgeCalls: [],
         }
       }
       throw e
@@ -403,6 +415,7 @@ implements Prefix<G, M> {
     const allGlobals = registry.size > 0
       ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
       : bridgeGlobals
+    const resolveName = makeBridgeNameResolver(this.declaredImportShape)
     try {
       return await this.pool.withClient(async (client) => {
         const raw = await client.prefixRun({
@@ -413,7 +426,7 @@ implements Prefix<G, M> {
           globals: allGlobals,
           signal: options.signal,
         })
-        return decodeRunCompletionPayload(raw.result).result
+        return decodeRunCompletionPayload(raw.result, resolveName).result
       })
     } catch (error) {
       if (error instanceof RunAbortedError)

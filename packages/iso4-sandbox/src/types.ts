@@ -607,6 +607,57 @@ export type AbortReason = unknown
 export type RunResult = RunSuccess | RunFailure | RunAborted
 
 /**
+ * Metadata for a single bridge call attempt, recorded by the Rust runtime on
+ * the run's own clock. No payloads — names, timing, and sizes only — so
+ * recording is cheap enough to stay always-on. Unbounded: every attempt gets
+ * an entry (~100 bytes); consumers that only care about a subset filter the
+ * list themselves.
+ */
+export interface BridgeCallEntry {
+  /**
+   * The name sandbox code called. Plain globals appear as-is (`fetch`),
+   * shimmed globals under their public name (not the private stub), and
+   * host-module import leaves as `<specifier>.<path>` (e.g.
+   * `tools:search.query`).
+   */
+  name: string
+  /**
+   * Offset from run start to the attempt, in milliseconds — same clock as
+   * the result's `durationMs`, so entries line up on a run timeline.
+   */
+  startMs: number
+  /**
+   * Round-trip time the sandbox waited for the response (host handler + IPC),
+   * in milliseconds. For calls still unanswered when the run ended
+   * (timeout/abort): the time until the run ended. `0` for blocked attempts.
+   */
+  durationMs: number
+  /**
+   * Serialized size of the call payload (callId + target + arguments) in
+   * bytes — the same size `maxBridgeCallBytes` is enforced against. `0` for
+   * attempts blocked before argument serialization.
+   */
+  argBytes: number
+  /**
+   * Serialized size of the successful response value in bytes. `0` when the
+   * handler failed or the call never settled.
+   */
+  responseBytes: number
+  /**
+   * `true` when the host handler resolved and its response reached the
+   * sandbox. `false` for handler errors, blocked attempts, and calls still
+   * in flight when the run ended.
+   */
+  ok: boolean
+  /**
+   * `true` when the attempt was blocked inside the runtime (`maxBridgeCalls`
+   * exceeded, payload over `maxBridgeCallBytes`, function argument) and never
+   * reached the host.
+   */
+  blocked: boolean
+}
+
+/**
  * `status` is the primary discriminant across all three outcomes; `ok` is kept
  * as a convenience alias for `status === 'completed'`, so the common guard
  * stays `if (result.ok)`. Reach for `switch (result.status)` when a deliberate
@@ -618,7 +669,24 @@ export interface RunSuccess {
   exports: SandboxExports
   stdout: string[]
   stderr: string[]
+  /**
+   * Wall-clock time of the run (start of execution to result), measured in
+   * the runtime. Milliseconds with microsecond resolution.
+   */
   durationMs: number
+  /**
+   * Active V8 execution time — time spent waiting on host bridge calls is
+   * excluded. Milliseconds with microsecond resolution. The remainder
+   * (`durationMs - cpuTimeMs`) is bridge waits plus scheduling.
+   */
+  cpuTimeMs: number
+  /**
+   * One entry per bridge call the sandbox attempted, in attempt order —
+   * including attempts blocked by limits ({@link BridgeCallEntry.blocked}).
+   * Recorded by the Rust runtime; empty for aborted runs (an abort tears the
+   * connection down before the runtime can report).
+   */
+  bridgeCalls: BridgeCallEntry[]
 }
 
 export interface RunFailure {
@@ -628,6 +696,8 @@ export interface RunFailure {
   stdout: string[]
   stderr: string[]
   durationMs: number
+  cpuTimeMs: number
+  bridgeCalls: BridgeCallEntry[]
 }
 
 /**
@@ -645,6 +715,13 @@ export interface RunAborted {
   stdout: string[]
   stderr: string[]
   durationMs: number
+  cpuTimeMs: number
+  /**
+   * Always empty today: aborting tears the connection down before the
+   * runtime can send its result frame. Graceful termination (#36) will fill
+   * this in.
+   */
+  bridgeCalls: BridgeCallEntry[]
 }
 
 export type SandboxExports = {

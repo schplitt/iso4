@@ -284,6 +284,107 @@ impl CpuBudget {
             .unwrap_or(0);
         (base + active) / 1_000_000
     }
+
+    /// Total accumulated CPU time in milliseconds with microsecond
+    /// resolution. The integer `elapsed_ms` is enough for the 10ms-poll CPU
+    /// guard; the run result reports this precise value so sub-millisecond
+    /// runs don't read as `0`.
+    pub fn elapsed_ms_precise(&self) -> f64 {
+        let base = self.accumulated_ns.load(Ordering::Relaxed);
+        let active = self
+            .epoch_start
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|t| t.elapsed().as_nanos() as u64)
+            .unwrap_or(0);
+        ((base + active) as f64 / 1_000.0).round() / 1_000.0
+    }
+}
+
+// ── Bridge call log ──────────────────────────────────────────────────────────
+
+/// The reserved dispatcher global backing all host-module import function
+/// leaves. Mirrors `BRIDGE_DISPATCH_GLOBAL` in the TS client (`imports.ts`);
+/// used here to tag records with the import handle ID so the client can
+/// resolve the `<specifier>.<path>` name.
+const BRIDGE_DISPATCH_GLOBAL: &str = "__iso4_call";
+
+/// Round to microsecond resolution, matching `elapsed_ms`.
+fn round_micro(ms: f64) -> f64 {
+    (ms * 1_000.0).round() / 1_000.0
+}
+
+/// Per-run bridge-call records, shared between the bridge callbacks (which
+/// record attempts) and the poll loop (which settles them when the response
+/// frame arrives). Both run on the V8 thread — the Mutex exists to satisfy
+/// Send for the Arc, mirroring `PendingResolvers`.
+#[derive(Default)]
+struct BridgeCallLog {
+    records: Vec<wire::BridgeCallRecord>,
+    /// callId → index into `records`, for calls awaiting their response.
+    in_flight: HashMap<u32, usize>,
+}
+
+impl BridgeCallLog {
+    /// An attempt blocked runtime-side (limit, oversized payload, function
+    /// argument, transport failure) — never reached the host.
+    fn record_blocked(&mut self, raw_name: &str, start_ms: f64, arg_bytes: u32) {
+        self.records.push(wire::BridgeCallRecord {
+            raw_name: raw_name.to_string(),
+            import_handle_id: None,
+            start_ms,
+            duration_ms: 0.0,
+            arg_bytes,
+            response_bytes: 0,
+            ok: false,
+            blocked: true,
+        });
+    }
+
+    /// A call whose BridgeCall frame was written to the host; settles when
+    /// the matching response arrives (or at finalize if it never does).
+    fn record_sent(
+        &mut self,
+        call_id: u32,
+        raw_name: &str,
+        import_handle_id: Option<u32>,
+        start_ms: f64,
+        arg_bytes: u32,
+    ) {
+        self.records.push(wire::BridgeCallRecord {
+            raw_name: raw_name.to_string(),
+            import_handle_id,
+            start_ms,
+            duration_ms: 0.0,
+            arg_bytes,
+            response_bytes: 0,
+            ok: false,
+            blocked: false,
+        });
+        self.in_flight.insert(call_id, self.records.len() - 1);
+    }
+
+    /// Route a BridgeResponse to its record. Unknown callIds (stale frames
+    /// from a previous run) are ignored, mirroring the resolver map.
+    fn settle(&mut self, call_id: u32, now_ms: f64, ok: bool, response_bytes: u32) {
+        if let Some(idx) = self.in_flight.remove(&call_id) {
+            let r = &mut self.records[idx];
+            r.duration_ms = round_micro((now_ms - r.start_ms).max(0.0));
+            r.ok = ok;
+            r.response_bytes = response_bytes;
+        }
+    }
+
+    /// Snapshot the records for the run result. Calls still in flight get
+    /// their duration set to "until run end" and stay `ok: false`.
+    fn finalize(&mut self, now_ms: f64) -> Vec<wire::BridgeCallRecord> {
+        for idx in self.in_flight.values() {
+            let r = &mut self.records[*idx];
+            r.duration_ms = round_micro((now_ms - r.start_ms).max(0.0));
+        }
+        self.in_flight.clear();
+        std::mem::take(&mut self.records)
+    }
 }
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -305,6 +406,15 @@ pub struct Output {
     /// Wall-clock time from start of execution to result, in milliseconds
     /// with microsecond resolution (three decimal places).
     pub duration_ms: f64,
+
+    /// Active V8 execution time (bridge waits excluded), in milliseconds
+    /// with microsecond resolution.
+    pub cpu_time_ms: f64,
+
+    /// One record per bridge call the sandbox attempted, in attempt order —
+    /// including attempts blocked Rust-side (limit exceeded, oversized
+    /// payload, function arguments) that never reached the host.
+    pub bridge_calls: Vec<wire::BridgeCallRecord>,
 }
 
 /// The result of a failed JavaScript execution.
@@ -317,6 +427,12 @@ pub struct FailureOutput {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub duration_ms: f64,
+
+    /// Active V8 execution time — see `Output::cpu_time_ms`.
+    pub cpu_time_ms: f64,
+
+    /// Bridge call records — see `Output::bridge_calls`.
+    pub bridge_calls: Vec<wire::BridgeCallRecord>,
 }
 
 /// Payload carried by `RunError::RuntimeError`. Kept in a separate struct so
@@ -466,14 +582,65 @@ fn run_module(
     globals: &[String],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
+    call_id_counter: Arc<AtomicU32>,
+) -> Result<Output, FailureOutput> {
+    // The run clock, CPU budget, and bridge-call log live here (not inside
+    // the inner function) so the final values can be stamped onto BOTH
+    // result arms in one place — the inner function has many early-return
+    // failure paths.
+    let start = std::time::Instant::now();
+    let cpu_budget = Arc::new(CpuBudget::new());
+    let bridge_log: Arc<Mutex<BridgeCallLog>> = Arc::new(Mutex::new(BridgeCallLog::default()));
+    let mut result = run_module_inner(
+        code,
+        filename,
+        snapshot,
+        limits,
+        globals,
+        imports,
+        stream_fd,
+        call_id_counter,
+        start,
+        Arc::clone(&cpu_budget),
+        Arc::clone(&bridge_log),
+    );
+    let cpu_time_ms = cpu_budget.elapsed_ms_precise();
+    let records = bridge_log
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .finalize(elapsed_ms(start));
+    match &mut result {
+        Ok(output) => {
+            output.cpu_time_ms = cpu_time_ms;
+            output.bridge_calls = records;
+        }
+        Err(failure) => {
+            failure.cpu_time_ms = cpu_time_ms;
+            failure.bridge_calls = records;
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)] // internal; parameters mirror run_module + shared run state
+fn run_module_inner(
+    code: &str,
+    filename: &str,
+    snapshot: Option<&[u8]>,
+    limits: Limits,
+    globals: &[String],
+    imports: &[ImportBinding],
+    stream_fd: Option<RawFd>,
     // Per-connection call-ID counter. Shared across all runs on the same
     // connection so callIds are monotonically increasing and never reset to 0
     // between runs. This prevents a stale BridgeResponse from a previous
     // run's orphaned handler from being accepted as a valid response by the
     // next run's bridge_global_callback.
     call_id_counter: Arc<AtomicU32>,
+    start: std::time::Instant,
+    cpu_budget: Arc<CpuBudget>,
+    bridge_log: Arc<Mutex<BridgeCallLog>>,
 ) -> Result<Output, FailureOutput> {
-    let start = std::time::Instant::now();
     let mut logs = LogBuffers {
         max_stdout_bytes: limits.max_stdout_bytes,
         max_stderr_bytes: limits.max_stderr_bytes,
@@ -585,7 +752,6 @@ fn run_module(
     // is obtained while we still hold a plain &Isolate borrow.
     let handle = isolate.thread_safe_handle();
     let cancel_handle = handle.clone(); // for cancel_terminate_execution on success
-    let cpu_budget = Arc::new(CpuBudget::new());
     let cancel_wall = start_wall_guard(handle.clone(), Arc::clone(&reason), limits.wall_time_ms);
     let cancel_cpu = start_cpu_guard(
         handle.clone(),
@@ -657,6 +823,8 @@ fn run_module(
             Arc::clone(&bridge_call_count),
             limits.max_bridge_calls,
             Arc::clone(&pending_resolvers),
+            start,
+            Arc::clone(&bridge_log),
             &mut callback_data_boxes,
         )
         .map_err(|e| failure(e, &logs, start))?;
@@ -928,6 +1096,21 @@ fn run_module(
                         ));
                     }
                     Ok((call_id, result)) => {
+                        // Settle the call's bridge record: round-trip time on
+                        // the run clock plus the response value's serialized
+                        // size (frame payload minus the callId + ok header).
+                        // Unknown callIds are ignored inside settle().
+                        let response_value_bytes = if result.is_ok() {
+                            frame.payload.len().saturating_sub(5) as u32
+                        } else {
+                            0
+                        };
+                        bridge_log.lock().unwrap_or_else(|p| p.into_inner()).settle(
+                            call_id,
+                            elapsed_ms(start),
+                            result.is_ok(),
+                            response_value_bytes,
+                        );
                         // Route to the matching resolver.  An unknown callId
                         // means a stale frame from a previous run — discard.
                         let entry = pending_resolvers
@@ -1079,6 +1262,9 @@ fn run_module(
         stdout: logs.stdout.clone(),
         stderr: logs.stderr.clone(),
         duration_ms: elapsed_ms(start),
+        // Stamped by run_module from the shared run state.
+        cpu_time_ms: 0.0,
+        bridge_calls: Vec::new(),
     })
 }
 
@@ -1246,6 +1432,8 @@ fn precompile_module(
             stdout: Vec::new(),
             stderr: Vec::new(),
             duration_ms: elapsed_ms(start),
+            cpu_time_ms: 0.0,
+            bridge_calls: Vec::new(),
         })
 }
 
@@ -1262,6 +1450,10 @@ fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> Fai
         stdout: logs.stdout.clone(),
         stderr: logs.stderr.clone(),
         duration_ms: elapsed_ms(start),
+        // Stamped by run_module from the shared run state (stays empty/0 for
+        // precompile failures, which have no bridge and no CPU budget).
+        cpu_time_ms: 0.0,
+        bridge_calls: Vec::new(),
     }
 }
 
@@ -1611,6 +1803,12 @@ struct GlobalCallbackData {
     /// Map of in-flight resolvers keyed by callId.  The callback inserts here;
     /// the poll loop in run_module removes and resolves/rejects.
     resolver_map: PendingResolvers,
+    /// Run start — bridge-call records carry offsets on this clock so they
+    /// line up with the result's `durationMs`.
+    run_start: std::time::Instant,
+    /// Per-run bridge-call records (attempts + blocked attempts); the poll
+    /// loop settles sent entries when their response arrives.
+    log: Arc<Mutex<BridgeCallLog>>,
 }
 
 /// Record a fatal bridge error and terminate JS execution immediately.
@@ -1662,13 +1860,22 @@ fn bridge_global_callback(
     // `module.evaluate()` returns. No callback fires after that.
     let data = unsafe { &*data };
 
+    // Attempt timestamp on the run clock — recorded for every attempt,
+    // including ones blocked below.
+    let start_ms = elapsed_ms(data.run_start);
+    let record_blocked = |arg_bytes: u32| {
+        data.log
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record_blocked(&data.name, start_ms, arg_bytes);
+    };
+
     // ── Bridge call count limit ────────────────────────────────────────────
-    if data.max_bridge_calls > 0 {
-        let prev = data.bridge_call_count.fetch_add(1, Ordering::Relaxed);
-        if prev >= data.max_bridge_calls {
-            fatal_bridge_error(scope, &data.bridge_error, RunError::BridgeCallLimitExceeded);
-            return;
-        }
+    let prev = data.bridge_call_count.fetch_add(1, Ordering::Relaxed);
+    if data.max_bridge_calls > 0 && prev >= data.max_bridge_calls {
+        record_blocked(0);
+        fatal_bridge_error(scope, &data.bridge_error, RunError::BridgeCallLimitExceeded);
+        return;
     }
 
     // ── Serialise arguments ────────────────────────────────────────────────
@@ -1676,6 +1883,7 @@ fn bridge_global_callback(
     for i in 0..args.length() {
         let arg = args.get(i);
         if arg.is_function() {
+            record_blocked(0);
             fatal_bridge_error(
                 scope,
                 &data.bridge_error,
@@ -1686,6 +1894,7 @@ fn bridge_global_callback(
         match arg_to_wire(scope, arg) {
             Ok(wv) => wire_args.push(wv),
             Err(e) => {
+                record_blocked(0);
                 fatal_bridge_error(scope, &data.bridge_error, e);
                 return;
             }
@@ -1704,6 +1913,7 @@ fn bridge_global_callback(
     if data.max_bridge_call_bytes > 0
         && bridge_call_payload.len() > data.max_bridge_call_bytes as usize
     {
+        record_blocked(bridge_call_payload.len() as u32);
         fatal_bridge_error(
             scope,
             &data.bridge_error,
@@ -1721,6 +1931,7 @@ fn bridge_global_callback(
         ipc::RustToTsMessageType::BridgeCall,
         &bridge_call_payload,
     ) {
+        record_blocked(bridge_call_payload.len() as u32);
         fatal_bridge_error(
             scope,
             &data.bridge_error,
@@ -1728,6 +1939,30 @@ fn bridge_global_callback(
         );
         return;
     }
+
+    // The frame reached the host — record the call for the run's bridge
+    // report. A `__iso4_call` dispatch carries its host-module handle ID as
+    // the first argument; recorded so the client can resolve the
+    // `<specifier>.<path>` name. Settled by the poll loop when the matching
+    // BridgeResponse arrives.
+    let import_handle_id = if data.name == BRIDGE_DISPATCH_GLOBAL {
+        match wire_args.first() {
+            Some(WireValue::Number(n)) if *n >= 0.0 => Some(*n as u32),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    data.log
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record_sent(
+            call_id,
+            &data.name,
+            import_handle_id,
+            start_ms,
+            bridge_call_payload.len() as u32,
+        );
 
     // ── Create PromiseResolver, store it, return the Promise ──────────────
     // The run_module poll loop will resolve/reject this when the matching
@@ -1769,6 +2004,8 @@ fn install_bridge_globals(
     bridge_call_count: Arc<AtomicU32>,
     max_bridge_calls: u32,
     resolver_map: PendingResolvers,
+    run_start: std::time::Instant,
+    log: Arc<Mutex<BridgeCallLog>>,
     // Vec<Box<>> is intentional: raw pointers into each Box are passed to V8
     // as External data — the address must not move on Vec reallocation.
     #[allow(clippy::vec_box)] out_boxes: &mut Vec<Box<GlobalCallbackData>>,
@@ -1784,6 +2021,8 @@ fn install_bridge_globals(
             bridge_call_count: Arc::clone(&bridge_call_count),
             max_bridge_calls,
             resolver_map: Arc::clone(&resolver_map),
+            run_start,
+            log: Arc::clone(&log),
         });
         // Pass a raw pointer to the Box's heap allocation as External data.
         // The Box is stored in out_boxes and outlives all V8 callbacks.
@@ -5286,6 +5525,93 @@ mod tests {
             calls_handled, 3,
             "expected 3 calls before limit, got {calls_handled}"
         );
+    }
+
+    #[test]
+    fn bridge_calls_recorded_on_success_without_limit() {
+        // max_bridge_calls = 0 (unlimited): calls are still recorded and
+        // reported on the success output, with metadata.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 3, WireValue::Number(1.0)));
+
+        let out = execute(
+            "await myTool(); await myTool(); await myTool(); export default 'done'",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_calls: 0,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            &[],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(out.bridge_calls.len(), 3);
+        for record in &out.bridge_calls {
+            assert_eq!(record.raw_name, "myTool");
+            assert!(record.ok, "served call must settle ok");
+            assert!(!record.blocked);
+            assert!(record.arg_bytes > 0, "call payload has at least the header");
+            assert!(record.response_bytes > 0, "number response has bytes");
+            assert!(record.duration_ms >= 0.0);
+        }
+        // Attempt order is preserved on the run clock.
+        assert!(out.bridge_calls[0].start_ms <= out.bridge_calls[1].start_ms);
+        assert!(out.bridge_calls[1].start_ms <= out.bridge_calls[2].start_ms);
+        // Active CPU time is reported with sub-millisecond resolution.
+        assert!(out.cpu_time_ms > 0.0);
+        assert!(out.cpu_time_ms <= out.duration_ms);
+    }
+
+    #[test]
+    fn bridge_calls_recorded_on_limit_failure() {
+        // The violating attempt is recorded too, flagged as blocked:
+        // limit 3 → 4 records, the last one blocked.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
+
+        let failure = execute(
+            "await myTool(); await myTool(); await myTool(); await myTool(); \
+             export default 'done'",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_calls: 3,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            &[],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap_err();
+
+        handle.join().unwrap();
+        assert!(matches!(failure.error, RunError::BridgeCallLimitExceeded));
+        assert_eq!(failure.bridge_calls.len(), 4);
+        assert!(failure.bridge_calls[..3].iter().all(|r| r.ok && !r.blocked));
+        let violating = &failure.bridge_calls[3];
+        assert!(violating.blocked, "attempt past the limit is blocked");
+        assert!(!violating.ok);
+        assert_eq!(violating.response_bytes, 0);
     }
 
     #[test]

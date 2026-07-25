@@ -10,7 +10,17 @@
  */
 
 import { Buffer } from 'node:buffer'
-import type { RunErrorCode, RunResult, SandboxExports } from './types'
+import type { BridgeCallEntry, RunErrorCode, RunResult, SandboxExports } from './types'
+
+/**
+ * Maps a wire-level bridge stub name (+ import handle ID for `__iso4_call`
+ * dispatches) to the public call name. Built per run by
+ * `makeBridgeNameResolver` (`bridge-report.ts`); defaults to identity.
+ */
+export type BridgeNameResolver = (
+  rawName: string,
+  importHandleId: number | undefined,
+) => string
 
 // ── Value tags ─────────────────────────────────────────────────────────────
 
@@ -264,6 +274,8 @@ export interface DecodedRunCompletion {
  *   List<String>  stdout
  *   List<String>  stderr
  *   f64  durationMs
+ *   f64  cpuTimeMs
+ *   List<BridgeCallRecord>  bridgeCalls
  * u8    failurePresent   (1 when ok = 0)
  *   String  code
  *   String  name
@@ -273,10 +285,17 @@ export interface DecodedRunCompletion {
  *   List<String>  stdout
  *   List<String>  stderr
  *   f64  durationMs
+ *   f64  cpuTimeMs
+ *   List<BridgeCallRecord>  bridgeCalls
  * ```
  * @param buf
+ * @param resolveName maps wire-level stub names to public call names;
+ * identity when omitted
  */
-export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletion {
+export function decodeRunCompletionPayload(
+  buf: Uint8Array,
+  resolveName: BridgeNameResolver = (rawName) => rawName,
+): DecodedRunCompletion {
   const reader = new WireReader(buf)
   const runId = reader.readU32()
   const ok = reader.readBool()
@@ -292,6 +311,8 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
     const stdout = reader.readStringList()
     const stderr = reader.readStringList()
     const durationMs = reader.readF64()
+    const cpuTimeMs = reader.readF64()
+    const bridgeCalls = readBridgeCallRecords(reader, resolveName)
     reader.readU8() // failurePresent = 0; consumed for forward-compat
 
     reader.assertDone()
@@ -304,6 +325,8 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
         stdout,
         stderr,
         durationMs,
+        cpuTimeMs,
+        bridgeCalls,
       },
     }
   }
@@ -327,12 +350,58 @@ export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletio
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
   const durationMs = reader.readF64()
+  const cpuTimeMs = reader.readF64()
+  const bridgeCalls = readBridgeCallRecords(reader, resolveName)
 
   reader.assertDone()
   return {
     runId,
-    result: { status: 'failed', ok: false, error: { code, name, message, stack, fields }, stdout, stderr, durationMs },
+    result: {
+      status: 'failed',
+      ok: false,
+      error: { code, name, message, stack, fields },
+      stdout,
+      stderr,
+      durationMs,
+      cpuTimeMs,
+      bridgeCalls,
+    },
   }
+}
+
+/**
+ * Decode `List<BridgeCallRecord>` per `docs/protocol.md` §5.6, resolving each
+ * record's wire-level name to its public name as it is read.
+ * @param reader
+ * @param resolveName
+ */
+function readBridgeCallRecords(
+  reader: WireReader,
+  resolveName: BridgeNameResolver,
+): BridgeCallEntry[] {
+  const count = reader.readU32()
+  const entries: BridgeCallEntry[] = []
+  for (let i = 0; i < count; i++) {
+    const rawName = reader.readString()
+    const handlePresent = reader.readU8()
+    const importHandleId = handlePresent === 1 ? reader.readU32() : undefined
+    const startMs = reader.readF64()
+    const durationMs = reader.readF64()
+    const argBytes = reader.readU32()
+    const responseBytes = reader.readU32()
+    const ok = reader.readBool()
+    const blocked = reader.readBool()
+    entries.push({
+      name: resolveName(rawName, importHandleId),
+      startMs,
+      durationMs,
+      argBytes,
+      responseBytes,
+      ok,
+      blocked,
+    })
+  }
+  return entries
 }
 
 // ── PrecompileResultPayload decoder ───────────────────────────────────────────

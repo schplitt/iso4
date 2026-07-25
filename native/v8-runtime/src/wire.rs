@@ -282,6 +282,39 @@ pub struct RunErrorPayload {
     pub fields: Option<WireValue>,
 }
 
+/// Per-call metadata for one bridge call attempt — names, timing, and sizes
+/// only, never payloads. Recorded by the runtime (`v8.rs`) and shipped on the
+/// Result frame; the TS client resolves `raw_name`/`import_handle_id` to the
+/// public call name.
+#[derive(Debug, Clone)]
+pub struct BridgeCallRecord {
+    /// Wire-level export name the sandbox called (`fetch`, `__iso4_fetch_h`,
+    /// `__iso4_call`).
+    pub raw_name: String,
+    /// First argument of a `__iso4_call` dispatch — the host-module function
+    /// handle ID. `None` for plain globals and for attempts blocked before
+    /// argument serialisation.
+    pub import_handle_id: Option<u32>,
+    /// Offset from run start to the attempt, in ms (same clock as
+    /// `duration_ms` on the run result).
+    pub start_ms: f64,
+    /// Round-trip time the sandbox waited (handler + IPC), in ms. For calls
+    /// still unanswered when the run ended: time until run end. `0` for
+    /// blocked attempts.
+    pub duration_ms: f64,
+    /// Serialized call payload size in bytes (the size `maxBridgeCallBytes`
+    /// is enforced against). `0` for attempts blocked before serialisation.
+    pub arg_bytes: u32,
+    /// Serialized response value size in bytes. `0` on handler error or when
+    /// the call never settled.
+    pub response_bytes: u32,
+    /// The host handler resolved and its response reached the sandbox.
+    pub ok: bool,
+    /// The attempt was blocked runtime-side (maxBridgeCalls, oversized
+    /// payload, function argument) and never reached the host.
+    pub blocked: bool,
+}
+
 /// Payload for a successful run.
 pub struct RunSuccessPayload {
     /// All exports as a flat `WireValue::Object`. The `default` export (if
@@ -290,6 +323,10 @@ pub struct RunSuccessPayload {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub duration_ms: f64,
+    /// Active V8 execution time (bridge waits excluded), in ms.
+    pub cpu_time_ms: f64,
+    /// One record per bridge call attempt, in attempt order.
+    pub bridge_calls: Vec<BridgeCallRecord>,
 }
 
 /// Payload for a failed run.
@@ -298,6 +335,10 @@ pub struct RunFailurePayload {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub duration_ms: f64,
+    /// Active V8 execution time (bridge waits excluded), in ms.
+    pub cpu_time_ms: f64,
+    /// One record per bridge call attempt, in attempt order.
+    pub bridge_calls: Vec<BridgeCallRecord>,
 }
 
 /// The two variants of a completed run.
@@ -319,11 +360,15 @@ pub enum RunCompletion {
 ///   List<String>  stdout
 ///   List<String>  stderr
 ///   f64  durationMs
+///   f64  cpuTimeMs
+///   List<BridgeCallRecord>  bridgeCalls
 /// u8    failurePresent  (1 when ok = 0)
 ///   RunErrorPayload  error
 ///   List<String>  stdout
 ///   List<String>  stderr
 ///   f64  durationMs
+///   f64  cpuTimeMs
+///   List<BridgeCallRecord>  bridgeCalls
 /// ```
 pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> Vec<u8> {
     let mut out = Vec::new();
@@ -337,6 +382,8 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_string_list(&s.stdout, &mut out);
             encode_string_list(&s.stderr, &mut out);
             encode_f64(s.duration_ms, &mut out);
+            encode_f64(s.cpu_time_ms, &mut out);
+            encode_bridge_call_records(&s.bridge_calls, &mut out);
             out.push(0); // Optional<RunFailurePayload> absent
         }
         RunCompletion::Failure(f) => {
@@ -347,10 +394,43 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_string_list(&f.stdout, &mut out);
             encode_string_list(&f.stderr, &mut out);
             encode_f64(f.duration_ms, &mut out);
+            encode_f64(f.cpu_time_ms, &mut out);
+            encode_bridge_call_records(&f.bridge_calls, &mut out);
         }
     }
 
     out
+}
+
+/// Encode `List<BridgeCallRecord>`. Per record:
+/// ```text
+/// String        rawName
+/// Optional<u32> importHandleId
+/// f64           startMs
+/// f64           durationMs
+/// u32           argBytes
+/// u32           responseBytes
+/// bool          ok
+/// bool          blocked
+/// ```
+fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
+    encode_u32(records.len() as u32, out);
+    for r in records {
+        encode_string(&r.raw_name, out);
+        match r.import_handle_id {
+            Some(id) => {
+                out.push(1);
+                encode_u32(id, out);
+            }
+            None => out.push(0),
+        }
+        encode_f64(r.start_ms, out);
+        encode_f64(r.duration_ms, out);
+        encode_u32(r.arg_bytes, out);
+        encode_u32(r.response_bytes, out);
+        encode_bool(r.ok, out);
+        encode_bool(r.blocked, out);
+    }
 }
 
 fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
@@ -912,6 +992,8 @@ mod tests {
                 stdout: vec![],
                 stderr: vec![],
                 duration_ms: 1.0,
+                cpu_time_ms: 0.5,
+                bridge_calls: Vec::new(),
             }),
         );
         // First 4 bytes: run_id = 42
@@ -937,6 +1019,8 @@ mod tests {
                 stdout: vec![],
                 stderr: vec![],
                 duration_ms: 0.5,
+                cpu_time_ms: 0.1,
+                bridge_calls: Vec::new(),
             }),
         );
         // First 4 bytes: run_id = 7
@@ -959,6 +1043,17 @@ mod tests {
                 stdout: vec!["hello".to_string()],
                 stderr: vec!["warn".to_string()],
                 duration_ms: 2.5,
+                cpu_time_ms: 1.25,
+                bridge_calls: vec![BridgeCallRecord {
+                    raw_name: "fetch".to_string(),
+                    import_handle_id: None,
+                    start_ms: 0.5,
+                    duration_ms: 1.0,
+                    arg_bytes: 42,
+                    response_bytes: 128,
+                    ok: true,
+                    blocked: false,
+                }],
             }),
         );
 
@@ -975,6 +1070,16 @@ mod tests {
         assert_eq!(hello_len, 5);
         offset += 4;
         assert_eq!(&payload[offset..offset + 5], b"hello");
+
+        // Tail layout: … f64 durationMs, f64 cpuTimeMs,
+        // List<BridgeCallRecord>, failureAbsent byte. The single record ends
+        // with u32 argBytes(42) + u32 responseBytes(128) + ok(1) + blocked(0).
+        let n = payload.len();
+        assert_eq!(payload[n - 1], 0); // failure absent
+        assert_eq!(payload[n - 2], 0); // blocked = false
+        assert_eq!(payload[n - 3], 1); // ok = true
+        assert_eq!(&payload[n - 7..n - 3], &128u32.to_be_bytes());
+        assert_eq!(&payload[n - 11..n - 7], &42u32.to_be_bytes());
     }
 
     // ── Decoder error cases ───────────────────────────────────────────────────

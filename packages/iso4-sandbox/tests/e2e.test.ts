@@ -2773,3 +2773,217 @@ describe('async context — node:async_hooks', () => {
     })
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 18. Bridge report — result.bridgeCalls + result.cpuTimeMs
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('bridge report', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('run with no bridge calls reports empty bridgeCalls and a CPU time', async () => {
+    const result = await runtime.run({ code: 'export default 1' })
+    expect(result.ok).toBe(true)
+    expect(result.bridgeCalls).toEqual([])
+    expect(result.cpuTimeMs).toBeGreaterThan(0)
+    expect(result.cpuTimeMs).toBeLessThanOrEqual(result.durationMs)
+  })
+
+  test('plain global calls are recorded in order with metadata', async () => {
+    const result = await runtime.run({
+      code: `
+        await toolA('x'.repeat(500))
+        await toolA(2)
+        await toolB()
+        export default 'done'
+      `,
+      globals: {
+        toolA: () => 'y'.repeat(2000),
+        toolB: () => null,
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(result.bridgeCalls).toHaveLength(3)
+    expect(result.bridgeCalls.map((c) => c.name)).toEqual(['toolA', 'toolA', 'toolB'])
+    const [first] = result.bridgeCalls
+    // ~500-char string argument → payload well above 500 bytes.
+    expect(first.argBytes).toBeGreaterThan(500)
+    // ~2000-char return value → response value above 2000 bytes.
+    expect(first.responseBytes).toBeGreaterThan(2000)
+    for (const call of result.bridgeCalls) {
+      expect(call.ok).toBe(true)
+      expect(call.blocked).toBe(false)
+      expect(call.startMs).toBeGreaterThanOrEqual(0)
+      expect(call.durationMs).toBeGreaterThanOrEqual(0)
+      expect(call.argBytes).toBeGreaterThan(0)
+      expect(call.responseBytes).toBeGreaterThan(0)
+      // Entries live on the run clock, so they fit inside the run duration.
+      expect(call.startMs).toBeLessThanOrEqual(result.durationMs)
+    }
+    // Attempt order matches call order.
+    expect(result.bridgeCalls[0].startMs).toBeLessThanOrEqual(result.bridgeCalls[1].startMs)
+    expect(result.bridgeCalls[1].startMs).toBeLessThanOrEqual(result.bridgeCalls[2].startMs)
+  })
+
+  test('cpuTimeMs excludes time spent waiting on host handlers', async () => {
+    const result = await runtime.run({
+      code: 'export default await slow()',
+      globals: {
+        slow: () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve('done'), 150)
+          }),
+      },
+    })
+    expect(result.ok).toBe(true)
+    // The run waited ~150ms on the handler…
+    expect(result.durationMs).toBeGreaterThan(100)
+    // …but barely executed any JS.
+    expect(result.cpuTimeMs).toBeLessThan(result.durationMs / 2)
+    // The bridge entry's round-trip covers the wait.
+    expect(result.bridgeCalls[0].durationMs).toBeGreaterThan(100)
+  })
+
+  test('shimmed global is reported under its public name', async () => {
+    const result = await runtime.run({
+      code: 'export default await fetchLike(\'u\')',
+      globals: {
+        fetchLike: {
+          kind: 'bridge-with-shim' as const,
+          handler: (() => ({ status: 200 })) as (...args: unknown[]) => unknown,
+          shim: '(r) => r.status',
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(result.exports.default).toBe(200)
+    expect(result.bridgeCalls).toHaveLength(1)
+    expect(result.bridgeCalls[0].name).toBe('fetchLike')
+  })
+
+  test('host-module import calls are reported as <specifier>.<path>', async () => {
+    const result = await runtime.run({
+      code: `
+        import { query } from 'tools:search'
+        export default await query('term')
+      `,
+      imports: {
+        'tools:search': {
+          query: (q: unknown) => `result for ${String(q)}`,
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(result.bridgeCalls).toHaveLength(1)
+    expect(result.bridgeCalls[0].name).toBe('tools:search.query')
+    expect(result.bridgeCalls[0].ok).toBe(true)
+  })
+
+  test('handler errors are recorded as ok: false with zero response bytes', async () => {
+    const result = await runtime.run({
+      code: `
+        let failed = false
+        try {
+          await broken()
+        }
+        catch {
+          failed = true
+        }
+        export default failed
+      `,
+      globals: {
+        broken: () => {
+          throw new Error('boom')
+        },
+      },
+    })
+    // Handler errors are catchable in the sandbox — the run itself succeeds.
+    expect(result.ok).toBe(true)
+    expect(result.exports.default).toBe(true)
+    expect(result.bridgeCalls).toHaveLength(1)
+    expect(result.bridgeCalls[0].ok).toBe(false)
+    expect(result.bridgeCalls[0].blocked).toBe(false)
+    expect(result.bridgeCalls[0].responseBytes).toBe(0)
+  })
+
+  test('failed runs still carry the bridge report', async () => {
+    const result = await runtime.run({
+      code: `
+        await tool()
+        throw new Error('after the call')
+      `,
+      globals: { tool: () => 1 },
+    })
+    expect(result.ok).toBe(false)
+    expect(result.bridgeCalls).toHaveLength(1)
+    expect(result.bridgeCalls[0].name).toBe('tool')
+    expect(result.bridgeCalls[0].ok).toBe(true)
+  })
+
+  test('attempts blocked by maxBridgeCalls are recorded as blocked entries', async () => {
+    const result = await runtime.run({
+      code: `
+        await tool()
+        await tool()
+        await tool()
+        await tool()
+        export default 'done'
+      `,
+      limits: { maxBridgeCalls: 3, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
+      globals: { tool: () => null },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    // The 4th attempt never reached the host but is on the record — blocked.
+    expect(result.bridgeCalls).toHaveLength(4)
+    expect(result.bridgeCalls.slice(0, 3).every((c) => c.ok && !c.blocked)).toBe(true)
+    const violating = result.bridgeCalls[3]
+    expect(violating.blocked).toBe(true)
+    expect(violating.ok).toBe(false)
+    expect(violating.responseBytes).toBe(0)
+  })
+
+  test('aborted runs carry no bridge report (no result frame from Rust)', async () => {
+    // Documented gap until graceful termination (#36): the abort tears the
+    // connection down, so the runtime never reports what it recorded.
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 50)
+    const result = await runtime.run({
+      code: 'export default await hang()',
+      signal: controller.signal,
+      globals: {
+        hang: () =>
+          new Promise((resolve) => {
+            setTimeout(resolve, 10_000)
+          }),
+      },
+    })
+    expect(result.status).toBe('aborted')
+    expect(result.bridgeCalls).toEqual([])
+    expect(result.cpuTimeMs).toBe(0)
+  })
+
+  test('prefix.run() carries the bridge report too', async () => {
+    const prefix = await runtime.precompile({
+      code: 'globalThis.ready = true',
+      globals: { tool: () => 'v' },
+    })
+    const result = await prefix.run({ code: 'export default await tool()' })
+    expect(result.ok).toBe(true)
+    expect(result.exports.default).toBe('v')
+    expect(result.bridgeCalls).toHaveLength(1)
+    expect(result.bridgeCalls[0].name).toBe('tool')
+    expect(result.cpuTimeMs).toBeGreaterThan(0)
+    await prefix.dispose()
+  })
+})
