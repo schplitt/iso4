@@ -18,8 +18,8 @@ import {
   encodeTerminatePayload,
   encodeTsToRustFrame,
 } from './ipc'
-import type { HostExportFunction } from './types.js'
-import type { ImportBindingPayload, ResourceLimits } from './ipc'
+import type { HostExportFunction, ResourceLimits } from './types.js'
+import type { ImportBindingPayload } from './ipc'
 import { encodeWireValue } from './wire'
 
 export interface RuntimeIpcClientOptions {

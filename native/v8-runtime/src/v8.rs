@@ -1042,9 +1042,10 @@ fn run_module_inner(
                 sock.set_read_timeout(Some(t)).ok();
             }
             // Cap BridgeResponse frame reads by the sandbox memory budget.
-            // memory_mb = 0 means the TS layer sent MAX_MEMORY_LIMIT (explicit
-            // opt-out); fall back to the global framing cap as a parsing
-            // safety limit only in that case.
+            // memory_mb = 0 means the caller explicitly opted out of the memory
+            // cap (an explicit 0 on the wire; absent would have resolved to the
+            // default); fall back to the global framing cap as a parsing safety
+            // limit only in that case.
             let bridge_frame_limit: u32 = if limits.memory_mb > 0 {
                 limits.memory_mb.saturating_mul(1024 * 1024)
             } else {

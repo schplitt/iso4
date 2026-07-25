@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { decodeWireValueFromSlice, encodeWireValue } from './wire.js'
+import type { ResourceLimits } from './types.js'
 
 export const PROTOCOL_VERSION: 1 = 1
 
@@ -316,6 +317,16 @@ class PayloadWriter {
     return this
   }
 
+  writeOptionalU32(n: number | undefined): this {
+    if (n === undefined) {
+      this.writeU8(0)
+    } else {
+      this.writeU8(1)
+      this.writeU32(n)
+    }
+    return this
+  }
+
   writeImports(imports: readonly ImportBindingPayload[]): this {
     // Wire layout per docs/protocol.md §5.2 and the Rust parser in `ipc.rs`:
     //   u32                count
@@ -329,16 +340,18 @@ class PayloadWriter {
   }
 
   writeResourceLimits(limits: ResourceLimits): this {
-    this.writeU32(limits.memoryMb ?? 0)
-    this.writeU32(limits.cpuTimeMs ?? 0)
-    this.writeU32(limits.wallTimeMs ?? 0)
-    this.writeU32(limits.maxExportBytes ?? 0)
-    this.writeU32(limits.maxStdoutBytes ?? 0)
-    this.writeU32(limits.maxStderrBytes ?? 0)
-    this.writeU32(limits.maxBridgeCallBytes ?? 0)
-    // Default to 10 when not explicitly set so the door is never accidentally
-    // left open. Pass 0 to disable the limit entirely.
-    this.writeU32(limits.maxBridgeCalls ?? 10)
+    // Each field is `Optional<u32>`: the client sends only the limits the
+    // caller explicitly set. Absent fields are filled in by the runtime, which
+    // owns the default safety posture (see `ResourceLimits` jsdoc). An explicit
+    // `0` is distinct from absent — it disables that limit entirely.
+    this.writeOptionalU32(limits.memoryMb)
+    this.writeOptionalU32(limits.cpuTimeMs)
+    this.writeOptionalU32(limits.wallTimeMs)
+    this.writeOptionalU32(limits.maxExportBytes)
+    this.writeOptionalU32(limits.maxStdoutBytes)
+    this.writeOptionalU32(limits.maxStderrBytes)
+    this.writeOptionalU32(limits.maxBridgeCallBytes)
+    this.writeOptionalU32(limits.maxBridgeCalls)
     return this
   }
 
@@ -348,41 +361,13 @@ class PayloadWriter {
 }
 
 // ── ResourceLimits ──────────────────────────────────────────────────────────
-
-export interface ResourceLimits {
-  /**
-   * V8 heap + ArrayBuffer budget in megabytes. Zero = no limit. \@default 0
-   */
-  memoryMb?: number
-  /**
-   * Active JS execution time in ms (host-wait excluded). Zero = no limit. \@default 0
-   */
-  cpuTimeMs?: number
-  /**
-   * Hard wall-clock cap in ms including async waits. Zero = no limit. \@default 0
-   */
-  wallTimeMs?: number
-  /**
-   * Max serialised export size in bytes. Zero = no limit. \@default 0
-   */
-  maxExportBytes?: number
-  /**
-   * Max captured stdout size in bytes. Zero = no limit. \@default 0
-   */
-  maxStdoutBytes?: number
-  /**
-   * Max captured stderr size in bytes. Zero = no limit. \@default 0
-   */
-  maxStderrBytes?: number
-  /**
-   * Max bridge call payload in bytes (sandbox → host args). Zero = no limit. \@default 0
-   */
-  maxBridgeCallBytes?: number
-  /**
-   * Max total bridge calls per run. Zero = no limit. \@default 10
-   */
-  maxBridgeCalls?: number
-}
+//
+// The wire form is the public `ResourceLimits` from `types.ts` (single source
+// of truth — rich jsdoc and `@default` values live there). Every field is
+// optional: the client sends only what the caller explicitly set, and the
+// runtime fills any absent field from its own defaults. An explicit `0` is
+// distinct from absent and disables that limit entirely. `writeResourceLimits`
+// encodes each field as `Optional<u32>` accordingly.
 
 // ── ImportBinding (wire form) ───────────────────────────────────────────────
 
