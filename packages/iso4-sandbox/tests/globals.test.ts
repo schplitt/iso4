@@ -12,54 +12,69 @@
 import { describe, expect, it } from 'vitest'
 import type {
   BridgeWithShim,
+  DataGlobal,
   HostExportFunction,
   HostGlobals,
   RebindGlobals,
 } from '../src/types.js'
+import type { GlobalDefPayload } from '../src/ipc.js'
 import { extractBridgeGlobals, processGlobals } from '../src/globals.js'
 
+// Find a produced global def by its public name.
+function defFor(defs: GlobalDefPayload[], name: string): GlobalDefPayload | undefined {
+  return defs.find((d) => d.name === name)
+}
+
 // ─────────────────────────────────────────────────────────────────────────
-// processGlobals — preamble + bridge global extraction
+// processGlobals — structured defs + bridge dispatch map
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('processGlobals', () => {
   describe('HostExportFunction', () => {
-    it('registers function under its own name, no preamble', () => {
+    it('emits a bridge def and a dispatch entry under its own name', () => {
       const fn: HostExportFunction = () => 42
-      const { bridgeGlobals, preamble } = processGlobals({ myTool: fn })
-      expect(bridgeGlobals['myTool']).toBe(fn)
-      expect(preamble).toBeUndefined()
+      const { defs, dispatch } = processGlobals({ myTool: fn })
+      expect(defFor(defs, 'myTool')).toEqual({ kind: 'bridge', name: 'myTool' })
+      expect(dispatch['myTool']).toBe(fn)
     })
 
     it('registers multiple plain functions independently', () => {
       const a: HostExportFunction = () => 'a'
       const b: HostExportFunction = () => 'b'
-      const { bridgeGlobals, preamble } = processGlobals({ a, b })
-      expect(bridgeGlobals['a']).toBe(a)
-      expect(bridgeGlobals['b']).toBe(b)
-      expect(preamble).toBeUndefined()
+      const { defs, dispatch } = processGlobals({ a, b })
+      expect(defFor(defs, 'a')).toEqual({ kind: 'bridge', name: 'a' })
+      expect(defFor(defs, 'b')).toEqual({ kind: 'bridge', name: 'b' })
+      expect(dispatch['a']).toBe(a)
+      expect(dispatch['b']).toBe(b)
     })
   })
 
   describe('string global', () => {
-    it('generates preamble, no bridge global', () => {
-      const { bridgeGlobals, preamble } = processGlobals({
-        PI: `Math.PI`,
-      })
-      expect(Object.keys(bridgeGlobals)).toHaveLength(0)
-      expect(preamble).toBe('globalThis["PI"] = (Math.PI)')
+    it('emits a string-expr def and no dispatch entry', () => {
+      const { defs, dispatch } = processGlobals({ PI: `Math.PI` })
+      expect(defFor(defs, 'PI')).toEqual({ kind: 'string', name: 'PI', expr: 'Math.PI' })
+      expect(Object.keys(dispatch)).toHaveLength(0)
     })
 
-    it('wraps the expression in globalThis assignment', () => {
-      const { preamble } = processGlobals({ VERSION: `'2.0'` })
-      expect(preamble).toBe('globalThis["VERSION"] = (\'2.0\')')
+    it('carries the raw expression verbatim (no globalThis wrapping in the client)', () => {
+      const { defs } = processGlobals({ VERSION: `'2.0'` })
+      expect(defFor(defs, 'VERSION')).toEqual({ kind: 'string', name: 'VERSION', expr: `'2.0'` })
     })
 
-    it('multiple string globals produce multiple preamble lines', () => {
-      const { preamble } = processGlobals({ A: `1`, B: `2` })
-      expect(preamble?.split('\n')).toHaveLength(2)
-      expect(preamble).toContain('globalThis["A"] = (1)')
-      expect(preamble).toContain('globalThis["B"] = (2)')
+    it('multiple string globals produce multiple defs', () => {
+      const { defs } = processGlobals({ A: `1`, B: `2` })
+      expect(defFor(defs, 'A')).toEqual({ kind: 'string', name: 'A', expr: '1' })
+      expect(defFor(defs, 'B')).toEqual({ kind: 'string', name: 'B', expr: '2' })
+    })
+  })
+
+  describe('data global', () => {
+    it('emits a data def carrying the value, no dispatch entry', () => {
+      const value = { model: 'gpt-4', maxTokens: 1000 }
+      const dataGlobal: DataGlobal = { kind: 'data', value }
+      const { defs, dispatch } = processGlobals({ config: dataGlobal })
+      expect(defFor(defs, 'config')).toEqual({ kind: 'data', name: 'config', value })
+      expect(Object.keys(dispatch)).toHaveLength(0)
     })
   })
 
@@ -69,47 +84,49 @@ describe('processGlobals', () => {
 
     const shimGlobal: BridgeWithShim = { kind: 'bridge-with-shim', handler, shim }
 
-    it('registers handler under private __iso4_<name>_h key, not the public name', () => {
-      const { bridgeGlobals } = processGlobals({ fetch: shimGlobal })
-      expect(bridgeGlobals['fetch']).toBeUndefined()
-      expect(bridgeGlobals['__iso4_fetch_h']).toBe(handler)
+    it('dispatches the handler under the private __iso4_<name>_h key, not the public name', () => {
+      const { dispatch } = processGlobals({ fetch: shimGlobal })
+      expect(dispatch['fetch']).toBeUndefined()
+      expect(dispatch['__iso4_fetch_h']).toBe(handler)
     })
 
-    it('generates wrapper preamble that calls the private stub then the shim', () => {
-      const { preamble } = processGlobals({ fetch: shimGlobal })
-      expect(preamble).toContain('globalThis["fetch"]')
-      expect(preamble).toContain('__iso4_fetch_h')
-      expect(preamble).toContain(shim)
-      // wrapper is async and awaits both the stub and the shim
-      expect(preamble).toContain('async (...args)')
-      expect(preamble).toContain('await')
+    it('emits a shim def naming the shim expression and the private handler', () => {
+      const { defs } = processGlobals({ fetch: shimGlobal })
+      expect(defFor(defs, 'fetch')).toEqual({
+        kind: 'shim',
+        name: 'fetch',
+        shim,
+        handlerName: '__iso4_fetch_h',
+      })
     })
 
     it('uses the correct private key for any global name', () => {
-      const { bridgeGlobals, preamble } = processGlobals({ myApi: shimGlobal })
-      expect(bridgeGlobals['__iso4_myApi_h']).toBe(handler)
-      expect(preamble).toContain('globalThis["myApi"]')
-      expect(preamble).toContain('__iso4_myApi_h')
+      const { defs, dispatch } = processGlobals({ myApi: shimGlobal })
+      expect(dispatch['__iso4_myApi_h']).toBe(handler)
+      expect(defFor(defs, 'myApi')).toMatchObject({ kind: 'shim', handlerName: '__iso4_myApi_h' })
     })
 
-    it('mixes plain functions, string globals, and shims correctly', () => {
+    it('mixes plain functions, string globals, data globals, and shims correctly', () => {
       const plainFn: HostExportFunction = () => 'plain'
-      const { bridgeGlobals, preamble } = processGlobals({
+      const { defs, dispatch } = processGlobals({
         fetch: shimGlobal, // BridgeWithShim
         myTool: plainFn, // HostExportFunction
         API_URL: `'https://api'`, // string
+        limits: { kind: 'data', value: { max: 5 } }, // DataGlobal
       })
 
-      // Bridge globals: plain function under own name, shim under private key
-      expect(bridgeGlobals['myTool']).toBe(plainFn)
-      expect(bridgeGlobals['__iso4_fetch_h']).toBe(handler)
-      expect(bridgeGlobals['fetch']).toBeUndefined()
-      expect(bridgeGlobals['API_URL']).toBeUndefined()
+      // Dispatch map: plain function under own name, shim under private key.
+      expect(dispatch['myTool']).toBe(plainFn)
+      expect(dispatch['__iso4_fetch_h']).toBe(handler)
+      expect(dispatch['fetch']).toBeUndefined()
+      expect(dispatch['API_URL']).toBeUndefined()
+      expect(dispatch['limits']).toBeUndefined()
 
-      // Preamble: only string and shim generate preamble
-      expect(preamble).toContain('globalThis["API_URL"]')
-      expect(preamble).toContain('globalThis["fetch"]')
-      expect(preamble).not.toContain('myTool') // plain fn has no preamble
+      // One def per global, tagged by kind.
+      expect(defFor(defs, 'myTool')).toMatchObject({ kind: 'bridge' })
+      expect(defFor(defs, 'fetch')).toMatchObject({ kind: 'shim' })
+      expect(defFor(defs, 'API_URL')).toMatchObject({ kind: 'string' })
+      expect(defFor(defs, 'limits')).toMatchObject({ kind: 'data' })
     })
   })
 })
@@ -131,41 +148,51 @@ describe('extractBridgeGlobals', () => {
     fetch: shimGlobal,
     myTool: plainFn,
     API_URL: `'https://api'`,
+    config: { kind: 'data', value: { a: 1 } },
   }
 
-  it('string globals are skipped — they have no bridge function', () => {
-    const out = extractBridgeGlobals({}, precompileGlobals)
-    expect(Object.keys(out)).not.toContain('API_URL')
+  it('string and data globals are skipped — they are baked into the snapshot', () => {
+    const { defs, dispatch } = extractBridgeGlobals({}, precompileGlobals)
+    expect(defFor(defs, 'API_URL')).toBeUndefined()
+    expect(defFor(defs, 'config')).toBeUndefined()
+    expect(dispatch['API_URL']).toBeUndefined()
+    expect(dispatch['config']).toBeUndefined()
   })
 
-  it('shimmed global with no override uses the precompile handler at private key', () => {
-    const out = extractBridgeGlobals({}, precompileGlobals)
-    expect(out['__iso4_fetch_h']).toBe(defaultHandler)
-    expect(out['fetch']).toBeUndefined()
+  it('every re-installed def is a plain bridge stub', () => {
+    const { defs } = extractBridgeGlobals({}, precompileGlobals)
+    for (const d of defs) expect(d.kind).toBe('bridge')
+  })
+
+  it('shimmed global with no override re-installs the private handler stub with the default', () => {
+    const { defs, dispatch } = extractBridgeGlobals({}, precompileGlobals)
+    expect(defFor(defs, '__iso4_fetch_h')).toEqual({ kind: 'bridge', name: '__iso4_fetch_h' })
+    expect(dispatch['__iso4_fetch_h']).toBe(defaultHandler)
+    expect(dispatch['fetch']).toBeUndefined()
   })
 
   it('plain function with no override uses the precompile handler at own name', () => {
-    const out = extractBridgeGlobals({}, precompileGlobals)
-    expect(out['myTool']).toBe(plainFn)
+    const { defs, dispatch } = extractBridgeGlobals({}, precompileGlobals)
+    expect(defFor(defs, 'myTool')).toEqual({ kind: 'bridge', name: 'myTool' })
+    expect(dispatch['myTool']).toBe(plainFn)
   })
 
-  it('shimmed global with function override: override goes to private key', () => {
+  it('shimmed global with function override: override goes to the private key', () => {
     const newHandler: HostExportFunction = async () => ({ status: 418, body: 'teapot' })
-    const out = extractBridgeGlobals({ fetch: newHandler }, precompileGlobals)
-    expect(out['__iso4_fetch_h']).toBe(newHandler)
-    expect(out['fetch']).toBeUndefined()
+    const { dispatch } = extractBridgeGlobals({ fetch: newHandler }, precompileGlobals)
+    expect(dispatch['__iso4_fetch_h']).toBe(newHandler)
+    expect(dispatch['fetch']).toBeUndefined()
   })
 
   it('plain function with override: override goes to own name', () => {
     const newTool: HostExportFunction = () => 'overridden'
-    const out = extractBridgeGlobals({ myTool: newTool }, precompileGlobals)
-    expect(out['myTool']).toBe(newTool)
+    const { dispatch } = extractBridgeGlobals({ myTool: newTool }, precompileGlobals)
+    expect(dispatch['myTool']).toBe(newTool)
   })
 
-  it('produces a flat map of only bridge functions — no preamble needed at run time', () => {
-    const out = extractBridgeGlobals({}, precompileGlobals)
-    // Every value must be a function
-    for (const v of Object.values(out)) {
+  it('produces a dispatch map of only functions', () => {
+    const { dispatch } = extractBridgeGlobals({}, precompileGlobals)
+    for (const v of Object.values(dispatch)) {
       expect(typeof v).toBe('function')
     }
   })
@@ -183,6 +210,7 @@ describe('RebindGlobals type constraints (compile-time)', () => {
     fetch: BridgeWithShim<SafeFetchFn>
     myTool: MyToolFn
     API_URL: string
+    config: DataGlobal
   }
 
   type Rebind = RebindGlobals<G>
@@ -194,6 +222,12 @@ describe('RebindGlobals type constraints (compile-time)', () => {
     // @ts-expect-error — API_URL is a string global and must not be rebindable
     const _: Rebind = { API_URL: 'https://new' }
     expect(true).toBe(true) // runtime assertion is trivial; the type error above is the test
+  })
+
+  it('data global key is excluded from RebindGlobals entirely', () => {
+    // @ts-expect-error — config is a data (constant) global and must not be rebindable
+    const _: Rebind = { config: { kind: 'data', value: 1 } }
+    expect(true).toBe(true)
   })
 
   it('shimmed global can only be rebound with the same handler type', () => {
@@ -230,17 +264,18 @@ describe('RebindGlobals type constraints (compile-time)', () => {
 
 describe('bad paths — runtime', () => {
   describe('processGlobals edge cases', () => {
-    it('unknown kind object is silently ignored (not a function, string, or BridgeWithShim)', () => {
-      // An object that isn't a BridgeWithShim (wrong kind) should not crash.
-      // Treated as a function (typeof check comes first) — not the intended use,
-      // but shouldn't throw.
-      expect(() => processGlobals({ weird: { kind: 'not-a-shim' } as unknown as HostExportFunction })).not.toThrow()
+    it('unknown kind object is silently ignored (not a function, string, data, or shim)', () => {
+      const { defs, dispatch } = processGlobals({
+        weird: { kind: 'not-a-shim' } as unknown as HostExportFunction,
+      })
+      expect(defFor(defs, 'weird')).toBeUndefined()
+      expect(Object.keys(dispatch)).toHaveLength(0)
     })
 
-    it('empty globals map returns no bridge globals and no preamble', () => {
-      const { bridgeGlobals, preamble } = processGlobals({})
-      expect(Object.keys(bridgeGlobals)).toHaveLength(0)
-      expect(preamble).toBeUndefined()
+    it('empty globals map returns no defs and no dispatch entries', () => {
+      const { defs, dispatch } = processGlobals({})
+      expect(defs).toHaveLength(0)
+      expect(Object.keys(dispatch)).toHaveLength(0)
     })
   })
 
@@ -253,21 +288,21 @@ describe('bad paths — runtime', () => {
         handler: () => {},
         shim: '(r) => r',
       }
-      const out = extractBridgeGlobals(
+      const { dispatch } = extractBridgeGlobals(
         { fetch: 'https://evil.com' } as unknown as RebindGlobals<HostGlobals>,
         { fetch: shimGlobal },
       )
       // String override is ignored; falls back to default handler at the private key
-      expect(out['__iso4_fetch_h']).toBe(shimGlobal.handler)
+      expect(dispatch['__iso4_fetch_h']).toBe(shimGlobal.handler)
     })
 
     it('null/undefined override falls back to precompile default', () => {
       const defaultFn: HostExportFunction = () => 'default'
-      const out = extractBridgeGlobals(
+      const { dispatch } = extractBridgeGlobals(
         { myTool: undefined as unknown as HostExportFunction },
         { myTool: defaultFn },
       )
-      expect(out['myTool']).toBe(defaultFn)
+      expect(dispatch['myTool']).toBe(defaultFn)
     })
   })
 })

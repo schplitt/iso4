@@ -143,7 +143,8 @@ describe('RuntimeIpcClient', () => {
     const dispatched: unknown[] = []
     const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
     const raw = await client.runRawCode('export default 1', {
-      globals: {
+      globals: [{ kind: 'bridge', name: 'greet' }],
+      dispatch: {
         greet: (...args: unknown[]) => {
           dispatched.push(args[0])
           return 'hello'

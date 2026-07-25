@@ -2124,6 +2124,72 @@ describe('globals bridge — BridgeWithShim (Phase 4)', () => {
     expect(result.exports['default']).toBe(42)
   })
 
+  test('data global: a plain constant object is materialised natively in the sandbox', async () => {
+    const config = { model: 'gpt-4', maxTokens: 1000, nested: { retries: 3 } }
+    const result = await runtime.run({
+      code: 'export default { model: config.model, retries: config.nested.retries }',
+      globals: {
+        config: { kind: 'data', value: config },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual({ model: 'gpt-4', retries: 3 })
+  })
+
+  test('data global: carries Uint8Array, bigint, and null without a code string', async () => {
+    const result = await runtime.run({
+      code: `export default {
+        byte: blob[1],
+        len: blob.length,
+        big: (big + 1n).toString(),
+        nothing: nada,
+      }`,
+      globals: {
+        blob: { kind: 'data', value: new Uint8Array([10, 20, 30]) },
+        big: { kind: 'data', value: 9007199254740993n },
+        nada: { kind: 'data', value: null },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual({
+      byte: 20,
+      len: 3,
+      big: '9007199254740994',
+      nothing: null,
+    })
+  })
+
+  test('line numbers: a user error reports its real line even with globals configured', async () => {
+    // Regression for #38: globals used to be installed by prepending generated
+    // source to user code, which shifted every stack-trace line. Native install
+    // means user code starts at line 1 regardless of how many globals exist.
+    const result = await runtime.run({
+      // `throw` is on line 1 of the user code.
+      code: `throw new Error('boom')`,
+      globals: {
+        API_URL: `'https://api.example.com'`,
+        config: { kind: 'data', value: { a: 1 } },
+        fetch: {
+          kind: 'bridge-with-shim',
+          handler: async () => ({ status: 200 }),
+          shim: `(r) => r`,
+        },
+        myTool: async () => 'ok',
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.message).toBe('boom')
+    // The throw is on line 1; the preamble no longer offsets it.
+    expect(result.error.stack).toContain(':1:')
+    expect(result.error.stack).not.toContain(':2:')
+  })
+
   test('BridgeWithShim: sandbox sees the shimmed wrapper, not the raw return value', async () => {
     // The handler returns { status, body }; the shim adds .ok and .data
     const result = await runtime.run({

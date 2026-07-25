@@ -140,27 +140,51 @@ export type HostGlobals = Record<string, HostGlobalValue>
  *
  * - `HostExportFunction` — bridge call: every sandbox invocation dispatches
  *   to the host handler.
- * - `string` — a JS expression installed once at prefix setup:
- *   `globalThis.<name> = <expr>`. Use for pure sandbox utilities that need
- *   no host involvement.
+ * - `string` — a JS expression the runtime evaluates once and installs as
+ *   `globalThis.<name>`. Use for pure sandbox utilities that need no host
+ *   involvement. The expression is evaluated by Rust as its own script, so it
+ *   never shifts the line numbers of user code.
+ * - `DataGlobal` — a plain constant carried as data and installed natively;
+ *   no code text, no host involvement.
  * - `BridgeWithShim` — bridge call + in-sandbox result wrapper. The handler
  *   can be rebound per `prefix.run()`; the shim is compiled into the snapshot.
  */
 
-export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any>
+export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> | DataGlobal
+
+/**
+ * A plain **constant** global — a data value installed directly on the sandbox
+ * global object, with no host involvement and no code text anywhere.
+ *
+ * The value crosses the wire as a `WireValue` and Rust materialises it natively
+ * with `wire_to_v8_value` (the same path host-module data leaves take):
+ *
+ * ```ts
+ * globals: { config: { kind: 'data', value: userConfig } }
+ * ```
+ *
+ * `value` accepts the same set as host-module data leaves (`HostExportData`):
+ * primitives, `bigint`, `string`, `Uint8Array`, and plain objects/arrays.
+ * Like string globals, a data global is a constant — it cannot be rebound per
+ * `prefix.run()`.
+ */
+export interface DataGlobal {
+  kind: 'data'
+  value: HostExportData
+}
 
 /**
  * A global that pairs a bridge handler with an in-sandbox shim that wraps
  * its return value. Typical use: adding `.json()` / `.text()` convenience
  * methods to a fetch response without extra bridge round-trips.
  *
- * The TS layer:
- *  1. Registers `handler` as a bridge stub under `__iso4_<name>_h`.
- *  2. Prepends to the prefix source:
- *     ```js
- *     globalThis.<name> = async (...args) =>
- *       await (<shim>)(await __iso4_<name>_h(...args))
- *     ```
+ * The runtime installs this natively:
+ *  1. `handler` is registered as a bridge stub under the private dispatch
+ *     name `__iso4_<name>_h`.
+ *  2. Rust evaluates the shim expression and builds the wrapper
+ *     `async (...args) => await shim(await globalThis["__iso4_<name>_h"](...args))`,
+ *     then sets it on the global object under `<name>` via the V8 API — the
+ *     public name is a plain string passed to `object.set`, never code.
  *
  * The shim is a JS function expression `(result) => transformedResult` (sync
  * or async). Sandbox built-ins (TextDecoder, JSON, …) are available in scope.
@@ -216,16 +240,16 @@ export type RebindValue<V extends HostGlobalValue>
 /**
  * The per-run globals override map for a `Prefix<G>`.
  *
- * String-valued globals are filtered out entirely (key remapping to `never`)
- * rather than mapped to `?: never` — they cannot be rebound because their
- * expression is compiled into the snapshot, and they should not appear as
- * valid keys at all.
+ * String-valued and `DataGlobal` (constant) globals are filtered out entirely
+ * (key remapping to `never`) rather than mapped to `?: never` — they cannot be
+ * rebound because their value is compiled into the snapshot, and they should
+ * not appear as valid keys at all.
  *
  * Each remaining key is optional and typed as `RebindValue<G[K]>`, which
  * enforces the correct constraint per global kind.
  */
 export type RebindGlobals<G extends HostGlobals> = {
-  [K in keyof G as G[K] extends string ? never : K]?: RebindValue<G[K]>
+  [K in keyof G as G[K] extends string | DataGlobal ? never : K]?: RebindValue<G[K]>
 }
 
 // ─────────────────────────────────────────────────────────────────────────

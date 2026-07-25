@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::RecvTimeoutError;
 
 use crate::ipc;
-use crate::ipc::ImportBinding;
+use crate::ipc::{HostGlobalDef, ImportBinding};
 use crate::wire::{self, BridgeErrorPayload, WireValue};
 
 static INIT: Once = Once::new();
@@ -496,15 +496,16 @@ pub enum RunError {
 
 /// Execute a sandboxed run and return the full output.
 ///
-/// `globals` is the list of declared host-global names. Each name becomes a
-/// bridge stub; when called from sandbox JS a `BridgeCall` frame goes out on
-/// `stream_fd` and execution blocks until the matching `BridgeResponse`
-/// arrives. Pass `None` when no globals are configured.
+/// `globals` is the list of declared host globals, each tagged by how it is
+/// installed natively (`HostGlobalDef`): bridge stubs issue `BridgeCall` frames
+/// on `stream_fd` and block until the matching `BridgeResponse`; string/data
+/// globals are evaluated/materialised in-isolate and need no socket. Pass
+/// `None` for `stream_fd` when no global installs a bridge stub.
 pub fn execute(
     code: &str,
     filename: Option<&str>,
     limits: Limits,
-    globals: &[String],
+    globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
@@ -524,15 +525,17 @@ pub fn execute(
 
 /// Execute a postfix against a pre-compiled prefix snapshot.
 ///
-/// `globals` names are re-installed as fresh bridge stubs bound to `stream_fd`
-/// for this run. Bridge stubs are never part of the snapshot - they are always
-/// installed from scratch at run time.
+/// `globals` here are all `HostGlobalDef::Bridge` stubs re-installed fresh and
+/// bound to `stream_fd` for this run. Bridge stubs are never part of the
+/// snapshot — they are always installed from scratch at run time. String/data
+/// globals and shim wrappers are already baked into the snapshot and are not
+/// re-sent.
 pub fn execute_with_prefix(
     snapshot_bytes: &[u8],
     code: &str,
     filename: Option<&str>,
     limits: Limits,
-    globals: &[String],
+    globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
@@ -565,10 +568,11 @@ pub fn execute_with_prefix(
 pub fn precompile(
     code: &str,
     filename: Option<&str>,
+    globals: &[HostGlobalDef],
     imports: &[ImportBinding],
 ) -> Result<Vec<u8>, FailureOutput> {
     init_platform();
-    precompile_module(code, filename.unwrap_or("<prefix>"), imports)
+    precompile_module(code, filename.unwrap_or("<prefix>"), globals, imports)
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
@@ -584,7 +588,7 @@ fn run_module(
     filename: &str,
     snapshot: Option<&[u8]>,
     limits: Limits,
-    globals: &[String],
+    globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
@@ -633,7 +637,7 @@ fn run_module_inner(
     filename: &str,
     snapshot: Option<&[u8]>,
     limits: Limits,
-    globals: &[String],
+    globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     // Per-connection call-ID counter. Shared across all runs on the same
@@ -810,17 +814,27 @@ fn run_module_inner(
     let bridge_error: Arc<OnceLock<RunError>> = Arc::new(OnceLock::new());
     let pending_resolvers: PendingResolvers = Arc::new(Mutex::new(HashMap::new()));
 
+    // Split the tagged defs into the bridge stubs to install (plain functions,
+    // shim handlers, the `__iso4_call` dispatcher) and everything else. Value
+    // globals (string exprs, constants, shim wrappers) are installed after the
+    // stubs so a shim wrapper's handler stub already exists on globalThis.
+    let bridge_stub_names: Vec<String> = globals
+        .iter()
+        .filter_map(|g| g.bridge_stub_name().map(str::to_string))
+        .collect();
+
     // Box-per-stub allocations; kept alive until after the poll loop exits.
     // Vec<Box<>> is intentional: raw pointers into each Box are passed to V8
     // as External data — the address must not move on Vec reallocation.
     #[allow(clippy::vec_box)]
-    let mut callback_data_boxes: Vec<Box<GlobalCallbackData>> = Vec::with_capacity(globals.len());
-    if !globals.is_empty() {
+    let mut callback_data_boxes: Vec<Box<GlobalCallbackData>> =
+        Vec::with_capacity(bridge_stub_names.len());
+    if !bridge_stub_names.is_empty() {
         let fd = stream_fd
-            .expect("install_bridge_globals called with non-empty globals but no stream_fd");
+            .expect("install_bridge_globals called with bridge-backed globals but no stream_fd");
         install_bridge_globals(
             scope,
-            globals,
+            &bridge_stub_names,
             fd,
             Arc::clone(&call_id),
             Arc::clone(&bridge_error),
@@ -834,6 +848,12 @@ fn run_module_inner(
         )
         .map_err(|e| failure(e, &logs, start))?;
     }
+
+    // Install the value globals (string exprs, constants, shim wrappers)
+    // natively. For a direct run these arrive here; for a PrefixRun they are
+    // already baked into the snapshot, so `globals` carries only bridge stubs
+    // and this is a no-op.
+    install_value_globals(scope, globals).map_err(|e| failure(e, &logs, start))?;
 
     let scope = &mut v8::TryCatch::new(scope);
 
@@ -1327,8 +1347,15 @@ fn evaluate_prefix_module(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     code: &str,
     filename: &str,
+    globals: &[HostGlobalDef],
     imports: &[ImportBinding],
 ) -> Result<(), RunError> {
+    // Install the value globals (string exprs, constants, shim wrappers) into
+    // the snapshot context before evaluating the prefix, so prefix code sees
+    // them and they are captured in the snapshot. Bridge stubs are NOT
+    // installed here — they are re-created per run against a live socket.
+    install_value_globals(scope, globals)?;
+
     let source_string = v8::String::new(scope, code)
         .ok_or_else(|| RunError::Internal("failed to intern module source".to_string()))?;
     let filename_str = v8::String::new(scope, filename)
@@ -1428,6 +1455,7 @@ fn evaluate_prefix_module(
 fn precompile_module(
     code: &str,
     filename: &str,
+    globals: &[HostGlobalDef],
     imports: &[ImportBinding],
 ) -> Result<Vec<u8>, FailureOutput> {
     let start = std::time::Instant::now();
@@ -1446,7 +1474,7 @@ fn precompile_module(
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let scope = &mut v8::TryCatch::new(scope);
-        evaluate_prefix_module(scope, code, filename, imports)
+        evaluate_prefix_module(scope, code, filename, globals, imports)
             .map_err(|error| failure(error, &logs, start))?;
     }
 
@@ -1463,7 +1491,7 @@ fn precompile_module(
         // Mark this context as the snapshot default BEFORE creating TryCatch.
         scope.set_default_context(context);
         let scope = &mut v8::TryCatch::new(scope);
-        evaluate_prefix_module(scope, code, filename, imports)
+        evaluate_prefix_module(scope, code, filename, globals, imports)
             .map_err(|error| failure(error, &logs, start))
     })();
 
@@ -2091,6 +2119,160 @@ fn install_bridge_globals(
             .ok_or_else(|| RunError::Internal(format!("failed to install global '{name}'")))?;
     }
     Ok(())
+}
+
+// ── Value globals (native install) ────────────────────────────────────────────
+
+/// Fixed factory that builds a `BridgeWithShim` wrapper. Called with the
+/// evaluated shim function and the private handler's global name (a plain
+/// string, passed as data — never interpolated into code). The wrapper looks
+/// the handler stub up on `globalThis` at call time, so the same wrapper works
+/// whether it is built for a direct run (stub installed alongside it) or baked
+/// into a snapshot (stub re-installed per `prefix.run()`).
+const SHIM_FACTORY_SRC: &str =
+    "(shim, handlerName) => (async (...args) => await shim(await globalThis[handlerName](...args)))";
+
+/// Install the value globals — string expressions, data constants, and shim
+/// wrappers — natively on the sandbox global object. Plain bridge stubs are
+/// installed separately by [`install_bridge_globals`]; their defs are skipped
+/// here.
+///
+/// Every public name reaches the global object through `object.set(key, value)`
+/// — a plain string, never interpolated into an identifier position — so no
+/// global name can shape generated source (issue #38). String expressions and
+/// shim expressions are evaluated as their own scripts with their own
+/// filenames, so they never shift the line numbers of user code.
+fn install_value_globals(
+    scope: &mut v8::HandleScope,
+    globals: &[HostGlobalDef],
+) -> Result<(), RunError> {
+    // Built lazily on the first shim global, then reused for the rest.
+    let mut shim_factory: Option<v8::Local<v8::Function>> = None;
+
+    for def in globals {
+        match def {
+            // Installed as a bridge stub by install_bridge_globals.
+            HostGlobalDef::Bridge { .. } => {}
+            HostGlobalDef::StringExpr { name, expr } => {
+                let value = eval_global_expression(scope, expr, name)?;
+                set_global(scope, name, value)?;
+            }
+            HostGlobalDef::Data { name, value } => {
+                let v8_value = wire_to_v8_value(scope, value).ok_or_else(|| {
+                    RunError::Internal(format!("failed to materialise data global '{name}'"))
+                })?;
+                set_global(scope, name, v8_value)?;
+            }
+            HostGlobalDef::Shim {
+                name,
+                shim,
+                handler_name,
+            } => {
+                let factory = match shim_factory {
+                    Some(f) => f,
+                    None => {
+                        let f = build_shim_factory(scope)?;
+                        shim_factory = Some(f);
+                        f
+                    }
+                };
+                let shim_fn = eval_global_expression(scope, shim, name)?;
+                let handler_key = v8::String::new(scope, handler_name).ok_or_else(|| {
+                    RunError::Internal(format!("failed to intern shim handler name for '{name}'"))
+                })?;
+                let recv = v8::undefined(scope).into();
+                let wrapper = factory
+                    .call(scope, recv, &[shim_fn, handler_key.into()])
+                    .ok_or_else(|| {
+                        RunError::Internal(format!("failed to build shim wrapper for '{name}'"))
+                    })?;
+                set_global(scope, name, wrapper)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set `globalThis[name] = value` via the V8 API. The name is a property key,
+/// never code.
+fn set_global(
+    scope: &mut v8::HandleScope,
+    name: &str,
+    value: v8::Local<v8::Value>,
+) -> Result<(), RunError> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, name)
+        .ok_or_else(|| RunError::Internal(format!("failed to intern global name '{name}'")))?;
+    global
+        .set(scope, key.into(), value)
+        .ok_or_else(|| RunError::Internal(format!("failed to install global '{name}'")))?;
+    Ok(())
+}
+
+/// Evaluate a host-provided global expression (`<expr>`, wrapped in parens so a
+/// bare function/object expression parses) as its own script, tagged with a
+/// dedicated filename so it never appears in a user-code stack trace.
+fn eval_global_expression<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    expr: &str,
+    name: &str,
+) -> Result<v8::Local<'s, v8::Value>, RunError> {
+    let wrapped = format!("({expr})");
+    let filename = format!("<iso4:global:{name}>");
+    eval_script(scope, &wrapped, &filename)
+}
+
+/// Build the shim-wrapper factory function from [`SHIM_FACTORY_SRC`].
+fn build_shim_factory<'s>(
+    scope: &mut v8::HandleScope<'s>,
+) -> Result<v8::Local<'s, v8::Function>, RunError> {
+    let value = eval_script(scope, SHIM_FACTORY_SRC, "<iso4:shim-factory>")?;
+    v8::Local::<v8::Function>::try_from(value)
+        .map_err(|_| RunError::Internal("shim factory did not evaluate to a function".to_string()))
+}
+
+/// Compile and run `source` as a classic script under `filename`, returning the
+/// completion value. Compile/runtime failures map to `RunError` carrying the
+/// V8 exception. Runs inside its own `TryCatch`; the returned value lives in the
+/// caller's handle scope.
+fn eval_script<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    source: &str,
+    filename: &str,
+) -> Result<v8::Local<'s, v8::Value>, RunError> {
+    let source_str = v8::String::new(scope, source)
+        .ok_or_else(|| RunError::Internal("failed to intern global source".to_string()))?;
+    let filename_str = v8::String::new(scope, filename)
+        .ok_or_else(|| RunError::Internal("failed to intern global filename".to_string()))?;
+    // Classic script (is_module = false) — the last three ScriptOrigin bools
+    // mirror the module origin built in run_module with is_module flipped off.
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        filename_str.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let tc = &mut v8::TryCatch::new(scope);
+    let script = match v8::Script::compile(tc, source_str, Some(&origin)) {
+        Some(s) => s,
+        None => return Err(RunError::CompileError(exception_message(tc))),
+    };
+    match script.run(tc) {
+        Some(v) => Ok(v),
+        None => Err(RunError::RuntimeError(Box::new(RuntimeErrorData {
+            name: exception_name(tc),
+            message: exception_message(tc),
+            stack: exception_stack(tc),
+            fields: exception_fields(tc),
+        }))),
+    }
 }
 
 /// Convert a V8 value back to a `WireValue` for injection into the sandbox.
@@ -3899,7 +4081,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_infinite_loop_is_killed() {
-        let snapshot = precompile("globalThis.base = 10", None, &[]).unwrap();
+        let snapshot = precompile("globalThis.base = 10", None, &[], &[]).unwrap();
         let err = execute_with_prefix(
             &snapshot,
             "while (true) {}",
@@ -4274,19 +4456,19 @@ mod tests {
 
     #[test]
     fn precompile_returns_non_empty_snapshot_bytes() {
-        let bytes = precompile("const x = 1", None, &[]).unwrap();
+        let bytes = precompile("const x = 1", None, &[], &[]).unwrap();
         assert!(!bytes.is_empty());
     }
 
     #[test]
     fn precompile_compile_error_is_reported() {
-        let err = precompile("export default (((", None, &[]).unwrap_err();
+        let err = precompile("export default (((", None, &[], &[]).unwrap_err();
         assert!(matches!(err.error, RunError::CompileError(_)));
     }
 
     #[test]
     fn precompile_runtime_error_is_reported() {
-        let err = precompile(r#"throw new Error("prefix failed")"#, None, &[]).unwrap_err();
+        let err = precompile(r#"throw new Error("prefix failed")"#, None, &[], &[]).unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
@@ -4294,7 +4476,7 @@ mod tests {
     fn execute_with_prefix_basic_postfix() {
         // Module-scoped `const` stays in the prefix module's scope.
         // Use globalThis to share values with the postfix module.
-        let snapshot = precompile("globalThis.base = 100", None, &[]).unwrap();
+        let snapshot = precompile("globalThis.base = 100", None, &[], &[]).unwrap();
         let out = execute_with_prefix(
             &snapshot,
             "export default globalThis.base + 1",
@@ -4311,7 +4493,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_global_mutation_visible_in_postfix() {
-        let snapshot = precompile("globalThis.answer = 42", None, &[]).unwrap();
+        let snapshot = precompile("globalThis.answer = 42", None, &[], &[]).unwrap();
         let out = execute_with_prefix(
             &snapshot,
             "export default globalThis.answer",
@@ -4328,7 +4510,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_multiple_postfixes_are_independent() {
-        let snapshot = precompile("globalThis.base = 10", None, &[]).unwrap();
+        let snapshot = precompile("globalThis.base = 10", None, &[], &[]).unwrap();
         let b = "globalThis.base";
         let out1 = execute_with_prefix(
             &snapshot,
@@ -4370,7 +4552,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
-        let snapshot = precompile("globalThis.counter = 0", None, &[]).unwrap();
+        let snapshot = precompile("globalThis.counter = 0", None, &[], &[]).unwrap();
         execute_with_prefix(
             &snapshot,
             "globalThis.counter = 99; export default 1",
@@ -4402,6 +4584,7 @@ mod tests {
             r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
             None,
             &[],
+            &[],
         )
         .unwrap();
         let out = execute_with_prefix(
@@ -4420,7 +4603,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_console_is_available_in_postfix() {
-        let snapshot = precompile("const x = 1", None, &[]).unwrap();
+        let snapshot = precompile("const x = 1", None, &[], &[]).unwrap();
         let out = execute_with_prefix(
             &snapshot,
             r#"console.log("hello from postfix"); export default 1"#,
@@ -4437,7 +4620,7 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_postfix_runtime_error_is_reported() {
-        let snapshot = precompile("", None, &[]).unwrap();
+        let snapshot = precompile("", None, &[], &[]).unwrap();
         let err = execute_with_prefix(
             &snapshot,
             r#"throw new Error("postfix failed")"#,
@@ -4643,7 +4826,7 @@ mod tests {
                 wall_time_ms: 5_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -4752,7 +4935,7 @@ mod tests {
             code,
             None,
             limits,
-            &[global.to_string()],
+            &[HostGlobalDef::bridge(global)],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -4881,7 +5064,7 @@ mod tests {
                 wall_time_ms: 10_000,
                 ..Default::default()
             },
-            &["add".to_string()],
+            &[HostGlobalDef::bridge("add")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5132,7 +5315,7 @@ mod tests {
                 wall_time_ms: 10_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5175,7 +5358,7 @@ mod tests {
                 max_bridge_call_bytes: 4,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5300,7 +5483,7 @@ mod tests {
                 wall_time_ms: 300,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5362,7 +5545,7 @@ mod tests {
                 cpu_time_ms: 30_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5476,7 +5659,7 @@ mod tests {
                 max_bridge_calls: 3,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5524,7 +5707,7 @@ mod tests {
                 max_bridge_calls: 0,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5560,7 +5743,7 @@ mod tests {
                 max_bridge_calls: 3,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5596,7 +5779,10 @@ mod tests {
                 max_bridge_calls: 3,
                 ..Default::default()
             },
-            &["toolA".to_string(), "toolB".to_string()],
+            &[
+                HostGlobalDef::bridge("toolA"),
+                HostGlobalDef::bridge("toolB"),
+            ],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5637,7 +5823,7 @@ mod tests {
                 max_bridge_calls: 0,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5685,7 +5871,7 @@ mod tests {
                 max_bridge_calls: 3,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5731,7 +5917,7 @@ mod tests {
                 max_bridge_calls: 3,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5773,7 +5959,7 @@ mod tests {
                 max_bridge_call_bytes: 1_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5811,7 +5997,7 @@ mod tests {
                 wall_time_ms: 10_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5865,7 +6051,7 @@ mod tests {
                 wall_time_ms: 10_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -5916,7 +6102,7 @@ mod tests {
                 wall_time_ms: 10_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd1),
             Arc::clone(&counter),
@@ -5953,7 +6139,7 @@ mod tests {
                 wall_time_ms: 10_000,
                 ..Default::default()
             },
-            &["myTool".to_string()],
+            &[HostGlobalDef::bridge("myTool")],
             &[],
             Some(fd2),
             Arc::clone(&counter),
@@ -6020,7 +6206,10 @@ mod tests {
                 wall_time_ms: 10_000,
                 ..Default::default()
             },
-            &["toolA".to_string(), "toolB".to_string()],
+            &[
+                HostGlobalDef::bridge("toolA"),
+                HostGlobalDef::bridge("toolB"),
+            ],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
@@ -6065,7 +6254,7 @@ mod tests {
              export default typeof a === 'number' && typeof b === 'number' && typeof c === 'number'",
             None,
             Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
-            &["tool".to_string()],
+            &[HostGlobalDef::bridge("tool")],
             &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
         ).unwrap();
@@ -6224,6 +6413,7 @@ mod tests {
             "import { AsyncLocalStorage } from 'node:async_hooks'; export default 1;",
             "<prefix>",
             &[],
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -6242,6 +6432,7 @@ mod tests {
             "import x from 'totally-nonexistent-xyz'; export default x;",
             "<prefix>",
             &[],
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -6254,8 +6445,13 @@ mod tests {
     #[test]
     fn precompile_still_succeeds_for_valid_prefix() {
         // The two-pass validation must not break the happy path.
-        let snapshot =
-            precompile_module("globalThis.base = 100; export default 1;", "<prefix>", &[]).unwrap();
+        let snapshot = precompile_module(
+            "globalThis.base = 100; export default 1;",
+            "<prefix>",
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(!snapshot.is_empty());
     }
 }
