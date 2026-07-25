@@ -21,6 +21,13 @@ use crate::ipc;
 use crate::v8 as sandbox;
 use crate::wire;
 
+/// True when any global in `defs` installs a bridge stub — a plain function, a
+/// shim handler, or the `__iso4_call` import dispatcher. Such a run needs the
+/// session socket for bridge calls; string/data-only runs do not.
+fn needs_bridge_stub(defs: &[ipc::HostGlobalDef]) -> bool {
+    defs.iter().any(|g| g.bridge_stub_name().is_some())
+}
+
 /// Snapshot + declared global / import shape for one precompiled prefix.
 pub struct PrefixData {
     pub snapshot: Vec<u8>,
@@ -145,15 +152,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     payload.globals.len(),
                 );
 
-                let globals: Vec<String> = payload.globals.iter().map(|g| g.name.clone()).collect();
-                // Any host-side bridge capability is exposed to V8 as "globals".
-                // Host-module import function leaves now route through the single reserved
-                // dispatcher global `__iso4_call`, so a non-empty globals list is the full
-                // "needs bridge" check.
-                let stream_fd = if globals.is_empty() {
-                    None
-                } else {
+                // A socket is needed only when some global installs a bridge
+                // stub (a plain function, a shim handler, or the `__iso4_call`
+                // import dispatcher). String/data-only runs need no socket.
+                let stream_fd = if needs_bridge_stub(&payload.globals) {
                     Some(stream.as_raw_fd())
+                } else {
+                    None
                 };
                 let result_payload = match sandbox::execute(
                     &payload.code,
@@ -168,7 +173,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
                         max_bridge_calls: payload.limits.max_bridge_calls,
                     },
-                    &globals,
+                    &payload.globals,
                     &payload.imports,
                     stream_fd,
                     Arc::clone(&call_id_counter),
@@ -227,6 +232,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 let result_payload = match sandbox::precompile(
                     &payload.code,
                     payload.filename.as_deref(),
+                    &payload.globals,
                     &payload.imports,
                 ) {
                     Ok(snapshot_bytes) => {
@@ -234,8 +240,16 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             .next_prefix_id
                             .fetch_add(1, Ordering::Relaxed)
                             .to_string();
-                        let declared_globals: Vec<String> =
-                            payload.globals.iter().map(|g| g.name.clone()).collect();
+                        // Only bridge-backed globals are re-installable per run
+                        // (string/data globals and shim wrappers are frozen in
+                        // the snapshot). The declared set is the bridge stub
+                        // names a PrefixRun may re-bind; the undeclared-binding
+                        // check validates against it.
+                        let declared_globals: Vec<String> = payload
+                            .globals
+                            .iter()
+                            .filter_map(|g| g.bridge_stub_name().map(str::to_string))
+                            .collect();
                         let declared_imports = payload.imports.clone();
                         eprintln!(
                             "[iso4-v8] precompile succeeded — prefix_id={prefix_id} \
@@ -347,7 +361,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         let undeclared: Vec<&str> = payload
                             .globals
                             .iter()
-                            .map(|g| g.name.as_str())
+                            .filter_map(|g| g.bridge_stub_name())
                             .filter(|name| !declared_set.contains(name))
                             .collect();
                         if let Some(name) = undeclared.first() {
@@ -375,24 +389,24 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 }),
                             )
                         } else {
-                            let run_globals: Vec<String> =
-                                payload.globals.iter().map(|g| g.name.clone()).collect();
                             // PrefixRun reuses the declared imports shape
                             // verbatim. The TS side enforces that run-time
                             // overrides only update host function handlers
                             // (data exports + source modules are frozen in
                             // the snapshot), so the wire-level shape that
                             // matters for bridge dispatch here is the one
-                            // captured at precompile.
-                            let stream_fd = if run_globals.is_empty() {
-                                None
-                            } else {
+                            // captured at precompile. Every run global here is
+                            // a bridge stub to re-install (string/data globals
+                            // and shim wrappers live in the snapshot).
+                            let stream_fd = if needs_bridge_stub(&payload.globals) {
                                 Some(stream.as_raw_fd())
+                            } else {
+                                None
                             };
                             eprintln!(
                             "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports)",
                             payload.run_id, payload.prefix_id, payload.code.len(),
-                            run_globals.len(), declared_imports.len(),
+                            payload.globals.len(), declared_imports.len(),
                         );
                             match sandbox::execute_with_prefix(
                                 &snapshot_bytes,
@@ -408,7 +422,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
                                     max_bridge_calls: payload.limits.max_bridge_calls,
                                 },
-                                &run_globals,
+                                &payload.globals,
                                 &declared_imports,
                                 stream_fd,
                                 Arc::clone(&call_id_counter),

@@ -25,6 +25,8 @@
 
 use std::io::{self, Read, Write};
 
+use crate::wire::{decode_wire_value, WireValue};
+
 /// Current wire protocol version.
 ///
 /// This must stay in sync with `docs/protocol.md` and the future TypeScript
@@ -308,10 +310,49 @@ impl Default for ResourceLimits {
     }
 }
 
-/// A host global the sandbox is allowed to reference.
-#[derive(Debug)]
-pub struct HostGlobalBinding {
-    pub name: String,
+/// A host global the sandbox is allowed to reference, tagged by how the
+/// runtime installs it natively. Mirrors `GlobalDefPayload` on the TS side
+/// (`ipc.ts`); see `docs/protocol.md` §5.2.
+#[derive(Debug, Clone)]
+pub enum HostGlobalDef {
+    /// A plain host function — installed as a bridge stub under `name`.
+    Bridge { name: String },
+    /// A JS expression the runtime evaluates as its own script and sets on
+    /// `globalThis[name]`.
+    StringExpr { name: String, expr: String },
+    /// A constant carried as a `WireValue`, materialised natively.
+    Data { name: String, value: WireValue },
+    /// A bridge handler (installed as a stub under `handler_name`) plus a shim
+    /// expression the runtime wraps and sets on `globalThis[name]`.
+    Shim {
+        name: String,
+        shim: String,
+        handler_name: String,
+    },
+}
+
+impl HostGlobalDef {
+    /// The wire-level bridge stub name to install for this def, if any. Plain
+    /// bridge globals install under their own name; shims install a hidden
+    /// handler stub under `handler_name`. String/data globals need no stub.
+    ///
+    /// This is also the set of names that a `PrefixRun` may re-install and that
+    /// the `ERR_UNDECLARED_BINDING` check validates against.
+    pub fn bridge_stub_name(&self) -> Option<&str> {
+        match self {
+            HostGlobalDef::Bridge { name } => Some(name),
+            HostGlobalDef::Shim { handler_name, .. } => Some(handler_name),
+            HostGlobalDef::StringExpr { .. } | HostGlobalDef::Data { .. } => None,
+        }
+    }
+
+    /// A convenience constructor for tests: a plain bridge global.
+    #[cfg(test)]
+    pub fn bridge(name: &str) -> Self {
+        HostGlobalDef::Bridge {
+            name: name.to_string(),
+        }
+    }
 }
 
 /// One entry in the `imports` list of a `Run` / `Precompile` / `PrefixRun`
@@ -333,7 +374,7 @@ pub struct RunPayload {
     pub code: String,
     pub filename: Option<String>,
     pub limits: ResourceLimits,
-    pub globals: Vec<HostGlobalBinding>,
+    pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
 }
 
@@ -459,6 +500,47 @@ impl<'a> PayloadReader<'a> {
         })
     }
 
+    /// Decode a single `WireValue` at the current cursor, advancing past it.
+    fn read_wire_value(&mut self) -> io::Result<WireValue> {
+        decode_wire_value(self.data, &mut self.offset)
+    }
+
+    /// Read the `List<GlobalDef>` block: a `u32` count followed by one tagged
+    /// entry per global. Mirrors `writeGlobalDefs` in the TS codec (`ipc.ts`)
+    /// and `docs/protocol.md` §5.2.
+    fn read_global_defs(&mut self) -> io::Result<Vec<HostGlobalDef>> {
+        let count = self.read_u32()? as usize;
+        let mut defs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let kind = self.read_u8()?;
+            let name = self.read_string()?;
+            let def = match kind {
+                0 => HostGlobalDef::Bridge { name },
+                1 => HostGlobalDef::StringExpr {
+                    name,
+                    expr: self.read_string()?,
+                },
+                2 => HostGlobalDef::Data {
+                    name,
+                    value: self.read_wire_value()?,
+                },
+                3 => HostGlobalDef::Shim {
+                    name,
+                    shim: self.read_string()?,
+                    handler_name: self.read_string()?,
+                },
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown global def kind: {other:#04x}"),
+                    ))
+                }
+            };
+            defs.push(def);
+        }
+        Ok(defs)
+    }
+
     fn assert_done(&self) -> io::Result<()> {
         if self.remaining() != 0 {
             return Err(io::Error::new(
@@ -480,19 +562,13 @@ fn parse_code_fields(
     String,
     Option<String>,
     ResourceLimits,
-    Vec<HostGlobalBinding>,
+    Vec<HostGlobalDef>,
     Vec<ImportBinding>,
 )> {
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
     let limits = r.read_resource_limits()?;
-    let globals_count = r.read_u32()? as usize;
-    let mut globals = Vec::with_capacity(globals_count);
-    for _ in 0..globals_count {
-        globals.push(HostGlobalBinding {
-            name: r.read_string()?,
-        });
-    }
+    let globals = r.read_global_defs()?;
     let imports_count = r.read_u32()? as usize;
     let mut imports = Vec::with_capacity(imports_count);
     for _ in 0..imports_count {
@@ -526,7 +602,7 @@ pub struct PrecompilePayload {
     pub code: String,
     pub filename: Option<String>,
     pub limits: ResourceLimits,
-    pub globals: Vec<HostGlobalBinding>,
+    pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
 }
 
@@ -552,7 +628,7 @@ pub struct PrefixRunPayload {
     pub code: String,
     pub filename: Option<String>,
     pub limits: ResourceLimits,
-    pub globals: Vec<HostGlobalBinding>,
+    pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
 }
 
@@ -926,14 +1002,63 @@ mod tests {
         v.push(0); // no filename
         push_absent_limits(&mut v); // limits (all absent → defaults)
         push_u32(&mut v, 2); // 2 globals
+        v.push(0); // kind: bridge
         push_string(&mut v, "fetch");
+        v.push(0); // kind: bridge
         push_string(&mut v, "myTool");
         push_u32(&mut v, 0); // 0 imports
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.globals.len(), 2);
-        assert_eq!(p.globals[0].name, "fetch");
-        assert_eq!(p.globals[1].name, "myTool");
+        assert_eq!(p.globals[0].bridge_stub_name(), Some("fetch"));
+        assert_eq!(p.globals[1].bridge_stub_name(), Some("myTool"));
+    }
+
+    #[test]
+    fn parse_run_payload_with_all_global_kinds() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "x"); // code
+        v.push(0); // no filename
+        push_absent_limits(&mut v); // limits
+        push_u32(&mut v, 4); // 4 globals
+                             // bridge
+        v.push(0);
+        push_string(&mut v, "fetch");
+        // string expr
+        v.push(1);
+        push_string(&mut v, "PI");
+        push_string(&mut v, "3.14159");
+        // data: a WireValue::Bool(true) → tag 0x03 (TAG_TRUE), no body
+        v.push(2);
+        push_string(&mut v, "flag");
+        v.push(0x03);
+        // shim
+        v.push(3);
+        push_string(&mut v, "wrapped");
+        push_string(&mut v, "(r) => r");
+        push_string(&mut v, "__iso4_wrapped_h");
+        push_u32(&mut v, 0); // 0 imports
+
+        let p = parse_run_payload(&v).unwrap();
+        assert_eq!(p.globals.len(), 4);
+        assert!(matches!(&p.globals[0], HostGlobalDef::Bridge { name } if name == "fetch"));
+        assert!(
+            matches!(&p.globals[1], HostGlobalDef::StringExpr { name, expr } if name == "PI" && expr == "3.14159")
+        );
+        assert!(
+            matches!(&p.globals[2], HostGlobalDef::Data { name, value } if name == "flag" && *value == WireValue::Bool(true))
+        );
+        assert!(matches!(
+            &p.globals[3],
+            HostGlobalDef::Shim { name, shim, handler_name }
+                if name == "wrapped" && shim == "(r) => r" && handler_name == "__iso4_wrapped_h"
+        ));
+        // Only bridge + shim install a stub.
+        assert_eq!(p.globals[0].bridge_stub_name(), Some("fetch"));
+        assert_eq!(p.globals[1].bridge_stub_name(), None);
+        assert_eq!(p.globals[2].bridge_stub_name(), None);
+        assert_eq!(p.globals[3].bridge_stub_name(), Some("__iso4_wrapped_h"));
     }
 
     #[test]

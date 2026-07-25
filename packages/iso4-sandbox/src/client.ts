@@ -19,7 +19,7 @@ import {
   encodeTsToRustFrame,
 } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
-import type { ImportBindingPayload } from './ipc'
+import type { GlobalDefPayload, ImportBindingPayload } from './ipc'
 import { encodeWireValue } from './wire'
 
 export interface RuntimeIpcClientOptions {
@@ -144,17 +144,18 @@ export class RuntimeIpcClient {
     return this.nextRunId
   }
 
-  // globals here is always `Record<string, HostExportFunction>` — the
-  // processed bridge map produced by `processGlobals()` in index.ts.
-  // String globals become preamble code prepended to `code`; BridgeWithShim
-  // handlers are unwrapped to private `__iso4_<name>_h` keys. The client
-  // layer only ever sees plain bridge functions.
+  // `globals` is the wire-shaped `GlobalDefPayload[]` produced by
+  // `processGlobals()` in index.ts — Rust installs each kind natively.
+  // `dispatch` is the separate `name → handler` map the client routes incoming
+  // `BridgeCall` frames through: plain functions under their own name,
+  // `BridgeWithShim` handlers under their private `__iso4_<name>_h` key.
   async runRawCode(
     code: string,
     options?: {
       filename?: string
       limits?: ResourceLimits
-      globals?: Record<string, HostExportFunction>
+      globals?: readonly GlobalDefPayload[]
+      dispatch?: Record<string, HostExportFunction>
       imports?: readonly ImportBindingPayload[]
       signal?: AbortSignal
     },
@@ -162,8 +163,6 @@ export class RuntimeIpcClient {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
 
-    const globals = options?.globals ?? {}
-    const globalNames = Object.keys(globals)
     const runId = this.nextRunIdValue()
     await this.write(
       encodeTsToRustFrame(
@@ -173,13 +172,13 @@ export class RuntimeIpcClient {
           code,
           filename: options?.filename,
           limits: options?.limits,
-          globals: globalNames,
+          globals: options?.globals,
           imports: options?.imports,
         }),
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(globals), runId, options?.signal)
+    return this.drainUntilResult(makeDispatcher(options?.dispatch ?? {}), runId, options?.signal)
   }
 
   async precompile(
@@ -187,7 +186,7 @@ export class RuntimeIpcClient {
       code: string
       filename?: string
       limits?: ResourceLimits
-      globals?: Record<string, HostExportFunction>
+      globals?: readonly GlobalDefPayload[]
       imports?: readonly ImportBindingPayload[]
     },
   ): Promise<Uint8Array> {
@@ -201,7 +200,7 @@ export class RuntimeIpcClient {
           code: options.code,
           filename: options.filename,
           limits: options.limits,
-          globals: Object.keys(options.globals ?? {}),
+          globals: options.globals,
           imports: options.imports,
         }),
       ),
@@ -224,7 +223,8 @@ export class RuntimeIpcClient {
       code: string
       filename?: string
       limits?: ResourceLimits
-      globals?: Record<string, HostExportFunction>
+      globals?: readonly GlobalDefPayload[]
+      dispatch?: Record<string, HostExportFunction>
       imports?: readonly ImportBindingPayload[]
       signal?: AbortSignal
     },
@@ -232,8 +232,6 @@ export class RuntimeIpcClient {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
 
-    const globals = options.globals ?? {}
-    const globalNames = Object.keys(globals)
     const runId = this.nextRunIdValue()
     await this.write(
       encodeTsToRustFrame(
@@ -243,14 +241,14 @@ export class RuntimeIpcClient {
           code: options.code,
           filename: options.filename,
           limits: options.limits,
-          globals: globalNames,
+          globals: options.globals,
           imports: options.imports,
           runId,
         }),
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(globals), runId, options.signal)
+    return this.drainUntilResult(makeDispatcher(options.dispatch ?? {}), runId, options.signal)
   }
 
   async disposePrefix(prefixId: string): Promise<void> {

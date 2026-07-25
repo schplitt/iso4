@@ -267,36 +267,36 @@ socket immediately on version or token mismatch.
 
 `RunPayload`:
 
-| Field      | Encoding                  | Notes                                                |
-| ---------- | ------------------------- | ---------------------------------------------------- |
-| `runId`    | `u32`                     | Unique on this connection.                           |
-| `code`     | `String`                  | ESM source.                                          |
-| `filename` | `Optional<String>`        | Used in stack traces.                                |
-| `limits`   | `ResourceLimits`          | Only caller-set fields sent; runtime fills defaults. |
-| `globals`  | `List<HostGlobalBinding>` | Names configured for this run.                       |
-| `imports`  | `List<ImportBinding>`     | Source or host import declarations.                  |
+| Field      | Encoding              | Notes                                                |
+| ---------- | --------------------- | ---------------------------------------------------- |
+| `runId`    | `u32`                 | Unique on this connection.                           |
+| `code`     | `String`              | ESM source.                                          |
+| `filename` | `Optional<String>`    | Used in stack traces.                                |
+| `limits`   | `ResourceLimits`      | Only caller-set fields sent; runtime fills defaults. |
+| `globals`  | `List<GlobalDef>`     | Host globals + how the runtime installs each one.    |
+| `imports`  | `List<ImportBinding>` | Source or host import declarations.                  |
 
 `PrefixRunPayload`:
 
-| Field      | Encoding                  | Notes                                         |
-| ---------- | ------------------------- | --------------------------------------------- |
-| `runId`    | `u32`                     | Unique on this connection.                    |
-| `prefixId` | `PrefixId`                | Snapshot handle returned by `Precompile`.     |
-| `code`     | `String`                  | ESM postfix source.                           |
-| `filename` | `Optional<String>`        | Used in stack traces.                         |
-| `limits`   | `ResourceLimits`          | Fully normalized by TS before sending.        |
-| `globals`  | `List<HostGlobalBinding>` | Must be subset of predeclared globals.        |
-| `imports`  | `List<ImportBinding>`     | Rebindings for predeclared host imports only. |
+| Field      | Encoding              | Notes                                                                                             |
+| ---------- | --------------------- | ------------------------------------------------------------------------------------------------- |
+| `runId`    | `u32`                 | Unique on this connection.                                                                        |
+| `prefixId` | `PrefixId`            | Snapshot handle returned by `Precompile`.                                                         |
+| `code`     | `String`              | ESM postfix source.                                                                               |
+| `filename` | `Optional<String>`    | Used in stack traces.                                                                             |
+| `limits`   | `ResourceLimits`      | Fully normalized by TS before sending.                                                            |
+| `globals`  | `List<GlobalDef>`     | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are snapshotted). |
+| `imports`  | `List<ImportBinding>` | Rebindings for predeclared host imports only.                                                     |
 
 `PrecompilePayload`:
 
-| Field      | Encoding                  | Notes                                                              |
-| ---------- | ------------------------- | ------------------------------------------------------------------ |
-| `code`     | `String`                  | ESM prefix source.                                                 |
-| `filename` | `Optional<String>`        | Used in stack traces.                                              |
-| `limits`   | `ResourceLimits`          | Limits used during precompile.                                     |
-| `globals`  | `List<HostGlobalBinding>` | Declares permitted global shape.                                   |
-| `imports`  | `List<ImportBinding>`     | Source imports are snapshotted; host imports declare bridge shape. |
+| Field      | Encoding              | Notes                                                               |
+| ---------- | --------------------- | ------------------------------------------------------------------- |
+| `code`     | `String`              | ESM prefix source.                                                  |
+| `filename` | `Optional<String>`    | Used in stack traces.                                               |
+| `limits`   | `ResourceLimits`      | Limits used during precompile.                                      |
+| `globals`  | `List<GlobalDef>`     | Declares the global shape; value kinds are baked into the snapshot. |
+| `imports`  | `List<ImportBinding>` | Source imports are snapshotted; host imports declare bridge shape.  |
 
 `ResourceLimits`:
 
@@ -318,11 +318,26 @@ distinct from absent.
 | `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
 | `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.               |
 
-`HostGlobalBinding`:
+`GlobalDef`:
 
-| Field  | Encoding | Notes                                                  |
-| ------ | -------- | ------------------------------------------------------ |
-| `name` | `String` | Example: `fetch`; only allowlisted names are accepted. |
+Each host global is installed **natively** by the runtime — the client never
+prepends generated source to user code, so user code always starts at line 1,
+and a global's name reaches the sandbox global object through the V8 API
+(`object.set`), never interpolated into an identifier position. Every entry is a
+`u8` kind tag, then a `String` name, then a kind-specific tail:
+
+| Kind Byte | Kind     | Tail                              | Install                                                                                                                            |
+| --------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `0x00`    | `bridge` | —                                 | Bridge stub under `name` (issues `BridgeCall` frames).                                                                             |
+| `0x01`    | `string` | `String expr`                     | Runtime evaluates `(expr)` as its own script; sets `globalThis[name]`.                                                             |
+| `0x02`    | `data`   | `WireValue value`                 | Materialised via the value codec; sets `globalThis[name]`.                                                                         |
+| `0x03`    | `shim`   | `String shim, String handlerName` | Installs a bridge stub under `handlerName` and a wrapper `async (...a) => shim(await globalThis[handlerName](...a))` under `name`. |
+
+Only `bridge` and `shim` install a bridge stub (and so require the session
+socket); `string`/`data` are pure in-isolate installs. On `PrefixRun` every
+entry is `bridge` kind — string/data globals and shim wrappers are baked into
+the snapshot at `Precompile` time, so only their bridge stubs are re-installed
+per run.
 
 `ImportBinding`:
 

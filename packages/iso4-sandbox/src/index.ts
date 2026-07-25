@@ -32,7 +32,9 @@ import type {
   Sandbox,
   SandboxOptions,
   Imports,
+  HostExportFunction,
 } from './types'
+import type { GlobalDefPayload } from './ipc'
 
 // ── Global processing (imported from globals.ts for testability) ──────────
 
@@ -51,6 +53,7 @@ export type {
   ResourceLimits,
   HostGlobals,
   HostGlobalValue,
+  DataGlobal,
   BridgeCallEntry,
   BridgeWithShim,
   RebindValue,
@@ -168,6 +171,28 @@ function abortedResult(reason?: unknown, from?: RunResult): RunResult {
 
 // ── Bridge dispatcher factory ─────────────────────────────────────────────
 
+/**
+ * Append the reserved `__iso4_call` dispatcher global when the run has any
+ * host-module function leaves. All such leaves reach the bridge through this
+ * single global (keyed by handle ID), so one extra bridge def + dispatch entry
+ * covers the whole import tree. A no-op when the registry is empty.
+ * @param defs structured global defs to send over the wire
+ * @param dispatch bridge-dispatch map (name → handler)
+ * @param registry host-module function-leaf registry for this run
+ */
+function withImportDispatcher(
+  defs: GlobalDefPayload[],
+  dispatch: Record<string, HostExportFunction>,
+  registry: HandleRegistry,
+): { defs: GlobalDefPayload[], dispatch: Record<string, HostExportFunction> } {
+  if (registry.size === 0)
+    return { defs, dispatch }
+  return {
+    defs: [...defs, { kind: 'bridge', name: BRIDGE_DISPATCH_GLOBAL }],
+    dispatch: { ...dispatch, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) },
+  }
+}
+
 // ── SandboxImpl ─────────────────────────────────────────────────────────────
 
 class SandboxImpl implements Sandbox {
@@ -193,22 +218,22 @@ class SandboxImpl implements Sandbox {
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
     }
-    const { bridgeGlobals, preamble } = processGlobals(options.globals ?? {})
+    const { defs, dispatch } = processGlobals(options.globals ?? {})
     const { bindings, registry, shape } = processImports(options.imports)
     // Host-module function leaves are reached through the single
     // `__iso4_call` dispatcher global, which routes by handle ID. Install it
     // alongside the user globals when any function leaves exist.
-    const allGlobals = registry.size > 0
-      ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
-      : bridgeGlobals
-    const code = preamble ? `${preamble}\n${options.code}` : options.code
+    const { defs: allDefs, dispatch: allDispatch } = withImportDispatcher(defs, dispatch, registry)
     const resolveName = makeBridgeNameResolver(shape)
     try {
       return await this.pool.withClient(async (client) => {
-        const raw = await client.runRawCode(code, {
+        // Every global is installed natively by the runtime, so user code
+        // always starts at line 1.
+        const raw = await client.runRawCode(options.code, {
           filename: options.filename,
           limits: options.limits,
-          globals: allGlobals,
+          globals: allDefs,
+          dispatch: allDispatch,
           imports: bindings,
           signal: options.signal,
         })
@@ -241,19 +266,19 @@ class SandboxImpl implements Sandbox {
   ): Promise<Prefix<G, M>> {
     return this.pool.withClient(async (client) => {
       const rawGlobals = options.globals ?? {} as G
-      const { bridgeGlobals, preamble } = processGlobals(rawGlobals)
+      const { defs } = processGlobals(rawGlobals)
       const { bindings, registry, shape } = processImports(options.imports)
       // See the comment in `run` — host-module function leaves reach the
-      // bridge through the single `__iso4_call` dispatcher global.
-      const allGlobals = registry.size > 0
-        ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
-        : bridgeGlobals
-      const code = preamble ? `${preamble}\n${options.code}` : options.code
+      // bridge through the single `__iso4_call` dispatcher global. Precompile
+      // needs no dispatch map (bridge stubs are installed per run, not while
+      // snapshotting); the `__iso4_call` def is sent only so it is recorded in
+      // the prefix's declared-globals set for the ERR_UNDECLARED_BINDING check.
+      const { defs: allDefs } = withImportDispatcher(defs, {}, registry)
       const raw = await client.precompile({
-        code,
+        code: options.code,
         filename: options.filename,
         limits: options.limits,
-        globals: allGlobals,
+        globals: allDefs,
         imports: bindings,
       })
       const result = decodePrecompileResultPayload(raw)
@@ -365,8 +390,9 @@ implements Prefix<G, M> {
       return abortedResult(options.signal.reason)
     }
     // Extract bridge globals, routing shimmed overrides to their private keys.
-    // The preamble is already compiled into the snapshot — not re-injected.
-    const bridgeGlobals = extractBridgeGlobals(
+    // String/data globals and shim wrappers are already compiled into the
+    // snapshot — only the bridge stubs they call are re-installed per run.
+    const { defs, dispatch } = extractBridgeGlobals(
       (options.globals ?? {}) as RebindGlobals<HostGlobals>,
       this.defaultGlobals as HostGlobals,
     )
@@ -396,9 +422,7 @@ implements Prefix<G, M> {
     }
     // Host-module function leaves reach the bridge through the single
     // `__iso4_call` dispatcher global, keyed by handle ID.
-    const allGlobals = registry.size > 0
-      ? { ...bridgeGlobals, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) }
-      : bridgeGlobals
+    const { defs: allDefs, dispatch: allDispatch } = withImportDispatcher(defs, dispatch, registry)
     const resolveName = makeBridgeNameResolver(this.declaredImportShape)
     try {
       return await this.pool.withClient(async (client) => {
@@ -407,7 +431,8 @@ implements Prefix<G, M> {
           code: options.code,
           filename: options.filename,
           limits: options.limits,
-          globals: allGlobals,
+          globals: allDefs,
+          dispatch: allDispatch,
           signal: options.signal,
         })
         const decoded = decodeRunCompletionPayload(raw.result, resolveName).result

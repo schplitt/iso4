@@ -278,6 +278,41 @@ export function decodeAuthenticatePayload(
 // Mirror of the Rust `PayloadReader` primitive encoders in `ipc.rs`.
 // All integers are big-endian per docs/protocol.md §3.
 
+// ── GlobalDef (wire form) ─────────────────────────────────────────────────────
+
+/**
+ * Wire-shaped host-global declaration for `Run`/`Precompile`/`PrefixRun`
+ * payloads. The runtime installs every global kind natively, so the client
+ * sends structured data and generates no sandbox source.
+ *
+ * - `bridge` — a plain host function; Rust installs a bridge stub under `name`.
+ * - `string` — a JS expression Rust evaluates as its own script and sets on
+ *   `globalThis[name]`.
+ * - `data` — a constant carried as a `WireValue`, materialised natively.
+ * - `shim` — a bridge handler (installed as a stub under `handlerName`) plus a
+ *   shim expression Rust wraps and sets on `globalThis[name]`.
+ *
+ * The name of the global is always a plain string here — it reaches the sandbox
+ * global object through the V8 API (`object.set`), never through interpolation
+ * into an identifier position.
+ */
+export type GlobalDefPayload
+  = | { kind: 'bridge', name: string }
+    | { kind: 'string', name: string, expr: string }
+    | { kind: 'data', name: string, value: unknown }
+    | { kind: 'shim', name: string, shim: string, handlerName: string }
+
+/**
+ * Wire tag for each `GlobalDefPayload` kind. Mirrors `HostGlobalDef` on the
+ * Rust side (`ipc.rs`).
+ */
+const GLOBAL_DEF_KIND = {
+  bridge: 0,
+  string: 1,
+  data: 2,
+  shim: 3,
+} as const
+
 class PayloadWriter {
   readonly parts: Buffer[] = []
 
@@ -323,6 +358,34 @@ class PayloadWriter {
     } else {
       this.writeU8(1)
       this.writeU32(n)
+    }
+    return this
+  }
+
+  writeGlobalDefs(defs: readonly GlobalDefPayload[]): this {
+    // Wire layout per docs/protocol.md §5.2: a length-prefixed list of
+    // tagged global definitions. Each entry is `u8 kind, String name`
+    // followed by a kind-specific tail. See `GlobalDefPayload`.
+    this.writeU32(defs.length)
+    for (const def of defs) {
+      this.writeU8(GLOBAL_DEF_KIND[def.kind])
+      this.writeString(def.name)
+      switch (def.kind) {
+        case 'bridge':
+          break
+        case 'string':
+          this.writeString(def.expr)
+          break
+        case 'data':
+          // The constant crosses as a raw WireValue (no length prefix); Rust
+          // decodes exactly one value and advances its cursor.
+          this.writeBytes(encodeWireValue(def.value))
+          break
+        case 'shim':
+          this.writeString(def.shim)
+          this.writeString(def.handlerName)
+          break
+      }
     }
     return this
   }
@@ -390,7 +453,7 @@ export interface RunPayloadOptions {
   code: string
   filename?: string
   limits?: ResourceLimits
-  globals?: string[]
+  globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
 }
 
@@ -399,16 +462,14 @@ export interface RunPayloadOptions {
  * @param options
  */
 export function encodeRunPayload(options: RunPayloadOptions): Buffer {
-  const w = new PayloadWriter()
+  return new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
-  const globals = options.globals ?? []
-  w.writeU32(globals.length)
-  for (const name of globals) w.writeString(name)
-  w.writeImports(options.imports ?? [])
-  return w.toBuffer()
+    .writeGlobalDefs(options.globals ?? [])
+    .writeImports(options.imports ?? [])
+    .toBuffer()
 }
 
 // ── PrecompilePayload ──────────────────────────────────────────
@@ -417,7 +478,7 @@ export interface PrecompilePayloadOptions {
   code: string
   filename?: string
   limits?: ResourceLimits
-  globals?: string[]
+  globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
 }
 
@@ -427,15 +488,13 @@ export interface PrecompilePayloadOptions {
  * @param options
  */
 export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buffer {
-  const w = new PayloadWriter()
+  return new PayloadWriter()
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
-  const globals = options.globals ?? []
-  w.writeU32(globals.length)
-  for (const name of globals) w.writeString(name)
-  w.writeImports(options.imports ?? [])
-  return w.toBuffer()
+    .writeGlobalDefs(options.globals ?? [])
+    .writeImports(options.imports ?? [])
+    .toBuffer()
 }
 
 // ── PrefixRunPayload ────────────────────────────────────────────
@@ -445,7 +504,7 @@ export interface PrefixRunPayloadOptions {
   code: string
   filename?: string
   limits?: ResourceLimits
-  globals?: string[]
+  globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
 }
 
@@ -458,17 +517,15 @@ export interface PrefixRunPayloadOptions {
 export function encodePrefixRunPayload(
   options: PrefixRunPayloadOptions & { runId: number },
 ): Buffer {
-  const w = new PayloadWriter()
+  return new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.prefixId)
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
-  const globals = options.globals ?? []
-  w.writeU32(globals.length)
-  for (const name of globals) w.writeString(name)
-  w.writeImports(options.imports ?? [])
-  return w.toBuffer()
+    .writeGlobalDefs(options.globals ?? [])
+    .writeImports(options.imports ?? [])
+    .toBuffer()
 }
 
 // ── DisposePrefixPayload ────────────────────────────────────────────────────
