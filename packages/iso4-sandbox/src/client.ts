@@ -15,6 +15,7 @@ import {
   encodePrecompilePayload,
   encodePrefixRunPayload,
   encodeRunPayload,
+  encodeTerminatePayload,
   encodeTsToRustFrame,
 } from './ipc'
 import type { HostExportFunction } from './types.js'
@@ -45,11 +46,26 @@ export type BridgeCallDispatcher = (call: {
 export type { ResourceLimits }
 
 /**
- * Thrown out of a run when its `AbortSignal` fires mid-flight. The connection
+ * How long TS waits for Rust's graceful `ERR_ABORTED` Result after sending a
+ * `Terminate` frame, before falling back to tearing the connection down (#36).
+ *
+ * The common case — a run suspended awaiting a bridge response — has the Rust
+ * V8 thread parked on a socket read, so it consumes the `Terminate` and replies
+ * in well under a millisecond; this window only bites when the sandbox is stuck
+ * in a tight synchronous loop (Rust never reads the frame), where we fall back.
+ * Kept comfortably under the abort-latency the runtime aims for.
+ */
+const TERMINATE_GRACE_MS = 100
+
+/**
+ * Thrown out of a run when its `AbortSignal` fires mid-flight and the graceful
+ * `Terminate` path did not produce a Result within {@link TERMINATE_GRACE_MS}
+ * (or when the pre-run abort race tears down before draining). The connection
  * is torn down (so the Rust isolate is reclaimed) before this propagates, and
  * the client is marked unusable so the pool replaces it rather than reusing a
  * half-dead slot. `index.ts` catches this and synthesizes the `ERR_ABORTED`
- * `RunResult`.
+ * `RunResult`. When the graceful path succeeds instead, no error is thrown —
+ * the real `ERR_ABORTED` Result flows back through `drainFrames`.
  */
 export class RunAbortedError extends Error {
   /**
@@ -148,11 +164,12 @@ export class RuntimeIpcClient {
 
     const globals = options?.globals ?? {}
     const globalNames = Object.keys(globals)
+    const runId = this.nextRunIdValue()
     await this.write(
       encodeTsToRustFrame(
         TsToRustMessageTypes.Run,
         encodeRunPayload({
-          runId: this.nextRunIdValue(),
+          runId,
           code,
           filename: options?.filename,
           limits: options?.limits,
@@ -162,7 +179,7 @@ export class RuntimeIpcClient {
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(globals), options?.signal)
+    return this.drainUntilResult(makeDispatcher(globals), runId, options?.signal)
   }
 
   async precompile(
@@ -217,6 +234,7 @@ export class RuntimeIpcClient {
 
     const globals = options.globals ?? {}
     const globalNames = Object.keys(globals)
+    const runId = this.nextRunIdValue()
     await this.write(
       encodeTsToRustFrame(
         TsToRustMessageTypes.PrefixRun,
@@ -227,12 +245,12 @@ export class RuntimeIpcClient {
           limits: options.limits,
           globals: globalNames,
           imports: options.imports,
-          runId: this.nextRunIdValue(),
+          runId,
         }),
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(globals), options.signal)
+    return this.drainUntilResult(makeDispatcher(globals), runId, options.signal)
   }
 
   async disposePrefix(prefixId: string): Promise<void> {
@@ -277,45 +295,76 @@ export class RuntimeIpcClient {
    * continue to completion. Rust silently ignores any late `BridgeResponse`
    * that arrives after the run has completed (see session.rs).
    *
-   * ── In-flight abort ──────────────────────────────────────────────────────
+   * ── In-flight abort (graceful terminate, #36) ─────────────────────────────
    * When `signal` fires mid-run — including while a bridge call is in flight —
-   * we tear the connection down immediately (`abortConnection`): the reader is
-   * closed so this loop throws, and the socket is destroyed so the Rust side
-   * observes EOF and reclaims the isolate promptly (rather than waiting for
-   * `wallTimeMs`). The loop then throws `RunAbortedError`, which `index.ts`
-   * maps to an `ERR_ABORTED` `RunResult`. Any late `BridgeResponse` written by
-   * an orphaned handler after this point fails silently (the socket is gone),
-   * so the sandbox never observes a return value for the in-flight call.
+   * we first ask Rust to stop gracefully: send a `Terminate` frame (carrying
+   * `runId`) and keep draining, leaving the socket open. In the common case the
+   * Rust V8 thread is parked awaiting a bridge response, reads the frame, and
+   * replies with a real `ERR_ABORTED` `Result` (carrying duration, CPU time,
+   * and the bridge records collected so far). That Result flows back through
+   * `drainFrames` and the connection stays healthy for reuse.
+   *
+   * If no Result arrives within {@link TERMINATE_GRACE_MS} — the sandbox is
+   * stuck in a tight synchronous loop, so Rust never reaches the frame read —
+   * we fall back to `abortConnection`: the reader is closed so this loop
+   * throws, and the socket is destroyed so Rust observes EOF (its CPU guard
+   * ultimately reclaims the busy isolate; see DESIGN.md §14.7). The loop then
+   * throws `RunAbortedError`, which `index.ts` maps to a synthesized
+   * `ERR_ABORTED` `RunResult`. Any late `BridgeResponse` from an orphaned
+   * handler is harmless either way: on the graceful path the reused connection
+   * discards it (stale callId), on the fallback path the socket is gone.
    * @param dispatcher
+   * @param runId
    * @param signal
    */
   private async drainUntilResult(
     dispatcher: BridgeCallDispatcher | undefined,
+    runId: number,
     signal?: AbortSignal,
   ): Promise<RawRunResult> {
     // If the signal aborted between the run-entry check in index.ts and here,
-    // tear down before we start reading frames.
+    // tear down before we start reading frames. The Run frame is already on the
+    // wire but the run has barely started (and may have no bridge poll loop to
+    // read a Terminate), so the graceful path cannot reliably apply here.
     if (signal?.aborted) {
       this.abortConnection()
       throw new RunAbortedError(signal.reason)
     }
 
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
     const onAbort = (): void => {
-      this.abortConnection()
+      // Ask Rust to stop and send a real ERR_ABORTED Result. Fire-and-forget:
+      // if the write fails the socket is already broken, and the fallback timer
+      // (or a reader error) resolves the run anyway.
+      this.write(
+        encodeTsToRustFrame(
+          TsToRustMessageTypes.Terminate,
+          encodeTerminatePayload(runId),
+        ),
+      ).catch(() => {
+        // Socket already gone — nothing to gracefully terminate.
+      })
+      graceTimer = setTimeout(() => {
+        this.abortConnection()
+      }, TERMINATE_GRACE_MS)
+      // Don't let the grace timer alone keep the event loop alive.
+      graceTimer.unref?.()
     }
     signal?.addEventListener('abort', onAbort, { once: true })
 
     try {
       return await this.drainFrames(dispatcher)
     } catch (error) {
-      // `abortConnection` closes the reader, which makes the frame loop reject.
-      // Translate that (or any error observed once the signal has fired) into a
-      // distinguishable abort — carrying the abort reason — so the caller
-      // resolves an aborted RunResult.
+      // The fallback `abortConnection` closes the reader, which makes the frame
+      // loop reject. Translate that (or any error observed once the signal has
+      // fired) into a distinguishable abort — carrying the abort reason — so the
+      // caller resolves an aborted RunResult.
       if (signal?.aborted)
         throw new RunAbortedError(signal.reason)
       throw error
     } finally {
+      if (graceTimer !== undefined)
+        clearTimeout(graceTimer)
       signal?.removeEventListener('abort', onAbort)
     }
   }

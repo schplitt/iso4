@@ -520,6 +520,15 @@ pub fn parse_dispose_prefix_payload(payload: &[u8]) -> io::Result<String> {
     Ok(id)
 }
 
+/// Parse the payload bytes of a `Terminate` frame.
+/// Payload is a single `RunId` (`u32`, big-endian) identifying the run to stop.
+pub fn parse_terminate_payload(payload: &[u8]) -> io::Result<u32> {
+    let mut r = PayloadReader::new(payload);
+    let run_id = r.read_u32()?;
+    r.assert_done()?;
+    Ok(run_id)
+}
+
 /// Convert a raw type byte into a known TS->Rust message type.
 ///
 /// You can use this after `read_frame()` when reading from a host connection.
@@ -840,6 +849,22 @@ mod tests {
         assert_eq!(p.imports[0].source, "export const a = 1");
         assert_eq!(p.imports[1].specifier, "lib:b");
         assert_eq!(p.imports[1].source, "export const b = 2");
+    }
+
+    #[test]
+    fn parse_terminate_payload_reads_run_id() {
+        let payload = 42u32.to_be_bytes();
+        assert_eq!(parse_terminate_payload(&payload).unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_terminate_payload_rejects_trailing_bytes() {
+        let mut payload = 1u32.to_be_bytes().to_vec();
+        payload.push(0xff);
+        assert_eq!(
+            parse_terminate_payload(&payload).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
     }
 
     #[test]

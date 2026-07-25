@@ -683,8 +683,7 @@ export interface RunSuccess {
   /**
    * One entry per bridge call the sandbox attempted, in attempt order —
    * including attempts blocked by limits ({@link BridgeCallEntry.blocked}).
-   * Recorded by the Rust runtime; empty for aborted runs (an abort tears the
-   * connection down before the runtime can report).
+   * Recorded by the Rust runtime.
    */
   bridgeCalls: BridgeCallEntry[]
 }
@@ -717,9 +716,12 @@ export interface RunAborted {
   durationMs: number
   cpuTimeMs: number
   /**
-   * Always empty today: aborting tears the connection down before the
-   * runtime can send its result frame. Graceful termination (#36) will fill
-   * this in.
+   * Bridge calls recorded before the abort landed. Populated when the runtime
+   * terminates gracefully (#36) — the common case, where the run was suspended
+   * awaiting a bridge response. Empty (and `durationMs`/`cpuTimeMs` zero) only
+   * when graceful termination falls back to socket teardown — e.g. a run
+   * aborted while stuck in a tight synchronous loop, or a signal already
+   * aborted at run entry.
    */
   bridgeCalls: BridgeCallEntry[]
 }

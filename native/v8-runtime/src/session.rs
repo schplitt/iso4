@@ -489,8 +489,22 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 eprintln!("[iso4-v8] ignoring late BridgeResponse (run already completed)");
             }
             ipc::TsToRustMessageType::Terminate => {
-                eprintln!("[iso4-v8] Terminate received — closing");
-                break;
+                // A Terminate reaching the top-level session loop targets a run
+                // that has already completed — its Result was sent just before
+                // the host's abort landed (a benign race). The in-flight case is
+                // consumed inside the run's poll loop (see v8.rs), which returns
+                // an ERR_ABORTED Result. Discard the stray frame and keep the
+                // connection healthy for reuse, mirroring the late-BridgeResponse
+                // arm above; closing here would needlessly force the pool to
+                // reconnect the slot.
+                match ipc::parse_terminate_payload(&frame.payload) {
+                    Ok(run_id) => eprintln!(
+                        "[iso4-v8] ignoring stray Terminate (run {run_id} already completed)"
+                    ),
+                    Err(e) => {
+                        eprintln!("[iso4-v8] ignoring stray Terminate with malformed payload: {e}")
+                    }
+                }
             }
         }
     }

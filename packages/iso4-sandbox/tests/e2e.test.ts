@@ -1203,6 +1203,39 @@ describe('AbortSignal cancellation', () => {
     expect(result.error.code).toBe('ERR_ABORTED')
   })
 
+  test('graceful abort reports runtime telemetry (bridge records + timings)', async () => {
+    // Aborting while the sandbox is suspended awaiting a bridge call takes the
+    // graceful terminate path (#36): Rust sends a real ERR_ABORTED result, so
+    // the aborted RunResult carries the in-flight bridge record and non-zero
+    // timings rather than the synthesized zeros of a socket teardown.
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 100)
+    const result = await runtime.run({
+      code: `
+        import { slowCall } from 'host:slow'
+        export default await slowCall()
+      `,
+      signal: controller.signal,
+      imports: {
+        'host:slow': {
+          slowCall: () =>
+            new Promise((resolve) => {
+              setTimeout(resolve, 10_000)
+            }),
+        },
+      },
+    })
+    expect(result.status).toBe('aborted')
+    if (result.status !== 'aborted')
+      return
+    // The in-flight slowCall is recorded — unsettled, so ok is false.
+    expect(result.bridgeCalls.length).toBeGreaterThanOrEqual(1)
+    expect(result.bridgeCalls[0]?.name).toContain('slowCall')
+    expect(result.bridgeCalls[0]?.ok).toBe(false)
+    // Real timings from the runtime, not synthesized zeros.
+    expect(result.durationMs).toBeGreaterThan(0)
+  })
+
   test('a late BridgeResponse after abort is not observed by the sandbox', async () => {
     // The bridge handler resolves *after* the abort lands. The run must still
     // resolve ERR_ABORTED and the sandbox must never see the returned value.
@@ -2953,9 +2986,10 @@ describe('bridge report', () => {
     expect(violating.responseBytes).toBe(0)
   })
 
-  test('aborted runs carry no bridge report (no result frame from Rust)', async () => {
-    // Documented gap until graceful termination (#36): the abort tears the
-    // connection down, so the runtime never reports what it recorded.
+  test('aborted runs carry the bridge report from the graceful terminate result (#36)', async () => {
+    // Graceful termination (#36): the abort lands while the run is suspended
+    // awaiting `hang()`, so Rust sends a real ERR_ABORTED result carrying the
+    // in-flight bridge record and timings — no longer synthesized zeros.
     const controller = new AbortController()
     setTimeout(() => controller.abort(), 50)
     const result = await runtime.run({
@@ -2969,8 +3003,12 @@ describe('bridge report', () => {
       },
     })
     expect(result.status).toBe('aborted')
-    expect(result.bridgeCalls).toEqual([])
-    expect(result.cpuTimeMs).toBe(0)
+    // The in-flight hang() call is recorded — unsettled, so ok is false.
+    expect(result.bridgeCalls).toHaveLength(1)
+    expect(result.bridgeCalls[0].name).toBe('hang')
+    expect(result.bridgeCalls[0].ok).toBe(false)
+    expect(result.durationMs).toBeGreaterThan(0)
+    expect(result.cpuTimeMs).toBeGreaterThanOrEqual(0)
   })
 
   test('prefix.run() carries the bridge report too', async () => {
