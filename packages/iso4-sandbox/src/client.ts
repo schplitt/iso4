@@ -19,7 +19,9 @@ import {
   encodeTsToRustFrame,
 } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
-import type { GlobalDefPayload, ImportBindingPayload } from './ipc'
+import type { GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
+import type { ImportHandlerMap } from './imports.js'
+import { importHandlerKey } from './imports.js'
 import { encodeWireValue } from './wire'
 
 export interface RuntimeIpcClientOptions {
@@ -32,13 +34,15 @@ export interface RawRunResult {
 }
 
 /**
- * Dispatches a bridge call to the host-configured handler. Resolves the
- * handler by the call's `exportName` against the per-run globals map.
- * Host-module imports route through the same map via a single reserved
- * global, `__iso4_call`, whose handler peels a leading integer handle ID
- * and routes to the import registry (see `imports.ts`).
+ * Dispatches a bridge call to the host-configured handler. Global calls
+ * (`targetKind = 0`) resolve by `exportName` against the per-run globals
+ * map; host-import calls (`targetKind = 1`) arrive with their specifier and
+ * function-leaf path already resolved by the runtime and route through the
+ * per-run import handler map (see `imports.ts`).
  */
 export type BridgeCallDispatcher = (call: {
+  targetKind: 0 | 1
+  specifier: string | undefined
   exportName: string
   args: unknown[]
 }) => Promise<unknown>
@@ -147,8 +151,9 @@ export class RuntimeIpcClient {
   // `globals` is the wire-shaped `GlobalDefPayload[]` produced by
   // `processGlobals()` in index.ts — Rust installs each kind natively.
   // `dispatch` is the separate `name → handler` map the client routes incoming
-  // `BridgeCall` frames through: plain functions under their own name,
+  // global `BridgeCall` frames through: plain functions under their own name,
   // `BridgeWithShim` handlers under their private `__iso4_<name>_h` key.
+  // `importDispatch` routes import-targeted frames by (specifier, leaf path).
   async runRawCode(
     code: string,
     options?: {
@@ -157,6 +162,7 @@ export class RuntimeIpcClient {
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
       imports?: readonly ImportBindingPayload[]
+      importDispatch?: ImportHandlerMap
       signal?: AbortSignal
     },
   ): Promise<RawRunResult> {
@@ -178,7 +184,11 @@ export class RuntimeIpcClient {
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(options?.dispatch ?? {}), runId, options?.signal)
+    return this.drainUntilResult(
+      makeDispatcher(options?.dispatch ?? {}, options?.importDispatch),
+      runId,
+      options?.signal,
+    )
   }
 
   async precompile(
@@ -225,7 +235,8 @@ export class RuntimeIpcClient {
       limits?: ResourceLimits
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
-      imports?: readonly ImportBindingPayload[]
+      importRebinds?: readonly ImportRebindPayload[]
+      importDispatch?: ImportHandlerMap
       signal?: AbortSignal
     },
   ): Promise<RawRunResult> {
@@ -242,13 +253,17 @@ export class RuntimeIpcClient {
           filename: options.filename,
           limits: options.limits,
           globals: options.globals,
-          imports: options.imports,
+          importRebinds: options.importRebinds,
           runId,
         }),
       ),
     )
 
-    return this.drainUntilResult(makeDispatcher(options.dispatch ?? {}), runId, options.signal)
+    return this.drainUntilResult(
+      makeDispatcher(options.dispatch ?? {}, options.importDispatch),
+      runId,
+      options.signal,
+    )
   }
 
   async disposePrefix(prefixId: string): Promise<void> {
@@ -415,6 +430,8 @@ export class RuntimeIpcClient {
             // If the run timed out by then, Rust ignores the late frame.
             const { callId } = call
             dispatcher({
+              targetKind: call.targetKind,
+              specifier: call.specifier,
               exportName: call.exportName,
               args: call.args,
             }).then(
@@ -485,21 +502,32 @@ export class RuntimeIpcClient {
 }
 
 /**
- * Build a dispatcher that looks up a handler by `exportName` in the
- * per-run globals map. Host-module imports are bridged through the same
- * map via the reserved `__iso4_call` global, so a single lookup table
- * handles every bridge call.
+ * Build a dispatcher over the two per-run handler maps: globals by
+ * `exportName`, host-import function leaves by `(specifier, leaf path)` —
+ * the runtime resolves import handle IDs before the frame is sent, so both
+ * lookups are plain name-addressed.
  *
- * Returns `undefined` when the map is empty so the loop short-circuits to
+ * Returns `undefined` when both maps are empty so the loop short-circuits to
  * an "unconfigured bridge" error response.
  * @param globals
+ * @param imports
  */
 function makeDispatcher(
   globals: Record<string, HostExportFunction>,
+  imports?: ImportHandlerMap,
 ): BridgeCallDispatcher | undefined {
-  if (Object.keys(globals).length === 0)
+  if (Object.keys(globals).length === 0 && (imports === undefined || imports.size === 0))
     return undefined
-  return async ({ exportName, args }) => {
+  return async ({ targetKind, specifier, exportName, args }) => {
+    if (targetKind === 1) {
+      const handler = imports?.get(importHandlerKey(specifier ?? '', exportName))
+      if (handler === undefined) {
+        throw new Error(
+          `no handler configured for host import '${specifier}'.${exportName}`,
+        )
+      }
+      return handler(...(args as any[]))
+    }
     const handler = globals[exportName]
     if (handler === undefined)
       throw new Error(`no handler configured for bridge global '${exportName}'`)

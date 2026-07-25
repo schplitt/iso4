@@ -284,17 +284,15 @@ pub struct RunErrorPayload {
 
 /// Per-call metadata for one bridge call attempt — names, timing, and sizes
 /// only, never payloads. Recorded by the runtime (`v8.rs`) and shipped on the
-/// Result frame; the TS client resolves `raw_name`/`import_handle_id` to the
-/// public call name.
+/// Result frame with the name already resolved — the runtime owns both the
+/// import handle table and the shim naming convention, so no client-side
+/// resolution remains.
 #[derive(Debug, Clone)]
 pub struct BridgeCallRecord {
-    /// Wire-level export name the sandbox called (`fetch`, `__iso4_fetch_h`,
-    /// `__iso4_call`).
-    pub raw_name: String,
-    /// First argument of a `__iso4_call` dispatch — the host-module function
-    /// handle ID. `None` for plain globals and for attempts blocked before
-    /// argument serialisation.
-    pub import_handle_id: Option<u32>,
+    /// The public name sandbox code called: plain globals as-is (`fetch`),
+    /// shimmed globals under their public name (not the private stub), and
+    /// host-module import leaves as `<specifier>.<path>`.
+    pub name: String,
     /// Offset from run start to the attempt, in ms (same clock as
     /// `duration_ms` on the run result).
     pub start_ms: f64,
@@ -404,8 +402,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
 
 /// Encode `List<BridgeCallRecord>`. Per record:
 /// ```text
-/// String        rawName
-/// Optional<u32> importHandleId
+/// String        name
 /// f64           startMs
 /// f64           durationMs
 /// u32           argBytes
@@ -416,14 +413,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
 fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
     encode_u32(records.len() as u32, out);
     for r in records {
-        encode_string(&r.raw_name, out);
-        match r.import_handle_id {
-            Some(id) => {
-                out.push(1);
-                encode_u32(id, out);
-            }
-            None => out.push(0),
-        }
+        encode_string(&r.name, out);
         encode_f64(r.start_ms, out);
         encode_f64(r.duration_ms, out);
         encode_u32(r.arg_bytes, out);
@@ -1052,8 +1042,7 @@ mod tests {
                 duration_ms: 2.5,
                 cpu_time_ms: 1.25,
                 bridge_calls: vec![BridgeCallRecord {
-                    raw_name: "fetch".to_string(),
-                    import_handle_id: None,
+                    name: "fetch".to_string(),
                     start_ms: 0.5,
                     duration_ms: 1.0,
                     arg_bytes: 42,

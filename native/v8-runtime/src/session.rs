@@ -21,11 +21,90 @@ use crate::ipc;
 use crate::v8 as sandbox;
 use crate::wire;
 
-/// True when any global in `defs` installs a bridge stub — a plain function, a
-/// shim handler, or the `__iso4_call` import dispatcher. Such a run needs the
-/// session socket for bridge calls; string/data-only runs do not.
-fn needs_bridge_stub(defs: &[ipc::HostGlobalDef]) -> bool {
+/// True when the run needs the session socket for bridge calls: some global
+/// installs a bridge stub (a plain function or a shim handler), or some host
+/// import declares a function leaf (the runtime then installs the reserved
+/// `__iso4_call` dispatcher stub itself). String/data-only runs do not.
+fn needs_bridge_stub(defs: &[ipc::HostGlobalDef], imports: &[ipc::ImportBinding]) -> bool {
     defs.iter().any(|g| g.bridge_stub_name().is_some())
+        || imports.iter().any(|b| match &b.module {
+            ipc::ImportModule::Source(_) => false,
+            ipc::ImportModule::Host(exports) => has_function_leaf(exports),
+        })
+}
+
+fn has_function_leaf(entries: &[(String, ipc::HostModuleNode)]) -> bool {
+    entries.iter().any(|(_, node)| match node {
+        ipc::HostModuleNode::Function => true,
+        ipc::HostModuleNode::Object(children) => has_function_leaf(children),
+        ipc::HostModuleNode::Data(_) => false,
+    })
+}
+
+/// Validate the host-import rebinds a `PrefixRun` requested against the shape
+/// declared at `Precompile`. Returns the first violation, phrased like the
+/// undeclared-globals check: only declared host-module *function leaves* may
+/// be re-pointed at a new host handler; source modules and data leaves are
+/// frozen with the snapshot.
+fn validate_import_rebinds(
+    rebinds: &[ipc::ImportRebind],
+    declared: &[ipc::ImportBinding],
+) -> Result<(), String> {
+    for rb in rebinds {
+        let Some(binding) = declared.iter().find(|b| b.specifier == rb.specifier) else {
+            return Err(format!(
+                "import '{}' was not declared at precompile time",
+                rb.specifier
+            ));
+        };
+        let exports = match &binding.module {
+            ipc::ImportModule::Source(_) => {
+                return Err(format!(
+                    "import '{}' is a source module — source imports are frozen \
+                     in the snapshot and cannot be rebound at prefix.run() time",
+                    rb.specifier
+                ))
+            }
+            ipc::ImportModule::Host(exports) => exports,
+        };
+        match find_host_node(exports, &rb.path) {
+            Some(ipc::HostModuleNode::Function) => {}
+            Some(ipc::HostModuleNode::Data(_)) => {
+                return Err(format!(
+                    "import '{}'.{} is a data leaf, not a function — data leaves \
+                     cannot be rebound",
+                    rb.specifier, rb.path
+                ))
+            }
+            _ => {
+                return Err(format!(
+                    "import '{}'.{} was not declared at precompile time",
+                    rb.specifier, rb.path
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Follow a dot-joined path through a host-module tree.
+fn find_host_node<'a>(
+    entries: &'a [(String, ipc::HostModuleNode)],
+    path: &str,
+) -> Option<&'a ipc::HostModuleNode> {
+    let mut segments = path.split('.');
+    let first = segments.next()?;
+    let mut node = entries.iter().find(|(k, _)| k == first).map(|(_, n)| n)?;
+    for segment in segments {
+        let ipc::HostModuleNode::Object(children) = node else {
+            return None;
+        };
+        node = children
+            .iter()
+            .find(|(k, _)| k == segment)
+            .map(|(_, n)| n)?;
+    }
+    Some(node)
 }
 
 /// Snapshot + declared global / import shape for one precompiled prefix.
@@ -153,9 +232,9 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 );
 
                 // A socket is needed only when some global installs a bridge
-                // stub (a plain function, a shim handler, or the `__iso4_call`
-                // import dispatcher). String/data-only runs need no socket.
-                let stream_fd = if needs_bridge_stub(&payload.globals) {
+                // stub or some host import declares a function leaf.
+                // String/data-only runs need no socket.
+                let stream_fd = if needs_bridge_stub(&payload.globals, &payload.imports) {
                     Some(stream.as_raw_fd())
                 } else {
                     None
@@ -356,17 +435,23 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         // precompile time. Adding a new name at run time would silently
                         // mutate the snapshot's global object shape, breaking the
                         // invariant that the prefix captures the full bridge surface.
+                        // The same rule covers host-import rebinds: only function
+                        // leaves declared at precompile time may be re-pointed.
                         let declared_set: std::collections::HashSet<&str> =
                             declared_globals.iter().map(String::as_str).collect();
-                        let undeclared: Vec<&str> = payload
+                        let violation: Option<String> = payload
                             .globals
                             .iter()
                             .filter_map(|g| g.bridge_stub_name())
-                            .filter(|name| !declared_set.contains(name))
-                            .collect();
-                        if let Some(name) = undeclared.first() {
-                            let msg =
-                                format!("global '{name}' was not declared at precompile time");
+                            .find(|name| !declared_set.contains(name))
+                            .map(|name| {
+                                format!("global '{name}' was not declared at precompile time")
+                            })
+                            .or_else(|| {
+                                validate_import_rebinds(&payload.import_rebinds, &declared_imports)
+                                    .err()
+                            });
+                        if let Some(msg) = violation {
                             eprintln!(
                                 "[iso4-v8] PrefixRun {} — ERR_UNDECLARED_BINDING: {msg}",
                                 payload.run_id
@@ -390,19 +475,18 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             )
                         } else {
                             // PrefixRun reuses the declared imports shape
-                            // verbatim. The TS side enforces that run-time
-                            // overrides only update host function handlers
-                            // (data exports + source modules are frozen in
-                            // the snapshot), so the wire-level shape that
-                            // matters for bridge dispatch here is the one
-                            // captured at precompile. Every run global here is
-                            // a bridge stub to re-install (string/data globals
-                            // and shim wrappers live in the snapshot).
-                            let stream_fd = if needs_bridge_stub(&payload.globals) {
-                                Some(stream.as_raw_fd())
-                            } else {
-                                None
-                            };
+                            // verbatim — rebinds only re-point host function
+                            // handlers on the TS side (data exports + source
+                            // modules are frozen in the snapshot), validated
+                            // above. Every run global here is a bridge stub to
+                            // re-install (string/data globals and shim
+                            // wrappers live in the snapshot).
+                            let stream_fd =
+                                if needs_bridge_stub(&payload.globals, &declared_imports) {
+                                    Some(stream.as_raw_fd())
+                                } else {
+                                    None
+                                };
                             eprintln!(
                             "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports)",
                             payload.run_id, payload.prefix_id, payload.code.len(),

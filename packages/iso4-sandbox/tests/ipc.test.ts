@@ -231,12 +231,12 @@ describe('payload encoders', () => {
   })
 
   // ── imports field wire encoding ────────────────────────────────────────
-  // The wire only carries source-form imports: the TS-side import processor
-  // lowers "host module" (object) imports to generated ESM source before
-  // encoding. The Rust parser is in `native/v8-runtime/src/ipc.rs`; the
-  // round-trip tests there mirror the layout asserted below.
+  // Each binding is `String specifier` + `u8 kind`: source modules (kind 0)
+  // carry ESM text; host modules (kind 1) carry their shape as a data tree.
+  // The Rust parser is in `native/v8-runtime/src/ipc.rs`; the round-trip
+  // tests there mirror the layout asserted below.
 
-  test('encodeRunPayload with one import lays out specifier then source', () => {
+  test('encodeRunPayload with one source import lays out specifier, kind, source', () => {
     const buf = encodeRunPayload({
       runId: 1,
       code: 'x',
@@ -250,9 +250,54 @@ describe('payload encoders', () => {
     off += 4
     const { value: specifier, end: e1 } = readString(buf, off)
     expect(specifier).toBe('lib:math')
-    const { value: source, end: e2 } = readString(buf, e1)
+    expect(buf[e1]).toBe(0) // kind: source
+    const { value: source, end: e2 } = readString(buf, e1 + 1)
     expect(source).toBe('export const add = (a, b) => a + b')
     expect(e2).toBe(buf.byteLength)
+  })
+
+  test('encodeRunPayload lays out a host-module tree as tagged nodes', () => {
+    const buf = encodeRunPayload({
+      runId: 1,
+      code: 'x',
+      imports: [
+        {
+          specifier: 'tools:search',
+          module: [
+            ['query', { kind: 'function' }],
+            ['limit', { kind: 'data', value: true }],
+            ['nested', { kind: 'object', entries: [['inner', { kind: 'function' }]] }],
+          ],
+        },
+      ],
+    })
+    let off = 4 + 4 + 1 + 1 + 8 + 4
+    expect(readU32BE(buf, off)).toBe(1) // imports count
+    off += 4
+    const { value: specifier, end: e1 } = readString(buf, off)
+    expect(specifier).toBe('tools:search')
+    off = e1
+    expect(buf[off]).toBe(1) // kind: host
+    off += 1
+    expect(readU32BE(buf, off)).toBe(3) // export count
+    off += 4
+    const { value: n1, end: e2 } = readString(buf, off)
+    expect(n1).toBe('query')
+    expect(buf[e2]).toBe(0) // node tag: function
+    off = e2 + 1
+    const { value: n2, end: e3 } = readString(buf, off)
+    expect(n2).toBe('limit')
+    expect(buf[e3]).toBe(1) // node tag: data
+    expect(buf[e3 + 1]).toBe(0x03) // WireValue TAG_TRUE
+    off = e3 + 2
+    const { value: n3, end: e4 } = readString(buf, off)
+    expect(n3).toBe('nested')
+    expect(buf[e4]).toBe(2) // node tag: object
+    expect(readU32BE(buf, e4 + 1)).toBe(1) // 1 child
+    const { value: c1, end: e5 } = readString(buf, e4 + 5)
+    expect(c1).toBe('inner')
+    expect(buf[e5]).toBe(0) // node tag: function
+    expect(e5 + 1).toBe(buf.byteLength)
   })
 
   test('encodeRunPayload with multiple imports preserves order', () => {
@@ -269,21 +314,32 @@ describe('payload encoders', () => {
     off += 4
     const { value: s1, end: e1 } = readString(buf, off)
     expect(s1).toBe('lib:a')
-    const { value: src1, end: e2 } = readString(buf, e1)
+    expect(buf[e1]).toBe(0) // kind: source
+    const { value: src1, end: e2 } = readString(buf, e1 + 1)
     expect(src1).toBe('export const a = 1')
     const { value: s2, end: e3 } = readString(buf, e2)
     expect(s2).toBe('lib:b')
-    const { value: src2, end: e4 } = readString(buf, e3)
+    expect(buf[e3]).toBe(0) // kind: source
+    const { value: src2, end: e4 } = readString(buf, e3 + 1)
     expect(src2).toBe('export const b = 2')
     expect(e4).toBe(buf.byteLength)
   })
 
-  test('encodePrecompilePayload and encodePrefixRunPayload both carry the imports field', () => {
+  test('encodePrecompilePayload carries import declarations; encodePrefixRunPayload carries rebind locations', () => {
     const imports = [{ specifier: 'lib:zod', source: 'export const z = {}' }] as const
     const pre = encodePrecompilePayload({ code: 'x', imports })
-    const pref = encodePrefixRunPayload({ runId: 1, prefixId: 'p', code: 'x', imports })
     expect(pre.toString('utf8')).toContain('lib:zod')
-    expect(pref.toString('utf8')).toContain('lib:zod')
+
+    const pref = encodePrefixRunPayload({
+      runId: 1,
+      prefixId: 'p',
+      code: 'x',
+      importRebinds: [{ specifier: 'tools:search', path: 'nested.inner' }],
+    })
+    // Tail: u32 count, String specifier, String path.
+    const s = pref.toString('utf8')
+    expect(s).toContain('tools:search')
+    expect(s).toContain('nested.inner')
   })
 
   test('imports field defaults to empty list when omitted', () => {

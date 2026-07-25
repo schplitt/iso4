@@ -122,8 +122,7 @@ function encodeStringList(items: string[], out: number[]): void {
 }
 
 interface TestBridgeRecord {
-  rawName: string
-  importHandleId?: number
+  name: string
   startMs: number
   durationMs: number
   argBytes: number
@@ -159,13 +158,7 @@ interface FailureCompletion {
 function encodeBridgeRecords(records: TestBridgeRecord[], out: number[]): void {
   pushU32(out, records.length)
   for (const r of records) {
-    encodeString(r.rawName, out)
-    if (r.importHandleId !== undefined) {
-      out.push(1)
-      pushU32(out, r.importHandleId)
-    } else {
-      out.push(0)
-    }
+    encodeString(r.name, out)
     pushF64(out, r.startMs)
     pushF64(out, r.durationMs)
     pushU32(out, r.argBytes)
@@ -543,9 +536,11 @@ describe('decodeRunCompletionPayload — success', () => {
   })
 
   test('cpuTimeMs and bridge call records decoded on success and failure', () => {
+    // Names arrive already resolved by the runtime — import calls carry
+    // their `<specifier>.<path>` form, shims their public name.
     const records: TestBridgeRecord[] = [
       {
-        rawName: 'fetch',
+        name: 'fetch',
         startMs: 0.5,
         durationMs: 2.25,
         argBytes: 180,
@@ -554,8 +549,7 @@ describe('decodeRunCompletionPayload — success', () => {
         blocked: false,
       },
       {
-        rawName: '__iso4_call',
-        importHandleId: 3,
+        name: 'tools:search.query',
         startMs: 3,
         durationMs: 0.5,
         argBytes: 64,
@@ -574,8 +568,6 @@ describe('decodeRunCompletionPayload — success', () => {
         cpuTimeMs: 1.25,
         bridgeCalls: records,
       }),
-      // Resolver receives the raw name + handle ID exactly as decoded.
-      (rawName, handleId) => (handleId !== undefined ? `resolved.${handleId}` : rawName),
     )
     expect(success.result.cpuTimeMs).toBeCloseTo(1.25)
     expect(success.result.bridgeCalls).toEqual([
@@ -589,7 +581,7 @@ describe('decodeRunCompletionPayload — success', () => {
         blocked: false,
       },
       {
-        name: 'resolved.3',
+        name: 'tools:search.query',
         startMs: 3,
         durationMs: 0.5,
         argBytes: 64,
@@ -609,7 +601,7 @@ describe('decodeRunCompletionPayload — success', () => {
       durationMs: 1,
       cpuTimeMs: 0.75,
       bridgeCalls: [{
-        rawName: 'tool',
+        name: 'tool',
         startMs: 0.1,
         durationMs: 0,
         argBytes: 0,

@@ -332,30 +332,42 @@ value type is the discriminator:
   string. V8 compiles and evaluates it inside the isolate; transitive
   `import`s resolve back through the same map. Zero per-call bridge cost.
 - **Object value — host module.** The host provides a JS object whose
-  shape becomes the module's exports. The runtime walks the object
-  recursively and auto-generates ESM source: data leaves become JS
-  literals, function leaves become async stubs that call a single
-  **ID-addressed dispatcher**:
+  shape becomes the module's exports. The client walks the object
+  recursively and ships the **shape as plain data** over the wire (#37):
+  function leaves as bare markers, data leaves as `WireValue`s, nested
+  objects as trees. No JS source is ever generated from the data. The
+  Rust runtime builds the module natively:
 
   ```js
-  // generated for { search: fn } — fn assigned handle ID 0
-  export const search = async (...args) => await globalThis.__iso4_call(0, ...args);
+  // Rust-emitted module for { search: fn } — a fixed-shape template.
+  // Only identifier-validated export names and integer indices appear;
+  // the values array rides on the module's import.meta, populated by a
+  // native V8 callback.
+  export const search = import.meta.__iso4[0];
   ```
 
-  `__iso4_call` is one ordinary host global whose handler peels the
-  leading integer handle ID and routes to a per-run registry
-  (`Map<id, fn>`). This means there are **no generated bridge-global
-  names** — nothing to sanitise, no collision class (two specifiers like
-  `host:tools` and `host_tools` can never clash because there are no
-  derived names, only integer IDs). The wire format and the Rust side are
-  unchanged: `__iso4_call` is dispatched like any other named global.
-  Nested objects mixing data and functions are walked recursively and
-  Just Work — `db.users.create()` is a single dispatcher call to one
+  Data leaves are materialised with the value codec (`wire_to_v8_value`);
+  each function leaf becomes an async trampoline built by a fixed factory
+  — `(id) => (async (...args) => await globalThis.__iso4_call(id, ...args))`
+  — with its **handle ID passed as a number**, never printed into source.
+  Handle IDs are assigned by the runtime in tree-walk order over the
+  declared bindings, and the runtime owns the `id → (specifier, path)`
+  table: when a trampoline fires, the dispatcher resolves the ID before
+  the `BridgeCall` frame is written, so the frame (and the bridge-call
+  record) carries the real `tools:search.query`-style name and the IDs
+  never leave the runtime. The TS client routes the call through a
+  location-keyed handler map (`(specifier, path) → fn`).
+
+  `__iso4_call` is a reserved bridge stub the runtime installs itself
+  whenever the declared imports contain a function leaf. There are **no
+  generated bridge-global names** — nothing to sanitise, no collision
+  class. Nested objects mixing data and functions are walked recursively
+  and Just Work — `db.users.create()` is a single dispatcher call to one
   handle ID, no more expensive than a flat call.
 
-  The same registry + dispatcher is the foundation for **callable handles**
+  The same dispatcher is the foundation for **callable handles**
   (Phase 13): functions *returned* from a bridge call get registered the
-  same way and materialise into the same `__iso4_call` stubs, so
+  same way and materialise into the same trampolines, so
   request/response objects (`res.json()`) become purely additive.
 
 ```ts
@@ -363,7 +375,7 @@ imports: {
   // string → source module
   "lodash-es": lodashEsmBundle,
 
-  // object → host module (auto-generated source + bridge globals)
+  // object → host module (shape shipped as data; Rust builds the module)
   "host:tools": {
     search: async (q) => mySearch(q),
     version: "1.0",
@@ -372,26 +384,26 @@ imports: {
 }
 ```
 
-Both flavors are submitted to V8 as standard ESM modules; the only
-difference is who wrote the source string. The runtime resolver looks up
-each specifier in `imports`. Anything missing surfaces as
-`ERR_MODULE_NOT_FOUND`.
+Both flavors materialise as standard ESM source-text modules inside the
+isolate; the host-module template is Rust-emitted and contains no
+host-provided text. The runtime resolver looks up each specifier in
+`imports`. Anything missing surfaces as `ERR_MODULE_NOT_FOUND`.
 
 The object form imposes these restrictions on the value tree:
 
 - **Function leaves** must take serialisable data and return serialisable
-  data. In v1 the generated stub is always `async` because bridge calls
+  data. In v1 the trampoline is always `async` because bridge calls
   cross a UDS round trip; the sandbox always `await`s the result.
-  Synchronous delivery is Phase 11 (see the sync-codegen note below).
+  Synchronous delivery is Phase 11 (see the sync-leaves note below).
 - **Function arguments may not themselves be functions** (no callback
   support in v1). Bridge rejects with `FunctionArgumentNotSupported`.
   Passing host functions back to the sandbox via *return values* is
   Phase 13 (callable handles).
-- **Data leaves** must be representable as JS literals: primitives,
-  strings, plain objects, arrays, `Date`, `BigInt`, `Uint8Array`.
-  `Map` / `Set` / circular references throw at registration with a
-  pointer to the eventual "lazy data load" mechanism, if it becomes
-  needed.
+- **Data leaves** must be representable in the wire value codec:
+  primitives, strings, `BigInt`, `Uint8Array`, plain objects, arrays.
+  `Date` / `Map` / `Set` / class instances / circular references throw at
+  registration — the supported set deliberately matches what the codec
+  can carry back *out* of the sandbox, so there is no one-way asymmetry.
 - **Stateful object handles** (`createReadStream` returning a stream)
   remain unsupported; nothing changes there.
 - **Class instances with prototype methods** — methods on the prototype
@@ -400,46 +412,54 @@ The object form imposes these restrictions on the value tree:
 
 Rebinding on `prefix.run()` is keyed on the same shape: only function
 leaves declared at `precompile()` time may be rebound, and only with the
-same signature. TypeScript enforces this via `RebindImports<I>`; the
-runtime fallback for `as any` shenanigans returns
-`ERR_UNDECLARED_BINDING` symmetrically with the globals path.
+same signature. TypeScript enforces this via `RebindImports<I>` at compile
+time; at run time the client sends the rebind **locations**
+(`specifier` + leaf path) on the `PrefixRun` payload and the Rust runtime
+validates them against the shape stored with the prefix, returning
+`ERR_UNDECLARED_BINDING` for anything else — one enforcement point,
+shared with the undeclared-globals check, that a non-TS client cannot
+skip.
 
-#### Implementation note: why generated source instead of synthetic V8 modules
+#### Implementation note: how host modules are built (shape-as-data, #37)
 
-An earlier version of Phase 7 used V8 synthetic modules
-(`v8::Module::create_synthetic_module` + `set_synthetic_module_export`) to
-bind host-module exports natively. Pre-v1 it was rewritten to the
-source-generation approach because:
+Two earlier iterations informed the current design:
 
-1. The public API simplifies dramatically (`Record<string, string |
-   object>` instead of a discriminated union with `kind`, `exports`,
-   `source` fields).
-2. Nested objects mixing data and functions fall out for free — the
-   recursive walker emits literal source with bridge-global references at
-   the function leaves.
-3. The implementation reduces to two primitives already present (source
-   imports + globals) instead of a third (synthetic modules) carrying its
-   own wire-format fields, callback shapes, and `Box` lifetime
-   management.
-4. Generated source is a real ESM module: debuggable, code-cacheable by
-   V8, and present in stack traces under a sanitised filename.
+1. **Synthetic V8 modules** (original Phase 7):
+   `v8::Module::create_synthetic_module` binds exports natively, but the
+   synthetic module object holds a native evaluation-steps pointer. Any
+   prefix that makes the module reachable from the snapshot heap (a
+   namespace stash, a closure over an imported binding) would then
+   require V8 external-reference bookkeeping on snapshot creation *and*
+   every restore — a crash, not an error, when missed.
+2. **Client-side source generation**: the TS client walked the object and
+   emitted ESM text (function leaves as `__iso4_call(<id>, …)` stubs,
+   data leaves as printed JS literals). Snapshot-safe, but emitting code
+   from data is an injection-adjacent surface, and Rust only ever saw
+   opaque generated source — bridge records needed TS-side name
+   resolution.
 
-The native-binding mechanism is preserved as **Phase 12** ("Native
-host-module binding") if performance, stack-trace polish, or in-process
-integration ever justify it. Until then the source-gen path is the
-shipping implementation.
+The shipping design keeps the best of both: the shape crosses the wire as
+**plain data**, and the Rust runtime emits only a fixed template
+(`export const <name> = import.meta.__iso4[<i>];` — identifier-validated
+names, integer indices) while building every value natively and handing
+the values array to the module through V8's import-meta callback. The
+module is an ordinary source-text module, so prefix snapshots capture
+host-module bindings as plain JS with no external references; and the
+runtime owns the handle table, so bridge frames and records carry fully
+resolved names.
 
-#### Implementation note: sync codegen (Phase 11)
+#### Implementation note: sync function leaves (Phase 11)
 
-The source generator decides per function leaf whether to emit an async
-stub (`__iso4_call`, returns a Promise) or a sync stub (`__iso4_call_sync`,
-blocks the isolate and returns the value directly):
+The wire shape tags each function leaf async or sync, and the runtime
+picks the matching trampoline factory: async (`__iso4_call`, returns a
+Promise) or sync (`__iso4_call_sync`, blocks the isolate and returns the
+value directly):
 
 ```js
-// async leaf
-export const search = async (...args) => await globalThis.__iso4_call(0, ...args);
-// sync leaf
-export const readFileSync = (...args) => globalThis.__iso4_call_sync(1, ...args);
+// async leaf trampoline (built by the async factory)
+(async (...args) => await globalThis.__iso4_call(id, ...args))
+// sync leaf trampoline (built by the sync factory)
+((...args) => globalThis.__iso4_call_sync(id, ...args))
 ```
 
 **How a leaf is classified.** Default by inspecting the host handler:
@@ -472,11 +492,10 @@ explicit per-leaf override must remain available:**
   make blocking safe; the question is purely ergonomic.
 
 Mechanically this is purely additive over today's design: a second
-reserved global (`__iso4_call_sync`), a non-`async` generated stub for
-sync leaves, and one blocking bridge callback in Rust. The handle
-registry (`Map<id, fn>`), the ID assignment, and the walker are unchanged
-— sync-ness is a property of the emitted *stub*, not of the registry
-entry.
+reserved dispatcher stub (`__iso4_call_sync`), a second trampoline
+factory, and one blocking bridge callback in Rust. The handle table, the
+ID assignment, and the shape walker are unchanged — sync-ness is a
+property of the *trampoline*, not of the handler map entry.
 
 ---
 
@@ -802,12 +821,12 @@ feature most users will rely on and shapes the IPC protocol.
 | 4 ✅   | Generic host-bridge dispatch for globals (string / function / shimmed); `fetch` is just one allowed name on this path                     | Hosts can expose any allowlisted global; `fetch` works as a regular global |
 | 5 ✅   | `@iso4/fetch` package: `createSafeFetch` with allowlist, DNS pin, private-IP blocking, no-auto-redirect                                   | Hardened default users can opt into in two lines                           |
 | 6 ✅   | Imports: source modules (Flavor B); host-supplied ESM strings compiled per-isolate. No separate code-cache LRU — the precompile snapshot is the cache.   | `import { add } from "lib:math"` works when the host declares the source     |
-| 7 ✅   | Imports: host modules — host provides a JS object; the runtime generates ESM source that exposes the object's structure (function leaves call bridge globals, data leaves are JS literals). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for arbitrarily-nested mixed data/function shapes; the synthetic-module native-binding path is preserved as Phase 12 |
+| 7 ✅   | Imports: host modules — host provides a JS object; the shape crosses the wire as plain data and the Rust runtime builds the module natively (data leaves via the value codec, function leaves as trampolines dispatching `BridgeCall { targetKind: 1 }` with runtime-resolved names). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for arbitrarily-nested mixed data/function shapes; bridge records report `host:tools.search` with no client-side name resolution |
 | 8     | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
 | 9     | Pre-warmed isolate pool (optional, behind a runtime option)                                                                               | Sub-2ms cold start for high-throughput workloads                           |
 | 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |
-| 11    | **Sync bridge calls.** Per-leaf codegen emits a sync stub (`__iso4_call_sync`, blocks the isolate on UDS read) instead of the async stub. Leaf classification + the opt-in-vs-auto policy question are covered in the §4.3 "sync codegen" note. CPU budget bracketed; wall guard preempts via `terminate_execution`. | `import { readFileSync } from "host:fs"` works without `await`. Foundational for a future node-compat layer. |
-| 12    | **Native host-module binding.** Replace the source-generation path (§4.3) with synthetic `v8::Module` export slots filled at evaluation. Recursive Rust walker, per-leaf `BridgeCall { targetKind: 1 }` (revived), `Box` lifetime registry. Supports both sync (from Phase 11) and async stubs. | Lower per-run overhead for import-heavy code; cleaner stack traces. No behaviour change visible to sandbox code. |
+| 11    | **Sync bridge calls.** Per-leaf sync tag on the wire shape; the runtime builds a sync trampoline (`__iso4_call_sync`, blocks the isolate on UDS read) instead of the async one. Leaf classification + the opt-in-vs-auto policy question are covered in the §4.3 "sync function leaves" note. CPU budget bracketed; wall guard preempts via `terminate_execution`. | `import { readFileSync } from "host:fs"` works without `await`. Foundational for a future node-compat layer. |
+| 12    | ~~Native host-module binding.~~ Superseded by #37: host modules already cross as data and are built natively by the runtime, which owns the handle table and emits `BridgeCall { targetKind: 1 }` with resolved names. Full synthetic modules remain deliberately unused (native evaluation-steps pointers would need external-reference bookkeeping to survive prefix snapshots). | — |
 | 13    | **Callable handles for return values.** Functions crossing back from a bridge call get a per-run integer ID; sandbox invokes via `BridgeCall { targetKind: 2 }`. Host-side handle registry, GC on run end. | `await fetch().then(r => r.json())`, `cursor.next()`, any host-returned method callable from sandbox. |
 
 Each phase is independently shippable. Phases 11–13 are post-v1; nothing
@@ -994,11 +1013,12 @@ finishes evaluating. That means:
 
 ### 11.4 Rebinding rules
 
-When `prefix.run()` provides `globals` or `imports`, the Rust runtime
-looks up each name in the snapshot's global object (for globals) or its
-module registry (for host imports) and replaces the underlying bridge
-handler pointer. Source modules cannot be rebound — their code is frozen
-in the snapshot.
+When `prefix.run()` provides `globals` or `imports`, the replacement
+handlers stay on the TS side — bridge dispatch is name-addressed, so a
+rebind just re-points the per-run dispatch entry (global name, or
+host-import `specifier` + leaf path). The Rust runtime validates every
+rebound name/location against the shape stored with the prefix. Source
+modules cannot be rebound — their code is frozen in the snapshot.
 
 If `prefix.run()` passes a name that wasn't declared at `precompile()`
 time, the run fails fast with `ERR_UNDECLARED_BINDING`. This is intentional:

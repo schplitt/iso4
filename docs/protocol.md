@@ -278,15 +278,15 @@ socket immediately on version or token mismatch.
 
 `PrefixRunPayload`:
 
-| Field      | Encoding              | Notes                                                                                             |
-| ---------- | --------------------- | ------------------------------------------------------------------------------------------------- |
-| `runId`    | `u32`                 | Unique on this connection.                                                                        |
-| `prefixId` | `PrefixId`            | Snapshot handle returned by `Precompile`.                                                         |
-| `code`     | `String`              | ESM postfix source.                                                                               |
-| `filename` | `Optional<String>`    | Used in stack traces.                                                                             |
-| `limits`   | `ResourceLimits`      | Fully normalized by TS before sending.                                                            |
-| `globals`  | `List<GlobalDef>`     | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are snapshotted). |
-| `imports`  | `List<ImportBinding>` | Rebindings for predeclared host imports only.                                                     |
+| Field      | Encoding             | Notes                                                                                             |
+| ---------- | -------------------- | ------------------------------------------------------------------------------------------------- |
+| `runId`    | `u32`                | Unique on this connection.                                                                        |
+| `prefixId` | `PrefixId`           | Snapshot handle returned by `Precompile`.                                                         |
+| `code`     | `String`             | ESM postfix source.                                                                               |
+| `filename` | `Optional<String>`   | Used in stack traces.                                                                             |
+| `limits`   | `ResourceLimits`     | Fully normalized by TS before sending.                                                            |
+| `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are snapshotted). |
+| `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                 |
 
 `PrecompilePayload`:
 
@@ -339,19 +339,50 @@ entry is `bridge` kind — string/data globals and shim wrappers are baked into
 the snapshot at `Precompile` time, so only their bridge stubs are re-installed
 per run.
 
-`ImportBinding`:
+`ImportBinding` (`Run` / `Precompile`):
 
-The wire only carries source-form imports. The public TypeScript API
-discriminates string-valued specifiers (source modules) from object-valued
-specifiers (host modules), but the TS-side import processor lowers the
-object form to generated ESM source that calls bridge globals at function
-leaves (see DESIGN.md §4.3). Both flavors therefore reach the wire as a
-flat `(specifier, source)` pair.
+Both public import flavors cross the wire structurally — the client never
+generates sandbox source. A source module carries ESM text verbatim; a host
+module carries its **shape** as a tree of data. The runtime builds host
+modules natively (see DESIGN.md §4.3): data leaves are materialised with the
+value codec, function leaves become async trampolines produced by a fixed
+factory with a runtime-assigned handle ID passed as a number, and the values
+reach the module through V8's `import.meta` callback — no value is ever
+printed into source text.
 
-| Field       | Encoding | Notes                                                                                             |
-| ----------- | -------- | ------------------------------------------------------------------------------------------------- |
-| `specifier` | `String` | Import specifier.                                                                                 |
-| `source`    | `String` | ESM source text. Compiled fresh per isolate; transitive `import`s recurse back into the resolver. |
+| Field       | Encoding                              | Notes                                                                                                                                                     |
+| ----------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `specifier` | `String`                              | Import specifier.                                                                                                                                         |
+| `kind`      | `u8`                                  | `0 = source`, `1 = host`.                                                                                                                                 |
+| `source`    | `String`                              | kind 0 only. ESM source text, compiled fresh per isolate; transitive `import`s recurse back into the resolver.                                            |
+| `exports`   | `List<(String name, HostModuleNode)>` | kind 1 only. Ordered top-level exports. Names must be valid JS identifiers (or `default`); the runtime re-validates before emitting them as export names. |
+
+`HostModuleNode`:
+
+| Tag Byte | Kind       | Tail                                 | Meaning                                                                                                                    |
+| -------- | ---------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
+| `0x00`   | `function` | —                                    | Host function leaf; the runtime assigns handle IDs in tree-walk order over all declared bindings.                          |
+| `0x01`   | `data`     | `WireValue value`                    | Constant materialised via the value codec.                                                                                 |
+| `0x02`   | `object`   | `List<(String key, HostModuleNode)>` | Nested plain object; may mix functions and data. Keys are property keys (any string except `__proto__`, which is dropped). |
+
+Handle IDs never cross the wire: the runtime derives them from the declared
+shape (depth-first over each binding, bindings in wire order) and resolves
+them back to `(specifier, path)` before a `BridgeCall` frame is written.
+
+`ImportRebind` (`PrefixRun` only):
+
+The declared module shapes are frozen with the snapshot and stored with the
+prefix; a `PrefixRun` sends only the **locations** of host function leaves
+whose TS handler was replaced for this run. The runtime validates each
+location against the declared shape and fails the run with
+`ERR_UNDECLARED_BINDING` for anything that is not a declared host-module
+function leaf (undeclared specifier or path, data leaf, source module) —
+the same enforcement point that guards undeclared globals.
+
+| Field       | Encoding | Notes                                                      |
+| ----------- | -------- | ---------------------------------------------------------- |
+| `specifier` | `String` | Declared host-module specifier.                            |
+| `path`      | `String` | Dot-joined function-leaf path (e.g. `someObj.someMethod`). |
 
 ### 5.3 Prefix identifiers
 
@@ -365,13 +396,23 @@ flat `(specifier, source)` pair.
 
 `BridgeCallPayload`:
 
-| Field        | Encoding           | Notes                                        |
-| ------------ | ------------------ | -------------------------------------------- |
-| `callId`     | `u32`              | Unique within one run.                       |
-| `targetKind` | `u8`               | `0 = global`, `1 = import`.                  |
-| `specifier`  | `Optional<String>` | Import specifier when `targetKind = import`. |
-| `exportName` | `String`           | Function/global name.                        |
-| `args`       | `List<WireValue>`  | Function arguments.                          |
+| Field        | Encoding           | Notes                                                                        |
+| ------------ | ------------------ | ---------------------------------------------------------------------------- |
+| `callId`     | `u32`              | Unique within one run.                                                       |
+| `targetKind` | `u8`               | `0 = global`, `1 = import`.                                                  |
+| `specifier`  | `Optional<String>` | Import specifier when `targetKind = import`.                                 |
+| `exportName` | `String`           | Global/stub name for globals; the dot-joined function-leaf path for imports. |
+| `args`       | `List<WireValue>`  | Function arguments.                                                          |
+
+Host-module function leaves dispatch through the reserved `__iso4_call`
+bridge stub (installed by the runtime, never declared by the client) with
+their handle ID as the first argument. The runtime resolves the ID against
+its handle table before writing the frame: the payload carries
+`targetKind = import` plus the resolved `specifier` and leaf path, with the
+ID argument stripped — handle IDs never leave the runtime. A direct sandbox
+call to `__iso4_call` with an invalid handle is refused without any I/O: the
+call's promise rejects with a catchable host-bridge-style error and the
+attempt is recorded as `blocked`.
 
 `BridgeResponsePayload`:
 
@@ -489,16 +530,15 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 
 `BridgeCallRecord` — per-call metadata (names, timing, sizes; never payloads):
 
-| Field            | Encoding        | Notes                                                                            |
-| ---------------- | --------------- | -------------------------------------------------------------------------------- |
-| `rawName`        | `String`        | Wire-level export name (`fetch`, `__iso4_fetch_h`, `__iso4_call`).               |
-| `importHandleId` | `Optional<u32>` | Host-module function handle for `__iso4_call` dispatches; client resolves names. |
-| `startMs`        | `f64`           | Offset from run start (same clock as `durationMs`).                              |
-| `durationMs`     | `f64`           | Round-trip the sandbox waited; time-until-run-end for calls that never settled.  |
-| `argBytes`       | `u32`           | Serialized call payload size — what `maxBridgeCallBytes` is enforced against.    |
-| `responseBytes`  | `u32`           | Serialized response value size; `0` on handler error or unsettled.               |
-| `ok`             | `bool`          | Handler resolved and the response reached the sandbox.                           |
-| `blocked`        | `bool`          | Blocked runtime-side (limit, oversized payload, function argument); never sent.  |
+| Field           | Encoding | Notes                                                                                                                                                       |
+| --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`          | `String` | Public call name, resolved by the runtime: plain globals as-is (`fetch`), shims under their public name, host-module import leaves as `<specifier>.<path>`. |
+| `startMs`       | `f64`    | Offset from run start (same clock as `durationMs`).                                                                                                         |
+| `durationMs`    | `f64`    | Round-trip the sandbox waited; time-until-run-end for calls that never settled.                                                                             |
+| `argBytes`      | `u32`    | Serialized call payload size — what `maxBridgeCallBytes` is enforced against.                                                                               |
+| `responseBytes` | `u32`    | Serialized response value size; `0` on handler error or unsettled.                                                                                          |
+| `ok`            | `bool`   | Handler resolved and the response reached the sandbox.                                                                                                      |
+| `blocked`       | `bool`   | Blocked runtime-side (limit, oversized payload, function argument, invalid import handle); never sent.                                                      |
 
 `RunErrorPayload`:
 
