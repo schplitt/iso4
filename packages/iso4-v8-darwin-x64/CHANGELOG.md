@@ -1,5 +1,39 @@
 # @iso4/v8-darwin-x64
 
+## 0.4.0
+
+### Minor Changes
+
+- 4126420: Every `RunResult` now reports what the run did, measured inside the Rust runtime: `cpuTimeMs` (active V8 execution time, bridge waits excluded — `durationMs` remains wall-clock time) and `bridgeCalls`, one metadata record per bridge call attempt in attempt order — resolved name (`fetch`, `tools:search.query`), start offset and round-trip duration on the run's clock, argument/response byte sizes, and outcome. Attempts blocked by `maxBridgeCalls`/`maxBridgeCallBytes` are included with `blocked: true`, so runs that hit a limit show exactly which attempt crossed it. Payloads are never captured, keeping the report cheap enough to stay always-on. Aborted runs report zeros and an empty list for now (the abort teardown precedes the runtime's result frame; see #36).
+- 9332cca: Aborting a run now terminates it gracefully whenever possible, so the aborted `RunResult` carries real telemetry instead of synthesized zeros. Previously an abort destroyed the socket and TypeScript fabricated the result (`durationMs: 0`, `cpuTimeMs: 0`, `bridgeCalls: []`) — which meant every durable-isolates suspension (implemented as an abort) lost its per-call bridge records. Now TypeScript sends a `Terminate` frame carrying the run ID; the Rust runtime, parked in its bridge-wait poll loop, stops the run and replies with a real `ERR_ABORTED` result reporting `durationMs`, `cpuTimeMs`, and the bridge-call records collected up to the abort. The connection stays healthy and is reused rather than reconnected. This covers the case that matters most — suspensions always happen while the sandbox is awaiting a bridge call, exactly when the runtime can receive the frame. A run stuck in a tight synchronous loop can't be reached this way, so after a short grace period TypeScript falls back to today's socket teardown and synthesized (zeroed) result; the busy isolate is still reclaimed by its CPU guard.
+- 0fee306: Host-import modules are now built natively by the Rust runtime from structured shape data instead of being lowered to generated JavaScript source in the client. Previously the client walked a host-module object and emitted ESM text — data leaves printed as JS literals, function leaves as `__iso4_call(<id>, …)` stubs — an injection-adjacent codegen surface, and the runtime only ever saw opaque source. The module shape now crosses the wire as plain data (function-leaf markers, data leaves as `WireValue`s, nested objects as trees); the runtime materialises data leaves with the value codec, builds function leaves as async trampolines from a fixed factory (the handle ID passed as a number, never printed into source), and hands the values to a fixed-shape module through V8's `import.meta` callback. Host modules remain ordinary source-text modules, so prefix snapshots capture their bindings as plain JS exactly as before.
+
+  The runtime owns the handle → `<specifier>.<path>` table, so `RunResult.bridgeCalls` records now arrive with **fully resolved names** for host-import calls (e.g. `tools:search.query`) straight from the runtime — the client-side name resolver is gone — and `BridgeCall` frames carry the resolved import target (`targetKind: import` + specifier + leaf path) instead of a dispatcher name and a numeric handle argument.
+
+  Undeclared-import rebind validation moved into the runtime: `prefix.run()` sends only the rebind locations, and the runtime checks them against the shape declared at `precompile()`, rejecting undeclared specifiers/paths, data leaves, and source modules with `ERR_UNDECLARED_BINDING` — the same enforcement point that guards undeclared globals, no longer bypassable by a non-TypeScript client. Compile-time enforcement via `RebindImports<M>` is unchanged.
+
+  Wire-protocol change (`ImportBinding` is now tagged source/host with a shape tree; `PrefixRun` carries `ImportRebind` locations; `BridgeCallRecord` carries a resolved `name` and drops `rawName`/`importHandleId`): `@iso4/sandbox` and the `@iso4/v8-*` runtime binaries must be released together.
+
+- 2f0e296: Host globals are now installed natively by the Rust runtime instead of by prepending generated JavaScript to the user's code. Previously `processGlobals` turned string globals and `BridgeWithShim` wrappers into source text and pasted it in front of the run's code, which shifted every line of user code so sandbox stack traces pointed at the wrong lines, and interpolated the global's name into an identifier position in the generated wrapper.
+
+  The client now sends each global as structured data — a `GlobalDef` tagged `bridge`, `string`, `data`, or `shim` — and the runtime installs it directly on the sandbox global object via the V8 API. String expressions and shim wrappers are evaluated as their own scripts with their own filenames, so **user code always starts at line 1 and its stack traces are correct**, and a global's name only ever travels as a string passed to `object.set` (or a `WireValue`) — never interpolated into code.
+
+  Adds a new **data-valued global kind** for passing a plain constant: `globals: { config: { kind: 'data', value: … } }`. The value crosses the wire as a `WireValue` (same supported set as host-module data leaves — primitives, `bigint`, `string`, `Uint8Array`, plain objects/arrays) and is materialised natively, removing the need to hand-roll a `JSON.stringify`-into-a-string-expression global. Data globals, like string globals, are constants and cannot be rebound per `prefix.run()`.
+
+  For precompiled prefixes, string/data globals and shim wrappers are baked into the snapshot at `precompile()` time exactly as before, so only bridge stubs are re-installed per `prefix.run()` — the repeated-run hot path is unchanged.
+
+  Wire-protocol change (the `globals` field of `Run`/`Precompile`/`PrefixRun` is now a `List<GlobalDef>` instead of a name list): `@iso4/sandbox` and the `@iso4/v8-*` runtime binaries must be released together.
+
+- f1ccb9d: The Rust runtime now owns the resource-limit defaults; the client sends only the limits the caller explicitly set. Previously the default numbers (64 MB memory, 5 s CPU, 30 s wall, 10 bridge calls, 16 MiB export/bridge-payload caps, 1 MiB stdio caps) were filled in client-side before every Run/Precompile/PrefixRun and shipped as concrete values on the wire, so the same constants were documented in three places (TS code, `types.ts` jsdoc, Rust doc comments) that could drift, and any non-TS client had to re-implement them to get safe behavior.
+
+  Each `ResourceLimits` field is now `Optional<u32>` on the wire: absent means "apply the runtime default", an explicit `0` still means "no limit" (distinct from absent). Rust resolves any absent field from a single set of `DEFAULT_*` constants in `native/v8-runtime/src/ipc.rs` — the source of truth. The public `ResourceLimits` fields become optional to match (`limits` is `ResourceLimits` rather than `Partial<ResourceLimits>` at the call sites), and their `@default` jsdoc now documents the runtime defaults it mirrors. Effective behavior for existing callers is unchanged; the defaults are identical.
+
+  Wire-protocol change (limits payload shape): `@iso4/sandbox` and the `@iso4/v8-*` runtime binaries must be released together.
+
+### Patch Changes
+
+- 91e6b59: Bridge limit violations (`maxBridgeCalls`, `maxBridgeCallBytes`, function arguments) now terminate V8 execution immediately and uncatchably, as DESIGN.md always specified. Previously they were thrown as catchable JS exceptions: sandbox code could `try/catch` past a violation in the synchronous window before the next microtask checkpoint, keep making (blocked) call attempts, or even complete the run successfully despite the violation. Host handler errors are unchanged and remain catchable in the sandbox.
+
 ## 0.3.1
 
 ### Patch Changes
