@@ -1048,7 +1048,9 @@ Sandbox code can catch the error and continue running; if it stays uncaught it
 fails the run as `ERR_HOST_BRIDGE` with the same identity preserved on
 `RunError` (extra props under `error.fields`). Bridge *limit* violations
 (`maxBridgeCalls`, `maxBridgeCallBytes`, function arguments) are different:
-they stay fatal to the run even when caught.
+they terminate V8 execution immediately via `terminate_execution()` — the
+violation is uncatchable, no sandbox code runs after it, and the run fails
+with the corresponding error code.
 
 ### 12.2 Attack categories and where each is mitigated
 

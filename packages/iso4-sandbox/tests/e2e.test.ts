@@ -2322,6 +2322,41 @@ describe('maxBridgeCalls limit', () => {
     expect(calls).toBe(3)
   })
 
+  test('limit violation terminates the run even when sandbox code catches it', async () => {
+    // Untrusted code swallowing the limit error in try/catch must not be able
+    // to keep executing (or complete the run): the violation terminates V8
+    // immediately and uncatchably.
+    let calls = 0
+    const result = await runtime.run({
+      code: `
+        let n = 0
+        for (let i = 0; i < 10; i++) {
+          try {
+            await myTool()
+            n++
+          }
+          catch {
+            // swallowed — must not keep the run alive
+          }
+        }
+        export default n
+      `,
+      limits: { maxBridgeCalls: 3, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
+      globals: {
+        myTool: () => {
+          calls++
+          return null
+        },
+      },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
+    // No attempt past the limit reaches the host.
+    expect(calls).toBe(3)
+  })
+
   test('exactly at limit succeeds', async () => {
     let calls = 0
     const result = await runtime.run({

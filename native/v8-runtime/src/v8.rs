@@ -738,6 +738,7 @@ fn run_module(
                     }
                     RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
                     RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
+                    RunError::Internal(m) => RunError::Internal(m.clone()),
                     other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                 };
                 return Err(failure(owned, &logs, start));
@@ -796,6 +797,7 @@ fn run_module(
             RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
             RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
             RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
+            RunError::Internal(m) => RunError::Internal(m.clone()),
             other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
         }
     };
@@ -829,6 +831,16 @@ fn run_module(
                 ));
             }
             v8::PromiseState::Pending => {}
+        }
+
+        // A fatal bridge error set during a microtask checkpoint (bridge
+        // callbacks run inside checkpoints) has terminated execution: no
+        // further BridgeResponse will ever arrive, so bail out before
+        // blocking on the socket — otherwise this run would sit until the
+        // wall timeout and report the wrong error.
+        if let Some(err) = bridge_error.get() {
+            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+            return Err(failure(owned_bridge_error(err), &logs, start));
         }
 
         // ── Drain one BridgeResponse frame ──────────────────────────────────
@@ -1551,7 +1563,9 @@ impl Drop for GuardCanceller<'_> {
 //      symbol). Sandbox code may catch it and continue; uncaught it
 //      surfaces as ERR_HOST_BRIDGE. Only limit violations (maxBridgeCalls,
 //      payload too large, function args) store a RunError in the shared
-//      OnceLock and remain fatal to the run.
+//      OnceLock and are fatal to the run: they call terminate_execution()
+//      so sandbox code cannot catch its way past a violation (see
+//      fatal_bridge_error).
 //
 // fetch is NOT special. It gets the same callback as every other global.
 // The host handler decides what the arguments mean and what to return.
@@ -1599,6 +1613,25 @@ struct GlobalCallbackData {
     resolver_map: PendingResolvers,
 }
 
+/// Record a fatal bridge error and terminate JS execution immediately.
+///
+/// Fatal bridge violations (maxBridgeCalls, payload too large, function
+/// arguments, transport failures) must end the run. A catchable JS exception
+/// is not enough: inside the synchronous window before the next microtask
+/// checkpoint, sandbox code could `try/catch` past the violation and keep
+/// executing — or even complete the run successfully. `terminate_execution()`
+/// raises V8's uncatchable termination instead; `run_module` maps the stored
+/// `bridge_error` to the run failure on both exit paths (evaluate bail-out and
+/// poll-loop checkpoint), checked before termination reasons.
+fn fatal_bridge_error(
+    scope: &mut v8::HandleScope,
+    bridge_error: &OnceLock<RunError>,
+    error: RunError,
+) {
+    bridge_error.set(error).ok();
+    scope.thread_safe_handle().terminate_execution();
+}
+
 /// A single generic V8 FunctionCallback used for every host-declared global.
 ///
 /// Non-blocking: serialises arguments, writes a BridgeCall frame, stores a
@@ -1633,10 +1666,7 @@ fn bridge_global_callback(
     if data.max_bridge_calls > 0 {
         let prev = data.bridge_call_count.fetch_add(1, Ordering::Relaxed);
         if prev >= data.max_bridge_calls {
-            data.bridge_error
-                .set(RunError::BridgeCallLimitExceeded)
-                .ok();
-            throw_v8_error(scope, "[iso4] bridge: maxBridgeCalls limit exceeded");
+            fatal_bridge_error(scope, &data.bridge_error, RunError::BridgeCallLimitExceeded);
             return;
         }
     }
@@ -1646,17 +1676,17 @@ fn bridge_global_callback(
     for i in 0..args.length() {
         let arg = args.get(i);
         if arg.is_function() {
-            data.bridge_error
-                .set(RunError::FunctionArgumentNotSupported)
-                .ok();
-            throw_v8_error(scope, "[iso4] bridge: function arguments are not supported");
+            fatal_bridge_error(
+                scope,
+                &data.bridge_error,
+                RunError::FunctionArgumentNotSupported,
+            );
             return;
         }
         match arg_to_wire(scope, arg) {
             Ok(wv) => wire_args.push(wv),
             Err(e) => {
-                data.bridge_error.set(e).ok();
-                throw_v8_error(scope, "[iso4] bridge: failed to serialise argument");
+                fatal_bridge_error(scope, &data.bridge_error, e);
                 return;
             }
         }
@@ -1674,12 +1704,10 @@ fn bridge_global_callback(
     if data.max_bridge_call_bytes > 0
         && bridge_call_payload.len() > data.max_bridge_call_bytes as usize
     {
-        data.bridge_error
-            .set(RunError::BridgeCallPayloadTooLarge)
-            .ok();
-        throw_v8_error(
+        fatal_bridge_error(
             scope,
-            "[iso4] bridge: call payload exceeds maxBridgeCallBytes",
+            &data.bridge_error,
+            RunError::BridgeCallPayloadTooLarge,
         );
         return;
     }
@@ -1693,10 +1721,11 @@ fn bridge_global_callback(
         ipc::RustToTsMessageType::BridgeCall,
         &bridge_call_payload,
     ) {
-        data.bridge_error
-            .set(RunError::Internal(format!("bridge write failed: {e}")))
-            .ok();
-        throw_v8_error(scope, "[iso4] bridge: send failed");
+        fatal_bridge_error(
+            scope,
+            &data.bridge_error,
+            RunError::Internal(format!("bridge write failed: {e}")),
+        );
         return;
     }
 
@@ -1706,12 +1735,11 @@ fn bridge_global_callback(
     let resolver = match v8::PromiseResolver::new(scope) {
         Some(r) => r,
         None => {
-            data.bridge_error
-                .set(RunError::Internal(
-                    "failed to create PromiseResolver".into(),
-                ))
-                .ok();
-            throw_v8_error(scope, "[iso4] bridge: failed to create promise resolver");
+            fatal_bridge_error(
+                scope,
+                &data.bridge_error,
+                RunError::Internal("failed to create PromiseResolver".into()),
+            );
             return;
         }
     };
@@ -5257,6 +5285,134 @@ mod tests {
         assert_eq!(
             calls_handled, 3,
             "expected 3 calls before limit, got {calls_handled}"
+        );
+    }
+
+    #[test]
+    fn bridge_call_limit_violation_is_uncatchable() {
+        // Sandbox code swallows the limit error in try/catch and would have
+        // completed successfully before the fix (the violation only surfaced
+        // if the error propagated uncaught). The violation must terminate
+        // execution: the run fails even though every throw is caught, and no
+        // attempt past the limit reaches the host.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
+
+        let err = execute(
+            "let n = 0; \
+             for (let i = 0; i < 10; i++) { \
+               try { n += await myTool(); } catch (e) { /* swallowed */ } \
+             } \
+             export default n",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_calls: 3,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            &[],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap_err()
+        .error;
+
+        let calls_handled = handle.join().unwrap();
+        assert!(
+            matches!(err, RunError::BridgeCallLimitExceeded),
+            "expected BridgeCallLimitExceeded despite try/catch, got {err:?}"
+        );
+        assert_eq!(
+            calls_handled, 3,
+            "expected exactly 3 calls to reach the host, got {calls_handled}"
+        );
+    }
+
+    #[test]
+    fn bridge_payload_too_large_is_uncatchable() {
+        // An oversized argument payload terminates the run even when the
+        // sandbox catches the error; the call never reaches the host.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 1, WireValue::Number(1.0)));
+
+        let err = execute(
+            "try { await myTool('x'.repeat(100000)); } catch (e) { /* swallowed */ } \
+             export default 'survived'",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                max_bridge_call_bytes: 1_000,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            &[],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap_err()
+        .error;
+
+        let calls_handled = handle.join().unwrap();
+        assert!(
+            matches!(err, RunError::BridgeCallPayloadTooLarge),
+            "expected BridgeCallPayloadTooLarge despite try/catch, got {err:?}"
+        );
+        assert_eq!(calls_handled, 0, "oversized call must never reach the host");
+    }
+
+    #[test]
+    fn bridge_function_argument_is_uncatchable() {
+        // Function arguments cannot cross the bridge; the violation terminates
+        // the run even when the sandbox catches the error.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+
+        let handle =
+            std::thread::spawn(move || drain_bridge_calls(server, 1, WireValue::Number(1.0)));
+
+        let err = execute(
+            "try { await myTool(() => 1); } catch (e) { /* swallowed */ } \
+             export default 'survived'",
+            None,
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            &["myTool".to_string()],
+            &[],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap_err()
+        .error;
+
+        let calls_handled = handle.join().unwrap();
+        assert!(
+            matches!(err, RunError::FunctionArgumentNotSupported),
+            "expected FunctionArgumentNotSupported despite try/catch, got {err:?}"
+        );
+        assert_eq!(
+            calls_handled, 0,
+            "call with function argument must never reach the host"
         );
     }
 
