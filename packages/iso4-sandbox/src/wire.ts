@@ -12,16 +12,6 @@
 import { Buffer } from 'node:buffer'
 import type { BridgeCallEntry, RunErrorCode, RunResult, SandboxExports } from './types'
 
-/**
- * Maps a wire-level bridge stub name (+ import handle ID for `__iso4_call`
- * dispatches) to the public call name. Built per run by
- * `makeBridgeNameResolver` (`bridge-report.ts`); defaults to identity.
- */
-export type BridgeNameResolver = (
-  rawName: string,
-  importHandleId: number | undefined,
-) => string
-
 // ── Value tags ─────────────────────────────────────────────────────────────
 
 const TAG_UNDEFINED = 0x00
@@ -289,12 +279,9 @@ export interface DecodedRunCompletion {
  *   List<BridgeCallRecord>  bridgeCalls
  * ```
  * @param buf
- * @param resolveName maps wire-level stub names to public call names;
- * identity when omitted
  */
 export function decodeRunCompletionPayload(
   buf: Uint8Array,
-  resolveName: BridgeNameResolver = (rawName) => rawName,
 ): DecodedRunCompletion {
   const reader = new WireReader(buf)
   const runId = reader.readU32()
@@ -312,7 +299,7 @@ export function decodeRunCompletionPayload(
     const stderr = reader.readStringList()
     const durationMs = reader.readF64()
     const cpuTimeMs = reader.readF64()
-    const bridgeCalls = readBridgeCallRecords(reader, resolveName)
+    const bridgeCalls = readBridgeCallRecords(reader)
     reader.readU8() // failurePresent = 0; consumed for forward-compat
 
     reader.assertDone()
@@ -351,7 +338,7 @@ export function decodeRunCompletionPayload(
   const stderr = reader.readStringList()
   const durationMs = reader.readF64()
   const cpuTimeMs = reader.readF64()
-  const bridgeCalls = readBridgeCallRecords(reader, resolveName)
+  const bridgeCalls = readBridgeCallRecords(reader)
 
   reader.assertDone()
   return {
@@ -370,21 +357,16 @@ export function decodeRunCompletionPayload(
 }
 
 /**
- * Decode `List<BridgeCallRecord>` per `docs/protocol.md` §5.6, resolving each
- * record's wire-level name to its public name as it is read.
+ * Decode `List<BridgeCallRecord>` per `docs/protocol.md` §5.6. Names arrive
+ * already resolved — the runtime owns the import handle table and the shim
+ * naming convention, so no client-side mapping remains.
  * @param reader
- * @param resolveName
  */
-function readBridgeCallRecords(
-  reader: WireReader,
-  resolveName: BridgeNameResolver,
-): BridgeCallEntry[] {
+function readBridgeCallRecords(reader: WireReader): BridgeCallEntry[] {
   const count = reader.readU32()
   const entries: BridgeCallEntry[] = []
   for (let i = 0; i < count; i++) {
-    const rawName = reader.readString()
-    const handlePresent = reader.readU8()
-    const importHandleId = handlePresent === 1 ? reader.readU32() : undefined
+    const name = reader.readString()
     const startMs = reader.readF64()
     const durationMs = reader.readF64()
     const argBytes = reader.readU32()
@@ -392,7 +374,7 @@ function readBridgeCallRecords(
     const ok = reader.readBool()
     const blocked = reader.readBool()
     entries.push({
-      name: resolveName(rawName, importHandleId),
+      name,
       startMs,
       durationMs,
       argBytes,

@@ -1186,6 +1186,67 @@ describe('imports rebinding enforcement (runtime)', () => {
     expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
     expect(result.error.message).toMatch(/can only be rebound with a function/)
   })
+
+  test('rebinding a data export with a function → ERR_UNDECLARED_BINDING (runtime shape check)', async () => {
+    // A function value passes the client-side checks, so this exercises the
+    // Rust-side validation against the declared prefix shape.
+    await using prefix = await runtime.precompile({
+      code: `globalThis.__primed = true`,
+      imports: {
+
+        'host:cfg': { version: '1.0.0' },
+      },
+    })
+    const result = await prefix.run({
+      code: 'export default 1',
+      imports: {
+
+        'host:cfg': { version: () => '2.0.0' },
+      } as any,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.message).toMatch(/is a data leaf, not a function/)
+  })
+
+  test('declared function leaf CAN be rebound and the new handler is used', async () => {
+    await using prefix = await runtime.precompile({
+      code: `globalThis.__primed = true`,
+      imports: {
+
+        'host:tools': { search: () => 'original' },
+      },
+    })
+    const first = await prefix.run({
+      code: `import { search } from 'host:tools'; export default await search()`,
+    })
+    expect(first.ok).toBe(true)
+    if (!first.ok)
+      return
+    expect(first.exports['default']).toBe('original')
+
+    const second = await prefix.run({
+      code: `import { search } from 'host:tools'; export default await search()`,
+      imports: {
+
+        'host:tools': { search: () => 'rebound' },
+      },
+    })
+    expect(second.ok).toBe(true)
+    if (!second.ok)
+      return
+    expect(second.exports['default']).toBe('rebound')
+    // The rebind is per-run: the default handler is back on the next run.
+    const third = await prefix.run({
+      code: `import { search } from 'host:tools'; export default await search()`,
+    })
+    expect(third.ok).toBe(true)
+    if (!third.ok)
+      return
+    expect(third.exports['default']).toBe('original')
+  })
 })
 
 // ── Imports: failure paths in the resolver itself ──────────────────────

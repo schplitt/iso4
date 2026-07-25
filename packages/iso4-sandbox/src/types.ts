@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-empty-object-type */
 /**
  * \@iso4/sandbox — public API types.
  *
@@ -445,9 +446,7 @@ export interface Sandbox {
    * eslint-disable \@typescript-eslint/no-empty-object-type
    */
   precompile: <
-    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
     G extends HostGlobals = {},
-    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
     M extends Imports = {},
   >(
     options: PrecompileOptions<G, M>,
@@ -542,8 +541,8 @@ export interface PrecompileOptions<
  * were not declared at precompile time.
  */
 export interface Prefix<
-  G extends HostGlobals,
-  M extends Imports,
+  G extends HostGlobals = {},
+  M extends Imports = {},
 > {
   readonly id: string
 

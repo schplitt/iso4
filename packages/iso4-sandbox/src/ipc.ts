@@ -392,12 +392,60 @@ class PayloadWriter {
 
   writeImports(imports: readonly ImportBindingPayload[]): this {
     // Wire layout per docs/protocol.md §5.2 and the Rust parser in `ipc.rs`:
-    //   u32                count
-    //   for each: String specifier, String source
+    //   u32   count
+    //   for each: String specifier, u8 kind,
+    //     kind 0 (source): String source
+    //     kind 1 (host):   u32 exportCount, then per export:
+    //                      String name, HostModuleNode
     this.writeU32(imports.length)
     for (const imp of imports) {
       this.writeString(imp.specifier)
-      this.writeString(imp.source)
+      if ('source' in imp) {
+        this.writeU8(0)
+        this.writeString(imp.source)
+      } else {
+        this.writeU8(1)
+        this.writeU32(imp.module.length)
+        for (const [name, node] of imp.module) {
+          this.writeString(name)
+          this.writeHostModuleNode(node)
+        }
+      }
+    }
+    return this
+  }
+
+  writeHostModuleNode(node: HostModuleNodePayload): this {
+    // u8 tag: 0 = function leaf, 1 = data leaf (WireValue), 2 = object.
+    switch (node.kind) {
+      case 'function':
+        this.writeU8(0)
+        break
+      case 'data':
+        this.writeU8(1)
+        // Raw WireValue, no length prefix — Rust decodes exactly one value.
+        this.writeBytes(encodeWireValue(node.value))
+        break
+      case 'object':
+        this.writeU8(2)
+        this.writeU32(node.entries.length)
+        for (const [key, child] of node.entries) {
+          this.writeString(key)
+          this.writeHostModuleNode(child)
+        }
+        break
+    }
+    return this
+  }
+
+  writeImportRebinds(rebinds: readonly ImportRebindPayload[]): this {
+    // Wire layout per docs/protocol.md §5.2 (PrefixRun only):
+    //   u32   count
+    //   for each: String specifier, String path
+    this.writeU32(rebinds.length)
+    for (const rebind of rebinds) {
+      this.writeString(rebind.specifier)
+      this.writeString(rebind.path)
     }
     return this
   }
@@ -435,15 +483,41 @@ class PayloadWriter {
 // ── ImportBinding (wire form) ───────────────────────────────────────────────
 
 /**
- * Wire-shaped import declaration for `Run`/`Precompile`/`PrefixRun` payloads.
- *
- * This is the flat, serialisable form. The richer `ImportDefinition` in
- * `types.ts` (with resolver callbacks, host export functions, etc.) is
- * flattened to this shape by the client before encoding.
+ * One node of a host-module shape tree, mirrored by `HostModuleNode` in the
+ * Rust parser (`ipc.rs`). The tree is plain data — function leaves are bare
+ * markers (the runtime assigns handle IDs in tree-walk order), data leaves
+ * cross as `WireValue`s, and no JS source is ever generated from the tree.
  */
-export interface ImportBindingPayload {
+export type HostModuleNodePayload
+  = | { kind: 'function' }
+    | { kind: 'data', value: unknown }
+    | { kind: 'object', entries: readonly (readonly [string, HostModuleNodePayload])[] }
+
+/**
+ * Wire-shaped import declaration for `Run`/`Precompile` payloads.
+ *
+ * A source module carries ESM text verbatim; a host module carries its shape
+ * as ordered `(exportName, node)` pairs. The runtime builds host modules
+ * natively — the client generates no sandbox source (#37).
+ */
+export type ImportBindingPayload
+  = | { specifier: string, source: string }
+    | { specifier: string, module: readonly (readonly [string, HostModuleNodePayload])[] }
+
+/**
+ * One host-import function-leaf rebinding for a `PrefixRun` payload. Only the
+ * location crosses the wire — the replacement handler stays in the client's
+ * dispatch map. The runtime validates it against the shape declared at
+ * precompile time (`ERR_UNDECLARED_BINDING` otherwise), unifying enforcement
+ * with the Rust-side check for undeclared globals.
+ */
+export interface ImportRebindPayload {
   specifier: string
-  source: string
+  /**
+   * Dot-joined function-leaf path inside the host module
+   * (e.g. `"someObj.someMethod"`).
+   */
+  path: string
 }
 
 // ── RunPayload ──────────────────────────────────────────────────────────────
@@ -505,7 +579,11 @@ export interface PrefixRunPayloadOptions {
   filename?: string
   limits?: ResourceLimits
   globals?: readonly GlobalDefPayload[]
-  imports?: readonly ImportBindingPayload[]
+  /**
+   * Host-import function-leaf rebindings. The declared module shapes are
+   * frozen with the snapshot on the Rust side; only rebind locations cross.
+   */
+  importRebinds?: readonly ImportRebindPayload[]
 }
 
 /**
@@ -524,7 +602,7 @@ export function encodePrefixRunPayload(
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
-    .writeImports(options.imports ?? [])
+    .writeImportRebinds(options.importRebinds ?? [])
     .toBuffer()
 }
 

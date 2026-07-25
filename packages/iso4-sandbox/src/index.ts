@@ -32,22 +32,17 @@ import type {
   Sandbox,
   SandboxOptions,
   Imports,
-  HostExportFunction,
 } from './types'
-import type { GlobalDefPayload } from './ipc'
 
 // ── Global processing (imported from globals.ts for testability) ──────────
 
 import { extractBridgeGlobals, processGlobals } from './globals.js'
 import {
-  BRIDGE_DISPATCH_GLOBAL,
   UndeclaredImportBindingError,
-  createDispatchGlobal,
-  extractRebindImports,
+  mergeRebindImports,
   processImports,
 } from './imports.js'
-import type { DeclaredImportShape, HandleRegistry } from './imports.js'
-import { makeBridgeNameResolver } from './bridge-report.js'
+import type { ImportHandlerMap } from './imports.js'
 
 export type {
   ResourceLimits,
@@ -169,30 +164,6 @@ function abortedResult(reason?: unknown, from?: RunResult): RunResult {
   }
 }
 
-// ── Bridge dispatcher factory ─────────────────────────────────────────────
-
-/**
- * Append the reserved `__iso4_call` dispatcher global when the run has any
- * host-module function leaves. All such leaves reach the bridge through this
- * single global (keyed by handle ID), so one extra bridge def + dispatch entry
- * covers the whole import tree. A no-op when the registry is empty.
- * @param defs structured global defs to send over the wire
- * @param dispatch bridge-dispatch map (name → handler)
- * @param registry host-module function-leaf registry for this run
- */
-function withImportDispatcher(
-  defs: GlobalDefPayload[],
-  dispatch: Record<string, HostExportFunction>,
-  registry: HandleRegistry,
-): { defs: GlobalDefPayload[], dispatch: Record<string, HostExportFunction> } {
-  if (registry.size === 0)
-    return { defs, dispatch }
-  return {
-    defs: [...defs, { kind: 'bridge', name: BRIDGE_DISPATCH_GLOBAL }],
-    dispatch: { ...dispatch, [BRIDGE_DISPATCH_GLOBAL]: createDispatchGlobal(registry) },
-  }
-}
-
 // ── SandboxImpl ─────────────────────────────────────────────────────────────
 
 class SandboxImpl implements Sandbox {
@@ -219,12 +190,10 @@ class SandboxImpl implements Sandbox {
       return abortedResult(options.signal.reason)
     }
     const { defs, dispatch } = processGlobals(options.globals ?? {})
-    const { bindings, registry, shape } = processImports(options.imports)
-    // Host-module function leaves are reached through the single
-    // `__iso4_call` dispatcher global, which routes by handle ID. Install it
-    // alongside the user globals when any function leaves exist.
-    const { defs: allDefs, dispatch: allDispatch } = withImportDispatcher(defs, dispatch, registry)
-    const resolveName = makeBridgeNameResolver(shape)
+    // Host modules cross the wire as shape data; the runtime builds them
+    // natively and dispatches function-leaf calls back here by
+    // (specifier, path) through `handlers`.
+    const { bindings, handlers } = processImports(options.imports)
     try {
       return await this.pool.withClient(async (client) => {
         // Every global is installed natively by the runtime, so user code
@@ -232,12 +201,13 @@ class SandboxImpl implements Sandbox {
         const raw = await client.runRawCode(options.code, {
           filename: options.filename,
           limits: options.limits,
-          globals: allDefs,
-          dispatch: allDispatch,
+          globals: defs,
+          dispatch,
           imports: bindings,
+          importDispatch: handlers,
           signal: options.signal,
         })
-        const decoded = decodeRunCompletionPayload(raw.result, resolveName).result
+        const decoded = decodeRunCompletionPayload(raw.result).result
         // Graceful terminate (#36): a run whose signal aborted and whose Rust
         // Result carries ERR_ABORTED is a deliberate abort, not a failure —
         // remap to `status: 'aborted'` with the abort reason, keeping the real
@@ -267,18 +237,16 @@ class SandboxImpl implements Sandbox {
     return this.pool.withClient(async (client) => {
       const rawGlobals = options.globals ?? {} as G
       const { defs } = processGlobals(rawGlobals)
-      const { bindings, registry, shape } = processImports(options.imports)
-      // See the comment in `run` — host-module function leaves reach the
-      // bridge through the single `__iso4_call` dispatcher global. Precompile
-      // needs no dispatch map (bridge stubs are installed per run, not while
-      // snapshotting); the `__iso4_call` def is sent only so it is recorded in
-      // the prefix's declared-globals set for the ERR_UNDECLARED_BINDING check.
-      const { defs: allDefs } = withImportDispatcher(defs, {}, registry)
+      // The declared import shape travels as data and is stored with the
+      // prefix on the Rust side — it is the runtime's reference for building
+      // the modules on every run and for validating rebind attempts. The
+      // handler map is kept here as the per-run dispatch defaults.
+      const { bindings, handlers } = processImports(options.imports)
       const raw = await client.precompile({
         code: options.code,
         filename: options.filename,
         limits: options.limits,
-        globals: allDefs,
+        globals: defs,
         imports: bindings,
       })
       const result = decodePrecompileResultPayload(raw)
@@ -296,7 +264,7 @@ class SandboxImpl implements Sandbox {
         throw err
       }
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, registry, shape)
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers)
     })
   }
 
@@ -335,33 +303,27 @@ implements Prefix<G, M> {
    */
   private readonly defaultGlobals: G
   /**
-   * Handle registry declared at precompile time: handle ID → host function.
-   * Same rebinding rules as `defaultGlobals` — a `prefix.run()` may override
-   * a subset of function leaves; everything else falls back to these. Source
-   * modules and data leaves are frozen in the snapshot and not represented
-   * here.
+   * Host-import function-leaf handlers declared at precompile time, keyed by
+   * `(specifier, path)`. Same rebinding rules as `defaultGlobals` — a
+   * `prefix.run()` may override a subset of function leaves; everything else
+   * falls back to these. Source modules and data leaves are frozen in the
+   * snapshot and not represented here. The declared shape itself lives with
+   * the prefix in the Rust runtime, which enforces `ERR_UNDECLARED_BINDING`
+   * for rebind attempts outside it.
    */
-  private readonly defaultRegistry: HandleRegistry
-  /**
-   * Declared shape captured at precompile time. Drives type-level rebinding
-   * via `RebindImports<M>` and runtime `ERR_UNDECLARED_BINDING` enforcement
-   * inside `extractRebindImports`.
-   */
-  private readonly declaredImportShape: DeclaredImportShape
+  private readonly defaultImportHandlers: ImportHandlerMap
   private _alive = true
 
   constructor(
     id: string,
     pool: ConnectionPool,
     defaultGlobals: G,
-    defaultRegistry: HandleRegistry,
-    declaredImportShape: DeclaredImportShape,
+    defaultImportHandlers: ImportHandlerMap,
   ) {
     this.id = id
     this.pool = pool
     this.defaultGlobals = defaultGlobals
-    this.defaultRegistry = defaultRegistry
-    this.declaredImportShape = declaredImportShape
+    this.defaultImportHandlers = defaultImportHandlers
   }
 
   get alive(): boolean {
@@ -396,16 +358,20 @@ implements Prefix<G, M> {
       (options.globals ?? {}) as RebindGlobals<HostGlobals>,
       this.defaultGlobals as HostGlobals,
     )
-    let registry: HandleRegistry
+    // Merge run-time handler overrides over the precompile defaults and
+    // collect the rebind locations for the wire. Declared-shape enforcement
+    // happens in the Rust runtime against the stored prefix shape (the same
+    // ERR_UNDECLARED_BINDING check that guards globals); only client-visible
+    // shape problems throw here.
+    let merged: ReturnType<typeof mergeRebindImports>
     try {
-      registry = extractRebindImports(
-        options.imports as unknown as Parameters<typeof extractRebindImports>[0],
-        this.defaultRegistry,
-        this.declaredImportShape,
+      merged = mergeRebindImports(
+        options.imports as Imports | undefined,
+        this.defaultImportHandlers,
       )
     } catch (e) {
       if (e instanceof UndeclaredImportBindingError) {
-        // Symmetric with the Rust-side ERR_UNDECLARED_BINDING path for globals:
+        // Symmetric with the Rust-side ERR_UNDECLARED_BINDING path:
         // surface the error as a RunResult failure rather than a thrown promise.
         return {
           status: 'failed',
@@ -420,10 +386,6 @@ implements Prefix<G, M> {
       }
       throw e
     }
-    // Host-module function leaves reach the bridge through the single
-    // `__iso4_call` dispatcher global, keyed by handle ID.
-    const { defs: allDefs, dispatch: allDispatch } = withImportDispatcher(defs, dispatch, registry)
-    const resolveName = makeBridgeNameResolver(this.declaredImportShape)
     try {
       return await this.pool.withClient(async (client) => {
         const raw = await client.prefixRun({
@@ -431,11 +393,13 @@ implements Prefix<G, M> {
           code: options.code,
           filename: options.filename,
           limits: options.limits,
-          globals: allDefs,
-          dispatch: allDispatch,
+          globals: defs,
+          dispatch,
+          importRebinds: merged.rebinds,
+          importDispatch: merged.handlers,
           signal: options.signal,
         })
-        const decoded = decodeRunCompletionPayload(raw.result, resolveName).result
+        const decoded = decodeRunCompletionPayload(raw.result).result
         // See the note in SandboxImpl.run — remap a graceful ERR_ABORTED Result
         // to `status: 'aborted'`, preserving the runtime's telemetry.
         if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')

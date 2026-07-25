@@ -39,7 +39,7 @@ afterAll(async () => {
 //
 // warmupIterations: 0 — each iteration spawns a real binary; warmup would
 //                        just add extra spawn overhead before the timed region.
-// iterations: 10      — small sample; each call takes ~50–200 ms.
+// iterations: 50      — small sample; each call takes ~50–200 ms.
 
 describe('cold start', () => {
   bench(
@@ -49,7 +49,7 @@ describe('cold start', () => {
       await rt.run({ code: SAMPLE_CODE })
       await rt.dispose()
     },
-    { warmupIterations: 0, iterations: 10 },
+    { warmupIterations: 0, iterations: 50 },
   )
 
   bench(
@@ -60,7 +60,7 @@ describe('cold start', () => {
       await prefix.run({ code: SAMPLE_CODE })
       await rt.dispose()
     },
-    { warmupIterations: 0, iterations: 10 },
+    { warmupIterations: 0, iterations: 50 },
   )
 })
 
@@ -69,9 +69,9 @@ describe('cold start', () => {
 describe('hot run', () => {
   bench('direct  (runtime.run — no snapshot)', async () => {
     await hotDirectRt.run({ code: SAMPLE_CODE })
-  })
+  }, { warmupIterations: 0, iterations: 50 })
 
   bench('prefix  (prefix.run — from snapshot)', async () => {
     await hotPrefix.run({ code: SAMPLE_CODE })
-  })
+  }, { warmupIterations: 0, iterations: 50 })
 })

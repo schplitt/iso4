@@ -2,70 +2,67 @@
  * Tests for the imports processing layer.
  *
  * Three categories, mirroring `globals.test.ts`:
- * 1. Unit tests — `processImports` / `extractRebindImports`, no binary needed.
+ * 1. Unit tests — `processImports` / `mergeRebindImports`, no binary needed.
  * 2. Type tests — `RebindImports<M>` constraints verified with `@ts-expect-error`.
- * 3. Bad-path / runtime-rejection tests — undeclared specifiers, illegal
- *    rebindings of source modules and data leaves, etc.
+ * 3. Bad-path tests for the client-visible rejections (invalid shapes,
+ *    unsupported data values, non-function rebind values). Declared-shape
+ *    enforcement (undeclared specifiers/paths, data-leaf and source-module
+ *    rebinds) lives in the Rust runtime and is covered end-to-end in
+ *    `e2e.test.ts` under "ERR_UNDECLARED_BINDING".
  *
- * End-to-end resolver / generated-module behaviour (the sandbox actually
- * importing from these bindings) is covered in `integration.test.ts` and
- * `e2e.test.ts` under "source imports" and "host imports".
+ * End-to-end resolver / host-module behaviour (the sandbox actually importing
+ * from these bindings) is covered in `integration.test.ts` and `e2e.test.ts`
+ * under "source imports" and "host imports".
  */
 
 import { describe, expect, it } from 'vitest'
 import {
   UndeclaredImportBindingError,
-  extractRebindImports,
+  importHandlerKey,
+  mergeRebindImports,
   processImports,
 } from '../src/imports.js'
-import type { DeclaredImportShape } from '../src/imports.js'
 import type { HostExportFunction, Imports, RebindImports } from '../src/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────
-// processImports — flattening + shape capture
+// processImports — lowering to wire shape + handler capture
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('processImports', () => {
-  it('returns empty bindings + registry + empty shape when imports is undefined', () => {
-    const { bindings, registry, shape } = processImports(undefined)
+  it('returns empty bindings + handlers when imports is undefined', () => {
+    const { bindings, handlers } = processImports(undefined)
     expect(bindings).toEqual([])
-    expect(registry.size).toBe(0)
-    expect(shape.sourceSpecifiers.size).toBe(0)
-    expect(Object.keys(shape.hostFunctionIds)).toHaveLength(0)
-    expect(Object.keys(shape.hostDataPaths)).toHaveLength(0)
+    expect(handlers.size).toBe(0)
   })
 
   it('passes a string-valued specifier through as a source module', () => {
-    const { bindings, registry, shape } = processImports({
+    const { bindings, handlers } = processImports({
       'lib:math': 'export const x = 1',
     })
     expect(bindings).toEqual([{ specifier: 'lib:math', source: 'export const x = 1' }])
-    expect(registry.size).toBe(0)
-    expect(shape.sourceSpecifiers.has('lib:math')).toBe(true)
+    expect(handlers.size).toBe(0)
   })
 
-  it('lowers an object-valued specifier into generated source + a handle registry', () => {
+  it('lowers an object-valued specifier into a data tree + handler map', () => {
     const search: HostExportFunction = async (..._args) => 'hit'
-    const { bindings, registry, shape } = processImports({
+    const { bindings, handlers } = processImports({
       'host:tools': { search, version: '1.2.3' },
     })
-    expect(bindings).toHaveLength(1)
-    const binding = bindings[0]!
-    expect(binding.specifier).toBe('host:tools')
-    // Function leaf → an async stub calling the __iso4_call dispatcher by ID.
-    expect(binding.source).toContain('export const search')
-    expect(binding.source).toContain('globalThis.__iso4_call(0, ...args)')
-    // Data leaf → literal string in the source.
-    expect(binding.source).toContain('export const version = "1.2.3"')
-    // Handler registered under its handle ID.
-    expect(registry.get(0)).toBe(search)
-    expect(shape.hostFunctionIds['host:tools']).toEqual({ search: 0 })
-    expect(shape.hostDataPaths['host:tools']).toEqual(new Set(['version']))
+    expect(bindings).toEqual([{
+      specifier: 'host:tools',
+      module: [
+        ['search', { kind: 'function' }],
+        ['version', { kind: 'data', value: '1.2.3' }],
+      ],
+    }])
+    // No source text anywhere — the runtime builds the module from the tree.
+    expect(bindings[0]).not.toHaveProperty('source')
+    expect(handlers.get(importHandlerKey('host:tools', 'search'))).toBe(search)
   })
 
   it('recursively walks nested mixed data + function objects', () => {
     const greet: HostExportFunction = () => 'hi'
-    const { bindings, registry, shape } = processImports({
+    const { bindings, handlers } = processImports({
       'host:nested': {
         someObj: {
           someMethod: greet,
@@ -73,54 +70,85 @@ describe('processImports', () => {
         },
       },
     })
-    const src = bindings[0]!.source
-    // Outer export.
-    expect(src).toContain('export const someObj')
-    // Inner function gets a dispatcher call keyed by its handle ID.
-    expect(src).toContain('globalThis.__iso4_call(0, ...args)')
-    // Inner data literal preserved.
-    expect(src).toContain('name: "demo"')
-    expect(registry.get(0)).toBe(greet)
-    expect(shape.hostFunctionIds['host:nested']).toEqual({ 'someObj.someMethod': 0 })
-    // `hostDataPaths` records actual data leaves only — intermediate plain
-    // objects (like `someObj.meta`) are walked through, not stored.
-    expect(shape.hostDataPaths['host:nested']).toEqual(new Set(['someObj.meta.name']))
+    expect(bindings).toEqual([{
+      specifier: 'host:nested',
+      module: [
+        ['someObj', {
+          kind: 'object',
+          entries: [
+            ['someMethod', { kind: 'function' }],
+            // Plain objects are walked into object nodes; only non-object
+            // values become data leaves.
+            ['meta', {
+              kind: 'object',
+              entries: [['name', { kind: 'data', value: 'demo' }]],
+            }],
+          ],
+        }],
+      ],
+    }])
+    expect(handlers.get(importHandlerKey('host:nested', 'someObj.someMethod'))).toBe(greet)
   })
 
-  it('assigns distinct IDs across multiple modules from one counter', () => {
+  it('registers handlers for multiple modules under distinct keys', () => {
     const a: HostExportFunction = () => 'a'
     const b: HostExportFunction = () => 'b'
-    const { registry, shape } = processImports({
+    const { handlers } = processImports({
       'host:one': { a },
       'host:two': { b },
     })
-    expect(shape.hostFunctionIds['host:one']).toEqual({ a: 0 })
-    expect(shape.hostFunctionIds['host:two']).toEqual({ b: 1 })
-    expect(registry.get(0)).toBe(a)
-    expect(registry.get(1)).toBe(b)
+    expect(handlers.get(importHandlerKey('host:one', 'a'))).toBe(a)
+    expect(handlers.get(importHandlerKey('host:two', 'b'))).toBe(b)
+    expect(handlers.size).toBe(2)
   })
 
-  it('handles default export specially', () => {
+  it('accepts a default export entry', () => {
     const handler: HostExportFunction = () => 1
-    const { bindings, registry, shape } = processImports({
+    const { bindings, handlers } = processImports({
       'host:default': { default: { handler, version: 2 } },
     })
-    const src = bindings[0]!.source
-    expect(src.startsWith('export default')).toBe(true)
-    expect(registry.get(0)).toBe(handler)
-    expect(shape.hostFunctionIds['host:default']).toEqual({ 'default.handler': 0 })
+    expect(bindings).toEqual([{
+      specifier: 'host:default',
+      module: [
+        ['default', {
+          kind: 'object',
+          entries: [
+            ['handler', { kind: 'function' }],
+            ['version', { kind: 'data', value: 2 }],
+          ],
+        }],
+      ],
+    }])
+    expect(handlers.get(importHandlerKey('host:default', 'default.handler'))).toBe(handler)
   })
 
-  it('emits BigInt and Uint8Array as proper literals', () => {
+  it('carries BigInt, Uint8Array, and arrays as data leaves', () => {
+    const bytes = new Uint8Array([1, 2, 3])
     const { bindings } = processImports({
       'host:data': {
         big: 9007199254740993n,
-        bytes: new Uint8Array([1, 2, 3]),
+        bytes,
+        list: [1, 'two', { three: 3 }],
       },
     })
-    const src = bindings[0]!.source
-    expect(src).toContain('9007199254740993n')
-    expect(src).toContain('new Uint8Array([1, 2, 3])')
+    expect(bindings).toEqual([{
+      specifier: 'host:data',
+      module: [
+        ['big', { kind: 'data', value: 9007199254740993n }],
+        ['bytes', { kind: 'data', value: bytes }],
+        ['list', { kind: 'data', value: [1, 'two', { three: 3 }] }],
+      ],
+    }])
+  })
+
+  it('skips undefined values in the module shape', () => {
+    const { bindings } = processImports({
+      'host:sparse': { present: 1, absent: undefined },
+    })
+    expect(bindings).toEqual([{
+      specifier: 'host:sparse',
+      module: [['present', { kind: 'data', value: 1 }]],
+    }])
   })
 
   it('rejects Date as a data leaf (wire cannot carry it back out)', () => {
@@ -157,7 +185,7 @@ describe('processImports — rejected configurations', () => {
     ).toThrow(/Map values are not supported as data leaves/)
   })
 
-  it('rejects circular references in data leaves', () => {
+  it('rejects circular references in host-module shapes', () => {
     const cyclic: { self?: unknown } = {}
     cyclic.self = cyclic
     expect(() =>
@@ -167,10 +195,28 @@ describe('processImports — rejected configurations', () => {
     ).toThrow(/circular references/)
   })
 
+  it('rejects circular references inside array data leaves', () => {
+    const arr: unknown[] = []
+    arr.push(arr)
+    expect(() =>
+      processImports({
+        'host:bad': { list: arr as unknown as never },
+      }),
+    ).toThrow(/circular references/)
+  })
+
   it('rejects a top-level key that is not a valid identifier', () => {
     expect(() =>
       processImports({
         'host:bad': { 'not a valid name': 1 },
+      }),
+    ).toThrow(/not a valid JavaScript identifier/)
+  })
+
+  it('rejects a reserved word as a top-level key', () => {
+    expect(() =>
+      processImports({
+        'host:bad': { class: 1 },
       }),
     ).toThrow(/not a valid JavaScript identifier/)
   })
@@ -185,91 +231,106 @@ describe('processImports — rejected configurations', () => {
       }),
     ).toThrow(/class instances are not supported/)
   })
+
+  it('rejects functions nested inside array data leaves', () => {
+    expect(() =>
+      processImports({
+        'host:bad': { list: [() => 1] as unknown as never },
+      }),
+    ).toThrow(/unsupported data value of type function/)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────
-// extractRebindImports — rebinding on prefix.run()
+// mergeRebindImports — rebinding on prefix.run()
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('extractRebindImports', () => {
+describe('mergeRebindImports', () => {
   const fnA: HostExportFunction = () => 'a'
   const fnB: HostExportFunction = () => 'b'
 
   function makeFixture() {
-    const { registry, shape } = processImports({
+    const { handlers } = processImports({
       'host:tools': { search: fnA, version: '1.0.0' },
       'lib:math': 'export const x = 1',
     })
-    return { registry, shape }
+    return handlers
   }
 
-  it('returns the precompile defaults when no override is passed', () => {
-    const { registry, shape } = makeFixture()
-    expect(extractRebindImports(undefined, registry, shape)).toBe(registry)
+  it('returns the precompile defaults and no rebinds when no override is passed', () => {
+    const defaults = makeFixture()
+    const { rebinds, handlers } = mergeRebindImports(undefined, defaults)
+    expect(rebinds).toEqual([])
+    expect(handlers).toBe(defaults)
   })
 
-  it('overrides a declared function leaf', () => {
-    const { registry, shape } = makeFixture()
-    const out = extractRebindImports(
+  it('overrides a declared function leaf and reports the rebind location', () => {
+    const defaults = makeFixture()
+    const { rebinds, handlers } = mergeRebindImports(
       { 'host:tools': { search: fnB } },
-      registry,
-      shape,
+      defaults,
     )
-    // `search` was handle 0.
-    expect(out.get(0)).toBe(fnB)
+    expect(rebinds).toEqual([{ specifier: 'host:tools', path: 'search' }])
+    expect(handlers.get(importHandlerKey('host:tools', 'search'))).toBe(fnB)
+    // The defaults map is not mutated.
+    expect(defaults.get(importHandlerKey('host:tools', 'search'))).toBe(fnA)
   })
 
-  it('overrides a declared function leaf at a nested path', () => {
+  it('overrides a function leaf at a nested path', () => {
     const greet: HostExportFunction = () => 'hi'
     const replaced: HostExportFunction = () => 'bye'
-    const { registry, shape } = processImports({
+    const { handlers: defaults } = processImports({
       'host:nested': { someObj: { someMethod: greet, meta: 'x' } },
     })
-    const out = extractRebindImports(
+    const { rebinds, handlers } = mergeRebindImports(
       { 'host:nested': { someObj: { someMethod: replaced } } },
-      registry,
-      shape,
+      defaults,
     )
-    expect(out.get(0)).toBe(replaced)
+    expect(rebinds).toEqual([{ specifier: 'host:nested', path: 'someObj.someMethod' }])
+    expect(handlers.get(importHandlerKey('host:nested', 'someObj.someMethod'))).toBe(replaced)
   })
 
   it('omitted overrides fall back to the precompile-time handler', () => {
     const fnX: HostExportFunction = () => 'x'
     const fnY: HostExportFunction = () => 'y'
-    const { registry, shape } = processImports({
+    const { handlers: defaults } = processImports({
       'host:multi': { a: fnX, b: fnY },
     })
-    const out = extractRebindImports(
+    const { handlers } = mergeRebindImports(
       { 'host:multi': { a: () => 'new-a' } },
-      registry,
-      shape,
+      defaults,
     )
-    // a=0, b=1.
-    expect(out.get(0)?.()).toBe('new-a')
-    expect(out.get(1)).toBe(fnY)
+    expect(handlers.get(importHandlerKey('host:multi', 'a'))?.()).toBe('new-a')
+    expect(handlers.get(importHandlerKey('host:multi', 'b'))).toBe(fnY)
+  })
+
+  it('collects rebind locations even for specifiers it has no defaults for', () => {
+    // Declared-shape enforcement is the runtime's job: the location is sent
+    // on the wire and the run fails with ERR_UNDECLARED_BINDING there. The
+    // client merge stays permissive so a non-TS caller path can't bypass
+    // enforcement that only existed here.
+    const { rebinds } = mergeRebindImports(
+      { 'host:never-declared': { fn: () => 1 } },
+      new Map(),
+    )
+    expect(rebinds).toEqual([{ specifier: 'host:never-declared', path: 'fn' }])
   })
 })
 
 // ─────────────────────────────────────────────────────────────────────────
-// extractRebindImports — undeclared bindings rejection
+// mergeRebindImports — client-visible rejections
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('extractRebindImports — UndeclaredImportBindingError', () => {
-  const empty: DeclaredImportShape = {
-    sourceSpecifiers: new Set(),
-    hostFunctionIds: {},
-    hostDataPaths: {},
-  }
-
-  it('refuses to rebind an undeclared specifier', () => {
+describe('mergeRebindImports — UndeclaredImportBindingError', () => {
+  it('refuses to rebind a specifier with a string (source-module form)', () => {
     expect(() =>
-      extractRebindImports({ 'host:never-declared': { fn: () => 1 } }, new Map(), empty),
-    ).toThrow(UndeclaredImportBindingError)
+      mergeRebindImports({ 'lib:math': 'export const x = 2' }, new Map()),
+    ).toThrow(/source imports are frozen/)
   })
 
   it('UndeclaredImportBindingError carries the ERR_UNDECLARED_BINDING code', () => {
     try {
-      extractRebindImports({ 'host:x': { fn: () => 1 } }, new Map(), empty)
+      mergeRebindImports({ 'lib:math': 'export const x = 2' }, new Map())
       throw new Error('should have thrown')
     } catch (e) {
       expect(e).toBeInstanceOf(UndeclaredImportBindingError)
@@ -277,69 +338,19 @@ describe('extractRebindImports — UndeclaredImportBindingError', () => {
     }
   })
 
-  it('refuses to rebind a source-module specifier with a string', () => {
-    const { registry, shape } = processImports({
-      'lib:math': 'export const x = 1',
-    })
+  it('refuses a non-function, non-object value at a leaf', () => {
     expect(() =>
-      extractRebindImports(
-        { 'lib:math': 'export const x = 2' },
-        registry,
-        shape,
-      ),
-    ).toThrow(/source imports are frozen/)
-  })
-
-  it('refuses to rebind a source-module specifier with an object', () => {
-    const { registry, shape } = processImports({
-      'lib:math': 'export const x = 1',
-    })
-    expect(() =>
-      extractRebindImports(
-        { 'lib:math': { whatever: () => 1 } },
-        registry,
-        shape,
-      ),
-    ).toThrow(/source imports are frozen/)
-  })
-
-  it('refuses to rebind a data leaf of a declared host module', () => {
-    const { registry, shape } = processImports({
-      'host:cfg': { version: '1.0.0' },
-    })
-    expect(() =>
-      extractRebindImports(
-        { 'host:cfg': { version: () => '2.0.0' } },
-        registry,
-        shape,
-      ),
-    ).toThrow(/'host:cfg'.version is a data leaf, not a function/)
-  })
-
-  it('refuses to rebind an undeclared function name on a declared specifier', () => {
-    const { registry, shape } = processImports({
-      'host:tools': { search: () => 1 },
-    })
-    expect(() =>
-      extractRebindImports(
-        { 'host:tools': { undeclared: () => 1 } },
-        registry,
-        shape,
-      ),
-    ).toThrow(/'host:tools'.undeclared was not declared/)
-  })
-
-  it('refuses a data value where a function was declared', () => {
-    const { registry, shape } = processImports({
-      'host:tools': { search: () => 1 },
-    })
-    expect(() =>
-      extractRebindImports(
+      mergeRebindImports(
         { 'host:tools': { search: 'not-a-function' as unknown as never } },
-        registry,
-        shape,
+        new Map(),
       ),
     ).toThrow(/can only be rebound with a function/)
+  })
+
+  it('rejects a non-object specifier override', () => {
+    expect(() =>
+      mergeRebindImports({ 'host:tools': 42 as unknown as never }, new Map()),
+    ).toThrow(/must be a plain object/)
   })
 })
 

@@ -43,8 +43,9 @@ export function isDataGlobal(v: HostGlobalValue): v is DataGlobal {
 /**
  * Private bridge-dispatch name for a `BridgeWithShim` handler. This is a wire
  * dispatch key and an object-property key — never interpolated into generated
- * code — so any global name is safe. Kept as `__iso4_<name>_h` for backward
- * compatibility with the bridge-record name resolver (`bridge-report.ts`).
+ * code — so any global name is safe. The runtime recognises the
+ * `__iso4_<name>_h` convention (`public_record_name` in `v8.rs`) and reports
+ * bridge records under the public `<name>`.
  * @param name public global name
  */
 export function shimHandlerName(name: string): string {

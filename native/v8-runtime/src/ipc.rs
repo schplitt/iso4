@@ -29,8 +29,8 @@ use crate::wire::{decode_wire_value, WireValue};
 
 /// Current wire protocol version.
 ///
-/// This must stay in sync with `docs/protocol.md` and the future TypeScript
-/// codec in `packages/iso4-dynamic/src/ipc.ts`.
+/// This must stay in sync with `docs/protocol.md` and the TypeScript codec in
+/// `packages/iso4-sandbox/src/ipc.ts`.
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Default maximum frame length in bytes, including the 1-byte message type.
@@ -355,16 +355,50 @@ impl HostGlobalDef {
     }
 }
 
-/// One entry in the `imports` list of a `Run` / `Precompile` / `PrefixRun`
-/// request. Always carries a source string: the TS-side import processor
-/// lowers "host modules" (object form) to generated ESM source that calls
-/// bridge globals at function leaves, so by the time a binding reaches the
-/// wire it's source-form regardless of which public API flavor the host
-/// used. See DESIGN.md §4.3.
+/// One node in a host-module shape tree. The tree is plain data — the client
+/// never generates sandbox source from it; the runtime builds the module
+/// natively (see `v8.rs`). Mirrors `HostModuleNodePayload` on the TS side.
+#[derive(Debug, Clone)]
+pub enum HostModuleNode {
+    /// A host function leaf. The runtime assigns it a handle ID (tree-walk
+    /// order over the declared bindings) and installs an async trampoline
+    /// that dispatches through the reserved `__iso4_call` bridge stub.
+    Function,
+    /// A constant data leaf, materialised natively via `wire_to_v8_value`.
+    Data(WireValue),
+    /// A nested object of named children (may mix functions and data).
+    Object(Vec<(String, HostModuleNode)>),
+}
+
+/// The two flavors of import module per DESIGN.md §4.3, now discriminated on
+/// the wire instead of being lowered to source text by the client.
+#[derive(Debug, Clone)]
+pub enum ImportModule {
+    /// Host-provided ESM source, compiled verbatim inside the isolate.
+    Source(String),
+    /// A host-module shape: named top-level exports, each a tree of function
+    /// leaves and data leaves. The runtime builds the module from this data.
+    Host(Vec<(String, HostModuleNode)>),
+}
+
+/// One entry in the `imports` list of a `Run` / `Precompile` request.
 #[derive(Debug, Clone)]
 pub struct ImportBinding {
     pub specifier: String,
-    pub source: String,
+    pub module: ImportModule,
+}
+
+/// One host-import function-leaf rebinding requested by a `PrefixRun`. Only
+/// the location crosses the wire — the replacement handler stays on the TS
+/// side (bridge dispatch is name-addressed). The runtime validates each entry
+/// against the shape declared at `Precompile` and rejects anything else with
+/// `ERR_UNDECLARED_BINDING`.
+#[derive(Debug, Clone)]
+pub struct ImportRebind {
+    pub specifier: String,
+    /// Dot-joined path of the function leaf inside the host module
+    /// (e.g. `"someObj.someMethod"`).
+    pub path: String,
 }
 
 /// Fully parsed `Run` frame payload per `docs/protocol.md` §5.2.
@@ -541,6 +575,72 @@ impl<'a> PayloadReader<'a> {
         Ok(defs)
     }
 
+    /// Read one host-module shape node. Tags mirror `writeHostModuleNode` in
+    /// the TS codec (`ipc.ts`) and `docs/protocol.md` §5.2:
+    /// `0 = function`, `1 = data (WireValue)`, `2 = object`.
+    fn read_host_module_node(&mut self) -> io::Result<HostModuleNode> {
+        match self.read_u8()? {
+            0 => Ok(HostModuleNode::Function),
+            1 => Ok(HostModuleNode::Data(self.read_wire_value()?)),
+            2 => {
+                let count = self.read_u32()? as usize;
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let key = self.read_string()?;
+                    let node = self.read_host_module_node()?;
+                    entries.push((key, node));
+                }
+                Ok(HostModuleNode::Object(entries))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown host-module node tag: {other:#04x}"),
+            )),
+        }
+    }
+
+    /// Read the `List<ImportBinding>` block of a `Run` / `Precompile` payload.
+    fn read_import_bindings(&mut self) -> io::Result<Vec<ImportBinding>> {
+        let count = self.read_u32()? as usize;
+        let mut imports = Vec::with_capacity(count);
+        for _ in 0..count {
+            let specifier = self.read_string()?;
+            let module = match self.read_u8()? {
+                0 => ImportModule::Source(self.read_string()?),
+                1 => {
+                    let export_count = self.read_u32()? as usize;
+                    let mut exports = Vec::with_capacity(export_count);
+                    for _ in 0..export_count {
+                        let name = self.read_string()?;
+                        let node = self.read_host_module_node()?;
+                        exports.push((name, node));
+                    }
+                    ImportModule::Host(exports)
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown import binding kind: {other:#04x}"),
+                    ))
+                }
+            };
+            imports.push(ImportBinding { specifier, module });
+        }
+        Ok(imports)
+    }
+
+    /// Read the `List<ImportRebind>` block of a `PrefixRun` payload.
+    fn read_import_rebinds(&mut self) -> io::Result<Vec<ImportRebind>> {
+        let count = self.read_u32()? as usize;
+        let mut rebinds = Vec::with_capacity(count);
+        for _ in 0..count {
+            let specifier = self.read_string()?;
+            let path = self.read_string()?;
+            rebinds.push(ImportRebind { specifier, path });
+        }
+        Ok(rebinds)
+    }
+
     fn assert_done(&self) -> io::Result<()> {
         if self.remaining() != 0 {
             return Err(io::Error::new(
@@ -554,36 +654,27 @@ impl<'a> PayloadReader<'a> {
 
 // ── Payload parsers ──────────────────────────────────────────────────────────────
 
-/// Parse the shared code + filename + limits + globals + imports fields that
-/// appear in `RunPayload`, `PrecompilePayload`, and `PrefixRunPayload`.
+/// Parse the shared code + filename + limits + globals fields that appear in
+/// `RunPayload`, `PrecompilePayload`, and `PrefixRunPayload`. The `imports`
+/// block that follows differs per message type (`ImportBinding` declarations
+/// for Run/Precompile, `ImportRebind` entries for PrefixRun) and is read by
+/// the individual parsers.
 fn parse_code_fields(
     r: &mut PayloadReader,
-) -> io::Result<(
-    String,
-    Option<String>,
-    ResourceLimits,
-    Vec<HostGlobalDef>,
-    Vec<ImportBinding>,
-)> {
+) -> io::Result<(String, Option<String>, ResourceLimits, Vec<HostGlobalDef>)> {
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
     let limits = r.read_resource_limits()?;
     let globals = r.read_global_defs()?;
-    let imports_count = r.read_u32()? as usize;
-    let mut imports = Vec::with_capacity(imports_count);
-    for _ in 0..imports_count {
-        let specifier = r.read_string()?;
-        let source = r.read_string()?;
-        imports.push(ImportBinding { specifier, source });
-    }
-    Ok((code, filename, limits, globals, imports))
+    Ok((code, filename, limits, globals))
 }
 
 /// Parse the payload bytes of a `Run` frame per `docs/protocol.md` §5.2.
 pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
-    let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
+    let (code, filename, limits, globals) = parse_code_fields(&mut r)?;
+    let imports = r.read_import_bindings()?;
     r.assert_done()?;
     Ok(RunPayload {
         run_id,
@@ -609,7 +700,8 @@ pub struct PrecompilePayload {
 /// Parse the payload bytes of a `Precompile` frame per `docs/protocol.md` §5.2.
 pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload> {
     let mut r = PayloadReader::new(payload);
-    let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
+    let (code, filename, limits, globals) = parse_code_fields(&mut r)?;
+    let imports = r.read_import_bindings()?;
     r.assert_done()?;
     Ok(PrecompilePayload {
         code,
@@ -621,6 +713,11 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
 }
 
 /// Fully parsed `PrefixRun` frame payload per `docs/protocol.md` §5.2.
+///
+/// Unlike `Run`/`Precompile`, the imports block carries `ImportRebind`
+/// entries — the declared module shapes are frozen with the snapshot and
+/// re-used from the prefix store; only host function leaves may be re-pointed
+/// at new TS handlers per run.
 #[derive(Debug)]
 pub struct PrefixRunPayload {
     pub run_id: u32,
@@ -629,7 +726,7 @@ pub struct PrefixRunPayload {
     pub filename: Option<String>,
     pub limits: ResourceLimits,
     pub globals: Vec<HostGlobalDef>,
-    pub imports: Vec<ImportBinding>,
+    pub import_rebinds: Vec<ImportRebind>,
 }
 
 /// Parse the payload bytes of a `PrefixRun` frame per `docs/protocol.md` §5.2.
@@ -637,7 +734,8 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
     let prefix_id = r.read_string()?;
-    let (code, filename, limits, globals, imports) = parse_code_fields(&mut r)?;
+    let (code, filename, limits, globals) = parse_code_fields(&mut r)?;
+    let import_rebinds = r.read_import_rebinds()?;
     r.assert_done()?;
     Ok(PrefixRunPayload {
         run_id,
@@ -646,7 +744,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
         filename,
         limits,
         globals,
-        imports,
+        import_rebinds,
     })
 }
 
@@ -1062,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_run_payload_with_one_import() {
+    fn parse_run_payload_with_one_source_import() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "code"); // code
@@ -1071,16 +1169,20 @@ mod tests {
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 1); // 1 import
         push_string(&mut v, "lib:math"); // specifier
+        v.push(0); // kind: source
         push_string(&mut v, "export const add = (a, b) => a + b");
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 1);
         assert_eq!(p.imports[0].specifier, "lib:math");
-        assert_eq!(p.imports[0].source, "export const add = (a, b) => a + b");
+        assert!(matches!(
+            &p.imports[0].module,
+            ImportModule::Source(src) if src == "export const add = (a, b) => a + b"
+        ));
     }
 
     #[test]
-    fn parse_run_payload_with_multiple_imports() {
+    fn parse_run_payload_with_multiple_source_imports() {
         let mut v = Vec::new();
         push_u32(&mut v, 1);
         push_string(&mut v, "code");
@@ -1089,16 +1191,113 @@ mod tests {
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 2); // 2 imports
         push_string(&mut v, "lib:a");
+        v.push(0); // kind: source
         push_string(&mut v, "export const a = 1");
         push_string(&mut v, "lib:b");
+        v.push(0); // kind: source
         push_string(&mut v, "export const b = 2");
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 2);
         assert_eq!(p.imports[0].specifier, "lib:a");
-        assert_eq!(p.imports[0].source, "export const a = 1");
+        assert!(matches!(
+            &p.imports[0].module,
+            ImportModule::Source(src) if src == "export const a = 1"
+        ));
         assert_eq!(p.imports[1].specifier, "lib:b");
-        assert_eq!(p.imports[1].source, "export const b = 2");
+        assert!(matches!(
+            &p.imports[1].module,
+            ImportModule::Source(src) if src == "export const b = 2"
+        ));
+    }
+
+    #[test]
+    fn parse_run_payload_with_host_import_tree() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "code");
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
+        push_string(&mut v, "tools:search");
+        v.push(1); // kind: host
+        push_u32(&mut v, 3); // 3 top-level exports
+                             // "query": function leaf
+        push_string(&mut v, "query");
+        v.push(0);
+        // "config": data leaf — WireValue::Bool(true) is tag 0x03, no body
+        push_string(&mut v, "config");
+        v.push(1);
+        v.push(0x03);
+        // "nested": object with one function leaf "inner"
+        push_string(&mut v, "nested");
+        v.push(2);
+        push_u32(&mut v, 1);
+        push_string(&mut v, "inner");
+        v.push(0);
+
+        let p = parse_run_payload(&v).unwrap();
+        assert_eq!(p.imports.len(), 1);
+        assert_eq!(p.imports[0].specifier, "tools:search");
+        let ImportModule::Host(exports) = &p.imports[0].module else {
+            panic!("expected host module");
+        };
+        assert_eq!(exports.len(), 3);
+        assert_eq!(exports[0].0, "query");
+        assert!(matches!(exports[0].1, HostModuleNode::Function));
+        assert_eq!(exports[1].0, "config");
+        assert!(matches!(
+            &exports[1].1,
+            HostModuleNode::Data(WireValue::Bool(true))
+        ));
+        assert_eq!(exports[2].0, "nested");
+        let HostModuleNode::Object(entries) = &exports[2].1 else {
+            panic!("expected object node");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "inner");
+        assert!(matches!(entries[0].1, HostModuleNode::Function));
+    }
+
+    #[test]
+    fn parse_run_payload_rejects_unknown_import_kind() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1);
+        push_string(&mut v, "code");
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
+        push_string(&mut v, "lib:x");
+        v.push(9); // bogus kind
+
+        assert_eq!(
+            parse_run_payload(&v).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn parse_prefix_run_payload_reads_import_rebinds() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 3); // run_id
+        push_string(&mut v, "prefix-0"); // prefix_id
+        push_string(&mut v, "code");
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 2); // 2 rebinds
+        push_string(&mut v, "tools:search");
+        push_string(&mut v, "query");
+        push_string(&mut v, "tools:search");
+        push_string(&mut v, "nested.inner");
+
+        let p = parse_prefix_run_payload(&v).unwrap();
+        assert_eq!(p.import_rebinds.len(), 2);
+        assert_eq!(p.import_rebinds[0].specifier, "tools:search");
+        assert_eq!(p.import_rebinds[0].path, "query");
+        assert_eq!(p.import_rebinds[1].path, "nested.inner");
     }
 
     #[test]

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::RecvTimeoutError;
 
 use crate::ipc;
-use crate::ipc::{HostGlobalDef, ImportBinding};
+use crate::ipc::{HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
 use crate::wire::{self, BridgeErrorPayload, WireValue};
 
 static INIT: Once = Once::new();
@@ -304,10 +304,113 @@ impl CpuBudget {
 // ── Bridge call log ──────────────────────────────────────────────────────────
 
 /// The reserved dispatcher global backing all host-module import function
-/// leaves. Mirrors `BRIDGE_DISPATCH_GLOBAL` in the TS client (`imports.ts`);
-/// used here to tag records with the import handle ID so the client can
-/// resolve the `<specifier>.<path>` name.
+/// leaves. The runtime installs it automatically (as a bridge stub) whenever
+/// the declared imports contain at least one function leaf; the trampolines
+/// built into host modules call it with their handle ID as the first
+/// argument. Mirrors `BRIDGE_DISPATCH_GLOBAL` in the TS client (`imports.ts`),
+/// where the name is reserved so no user global can collide with it.
 const BRIDGE_DISPATCH_GLOBAL: &str = "__iso4_call";
+
+// ── Host-module import handles ───────────────────────────────────────────────
+
+/// One host-module function leaf, located by its declared position. Handle IDs
+/// are the indices into the `Vec<ImportHandleEntry>` produced by
+/// [`collect_import_handles`].
+#[derive(Debug, Clone, PartialEq)]
+struct ImportHandleEntry {
+    specifier: String,
+    /// Dot-joined path inside the module (e.g. `"nested.inner"`); doubles as
+    /// the `exportName` on `BridgeCall` frames with `targetKind = import`.
+    path: String,
+}
+
+impl ImportHandleEntry {
+    /// The public bridge-record name for this leaf: `<specifier>.<path>`.
+    fn record_name(&self) -> String {
+        format!("{}.{}", self.specifier, self.path)
+    }
+}
+
+/// Walk the declared imports in wire order (bindings first-to-last, each tree
+/// depth-first in entry order) and collect every function leaf. Handle IDs are
+/// positions in the returned Vec.
+///
+/// This walk is the single source of truth for handle assignment: the module
+/// builder derives trampoline IDs from the same order (via
+/// [`host_module_base_id`]), so the dispatcher and the trampolines can never
+/// disagree — including across the snapshot boundary, where trampolines baked
+/// into a prefix snapshot are matched by a table rebuilt from the same
+/// declared imports on every run.
+fn collect_import_handles(imports: &[ImportBinding]) -> Vec<ImportHandleEntry> {
+    fn walk(
+        specifier: &str,
+        entries: &[(String, HostModuleNode)],
+        path: &mut Vec<String>,
+        out: &mut Vec<ImportHandleEntry>,
+    ) {
+        for (key, node) in entries {
+            path.push(key.clone());
+            match node {
+                HostModuleNode::Function => out.push(ImportHandleEntry {
+                    specifier: specifier.to_string(),
+                    path: path.join("."),
+                }),
+                HostModuleNode::Object(children) => walk(specifier, children, path, out),
+                HostModuleNode::Data(_) => {}
+            }
+            path.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    for binding in imports {
+        if let ImportModule::Host(exports) = &binding.module {
+            walk(&binding.specifier, exports, &mut Vec::new(), &mut out);
+        }
+    }
+    out
+}
+
+/// The handle ID of the first function leaf belonging to `specifier`, under
+/// the same walk order as [`collect_import_handles`]. Leaves within one
+/// binding are contiguous, so the module builder assigns `base, base+1, …` to
+/// its own depth-first walk.
+fn host_module_base_id(imports: &[ImportBinding], specifier: &str) -> u32 {
+    let mut id = 0u32;
+    for binding in imports {
+        if binding.specifier == specifier {
+            break;
+        }
+        if let ImportModule::Host(exports) = &binding.module {
+            id += count_function_leaves(exports);
+        }
+    }
+    id
+}
+
+fn count_function_leaves(entries: &[(String, HostModuleNode)]) -> u32 {
+    let mut n = 0;
+    for (_, node) in entries {
+        match node {
+            HostModuleNode::Function => n += 1,
+            HostModuleNode::Object(children) => n += count_function_leaves(children),
+            HostModuleNode::Data(_) => {}
+        }
+    }
+    n
+}
+
+/// The public record name for a bridge stub: shim handler stubs
+/// (`__iso4_<name>_h`, see `shimHandlerName` in the TS client) report under
+/// their public `<name>`; everything else reports as-is. This mirrors the
+/// naming convention the TS client uses when routing shim rebinds, so records
+/// carry the name sandbox code actually called.
+fn public_record_name(stub_name: &str) -> &str {
+    stub_name
+        .strip_prefix("__iso4_")
+        .and_then(|s| s.strip_suffix("_h"))
+        .unwrap_or(stub_name)
+}
 
 /// Round to microsecond resolution, matching `elapsed_ms`.
 fn round_micro(ms: f64) -> f64 {
@@ -328,10 +431,9 @@ struct BridgeCallLog {
 impl BridgeCallLog {
     /// An attempt blocked runtime-side (limit, oversized payload, function
     /// argument, transport failure) — never reached the host.
-    fn record_blocked(&mut self, raw_name: &str, start_ms: f64, arg_bytes: u32) {
+    fn record_blocked(&mut self, name: &str, start_ms: f64, arg_bytes: u32) {
         self.records.push(wire::BridgeCallRecord {
-            raw_name: raw_name.to_string(),
-            import_handle_id: None,
+            name: name.to_string(),
             start_ms,
             duration_ms: 0.0,
             arg_bytes,
@@ -343,17 +445,11 @@ impl BridgeCallLog {
 
     /// A call whose BridgeCall frame was written to the host; settles when
     /// the matching response arrives (or at finalize if it never does).
-    fn record_sent(
-        &mut self,
-        call_id: u32,
-        raw_name: &str,
-        import_handle_id: Option<u32>,
-        start_ms: f64,
-        arg_bytes: u32,
-    ) {
+    /// `name` is already the public name — the runtime owns both the import
+    /// handle table and the shim naming convention.
+    fn record_sent(&mut self, call_id: u32, name: &str, start_ms: f64, arg_bytes: u32) {
         self.records.push(wire::BridgeCallRecord {
-            raw_name: raw_name.to_string(),
-            import_handle_id,
+            name: name.to_string(),
             start_ms,
             duration_ms: 0.0,
             arg_bytes,
@@ -715,6 +811,11 @@ fn run_module_inner(
     // export extraction (D9 hardening).
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
+    // Host modules receive their natively-built values through import.meta
+    // (see `build_host_module`); the callback consults the resolver context to
+    // find the values array staged for the module being initialised.
+    isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
+
     // ── Limit guard threads ───────────────────────────────────────────────────
     //
     // CURRENT APPROACH: one OS guard thread per limit type per run
@@ -815,26 +916,50 @@ fn run_module_inner(
     let pending_resolvers: PendingResolvers = Arc::new(Mutex::new(HashMap::new()));
 
     // Split the tagged defs into the bridge stubs to install (plain functions,
-    // shim handlers, the `__iso4_call` dispatcher) and everything else. Value
-    // globals (string exprs, constants, shim wrappers) are installed after the
-    // stubs so a shim wrapper's handler stub already exists on globalThis.
-    let bridge_stub_names: Vec<String> = globals
+    // shim handlers) and everything else. Value globals (string exprs,
+    // constants, shim wrappers) are installed after the stubs so a shim
+    // wrapper's handler stub already exists on globalThis. Each stub carries
+    // the public name its bridge records report under: shim handler stubs
+    // report under the public global name, everything else as-is.
+    let mut bridge_stubs: Vec<BridgeStubSpec> = globals
         .iter()
-        .filter_map(|g| g.bridge_stub_name().map(str::to_string))
+        .filter_map(|g| {
+            g.bridge_stub_name().map(|stub| BridgeStubSpec {
+                stub_name: stub.to_string(),
+                record_name: match g {
+                    HostGlobalDef::Shim { name, .. } => name.clone(),
+                    _ => public_record_name(stub).to_string(),
+                },
+                import_handles: None,
+            })
+        })
         .collect();
+
+    // Host-module function leaves dispatch through the reserved `__iso4_call`
+    // stub. The runtime owns the handle table (id → specifier + path), so it
+    // installs the dispatcher itself whenever the declared imports contain at
+    // least one function leaf — the client never sends a def for it.
+    let import_handles = collect_import_handles(imports);
+    if !import_handles.is_empty() {
+        bridge_stubs.push(BridgeStubSpec {
+            stub_name: BRIDGE_DISPATCH_GLOBAL.to_string(),
+            record_name: BRIDGE_DISPATCH_GLOBAL.to_string(),
+            import_handles: Some(Arc::new(import_handles)),
+        });
+    }
 
     // Box-per-stub allocations; kept alive until after the poll loop exits.
     // Vec<Box<>> is intentional: raw pointers into each Box are passed to V8
     // as External data — the address must not move on Vec reallocation.
     #[allow(clippy::vec_box)]
     let mut callback_data_boxes: Vec<Box<GlobalCallbackData>> =
-        Vec::with_capacity(bridge_stub_names.len());
-    if !bridge_stub_names.is_empty() {
+        Vec::with_capacity(bridge_stubs.len());
+    if !bridge_stubs.is_empty() {
         let fd = stream_fd
             .expect("install_bridge_globals called with bridge-backed globals but no stream_fd");
         install_bridge_globals(
             scope,
-            &bridge_stub_names,
+            &bridge_stubs,
             fd,
             Arc::clone(&call_id),
             Arc::clone(&bridge_error),
@@ -904,6 +1029,7 @@ fn run_module_inner(
     let _resolver_guard = install_resolver(ResolverContext {
         bindings: imports.to_vec(),
         module_cache: HashMap::new(),
+        pending_meta: Vec::new(),
         resolve_error: None,
         async_context_builtin: true,
     });
@@ -1383,6 +1509,7 @@ fn evaluate_prefix_module(
     let _resolver_guard = install_resolver(ResolverContext {
         bindings: imports.to_vec(),
         module_cache: HashMap::new(),
+        pending_meta: Vec::new(),
         resolve_error: None,
         async_context_builtin: false,
     });
@@ -1470,6 +1597,7 @@ fn precompile_module(
     {
         let mut isolate = v8::Isolate::new(Default::default());
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+        isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
         let scope = &mut v8::HandleScope::new(&mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -1483,6 +1611,7 @@ fn precompile_module(
     // is safe. All V8 scopes must drop before create_blob, hence the IIFE.
     let mut isolate = v8::Isolate::snapshot_creator(None, None);
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+    isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
 
     let compile_result: Result<(), FailureOutput> = (|| {
         let scope = &mut v8::HandleScope::new(&mut isolate);
@@ -1560,14 +1689,19 @@ fn no_import_resolver<'a>(
 // one thread with one isolate, so this is safe.
 
 struct ResolverContext {
-    /// Specifiers the host declared for this run, in wire-order. Every
-    /// binding is source-form: the TS-side import processor lowered any
-    /// object-shape ("host") imports to generated source that calls bridge
-    /// globals at function leaves.
+    /// Specifiers the host declared for this run, in wire-order. Source
+    /// bindings carry ESM text compiled verbatim; host bindings carry the
+    /// module shape as data, from which `build_host_module` constructs the
+    /// module natively.
     bindings: Vec<ImportBinding>,
     /// Per-isolate module cache so transitive imports resolve to the same
     /// `v8::Module` instance and import diamonds collapse correctly.
     module_cache: HashMap<String, v8::Global<v8::Module>>,
+    /// Values arrays staged for host modules, keyed by module identity. The
+    /// import-meta callback ([`host_import_meta_callback`]) attaches the array
+    /// as `import.meta.__iso4` when V8 initialises the module's meta object
+    /// (lazily, during evaluation — still inside the resolver guard's scope).
+    pending_meta: Vec<(v8::Global<v8::Module>, v8::Global<v8::Array>)>,
     /// First resolver error wins. V8's callback ABI can't carry a
     /// `RunError`, so the caller inspects this after `instantiate_module`.
     resolve_error: Option<RunError>,
@@ -1656,6 +1790,27 @@ fn record_resolve_error(err: RunError) {
     });
 }
 
+/// Stage the natively-built values array for a host module so the import-meta
+/// callback can attach it when V8 initialises the module's `import.meta`.
+fn stage_meta_values(module: v8::Global<v8::Module>, values: v8::Global<v8::Array>) {
+    RESOLVER_CTX.with(|c| {
+        if let Some(ctx) = c.borrow_mut().as_mut() {
+            ctx.pending_meta.push((module, values));
+        }
+    });
+}
+
+/// The handle ID of the first function leaf of `specifier` — see
+/// [`host_module_base_id`]; reads the bindings from the resolver context.
+fn staged_base_id(specifier: &str) -> u32 {
+    RESOLVER_CTX.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|ctx| host_module_base_id(&ctx.bindings, specifier))
+            .unwrap_or(0)
+    })
+}
+
 /// The module resolver V8 calls during `instantiate_module`.
 ///
 /// Returning `None` causes V8 to throw "Cannot find module …"; the outer
@@ -1683,12 +1838,15 @@ fn module_resolver_callback<'a>(
         None if specifier_str == ASYNC_HOOKS_SPECIFIER && async_context_builtin_enabled() => {
             ImportBinding {
                 specifier: specifier_str.clone(),
-                source: ASYNC_HOOKS_MODULE_SRC.to_string(),
+                module: ImportModule::Source(ASYNC_HOOKS_MODULE_SRC.to_string()),
             }
         }
         None => return None,
     };
-    let module = compile_source_module(scope, &specifier_str, &binding)?;
+    let module = match &binding.module {
+        ImportModule::Source(source) => compile_source_module(scope, &specifier_str, source)?,
+        ImportModule::Host(exports) => build_host_module(scope, &specifier_str, exports)?,
+    };
 
     let global = v8::Global::new(scope, module);
     cache_put(specifier_str, global);
@@ -1698,9 +1856,9 @@ fn module_resolver_callback<'a>(
 fn compile_source_module<'s>(
     scope: &mut v8::HandleScope<'s>,
     specifier: &str,
-    binding: &ImportBinding,
+    source: &str,
 ) -> Option<v8::Local<'s, v8::Module>> {
-    let source_string = v8::String::new(scope, &binding.source)?;
+    let source_string = v8::String::new(scope, source)?;
     let filename = v8::String::new(scope, specifier)?;
     let origin = v8::ScriptOrigin::new(
         scope,
@@ -1727,6 +1885,258 @@ fn compile_source_module<'s>(
             None
         }
     }
+}
+
+// ── Host modules (built natively from shape data, #37) ───────────────────────
+//
+// A host module crosses the wire as data: named top-level exports, each a
+// tree of function leaves and data leaves. No JS is ever generated from that
+// data. The module the sandbox imports is a fixed-shape source-text module —
+//
+//     export const <name> = import.meta.__iso4[<i>];
+//
+// — where only identifier-validated export names and integer indices are
+// interpolated. The values array is built natively (data leaves via
+// `wire_to_v8_value`, function leaves as trampolines from a fixed factory
+// with the handle ID passed as a number) and handed to the module through
+// V8's import-meta callback. Using a plain source-text module keeps host
+// modules snapshot-safe: everything reachable from a prefix snapshot is
+// ordinary JS, with no native pointers that would need external references.
+
+/// Property on `import.meta` carrying a host module's values array. Only
+/// Rust-generated host-module source reads it; user modules get an empty
+/// `import.meta` (the callback attaches nothing for unknown modules).
+const IMPORT_META_VALUES_KEY: &str = "__iso4";
+
+/// Fixed factory building the async trampoline for one function leaf. The
+/// handle ID is passed as a number — never interpolated into source — and the
+/// dispatcher (`BRIDGE_DISPATCH_GLOBAL`, a per-run bridge stub) is looked up
+/// on globalThis at call time, so a trampoline baked into a prefix snapshot
+/// still reaches the fresh stub of every later run.
+const IMPORT_TRAMPOLINE_FACTORY_SRC: &str =
+    "(id) => (async (...args) => await globalThis.__iso4_call(id, ...args))";
+
+/// Build the module for a host import binding.
+///
+/// On failure records a resolver error (surfaced after `instantiate_module`)
+/// and returns `None`, like `compile_source_module`.
+fn build_host_module<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    specifier: &str,
+    exports: &[(String, HostModuleNode)],
+) -> Option<v8::Local<'s, v8::Module>> {
+    // Defensive re-validation: the TS client already rejects invalid names,
+    // but Rust is the side interpolating them into export positions, so it
+    // owns the final check.
+    for (name, _) in exports {
+        if !is_valid_export_identifier(name) {
+            record_resolve_error(RunError::CompileError(format!(
+                "host module '{specifier}': top-level key '{name}' is not a valid \
+                 JavaScript identifier and cannot be exported as a named ESM export"
+            )));
+            return None;
+        }
+    }
+
+    let factory = match build_import_trampoline_factory(scope) {
+        Ok(f) => f,
+        Err(e) => {
+            record_resolve_error(e);
+            return None;
+        }
+    };
+
+    // Handle IDs continue the global walk order established by
+    // `collect_import_handles` over the declared bindings.
+    let mut next_id = staged_base_id(specifier);
+    let values = v8::Array::new(scope, exports.len() as i32);
+    let mut source = String::new();
+    for (i, (name, node)) in exports.iter().enumerate() {
+        let value = match build_host_value(scope, specifier, node, factory, &mut next_id) {
+            Ok(v) => v,
+            Err(e) => {
+                record_resolve_error(e);
+                return None;
+            }
+        };
+        values.set_index(scope, i as u32, value)?;
+        if name == "default" {
+            source.push_str(&format!(
+                "export default import.meta.{IMPORT_META_VALUES_KEY}[{i}];\n"
+            ));
+        } else {
+            source.push_str(&format!(
+                "export const {name} = import.meta.{IMPORT_META_VALUES_KEY}[{i}];\n"
+            ));
+        }
+    }
+
+    let module = compile_source_module(scope, specifier, &source)?;
+    stage_meta_values(
+        v8::Global::new(scope, module),
+        v8::Global::new(scope, values),
+    );
+    Some(module)
+}
+
+/// Build one host-module value natively: function leaves become trampolines
+/// (consuming the next handle ID), data leaves are materialised from their
+/// `WireValue`, and object nodes become plain objects built via the V8 API.
+fn build_host_value<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    specifier: &str,
+    node: &HostModuleNode,
+    factory: v8::Local<v8::Function>,
+    next_id: &mut u32,
+) -> Result<v8::Local<'s, v8::Value>, RunError> {
+    match node {
+        HostModuleNode::Function => {
+            let id = *next_id;
+            *next_id += 1;
+            let id_arg = v8::Number::new(scope, id as f64).into();
+            let recv = v8::undefined(scope).into();
+            factory.call(scope, recv, &[id_arg]).ok_or_else(|| {
+                RunError::Internal(format!(
+                    "failed to build import trampoline in host module '{specifier}'"
+                ))
+            })
+        }
+        HostModuleNode::Data(wv) => wire_to_v8_value(scope, wv).ok_or_else(|| {
+            RunError::Internal(format!(
+                "failed to materialise data leaf in host module '{specifier}'"
+            ))
+        }),
+        HostModuleNode::Object(entries) => {
+            let obj = v8::Object::new(scope);
+            for (key, child) in entries {
+                // "__proto__" never crosses the boundary in either direction —
+                // same policy as `wire_to_v8_value` / `serialize_object_fields`.
+                if key == "__proto__" {
+                    continue;
+                }
+                let v = build_host_value(scope, specifier, child, factory, next_id)?;
+                let k = v8::String::new(scope, key).ok_or_else(|| {
+                    RunError::Internal(format!(
+                        "failed to intern object key in host module '{specifier}'"
+                    ))
+                })?;
+                obj.create_data_property(scope, k.into(), v);
+            }
+            Ok(obj.into())
+        }
+    }
+}
+
+/// Build the trampoline factory from [`IMPORT_TRAMPOLINE_FACTORY_SRC`].
+fn build_import_trampoline_factory<'s>(
+    scope: &mut v8::HandleScope<'s>,
+) -> Result<v8::Local<'s, v8::Function>, RunError> {
+    let value = eval_script(
+        scope,
+        IMPORT_TRAMPOLINE_FACTORY_SRC,
+        "<iso4:import-trampoline-factory>",
+    )?;
+    v8::Local::<v8::Function>::try_from(value).map_err(|_| {
+        RunError::Internal("import trampoline factory did not evaluate to a function".to_string())
+    })
+}
+
+/// Isolate-level callback V8 invokes the first time a module's `import.meta`
+/// is accessed. Attaches the staged values array for host modules; any other
+/// module (user code, source imports) gets an untouched empty meta object.
+extern "C" fn host_import_meta_callback(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    // SAFETY: standard embedder-callback re-entry, same pattern as
+    // `module_resolver_callback`.
+    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    let values = RESOLVER_CTX.with(|c| {
+        c.borrow().as_ref().and_then(|ctx| {
+            ctx.pending_meta
+                .iter()
+                .find(|(m, _)| v8::Local::new(scope, m) == module)
+                .map(|(_, v)| v.clone())
+        })
+    });
+    let Some(values) = values else { return };
+    let Some(key) = v8::String::new(scope, IMPORT_META_VALUES_KEY) else {
+        return;
+    };
+    let array = v8::Local::new(scope, &values);
+    meta.create_data_property(scope, key.into(), array.into());
+}
+
+/// Reserved words that cannot appear as named ESM exports. Mirrors the list
+/// in the TS client (`imports.ts`).
+const RESERVED_EXPORT_WORDS: &[&str] = &[
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+    "let",
+    "static",
+    "enum",
+    "await",
+    "implements",
+    "package",
+    "protected",
+    "interface",
+    "private",
+    "public",
+    "null",
+    "true",
+    "false",
+];
+
+/// Whether `name` can appear as a named ESM export in generated host-module
+/// source: ASCII identifier rules plus a reserved-word filter. `default` is
+/// allowed (emitted as `export default`). Mirrors `isValidExportIdentifier`
+/// in the TS client.
+fn is_valid_export_identifier(name: &str) -> bool {
+    if name == "default" {
+        return true;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+        return false;
+    }
+    !RESERVED_EXPORT_WORDS.contains(&name)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1866,8 +2276,19 @@ struct GlobalCallbackData {
     call_id: Arc<AtomicU32>,
     /// First bridge error wins. Written once, read after evaluate() returns.
     bridge_error: Arc<OnceLock<RunError>>,
-    /// The global name this stub is registered for (e.g. "fetch", "myTool").
-    name: String,
+    /// The wire-level name this stub dispatches under — the `exportName` on
+    /// its `BridgeCall` frames (e.g. "fetch", "__iso4_fetch_h"). The TS
+    /// client routes handler lookup by this name.
+    stub_name: String,
+    /// The public name this stub's bridge records report under (e.g. "fetch",
+    /// "myTool"; shim handler stubs report their public global name, not the
+    /// private `__iso4_<name>_h` key).
+    record_name: String,
+    /// `Some` marks this stub as the host-import dispatcher
+    /// (`BRIDGE_DISPATCH_GLOBAL`): the table resolves the leading handle-ID
+    /// argument to the import function leaf being called, so the BridgeCall
+    /// frame and the bridge record carry the real `<specifier>.<path>`.
+    import_handles: Option<Arc<Vec<ImportHandleEntry>>>,
     /// Maximum allowed byte length for a bridge call payload (sandbox → host args).
     /// Zero means no per-call limit.
     max_bridge_call_bytes: u32,
@@ -1884,6 +2305,28 @@ struct GlobalCallbackData {
     /// Per-run bridge-call records (attempts + blocked attempts); the poll
     /// loop settles sent entries when their response arrives.
     log: Arc<Mutex<BridgeCallLog>>,
+}
+
+/// Return a pre-rejected Promise carrying a host-bridge-tagged Error. Used
+/// when a call is refused before any I/O (e.g. a direct dispatcher call with
+/// an invalid handle) — sandbox code may catch it, exactly like a host
+/// handler rejection; uncaught it surfaces as `ERR_HOST_BRIDGE`.
+fn reject_with_bridge_error(scope: &mut v8::HandleScope, rv: &mut v8::ReturnValue, message: &str) {
+    let error = host_bridge_error_to_v8(
+        scope,
+        &BridgeErrorPayload {
+            name: "Error".to_string(),
+            message: format!("[iso4] {message}"),
+            fields: None,
+        },
+    );
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        throw_v8_error(scope, message);
+        return;
+    };
+    resolver.reject(scope, error);
+    let promise = resolver.get_promise(scope);
+    rv.set(promise.into());
 }
 
 /// Record a fatal bridge error and terminate JS execution immediately.
@@ -1936,13 +2379,14 @@ fn bridge_global_callback(
     let data = unsafe { &*data };
 
     // Attempt timestamp on the run clock — recorded for every attempt,
-    // including ones blocked below.
+    // including ones blocked below. Blocked import dispatches record under
+    // the dispatcher's own name when they fail before handle resolution.
     let start_ms = elapsed_ms(data.run_start);
     let record_blocked = |arg_bytes: u32| {
         data.log
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record_blocked(&data.name, start_ms, arg_bytes);
+            .record_blocked(&data.record_name, start_ms, arg_bytes);
     };
 
     // ── Bridge call count limit ────────────────────────────────────────────
@@ -1976,14 +2420,62 @@ fn bridge_global_callback(
         }
     }
 
+    // ── Resolve the call target ────────────────────────────────────────────
+    //
+    // Plain globals dispatch under their own name (targetKind = 0). Host-
+    // module function leaves reach this callback through the reserved
+    // dispatcher stub with their handle ID as the first argument; the runtime
+    // owns the handle table, so the frame carries the resolved specifier and
+    // leaf path (targetKind = 1) and the ID never leaves the process.
+    #[allow(clippy::type_complexity)]
+    let (target_kind, specifier, export_name, call_args, record_name): (
+        u8,
+        Option<&str>,
+        &str,
+        &[WireValue],
+        String,
+    ) = match &data.import_handles {
+        None => (
+            0,
+            None,
+            data.stub_name.as_str(),
+            &wire_args[..],
+            data.record_name.clone(),
+        ),
+        Some(table) => {
+            let entry = match wire_args.first() {
+                Some(WireValue::Number(n))
+                    if n.fract() == 0.0 && *n >= 0.0 && (*n as usize) < table.len() =>
+                {
+                    &table[*n as usize]
+                }
+                _ => {
+                    // Only reachable by sandbox code calling the reserved
+                    // dispatcher directly with a bogus handle — reject the
+                    // call catchably, mirroring a host handler error.
+                    record_blocked(0);
+                    reject_with_bridge_error(
+                        scope,
+                        &mut rv,
+                        "no host import handle for direct dispatcher call",
+                    );
+                    return;
+                }
+            };
+            (
+                1,
+                Some(entry.specifier.as_str()),
+                entry.path.as_str(),
+                &wire_args[1..],
+                entry.record_name(),
+            )
+        }
+    };
+
     // ── Assign call ID and build BridgeCall payload ────────────────────────
     let call_id = data.call_id.fetch_add(1, Ordering::Relaxed);
-    // All bridge calls in v1 are globals (targetKind = 0).
-    // Host-module import function leaves reach the bridge via the single reserved
-    // dispatcher global `__iso4_call`, with the first argument being an integer
-    // handle ID that the host-side dispatcher uses to route the call.
     let bridge_call_payload =
-        wire::encode_bridge_call_payload(call_id, 0, None, &data.name, &wire_args);
+        wire::encode_bridge_call_payload(call_id, target_kind, specifier, export_name, call_args);
 
     if data.max_bridge_call_bytes > 0
         && bridge_call_payload.len() > data.max_bridge_call_bytes as usize
@@ -2016,25 +2508,14 @@ fn bridge_global_callback(
     }
 
     // The frame reached the host — record the call for the run's bridge
-    // report. A `__iso4_call` dispatch carries its host-module handle ID as
-    // the first argument; recorded so the client can resolve the
-    // `<specifier>.<path>` name. Settled by the poll loop when the matching
-    // BridgeResponse arrives.
-    let import_handle_id = if data.name == BRIDGE_DISPATCH_GLOBAL {
-        match wire_args.first() {
-            Some(WireValue::Number(n)) if *n >= 0.0 => Some(*n as u32),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    // report under its resolved public name. Settled by the poll loop when
+    // the matching BridgeResponse arrives.
     data.log
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .record_sent(
             call_id,
-            &data.name,
-            import_handle_id,
+            &record_name,
             start_ms,
             bridge_call_payload.len() as u32,
         );
@@ -2063,15 +2544,27 @@ fn bridge_global_callback(
     rv.set(promise.into());
 }
 
-/// Install a bridge stub for each declared global name.
+/// One bridge stub to install on the sandbox global object.
+struct BridgeStubSpec {
+    /// The global-object key the stub installs under (e.g. "fetch",
+    /// "__iso4_fetch_h", "__iso4_call").
+    stub_name: String,
+    /// The public name its bridge records report under.
+    record_name: String,
+    /// `Some` for the host-import dispatcher stub — the handle table it
+    /// resolves leading handle-ID arguments against.
+    import_handles: Option<Arc<Vec<ImportHandleEntry>>>,
+}
+
+/// Install a bridge stub for each spec.
 ///
-/// Each stub is an identical `bridge_global_callback` function with per-name
+/// Each stub is an identical `bridge_global_callback` function with per-stub
 /// `GlobalCallbackData` attached as External data. The boxes are pushed into
 /// `out_boxes` so their heap allocations outlive the V8 evaluation.
 #[allow(clippy::too_many_arguments)] // bridge setup genuinely needs all these params
 fn install_bridge_globals(
     scope: &mut v8::HandleScope,
-    globals: &[String],
+    stubs: &[BridgeStubSpec],
     stream_fd: RawFd,
     call_id: Arc<AtomicU32>,
     bridge_error: Arc<OnceLock<RunError>>,
@@ -2086,12 +2579,15 @@ fn install_bridge_globals(
     #[allow(clippy::vec_box)] out_boxes: &mut Vec<Box<GlobalCallbackData>>,
 ) -> Result<(), RunError> {
     let global_obj = scope.get_current_context().global(scope);
-    for name in globals {
+    for spec in stubs {
+        let name = &spec.stub_name;
         let data = Box::new(GlobalCallbackData {
             stream_fd,
             call_id: Arc::clone(&call_id),
             bridge_error: Arc::clone(&bridge_error),
-            name: name.clone(),
+            stub_name: spec.stub_name.clone(),
+            record_name: spec.record_name.clone(),
+            import_handles: spec.import_handles.clone(),
             max_bridge_call_bytes,
             bridge_call_count: Arc::clone(&bridge_call_count),
             max_bridge_calls,
@@ -3111,13 +3607,24 @@ mod tests {
         run_code(code, "<iso4>", Limits::default()).map_err(|failure| failure.error)
     }
 
-    /// Build an `ImportBinding` for tests. The wire is always source-form;
-    /// the public API's "host module" flavor is lowered to generated source
-    /// on the TS side before reaching the runtime.
+    /// Build a source-form `ImportBinding` for tests.
     fn source_import(specifier: &str, source: &str) -> ImportBinding {
         ImportBinding {
             specifier: specifier.to_string(),
-            source: source.to_string(),
+            module: ImportModule::Source(source.to_string()),
+        }
+    }
+
+    /// Build a host-form `ImportBinding` for tests.
+    fn host_import(specifier: &str, exports: Vec<(&str, HostModuleNode)>) -> ImportBinding {
+        ImportBinding {
+            specifier: specifier.to_string(),
+            module: ImportModule::Host(
+                exports
+                    .into_iter()
+                    .map(|(name, node)| (name.to_string(), node))
+                    .collect(),
+            ),
         }
     }
 
@@ -4999,7 +5506,7 @@ mod tests {
         // The bridge call that was in flight when the abort landed is recorded
         // (unsettled → ok=false), not dropped.
         assert_eq!(failure.bridge_calls.len(), 1);
-        assert_eq!(failure.bridge_calls[0].raw_name, "myTool");
+        assert_eq!(failure.bridge_calls[0].name, "myTool");
         assert!(!failure.bridge_calls[0].ok);
         assert!(!failure.bridge_calls[0].blocked);
         // Timings are stamped from the shared run state, not left as zeros.
@@ -5833,7 +6340,7 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(out.bridge_calls.len(), 3);
         for record in &out.bridge_calls {
-            assert_eq!(record.raw_name, "myTool");
+            assert_eq!(record.name, "myTool");
             assert!(record.ok, "served call must settle ok");
             assert!(!record.blocked);
             assert!(record.arg_bytes > 0, "call payload has at least the header");
@@ -6453,5 +6960,438 @@ mod tests {
         )
         .unwrap();
         assert!(!snapshot.is_empty());
+    }
+
+    // ── Host modules built natively from shape data (#37) ────────────────────
+    //
+    // Host modules cross the wire as data trees; the runtime builds the module
+    // itself. Data leaves need no socket. Function leaves dispatch through the
+    // auto-installed `__iso4_call` stub, so those tests use a responder thread
+    // like the bridge tests above.
+
+    /// Parse a BridgeCall payload: (callId, targetKind, specifier, exportName, args).
+    fn parse_bridge_call(payload: &[u8]) -> (u32, u8, Option<String>, String, Vec<WireValue>) {
+        let mut off = 0usize;
+        let call_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
+        off += 4;
+        let target_kind = payload[off];
+        off += 1;
+        let specifier = if payload[off] == 1 {
+            off += 1;
+            let len = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            let s = String::from_utf8(payload[off..off + len].to_vec()).unwrap();
+            off += len;
+            Some(s)
+        } else {
+            off += 1;
+            None
+        };
+        let len = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let export_name = String::from_utf8(payload[off..off + len].to_vec()).unwrap();
+        off += len;
+        let arg_count = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let mut args = Vec::with_capacity(arg_count);
+        for _ in 0..arg_count {
+            args.push(wire::decode_wire_value(payload, &mut off).unwrap());
+        }
+        (call_id, target_kind, specifier, export_name, args)
+    }
+
+    /// Run code with host imports over a socket pair; the responder receives
+    /// each BridgeCall frame parsed and answers via the returned closure.
+    fn run_with_host_imports(
+        code: &str,
+        imports: Vec<ImportBinding>,
+        respond: impl FnOnce(&mut std::os::unix::net::UnixStream, &[u8]) + Send + 'static,
+    ) -> (Result<Output, FailureOutput>, std::thread::JoinHandle<()>) {
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+        let handle = std::thread::spawn(move || {
+            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            respond(&mut server, &frame.payload);
+        });
+        let result = execute(
+            code,
+            None,
+            Limits::default(),
+            &[],
+            &imports,
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        );
+        (result, handle)
+    }
+
+    #[test]
+    fn host_module_data_leaves_materialise_natively() {
+        // Pure data host module — no socket, no bridge.
+        let imports = [host_import(
+            "conf:app",
+            vec![
+                ("retries", HostModuleNode::Data(WireValue::Number(3.0))),
+                (
+                    "region",
+                    HostModuleNode::Data(WireValue::String("eu".to_string())),
+                ),
+                (
+                    "flags",
+                    HostModuleNode::Data(WireValue::Array(vec![
+                        WireValue::Bool(true),
+                        WireValue::Null,
+                    ])),
+                ),
+            ],
+        )];
+        let out = run_with_source_imports(
+            r#"
+            import { retries, region, flags } from "conf:app";
+            export default `${retries}|${region}|${flags.length}|${flags[0]}`
+            "#,
+            &imports,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("3|eu|2|true"));
+    }
+
+    #[test]
+    fn host_module_default_and_nested_object_exports() {
+        let imports = [host_import(
+            "conf:shape",
+            vec![
+                ("default", HostModuleNode::Data(WireValue::Number(7.0))),
+                (
+                    "nested",
+                    HostModuleNode::Object(vec![(
+                        "deep".to_string(),
+                        HostModuleNode::Data(WireValue::Object(vec![(
+                            "x".to_string(),
+                            WireValue::Number(1.0),
+                        )])),
+                    )]),
+                ),
+            ],
+        )];
+        let out = run_with_source_imports(
+            r#"
+            import seven, { nested } from "conf:shape";
+            export default seven + nested.deep.x
+            "#,
+            &imports,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn host_module_function_leaf_dispatches_resolved_bridge_call() {
+        let imports = vec![host_import(
+            "tools:search",
+            vec![("query", HostModuleNode::Function)],
+        )];
+        let (out, h) = run_with_host_imports(
+            r#"
+            import { query } from "tools:search";
+            export default await query("cats", 2)
+            "#,
+            imports,
+            |s, payload| {
+                let (call_id, target_kind, specifier, export_name, args) =
+                    parse_bridge_call(payload);
+                // The frame carries the resolved import target — the handle ID
+                // never leaves the runtime.
+                assert_eq!(target_kind, 1);
+                assert_eq!(specifier.as_deref(), Some("tools:search"));
+                assert_eq!(export_name, "query");
+                assert_eq!(
+                    args,
+                    vec![
+                        WireValue::String("cats".to_string()),
+                        WireValue::Number(2.0)
+                    ]
+                );
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(call_id, &WireValue::Number(42.0)),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let out = out.unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("42"));
+        // The bridge record carries the resolved public name.
+        assert_eq!(out.bridge_calls.len(), 1);
+        assert_eq!(out.bridge_calls[0].name, "tools:search.query");
+        assert!(out.bridge_calls[0].ok);
+    }
+
+    #[test]
+    fn host_module_nested_function_leaf_and_second_module_offsets() {
+        // Handle IDs are assigned across ALL declared bindings in walk order;
+        // calling a leaf of the second module must resolve to the second
+        // module's specifier and path.
+        let imports = vec![
+            host_import(
+                "tools:a",
+                vec![
+                    ("first", HostModuleNode::Function),
+                    (
+                        "nested",
+                        HostModuleNode::Object(vec![(
+                            "inner".to_string(),
+                            HostModuleNode::Function,
+                        )]),
+                    ),
+                ],
+            ),
+            host_import("tools:b", vec![("second", HostModuleNode::Function)]),
+        ];
+        let (out, h) = run_with_host_imports(
+            r#"
+            import { second } from "tools:b";
+            export default await second()
+            "#,
+            imports,
+            |s, payload| {
+                let (call_id, target_kind, specifier, export_name, _) = parse_bridge_call(payload);
+                assert_eq!(target_kind, 1);
+                assert_eq!(specifier.as_deref(), Some("tools:b"));
+                assert_eq!(export_name, "second");
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(call_id, &WireValue::String("ok".to_string())),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let out = out.unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("ok"));
+        assert_eq!(out.bridge_calls[0].name, "tools:b.second");
+    }
+
+    #[test]
+    fn host_module_invalid_export_name_is_compile_error() {
+        let imports = [host_import(
+            "bad:name",
+            vec![("not a name", HostModuleNode::Data(WireValue::Null))],
+        )];
+        let err = run_with_source_imports(
+            r#"import * as x from "bad:name"; export default 1"#,
+            &imports,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, RunError::CompileError(m) if m.contains("not a name")),
+            "expected CompileError about the invalid key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn host_module_direct_dispatcher_call_with_bad_handle_rejects_catchably() {
+        // Sandbox code calling the reserved dispatcher directly with a bogus
+        // handle gets a catchable rejection — not a hang, not a crash.
+        let imports = vec![host_import(
+            "tools:x",
+            vec![("f", HostModuleNode::Function)],
+        )];
+        let (out, h) = run_with_host_imports(
+            r#"
+            import { f } from "tools:x";
+            let caught = "no";
+            try { await globalThis.__iso4_call(999) } catch (e) { caught = e.message }
+            export default caught
+            "#,
+            imports,
+            |_s, _payload| {
+                // No BridgeCall frame is ever written for the bad handle; the
+                // responder would block forever, so it must not be reached.
+                // (This closure only runs if a frame arrives — fail loudly.)
+                panic!("no BridgeCall frame expected for an invalid handle");
+            },
+        );
+        let out = out.unwrap();
+        let msg = get_default(&out).unwrap();
+        assert!(
+            msg.contains("no host import handle"),
+            "expected catchable rejection message, got: {msg}"
+        );
+        // One blocked record for the refused attempt.
+        assert_eq!(out.bridge_calls.len(), 1);
+        assert!(out.bridge_calls[0].blocked);
+        // The responder thread never got a frame; drop it by closing our end.
+        drop(h);
+    }
+
+    #[test]
+    fn host_module_import_meta_is_not_visible_to_user_code() {
+        // The values array rides on the HOST MODULE's import.meta only; user
+        // code's own import.meta must stay empty.
+        let imports = [host_import(
+            "conf:x",
+            vec![("v", HostModuleNode::Data(WireValue::Number(1.0)))],
+        )];
+        let out = run_with_source_imports(
+            r#"
+            import { v } from "conf:x";
+            export default `${v}|${JSON.stringify(import.meta.__iso4 ?? null)}`
+            "#,
+            &imports,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("1|null"));
+    }
+
+    #[test]
+    fn precompile_with_host_module_data_and_stored_trampoline_survives_snapshot() {
+        // The documented pattern: prefix imports a host module and stashes a
+        // function leaf on globalThis. The trampoline and data leaves are
+        // plain JS, so the snapshot must capture them; the postfix call then
+        // dispatches through the fresh per-run `__iso4_call` stub.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+
+        let imports = vec![host_import(
+            "tools:search",
+            vec![
+                ("query", HostModuleNode::Function),
+                ("limit", HostModuleNode::Data(WireValue::Number(5.0))),
+            ],
+        )];
+        let snapshot = precompile_module(
+            r#"
+            import { query, limit } from "tools:search";
+            globalThis.search = query;
+            globalThis.maxResults = limit;
+            export default 1;
+            "#,
+            "<prefix>",
+            &[],
+            &imports,
+        )
+        .unwrap();
+
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+        let handle = std::thread::spawn(move || {
+            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            let (call_id, target_kind, specifier, export_name, args) =
+                parse_bridge_call(&frame.payload);
+            assert_eq!(target_kind, 1);
+            assert_eq!(specifier.as_deref(), Some("tools:search"));
+            assert_eq!(export_name, "query");
+            assert_eq!(args, vec![WireValue::String("dogs".to_string())]);
+            ipc::write_ts_to_rust_frame(
+                &mut server,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(call_id, &WireValue::Number(3.0)),
+            )
+            .unwrap();
+        });
+
+        let out = execute_with_prefix(
+            &snapshot,
+            "export default (await globalThis.search('dogs')) + globalThis.maxResults",
+            None,
+            Limits::default(),
+            &[],
+            &imports,
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("8"));
+        assert_eq!(out.bridge_calls[0].name, "tools:search.query");
+    }
+
+    #[test]
+    fn postfix_can_import_host_module_declared_at_precompile() {
+        // The postfix itself may also import the declared specifier — the
+        // module is rebuilt in the run isolate from the same declared shape.
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+
+        let imports = vec![host_import(
+            "tools:t",
+            vec![("f", HostModuleNode::Function)],
+        )];
+        let snapshot =
+            precompile_module("globalThis.ready = true;", "<prefix>", &[], &imports).unwrap();
+
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+        let handle = std::thread::spawn(move || {
+            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            let (call_id, _, specifier, export_name, _) = parse_bridge_call(&frame.payload);
+            assert_eq!(specifier.as_deref(), Some("tools:t"));
+            assert_eq!(export_name, "f");
+            ipc::write_ts_to_rust_frame(
+                &mut server,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(call_id, &WireValue::Bool(true)),
+            )
+            .unwrap();
+        });
+
+        let out = execute_with_prefix(
+            &snapshot,
+            r#"import { f } from "tools:t"; export default await f()"#,
+            None,
+            Limits::default(),
+            &[],
+            &imports,
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn collect_import_handles_assigns_depth_first_walk_order() {
+        let imports = vec![
+            host_import(
+                "a",
+                vec![
+                    ("one", HostModuleNode::Function),
+                    ("data", HostModuleNode::Data(WireValue::Null)),
+                    (
+                        "obj",
+                        HostModuleNode::Object(vec![
+                            ("two".to_string(), HostModuleNode::Function),
+                            (
+                                "deeper".to_string(),
+                                HostModuleNode::Object(vec![(
+                                    "three".to_string(),
+                                    HostModuleNode::Function,
+                                )]),
+                            ),
+                        ]),
+                    ),
+                ],
+            ),
+            source_import("s", "export const x = 1;"),
+            host_import("b", vec![("four", HostModuleNode::Function)]),
+        ];
+        let handles = collect_import_handles(&imports);
+        let names: Vec<String> = handles.iter().map(|h| h.record_name()).collect();
+        assert_eq!(
+            names,
+            vec!["a.one", "a.obj.two", "a.obj.deeper.three", "b.four"]
+        );
+        assert_eq!(host_module_base_id(&imports, "a"), 0);
+        assert_eq!(host_module_base_id(&imports, "b"), 3);
     }
 }
