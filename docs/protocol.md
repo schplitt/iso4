@@ -45,15 +45,15 @@ Current protocol version: **`1`**.
 
 ### 2.1 TS → Rust
 
-|   Byte | Name             | Payload                 | Response                                             |
-| -----: | ---------------- | ----------------------- | ---------------------------------------------------- |
-| `0x01` | `Authenticate`   | `AuthenticatePayload`   | no frame; Rust closes the socket on mismatch         |
-| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result` |
-| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                       |
-| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | zero or more `BridgeCall`, then exactly one `Result` |
-| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                 |
-| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call              |
-| `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_TERMINATED`        |
+|   Byte | Name             | Payload                 | Response                                                                                                                         |
+| -----: | ---------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `Authenticate`   | `AuthenticatePayload`   | no frame; Rust closes the socket on mismatch                                                                                     |
+| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
+| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                   |
+| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
+| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                             |
+| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                          |
+| `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown |
 
 ### 2.2 Rust → TS
 
@@ -532,8 +532,7 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                           |
 | `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                            |
 | `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                 |
-| `ERR_ABORTED`                         | Host aborted the run.                                                       |
-| `ERR_TERMINATED`                      | Host sent `Terminate`.                                                      |
+| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).      |
 | `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                            |
 | `ERR_COMPILE`                         | Syntax/module compile error.                                                |
 | `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                       |

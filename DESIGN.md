@@ -562,9 +562,11 @@ A completed run:
 All three outcomes carry the run's timings (`durationMs` wall, `cpuTimeMs`
 active execution) and `bridgeCalls` — per-attempt metadata recorded inside
 the Rust runtime, including attempts blocked by limits (`blocked: true`); see
-§5 above. Exception: aborted runs report zeros and an empty `bridgeCalls`,
-because the abort tears the connection down before the runtime can send its
-result frame — graceful termination (#36) will close that gap.
+§5 above. Aborted runs carry these too: graceful termination (§14.7) has the
+runtime send a real result frame on abort, so timings and `bridgeCalls` reflect
+work done up to the abort. They report zeros and an empty `bridgeCalls` only
+when graceful termination falls back to socket teardown (a CPU-bound run not
+reading frames, or a signal already aborted at entry).
 
 If user code throws (uncaught), or the runtime kills the isolate (memory, CPU,
 wall), the run **fails**:
@@ -608,8 +610,8 @@ to `AbortController.abort(reason)`:
   error: { code: "ERR_ABORTED", name: "AbortError", message: "run was aborted" },
   reason,   // the value passed to abort(reason), or undefined
   stdout, stderr, durationMs,
-  cpuTimeMs,    // 0 — no result frame arrives from Rust on abort
-  bridgeCalls,  // [] — same reason; graceful termination (#36) will fill these
+  cpuTimeMs,    // real, from Rust's graceful abort result (0 on teardown fallback)
+  bridgeCalls,  // records up to the abort (empty on teardown fallback)
 }
 ```
 
@@ -649,7 +651,7 @@ direction. Both tables start at `0x01`.
 | `0x01` | `Authenticate`   | First message on connect: protocol version + token |
 | `0x02` | `Run`            | Start a sandboxed execution                        |
 | `0x03` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                  |
-| `0x04` | `Terminate`      | Force-stop a running isolate                       |
+| `0x04` | `Terminate`      | Ask Rust to abort a running run and reply with an `ERR_ABORTED` result (§14.7) |
 
 **Rust → TS**
 
@@ -1481,41 +1483,47 @@ a callback-handle protocol symmetric to callable return values. The same Phase
 `run({ signal })` and `prefix.run({ signal })` honor an `AbortSignal` that
 fires **at any point during a run**, not just at entry. A pre-aborted signal
 short-circuits to `ERR_ABORTED` before any frame is sent; an abort that lands
-mid-run tears the run down promptly.
+mid-run stops the run promptly and, wherever possible, **gracefully** — with a
+real result frame from Rust rather than a synthesized one (#36).
 
-Mechanism (TypeScript-only — no Rust control message is required):
+Graceful mechanism (the common case — a run suspended awaiting a bridge
+response, which is exactly how `durable-isolates` suspension works):
 
-1. **Interrupt the drain**: `drainUntilResult` subscribes to the signal. On
-   abort it closes the connection's frame reader (so the read loop throws) and
-   destroys the socket.
-2. **Reclaim the isolate**: destroying the socket makes the Rust session's
-   blocking bridge-response read observe EOF; it returns an error, `run_code`
-   unwinds, and the isolate is dropped — promptly, rather than waiting for
-   `wallTimeMs`.
-3. **Drop the late response**: an orphaned bridge handler that resolves *after*
-   the abort tries to write its `BridgeResponse` to a socket that is already
-   gone; the write fails silently. The sandbox therefore never observes a
-   return value for the call that was in flight when the abort landed. This
-   makes `controller.abort()` from inside a bridge handler a spoof-proof way to
-   stop a run: sandbox code cannot catch or swallow it, and no error name has
-   to propagate through the isolate. (This is the mechanism the
-   `durable-isolates` replay kernel uses to implement durable suspension.)
-4. **Keep the pool healthy**: a connection torn down this way is marked unusable
-   and is **not** returned to the free list. `ConnectionPool` disposes it and
-   opens a fresh replacement, so the pool keeps its full `maxIsolates`
-   complement and other/subsequent runs are unaffected.
+1. **Send `Terminate`**: `drainUntilResult` subscribes to the signal. On abort
+   it writes a `Terminate` frame (carrying the `runId`) and keeps draining,
+   leaving the socket open.
+2. **Rust aborts and reports**: the run's poll loop is parked on the socket read
+   awaiting a `BridgeResponse`; it reads the `Terminate` instead, calls
+   `terminate_execution()`, and returns an `ERR_ABORTED` result carrying the
+   real `durationMs`, `cpuTimeMs`, and the bridge-call records collected so far.
+3. **Remap and reuse**: that result flows back through `drainFrames`; `index.ts`
+   sees the aborted signal + `ERR_ABORTED` code and remaps it to
+   `status: 'aborted'` with the abort `reason`, keeping the telemetry. The
+   connection stays healthy and is **returned to the pool** — no reconnect.
+4. **Drop the late response**: an orphaned bridge handler that resolves *after*
+   the abort writes its `BridgeResponse` onto the (reused) connection, where it
+   is discarded — session.rs ignores stray responses and the monotonic
+   per-connection call-ID counter guarantees a stale callId never matches a
+   later run's resolver. The sandbox therefore never observes a return value for
+   the call that was in flight when the abort landed, so `controller.abort()`
+   from inside a bridge handler is a spoof-proof way to stop a run.
+
+**Fallback (CPU-bound caveat)**: a purely CPU-bound run (no bridge call in
+flight) is spinning inside `module.evaluate()` and never reaches the poll-loop
+frame read, so Rust cannot consume the `Terminate`. If no result arrives within
+a short grace window (`TERMINATE_GRACE_MS`, ~100 ms), TS falls back to the
+teardown path: it closes the frame reader and destroys the socket. The `run()`
+promise resolves as aborted immediately with synthesized zeros, the connection
+is marked unusable and replaced by `ConnectionPool` (keeping the full
+`maxIsolates` complement), and the abandoned isolate is reclaimed only when its
+**CPU guard** fires — bounded by `cpuTimeMs`, not `wallTimeMs`. Promptly
+interrupting a busy isolate would require a Rust-side `terminate_execution`
+driven by an out-of-band signal (e.g. a socket-hangup watcher); this is
+deferred until a consumer needs it.
 
 The `run()` promise resolves with `status: 'aborted'` (see §5.2) in all cases —
 carrying the value passed to `abort(reason)`, and retaining `error.code:
 'ERR_ABORTED'` for backward compatibility.
-
-**CPU-bound caveat**: a purely CPU-bound run (no bridge call in flight) is
-spinning inside `module.evaluate()` and does not observe the socket close.
-The `run()` promise still resolves as aborted immediately, but the abandoned
-isolate is only reclaimed when its **CPU guard** fires — bounded by
-`cpuTimeMs`, not `wallTimeMs`. Promptly interrupting a busy isolate would
-require a Rust-side `terminate_execution` triggered by a control message; this
-is deferred until a consumer needs it.
 
 ---
 

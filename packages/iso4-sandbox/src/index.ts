@@ -166,26 +166,30 @@ function toWireLimits(limits: Partial<ResourceLimits> | undefined): {
 
 /**
  * The `RunResult` returned when a run is aborted — whether the signal was
- * already aborted at run entry or fired mid-flight (surfaced as a
- * `RunAbortedError` from the client). Shared so both paths produce an
- * identical shape. `error` (code `ERR_ABORTED`) is retained for backward
- * compatibility; `reason` carries whatever was passed to `abort(reason)`.
+ * already aborted at run entry or fired mid-flight. `error` (code `ERR_ABORTED`)
+ * is retained for backward compatibility; `reason` carries whatever was passed
+ * to `abort(reason)`.
  *
- * An abort teardown means no Result frame from Rust, so timings and
- * `bridgeCalls` are empty — graceful termination (#36) will fill them in.
+ * When graceful termination (#36) succeeds, Rust sends a real `ERR_ABORTED`
+ * Result and `from` carries its telemetry — duration, CPU time, bridge records,
+ * and any logs produced before the abort landed — which is grafted onto the
+ * aborted shape. When it falls back to socket teardown (or the signal was
+ * already aborted at entry), no Result arrives from Rust, so `from` is omitted
+ * and timings/`bridgeCalls` report zeros/empty.
  * @param reason
+ * @param from
  */
-function abortedResult(reason?: unknown): RunResult {
+function abortedResult(reason?: unknown, from?: RunResult): RunResult {
   return {
     status: 'aborted',
     ok: false,
     error: { code: 'ERR_ABORTED', name: 'AbortError', message: 'run was aborted' },
     reason,
-    stdout: [],
-    stderr: [],
-    durationMs: 0,
-    cpuTimeMs: 0,
-    bridgeCalls: [],
+    stdout: from?.stdout ?? [],
+    stderr: from?.stderr ?? [],
+    durationMs: from?.durationMs ?? 0,
+    cpuTimeMs: from?.cpuTimeMs ?? 0,
+    bridgeCalls: from?.bridgeCalls ?? [],
   }
 }
 
@@ -235,7 +239,14 @@ class SandboxImpl implements Sandbox {
           imports: bindings,
           signal: options.signal,
         })
-        return decodeRunCompletionPayload(raw.result, resolveName).result
+        const decoded = decodeRunCompletionPayload(raw.result, resolveName).result
+        // Graceful terminate (#36): a run whose signal aborted and whose Rust
+        // Result carries ERR_ABORTED is a deliberate abort, not a failure —
+        // remap to `status: 'aborted'` with the abort reason, keeping the real
+        // telemetry Rust reported.
+        if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')
+          return abortedResult(options.signal.reason, decoded)
+        return decoded
       })
     } catch (error) {
       if (error instanceof RunAbortedError)
@@ -426,7 +437,12 @@ implements Prefix<G, M> {
           globals: allGlobals,
           signal: options.signal,
         })
-        return decodeRunCompletionPayload(raw.result, resolveName).result
+        const decoded = decodeRunCompletionPayload(raw.result, resolveName).result
+        // See the note in SandboxImpl.run — remap a graceful ERR_ABORTED Result
+        // to `status: 'aborted'`, preserving the runtime's telemetry.
+        if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')
+          return abortedResult(options.signal.reason, decoded)
+        return decoded
       })
     } catch (error) {
       if (error instanceof RunAbortedError)

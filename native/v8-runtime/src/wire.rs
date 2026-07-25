@@ -597,6 +597,13 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: None,
             fields: None,
         },
+        RunError::Aborted => RunErrorPayload {
+            code: "ERR_ABORTED".to_string(),
+            name: "AbortError".to_string(),
+            message: "run was aborted".to_string(),
+            stack: None,
+            fields: None,
+        },
         RunError::Internal(msg) => RunErrorPayload {
             code: "ERR_INTERNAL".to_string(),
             name: "Error".to_string(),
@@ -1166,5 +1173,12 @@ mod tests {
     fn memory_limit_maps_to_err_memory_limit() {
         let payload = run_error_to_payload(&RunError::MemoryLimit);
         assert_eq!(payload.code, "ERR_MEMORY_LIMIT");
+    }
+
+    #[test]
+    fn aborted_maps_to_err_aborted() {
+        let payload = run_error_to_payload(&RunError::Aborted);
+        assert_eq!(payload.code, "ERR_ABORTED");
+        assert_eq!(payload.name, "AbortError");
     }
 }

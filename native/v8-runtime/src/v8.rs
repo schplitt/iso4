@@ -483,6 +483,11 @@ pub enum RunError {
     ExportTooLarge,
     /// Total bridge calls in this run exceeded `limits.maxBridgeCalls`.
     BridgeCallLimitExceeded,
+    /// The host asked to stop the run via a `Terminate` frame (graceful abort,
+    /// #36). Surfaced to the sandbox consumer as `ERR_ABORTED`. Unlike the
+    /// socket-teardown fallback, this arm carries the real duration, CPU time,
+    /// and bridge-call records collected before the abort landed.
+    Aborted,
     /// Unexpected internal runtime failure.
     Internal(String),
 }
@@ -1073,16 +1078,57 @@ fn run_module_inner(
                 ));
             }
             Ok(frame) => {
-                // ── Validate and decode the BridgeResponse ───────────────
-                if frame.message_type != ipc::TsToRustMessageType::BridgeResponse {
-                    return Err(failure(
-                        RunError::Internal(format!(
-                            "poll loop: expected BridgeResponse, got {:?}",
-                            frame.message_type
-                        )),
-                        &logs,
-                        start,
-                    ));
+                // ── Validate and decode the frame ────────────────────────
+                match frame.message_type {
+                    ipc::TsToRustMessageType::BridgeResponse => {}
+                    ipc::TsToRustMessageType::Terminate => {
+                        // Graceful abort (#36). The TS host sends `Terminate`
+                        // (carrying the run ID) when its `AbortSignal` fires
+                        // while the sandbox is suspended awaiting a bridge
+                        // response — precisely the durable-isolates suspension
+                        // case, and precisely when the V8 thread is parked here
+                        // reading the socket and can observe the frame.
+                        //
+                        // Stop the run and return `Aborted`; `run_module` stamps
+                        // the CPU time and the bridge-call records gathered so
+                        // far onto the failure, so the aborted result carries
+                        // real telemetry instead of the synthesized zeros of the
+                        // socket-teardown fallback.
+                        //
+                        // NOT-IDEAL / DEFERRED: this only reaches a run that is
+                        // parked on this socket read. A purely CPU-bound run
+                        // (tight loop, no bridge call in flight) never returns
+                        // here, so a control-message `Terminate` cannot interrupt
+                        // it — that isolate is reclaimed only when the CPU guard
+                        // fires (bounded by `cpuTimeMs`), and the TS side falls
+                        // back to tearing the socket down. Promptly interrupting
+                        // a busy isolate is deliberately deferred; see
+                        // DESIGN.md §14.7.
+                        //
+                        // Only one run is ever in flight per connection, so the
+                        // run ID in the payload is redundant for routing; parse
+                        // it for validation/diagnostics only.
+                        match ipc::parse_terminate_payload(&frame.payload) {
+                            Ok(run_id) => {
+                                eprintln!("[iso4-v8] Terminate received for run {run_id} — aborting")
+                            }
+                            Err(e) => eprintln!(
+                                "[iso4-v8] Terminate received with malformed payload ({e}) — aborting"
+                            ),
+                        }
+                        cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+                        cancel_handle.terminate_execution();
+                        return Err(failure(RunError::Aborted, &logs, start));
+                    }
+                    other => {
+                        return Err(failure(
+                            RunError::Internal(format!(
+                                "poll loop: expected BridgeResponse or Terminate, got {other:?}"
+                            )),
+                            &logs,
+                            start,
+                        ));
+                    }
                 }
                 // Frame size is already bounded by bridge_frame_limit (= memoryMb
                 // or DEFAULT_MAX_FRAME_LENGTH) at the read_frame_with_limit call
@@ -4734,6 +4780,47 @@ mod tests {
         );
         h.join().unwrap();
         assert_eq!(get_default(&out.unwrap()).as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn terminate_frame_aborts_run_with_telemetry() {
+        // Graceful abort (#36): while the sandbox is suspended awaiting a bridge
+        // response, the host sends `Terminate` instead of a `BridgeResponse`.
+        // The run must return `ERR_ABORTED` and still carry the in-flight bridge
+        // record and real timings — not the synthesized zeros of a teardown.
+        let (out, h) = run_with_bridge(
+            "export default await myTool()",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::Terminate,
+                    &7u32.to_be_bytes(),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let failure = out.unwrap_err();
+        assert!(
+            matches!(failure.error, RunError::Aborted),
+            "expected Aborted, got {:?}",
+            failure.error
+        );
+        // The bridge call that was in flight when the abort landed is recorded
+        // (unsettled → ok=false), not dropped.
+        assert_eq!(failure.bridge_calls.len(), 1);
+        assert_eq!(failure.bridge_calls[0].raw_name, "myTool");
+        assert!(!failure.bridge_calls[0].ok);
+        assert!(!failure.bridge_calls[0].blocked);
+        // Timings are stamped from the shared run state, not left as zeros.
+        assert!(failure.duration_ms >= 0.0);
+        assert!(failure.cpu_time_ms >= 0.0);
     }
 
     #[test]
