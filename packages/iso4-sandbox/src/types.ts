@@ -445,6 +445,17 @@ export interface Sandbox {
   /**
    * eslint-disable \@typescript-eslint/no-empty-object-type
    */
+  prepare: <
+    G extends HostGlobals = {},
+    M extends Imports = {},
+  >(
+    options: PrecompileOptions<G, M>,
+  ) => Promise<Prefix<G, M>>
+
+  /**
+   * @deprecated Renamed to {@link Sandbox.prepare}. `precompile` stays as an
+   * alias (identical behavior) and is slated for removal in a future major.
+   */
   precompile: <
     G extends HostGlobals = {},
     M extends Imports = {},
@@ -555,9 +566,15 @@ export interface Prefix<
    * host-import function exports declared in `I`.
    *
    * @example
-   *   const result = await prefix.run({
+   *   const result = await prefix.execute({
    *     code: `export default await (${agentFn})()`,
    *   })
+   */
+  execute: (options: PrefixRunOptions<G, M>) => Promise<RunResult>
+
+  /**
+   * @deprecated Renamed to {@link Prefix.execute}. `run` stays as an alias
+   * (identical behavior) and is slated for removal in a future major.
    */
   run: (options: PrefixRunOptions<G, M>) => Promise<RunResult>
 
