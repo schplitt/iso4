@@ -27,7 +27,7 @@ import { createSafeFetch } from '@iso4/fetch'
 const sandbox = await createSandbox()
 
 // Compile host setup once into a V8 snapshot
-const prefix = await sandbox.precompile({
+const prefix = await sandbox.prepare({
   code: `
     const config = { apiBase: 'https://api.example.com' }
     globalThis.config = config
@@ -38,7 +38,7 @@ const prefix = await sandbox.precompile({
 })
 
 // Run agent-generated code against the snapshot — as many times as needed
-const result = await prefix.run({
+const result = await prefix.execute({
   code: `
     const res = await fetch(config.apiBase + '/users')
     export default { count: res.length }
@@ -54,6 +54,10 @@ if (result.ok) {
 
 await sandbox.dispose()
 ```
+
+> `sandbox.prepare()` and `prefix.execute()` are the current names. The former
+> names — `sandbox.precompile()` and `prefix.run()` — remain as deprecated
+> aliases with identical behavior and will be removed in a future major.
 
 ## How globals work
 
@@ -77,22 +81,22 @@ not class instances with methods.
 
 ## TypeScript-checked rebinding
 
-`precompile()` infers the globals shape `G` from what you pass, and the
+`prepare()` infers the globals shape `G` from what you pass, and the
 returned `Prefix<G>` only allows rebinding those names at run time:
 
 ```ts
-const prefix = await sandbox.precompile({
+const prefix = await sandbox.prepare({
   globals: { fetch: defaultFetch, myTool: defaultTool },
 })
 
-prefix.run({ globals: { fetch: perUserFetch } }) // ✅ rebind one
-prefix.run({ globals: { unknown: handler } }) // ❌ TS error
+prefix.execute({ globals: { fetch: perUserFetch } }) // ✅ rebind one
+prefix.execute({ globals: { unknown: handler } }) // ❌ TS error
 ```
 
 ## Resource limits
 
 ```ts
-prefix.run({
+prefix.execute({
   code: agentCode,
   limits: {
     cpuTimeMs: 200, // active JS execution only (await time excluded)
@@ -111,7 +115,7 @@ carry an ambient value across `await` points — concurrency-safe, unlike a
 module variable:
 
 ```ts
-prefix.run({
+prefix.execute({
   code: `
     import { AsyncLocalStorage } from 'node:async_hooks'
     const als = new AsyncLocalStorage()
@@ -125,7 +129,7 @@ prefix.run({
 
 Only `run(store, callback, ...args)` and `getStore()` are provided. Built on
 V8's continuation-preserved embedder data; no promise hooks, so it's free
-unless used. Not available in `precompile()` (prefix) code — it's for the
+unless used. Not available in `prepare()` (prefix) code — it's for the
 postfix. See DESIGN.md §16.
 
 ## Result shape
@@ -179,7 +183,7 @@ Thrown errors keep their identity across the bridge, in both directions:
 
 V8 runs in a separate Rust subprocess communicating over a Unix domain socket.
 A pool of connections (one per `maxIsolates` slot) provides concurrency —
-five concurrent `prefix.run()` calls each get their own slot and execute in
+five concurrent `prefix.execute()` calls each get their own slot and execute in
 parallel.
 
 ## License

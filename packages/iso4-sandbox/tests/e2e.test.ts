@@ -249,6 +249,24 @@ describe('precompile + prefix.run()', () => {
     await prefix.dispose()
   })
 
+  test('prepare()/execute() are aliases of precompile()/run()', async () => {
+    // The canonical names must behave identically to the deprecated aliases,
+    // and interoperate (a prefix from prepare() still answers run()).
+    const prefix = await runtime.prepare({ code: 'globalThis.base = 200' })
+    const viaExecute = await prefix.execute({ code: 'export default globalThis.base + 1' })
+    expect(viaExecute.ok).toBe(true)
+    if (!viaExecute.ok)
+      return
+    expect(viaExecute.exports.default).toBe(201)
+    // Deprecated run() still works on a prefix produced by prepare().
+    const viaRun = await prefix.run({ code: 'export default globalThis.base + 2' })
+    expect(viaRun.ok).toBe(true)
+    if (!viaRun.ok)
+      return
+    expect(viaRun.exports.default).toBe(202)
+    await prefix.dispose()
+  })
+
   test('many postfix runs against the same prefix', async () => {
     const prefix = await runtime.precompile({
       code: 'globalThis.multiplier = 10',

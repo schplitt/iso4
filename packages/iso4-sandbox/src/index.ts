@@ -224,9 +224,26 @@ class SandboxImpl implements Sandbox {
   }
 
   /**
+   * @deprecated Renamed to {@link SandboxImpl.prepare}; kept as an alias.
    * @param options
    */
   async precompile<
+    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+    G extends HostGlobals = {},
+    // eslint-disable-next-line @typescript-eslint/no-empty-object-type
+    M extends Imports = {},
+  >(
+    options: PrecompileOptions<G, M>,
+  ): Promise<Prefix<G, M>> {
+    return this.prepare<G, M>(options)
+  }
+
+  /**
+   * Pre-compile a prefix of code into a V8 startup snapshot. See
+   * {@link Sandbox.prepare}.
+   * @param options
+   */
+  async prepare<
     // eslint-disable-next-line @typescript-eslint/no-empty-object-type
     G extends HostGlobals = {},
     // eslint-disable-next-line @typescript-eslint/no-empty-object-type
@@ -330,6 +347,17 @@ implements Prefix<G, M> {
     return this._alive
   }
 
+  /**
+   * Execute dynamic code against this prefix's snapshot. See
+   * {@link Prefix.execute}.
+   */
+  async execute(options: PrefixRunOptions<G, M>): Promise<RunResult> {
+    return this.run(options)
+  }
+
+  /**
+   * @deprecated Renamed to {@link PrefixImpl.execute}; kept as an alias.
+   */
   async run(options: PrefixRunOptions<G, M>): Promise<RunResult> {
     if (!this._alive) {
       return {
