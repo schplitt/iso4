@@ -3,10 +3,7 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-mod ipc;
-mod session;
-mod v8;
-mod wire;
+use iso4_v8_runtime::session;
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;

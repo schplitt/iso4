@@ -1,0 +1,11 @@
+//! iso4-v8 library target.
+//!
+//! The product is the `iso4-v8` binary (`src/main.rs`); this lib target
+//! exists so `benches/` (criterion, `cargo bench`) can reach the wire codec
+//! and the V8 conversion helpers. It is `publish = false` and has no public
+//! API stability guarantees — nothing outside this repository links it.
+
+pub mod ipc;
+pub mod session;
+pub mod v8;
+pub mod wire;

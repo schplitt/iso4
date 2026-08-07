@@ -9,6 +9,20 @@ publish = false
 [[bin]]
 name = "iso4-v8"
 path = "src/main.rs"
+# `cargo bench` must run only the criterion target below — the default
+# libtest harness rejects criterion's `--output-format bencher` flag.
+bench = false
+
+# Lib target so `benches/` can reach the wire codec and V8 helpers.
+# Nothing outside this repository links it (publish = false above).
+[lib]
+name = "iso4_v8_runtime"
+path = "src/lib.rs"
+bench = false
+
+[[bench]]
+name = "micro"
+harness = false
 
 [dependencies]
 # Embedded V8 via the official rusty_v8 crate
@@ -22,6 +36,11 @@ signal-hook = "0.3"
 
 # POSIX bits: fcntl, pipe, poll, FD_CLOEXEC
 libc = "0.2"
+
+[dev-dependencies]
+# Wall-time microbenchmarks (benches/micro.rs). Plots and rayon disabled:
+# CI only needs `--output-format bencher` text output.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.release]
 # LTO and panic=abort produce a smaller, faster binary with no unwinding tables
