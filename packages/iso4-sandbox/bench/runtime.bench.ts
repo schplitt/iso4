@@ -16,6 +16,7 @@
 import { afterAll, bench, describe } from 'vitest'
 import { createSandbox as createRuntime } from '../src/index.js'
 import type { Prefix as DynamicPrefix, Sandbox as Runtime } from '../src/index.js'
+import { HEAVY_OPTS } from './profile.js'
 
 const SAMPLE_CODE = 'export default 42'
 
@@ -39,7 +40,7 @@ afterAll(async () => {
 //
 // warmupIterations: 0 — each iteration spawns a real binary; warmup would
 //                        just add extra spawn overhead before the timed region.
-// iterations: 50      — small sample; each call takes ~50–200 ms.
+// iterations           — small sample (see profile.ts); each call takes ~50–200 ms.
 
 describe('cold start', () => {
   bench(
@@ -49,7 +50,7 @@ describe('cold start', () => {
       await rt.run({ code: SAMPLE_CODE })
       await rt.dispose()
     },
-    { warmupIterations: 0, iterations: 50 },
+    HEAVY_OPTS,
   )
 
   bench(
@@ -60,7 +61,7 @@ describe('cold start', () => {
       await prefix.run({ code: SAMPLE_CODE })
       await rt.dispose()
     },
-    { warmupIterations: 0, iterations: 50 },
+    HEAVY_OPTS,
   )
 })
 
@@ -69,9 +70,9 @@ describe('cold start', () => {
 describe('hot run', () => {
   bench('direct  (runtime.run — no snapshot)', async () => {
     await hotDirectRt.run({ code: SAMPLE_CODE })
-  }, { warmupIterations: 0, iterations: 50 })
+  }, HEAVY_OPTS)
 
   bench('prefix  (prefix.run — from snapshot)', async () => {
     await hotPrefix.run({ code: SAMPLE_CODE })
-  }, { warmupIterations: 0, iterations: 50 })
+  }, HEAVY_OPTS)
 })

@@ -2775,7 +2775,7 @@ fn eval_script<'s>(
 ///
 /// Used to materialise the host's bridge response back into the JS context.
 /// Returns `None` only when V8 string allocation fails (essentially never).
-fn wire_to_v8_value<'s>(
+pub fn wire_to_v8_value<'s>(
     scope: &mut v8::HandleScope<'s>,
     value: &WireValue,
 ) -> Option<v8::Local<'s, v8::Value>> {
@@ -3303,7 +3303,7 @@ fn serialize_object_fields(
 /// Shared but non-cyclic references (the same object appearing in two
 /// different fields) are serialised correctly: the object is popped after
 /// the first field, so it is not in the set when the second field is visited.
-fn value_to_wire(
+pub fn value_to_wire(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
     visiting: &mut Vec<v8::Global<v8::Value>>,

@@ -40,7 +40,8 @@
   "scripts": {
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
-    "bench": "vitest bench bench/runtime.bench.ts",
+    "bench": "vitest bench --run",
+    "bench:json": "vitest bench --run --outputJson bench-results.json",
     "test": "vitest",
     "test:run": "vitest run"
   },

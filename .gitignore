@@ -5,6 +5,10 @@ node_modules
 # Rust build outputs
 target
 
+# Benchmark outputs (vitest bench --outputJson / criterion)
+bench-results.json
+bench-results
+
 # Native binaries copied into platform packages — built in CI, never committed
 packages/iso4-v8-*/bin/iso4-v8
 
