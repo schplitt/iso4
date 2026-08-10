@@ -14,6 +14,21 @@
 //! Nothing else in the protocol changes. A type that cannot be represented in
 //! this build reports `CodecError::Unsupported`, which the caller maps to
 //! `ERR_TYPE_NOT_SERIALIZABLE`.
+//!
+//! # The two directions use different mechanisms
+//!
+//! **Sandbox → host** writes real V8 host objects: the instances carry internal
+//! fields, so V8 routes them to `write_host_object` itself, at any depth, with
+//! no cost for ordinary values.
+//!
+//! **Host → sandbox** cannot do that. Node's `v8.Serializer` exposes no
+//! delegate to JavaScript, so the host cannot emit a host object at all. Instead
+//! it substitutes each instance with a **branded plain object** carrying the
+//! same fields, serializes the graph normally, and `rehydrate` (below) walks the
+//! result swapping brands for real instances. That works at any depth, for any
+//! type, and needs no hand-written framing.
+//!
+//! The asymmetry is safe because the two directions never share a reader.
 
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
@@ -83,7 +98,7 @@ fn write_bytes(helper: &dyn ValueSerializerHelper, bytes: &[u8]) {
     helper.write_raw_bytes(bytes);
 }
 
-fn read_bytes<'a>(helper: &'a dyn ValueDeserializerHelper) -> Codec<&'a [u8]> {
+fn read_bytes(helper: &dyn ValueDeserializerHelper) -> Codec<&[u8]> {
     let mut len = 0u32;
     if !helper.read_uint32(&mut len) {
         return malformed("truncated length");
@@ -143,7 +158,7 @@ fn encode_headers(
     };
     // The list is flat [name, value, …], so entry count is half its length.
     let flat = view.list.length();
-    if flat % 2 != 0 {
+    if !flat.is_multiple_of(2) {
         return malformed("Headers entry list has an odd length");
     }
     if flat / 2 > MAX_HEADER_ENTRIES {
@@ -175,7 +190,7 @@ fn decode_headers<'s>(
         Err(_) => return malformed("Headers entry list is not an array"),
     };
     let flat = list.length();
-    if flat % 2 != 0 {
+    if !flat.is_multiple_of(2) {
         return malformed("Headers entry list has an odd length");
     }
     if flat / 2 > MAX_HEADER_ENTRIES {
@@ -193,23 +208,31 @@ fn decode_headers<'s>(
 
 // ── Bodies ───────────────────────────────────────────────────────────────────
 
+/// The protocol permits exactly `null | string | Uint8Array`.
+///
+/// Checked in one place, used by the writer and by descriptor rehydration.
+/// Accepting any `ArrayBufferView` here would let a `DataView` or `Uint16Array`
+/// serialize out of Rust and then be refused by the host reader — turning a
+/// user value into a host-side decode failure.
+fn check_body(body: v8::Local<v8::Value>) -> Codec<v8::Local<v8::Value>> {
+    let ok = body.is_null_or_undefined() || body.is_string() || body.is_uint8_array();
+    if ok {
+        Ok(body)
+    } else {
+        Err(CodecError::Unsupported(
+            "body must be null, a string, or a Uint8Array — a stream cannot cross the \
+             sandbox boundary; buffer it first (await res.arrayBuffer())"
+                .to_string(),
+        ))
+    }
+}
+
 fn encode_body(
     scope: &mut v8::HandleScope,
     helper: &dyn ValueSerializerHelper,
     body: v8::Local<v8::Value>,
 ) -> Codec<()> {
-    // Only self-contained bodies cross. Checked here rather than left to V8 so
-    // the message names the real problem instead of "could not be cloned".
-    let self_contained = body.is_null_or_undefined()
-        || body.is_string()
-        || v8::Local::<v8::ArrayBufferView>::try_from(body).is_ok();
-    if !self_contained {
-        return Err(CodecError::Unsupported(
-            "body is not self-contained — a stream cannot cross the sandbox boundary; \
-             buffer it first (await res.arrayBuffer())"
-                .to_string(),
-        ));
-    }
+    let body = check_body(body)?;
     // V8 writes the bytes once, straight out of the backing store. Framing it
     // by hand meant copy_contents into a Vec and then a second copy into the
     // serializer.
@@ -226,9 +249,10 @@ fn decode_body<'s>(
 ) -> Codec<v8::Local<'s, v8::Value>> {
     let context = scope.get_current_context();
     // null, a string, or a Uint8Array — V8 preserves which, so there is no
-    // kind byte to agree on.
+    // kind byte to agree on. Still validated: a spoofed payload must not be
+    // able to hand user code a Response whose body is an arbitrary object.
     match helper.read_value(context) {
-        Some(v) => Ok(v),
+        Some(v) => check_body(v),
         None => malformed("truncated body"),
     }
 }
@@ -357,6 +381,173 @@ pub fn decode<'s>(
         TAG_INVALID => malformed("payload carries the reserved invalid tag"),
         other => Err(CodecError::Unsupported(format!(
             "received a {} (tag {other}); this build cannot materialise one",
+            tag_name(other)
+        ))),
+    }
+}
+
+// ── Rehydration (host → sandbox) ─────────────────────────────────────────────
+
+/// Property name marking a branded descriptor. Wire contract — kept in sync
+/// with `BRAND` in `packages/iso4-sandbox/src/web-codec.ts`.
+pub const BRAND: &str = "__iso4_ht";
+
+/// Cheap pre-check: could this blob contain a branded descriptor at all?
+///
+/// V8 writes property names as literal bytes, so if the brand is present the
+/// string appears verbatim. A false positive costs one harmless walk; a false
+/// negative is impossible. This keeps the walk off the overwhelmingly common
+/// path where a value contains no host types.
+pub fn might_contain_web_types(blob: &[u8]) -> bool {
+    let needle = BRAND.as_bytes();
+    blob.len() >= needle.len() && blob.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Replace every branded descriptor in `value` with a real instance, in place.
+///
+/// Depth-limited rather than cycle-tracked: V8 preserves object identity, so a
+/// cyclic graph would otherwise recurse forever. 32 levels is far past anything
+/// a request/response payload needs, and exceeding it is a refusal rather than
+/// silent truncation.
+pub fn rehydrate<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    value: v8::Local<'s, v8::Value>,
+) -> Codec<v8::Local<'s, v8::Value>> {
+    rehydrate_at(scope, value, 0)
+}
+
+const MAX_DEPTH: u32 = 32;
+
+fn rehydrate_at<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    value: v8::Local<'s, v8::Value>,
+    depth: u32,
+) -> Codec<v8::Local<'s, v8::Value>> {
+    if depth > MAX_DEPTH {
+        return Err(CodecError::Unsupported(format!(
+            "value nests deeper than {MAX_DEPTH} levels; cannot scan it for host types"
+        )));
+    }
+    if !value.is_object() || value.is_array_buffer_view() || value.is_array_buffer() {
+        return Ok(value);
+    }
+    let obj: v8::Local<v8::Object> = match value.try_into() {
+        Ok(o) => o,
+        Err(_) => return Ok(value),
+    };
+
+    // A branded descriptor is replaced wholesale; its own fields are plain data.
+    if let Some(tag) = brand_of(scope, obj)? {
+        return build_from_descriptor(scope, obj, tag).map(|o| o.into());
+    }
+
+    if let Ok(array) = v8::Local::<v8::Array>::try_from(value) {
+        for i in 0..array.length() {
+            if let Some(item) = array.get_index(scope, i) {
+                let replaced = rehydrate_at(scope, item, depth + 1)?;
+                array.set_index(scope, i, replaced);
+            }
+        }
+        return Ok(value);
+    }
+
+    // Own enumerable string keys only — the same surface V8 serialized.
+    let keys = match obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default()) {
+        Some(k) => k,
+        None => return Ok(value),
+    };
+    for i in 0..keys.length() {
+        let Some(key) = keys.get_index(scope, i) else {
+            continue;
+        };
+        let Some(item) = obj.get(scope, key) else {
+            continue;
+        };
+        let replaced = rehydrate_at(scope, item, depth + 1)?;
+        if replaced != item {
+            obj.set(scope, key, replaced);
+        }
+    }
+    Ok(value)
+}
+
+fn brand_of(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>) -> Codec<Option<u32>> {
+    let Some(key) = v8::String::new(scope, BRAND) else {
+        return malformed("could not intern the brand key");
+    };
+    match obj.get(scope, key.into()) {
+        Some(v) if v.is_uint32() => Ok(v.uint32_value(scope)),
+        _ => Ok(None),
+    }
+}
+
+fn descriptor_field<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    obj: v8::Local<v8::Object>,
+    name: &str,
+) -> Codec<v8::Local<'s, v8::Value>> {
+    let Some(key) = v8::String::new(scope, name) else {
+        return malformed("could not intern a descriptor key");
+    };
+    match obj.get(scope, key.into()) {
+        Some(v) => Ok(v),
+        None => malformed(&format!("descriptor is missing '{name}'")),
+    }
+}
+
+/// Turn one branded descriptor into a real instance.
+///
+/// Adding a type here plus a tag is the whole cost of making a new class cross
+/// in this direction.
+fn build_from_descriptor<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    desc: v8::Local<v8::Object>,
+    tag: u32,
+) -> Codec<v8::Local<'s, v8::Object>> {
+    let headers_value = descriptor_field(scope, desc, "headers")?;
+    let headers_list: v8::Local<v8::Array> = match headers_value.try_into() {
+        Ok(a) => a,
+        Err(_) => return malformed("descriptor headers is not an array"),
+    };
+    let flat = headers_list.length();
+    if !flat.is_multiple_of(2) {
+        return malformed("descriptor headers has an odd length");
+    }
+    if flat / 2 > MAX_HEADER_ENTRIES {
+        return Err(CodecError::Unsupported(format!(
+            "descriptor declares {} header entries, exceeding the {MAX_HEADER_ENTRIES} limit",
+            flat / 2
+        )));
+    }
+    let headers = match webtypes::make_headers(scope, headers_list) {
+        Some(h) => h,
+        None => return malformed("could not construct Headers"),
+    };
+
+    match tag {
+        TAG_HEADERS => Ok(headers),
+        TAG_REQUEST => {
+            let url = descriptor_field(scope, desc, "url")?;
+            let method = descriptor_field(scope, desc, "method")?;
+            let body = check_body(descriptor_field(scope, desc, "body")?)?;
+            match webtypes::make_request(scope, url, method, headers, body) {
+                Some(r) => Ok(r),
+                None => malformed("could not construct Request"),
+            }
+        }
+        TAG_RESPONSE => {
+            let status = descriptor_field(scope, desc, "status")?
+                .uint32_value(scope)
+                .unwrap_or(200);
+            let status_text = descriptor_field(scope, desc, "statusText")?;
+            let body = check_body(descriptor_field(scope, desc, "body")?)?;
+            match webtypes::make_response(scope, status, status_text, headers, body) {
+                Some(r) => Ok(r),
+                None => malformed("could not construct Response"),
+            }
+        }
+        other => Err(CodecError::Unsupported(format!(
+            "received a {} descriptor (tag {other}); this build cannot materialise one",
             tag_name(other)
         ))),
     }
@@ -530,5 +721,4 @@ mod tests {
         });
         assert!(err.contains("exceeding the 1024 limit"), "got: {err}");
     }
-
 }

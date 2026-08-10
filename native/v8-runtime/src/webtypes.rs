@@ -14,8 +14,30 @@
 //! a per-object tax on the bulk export path. workerd avoids it the same way
 //! (`src/workerd/jsg/ser.c++`, `Serializer::HasCustomHostObject`).
 //!
-//! The shell also stores its type tag in internal field 0, so
-//! `write_host_object` dispatches in O(1) with no prototype walk.
+//! The internal field is deliberately left **empty**. It exists only to make
+//! V8 route the object; nothing is ever written into it. That is not an
+//! oversight — `rusty_v8`'s built-in snapshot callback reads every embedder
+//! field as an *aligned pointer* and memcpy's out of it:
+//!
+//! ```cpp
+//! // v8 crate, src/binding.cc — identical in 130 and 146
+//! InternalFieldData* embedder_field = static_cast<InternalFieldData*>(
+//!     holder->GetAlignedPointerFromInternalField(index));
+//! if (embedder_field == nullptr) return {nullptr, 0};
+//! memcpy(payload, embedder_field, sizeof(*embedder_field));
+//! ```
+//!
+//! An earlier version stored the type tag here as a `v8::Integer`. A Smi read
+//! back as a pointer is non-null garbage, so any snapshot containing a live
+//! instance segfaulted the process — `globalThis.r = new Response("x")` in
+//! prefix code was enough. Leaving the field empty makes the callback see
+//! `nullptr` and return cleanly. Storing a real pointer instead would mean
+//! `unsafe`, a per-instance allocation, and a dependency on the layout of
+//! `rusty_v8`'s own `InternalFieldData` — far worse.
+//!
+//! The type tag therefore comes from an `instanceof` check inside
+//! `write_host_object`, which only ever runs for objects V8 has already routed
+//! there. It costs nothing on the ordinary path.
 //!
 //! Everything above the shell — the actual spec behaviour — is JS, evaluated
 //! once into the context. A JS subclass of a shell keeps the internal field,
@@ -39,48 +61,38 @@ use v8::MapFnTo;
 
 use crate::webcodec::{TAG_HEADERS, TAG_REQUEST, TAG_RESPONSE};
 
-/// Internal-field index holding the type tag. Index 0 of 1.
-pub const TAG_FIELD: usize = 0;
+/// Number of internal fields on a host-type instance.
+///
+/// The field itself is never written — it exists purely so V8 routes the object
+/// to `WriteHostObject`. See the module docs.
+pub const INTERNAL_FIELD_COUNT: usize = 1;
 
 // ── Native shells ────────────────────────────────────────────────────────────
 
-/// Stamp the type tag into the instance's internal field.
+/// The shells take no constructor action at all.
 ///
-/// Invoked through `super()` from the JS subclass, so `args.this()` is the
-/// instance V8 built from our instance template.
-fn stamp(scope: &mut v8::HandleScope, args: &v8::FunctionCallbackArguments, tag: u32) {
-    let this = args.this();
-    // A shell is only ever reachable via `super()` from its own JS subclass,
-    // but a hostile prototype chain could in principle route elsewhere. Setting
-    // the field on an object that has none would abort, so check first.
-    if this.internal_field_count() > TAG_FIELD {
-        let value = v8::Integer::new_from_unsigned(scope, tag);
-        this.set_internal_field(TAG_FIELD, value.into());
-    }
-}
-
+/// They exist so that `super()` produces an object built from an instance
+/// template with one internal field — which is what V8 dispatches on. See the
+/// module docs on why the field stays empty.
 fn headers_shell_ctor(
-    scope: &mut v8::HandleScope,
-    args: v8::FunctionCallbackArguments,
+    _scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
-    stamp(scope, &args, TAG_HEADERS);
 }
 
 fn request_shell_ctor(
-    scope: &mut v8::HandleScope,
-    args: v8::FunctionCallbackArguments,
+    _scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
-    stamp(scope, &args, TAG_REQUEST);
 }
 
 fn response_shell_ctor(
-    scope: &mut v8::HandleScope,
-    args: v8::FunctionCallbackArguments,
+    _scope: &mut v8::HandleScope,
+    _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
-    stamp(scope, &args, TAG_RESPONSE);
 }
 
 static EXTERNAL_REFS: OnceLock<v8::ExternalReferences> = OnceLock::new();
@@ -120,7 +132,8 @@ pub fn install(scope: &mut v8::HandleScope) -> Result<(), String> {
         ("ResponseShell", response_shell_ctor.map_fn_to()),
     ] {
         let tmpl = v8::FunctionTemplate::builder_raw(ctor).build(scope);
-        tmpl.instance_template(scope).set_internal_field_count(1);
+        tmpl.instance_template(scope)
+            .set_internal_field_count(INTERNAL_FIELD_COUNT);
         let class_name =
             v8::String::new(scope, name).ok_or_else(|| format!("intern {name} failed"))?;
         tmpl.set_class_name(class_name);
@@ -251,7 +264,8 @@ fn define(
     value: v8::Local<v8::Value>,
 ) -> Option<()> {
     let key = v8::String::new(scope, name)?;
-    obj.create_data_property(scope, key.into(), value).map(|_| ())
+    obj.create_data_property(scope, key.into(), value)
+        .map(|_| ())
 }
 
 /// Look up one of our classes on `globalThis`.
@@ -266,18 +280,27 @@ fn class<'s>(scope: &mut v8::HandleScope<'s>, name: &str) -> Option<v8::Local<'s
     global.get(scope, key.into())?.try_into().ok()
 }
 
-/// Read the type tag a shell constructor stamped into internal field 0.
-/// `None` for objects that are not ours.
+/// Identify which of our types `obj` is.
+///
+/// Only called for objects V8 has already routed to `write_host_object` — i.e.
+/// objects carrying an internal field — so the `instanceof` walk here never
+/// runs for ordinary values. Returns `None` for an internal-field object that
+/// is not one of ours; no such object exists in this runtime today.
 pub fn tag_of(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>) -> Option<u32> {
-    if obj.internal_field_count() <= TAG_FIELD {
+    if obj.internal_field_count() < INTERNAL_FIELD_COUNT {
         return None;
     }
-    let field = obj.get_internal_field(scope, TAG_FIELD)?;
-    let value: v8::Local<v8::Value> = field.try_into().ok()?;
-    if !value.is_uint32() {
-        return None;
+    for (name, tag) in [
+        ("Response", TAG_RESPONSE),
+        ("Request", TAG_REQUEST),
+        ("Headers", TAG_HEADERS),
+    ] {
+        let ctor = class(scope, name)?;
+        if obj.instance_of(scope, ctor.into()) == Some(true) {
+            return Some(tag);
+        }
     }
-    Some(value.uint32_value(scope)?)
+    None
 }
 
 pub fn headers_view<'s>(
@@ -339,11 +362,13 @@ fn make_instance<'s>(
     // invalidated on snapshot restore — more failure modes than it is worth
     // until a benchmark says otherwise.
     let tmpl = v8::ObjectTemplate::new(scope);
-    tmpl.set_internal_field_count(1);
+    tmpl.set_internal_field_count(INTERNAL_FIELD_COUNT);
     let obj = tmpl.new_instance(scope)?;
 
-    let tag_value = v8::Integer::new_from_unsigned(scope, tag);
-    obj.set_internal_field(TAG_FIELD, tag_value.into());
+    // The internal field stays empty — see the module docs. `tag` is accepted
+    // so the call sites read symmetrically with the wire format, and to keep
+    // the type visible at each construction site.
+    let _ = tag;
 
     // `instanceof` and every prototype method come from here.
     let ctor = class(scope, class_name)?;
@@ -397,31 +422,6 @@ pub fn make_response<'s>(
     let used = v8::Boolean::new(scope, false);
     define(scope, obj, "_used", used.into())?;
     Some(obj)
-}
-
-/// Does `obj` have one of our class prototypes in its chain without carrying an
-/// internal field?
-///
-/// This catches *lookalikes* — classes that re-point their prototype after the
-/// fact instead of calling our constructor, which is how srvx's `FastResponse`
-/// is built. They serialize only at the top level of a slot; see
-/// `docs/protocol.md` §4.4.6.
-pub fn lookalike_tag(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>) -> Option<u32> {
-    if obj.internal_field_count() > TAG_FIELD {
-        return None;
-    }
-    for (name, tag) in [
-        ("Response", TAG_RESPONSE),
-        ("Request", TAG_REQUEST),
-        ("Headers", TAG_HEADERS),
-    ] {
-        if let Some(ctor) = class(scope, name) {
-            if obj.instance_of(scope, ctor.into()) == Some(true) {
-                return Some(tag);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

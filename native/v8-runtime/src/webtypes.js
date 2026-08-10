@@ -65,41 +65,74 @@
     return out.subarray(0, p)
   }
 
+  // Strict, per the WHATWG encoding spec. The earlier version checked only the
+  // lead-byte pattern, so a malformed lead byte consumed the valid characters
+  // after it (`41 C3 41` decoded as "AÁ", losing the trailing "A") and overlong
+  // and surrogate sequences were accepted. On any error we emit one U+FFFD and
+  // advance a single byte, which is what stops the next character being eaten.
   function utf8Decode(bytes) {
     let out = ''
+    let buf = []
     let i = 0
     const n = bytes.length
-    // Assembled in chunks: string concatenation per code point is O(n^2) on
-    // large bodies in some engines.
-    let buf = []
-    while (i < n) {
-      const b0 = bytes[i++]
-      let cp
-      if (b0 < 0x80) {
-        cp = b0
-      } else if ((b0 & 0xE0) === 0xC0 && i < n) {
-        cp = ((b0 & 0x1F) << 6) | (bytes[i++] & 0x3F)
-      } else if ((b0 & 0xF0) === 0xE0 && i + 1 < n) {
-        cp = ((b0 & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F)
-      } else if ((b0 & 0xF8) === 0xF0 && i + 2 < n) {
-        cp = ((b0 & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12)
-          | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F)
-      } else {
-        cp = 0xFFFD
-      }
-      if (cp > 0xFFFF) {
-        cp -= 0x10000
-        buf.push(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF))
-      } else {
-        buf.push(cp)
-      }
-      if (buf.length >= 4096) {
+
+    const flush = () => {
+      if (buf.length) {
         out += String.fromCharCode.apply(null, buf)
         buf = []
       }
     }
-    if (buf.length)
-      out += String.fromCharCode.apply(null, buf)
+    const emit = (cp) => {
+      if (cp > 0xFFFF) {
+        const v = cp - 0x10000
+        buf.push(0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF))
+      } else {
+        buf.push(cp)
+      }
+      // Chunked: concatenating per code point is O(n^2) on large bodies.
+      if (buf.length >= 4096)
+        flush()
+    }
+
+    while (i < n) {
+      const b0 = bytes[i]
+      let cp = -1
+      let len = 0
+      let lower = 0
+
+      if (b0 < 0x80) {
+        cp = b0; len = 1; lower = 0
+      } else if (b0 >= 0xC2 && b0 <= 0xDF) {
+        cp = b0 & 0x1F; len = 2; lower = 0x80
+      } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+        cp = b0 & 0x0F; len = 3; lower = 0x800
+      } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+        cp = b0 & 0x07; len = 4; lower = 0x10000
+      } else {
+        // 0x80-0xC1 is a stray continuation or an overlong lead; 0xF5-0xFF is
+        // beyond the Unicode range.
+        emit(0xFFFD); i++; continue
+      }
+
+      if (i + len > n) {
+        emit(0xFFFD); i++; continue
+      }
+      let ok = true
+      for (let k = 1; k < len; k++) {
+        const b = bytes[i + k]
+        if ((b & 0xC0) !== 0x80) {
+          ok = false; break
+        }
+        cp = (cp << 6) | (b & 0x3F)
+      }
+      // Reject overlongs, the surrogate range, and anything past U+10FFFF.
+      if (!ok || cp < lower || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        emit(0xFFFD); i++; continue
+      }
+      emit(cp)
+      i += len
+    }
+    flush()
     return out
   }
 
@@ -112,11 +145,26 @@
       return utf8Encode(String(input))
     }
 
+    // Never writes a partial sequence, and `read` counts the UTF-16 units
+    // actually consumed rather than the whole input.
     encodeInto(source, dest) {
-      const bytes = utf8Encode(String(source))
-      const written = Math.min(bytes.length, dest.length)
-      dest.set(bytes.subarray(0, written))
-      return { read: source.length, written }
+      const str = String(source)
+      let read = 0
+      let written = 0
+      for (let i = 0; i < str.length;) {
+        const code = str.charCodeAt(i)
+        const pair = code >= 0xD800 && code <= 0xDBFF && i + 1 < str.length
+          && str.charCodeAt(i + 1) >= 0xDC00 && str.charCodeAt(i + 1) <= 0xDFFF
+        const units = pair ? 2 : 1
+        const bytes = utf8Encode(str.slice(i, i + units))
+        if (written + bytes.length > dest.length)
+          break
+        dest.set(bytes, written)
+        written += bytes.length
+        read += units
+        i += units
+      }
+      return { read, written }
     }
   }
 
@@ -146,9 +194,11 @@
 
   // ── URLSearchParams ────────────────────────────────────────────────────────
 
+  // application/x-www-form-urlencoded: space is "+", not "%20".
   const encodeQueryComponent = (s) =>
-    encodeURIComponent(s).replace(/[!'()~]/g, (c) =>
-      `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+    encodeURIComponent(s)
+      .replace(/[!'()~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+      .replace(/%20/g, '+')
 
   class URLSearchParams {
     constructor(init) {
@@ -222,17 +272,22 @@
       return this._p.some(([k]) => k === n)
     }
 
+    // Replaces the FIRST match in place and drops the rest, so parameter order
+    // is preserved. Walking backwards kept the last match and reordered.
     set(name, value) {
       const n = String(name)
       const v = String(value)
       let found = false
-      for (let i = this._p.length - 1; i >= 0; i--) {
-        if (this._p[i][0] !== n)
-          continue
-        if (found) {
-          this._p.splice(i, 1)
+      for (let i = 0; i < this._p.length;) {
+        if (this._p[i][0] !== n) {
+          i++; continue
+        }
+        if (!found) {
+          this._p[i][1] = v
+          found = true
+          i++
         } else {
-          this._p[i][1] = v; found = true
+          this._p.splice(i, 1)
         }
       }
       if (!found)
@@ -554,10 +609,18 @@
     return n.toLowerCase()
   }
 
+  // Header names and values are ByteStrings on the wire and in Node's Headers.
+  // Rejecting non-Latin-1 here rather than at the boundary means the throw
+  // points at the user's line instead of failing host-side materialization.
+  // eslint-disable-next-line no-control-regex -- the byte range is the point
+  const BYTE_STRING_RE = /^[\x00-\xFF]*$/
+
   function checkValue(value) {
     const v = String(value).replace(/^[\t ]+|[\t ]+$/g, '')
     if (/[\0\r\n]/.test(v))
       throw new TypeError('Invalid header value')
+    if (!BYTE_STRING_RE.test(v))
+      throw new TypeError(`Invalid header value: must be a ByteString, got "${v}"`)
     return v
   }
 
@@ -624,17 +687,22 @@
       return false
     }
 
+    // Replaces the FIRST match in place; walking backwards kept the last one
+    // and changed wire order.
     set(name, value) {
       const n = checkName(name)
       const v = checkValue(value)
       let found = false
-      for (let i = this._l.length - 2; i >= 0; i -= 2) {
-        if (this._l[i] !== n)
-          continue
-        if (found) {
-          this._l.splice(i, 2)
+      for (let i = 0; i < this._l.length;) {
+        if (this._l[i] !== n) {
+          i += 2; continue
+        }
+        if (!found) {
+          this._l[i + 1] = v
+          found = true
+          i += 2
         } else {
-          this._l[i + 1] = v; found = true
+          this._l.splice(i, 2)
         }
       }
       if (!found)
@@ -703,8 +771,10 @@
         headers.set('content-type', 'application/x-www-form-urlencoded;charset=UTF-8')
       return body.toString()
     }
+    // Copied: an aliased buffer would let a later mutation of the caller's array
+    // change an already-constructed Request/Response, and clone() share state.
     if (body instanceof Uint8Array)
-      return body
+      return new Uint8Array(body)
     if (ArrayBuffer.isView(body))
       return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength))
     if (body instanceof ArrayBuffer)
@@ -758,12 +828,17 @@
     if (self._used)
       throw new TypeError('Body has already been consumed')
     def(self, '_used', true)
-    return self._b
+    // `_b` is cleared as well as flagged, so a consumed body cannot be
+    // resurrected by serializing the instance out (the codec reads `_b`).
+    const body = self._b
+    def(self, '_b', null)
+    return body
   }
 
   // ── Request ────────────────────────────────────────────────────────────────
 
   const FORBIDDEN_BODY_METHODS = new Set(['GET', 'HEAD'])
+  const FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK'])
 
   class Request extends RequestShell {
     constructor(input, init = {}) {
@@ -787,6 +862,10 @@
         if (!TOKEN_RE.test(m))
           throw new TypeError(`Invalid method: "${m}"`)
         method = m.toUpperCase()
+        // Forbidden by the fetch spec and rejected by Node's Request, so
+        // rejecting here keeps the error on the user's line.
+        if (FORBIDDEN_METHODS.has(method))
+          throw new TypeError(`'${method}' HTTP method is unsupported`)
       }
 
       const headers = new Headers(init.headers !== undefined ? init.headers : headersInit)
@@ -842,18 +921,22 @@
     constructor(body = null, init = {}) {
       super()
       const status = init.status === undefined ? 200 : Number(init.status)
-      if (!Number.isInteger(status) || status < 200 || status > 599) {
-        // 101 is permitted for WebSocket upgrades in the Workers model, and
-        // Response.error() uses 0 through the internal path below.
-        if (status !== 101)
-          throw new RangeError(`Response status ${status} is outside the range [200, 599]`)
-      }
+      // Exactly the spec range, which is also what Node accepts. An earlier
+      // version carved out 101 for WebSocket upgrades; that is a workerd
+      // behaviour we do not support, and it made the host constructor throw.
+      // `Response.error()` is the only route to status 0.
+      if (!Number.isInteger(status) || status < 200 || status > 599)
+        throw new RangeError(`Response status ${status} is outside the range [200, 599]`)
       if (body !== null && body !== undefined && NULL_BODY_STATUS.has(status))
         throw new TypeError(`Response with status ${status} cannot have a body`)
 
+      const statusText = init.statusText === undefined ? '' : String(init.statusText)
+      if (/[\0\r\n]/.test(statusText) || !BYTE_STRING_RE.test(statusText))
+        throw new TypeError(`Invalid statusText: "${statusText}"`)
+
       const headers = new Headers(init.headers)
       def(this, '_s', status)
-      def(this, '_t', init.statusText === undefined ? '' : String(init.statusText))
+      def(this, '_t', statusText)
       def(this, '_h', headers)
       def(this, '_b', bodyInit(body, headers))
       def(this, '_used', false)

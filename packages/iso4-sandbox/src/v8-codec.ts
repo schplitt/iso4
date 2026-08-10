@@ -18,12 +18,7 @@
 import type { Buffer } from 'node:buffer'
 import v8 from 'node:v8'
 import type { GlobalDefPayload } from './ipc.js'
-import {
-  HostTypeDeserializer,
-  isMaterializedHostType,
-  materializeHostType,
-  writeHostType,
-} from './web-codec.js'
+import { HostTypeDeserializer, materializeHostTypes } from './web-codec.js'
 
 /**
  * The subset of `v8.Serializer` we need that `@types/node` does not declare.
@@ -71,13 +66,6 @@ export function serializeValue(value: unknown): Buffer {
     ._setTreatArrayBufferViewsAsHostObjects(false)
   serializer.writeHeader()
   try {
-    // A host type that an earlier async pass already drained (see
-    // `materializeHostTypesInGlobals`) is emitted by hand rather than written
-    // as a value — Node cannot write a host object through `writeValue`.
-    if (isMaterializedHostType(value)) {
-      writeHostType(serializer as unknown as Parameters<typeof writeHostType>[0], value)
-      return serializer.releaseBuffer()
-    }
     serializer.writeValue(value)
   } catch (error) {
     throw new ValueEncodeError(
@@ -88,48 +76,33 @@ export function serializeValue(value: unknown): Buffer {
 }
 
 /**
- * Serialize a value that may itself be a `Request`, `Response`, or `Headers`.
+ * Serialize a value that may contain `Request`/`Response`/`Headers` **anywhere**
+ * inside it.
  *
  * Async because reading a body is. Use this on every leg where a host type can
- * legitimately appear — bridge responses and data globals. Anything else should
- * keep using {@link serializeValue}, which stays synchronous.
+ * legitimately appear — bridge responses and data globals. Everything else keeps
+ * using {@link serializeValue}, which stays synchronous.
  *
- * Only a **top-level** host type is recognised. Node's serializer exposes no
- * delegate, so a payload can only be hand-emitted where we control emission;
- * one nested inside a larger value flattens the way any class instance does
- * (`docs/protocol.md` §4.4.6).
+ * Nesting is supported at any depth: the transform substitutes branded plain
+ * objects and the runtime rebuilds real instances on arrival
+ * (`docs/protocol.md` §4.4.6). Node's serializer exposes no host-object write
+ * hook, which is why the descriptor detour exists at all.
  * @param value the value to encode
  */
 export async function serializeHostValue(value: unknown): Promise<Buffer> {
-  const materialized = await materializeHostType(value)
-  if (materialized === undefined)
-    return serializeValue(value)
-
-  const serializer = new v8.DefaultSerializer()
-  ;(serializer as unknown as SerializerInternals)
-    ._setTreatArrayBufferViewsAsHostObjects(false)
-  serializer.writeHeader()
-  try {
-    writeHostType(serializer as unknown as Parameters<typeof writeHostType>[0], materialized)
-  } catch (error) {
-    throw new ValueEncodeError(
-      `[iso4] cannot serialize value: ${error instanceof Error ? error.message : String(error)}`,
-    )
-  }
-  return serializer.releaseBuffer()
+  return serializeValue(await materializeHostTypes(value))
 }
 
 /**
- * Drain any `Request`/`Response`/`Headers` sitting in a data global so the
- * synchronous payload encoder can emit them.
+ * Drain and brand any `Request`/`Response`/`Headers` inside a data global so the
+ * synchronous payload encoder can write it.
  *
- * This is the host → sandbox leg: it is how a real `Request` gets *into* the
- * sandbox today, before the call API exists. Bodies are async, payload encoding
- * is not, so the read has to happen here — both `prepare()` and `execute()` are
- * already async, so it costs no API change.
+ * This is one of the two host → sandbox legs — how a real `Request` gets *into*
+ * the sandbox before the call API exists. Bodies are async and payload encoding
+ * is not, so the read happens here; both `prepare()` and `execute()` are already
+ * async, so it costs no API change.
  *
- * Only the data global's top-level value is examined; one nested inside a
- * larger object flattens like any class instance (`docs/protocol.md` §4.4.6).
+ * Nested host types are handled, at any depth.
  * @param defs global definitions, mutated in place
  */
 export async function materializeHostTypesInGlobals(
@@ -138,9 +111,7 @@ export async function materializeHostTypesInGlobals(
   for (const def of defs) {
     if (def.kind !== 'data')
       continue
-    const materialized = await materializeHostType(def.value)
-    if (materialized !== undefined)
-      def.value = materialized
+    def.value = (await materializeHostTypes(def.value)) as typeof def.value
   }
 }
 

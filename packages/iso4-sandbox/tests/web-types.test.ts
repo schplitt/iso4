@@ -103,8 +103,8 @@ describe('sandbox → host', () => {
   })
 
   test('header names round-trip verbatim, whatever their shape', async () => {
-    // No name is special-cased on the wire, so this is really a cross-language
-    // check that both codecs frame `[len][name][len][value]` identically.
+    // Header names are not special-cased, so this checks that arbitrary names
+    // survive the flat-array representation both codecs use.
     const names = [
       'content-type',
       'x-custom-thing',
@@ -181,13 +181,98 @@ describe('host → sandbox', () => {
   })
 })
 
+describe('host → sandbox nesting', () => {
+  test('a Response nested inside a data global becomes a real Response', async () => {
+    const value = await run(
+      `const r = globalThis.payload.deep.list[0]
+       export default [r instanceof Response, r.status, await r.text()].join('|')`,
+      {
+        payload: {
+          kind: 'data',
+          value: { deep: { list: [new Response('nested', { status: 207 })] } },
+        },
+      },
+    )
+    expect(value).toBe('true|207|nested')
+  })
+
+  test('a bridge handler may return a nested Response', async () => {
+    const value = await run(
+      `const { res, meta } = await globalThis.callHost()
+       export default [meta, res instanceof Response, res.status].join('|')`,
+      { callHost: () => ({ meta: 'm', res: new Response(null, { status: 204 }) }) },
+    )
+    expect(value).toBe('m|true|204')
+  })
+})
+
 describe('refusals', () => {
-  test('a stream body is refused with an actionable message', async () => {
+  test('a non-serializable body reports ERR_TYPE_NOT_SERIALIZABLE', async () => {
+    // `_b` is reachable from sandbox code, so this is the codec's own gate
+    // rather than the constructor's.
     const result = await sandbox.run({
-      code: `export default new Response({ getReader() {} })`,
+      code: `const r = new Response('x')
+             Object.defineProperty(r, '_b', { value: new DataView(new ArrayBuffer(2)) })
+             export default r`,
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.error.code).toBe('ERR_TYPE_NOT_SERIALIZABLE')
+      expect(result.error.message).toMatch(/null, a string, or a Uint8Array/)
+    }
+  })
+
+  test('too many headers reports ERR_TYPE_NOT_SERIALIZABLE', async () => {
+    const result = await sandbox.run({
+      code: `const r = new Response(null)
+             for (let i = 0; i < 1025; i++) r.headers.append('x-h' + i, 'v')
+             export default r`,
     })
     expect(result.ok).toBe(false)
     if (!result.ok)
-      expect(result.error.message).toMatch(/buffer it first/)
+      expect(result.error.code).toBe('ERR_TYPE_NOT_SERIALIZABLE')
+  })
+
+  test('a reserved global name is rejected', async () => {
+    const result = await sandbox.run({
+      code: `export default 1`,
+      globals: { Response: { kind: 'data', value: 1 } } as never,
+    })
+    expect(result.ok).toBe(false)
+    if (!result.ok)
+      expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+  })
+})
+
+describe('platform parity — the sandbox throws where Node throws', () => {
+  test.each([
+    ['status below the range', `new Response(null, { status: 101 })`],
+    ['status above the range', `new Response(null, { status: 600 })`],
+    ['non-ByteString statusText', `new Response(null, { statusText: '世' })`],
+    ['statusText with a newline', `new Response(null, { statusText: 'a\\nb' })`],
+    ['non-ByteString header value', `new Response(null, { headers: { 'x-a': '世' } })`],
+    ['forbidden method', `new Request('https://ex.com/', { method: 'CONNECT' })`],
+  ])('%s is a user-code error, not a host throw', async (_label, expr) => {
+    const result = await sandbox.run({ code: `export default ${expr}` })
+    expect(result.ok).toBe(false)
+    if (!result.ok)
+      expect(result.error.code).toBe('ERR_USER_CODE')
+  })
+
+  test('Response.error() survives the crossing', async () => {
+    const value = await run(`export default Response.error()`)
+    expect(value).toBeInstanceOf(Response)
+    expect((value as Response).status).toBe(0)
+    expect((value as Response).type).toBe('error')
+  })
+
+  test('a consumed body does not come back to life', async () => {
+    const value = await run(
+      `const r = new Response('secret')
+       await r.text()
+       export default r`,
+    )
+    expect((value as Response).bodyUsed).toBe(false)
+    await expect((value as Response).text()).resolves.toBe('')
   })
 })

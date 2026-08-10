@@ -2,37 +2,33 @@
  * Host-side codec for host types — `Headers`, `Request`, `Response`.
  *
  * Wire format: `docs/protocol.md` §4.4. The Rust counterpart is
- * `native/v8-runtime/src/webcodec.rs`; the two must agree byte for byte.
+ * `native/v8-runtime/src/webcodec.rs`.
  *
- * ## Why the two directions look different
+ * ## The two directions use different mechanisms
  *
- * Reading is a real V8 hook: `v8.Deserializer` exposes `_readHostObject`, so a
- * host object arriving from the sandbox is dispatched by tag at any depth.
+ * **Reading** (sandbox → host) is a real V8 hook: `v8.Deserializer` exposes
+ * `_readHostObject`, so a host object arriving from the sandbox is dispatched by
+ * tag at any depth.
  *
- * Writing has no hook. Node's `v8.Serializer` gives JavaScript no delegate, and
- * `_writeHostObject` never fires for a class instance — the object silently
- * flattens to its own enumerable properties. So the payload is emitted **by
- * hand**: the `kHostObject` tag byte followed by the same bytes Rust would
- * write. That only works where we control emission, which is the top level of a
- * value slot. See §4.4.6.
+ * **Writing** (host → sandbox) has no hook at all. Node's `v8.Serializer`
+ * exposes no delegate to JavaScript and `_writeHostObject` never fires for a
+ * class instance — the object silently flattens. So we do not try: each
+ * instance is replaced by a **branded plain object** carrying the same fields,
+ * the graph is serialized normally, and the runtime walks the result swapping
+ * brands for real instances. That works at any depth, for any type, and needs no
+ * hand-written framing.
+ *
+ * The asymmetry is safe because the two directions never share a reader.
  *
  * ## Bodies are async
  *
- * Reading a body off a host `Request`/`Response` is asynchronous, so encoding
- * splits in two: {@link materializeHostType} drains the body and returns a
- * plain snapshot, then {@link writeHostType} emits it synchronously.
+ * Reading a body off a host `Request`/`Response` is asynchronous, so the
+ * transform is async: {@link materializeHostTypes} drains bodies and returns a
+ * plain graph that ordinary synchronous serialization can then write.
  */
 
 import type { Buffer } from 'node:buffer'
-import { Buffer as NodeBuffer } from 'node:buffer'
 import v8 from 'node:v8'
-
-/**
- * V8's `kHostObject` tag — the byte that introduces an embedder payload where a
- * value is expected. Both V8s agree on it because the handshake pins the
- * serialization format version (`docs/protocol.md` §5.1).
- */
-const K_HOST_OBJECT = 0x5C
 
 // ── Type tags (frozen — docs/protocol.md §4.4.1) ─────────────────────────────
 
@@ -71,6 +67,14 @@ export class HostTypeError extends TypeError {
   override readonly name = 'HostTypeError'
 }
 
+/**
+ * Property name marking a branded descriptor — a plain object standing in for a
+ * host type on the way into the sandbox, which the runtime swaps for a real
+ * instance. Wire contract: kept in sync with `BRAND` in
+ * `native/v8-runtime/src/webcodec.rs`.
+ */
+export const BRAND = '__iso4_ht'
+
 // ── Materialized form ────────────────────────────────────────────────────────
 
 /**
@@ -80,174 +84,197 @@ export class HostTypeError extends TypeError {
 type MaterializedBody = Uint8Array | string | null
 
 /**
- * A host type flattened into plain data, ready for synchronous emission.
- * Header entries stay an array of pairs, never a `Record` — a record cannot
- * represent duplicate `set-cookie`.
+ * A host type flattened into plain data.
  *
- * Marks a {@link MaterializedHostType} so a synchronous encoder can recognise
- * one that an earlier async pass produced. `Symbol.for` rather than a private
- * symbol so duplicate copies of this module in a dependency tree still agree.
+ * Header entries are flattened to `[name, value, name, value, …]` — the shape
+ * the sandbox keeps internally, so the runtime does not rebuild it. Never a
+ * `Record`: a record cannot represent duplicate `set-cookie`.
  */
-// `unique symbol`, not `symbol`: the interface below uses it as a computed
-// property key, and `isolatedDeclarations` needs the annotation to be explicit.
-const MATERIALIZED: unique symbol = Symbol.for('iso4.materializedHostType')
-
-export function isMaterializedHostType(value: unknown): value is MaterializedHostType {
-  return typeof value === 'object' && value !== null
-    && (value as Record<symbol, unknown>)[MATERIALIZED] === true
-}
-
-export interface MaterializedHostType {
-  [MATERIALIZED]?: true
-  tag: number
+interface Descriptor {
+  [BRAND]: number
   url?: string
   method?: string
   status?: number
   statusText?: string
-  headers: [string, string][]
+  headers: string[]
   body: MaterializedBody
 }
 
-function headerPairs(headers: Headers): [string, string][] {
-  const out: [string, string][] = []
+function flatHeaders(headers: Headers): string[] {
+  const out: string[] = []
   // `getSetCookie` is the only way to recover duplicates; `forEach` folds them
   // into one comma-joined value, which is wrong for cookies.
   const setCookies = typeof headers.getSetCookie === 'function' ? headers.getSetCookie() : []
   headers.forEach((value, name) => {
     if (name === 'set-cookie' && setCookies.length > 0)
       return
-    out.push([name, value])
+    out.push(name, value)
   })
-  for (const cookie of setCookies) out.push(['set-cookie', cookie])
+  for (const cookie of setCookies) out.push('set-cookie', cookie)
+  if (out.length / 2 > MAX_HEADER_ENTRIES) {
+    throw new HostTypeError(
+      `[iso4] Headers has ${out.length / 2} entries, exceeding the ${MAX_HEADER_ENTRIES} limit`,
+    )
+  }
   return out
 }
+
+/**
+ * Ceiling on a host-supplied body, matching the default `maxBridgeCallBytes` /
+ * `maxExportBytes`. The frame layer enforces the configured limit downstream;
+ * this exists so an unbounded body cannot exhaust host memory *before* the
+ * payload is ever framed.
+ */
+const MAX_BODY_BYTES = 16 * 1024 * 1024
 
 async function materializeBody(source: Request | Response): Promise<MaterializedBody> {
   // `bodyUsed` would make the read throw; report it as the caller's mistake.
   if (source.bodyUsed)
     throw new HostTypeError('[iso4] cannot serialize a Request/Response whose body was already read')
-  const buffer = await source.arrayBuffer()
-  return buffer.byteLength === 0 ? null : new Uint8Array(buffer)
+
+  const stream = source.body as ReadableStream<Uint8Array> | null
+  if (stream === null || stream === undefined) {
+    const buffer = await source.arrayBuffer()
+    return buffer.byteLength === 0 ? null : new Uint8Array(buffer)
+  }
+
+  // Drained by hand rather than with `arrayBuffer()` so the byte count is
+  // checked as it arrives. There is no way to tell a buffered body from a
+  // genuinely streaming one — in Node both are a ReadableStream, including
+  // `new Response('text')` — so refusing streams outright would refuse
+  // everything. Capping the read is the mitigation that actually applies.
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done)
+        break
+      total += value.byteLength
+      if (total > MAX_BODY_BYTES) {
+        throw new HostTypeError(
+          `[iso4] body exceeds ${MAX_BODY_BYTES} bytes; a Request/Response crossing the `
+          + 'boundary must be bounded — buffer and truncate it first',
+        )
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  if (total === 0)
+    return null
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return out
 }
 
-/**
- * Recognise and flatten a host type. Returns `undefined` for anything else.
- *
- * Async because bodies are. Callers on a synchronous path must handle
- * `undefined` and fall through to ordinary value serialization.
- * @param value the candidate host type
- */
-export async function materializeHostType(
-  value: unknown,
-): Promise<MaterializedHostType | undefined> {
-  if (value === null || typeof value !== 'object')
-    return undefined
-
+async function toDescriptor(value: object): Promise<Descriptor | undefined> {
   if (value instanceof globalThis.Response) {
-    const res = value as Response
     return {
-      [MATERIALIZED]: true,
-      tag: TAG_RESPONSE,
-      status: res.status,
-      statusText: res.statusText,
-      headers: headerPairs(res.headers),
-      body: await materializeBody(res),
+      [BRAND]: TAG_RESPONSE,
+      status: value.status,
+      statusText: value.statusText,
+      headers: flatHeaders(value.headers),
+      body: await materializeBody(value),
     }
   }
   if (value instanceof globalThis.Request) {
-    const req = value as Request
     return {
-      [MATERIALIZED]: true,
-      tag: TAG_REQUEST,
-      url: req.url,
-      method: req.method,
-      headers: headerPairs(req.headers),
-      body: await materializeBody(req),
+      [BRAND]: TAG_REQUEST,
+      url: value.url,
+      method: value.method,
+      headers: flatHeaders(value.headers),
+      body: await materializeBody(value),
     }
   }
-  if (value instanceof globalThis.Headers) {
-    return {
-      [MATERIALIZED]: true,
-      tag: TAG_HEADERS,
-      headers: headerPairs(value as Headers),
-      body: null,
-    }
-  }
+  if (value instanceof globalThis.Headers)
+    return { [BRAND]: TAG_HEADERS, headers: flatHeaders(value), body: null }
   return undefined
 }
 
-// ── Writing ──────────────────────────────────────────────────────────────────
+/**
+ * Depth cap, matching `MAX_DEPTH` in `webcodec.rs`. Cycles are handled by the
+ * `seen` map, so this only bounds pathologically deep graphs.
+ */
+const MAX_DEPTH = 32
 
 /**
- * The subset of `v8.Serializer` used here that `@types/node` does not declare.
+ * Replace every `Request`/`Response`/`Headers` anywhere in `value` with a
+ * branded plain object, returning a graph ordinary serialization can write.
+ *
+ * Structure is rebuilt rather than mutated, so the caller's value is untouched.
+ * Object identity and cycles are preserved through `seen`. `Map`/`Set` are
+ * rebuilt because a host type can hide in either.
+ * @param value the value to transform
  */
-interface SerializerInternals {
-  writeRawBytes: (bytes: Uint8Array) => void
-  writeUint32: (value: number) => void
-  writeValue: (value: unknown) => void
-  _setTreatArrayBufferViewsAsHostObjects: (flag: boolean) => void
+export async function materializeHostTypes(value: unknown): Promise<unknown> {
+  return transform(value, new Map(), 0)
 }
 
-function writeStr(ser: SerializerInternals, text: string): void {
-  const bytes = NodeBuffer.from(text, 'utf8')
-  ser.writeUint32(bytes.byteLength)
-  ser.writeRawBytes(bytes)
-}
-
-/**
- * Headers travel as one flat `[name, value, name, value, …]` array — the same
- * shape the sandbox keeps internally, so neither side rebuilds it element by
- * element across the V8 boundary.
- * @param ser the serializer
- * @param entries header pairs
- */
-function writeHeaders(ser: SerializerInternals, entries: [string, string][]): void {
-  if (entries.length > MAX_HEADER_ENTRIES) {
+async function transform(
+  value: unknown,
+  seen: Map<object, unknown>,
+  depth: number,
+): Promise<unknown> {
+  if (value === null || typeof value !== 'object')
+    return value
+  if (depth > MAX_DEPTH) {
     throw new HostTypeError(
-      `[iso4] Headers has ${entries.length} entries, exceeding the ${MAX_HEADER_ENTRIES} limit`,
+      `[iso4] value nests deeper than ${MAX_DEPTH} levels; cannot scan it for host types`,
     )
   }
-  const flat: string[] = []
-  for (const [rawName, value] of entries) flat.push(rawName.toLowerCase(), value)
-  ser.writeValue(flat)
-}
 
-function writeBody(ser: SerializerInternals, body: MaterializedBody): void {
-  // `_setTreatArrayBufferViewsAsHostObjects(false)` on every serializer means a
-  // Uint8Array here is written in plain V8 form, which the runtime can read.
-  ser.writeValue(body)
-}
+  const existing = seen.get(value)
+  if (existing !== undefined)
+    return existing
 
-/**
- * Emit a host-object payload by hand: the `kHostObject` tag, the type tag, then
- * the body. Must be called where a value is expected in the byte stream.
- * @param ser serializer, positioned where a value is expected
- * @param m the host type, already drained by {@link materializeHostType}
- */
-export function writeHostType(ser: SerializerInternals, m: MaterializedHostType): void {
-  ser.writeRawBytes(NodeBuffer.from([K_HOST_OBJECT]))
-  ser.writeUint32(m.tag)
-  switch (m.tag) {
-    case TAG_HEADERS:
-      writeHeaders(ser, m.headers)
-      return
-    case TAG_REQUEST:
-      writeStr(ser, m.url ?? '')
-      writeStr(ser, m.method ?? 'GET')
-      writeHeaders(ser, m.headers)
-      writeBody(ser, m.body)
-      ser.writeUint32(0) // extras: absent
-      return
-    case TAG_RESPONSE:
-      ser.writeUint32(m.status ?? 200)
-      writeStr(ser, m.statusText ?? '')
-      writeHeaders(ser, m.headers)
-      writeBody(ser, m.body)
-      ser.writeUint32(0) // extras: absent
-      return
-    default:
-      throw new HostTypeError(`[iso4] cannot serialize ${tagName(m.tag)}`)
+  const descriptor = await toDescriptor(value)
+  if (descriptor !== undefined) {
+    seen.set(value, descriptor)
+    return descriptor
   }
+
+  // Leave anything V8 carries natively alone — typed arrays, Date, RegExp,
+  // ArrayBuffer. Rebuilding those would lose their type.
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer
+    || value instanceof Date || value instanceof RegExp || value instanceof Error) {
+    return value
+  }
+
+  if (Array.isArray(value)) {
+    const out: unknown[] = []
+    seen.set(value, out)
+    for (const item of value) out.push(await transform(item, seen, depth + 1))
+    return out
+  }
+
+  if (value instanceof Map) {
+    const out = new Map<unknown, unknown>()
+    seen.set(value, out)
+    for (const [k, v] of value)
+      out.set(await transform(k, seen, depth + 1), await transform(v, seen, depth + 1))
+    return out
+  }
+
+  if (value instanceof Set) {
+    const out = new Set<unknown>()
+    seen.set(value, out)
+    for (const v of value) out.add(await transform(v, seen, depth + 1))
+    return out
+  }
+
+  // A plain object, or a class instance that would flatten anyway (§4.2).
+  const out: Record<string, unknown> = {}
+  seen.set(value, out)
+  for (const [k, v] of Object.entries(value))
+    out[k] = await transform(v, seen, depth + 1)
+  return out
 }
 
 // ── Reading ──────────────────────────────────────────────────────────────────
@@ -338,8 +365,12 @@ export function readHostType(des: DeserializerInternals): object {
       const headers = readHeaders(des)
       const body = readBody(des)
       skipExtras(des)
-      // `headers` stays an array of pairs rather than a Record: a Record
+      // Status 0 means Response.error(); `new Response(null, {status: 0})`
+      // throws in Node, so it has to be built the same way it was in the
+      // sandbox. Headers stay an array of pairs rather than a Record — a Record
       // cannot represent duplicate set-cookie.
+      if (status === 0)
+        return globalThis.Response.error()
       return new globalThis.Response(body, { status, statusText, headers })
     }
 

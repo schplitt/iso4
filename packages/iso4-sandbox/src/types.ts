@@ -118,9 +118,10 @@ export interface ResourceLimits {
  * Host-provided globals. Any name not reserved by V8 or the runtime is
  * permitted. Each value becomes a bridge stub in the sandbox global object.
  *
- * Reserved names (must not be used): `console`, `URL`, `URLSearchParams`,
- * `TextEncoder`, `TextDecoder`, `crypto`, `Event`, `AbortController`,
- * `AbortSignal`.
+ * Reserved names (rejected with `ERR_UNDECLARED_BINDING`): `console`,
+ * `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `URL`,
+ * `URLSearchParams`. These are owned by the runtime; shadowing `Response` would
+ * silently break serialization.
  *
  * Common usage:
  * ```ts
@@ -173,7 +174,12 @@ export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> 
  */
 export interface DataGlobal {
   kind: 'data'
-  value: HostExportData
+  /**
+   * Any `HostExportData`, or a `Request`/`Response`/`Headers` — including nested
+   * inside a plain object or array, which the runtime rebuilds as real instances
+   * (`docs/protocol.md` §4.4).
+   */
+  value: HostExportData | Request | Response | Headers
 }
 
 /**

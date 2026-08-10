@@ -545,6 +545,17 @@ pub struct RuntimeErrorData {
     pub fields: Option<Vec<u8>>,
 }
 
+/// Map a codec refusal onto the run error the boundary reports.
+///
+/// `Unsupported` is a value the caller could have avoided sending;
+/// `Malformed` is a corrupt payload, which is a protocol fault.
+fn codec_error_to_run_error(error: crate::webcodec::CodecError) -> RunError {
+    match error {
+        crate::webcodec::CodecError::Unsupported(m) => RunError::TypeNotSerializable(m),
+        crate::webcodec::CodecError::Malformed(m) => RunError::Internal(m),
+    }
+}
+
 /// All the ways an execution can fail.
 #[derive(Debug)]
 pub enum RunError {
@@ -656,6 +667,49 @@ pub fn execute_with_prefix(
     )
 }
 
+static BASE_SNAPSHOT: OnceLock<Arc<[u8]>> = OnceLock::new();
+
+/// A snapshot containing nothing but the web runtime.
+///
+/// A run without a prefix restores this instead of evaluating
+/// `webtypes::install` into a fresh context. Installing costs ~0.535 ms —
+/// measured — and it was being paid on every `sandbox.run()`, which showed up as
+/// an 11 % regression on the `hot run > direct` benchmark. Restoring a snapshot
+/// is the same work the prefix path already does.
+///
+/// Built once per process, lazily, so a host that only ever uses prefixes never
+/// pays for it.
+fn base_snapshot() -> Option<Arc<[u8]>> {
+    BASE_SNAPSHOT
+        .get_or_init(|| {
+            // An empty prefix: `precompile_module` installs the web runtime on
+            // the snapshot path already.
+            match precompile_module("", "<iso4:base>", &[], &[]) {
+                Ok(bytes) => Arc::from(bytes),
+                // A failure here is a runtime bug, not a user error. Fall back
+                // to per-run installation rather than failing the run.
+                Err(_) => Arc::from(Vec::new()),
+            }
+        })
+        .clone()
+        .pipe_non_empty()
+}
+
+/// `None` for the empty placeholder the fallback above stores.
+trait PipeNonEmpty {
+    fn pipe_non_empty(self) -> Option<Arc<[u8]>>;
+}
+
+impl PipeNonEmpty for Arc<[u8]> {
+    fn pipe_non_empty(self) -> Option<Arc<[u8]>> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
 /// Compile prefix code into a V8 startup snapshot blob.
 ///
 /// Returns the raw snapshot bytes on success. The bytes can be stored and
@@ -763,6 +817,13 @@ fn run_module_inner(
     // not reinstall them: that would burn per-run time re-evaluating the
     // runtime source and hand user code different class identities than the
     // prefix captured.
+    //
+    // With no prefix we restore the base snapshot, which contains the runtime
+    // and nothing else — far cheaper than evaluating it (see `base_snapshot`).
+    let snapshot = match snapshot {
+        Some(bytes) => Some(bytes),
+        None => base_snapshot(),
+    };
     let restores_snapshot = snapshot.is_some();
 
     // `reason` is created before the isolate so it can be shared with the
@@ -1349,14 +1410,23 @@ fn run_module_inner(
                                         // Absent value slot → the handler
                                         // returned nothing.
                                         None => Some(v8::undefined(scope).into()),
-                                        Some(bytes) => blob::deserialize_value(scope, bytes),
+                                        // Web-aware: a bridge handler may
+                                        // return a Request/Response.
+                                        Some(bytes) => {
+                                            blob::deserialize_value_with_web_types(scope, bytes)
+                                        }
                                     };
                                     if let Some(v8_val) = decoded {
                                         resolver.resolve(scope, v8_val);
                                     } else {
+                                        let detail = blob::take_codec_error()
+                                            .map(|e| e.message().to_string())
+                                            .unwrap_or_else(|| {
+                                                "failed to deserialize response value".to_string()
+                                            });
                                         let msg = v8::String::new(
                                             scope,
-                                            "[iso4] bridge: failed to deserialize response value",
+                                            &format!("[iso4] bridge: {detail}"),
                                         )
                                         .unwrap();
                                         resolver.reject(scope, msg.into());
@@ -1499,11 +1569,15 @@ fn run_module_inner(
     }
 
     let exports = blob::serialize_value(scope, exports_object.into()).map_err(|message| {
-        failure(
-            RunError::ExportNotSerializable(format!("exports could not be serialized: {message}")),
-            &logs,
-            start,
-        )
+        // A registered host type that cannot cross reports its own code; the
+        // generic path stays ERR_EXPORT_NOT_SERIALIZABLE.
+        let error = match blob::take_codec_error() {
+            Some(e) => codec_error_to_run_error(e),
+            None => RunError::ExportNotSerializable(format!(
+                "exports could not be serialized: {message}"
+            )),
+        };
+        failure(error, &logs, start)
     })?;
 
     // ── Export size limit ────────────────────────────────────────────────────
@@ -1678,7 +1752,8 @@ fn precompile_module(
     // is safe. All V8 scopes must drop before create_blob, hence the IIFE.
     // The external-reference table must match the one `run_module` passes when
     // restoring — see the comment there.
-    let mut isolate = v8::Isolate::snapshot_creator(Some(crate::webtypes::external_references()), None);
+    let mut isolate =
+        v8::Isolate::snapshot_creator(Some(crate::webtypes::external_references()), None);
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
 
@@ -2556,9 +2631,12 @@ fn bridge_global_callback(
             fatal_bridge_error(
                 scope,
                 &data.bridge_error,
-                RunError::ExportNotSerializable(format!(
-                    "bridge call argument could not be serialized: {message}"
-                )),
+                match blob::take_codec_error() {
+                    Some(e) => codec_error_to_run_error(e),
+                    None => RunError::ExportNotSerializable(format!(
+                        "bridge call argument could not be serialized: {message}"
+                    )),
+                },
             );
             return;
         }
@@ -2672,6 +2750,10 @@ fn install_bridge_globals(
 ) -> Result<(), RunError> {
     let global_obj = scope.get_current_context().global(scope);
     for spec in stubs {
+        // A bridge stub installs under its public name, so it can shadow a
+        // reserved class just as a data global can. Private shim handler names
+        // (`__iso4_<name>_h`) are internal and never collide.
+        check_not_reserved(&spec.stub_name)?;
         let name = &spec.stub_name;
         let data = Box::new(GlobalCallbackData {
             stream_fd,
@@ -2730,6 +2812,32 @@ const SHIM_FACTORY_SRC: &str =
 /// global name can shape generated source (issue #38). String expressions and
 /// shim expressions are evaluated as their own scripts with their own
 /// filenames, so they never shift the line numbers of user code.
+/// Names the runtime owns. A host global using one of these is rejected rather
+/// than allowed to shadow it: replacing `Response` would leave user code
+/// building objects the codec cannot recognise.
+///
+/// Keep in sync with the `HostGlobals` docs in
+/// `packages/iso4-sandbox/src/types.ts` and DESIGN.md §4.2.
+pub const RESERVED_GLOBAL_NAMES: &[&str] = &[
+    "console",
+    "Headers",
+    "Request",
+    "Response",
+    "TextEncoder",
+    "TextDecoder",
+    "URL",
+    "URLSearchParams",
+];
+
+fn check_not_reserved(name: &str) -> Result<(), RunError> {
+    if RESERVED_GLOBAL_NAMES.contains(&name) {
+        return Err(RunError::UndeclaredBinding(format!(
+            "global '{name}' is reserved by the runtime and cannot be provided by the host"
+        )));
+    }
+    Ok(())
+}
+
 fn install_value_globals(
     scope: &mut v8::HandleScope,
     globals: &[HostGlobalDef],
@@ -2742,13 +2850,23 @@ fn install_value_globals(
             // Installed as a bridge stub by install_bridge_globals.
             HostGlobalDef::Bridge { .. } => {}
             HostGlobalDef::StringExpr { name, expr } => {
+                check_not_reserved(name)?;
                 let value = eval_global_expression(scope, expr, name)?;
                 set_global(scope, name, value)?;
             }
             HostGlobalDef::Data { name, blob } => {
-                let v8_value = blob::deserialize_value(scope, blob).ok_or_else(|| {
-                    RunError::Internal(format!("failed to materialise data global '{name}'"))
-                })?;
+                check_not_reserved(name)?;
+                // Web-aware: a data global is one of the two ways a host
+                // Request/Response reaches the sandbox.
+                let v8_value =
+                    blob::deserialize_value_with_web_types(scope, blob).ok_or_else(|| {
+                        match blob::take_codec_error() {
+                            Some(e) => codec_error_to_run_error(e),
+                            None => RunError::Internal(format!(
+                                "failed to materialise data global '{name}'"
+                            )),
+                        }
+                    })?;
                 set_global(scope, name, v8_value)?;
             }
             HostGlobalDef::Shim {
@@ -2756,6 +2874,7 @@ fn install_value_globals(
                 shim,
                 handler_name,
             } => {
+                check_not_reserved(name)?;
                 let factory = match shim_factory {
                     Some(f) => f,
                     None => {
@@ -4891,8 +5010,13 @@ mod tests {
     /// aborts with `V8_Fatal: No external references provided via API`.
     #[test]
     fn web_globals_survive_a_prefix_snapshot() {
-        let snapshot = precompile("globalThis.mk = () => new Response('hi', { status: 201 })", None, &[], &[])
-            .unwrap();
+        let snapshot = precompile(
+            "globalThis.mk = () => new Response('hi', { status: 201 })",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
         let out = execute_with_prefix(
             snapshot.clone().into(),
             "const r = globalThis.mk(); \
@@ -4909,6 +5033,37 @@ mod tests {
             get_default(&out).as_deref(),
             Some("true|201|text/plain;charset=UTF-8")
         );
+    }
+
+    /// Regression test for a process-level crash: a snapshot containing a live
+    /// instance used to segfault.
+    ///
+    /// `rusty_v8`'s snapshot callback reads every embedder field as an aligned
+    /// pointer and memcpy's out of it, so the type tag must never be stored
+    /// there (see `webtypes.rs`). This is the case the original spike missed —
+    /// it snapshotted the *classes* but never an *instance*.
+    #[test]
+    fn a_live_instance_can_be_captured_in_a_snapshot() {
+        for expr in [
+            "new Response('x', { status: 201 })",
+            "new Request('https://ex.com/a')",
+            "new Headers([['content-type', 'text/plain']])",
+        ] {
+            let snapshot = precompile(&format!("globalThis.v = {expr}"), None, &[], &[])
+                .unwrap_or_else(|_| panic!("precompile with a live {expr} must not fail"));
+            let out = execute_with_prefix(
+                snapshot.clone().into(),
+                "export default typeof globalThis.v",
+                None,
+                Limits::default(),
+                &[],
+                &[],
+                None,
+                Arc::new(AtomicU32::new(0)),
+            )
+            .unwrap_or_else(|_| panic!("run against a snapshot holding {expr} must not fail"));
+            assert_eq!(get_default(&out).as_deref(), Some("object"), "{expr}");
+        }
     }
 
     /// A postfix constructing a `Response` against classes restored from the

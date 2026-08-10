@@ -310,6 +310,10 @@ names that the host must not shadow:
 - The web runtime the runtime installs: `Headers`, `Request`, `Response`,
   `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`.
 
+These are **enforced**, not merely documented: a host global using one of these
+names is rejected with `ERR_UNDECLARED_BINDING`. Allowing a host to shadow
+`Response` would leave user code building objects the codec cannot recognise.
+
 > **Correction (this section previously claimed otherwise).** These were
 > listed here as "V8 built-ins" alongside `crypto`, `Event`,
 > `AbortController` and `AbortSignal`. They are not. Plain V8 provides none

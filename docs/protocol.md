@@ -400,33 +400,55 @@ sitting in the body slot, which needs no new framing at all.
 
 #### 4.4.6 Direction asymmetry
 
-The two directions are not implemented the same way, and one of them is
-limited as a result.
+The two directions use different mechanisms. Both support nesting at any depth;
+they get there differently.
 
-| Leg                          | Mechanism                                     | Nesting                  |
-| ---------------------------- | --------------------------------------------- | ------------------------ |
-| Rust writes (sandbox → host) | V8 routes automatically on internal fields    | any depth                |
-| Node reads (sandbox → host)  | `v8.Deserializer` subclass, `_readHostObject` | any depth                |
-| Rust reads (host → sandbox)  | `ValueDeserializerImpl::read_host_object`     | any depth                |
-| Node writes (host → sandbox) | payload emitted **by hand**                   | top level of a slot only |
+| Leg                          | Mechanism                                     |
+| ---------------------------- | --------------------------------------------- |
+| Rust writes (sandbox → host) | V8 routes automatically on internal fields    |
+| Node reads (sandbox → host)  | `v8.Deserializer` subclass, `_readHostObject` |
+| Node writes (host → sandbox) | **branded plain objects** — see below         |
+| Rust reads (host → sandbox)  | ordinary deserialize, then a rehydration walk |
 
 The sandbox classes are backed by `FunctionTemplate` instances with internal
 fields, so V8 routes them to `WriteHostObject` off a map field read, with
 `HasCustomHostObject()` left `false`. No embedder callback fires for ordinary
-objects. This matters: enabling `HasCustomHostObject` would make V8 call back
-into the embedder for _every_ plain object serialized.
+objects. Enabling it would make V8 call back into the embedder for _every_ plain
+object serialized.
 
-Node has no equivalent. `v8.Serializer` exposes no delegate to JavaScript and
-`_writeHostObject` never fires for a class instance — the object simply
-flattens. So the host side writes the `0x5C` tag and payload itself, which it
-can only do where it controls emission: the top level of a value slot. A
-`Request` nested inside a larger host → sandbox value is a loud error, never a
-silent flatten.
+The internal field is deliberately left **empty**. `rusty_v8`'s snapshot callback
+reads every embedder field as an aligned pointer and `memcpy`s out of it, so
+storing anything there — a `v8::Integer` included — segfaults any snapshot that
+contains a live instance. The type tag comes from an `instanceof` check inside
+`write_host_object`, which only runs for objects V8 already routed there.
+
+Node has no write-side equivalent. `v8.Serializer` exposes no delegate to
+JavaScript and `_writeHostObject` never fires for a class instance — the object
+silently flattens. So the host does not attempt it: each instance is replaced by
+a plain object carrying the same fields plus a `__iso4_ht` property holding its
+type tag, the graph is serialized normally, and the runtime walks the result
+substituting real instances.
+
+```txt
+// host has:         { meta: 'x', res: Response }
+// host serializes:  { meta: 'x', res: { __iso4_ht: 3, status: 200,
+//                                       statusText: '', headers: [...],
+//                                       body: Uint8Array } }
+```
+
+Because the graph is an ordinary V8 value, nesting, cycles, `Map`/`Set` and
+object identity all work for free, and a new type costs one tag plus one
+constructor in the rehydration switch. The walk runs only on host → sandbox legs
+— bridge responses and data globals — and is guarded by a byte scan for the
+brand, so a payload with no host types pays only that scan. Depth is capped at
+32 levels on both sides.
+
+The asymmetry is safe because the two directions never share a reader: Rust reads
+what Node writes and vice versa, never both.
 
 Sandbox-side subclasses (`class My extends Response {}`) keep their internal
-fields and route normally. A _lookalike_ that fakes the prototype without
-calling the real constructor has no internal fields; those are picked up by a
-top-level prototype check only, and are not supported when nested.
+fields and route normally. A _lookalike_ that re-points its prototype without
+calling the real constructor has no internal field and is not supported.
 
 #### 4.4.7 Versioning
 
@@ -813,26 +835,26 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 
 ## 7. Error codes
 
-| Code                                  | Cause                                                                                                                                                                                                                                                               |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                                                                                       |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                                                                                                                                                                                                                   |
-| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                    |
-| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                         |
-| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                              |
-| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                                                                                    |
-| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                                                                                        |
-| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                                                                               |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.                                                                                                                                                                                                |
-| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                                                                                     |
-| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                                                                                                  |
-| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                                                                             |
-| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                                                                                           |
-| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                                                                                                    |
-| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross this boundary in this position — an unimplemented tag, a value whose contents are not self-contained (stream body, `WebSocket`, `AbortSignal`), or a host type nested below the top level of a host → sandbox slot. See §4.4.5. |
-| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                                                                                         |
-| `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                                                                                                                                                                                                            |
-| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                     |
+| Code                                  | Cause                                                                                                                                                                                        |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                                                                                                                                            |
+| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                             |
+| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                  |
+| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                       |
+| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                             |
+| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                 |
+| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                        |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.                                                                                                                         |
+| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                              |
+| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                           |
+| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                      |
+| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                    |
+| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                             |
+| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5. |
+| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                  |
+| `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                                                                                                                                     |
+| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                              |
 
 ---
 

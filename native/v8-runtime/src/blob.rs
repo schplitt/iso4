@@ -63,8 +63,8 @@ pub fn take_codec_error() -> Option<CodecError> {
 /// oversized-headers test, which passed serialization when it should have
 /// failed.
 fn record(scope: &mut v8::HandleScope, error: CodecError) {
-    let message = v8::String::new(scope, error.message())
-        .unwrap_or_else(|| v8::String::empty(scope));
+    let message =
+        v8::String::new(scope, error.message()).unwrap_or_else(|| v8::String::empty(scope));
     let exception = v8::Exception::type_error(scope, message);
     scope.throw_exception(exception);
     LAST_CODEC_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
@@ -177,6 +177,31 @@ pub fn serialize_value(
     // pending would abort unrelated JS further up the stack.
     tc.reset();
     Err(message)
+}
+
+/// Read one V8 value back from a blob, materialising any host types the host
+/// sent as branded descriptors.
+///
+/// Use this on host → sandbox legs (data globals, bridge responses). Ordinary
+/// `deserialize_value` is for everything else and never walks.
+///
+/// The walk is guarded by a byte scan for the brand, so a payload with no host
+/// types pays only that scan.
+pub fn deserialize_value_with_web_types<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    bytes: &[u8],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let value = deserialize_value(scope, bytes)?;
+    if !webcodec::might_contain_web_types(bytes) {
+        return Some(value);
+    }
+    match webcodec::rehydrate(scope, value) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            LAST_CODEC_ERROR.with(|slot| *slot.borrow_mut() = Some(e));
+            None
+        }
+    }
 }
 
 /// Read one V8 value back from a blob.
