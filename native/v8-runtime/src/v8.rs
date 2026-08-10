@@ -630,7 +630,7 @@ pub fn execute(
 /// globals and shim wrappers are already baked into the snapshot and are not
 /// re-sent.
 pub fn execute_with_prefix(
-    snapshot_bytes: &[u8],
+    snapshot_bytes: Arc<[u8]>,
     code: &str,
     filename: Option<&str>,
     limits: Limits,
@@ -669,9 +669,9 @@ pub fn precompile(
     filename: Option<&str>,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-) -> Result<Vec<u8>, FailureOutput> {
+) -> Result<Arc<[u8]>, FailureOutput> {
     init_platform();
-    precompile_module(code, filename.unwrap_or("<prefix>"), globals, imports)
+    precompile_module(code, filename.unwrap_or("<prefix>"), globals, imports).map(Arc::from)
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
@@ -685,7 +685,7 @@ pub fn precompile(
 fn run_module(
     code: &str,
     filename: &str,
-    snapshot: Option<&[u8]>,
+    snapshot: Option<Arc<[u8]>>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
@@ -734,7 +734,7 @@ fn run_module(
 fn run_module_inner(
     code: &str,
     filename: &str,
-    snapshot: Option<&[u8]>,
+    snapshot: Option<Arc<[u8]>>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
@@ -775,9 +775,13 @@ fn run_module_inner(
     };
 
     let mut isolate = {
+        // `snapshot_blob` takes `impl Allocated<[u8]>`, which has a dedicated
+        // `Arc` variant — the handle is stored, the bytes are not copied. V8
+        // requires the blob to outlive the isolate; `CreateParams` moves the
+        // allocation into the isolate, which is what keeps it alive.
         let params = match snapshot {
             None => v8::Isolate::create_params(),
-            Some(bytes) => v8::Isolate::create_params().snapshot_blob(bytes.to_vec()),
+            Some(bytes) => v8::Isolate::create_params().snapshot_blob(bytes),
         };
         // Cap the V8 heap (strings, plain objects). The near-heap callback
         // converts a heap-OOM into a clean terminate_execution().
@@ -4438,7 +4442,7 @@ mod tests {
     fn execute_with_prefix_infinite_loop_is_killed() {
         let snapshot = precompile("globalThis.base = 10", None, &[], &[]).unwrap();
         let err = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             "while (true) {}",
             None,
             Limits {
@@ -4833,7 +4837,7 @@ mod tests {
         // Use globalThis to share values with the postfix module.
         let snapshot = precompile("globalThis.base = 100", None, &[], &[]).unwrap();
         let out = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             "export default globalThis.base + 1",
             None,
             Limits::default(),
@@ -4850,7 +4854,7 @@ mod tests {
     fn execute_with_prefix_global_mutation_visible_in_postfix() {
         let snapshot = precompile("globalThis.answer = 42", None, &[], &[]).unwrap();
         let out = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             "export default globalThis.answer",
             None,
             Limits::default(),
@@ -4868,7 +4872,7 @@ mod tests {
         let snapshot = precompile("globalThis.base = 10", None, &[], &[]).unwrap();
         let b = "globalThis.base";
         let out1 = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             &format!("export default {b} * 2"),
             None,
             Limits::default(),
@@ -4879,7 +4883,7 @@ mod tests {
         )
         .unwrap();
         let out2 = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             &format!("export default {b} * 3"),
             None,
             Limits::default(),
@@ -4890,7 +4894,7 @@ mod tests {
         )
         .unwrap();
         let out3 = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             &format!("export default {b} * 4"),
             None,
             Limits::default(),
@@ -4909,7 +4913,7 @@ mod tests {
     fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
         let snapshot = precompile("globalThis.counter = 0", None, &[], &[]).unwrap();
         execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             "globalThis.counter = 99; export default 1",
             None,
             Limits::default(),
@@ -4920,7 +4924,7 @@ mod tests {
         )
         .unwrap();
         let out = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             "export default globalThis.counter",
             None,
             Limits::default(),
@@ -4943,7 +4947,7 @@ mod tests {
         )
         .unwrap();
         let out = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             "export default globalThis.sq[7]",
             None,
             Limits::default(),
@@ -4960,7 +4964,7 @@ mod tests {
     fn execute_with_prefix_console_is_available_in_postfix() {
         let snapshot = precompile("const x = 1", None, &[], &[]).unwrap();
         let out = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             r#"console.log("hello from postfix"); export default 1"#,
             None,
             Limits::default(),
@@ -4977,7 +4981,7 @@ mod tests {
     fn execute_with_prefix_postfix_runtime_error_is_reported() {
         let snapshot = precompile("", None, &[], &[]).unwrap();
         let err = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             r#"throw new Error("postfix failed")"#,
             None,
             Limits::default(),
@@ -7214,7 +7218,7 @@ mod tests {
         });
 
         let out = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             "export default (await globalThis.search('dogs')) + globalThis.maxResults",
             None,
             Limits::default(),
@@ -7260,7 +7264,7 @@ mod tests {
         });
 
         let out = execute_with_prefix(
-            &snapshot,
+            snapshot.clone().into(),
             r#"import { f } from "tools:t"; export default await f()"#,
             None,
             Limits::default(),
