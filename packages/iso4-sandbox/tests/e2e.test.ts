@@ -23,7 +23,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createSandbox as createRuntime } from '../src/index'
-import type { Sandbox as Runtime } from '../src/types'
+import type { HostExportData, Sandbox as Runtime } from '../src/types'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared mock libraries (host-provided JS source strings)
@@ -628,6 +628,55 @@ describe('host imports', () => {
     expect(result.exports.default).toBe('PING')
   })
 
+  test('widened data leaves arrive as real instances, cycles included', async () => {
+    // `HostExportData` covers everything V8's format carries, and nothing on
+    // the host walks a data leaf to check it — so these reach the sandbox as
+    // real instances, not as flattened plain objects.
+    const cyclic: { name: string, self?: unknown } = { name: 'root' }
+    cyclic.self = cyclic
+    const result = await runtime.run({
+      code: `
+        import { when, pattern, failure, lookup, tags, floats, loop } from 'host:data'
+        export default {
+          date: when instanceof Date && when.getTime(),
+          regexp: pattern instanceof RegExp && pattern.source + '/' + pattern.flags,
+          error: failure instanceof TypeError && failure.message,
+          map: lookup instanceof Map && lookup.get('a'),
+          set: tags instanceof Set && tags.has('x'),
+          typed: floats instanceof Float64Array && floats[1],
+          cycleHeld: loop[0].self === loop[0] && loop[0].name,
+        }
+      `,
+      imports: {
+        'host:data': {
+          when: new Date(1700000000000),
+          pattern: /ab+c/gi,
+          failure: new TypeError('boom'),
+          lookup: new Map<unknown, unknown>([['a', 1]]),
+          tags: new Set(['x']),
+          floats: new Float64Array([1.5, -2.5]),
+          // The cycle sits inside an array: an array is a data leaf and is
+          // never walked, so the back-reference survives. A cycle through a
+          // *plain* object still throws — the shape walker has to descend
+          // those to find function leaves (see DESIGN.md §4.3).
+          loop: [cyclic],
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      date: 1700000000000,
+      regexp: 'ab+c/gi',
+      error: 'boom',
+      map: 1,
+      set: true,
+      typed: -2.5,
+      cycleHeld: 'root',
+    })
+  })
+
   test('async host function is awaited correctly', async () => {
     const result = await runtime.run({
       code: `
@@ -1069,6 +1118,333 @@ describe('value boundary contract', () => {
       value: 1,
       hasMethod: 'undefined',
     })
+  })
+
+  // ── Full value matrix, both directions ──────────────────────────────────
+  //
+  // The three tests below exist because "it round-trips" is easy to believe
+  // and hard to verify: a `Date` that silently flattened to a plain object
+  // still prints plausibly, `JSON.stringify` renders a real `Date` as a
+  // string and a real `Map` as `{}`, and `toEqual` is structural enough to
+  // pass on a flattened value. So they check the **internal slot brand**
+  // (`Object.prototype.toString`, which a plain object cannot fake) plus
+  // `instanceof` against the *receiving realm's* constructor, on both sides.
+
+  /**
+   * Source for a sandbox-side `brand()` — `[object Date]`-style tag plus proof
+   * the value is an instance of the sandbox realm's own constructor.
+   *
+   * A flattened value tags as `Object`; a value carrying another realm's
+   * prototype tags correctly but fails `instanceof`. Either way the returned
+   * string stops matching, so the test fails loudly instead of passing on a
+   * lookalike.
+   */
+  const BRAND_FN_SRC = `
+    const brand = (v) => {
+      if (v === null) return 'null'
+      if (typeof v !== 'object') return typeof v
+      const tag = Object.prototype.toString.call(v).slice(8, -1)
+      const ctor = globalThis[tag]
+      if (typeof ctor !== 'function' || !(v instanceof ctor)) return tag + '!NOT-AN-INSTANCE'
+      return tag === 'Error' ? 'Error:' + v.name : tag
+    }
+  `
+
+  /**
+   * Host-side twin of `BRAND_FN_SRC`, run against what comes back.
+   * @param v the value to brand
+   */
+  function brand(v: unknown): string {
+    if (v === null)
+      return 'null'
+    if (typeof v !== 'object')
+      return typeof v
+    const tag = Object.prototype.toString.call(v).slice(8, -1)
+    const ctor = (globalThis as Record<string, unknown>)[tag]
+    if (typeof ctor !== 'function' || !(v instanceof (ctor as new () => object)))
+      return `${tag}!NOT-AN-INSTANCE`
+    return tag === 'Error' ? `Error:${(v as Error).name}` : tag
+  }
+
+  /**
+   * One row of the value matrix: a host value, the brand both realms must
+   * agree on, and a check that the value still *behaves* like its type after
+   * the round trip (a prototype alone proves less than a working method).
+   */
+  interface ValueCase {
+    name: string
+    value: HostExportData
+    brand: string
+    /**
+     * Expression evaluated in the sandbox against `v`; must equal `use`.
+     */
+    useExpr: string
+    use: unknown
+    assertHost: (v: unknown) => void
+  }
+
+  const VALUE_MATRIX: readonly ValueCase[] = [
+    {
+      name: 'Date',
+      value: new Date(1700000000000),
+      brand: 'Date',
+      useExpr: 'v.getTime()',
+      use: 1700000000000,
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(Date)
+        expect((v as Date).getTime()).toBe(1700000000000)
+      },
+    },
+    {
+      name: 'RegExp',
+      value: /ab+c/gi,
+      brand: 'RegExp',
+      useExpr: `[v.source, v.flags, v.test('xABBBCx')].join('|')`,
+      use: 'ab+c|gi|true',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(RegExp)
+        expect((v as RegExp).source).toBe('ab+c')
+        expect((v as RegExp).flags).toBe('gi')
+        expect((v as RegExp).test('xABBBCx')).toBe(true)
+      },
+    },
+    {
+      name: 'Error',
+      value: new TypeError('boom'),
+      brand: 'Error:TypeError',
+      useExpr: `[v.name, v.message, v instanceof TypeError].join('|')`,
+      use: 'TypeError|boom|true',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(TypeError)
+        expect((v as Error).message).toBe('boom')
+      },
+    },
+    {
+      name: 'Map',
+      value: new Map<HostExportData, HostExportData>([['a', 1], [2, 'b']]),
+      brand: 'Map',
+      useExpr: `[v.size, v.get('a'), v.get(2)].join('|')`,
+      use: '2|1|b',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(Map)
+        expect([...(v as Map<unknown, unknown>)]).toEqual([['a', 1], [2, 'b']])
+      },
+    },
+    {
+      name: 'Set',
+      value: new Set<HostExportData>(['x', 2]),
+      brand: 'Set',
+      useExpr: `[v.size, v.has('x'), v.has(2)].join('|')`,
+      use: '2|true|true',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(Set)
+        expect([...(v as Set<unknown>)]).toEqual(['x', 2])
+      },
+    },
+    {
+      name: 'ArrayBuffer',
+      value: new Uint8Array([7, 8, 9]).buffer,
+      brand: 'ArrayBuffer',
+      useExpr: `[v.byteLength, new Uint8Array(v)[1]].join('|')`,
+      use: '3|8',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(ArrayBuffer)
+        expect([...new Uint8Array(v as ArrayBuffer)]).toEqual([7, 8, 9])
+      },
+    },
+    {
+      name: 'DataView',
+      value: new DataView(new Uint8Array([0, 0, 1, 2]).buffer),
+      brand: 'DataView',
+      useExpr: `[v.byteLength, v.getUint8(3)].join('|')`,
+      use: '4|2',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(DataView)
+        expect((v as DataView).getUint8(3)).toBe(2)
+      },
+    },
+    {
+      name: 'Uint8Array',
+      value: new Uint8Array([1, 2, 3]),
+      brand: 'Uint8Array',
+      useExpr: `[v.length, v[2]].join('|')`,
+      use: '3|3',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(Uint8Array)
+        expect([...(v as Uint8Array)]).toEqual([1, 2, 3])
+      },
+    },
+    {
+      name: 'Float64Array',
+      value: new Float64Array([1.5, -2.5]),
+      brand: 'Float64Array',
+      useExpr: `[v.length, v[1]].join('|')`,
+      use: '2|-2.5',
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(Float64Array)
+        expect([...(v as Float64Array)]).toEqual([1.5, -2.5])
+      },
+    },
+    {
+      name: 'BigInt64Array',
+      value: new BigInt64Array([-1n, 2n ** 40n]),
+      brand: 'BigInt64Array',
+      useExpr: `[v.length, v[1].toString()].join('|')`,
+      use: `2|${2n ** 40n}`,
+      assertHost: (v) => {
+        expect(v).toBeInstanceOf(BigInt64Array)
+        expect([...(v as BigInt64Array)]).toEqual([-1n, 2n ** 40n])
+      },
+    },
+    {
+      name: 'a subarray window',
+      value: new Uint8Array([0, 1, 2, 3, 4]).subarray(1, 4),
+      brand: 'Uint8Array',
+      useExpr: `[v.length, v[0]].join('|')`,
+      use: '3|1',
+      assertHost: (v) => {
+        expect([...(v as Uint8Array)]).toEqual([1, 2, 3])
+        expect((v as Uint8Array).byteLength).toBe(3)
+      },
+    },
+    {
+      name: 'bigint',
+      value: 2n ** 70n,
+      brand: 'bigint',
+      useExpr: `(v + 1n).toString()`,
+      use: `${2n ** 70n + 1n}`,
+      assertHost: (v) => {
+        expect(v).toBe(2n ** 70n)
+      },
+    },
+    {
+      name: 'a plain object',
+      value: { a: 1, nested: { b: [1, 2] } },
+      brand: 'Object',
+      useExpr: `[v.a, v.nested.b[1]].join('|')`,
+      use: '1|2',
+      assertHost: (v) => {
+        expect(v).toEqual({ a: 1, nested: { b: [1, 2] } })
+      },
+    },
+    {
+      name: 'an array',
+      value: [1, 'two', true, null],
+      brand: 'Array',
+      useExpr: `v.join(',')`,
+      use: '1,two,true,',
+      assertHost: (v) => {
+        expect(v).toEqual([1, 'two', true, null])
+      },
+    },
+    {
+      name: 'null',
+      value: null,
+      brand: 'null',
+      useExpr: `String(v)`,
+      use: 'null',
+      assertHost: (v) => {
+        expect(v).toBeNull()
+      },
+    },
+    {
+      name: 'undefined',
+      value: undefined,
+      brand: 'undefined',
+      useExpr: `String(v)`,
+      use: 'undefined',
+      assertHost: (v) => {
+        expect(v).toBeUndefined()
+      },
+    },
+  ]
+
+  test('the whole value matrix survives host → sandbox → host in one array', async () => {
+    // One array carrying every type the boundary claims to support, in as a
+    // data global and straight back out as the default export. The sandbox
+    // brands each element before echoing, so a failure says which element
+    // stopped being itself and on which side.
+    const result = await runtime.run({
+      code: `
+        ${BRAND_FN_SRC}
+        export default { brands: VALUES.map(brand), echo: VALUES }
+      `,
+      globals: { VALUES: { kind: 'data', value: VALUE_MATRIX.map((c) => c.value) } },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const { brands, echo } = result.exports.default as { brands: string[], echo: unknown[] }
+    const expected = VALUE_MATRIX.map((c) => c.brand)
+
+    // Inbound: what the sandbox saw.
+    expect(brands).toEqual(expected)
+    // Outbound: what came back.
+    expect(echo.map(brand)).toEqual(expected)
+    expect(echo).toHaveLength(VALUE_MATRIX.length)
+    for (const [i, c] of VALUE_MATRIX.entries())
+      c.assertHost(echo[i])
+  })
+
+  test.each(VALUE_MATRIX.map((c) => [c.name, c] as const))(
+    'sandbox receives %s as a working instance and hands it back intact',
+    async (_name, c) => {
+      // Per-type twin of the array test: narrower blast radius on failure, and
+      // it additionally *uses* the value inside the sandbox — a working
+      // `getTime()` / `.test()` / `.get()` proves the internal slots crossed,
+      // not merely a prototype.
+      const result = await runtime.run({
+        code: `
+          ${BRAND_FN_SRC}
+          const v = VALUE
+          export default { brand: brand(v), used: ${c.useExpr}, echo: v }
+        `,
+        globals: { VALUE: { kind: 'data', value: c.value } },
+      })
+      expect(result.ok).toBe(true)
+      if (!result.ok)
+        return
+      const out = result.exports.default as { brand: string, used: unknown, echo: unknown }
+      expect(out.brand).toBe(c.brand)
+      expect(out.used).toBe(c.use)
+      expect(brand(out.echo)).toBe(c.brand)
+      c.assertHost(out.echo)
+    },
+  )
+
+  test('the matrix survives the bridge in both directions too', async () => {
+    // The data-global leg is host → sandbox only. This covers the other two
+    // value legs on one pass: bridge response (host → sandbox) and bridge
+    // arguments (sandbox → host).
+    const values = VALUE_MATRIX.map((c) => c.value)
+    const expected = VALUE_MATRIX.map((c) => c.brand)
+    let received: unknown[] = []
+
+    const result = await runtime.run({
+      code: `
+        ${BRAND_FN_SRC}
+        const incoming = await give()
+        await takeBack(...incoming)
+        export default incoming.map(brand)
+      `,
+      globals: {
+        give: async () => values,
+        takeBack: async (...args: unknown[]) => {
+          received = args
+          return null
+        },
+      },
+      limits: { maxBridgeCalls: 4 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    // Bridge response: host → sandbox.
+    expect(result.exports.default).toEqual(expected)
+    // Bridge arguments: sandbox → host.
+    expect(received.map(brand)).toEqual(expected)
+    for (const [i, c] of VALUE_MATRIX.entries())
+      c.assertHost(received[i])
   })
 
   test('exporting a function still fails loudly', async () => {

@@ -32,7 +32,6 @@
 
 import type { HostModuleNodePayload, ImportBindingPayload, ImportRebindPayload } from './ipc.js'
 import type {
-  HostExportData,
   HostExportFunction,
   HostModuleObject,
   Imports,
@@ -189,83 +188,14 @@ function lowerNode(
     seen.delete(value)
     return { kind: 'object', entries }
   }
-  // Data leaf — validated here so unsupported values fail with a pointer to
-  // their exact path, then carried as a V8 serialization blob.
-  validateDataLeaf(specifier, value as HostExportData, path)
+  // Data leaf. Deliberately NOT inspected here: the value is handed straight to
+  // V8's serializer, which is the single gate on what may cross (§4.2). Walking
+  // the graph first would duplicate exactly what the serializer does, on the
+  // Node main thread, at O(values) — the cost this package is trying to shed —
+  // and any pre-walk would drift from V8's real capabilities over time.
+  // Unsupported values therefore surface as the serializer's own data-clone
+  // error at encode time rather than as a path-annotated error here.
   return { kind: 'data', value }
-}
-
-/**
- * Validate a `HostExportData` value. Supports primitives, plain
- * objects/arrays, `BigInt`, `Uint8Array` — the same set the wire codec can
- * carry back out of the sandbox. `Date`, `Map`, `Set`, circular refs, and
- * class instances throw with a clear pointer.
- *
- * @param specifier
- * @param value
- * @param path
- * @param seen
- */
-function validateDataLeaf(
-  specifier: string,
-  value: HostExportData,
-  path: string[],
-  seen: Set<object> = new Set(),
-): void {
-  if (value === null || value === undefined)
-    return
-  switch (typeof value) {
-    case 'boolean':
-    case 'number':
-    case 'bigint':
-    case 'string':
-      return
-  }
-  if (value instanceof Uint8Array)
-    return
-  if (value instanceof Date || value instanceof Map || value instanceof Set) {
-    // Deliberately outside the typed `HostExportData` contract (the wire
-    // itself would carry them fine; see the jsdoc above)
-    // of the sandbox, so accepting them here would be a one-way asymmetry.
-    throw new Error(
-      `[@iso4/sandbox] imports['${specifier}'].${path.join('.')}: `
-      + `${value.constructor.name} values are not supported as data leaves; `
-      + `supported: primitives, bigint, string, Uint8Array, plain objects/arrays`,
-    )
-  }
-  if (typeof value === 'object') {
-    if (seen.has(value)) {
-      throw new Error(
-        `[@iso4/sandbox] imports['${specifier}'].${path.join('.')}: `
-        + `circular references in data leaves are not supported`,
-      )
-    }
-    seen.add(value)
-    if (Array.isArray(value)) {
-      value.forEach((item, i) => {
-        validateDataLeaf(specifier, item as HostExportData, [...path, String(i)], seen)
-      })
-      seen.delete(value)
-      return
-    }
-    const proto = Object.getPrototypeOf(value)
-    if (proto !== null && proto !== Object.prototype) {
-      throw new Error(
-        `[@iso4/sandbox] imports['${specifier}'].${path.join('.')}: `
-        + `class instances are not supported as data leaves; copy the data `
-        + `into a plain object explicitly`,
-      )
-    }
-    for (const [key, child] of Object.entries(value)) {
-      validateDataLeaf(specifier, child as HostExportData, [...path, key], seen)
-    }
-    seen.delete(value)
-    return
-  }
-  throw new Error(
-    `[@iso4/sandbox] imports['${specifier}'].${path.join('.')}: `
-    + `unsupported data value of type ${describeKind(value)}`,
-  )
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -351,10 +281,12 @@ function isPlainObject(value: unknown): value is HostModuleObject {
     return false
   if (Array.isArray(value))
     return false
-  if (value instanceof Uint8Array || value instanceof Date)
-    return false
-  if (value instanceof Map || value instanceof Set)
-    return false
+  // Only a genuinely plain object describes nested host-module *shape*.
+  // Everything else with an interesting prototype — `Date`, `Map`, `Set`,
+  // `RegExp`, `Error`, `ArrayBuffer`, any `TypedArray`, class instances — is a
+  // data leaf, handed to V8's serializer as-is. This is O(1) per node (it never
+  // descends into a leaf), and the prototype check alone covers every one of
+  // those types, so there is no per-type list here to keep in sync.
   const proto = Object.getPrototypeOf(value)
   return proto === null || proto === Object.prototype
 }
