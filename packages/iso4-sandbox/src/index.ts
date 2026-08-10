@@ -43,6 +43,7 @@ import {
   processImports,
 } from './imports.js'
 import type { ImportHandlerMap } from './imports.js'
+import { materializeHostTypesInGlobals } from './v8-codec.js'
 
 export type {
   ResourceLimits,
@@ -195,6 +196,9 @@ class SandboxImpl implements Sandbox {
       return abortedResult(options.signal.reason)
     }
     const { defs, dispatch } = processGlobals(options.globals ?? {})
+    // Drain any Request/Response body before the payload encoder, which is
+    // synchronous. See materializeHostTypesInGlobals.
+    await materializeHostTypesInGlobals(defs)
     // Host modules cross the wire as shape data; the runtime builds them
     // natively and dispatches function-leaf calls back here by
     // (specifier, path) through `handlers`.
@@ -259,6 +263,7 @@ class SandboxImpl implements Sandbox {
     return this.pool.withClient(async (client) => {
       const rawGlobals = options.globals ?? {} as G
       const { defs } = processGlobals(rawGlobals)
+      await materializeHostTypesInGlobals(defs)
       // The declared import shape travels as data and is stored with the
       // prefix on the Rust side — it is the runtime's reference for building
       // the modules on every run and for validating rebind attempts. The
@@ -355,12 +360,14 @@ implements Prefix<G, M> {
   /**
    * Execute dynamic code against this prefix's snapshot. See
    * {@link Prefix.execute}.
+   * @param options
    */
   async execute(options: PrefixRunOptions<G, M>): Promise<RunResult> {
     return this.run(options)
   }
 
   /**
+   * @param options
    * @deprecated Renamed to {@link PrefixImpl.execute}; kept as an alias.
    */
   async run(options: PrefixRunOptions<G, M>): Promise<RunResult> {

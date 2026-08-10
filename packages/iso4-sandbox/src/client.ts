@@ -24,7 +24,7 @@ import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
-import { deserializeValue, serializationProbe, serializeValue } from './v8-codec.js'
+import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
 
 export interface RuntimeIpcClientOptions {
   socketPath: string
@@ -535,14 +535,18 @@ export class RuntimeIpcClient {
               exportName: call.exportName,
               args: call.args,
             }).then(
-              (value) => {
-                // serializeValue throws for the handful of types V8 refuses to
-                // clone (function, symbol, promise, WeakMap, proxy). Catch and
-                // send an error response so the sandbox receives
+              async (value) => {
+                // serializeHostValue throws for the handful of types V8 refuses
+                // to clone (function, symbol, promise, WeakMap, proxy). Catch
+                // and send an error response so the sandbox receives
                 // ERR_HOST_BRIDGE rather than hanging.
+                //
+                // The async variant is used here because a handler may return a
+                // Request/Response — a `fetch` handler returning the real thing
+                // rather than a plain object — and draining its body is async.
                 let encoded: Uint8Array
                 try {
-                  encoded = serializeValue(value)
+                  encoded = await serializeHostValue(value)
                 } catch (e) {
                   return this.write(
                     encodeTsToRustFrame(

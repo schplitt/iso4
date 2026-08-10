@@ -17,6 +17,13 @@
 
 import type { Buffer } from 'node:buffer'
 import v8 from 'node:v8'
+import type { GlobalDefPayload } from './ipc.js'
+import {
+  HostTypeDeserializer,
+  isMaterializedHostType,
+  materializeHostType,
+  writeHostType,
+} from './web-codec.js'
 
 /**
  * The subset of `v8.Serializer` we need that `@types/node` does not declare.
@@ -64,6 +71,13 @@ export function serializeValue(value: unknown): Buffer {
     ._setTreatArrayBufferViewsAsHostObjects(false)
   serializer.writeHeader()
   try {
+    // A host type that an earlier async pass already drained (see
+    // `materializeHostTypesInGlobals`) is emitted by hand rather than written
+    // as a value — Node cannot write a host object through `writeValue`.
+    if (isMaterializedHostType(value)) {
+      writeHostType(serializer as unknown as Parameters<typeof writeHostType>[0], value)
+      return serializer.releaseBuffer()
+    }
     serializer.writeValue(value)
   } catch (error) {
     throw new ValueEncodeError(
@@ -74,6 +88,63 @@ export function serializeValue(value: unknown): Buffer {
 }
 
 /**
+ * Serialize a value that may itself be a `Request`, `Response`, or `Headers`.
+ *
+ * Async because reading a body is. Use this on every leg where a host type can
+ * legitimately appear — bridge responses and data globals. Anything else should
+ * keep using {@link serializeValue}, which stays synchronous.
+ *
+ * Only a **top-level** host type is recognised. Node's serializer exposes no
+ * delegate, so a payload can only be hand-emitted where we control emission;
+ * one nested inside a larger value flattens the way any class instance does
+ * (`docs/protocol.md` §4.4.6).
+ * @param value the value to encode
+ */
+export async function serializeHostValue(value: unknown): Promise<Buffer> {
+  const materialized = await materializeHostType(value)
+  if (materialized === undefined)
+    return serializeValue(value)
+
+  const serializer = new v8.DefaultSerializer()
+  ;(serializer as unknown as SerializerInternals)
+    ._setTreatArrayBufferViewsAsHostObjects(false)
+  serializer.writeHeader()
+  try {
+    writeHostType(serializer as unknown as Parameters<typeof writeHostType>[0], materialized)
+  } catch (error) {
+    throw new ValueEncodeError(
+      `[iso4] cannot serialize value: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+  return serializer.releaseBuffer()
+}
+
+/**
+ * Drain any `Request`/`Response`/`Headers` sitting in a data global so the
+ * synchronous payload encoder can emit them.
+ *
+ * This is the host → sandbox leg: it is how a real `Request` gets *into* the
+ * sandbox today, before the call API exists. Bodies are async, payload encoding
+ * is not, so the read has to happen here — both `prepare()` and `execute()` are
+ * already async, so it costs no API change.
+ *
+ * Only the data global's top-level value is examined; one nested inside a
+ * larger object flattens like any class instance (`docs/protocol.md` §4.4.6).
+ * @param defs global definitions, mutated in place
+ */
+export async function materializeHostTypesInGlobals(
+  defs: GlobalDefPayload[],
+): Promise<void> {
+  for (const def of defs) {
+    if (def.kind !== 'data')
+      continue
+    const materialized = await materializeHostType(def.value)
+    if (materialized !== undefined)
+      def.value = materialized
+  }
+}
+
+/**
  * Read one JavaScript value back from a V8 serialization blob.
  * @param bytes the blob, exactly as produced by {@link serializeValue} or by
  * the Rust `blob::serialize_value`
@@ -81,7 +152,12 @@ export function serializeValue(value: unknown): Buffer {
  */
 export function deserializeValue(bytes: Uint8Array): unknown {
   try {
-    return v8.deserialize(bytes)
+    // Not `v8.deserialize()`: that uses DefaultDeserializer, whose
+    // `_readHostObject` decodes Node's private typed-array format and cannot
+    // read the host types the runtime writes. See `web-codec.ts`.
+    const deserializer = new HostTypeDeserializer(bytes)
+    deserializer.readHeader()
+    return deserializer.readValue()
   } catch (error) {
     throw new ValueDecodeError(
       `[iso4] cannot deserialize value: ${error instanceof Error ? error.message : String(error)}`,

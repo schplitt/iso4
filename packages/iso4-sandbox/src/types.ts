@@ -857,6 +857,12 @@ export type RunErrorCode
     | 'ERR_COMPILE'
     | 'ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED'
     | 'ERR_EXPORT_NOT_SERIALIZABLE'
+    /**
+     * A registered host type (`Request`, `Response`, …) cannot cross this
+     * boundary in this position — an unimplemented tag, or content that is not
+     * self-contained such as a stream body. See `docs/protocol.md` §4.4.5.
+     */
+    | 'ERR_TYPE_NOT_SERIALIZABLE'
     | 'ERR_EXPORT_TOO_LARGE'
     | 'ERR_EXPORT_UNRESOLVED_PROMISE'
     | 'ERR_HOST_BRIDGE'

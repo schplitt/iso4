@@ -367,6 +367,13 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: None,
             fields: None,
         },
+        RunError::TypeNotSerializable(msg) => RunErrorPayload {
+            code: "ERR_TYPE_NOT_SERIALIZABLE".to_string(),
+            name: "TypeError".to_string(),
+            message: msg.clone(),
+            stack: None,
+            fields: None,
+        },
         RunError::CpuTimeout => RunErrorPayload {
             code: "ERR_CPU_TIMEOUT".to_string(),
             name: "Error".to_string(),
