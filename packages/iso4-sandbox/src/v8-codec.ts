@@ -17,6 +17,8 @@
 
 import type { Buffer } from 'node:buffer'
 import v8 from 'node:v8'
+import type { GlobalDefPayload } from './ipc.js'
+import { HostTypeDeserializer, materializeHostTypes } from './web-codec.js'
 
 /**
  * The subset of `v8.Serializer` we need that `@types/node` does not declare.
@@ -74,6 +76,46 @@ export function serializeValue(value: unknown): Buffer {
 }
 
 /**
+ * Serialize a value that may contain `Request`/`Response`/`Headers` **anywhere**
+ * inside it.
+ *
+ * Async because reading a body is. Use this on every leg where a host type can
+ * legitimately appear — bridge responses and data globals. Everything else keeps
+ * using {@link serializeValue}, which stays synchronous.
+ *
+ * Nesting is supported at any depth: the transform substitutes branded plain
+ * objects and the runtime rebuilds real instances on arrival
+ * (`docs/protocol.md` §4.4.6). Node's serializer exposes no host-object write
+ * hook, which is why the descriptor detour exists at all.
+ * @param value the value to encode
+ */
+export async function serializeHostValue(value: unknown): Promise<Buffer> {
+  return serializeValue(await materializeHostTypes(value))
+}
+
+/**
+ * Drain and brand any `Request`/`Response`/`Headers` inside a data global so the
+ * synchronous payload encoder can write it.
+ *
+ * This is one of the two host → sandbox legs — how a real `Request` gets *into*
+ * the sandbox before the call API exists. Bodies are async and payload encoding
+ * is not, so the read happens here; both `prepare()` and `execute()` are already
+ * async, so it costs no API change.
+ *
+ * Nested host types are handled, at any depth.
+ * @param defs global definitions, mutated in place
+ */
+export async function materializeHostTypesInGlobals(
+  defs: GlobalDefPayload[],
+): Promise<void> {
+  for (const def of defs) {
+    if (def.kind !== 'data')
+      continue
+    def.value = (await materializeHostTypes(def.value)) as typeof def.value
+  }
+}
+
+/**
  * Read one JavaScript value back from a V8 serialization blob.
  * @param bytes the blob, exactly as produced by {@link serializeValue} or by
  * the Rust `blob::serialize_value`
@@ -81,7 +123,12 @@ export function serializeValue(value: unknown): Buffer {
  */
 export function deserializeValue(bytes: Uint8Array): unknown {
   try {
-    return v8.deserialize(bytes)
+    // Not `v8.deserialize()`: that uses DefaultDeserializer, whose
+    // `_readHostObject` decodes Node's private typed-array format and cannot
+    // read the host types the runtime writes. See `web-codec.ts`.
+    const deserializer = new HostTypeDeserializer(bytes)
+    deserializer.readHeader()
+    return deserializer.readValue()
   } catch (error) {
     throw new ValueDecodeError(
       `[iso4] cannot deserialize value: ${error instanceof Error ? error.message : String(error)}`,

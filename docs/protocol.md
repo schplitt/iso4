@@ -241,6 +241,222 @@ Byte-level, the frame slot is `u32 byteLength` followed by the blob, whose
 first two bytes are V8's header tag `0xFF` and the serialization **format
 version** (the value the handshake in §5.1 agrees on).
 
+### 4.4 Host types
+
+Some classes cross as **real instances** rather than flattening the way §4.2
+describes. They use V8's own host-object escape hatch — the same mechanism
+workerd uses (`src/workerd/jsg/ser.h`).
+
+A host object is written as V8's `kHostObject` tag (`0x5C`) where a value is
+expected, followed by an embedder-defined payload: a type tag and then
+whatever that type's codec writes. This section defines the framing; each
+registered type defines its own body.
+
+The set of types is **open**. Adding one means allocating a tag and
+registering a codec pair on both sides; nothing else in the protocol changes.
+The first family to be registered is the web types (`Headers`, `Request`,
+`Response`).
+
+#### 4.4.1 Type tags
+
+One registry for the whole protocol. **Numeric values never change.** `0` is
+reserved so that a stray zero is never a valid type.
+
+| Tag | Type             | Status                                    |
+| --- | ---------------- | ----------------------------------------- |
+| 0   | _invalid_        | reserved; reading it is a protocol fault  |
+| 1   | `Headers`        | implemented                               |
+| 2   | `Request`        | implemented                               |
+| 3   | `Response`       | implemented                               |
+| 4   | `ReadableStream` | **reserved, not implemented** (see 4.4.5) |
+| 5   | `WritableStream` | **reserved, not implemented**             |
+| 6   | `WebSocket`      | **reserved, not implemented**             |
+| 7   | `AbortSignal`    | **reserved, not implemented**             |
+| 8   | `DOMException`   | **reserved, not implemented**             |
+| 9   | `Blob`           | **reserved, not implemented**             |
+| 10  | `FormData`       | **reserved, not implemented**             |
+| 11  | `URLPattern`     | **reserved, not implemented**             |
+
+Reading a tag that this build does not implement is
+`ERR_TYPE_NOT_SERIALIZABLE`, not a protocol fault: it is the expected outcome
+of a peer built with a wider type set, and the message names the tag.
+
+#### 4.4.2 Payload primitives
+
+Inside a host-object payload the integers are V8's own **varint** encoding
+(`ValueSerializer::WriteUint32` / `ReadUint32`) — _not_ the big-endian frame
+integers of §3. Three composites are used:
+
+```txt
+str   := u32 byteLength, UTF-8 bytes             (no NUL terminator)
+value := a nested V8 value, written with WriteValue / read with ReadValue
+blob  := u32 byteLength, V8 serialization blob   (byteLength 0 = absent)
+```
+
+`value` is the important one. Anything that is already a JavaScript object on
+both sides — the header list, the body — is written with a nested `WriteValue`
+rather than framed by hand. V8 then walks it internally instead of the embedder
+pushing elements across the API boundary one at a time, which is the cost
+`#48` measured at ~87 ns per `obj.set()` when it deleted the old `WireValue`
+codec. Only scalars that are _not_ already JS values (a status code, a URL
+string being read out of an instance) are hand-framed.
+
+#### 4.4.3 Headers
+
+Used by `Request` and `Response`, and as the whole payload of tag 1.
+
+```txt
+value   entries   // one flat array: [name, value, name, value, …]
+```
+
+Names are pre-lowercased. The array is flat rather than an array of pairs
+because that is how the sandbox stores headers internally, so neither side has
+to rebuild it.
+
+No name is special-cased. An earlier draft interned ~40 common names to a
+single varint the way workerd does (`api/headers.c++`), which saves roughly
+100 bytes per response — but it requires a frozen lookup table duplicated in
+both codecs, and a table that drifts by one position delivers headers under
+the **wrong names** silently. Not worth that failure mode at this scale.
+
+Duplicates are separate entries, so multiple `set-cookie` values survive
+intact — a `Record<string, string>` cannot represent them and must not be used
+as an intermediate anywhere on either side.
+
+Readers **must** reject an array longer than 2048 elements (1024 entries), and
+an odd-length array, before constructing anything.
+
+#### 4.4.4 Request and Response
+
+```txt
+request (tag 2)
+  str     url
+  str     method       // uppercased; "GET" is written explicitly
+  value   headers      // §4.4.3
+  value   body         // null | string | Uint8Array
+  blob    extras       // plain data only — see below
+
+response (tag 3)
+  u32     status
+  str     statusText   // "" when unset
+  value   headers
+  value   body
+  blob    extras
+```
+
+There is no body-kind discriminator: V8 records whether the value is `null`, a
+string, or a typed array, so the reader gets the right type back without the
+two sides agreeing on a tag byte. Writing the body as a nested value also means
+V8 copies the bytes once, straight out of the backing store; hand-framing it
+required a copy into an intermediate buffer and then a second copy into the
+serializer.
+
+A body that is anything else — a stream — is rejected before it reaches V8, so
+the error names the real problem rather than surfacing as "could not be
+cloned". A future streaming body would be a **host object nested in the body
+slot**, which already works: the runtime routes host objects at any depth.
+
+`extras` is a length-delimited V8 blob holding a plain object of
+forward-compatible fields (`redirect`, `cf`, `signal`, …). It exists so new
+fields can be added **without allocating a new type tag** — the pattern workerd
+uses for the same reason (`Request::serialize` in `api/http.c++`). A zero
+byteLength means no extras.
+
+`extras` must contain only plain data. It must **not** contain a nested host
+object: the host side hand-writes these payloads (§4.4.6) and Node cannot emit
+a host object inside a `writeValue` graph.
+
+#### 4.4.5 What does not cross
+
+Every case below reports `ERR_TYPE_NOT_SERIALIZABLE` with a message naming
+the type and the reason. There is one code for all of them, deliberately:
+the type set is open, and a caller's handling of "this value cannot cross"
+does not differ per type.
+
+| Value                                                           | Reason                        |
+| --------------------------------------------------------------- | ----------------------------- |
+| a body that is a `ReadableStream`                               | not self-contained            |
+| `WebSocket`, `AbortSignal`                                      | not self-contained            |
+| a tag this build does not implement                             | unimplemented type            |
+| a host type nested below the top level of a host → sandbox slot | unreachable position (§4.4.6) |
+
+Types that are **not self-contained** are the general category, borrowed from
+workerd's `ExternalHandler` split (`jsg/ser.h:62`): a value that refers to a
+resource elsewhere rather than carrying its content. Such a value can only be
+serialized in a context that offers somewhere to put the reference. iso4 has
+no such context today, so the answer is always the error; the seam exists so
+one can be added without touching any tag.
+
+Streams are the clearest instance, and deliberately unsupported rather than
+buffered-behind-the-scenes.
+workerd can serialize a `ReadableStream` only because its boundary sits on a
+live capability-passing RPC connection: `ReadableStream::serialize` writes no
+bytes at all, it mints a `capnp::ByteStream` capability, puts it in the
+message's cap table via an `ExternalHandler`, and pumps the body over that
+connection afterwards. A one-shot iso4 frame has no such channel, so a stream
+has nowhere to go. Tags 4–6 are reserved so that adding one later is not a
+format change — a streaming body would simply be one of those host objects
+sitting in the body slot, which needs no new framing at all.
+
+#### 4.4.6 Direction asymmetry
+
+The two directions use different mechanisms. Both support nesting at any depth;
+they get there differently.
+
+| Leg                          | Mechanism                                     |
+| ---------------------------- | --------------------------------------------- |
+| Rust writes (sandbox → host) | V8 routes automatically on internal fields    |
+| Node reads (sandbox → host)  | `v8.Deserializer` subclass, `_readHostObject` |
+| Node writes (host → sandbox) | **branded plain objects** — see below         |
+| Rust reads (host → sandbox)  | ordinary deserialize, then a rehydration walk |
+
+The sandbox classes are backed by `FunctionTemplate` instances with internal
+fields, so V8 routes them to `WriteHostObject` off a map field read, with
+`HasCustomHostObject()` left `false`. No embedder callback fires for ordinary
+objects. Enabling it would make V8 call back into the embedder for _every_ plain
+object serialized.
+
+The internal field is deliberately left **empty**. `rusty_v8`'s snapshot callback
+reads every embedder field as an aligned pointer and `memcpy`s out of it, so
+storing anything there — a `v8::Integer` included — segfaults any snapshot that
+contains a live instance. The type tag comes from an `instanceof` check inside
+`write_host_object`, which only runs for objects V8 already routed there.
+
+Node has no write-side equivalent. `v8.Serializer` exposes no delegate to
+JavaScript and `_writeHostObject` never fires for a class instance — the object
+silently flattens. So the host does not attempt it: each instance is replaced by
+a plain object carrying the same fields plus a `__iso4_ht` property holding its
+type tag, the graph is serialized normally, and the runtime walks the result
+substituting real instances.
+
+```txt
+// host has:         { meta: 'x', res: Response }
+// host serializes:  { meta: 'x', res: { __iso4_ht: 3, status: 200,
+//                                       statusText: '', headers: [...],
+//                                       body: Uint8Array } }
+```
+
+Because the graph is an ordinary V8 value, nesting, cycles, `Map`/`Set` and
+object identity all work for free, and a new type costs one tag plus one
+constructor in the rehydration switch. The walk runs only on host → sandbox legs
+— bridge responses and data globals — and is guarded by a byte scan for the
+brand, so a payload with no host types pays only that scan. Depth is capped at
+32 levels on both sides.
+
+The asymmetry is safe because the two directions never share a reader: Rust reads
+what Node writes and vice versa, never both.
+
+Sandbox-side subclasses (`class My extends Response {}`) keep their internal
+fields and route normally. A _lookalike_ that re-points its prototype without
+calling the real constructor has no internal field and is not supported.
+
+#### 4.4.7 Versioning
+
+Following workerd's rule (`jsg/ser.h`): the byte sequence for a given tag is
+frozen once anything has written it. A changed layout means a **new tag**,
+with the reader for it deployed everywhere before any writer starts emitting
+it. Additive fields go in `extras` and need no tag at all.
+
 ---
 
 ## 5. Message payload schemas
@@ -619,25 +835,26 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 
 ## 7. Error codes
 
-| Code                                  | Cause                                                                       |
-| ------------------------------------- | --------------------------------------------------------------------------- |
-| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.               |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                           |
-| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                            |
-| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                 |
-| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).      |
-| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                            |
-| `ERR_COMPILE`                         | Syntax/module compile error.                                                |
-| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                       |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.        |
-| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                             |
-| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                          |
-| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.     |
-| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                   |
-| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.            |
-| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`. |
-| `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                    |
-| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                             |
+| Code                                  | Cause                                                                                                                                                                                        |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                                                                                                                                            |
+| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                             |
+| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                  |
+| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                       |
+| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                             |
+| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                 |
+| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                        |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.                                                                                                                         |
+| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                              |
+| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                           |
+| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                      |
+| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                    |
+| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                             |
+| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5. |
+| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                  |
+| `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                                                                                                                                     |
+| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                              |
 
 ---
 

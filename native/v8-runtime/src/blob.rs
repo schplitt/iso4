@@ -11,13 +11,68 @@
 //!   precede `read_value()`. Skipping `read_header` does not fail cleanly — the
 //!   version byte is then read as a value tag and every payload dies with a
 //!   misleading host-object error.
-//! - Nothing here claims host objects. The delegates are deliberately empty so
-//!   the bytes stay plain-V8 readable from Node (which cannot write custom
-//!   host objects at all — see `V8_BLOB_FOLLOWUPS.md` §1).
+//! - `has_custom_host_object` stays at its default `false`, and `is_host_object`
+//!   is deliberately left unimplemented (its default throws). Returning `true`
+//!   from `has_custom_host_object` makes V8 call the delegate for **every**
+//!   plain object it serializes — a per-object cost on the bulk export path.
+//!   Instead the sandbox's host types carry V8 internal fields, which V8
+//!   dispatches on with a map field read and no callback at all. workerd relies
+//!   on exactly the same property (`src/workerd/jsg/ser.c++`,
+//!   `Serializer::HasCustomHostObject`). If a change ever makes V8 start
+//!   calling `is_host_object`, the default impl throws and the failure is loud.
+//!
+//! Host objects (`Headers`, `Request`, `Response`) are encoded by `webcodec`;
+//! this module only routes to it. Everything else stays plain-V8 readable from
+//! Node.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
+
+use crate::webcodec::{self, CodecError};
+
+thread_local! {
+    /// Set by a delegate when it refuses a value, then taken by the surrounding
+    /// call. V8's delegate methods can only signal failure as `None`/an
+    /// exception, which loses the distinction between "unsupported type" and
+    /// "malformed bytes" — and that distinction picks the error code.
+    static LAST_CODEC_ERROR: RefCell<Option<CodecError>> = const { RefCell::new(None) };
+}
+
+/// Take the codec error recorded by the most recent serialize/deserialize, if
+/// the failure came from a host type rather than from V8 itself.
+pub fn take_codec_error() -> Option<CodecError> {
+    LAST_CODEC_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+/// Record a codec failure **and throw**.
+///
+/// Returning `None` from a delegate is not enough. V8's
+/// `ValueSerializer::WriteHostObject` propagates failure only when an exception
+/// is already pending:
+///
+/// ```cpp
+/// Maybe<bool> result = delegate_->WriteHostObject(...);
+/// RETURN_VALUE_IF_EXCEPTION(isolate_, Nothing<bool>());
+/// DCHECK(!result.IsNothing());   // no-op in release
+/// ```
+///
+/// With no exception pending the `DCHECK` compiles away and serialization
+/// reports **success** having written a truncated payload. Found by the
+/// oversized-headers test, which passed serialization when it should have
+/// failed.
+fn record(scope: &mut v8::HandleScope, error: CodecError) {
+    let message =
+        v8::String::new(scope, error.message()).unwrap_or_else(|| v8::String::empty(scope));
+    let exception = v8::Exception::type_error(scope, message);
+    scope.throw_exception(exception);
+    LAST_CODEC_ERROR.with(|slot| *slot.borrow_mut() = Some(error));
+}
+
+fn clear_codec_error() {
+    LAST_CODEC_ERROR.with(|slot| *slot.borrow_mut() = None);
+}
 
 /// Serializer delegate. Turns V8's data-clone refusal into a JS exception the
 /// surrounding `TryCatch` picks up, so the caller gets the real message
@@ -33,12 +88,61 @@ impl v8::ValueSerializerImpl for SerDelegate {
         let exc = v8::Exception::error(scope, message);
         scope.throw_exception(exc);
     }
+
+    /// Reached only for objects with internal fields — V8 routes them here
+    /// without consulting `is_host_object`. See the module docs.
+    fn write_host_object<'s>(
+        &self,
+        scope: &mut v8::HandleScope<'s>,
+        object: v8::Local<'s, v8::Object>,
+        value_serializer: &dyn ValueSerializerHelper,
+    ) -> Option<bool> {
+        let tag = match crate::webtypes::tag_of(scope, object) {
+            Some(t) => t,
+            None => {
+                // An object with internal fields that is not one of ours. There
+                // is no such object in this runtime today; if one appears, say
+                // so rather than writing a malformed payload.
+                record(
+                    scope,
+                    CodecError::Unsupported(
+                        "value is a host object this build does not recognise".to_string(),
+                    ),
+                );
+                return None;
+            }
+        };
+        match webcodec::encode(scope, value_serializer, object, tag) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                record(scope, e);
+                None
+            }
+        }
+    }
 }
 
-/// Deserializer delegate. Empty: we read no host objects (see module docs).
+/// Deserializer delegate. Materialises host objects through `webcodec`.
 struct DeserDelegate;
 
-impl v8::ValueDeserializerImpl for DeserDelegate {}
+impl v8::ValueDeserializerImpl for DeserDelegate {
+    fn read_host_object<'s>(
+        &self,
+        scope: &mut v8::HandleScope<'s>,
+        value_deserializer: &dyn ValueDeserializerHelper,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        match webcodec::decode(scope, value_deserializer) {
+            Ok(obj) => Some(obj),
+            Err(e) => {
+                // Throwing is legal inside the DisallowJavascriptExecutionScope
+                // that wraps ReadHostObject — raising an exception runs no JS.
+                // workerd throws from the same place (`JSG_FAIL_REQUIRE`).
+                record(scope, e);
+                None
+            }
+        }
+    }
+}
 
 /// Serialize one V8 value into a blob.
 ///
@@ -49,6 +153,7 @@ pub fn serialize_value(
     scope: &mut v8::HandleScope,
     value: v8::Local<v8::Value>,
 ) -> Result<Vec<u8>, String> {
+    clear_codec_error();
     let context = scope.get_current_context();
     let tc = &mut v8::TryCatch::new(scope);
     let serializer = v8::ValueSerializer::new(tc, Box::new(SerDelegate));
@@ -56,15 +161,47 @@ pub fn serialize_value(
     if serializer.write_value(context, value) == Some(true) {
         return Ok(serializer.release());
     }
-    let message = tc
-        .exception()
-        .and_then(|e| e.to_string(tc))
-        .map(|s| s.to_rust_string_lossy(tc))
+    // A host-type refusal carries a better message than V8's generic one, and
+    // the caller needs it to pick between ERR_TYPE_NOT_SERIALIZABLE and
+    // ERR_EXPORT_NOT_SERIALIZABLE. `take_codec_error` leaves it for them; this
+    // only borrows the text.
+    let message = LAST_CODEC_ERROR
+        .with(|slot| slot.borrow().as_ref().map(|e| e.message().to_string()))
+        .or_else(|| {
+            tc.exception()
+                .and_then(|e| e.to_string(tc))
+                .map(|s| s.to_rust_string_lossy(tc))
+        })
         .unwrap_or_else(|| "value could not be cloned".to_string());
     // The failure is reported through the returned Err; leaving the exception
     // pending would abort unrelated JS further up the stack.
     tc.reset();
     Err(message)
+}
+
+/// Read one V8 value back from a blob, materialising any host types the host
+/// sent as branded descriptors.
+///
+/// Use this on host → sandbox legs (data globals, bridge responses). Ordinary
+/// `deserialize_value` is for everything else and never walks.
+///
+/// The walk is guarded by a byte scan for the brand, so a payload with no host
+/// types pays only that scan.
+pub fn deserialize_value_with_web_types<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    bytes: &[u8],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let value = deserialize_value(scope, bytes)?;
+    if !webcodec::might_contain_web_types(bytes) {
+        return Some(value);
+    }
+    match webcodec::rehydrate(scope, value) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            LAST_CODEC_ERROR.with(|slot| *slot.borrow_mut() = Some(e));
+            None
+        }
+    }
 }
 
 /// Read one V8 value back from a blob.
@@ -77,6 +214,7 @@ pub fn deserialize_value<'s>(
     scope: &mut v8::HandleScope<'s>,
     bytes: &[u8],
 ) -> Option<v8::Local<'s, v8::Value>> {
+    clear_codec_error();
     let context = scope.get_current_context();
     let tc = &mut v8::TryCatch::new(scope);
     let deserializer = v8::ValueDeserializer::new(tc, Box::new(DeserDelegate), bytes);

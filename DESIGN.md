@@ -307,8 +307,22 @@ Globals are _not_ a free-for-all. The runtime owns a fixed set of reserved
 names that the host must not shadow:
 
 - `console` — owned by the runtime for output capture.
-- V8 built-ins: `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`,
-  `crypto`, `Event`, `AbortController`, `AbortSignal`, etc.
+- The web runtime the runtime installs: `Headers`, `Request`, `Response`,
+  `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`.
+
+These are **enforced**, not merely documented: a host global using one of these
+names is rejected with `ERR_UNDECLARED_BINDING`. Allowing a host to shadow
+`Response` would leave user code building objects the codec cannot recognise.
+
+> **Correction (this section previously claimed otherwise).** These were
+> listed here as "V8 built-ins" alongside `crypto`, `Event`,
+> `AbortController` and `AbortSignal`. They are not. Plain V8 provides none
+> of them — they are embedder-supplied in Node, Deno and browsers, and a bare
+> iso4 sandbox had **no** web globals at all beyond `console`. `Headers`,
+> `Request`, `Response`, `TextEncoder`, `TextDecoder`, `URL` and
+> `URLSearchParams` are now installed by the runtime (see §4.4 below);
+> `crypto`, `Event`, `AbortController` and `AbortSignal` still do not exist
+> and are **not** reserved.
 
 Any name **not** on that reserved list may be provided by the host as a
 global. The host passes `globals: { fetch: fn, myTool: fn, transform: fn }`
@@ -323,6 +337,45 @@ Everything else the host wants to expose goes through `imports`. Globals are
 for things user code expects to find as a bare name (`fetch(url)` not
 `import { fetch } from 'host:net'`). When in doubt, prefer `imports` —
 they are statically greppable and cannot accidentally shadow a built-in.
+
+### 4.2.1 The web runtime
+
+The sandbox ships a minimal, deliberately incomplete web runtime so that
+request/response-shaped code can run and so `Request`/`Response` can cross the
+boundary as real objects rather than flattening.
+
+Installed: `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`,
+`URL`, `URLSearchParams`.
+
+**Implementation.** Each of the three serializable classes is a JS class
+extending a native `FunctionTemplate` shell whose instance template declares one
+internal field. The field is what makes serialization work: V8 routes objects
+with internal fields to `WriteHostObject` off a map field read, leaving
+`HasCustomHostObject()` `false` so no embedder callback fires for ordinary
+objects. workerd depends on the same property. Behaviour above the shell is JS,
+evaluated into the context once and captured in the prefix snapshot, so it costs
+nothing per run.
+
+Because the shells are native callbacks, they only survive the snapshot via an
+`ExternalReferences` table that must be supplied at **both** snapshot creation
+and restore. Omitting it at restore does not fail cleanly — the process aborts
+on the first `new Response()`.
+
+**Deliberate deviations from spec**, in scope terms rather than bugs:
+
+- No `.body` getter. That is a `ReadableStream`, and streams cannot cross a
+  one-shot boundary (`docs/protocol.md` §4.4.5). Use `text()`, `json()`,
+  `arrayBuffer()`, `bytes()`.
+- No `Blob` or `FormData`, so no `blob()`/`formData()` and neither works as a
+  body initializer.
+- `URL` is a pragmatic parser: correct for http(s)/ws(s)/ftp/file and relative
+  resolution, without IDNA/punycode or non-special-scheme edge cases.
+- No `crypto`, `AbortController`, `AbortSignal`, `Event`, `structuredClone`,
+  `setTimeout`, `queueMicrotask`.
+
+Widening this set is additive and does not change the wire format
+(`docs/protocol.md` §4.4), which is why the tier was chosen deliberately rather
+than aiming at full compliance up front.
 
 ### 4.3 Imports
 

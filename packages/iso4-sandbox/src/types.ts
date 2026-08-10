@@ -118,9 +118,10 @@ export interface ResourceLimits {
  * Host-provided globals. Any name not reserved by V8 or the runtime is
  * permitted. Each value becomes a bridge stub in the sandbox global object.
  *
- * Reserved names (must not be used): `console`, `URL`, `URLSearchParams`,
- * `TextEncoder`, `TextDecoder`, `crypto`, `Event`, `AbortController`,
- * `AbortSignal`.
+ * Reserved names (rejected with `ERR_UNDECLARED_BINDING`): `console`,
+ * `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `URL`,
+ * `URLSearchParams`. These are owned by the runtime; shadowing `Response` would
+ * silently break serialization.
  *
  * Common usage:
  * ```ts
@@ -173,7 +174,12 @@ export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> 
  */
 export interface DataGlobal {
   kind: 'data'
-  value: HostExportData
+  /**
+   * Any `HostExportData`, or a `Request`/`Response`/`Headers` — including nested
+   * inside a plain object or array, which the runtime rebuilds as real instances
+   * (`docs/protocol.md` §4.4).
+   */
+  value: HostExportData | Request | Response | Headers
 }
 
 /**
@@ -857,6 +863,12 @@ export type RunErrorCode
     | 'ERR_COMPILE'
     | 'ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED'
     | 'ERR_EXPORT_NOT_SERIALIZABLE'
+    /**
+     * A registered host type (`Request`, `Response`, …) cannot cross this
+     * boundary in this position — an unimplemented tag, or content that is not
+     * self-contained such as a stream body. See `docs/protocol.md` §4.4.5.
+     */
+    | 'ERR_TYPE_NOT_SERIALIZABLE'
     | 'ERR_EXPORT_TOO_LARGE'
     | 'ERR_EXPORT_UNRESOLVED_PROMISE'
     | 'ERR_HOST_BRIDGE'

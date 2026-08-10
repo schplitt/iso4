@@ -44,13 +44,20 @@ function strList(items: readonly string[]): Buffer {
   return Buffer.concat([u32(items.length), ...items.map(str)])
 }
 
-/** A value slot: `u32 byteLength` + blob. */
+/**
+ * A value slot: `u32 byteLength` + blob.
+ * @param value
+ */
 function valueSlot(value: unknown): Buffer {
   const blob = serializeValue(value)
   return Buffer.concat([u32(blob.byteLength), blob])
 }
 
-/** An `Optional<value slot>`: presence byte, then the slot when set. */
+/**
+ * An `Optional<value slot>`: presence byte, then the slot when set.
+ * @param value
+ * @param present
+ */
 function optionalValueSlot(value: unknown, present: boolean): Buffer {
   return present
     ? Buffer.concat([Buffer.from([1]), valueSlot(value)])
