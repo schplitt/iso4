@@ -83,8 +83,7 @@ type MaterializedBody = Uint8Array | string | null
  * A host type flattened into plain data, ready for synchronous emission.
  * Header entries stay an array of pairs, never a `Record` — a record cannot
  * represent duplicate `set-cookie`.
- */
-/**
+ *
  * Marks a {@link MaterializedHostType} so a synchronous encoder can recognise
  * one that an earlier async pass produced. `Symbol.for` rather than a private
  * symbol so duplicate copies of this module in a dependency tree still agree.
