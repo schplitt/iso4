@@ -628,6 +628,55 @@ describe('host imports', () => {
     expect(result.exports.default).toBe('PING')
   })
 
+  test('widened data leaves arrive as real instances, cycles included', async () => {
+    // `HostExportData` covers everything V8's format carries, and nothing on
+    // the host walks a data leaf to check it — so these reach the sandbox as
+    // real instances, not as flattened plain objects.
+    const cyclic: { name: string, self?: unknown } = { name: 'root' }
+    cyclic.self = cyclic
+    const result = await runtime.run({
+      code: `
+        import { when, pattern, failure, lookup, tags, floats, loop } from 'host:data'
+        export default {
+          date: when instanceof Date && when.getTime(),
+          regexp: pattern instanceof RegExp && pattern.source + '/' + pattern.flags,
+          error: failure instanceof TypeError && failure.message,
+          map: lookup instanceof Map && lookup.get('a'),
+          set: tags instanceof Set && tags.has('x'),
+          typed: floats instanceof Float64Array && floats[1],
+          cycleHeld: loop[0].self === loop[0] && loop[0].name,
+        }
+      `,
+      imports: {
+        'host:data': {
+          when: new Date(1700000000000),
+          pattern: /ab+c/gi,
+          failure: new TypeError('boom'),
+          lookup: new Map<unknown, unknown>([['a', 1]]),
+          tags: new Set(['x']),
+          floats: new Float64Array([1.5, -2.5]),
+          // The cycle sits inside an array: an array is a data leaf and is
+          // never walked, so the back-reference survives. A cycle through a
+          // *plain* object still throws — the shape walker has to descend
+          // those to find function leaves (see DESIGN.md §4.3).
+          loop: [cyclic],
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      date: 1700000000000,
+      regexp: 'ab+c/gi',
+      error: 'boom',
+      map: 1,
+      set: true,
+      typed: -2.5,
+      cycleHeld: 'root',
+    })
+  })
+
   test('async host function is awaited correctly', async () => {
     const result = await runtime.run({
       code: `

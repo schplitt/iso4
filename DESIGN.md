@@ -400,11 +400,18 @@ The object form imposes these restrictions on the value tree:
   support in v1). Bridge rejects with `FunctionArgumentNotSupported`.
   Passing host functions back to the sandbox via *return values* is
   Phase 13 (callable handles).
-- **Data leaves** must be representable in the wire value codec:
-  primitives, strings, `BigInt`, `Uint8Array`, plain objects, arrays.
-  `Date` / `Map` / `Set` / class instances / circular references throw at
-  registration — the supported set deliberately matches what the codec
-  can carry back *out* of the sandbox, so there is no one-way asymmetry.
+- **Data leaves** must be representable in V8's serialization format — see
+  `HostExportData` and §5.1 for the set. They are **not inspected at
+  registration**: the value goes straight to the serializer, which is the
+  single gate on what may cross. A pre-walk would duplicate the serializer's
+  work on the Node main thread at O(values), and any hand-maintained allowlist
+  would drift from V8's real capabilities. Unsupported values therefore fail
+  with the serializer's own data-clone error when the payload is encoded — still
+  before anything reaches the sandbox, but without a path annotation.
+  One consequence: a **cycle through a plain object** still throws, because the
+  shape walker must descend plain objects to find function leaves and cannot
+  tell nested shape from cyclic data. Cycles inside any other container
+  (arrays, `Map`, `Set`, class instances) cross fine.
 - **Stateful object handles** (`createReadStream` returning a stream)
   remain unsupported; nothing changes there.
 - **Class instances with prototype methods** — methods on the prototype
@@ -570,9 +577,11 @@ Note for hosts: Node `Buffer` is a `Uint8Array` subclass, so it crosses
 fine — but it always comes back as a plain `Uint8Array` (data preserved,
 subclass identity not).
 
-The **typed** contract stays narrower than the runtime one: `HostExportData`
-still describes only primitives, `bigint`, `Uint8Array`, and plain
-objects/arrays. Widening the public type is a separate, deliberate decision.
+The **typed** contract matches the runtime one: `HostExportData` describes
+exactly the list above, so what the type accepts is what V8's format carries.
+Nothing on the host walks a value to check it — the serializer is the single
+gate, and a value it refuses fails at encode time with its own data-clone
+error.
 
 ### 5.2 Errors
 

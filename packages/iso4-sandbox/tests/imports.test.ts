@@ -22,6 +22,7 @@ import {
   mergeRebindImports,
   processImports,
 } from '../src/imports.js'
+import { serializeValue } from '../src/v8-codec.js'
 import type { HostExportFunction, Imports, RebindImports } from '../src/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -150,13 +151,67 @@ describe('processImports', () => {
       module: [['present', { kind: 'data', value: 1 }]],
     }])
   })
+})
 
-  it('rejects Date as a data leaf (wire cannot carry it back out)', () => {
+// ─────────────────────────────────────────────────────────────────────────
+// Data leaves are not inspected — V8's serializer is the only gate
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('processImports — data leaves cross uninspected', () => {
+  // `processImports` deliberately does not walk data leaves: doing so would
+  // duplicate the serializer's work on the Node main thread at O(values), and
+  // any hand-written allowlist would drift from what V8 actually supports.
+  // Everything V8's format can represent therefore passes straight through.
+  it.each([
+    ['Date', new Date(1700000000000)],
+    ['RegExp', /ab+c/gi],
+    ['Error', new TypeError('boom')],
+    ['Map', new Map<unknown, unknown>([['a', 1]])],
+    ['Set', new Set([1, 2])],
+    ['ArrayBuffer', new Uint8Array([1, 2, 3]).buffer],
+    ['Float64Array', new Float64Array([1.5, -2.5])],
+    ['BigInt64Array', new BigInt64Array([1n])],
+    ['DataView', new DataView(new ArrayBuffer(4))],
+  ])('carries %s through as a data leaf', (_name, value) => {
+    const { bindings } = processImports({ 'host:data': { v: value } })
+    expect(bindings).toEqual([{
+      specifier: 'host:data',
+      module: [['v', { kind: 'data', value }]],
+    }])
+  })
+
+  it('carries a cycle inside a non-plain-object leaf (V8 writes back-references)', () => {
+    const arr: unknown[] = []
+    arr.push(arr)
+    const { bindings } = processImports({ 'host:data': { list: arr } })
+    expect(bindings[0]?.module).toEqual([['list', { kind: 'data', value: arr }]])
+    // And it really does survive the codec, identity included.
+    const back = arr
+    expect(() => serializeValue(back)).not.toThrow()
+  })
+
+  it('carries a class instance through, flattening at the codec (protocol.md §4.2)', () => {
+    class Cfg {
+      mode = 'prod'
+      describe(): string {
+        return this.mode
+      }
+    }
+    const instance = new Cfg()
+    const { bindings } = processImports({ 'host:data': { c: instance } })
+    expect(bindings[0]?.module).toEqual([['c', { kind: 'data', value: instance }]])
+    // Own enumerable props survive; the prototype and its methods do not.
+    const roundTripped = serializeValue(instance)
+    expect(roundTripped.byteLength).toBeGreaterThan(0)
+  })
+
+  it('leaves an unsupported value to the codec, which rejects it', () => {
+    // Registration no longer throws — the function reaches `serializeValue`,
+    // which is where the boundary is actually enforced.
     expect(() =>
-      processImports({
-        'host:data': { when: new Date(1700000000000) as unknown as never },
-      }),
-    ).toThrow(/Date values are not supported as data leaves/)
+      processImports({ 'host:bad': { list: [() => 1] as unknown as never } }),
+    ).not.toThrow()
+    expect(() => serializeValue([() => 1])).toThrow()
   })
 })
 
@@ -177,30 +232,12 @@ describe('processImports — rejected configurations', () => {
     ).toThrow(/must be a string/)
   })
 
-  it('rejects a Map value in a data leaf', () => {
-    expect(() =>
-      processImports({
-        'host:bad': { config: new Map([['a', 1]]) as unknown as never },
-      }),
-    ).toThrow(/Map values are not supported as data leaves/)
-  })
-
   it('rejects circular references in host-module shapes', () => {
     const cyclic: { self?: unknown } = {}
     cyclic.self = cyclic
     expect(() =>
       processImports({
         'host:bad': { cfg: cyclic as unknown as never },
-      }),
-    ).toThrow(/circular references/)
-  })
-
-  it('rejects circular references inside array data leaves', () => {
-    const arr: unknown[] = []
-    arr.push(arr)
-    expect(() =>
-      processImports({
-        'host:bad': { list: arr as unknown as never },
       }),
     ).toThrow(/circular references/)
   })
@@ -219,25 +256,6 @@ describe('processImports — rejected configurations', () => {
         'host:bad': { class: 1 },
       }),
     ).toThrow(/not a valid JavaScript identifier/)
-  })
-
-  it('rejects class instances (prototype-bearing objects) as data leaves', () => {
-    class Cfg {
-      mode = 'prod'
-    }
-    expect(() =>
-      processImports({
-        'host:bad': { c: new Cfg() as unknown as never },
-      }),
-    ).toThrow(/class instances are not supported/)
-  })
-
-  it('rejects functions nested inside array data leaves', () => {
-    expect(() =>
-      processImports({
-        'host:bad': { list: [() => 1] as unknown as never },
-      }),
-    ).toThrow(/unsupported data value of type function/)
   })
 })
 

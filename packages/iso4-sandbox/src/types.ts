@@ -291,17 +291,17 @@ export type ImportValue = string | HostModuleObject
 /**
  * A host-module description object. Each property is either:
  *
- *   - A function — becomes an async bridge stub in the generated module.
- *   - A plain data value (primitive, plain object/array, `BigInt`,
- *     `Uint8Array`) — becomes a JS literal in the generated module.
+ *   - A function — the runtime builds an async bridge trampoline for it.
+ *   - A data value (anything in {@link HostExportData}) — materialised in the
+ *     isolate from its V8 serialization blob.
  *   - A nested object that itself contains a mix of functions and data —
  *     walked recursively.
  *
- * `Date`, `Map`, `Set`, circular references, class instances with
- * prototype methods, and stateful handles (streams, sockets) are rejected
- * at registration with a clear error, keeping the declared shape inside the
- * `HostExportData` contract. (The runtime itself would carry a `Date` or `Map`
- * fine — the typed contract is deliberately narrower than the wire.)
+ * Class instances with prototype methods and stateful handles (streams,
+ * sockets) are rejected at registration with a clear error naming the exact
+ * path: V8's format would carry them, but only as their own enumerable
+ * properties, so the methods you meant to send would vanish silently. Copy
+ * what you mean to send into a plain object.
  */
 export interface HostModuleObject {
   [name: string]: HostModuleValue
@@ -316,8 +316,25 @@ export type HostModuleValue
     | HostModuleObject
 
 /**
- * The set of plain-data values supported as data leaves in the host-module
- * shape. The JS-literal emitter knows how to emit each of these.
+ * The set of data values that can cross the sandbox boundary.
+ *
+ * This mirrors what V8's serialization format can represent, so every value
+ * here arrives on the other side as a **real instance** — a `Date` is a `Date`,
+ * a `Map` is a `Map`, a `Float64Array` keeps its element type. Cyclic and
+ * shared references are preserved, including object identity.
+ *
+ * What is *not* here cannot cross and is rejected loudly: functions (except as
+ * declared function leaves), `Promise`, `Symbol`, `WeakMap`, `WeakSet`, and
+ * `Proxy`. Class instances are also excluded — V8 would carry one, but only as
+ * its own enumerable properties, silently dropping its prototype and methods.
+ *
+ * Two notes for hosts:
+ *
+ * - Node `Buffer` is a `Uint8Array` subclass, so it crosses fine, but it
+ *   arrives as a plain `Uint8Array` (data preserved, subclass identity not).
+ * - A `subarray` window carries only the bytes in its window.
+ *
+ * @see `docs/protocol.md` §4.2 for the full table, both directions.
  */
 export type HostExportData
   = | null
@@ -326,7 +343,24 @@ export type HostExportData
     | number
     | bigint
     | string
+    | Date
+    | RegExp
+    | Error
+    | Map<HostExportData, HostExportData>
+    | Set<HostExportData>
+    | ArrayBuffer
+    | DataView
+    | Int8Array
     | Uint8Array
+    | Uint8ClampedArray
+    | Int16Array
+    | Uint16Array
+    | Int32Array
+    | Uint32Array
+    | Float32Array
+    | Float64Array
+    | BigInt64Array
+    | BigUint64Array
     | HostExportData[]
     | { [key: string]: HostExportData }
 
