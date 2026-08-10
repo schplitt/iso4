@@ -102,7 +102,7 @@ analytics use case is served by a separate package, not a backend swap.
      calls from the sandbox cross a bridge to the host and return data.
 7. **Result extraction via ESM `export`**. User code is always wrapped so
    its return value becomes `export default`. Results cross the boundary
-   through the `WireValue` codec, which restricts results to plain data
+   as a V8 serialization blob, which restricts results to data
    (no functions, no methods — see §5.1).
 8. **Captured stdout/stderr** via a runtime-owned `console`.
 9. **Pre-compilable prefix code** via V8 startup snapshots. Snapshotting
@@ -218,11 +218,12 @@ Every call to `runtime.run(opts)`:
    - For host-implemented modules: builds a synthetic module whose
      exports are stubs that bridge to the host.
 5. Rust evaluates the module. Top-level `await` works.
-6. Once evaluation settles, Rust reads the module namespace and encodes
-   `default` and each named export as `WireValue`s. Functions, promises,
-   symbols, and non-plain objects (`Date`, `Map`, `Set`, `RegExp`, typed
-   arrays other than `Uint8Array`, class instances) throw
-   `ExportNotSerializable` (see §5.1).
+6. Once evaluation settles, Rust copies the module namespace into a plain
+   object and serializes it **once** as a V8 blob — `default` and every named
+   export in one payload. Functions, promises, symbols, `WeakMap`s, and
+   proxies throw `ExportNotSerializable`; everything V8's format carries
+   (`Date`, `Map`, `Set`, `RegExp`, `Error`, typed arrays, cycles) crosses as
+   a real instance (see §5.1).
 7. Rust sends back: serialized exports, captured stdout/stderr, error if
    any, duration.
 
@@ -235,7 +236,7 @@ Every call to `runtime.run(opts)`:
 | Host-implemented modules (Flavor A) | Stubs in V8 call across bridge → host                 |
 | `fetch`                             | Stub in V8, host implements with permission check     |
 | `console.*`                         | Captured in Rust, streamed back as stdout/stderr      |
-| Result serialization                | `WireValue` codec (Rust side), data only              |
+| Result serialization                | V8 serialization blob (Rust side), data only          |
 
 ---
 
@@ -290,10 +291,10 @@ poll loop additionally reads `BridgeResponse` frames with a cap of
 `min(maxBridgeResponseBytes, memoryMb × 1 MiB)`, ensuring the memory budget
 acts as a natural inbound frame limit.
 
-**Export size** (`maxExportBytes`): after all exports are serialised to a
-`WireValue`, Rust measures the encoded byte length. If it exceeds
-`maxExportBytes` the run fails with `ERR_EXPORT_TOO_LARGE` before the
-`Result` frame is written.
+**Export size** (`maxExportBytes`): Rust serializes all exports into one V8
+blob and measures that blob. If it exceeds `maxExportBytes` the run fails with
+`ERR_EXPORT_TOO_LARGE` before the `Result` frame is written. The check is on
+the bytes that actually cross the socket, so it costs nothing extra.
 
 **Stdout/stderr sizes** (`maxStdoutBytes`, `maxStderrBytes`): Rust tracks
 running byte totals during console capture. Any line whose addition would
@@ -334,7 +335,7 @@ value type is the discriminator:
 - **Object value — host module.** The host provides a JS object whose
   shape becomes the module's exports. The client walks the object
   recursively and ships the **shape as plain data** over the wire (#37):
-  function leaves as bare markers, data leaves as `WireValue`s, nested
+  function leaves as bare markers, data leaves as V8 value blobs, nested
   objects as trees. No JS source is ever generated from the data. The
   Rust runtime builds the module natively:
 
@@ -346,7 +347,7 @@ value type is the discriminator:
   export const search = import.meta.__iso4[0];
   ```
 
-  Data leaves are materialised with the value codec (`wire_to_v8_value`);
+  Data leaves are materialised with the value codec (`blob::deserialize_value`);
   each function leaf becomes an async trampoline built by a fixed factory
   — `(id) => (async (...args) => await globalThis.__iso4_call(id, ...args))`
   — with its **handle ID passed as a number**, never printed into source.
@@ -531,38 +532,47 @@ export const fetchedAt = Date.now()
 
 ### 5.1 What can be exported
 
-The boundary carries **data, not behavior**. The hand-rolled `WireValue`
-codec (`docs/protocol.md` §4) supports exactly:
+The boundary carries **data, not behavior**. Values travel as V8
+serialization blobs (`docs/protocol.md` §4), so anything V8's own format can
+represent crosses as a **real instance**:
 
-- Primitives: `undefined`, `null`, booleans, numbers
-- Strings
+- Primitives: `undefined`, `null`, booleans, numbers, strings
 - `BigInt` (arbitrary precision)
-- `Uint8Array` — the wire's binary primitive (`WireValue::Bytes`)
-- Arrays of supported values
-- Plain objects (`Object.prototype` or `null` prototype) of supported values
+- `Date`, `Map`, `Set`, `RegExp`, `Error` (and its subclasses)
+- `ArrayBuffer`, every `TypedArray`, `DataView` — element type preserved, and
+  a `subarray` window carries only its window
+- Arrays (including sparse ones) and plain objects
+- Cyclic and shared references — object identity survives the round trip
 
-Everything else is rejected loudly with `ERR_EXPORT_NOT_SERIALIZABLE`
-(sandbox → host) or a `TypeError` in the host encoder / `ERR_HOST_BRIDGE`
-(host → sandbox):
+Behavior does not cross. These are rejected loudly with
+`ERR_EXPORT_NOT_SERIALIZABLE` (sandbox → host) or a `TypeError` in the host
+encoder / `ERR_HOST_BRIDGE` (host → sandbox):
 
-- Functions, classes, and class instances
+- Functions and classes
 - Promises (must be `await`ed before exporting)
 - Symbols
-- `Date`, `Map`, `Set`, `RegExp`, `Error`
-- Typed arrays other than `Uint8Array`, `DataView`, `ArrayBuffer`,
-  `SharedArrayBuffer`
-- Circular references (diamond sharing is fine; true cycles throw)
+- `WeakMap` / `WeakSet` / `Proxy`
 
-The same contract applies in both directions — bridge call arguments,
-bridge return values, host-module data leaves, and exports. Rejecting
-non-plain builtins loudly (rather than serializing their own-enumerable
-properties, which is usually `{}`) is deliberate: silent corruption is
-worse than an error. Send a `Date` as an epoch number or ISO string, a
-`Map`/`Set` as a plain object/array, binary data as `Uint8Array`.
+The same contract applies in both directions — bridge call arguments, bridge
+return values, host-module data leaves, and exports.
+
+Two behaviours worth knowing:
+
+- **Class instances flatten silently** to their own enumerable properties
+  (`new Tenant()` → `{ id: "t1" }`; methods and prototype are gone). Node's
+  serializer offers no hook to reject them, so this is an accepted trade-off
+  rather than an oversight — copy what you mean to send into a plain object.
+- **`"__proto__"` as an own key crosses as a plain own key.** It is defined,
+  never `[[Set]]`, so the receiving object's prototype is untouched and no
+  prototype pollution is possible.
 
 Note for hosts: Node `Buffer` is a `Uint8Array` subclass, so it crosses
 fine — but it always comes back as a plain `Uint8Array` (data preserved,
 subclass identity not).
+
+The **typed** contract stays narrower than the runtime one: `HostExportData`
+still describes only primitives, `bigint`, `Uint8Array`, and plain
+objects/arrays. Widening the public type is a separate, deliberate decision.
 
 ### 5.2 Errors
 
@@ -683,9 +693,9 @@ direction. Both tables start at `0x01`.
 
 ### 6.3 Payload encoding
 
-Structured data (arguments, results, exports) uses the `WireValue`
-encoding (`docs/protocol.md` §4). Raw bytes for stdio chunks. Plain UTF-8
-for log strings.
+Structured data (arguments, results, exports) uses V8 serialization blobs
+(`docs/protocol.md` §4). Raw bytes for stdio chunks. Plain UTF-8 for log
+strings.
 
 ### 6.4 Session lifecycle and concurrency
 
@@ -870,8 +880,8 @@ Deliberately not specified now. What is known:
 
 What is shared with `@iso4/sandbox`:
 
-- The wire-frame types (`WireValue`, the bridge payload conventions).
-- The "only data crosses" rule and the `WireValue`-based contract.
+- The wire-frame types (value blobs, the bridge payload conventions).
+- The "only data crosses" rule and the blob-based value contract.
 - The host-import declaration shape (`Imports<…>` from §4.3) — the
   developer experience of describing the bridge surface stays uniform.
 - The limits semantics and error vocabulary.
@@ -936,9 +946,9 @@ To be resolved as we build, not blocking the start:
 
 - **`Session.call()` input/output serialization contract.** For the
   persistent-session API of the analytics product, the host calls a function that was
-  exported by the prefix. What can be passed as `input`? The `WireValue`
-  codec is the natural choice (same as exports today), but bytes could be
-  transferred zero-copy if needed for bulk data. Decide when designing the analytics product (§9.1).
+  exported by the prefix. What can be passed as `input`? A value blob is the
+  natural choice (same as exports today), but bytes could be transferred
+  zero-copy if needed for bulk data. Decide when designing the analytics product (§9.1).
 
 - **In-process backend: C++ NAPI addon or Rust NAPI with Node's V8
   headers?** `rusty_v8` cannot be used in-process because it calls
@@ -1408,7 +1418,7 @@ add intra-run multiplexing if needed for very deep async call trees.
 
 ### 14.2 No callable return values (current)
 
-Bridge return values are plain data (`WireValue`). Functions on returned
+Bridge return values are plain data (a value blob). Functions on returned
 objects are **silently dropped** — the sandbox receives the plain data fields
 but no methods. This means the handler cannot return a `Response`-like object
 with `.json()` on it today.
@@ -1491,8 +1501,8 @@ Until that lands, handlers should be written to be safe to orphan.
 ### 14.6 Function arguments rejected
 
 Passing a function as an argument to a bridge global is rejected with
-`ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`. Only serialisable data values
-(`WireValue`) may cross the boundary in either direction in v1.
+`ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`. Only serialisable data values may
+cross the boundary in either direction in v1.
 
 This is a deliberate limitation — callbacks across the boundary would require
 a callback-handle protocol symmetric to callable return values. The same Phase
@@ -1551,7 +1561,7 @@ carrying the value passed to `abort(reason)`, and retaining `error.code:
 
 ### 14.1 The problem
 
-Bridge return values are plain data (`WireValue`). This means a host handler
+Bridge return values are plain data (a value blob). This means a host handler
 that wants to return a rich object with methods — the classic example is a
 fetch `Response` with `.json()` and `.text()` — cannot do so: functions are
 not serialisable. Currently the handler must return a flat data object and
@@ -1584,7 +1594,7 @@ methods.
 
 The host handler returns a value that contains functions. The TypeScript
 serialiser detects functions in the return value and replaces each one with
-a plain-data marker `{ __iso4_fn__: <id> }` before encoding as `WireValue`.
+a plain-data marker `{ __iso4_fn__: <id> }` before serializing the blob.
 The original function is stored in a per-run `callableHandles` map keyed by
 the ID. The map is released when the run completes — no explicit disposal
 needed, no GC complexity.
@@ -1603,7 +1613,7 @@ callableHandles = { 42: originalJsonFn, 43: originalTextFn }
 
 ### 14.3 V8 side: callable stubs
 
-`wire_to_v8_value` (Rust) detects `{ __iso4_fn__: <id> }` objects and
+The Rust side detects `{ __iso4_fn__: <id> }` objects after deserializing and
 installs a real V8 `Function` in their place. The function's External data
 is the same `GlobalCallbackData` as all other bridge stubs (same
 `stream_fd`, `cpu_budget`, `call_id`, `bridge_error`), plus the callable ID.
@@ -1618,7 +1628,7 @@ BridgeCallPayload (targetKind = 2):
   u32  callId       — monotonic, same counter as global bridge calls
   u8   targetKind   — 2 = callable
   u32  callableId   — handle from the per-run table
-  List<WireValue>  args
+  ValueBlob        args   (one blob holding the argument array)
 ```
 
 CPU budget bracketing (`leave()` / `enter()`) applies exactly as for global
@@ -1646,7 +1656,7 @@ dispatcher, and discarded when the run's `Result` frame arrives.
 
 ### 14.5 Nested callables
 
-The result of a callable method call is itself encoded via `encodeWireValue`.
+The result of a callable method call is itself serialized as a value blob.
 This means a callable can return another callable, and the sandbox can chain
 method calls:
 

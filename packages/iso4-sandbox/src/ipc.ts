@@ -1,8 +1,14 @@
 import { Buffer } from 'node:buffer'
-import { decodeWireValueFromSlice, encodeWireValue } from './wire.js'
-import type { ResourceLimits } from './types.js'
+import { deserializeValue, serializeValue } from './v8-codec.js'
+import type {
+  BridgeCallEntry,
+  ResourceLimits,
+  RunErrorCode,
+  RunResult,
+  SandboxExports,
+} from './types.js'
 
-export const PROTOCOL_VERSION: 1 = 1
+export const PROTOCOL_VERSION: 2 = 2
 
 export const DEFAULT_MAX_FRAME_LENGTH: number = 64 * 1024 * 1024
 
@@ -24,6 +30,11 @@ export const RustToTsMessageTypes = {
   Result: 0x02,
   PrecompileResult: 0x03,
   Log: 0x04,
+  /**
+   * Handshake acknowledgement — the first frame the runtime sends on a new
+   * connection, answering `Authenticate` (protocol v2).
+   */
+  Hello: 0x05,
 } as const
 
 export type RustToTsMessageType
@@ -44,7 +55,37 @@ export type RustToTsFrame = TypedFrame<RustToTsMessageType>
 
 export interface AuthenticatePayload {
   protocolVersion: number
+  /**
+   * V8 serialization probe — a serialized `null`, whose second byte is the
+   * format version this Node writes. The runtime hard-fails the connection
+   * when it cannot read that version (see `HelloPayload`).
+   */
+  probe: Uint8Array
   token: string
+}
+
+/**
+ * Handshake status the runtime reports on its `Hello` frame.
+ */
+export const HelloStatus = {
+  Ok: 0,
+  ProtocolVersionMismatch: 1,
+  V8FormatMismatch: 2,
+} as const
+
+export type HelloStatusCode = (typeof HelloStatus)[keyof typeof HelloStatus]
+
+export interface HelloPayload {
+  status: number
+  /**
+   * The runtime's own V8 serialization probe (a serialized `null`). The client
+   * deserializes it to prove the runtime's format version is readable here.
+   */
+  probe: Uint8Array
+  /**
+   * Human-readable detail for a non-zero status; empty when `status = 0`.
+   */
+  message: string
 }
 
 interface PendingRead {
@@ -242,6 +283,12 @@ export function decodeRustToTsFrame(bytes: Uint8Array): RustToTsFrame {
   }
 }
 
+/**
+ * Encode an `Authenticate` payload per `docs/protocol.md` §5.1:
+ * `u16 protocolVersion`, `u32 probeLength + probe bytes`, then the token as
+ * UTF-8 for the remainder of the payload.
+ * @param auth
+ */
 export function encodeAuthenticatePayload(
   auth: AuthenticatePayload,
 ): Buffer {
@@ -253,23 +300,76 @@ export function encodeAuthenticatePayload(
   }
 
   const token = Buffer.from(auth.token, 'utf8')
-  const payload = Buffer.allocUnsafe(2 + token.byteLength)
+  const payload = Buffer.allocUnsafe(2 + 4 + auth.probe.byteLength + token.byteLength)
   payload.writeUInt16BE(auth.protocolVersion, 0)
-  token.copy(payload, 2)
+  payload.writeUInt32BE(auth.probe.byteLength, 2)
+  Buffer.from(auth.probe.buffer, auth.probe.byteOffset, auth.probe.byteLength)
+    .copy(payload, 6)
+  token.copy(payload, 6 + auth.probe.byteLength)
   return payload
 }
 
 export function decodeAuthenticatePayload(
   payload: Uint8Array,
 ): AuthenticatePayload {
-  if (payload.byteLength < 2) {
+  if (payload.byteLength < 6) {
     throw new Error('payload too short for Authenticate')
   }
 
   const view = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
+  const probeLength = view.readUInt32BE(2)
+  if (view.byteLength < 6 + probeLength) {
+    throw new Error('Authenticate payload truncated (probe)')
+  }
   return {
     protocolVersion: view.readUInt16BE(0),
-    token: view.subarray(2).toString('utf8'),
+    probe: view.subarray(6, 6 + probeLength),
+    token: view.subarray(6 + probeLength).toString('utf8'),
+  }
+}
+
+/**
+ * Encode a `Hello` payload — the runtime's handshake acknowledgement.
+ * Exported for tests and for the mock servers in `tests/client.test.ts`; the
+ * real encoder lives in the Rust runtime.
+ * @param hello
+ */
+export function encodeHelloPayload(hello: HelloPayload): Buffer {
+  const message = Buffer.from(hello.message, 'utf8')
+  const payload = Buffer.allocUnsafe(
+    1 + 4 + hello.probe.byteLength + 4 + message.byteLength,
+  )
+  payload.writeUInt8(hello.status, 0)
+  payload.writeUInt32BE(hello.probe.byteLength, 1)
+  Buffer.from(hello.probe.buffer, hello.probe.byteOffset, hello.probe.byteLength)
+    .copy(payload, 5)
+  let offset = 5 + hello.probe.byteLength
+  payload.writeUInt32BE(message.byteLength, offset)
+  offset += 4
+  message.copy(payload, offset)
+  return payload
+}
+
+export function decodeHelloPayload(payload: Uint8Array): HelloPayload {
+  const view = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
+  if (view.byteLength < 5) {
+    throw new Error('payload too short for Hello')
+  }
+  const status = view.readUInt8(0)
+  const probeLength = view.readUInt32BE(1)
+  if (view.byteLength < 5 + probeLength + 4) {
+    throw new Error('Hello payload truncated (probe)')
+  }
+  const probe = view.subarray(5, 5 + probeLength)
+  const messageLength = view.readUInt32BE(5 + probeLength)
+  const messageStart = 5 + probeLength + 4
+  if (view.byteLength < messageStart + messageLength) {
+    throw new Error('Hello payload truncated (message)')
+  }
+  return {
+    status,
+    probe,
+    message: view.subarray(messageStart, messageStart + messageLength).toString('utf8'),
   }
 }
 
@@ -288,7 +388,7 @@ export function decodeAuthenticatePayload(
  * - `bridge` — a plain host function; Rust installs a bridge stub under `name`.
  * - `string` — a JS expression Rust evaluates as its own script and sets on
  *   `globalThis[name]`.
- * - `data` — a constant carried as a `WireValue`, materialised natively.
+ * - `data` — a constant carried as a value blob, materialised natively.
  * - `shim` — a bridge handler (installed as a stub under `handlerName`) plus a
  *   shim expression Rust wraps and sets on `globalThis[name]`.
  *
@@ -342,6 +442,25 @@ class PayloadWriter {
     return this
   }
 
+  /**
+   * Write a value slot: `u32 byteLength` + the V8 serialization blob.
+   * The single encoding for every value crossing the boundary — there is no
+   * tag byte because there is only one codec (`docs/protocol.md` §4).
+   * @param value
+   */
+  writeValueBlob(value: unknown): this {
+    return this.writeLengthPrefixedBytes(serializeValue(value))
+  }
+
+  /**
+   * Write an already-serialized value slot: `u32 byteLength` + blob bytes.
+   * @param blob
+   */
+  writeLengthPrefixedBytes(blob: Uint8Array): this {
+    this.writeU32(blob.byteLength)
+    return this.writeBytes(blob)
+  }
+
   writeOptionalString(s: string | undefined): this {
     if (s === undefined) {
       this.writeU8(0)
@@ -377,9 +496,7 @@ class PayloadWriter {
           this.writeString(def.expr)
           break
         case 'data':
-          // The constant crosses as a raw WireValue (no length prefix); Rust
-          // decodes exactly one value and advances its cursor.
-          this.writeBytes(encodeWireValue(def.value))
+          this.writeValueBlob(def.value)
           break
         case 'shim':
           this.writeString(def.shim)
@@ -416,15 +533,14 @@ class PayloadWriter {
   }
 
   writeHostModuleNode(node: HostModuleNodePayload): this {
-    // u8 tag: 0 = function leaf, 1 = data leaf (WireValue), 2 = object.
+    // u8 tag: 0 = function leaf, 1 = data leaf (value blob), 2 = object.
     switch (node.kind) {
       case 'function':
         this.writeU8(0)
         break
       case 'data':
         this.writeU8(1)
-        // Raw WireValue, no length prefix — Rust decodes exactly one value.
-        this.writeBytes(encodeWireValue(node.value))
+        this.writeValueBlob(node.value)
         break
       case 'object':
         this.writeU8(2)
@@ -471,6 +587,116 @@ class PayloadWriter {
   }
 }
 
+// ── Payload reader ─────────────────────────────────────────────────────────
+
+/**
+ * Raised when a frame payload cannot be decoded: truncated data, an invalid
+ * presence byte, trailing bytes, or a value blob that does not hold the shape
+ * the slot promises. Internal — never surfaces through the public API.
+ */
+export class PayloadDecodeError extends Error {
+  override readonly name = 'PayloadDecodeError'
+}
+
+/**
+ * Stateful cursor over a frame payload — the mirror of `PayloadReader` in
+ * `ipc.rs`. Every read advances the offset; out-of-bounds reads throw
+ * immediately so callers never see partial state.
+ */
+class PayloadReader {
+  private readonly view: DataView
+  private offset = 0
+
+  constructor(buf: Uint8Array) {
+    // Respect the byteOffset of sliced Uint8Arrays.
+    this.view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
+  }
+
+  get remaining(): number {
+    return this.view.byteLength - this.offset
+  }
+
+  readU8(): number {
+    if (this.remaining < 1)
+      throw new PayloadDecodeError('unexpected end of payload reading u8')
+    return this.view.getUint8(this.offset++)
+  }
+
+  readU32(): number {
+    if (this.remaining < 4)
+      throw new PayloadDecodeError('unexpected end of payload reading u32')
+    const n = this.view.getUint32(this.offset, false) // big-endian
+    this.offset += 4
+    return n
+  }
+
+  readF64(): number {
+    if (this.remaining < 8)
+      throw new PayloadDecodeError('unexpected end of payload reading f64')
+    const n = this.view.getFloat64(this.offset, false) // big-endian
+    this.offset += 8
+    return n
+  }
+
+  readBool(): boolean {
+    const b = this.readU8()
+    if (b !== 0 && b !== 1) {
+      throw new PayloadDecodeError(
+        `invalid bool byte: 0x${b.toString(16).padStart(2, '0')}`,
+      )
+    }
+    return b === 1
+  }
+
+  readRawBytes(len: number): Uint8Array {
+    if (this.remaining < len) {
+      throw new PayloadDecodeError(
+        `unexpected end of payload: need ${len} bytes, have ${this.remaining}`,
+      )
+    }
+    const slice = new Uint8Array(
+      this.view.buffer,
+      this.view.byteOffset + this.offset,
+      len,
+    )
+    this.offset += len
+    return slice
+  }
+
+  readString(): string {
+    return Buffer.from(this.readRawBytes(this.readU32())).toString('utf8')
+  }
+
+  readStringList(): string[] {
+    const count = this.readU32()
+    const items: string[] = []
+    for (let i = 0; i < count; i++) items.push(this.readString())
+    return items
+  }
+
+  /**
+   * Read a value slot: `u32 byteLength` + V8 serialization blob.
+   */
+  readValueBlob(): unknown {
+    return deserializeValue(this.readRawBytes(this.readU32()))
+  }
+
+  /**
+   * Read an `Optional<value slot>`: a presence byte, then the slot when set.
+   */
+  readOptionalValueBlob(): unknown {
+    return this.readU8() === 1 ? this.readValueBlob() : undefined
+  }
+
+  assertDone(): void {
+    if (this.remaining !== 0) {
+      throw new PayloadDecodeError(
+        `${this.remaining} trailing bytes after expected end of payload`,
+      )
+    }
+  }
+}
+
 // ── ResourceLimits ──────────────────────────────────────────────────────────
 //
 // The wire form is the public `ResourceLimits` from `types.ts` (single source
@@ -486,7 +712,7 @@ class PayloadWriter {
  * One node of a host-module shape tree, mirrored by `HostModuleNode` in the
  * Rust parser (`ipc.rs`). The tree is plain data — function leaves are bare
  * markers (the runtime assigns handle IDs in tree-walk order), data leaves
- * cross as `WireValue`s, and no JS source is ever generated from the tree.
+ * cross as value blobs, and no JS source is ever generated from the tree.
  */
 export type HostModuleNodePayload
   = | { kind: 'function' }
@@ -644,54 +870,32 @@ export interface BridgeCallInfo {
 /**
  * Decode a `BridgeCallPayload` from a `BridgeCall` frame sent by Rust.
  * Per `docs/protocol.md` §5.4.
+ *
+ * The whole argument list crosses as **one** value blob holding an array —
+ * serializing N arguments together is measurably cheaper than N blobs, and it
+ * preserves identity between arguments that reference the same object.
  * @param buf
  */
 export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
-  const view = Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength)
-  let offset = 0
+  const reader = new PayloadReader(buf)
 
-  const readU8 = (): number => {
-    if (offset >= view.byteLength)
-      throw new Error('BridgeCall payload truncated (u8)')
-    return view.readUInt8(offset++)
-  }
-  const readU32 = (): number => {
-    if (offset + 4 > view.byteLength)
-      throw new Error('BridgeCall payload truncated (u32)')
-    const n = view.readUInt32BE(offset)
-    offset += 4
-    return n
-  }
-  const readString = (): string => {
-    const len = readU32()
-    if (offset + len > view.byteLength)
-      throw new Error('BridgeCall payload truncated (string)')
-    const s = view.subarray(offset, offset + len).toString('utf8')
-    offset += len
-    return s
-  }
-  const readWireValue = (): [unknown, number] => {
-    const slice = new Uint8Array(view.buffer, view.byteOffset + offset, view.byteLength - offset)
-    const [value, consumed] = decodeWireValueFromSlice(slice)
-    offset += consumed
-    return [value, consumed]
-  }
-
-  const callId = readU32()
-  const targetKindRaw = readU8()
+  const callId = reader.readU32()
+  const targetKindRaw = reader.readU8()
   if (targetKindRaw !== 0 && targetKindRaw !== 1)
     throw new Error(`invalid bridge targetKind: ${targetKindRaw}`)
   const targetKind = targetKindRaw as 0 | 1
-  const specifierPresent = readU8()
-  const specifier = specifierPresent === 1 ? readString() : undefined
-  const exportName = readString()
-  const argCount = readU32()
-  const args: unknown[] = []
-  for (let i = 0; i < argCount; i++) {
-    const [value] = readWireValue()
-    args.push(value)
+  const specifierPresent = reader.readU8()
+  const specifier = specifierPresent === 1 ? reader.readString() : undefined
+  const exportName = reader.readString()
+  const decoded = reader.readValueBlob()
+  if (!Array.isArray(decoded)) {
+    throw new PayloadDecodeError(
+      `BridgeCall args must decode to an array, got ${
+        decoded === null ? 'null' : typeof decoded
+      }`,
+    )
   }
-  return { callId, targetKind, specifier, exportName, args }
+  return { callId, targetKind, specifier, exportName, args: decoded }
 }
 
 // ── BridgeResponse encoder (TS → Rust) ──────────────────────────────────────
@@ -706,7 +910,7 @@ export interface BridgeErrorPayload {
   name: string
   message: string
   /**
-   * Pre-encoded WireValue bytes for the error's own-enumerable properties
+   * Pre-serialized value blob holding the error's own-enumerable properties
    * beyond `name`/`message`/`stack` (reserved keys). Absent when there are
    * none. The Rust side re-attaches these as direct own properties on the
    * Error it rejects the sandbox promise with.
@@ -719,8 +923,8 @@ export interface BridgeErrorPayload {
  *
  * Own-enumerable properties beyond `name`/`message`/`stack` travel as
  * `fields` and reappear as direct own properties on the sandbox-side Error;
- * properties that cannot be wire-encoded (functions, symbols, cycles, …) are
- * silently dropped, mirroring the sandbox → host direction (`RunError.fields`).
+ * properties V8 refuses to clone (functions, symbols, …) are silently
+ * dropped, mirroring the sandbox → host direction (`RunError.fields`).
  * @param err
  */
 export function bridgeErrorPayloadFromUnknown(err: unknown): BridgeErrorPayload {
@@ -741,16 +945,16 @@ export function bridgeErrorPayloadFromUnknown(err: unknown): BridgeErrorPayload 
         continue
       try {
         const value = obj[key] // may invoke a throwing getter
-        encodeWireValue(value)
+        serializeValue(value)
         fields[key] = value
         hasFields = true
       } catch {
-        continue // non-serializable property — drop it
+        continue // not serializable — drop it
       }
     }
     if (!hasFields)
       return { name, message }
-    return { name, message, encodedFields: encodeWireValue(fields) }
+    return { name, message, encodedFields: serializeValue(fields) }
   } catch {
     return { name: 'Error', message: 'host handler failed' }
   }
@@ -759,7 +963,7 @@ export function bridgeErrorPayloadFromUnknown(err: unknown): BridgeErrorPayload 
 /**
  * Encode a `BridgeResponsePayload` per `docs/protocol.md` §5.4.
  *
- * When `ok = true`, `encodedValue` contains pre-encoded WireValue bytes.
+ * When `ok = true`, `encodedValue` holds the pre-serialized value blob.
  * When `ok = false`, `error` describes the handler rejection. The stack slot
  * is always written as absent — host stacks must not leak into the sandbox.
  * @param callId
@@ -779,7 +983,7 @@ export function encodeBridgeResponsePayload(
     w.writeU8(1) // ok = true
     if (encodedValue !== undefined && encodedValue.byteLength > 0) {
       w.writeU8(1) // value present
-      w.writeBytes(encodedValue)
+      w.writeLengthPrefixedBytes(encodedValue)
     } else {
       w.writeU8(0) // value absent → Undefined
     }
@@ -791,12 +995,211 @@ export function encodeBridgeResponsePayload(
     w.writeU8(0) // stack: never carried host → sandbox
     if (error?.encodedFields !== undefined && error.encodedFields.byteLength > 0) {
       w.writeU8(1) // fields present
-      w.writeBytes(error.encodedFields)
+      w.writeLengthPrefixedBytes(error.encodedFields)
     } else {
       w.writeU8(0) // no fields
     }
   }
   return w.toBuffer()
+}
+
+// ── RunCompletionPayload decoder ───────────────────────────────────────────
+
+export interface DecodedRunCompletion {
+  /**
+   * Run identifier echoed from the `Run` request.
+   */
+  runId: number
+  result: RunResult
+}
+
+/**
+ * Decode a `RunCompletionPayload` from a `Result` frame payload.
+ *
+ * Wire layout per `docs/protocol.md` §5.6:
+ * ```
+ * u32   runId
+ * u8    ok
+ * u8    successPresent   (1 when ok = 1)
+ *   ValueBlob  exports
+ *   List<String>  stdout
+ *   List<String>  stderr
+ *   f64  durationMs
+ *   f64  cpuTimeMs
+ *   List<BridgeCallRecord>  bridgeCalls
+ * u8    failurePresent   (1 when ok = 0)
+ *   String  code
+ *   String  name
+ *   String  message
+ *   Optional<String>  stack
+ *   Optional<ValueBlob>  fields
+ *   List<String>  stdout
+ *   List<String>  stderr
+ *   f64  durationMs
+ *   f64  cpuTimeMs
+ *   List<BridgeCallRecord>  bridgeCalls
+ * ```
+ * @param buf
+ */
+export function decodeRunCompletionPayload(
+  buf: Uint8Array,
+): DecodedRunCompletion {
+  const reader = new PayloadReader(buf)
+  const runId = reader.readU32()
+  const ok = reader.readBool()
+
+  if (ok) {
+    const successPresent = reader.readU8()
+    if (successPresent !== 1) {
+      throw new PayloadDecodeError(
+        'expected success present byte = 1 when ok = true',
+      )
+    }
+    const exportsRaw = reader.readValueBlob()
+    const stdout = reader.readStringList()
+    const stderr = reader.readStringList()
+    const durationMs = reader.readF64()
+    const cpuTimeMs = reader.readF64()
+    const bridgeCalls = readBridgeCallRecords(reader)
+    reader.readU8() // failurePresent = 0; consumed for forward-compat
+
+    reader.assertDone()
+    return {
+      runId,
+      result: {
+        status: 'completed',
+        ok: true,
+        exports: exportsBlobToExports(exportsRaw),
+        stdout,
+        stderr,
+        durationMs,
+        cpuTimeMs,
+        bridgeCalls,
+      },
+    }
+  }
+
+  reader.readU8() // successPresent = 0
+  const failurePresent = reader.readU8()
+  if (failurePresent !== 1) {
+    throw new PayloadDecodeError(
+      'expected failure present byte = 1 when ok = false',
+    )
+  }
+  const code = reader.readString() as RunErrorCode
+  const name = reader.readString()
+  const message = reader.readString()
+  const stackPresent = reader.readU8()
+  const stack = stackPresent === 1 ? reader.readString() : undefined
+  const fields = reader.readOptionalValueBlob() as Record<string, unknown> | undefined
+  const stdout = reader.readStringList()
+  const stderr = reader.readStringList()
+  const durationMs = reader.readF64()
+  const cpuTimeMs = reader.readF64()
+  const bridgeCalls = readBridgeCallRecords(reader)
+
+  reader.assertDone()
+  return {
+    runId,
+    result: {
+      status: 'failed',
+      ok: false,
+      error: { code, name, message, stack, fields },
+      stdout,
+      stderr,
+      durationMs,
+      cpuTimeMs,
+      bridgeCalls,
+    },
+  }
+}
+
+/**
+ * Decode `List<BridgeCallRecord>` per `docs/protocol.md` §5.6. Names arrive
+ * already resolved — the runtime owns the import handle table and the shim
+ * naming convention, so no client-side mapping remains.
+ * @param reader
+ */
+function readBridgeCallRecords(reader: PayloadReader): BridgeCallEntry[] {
+  const count = reader.readU32()
+  const entries: BridgeCallEntry[] = []
+  for (let i = 0; i < count; i++) {
+    const name = reader.readString()
+    const startMs = reader.readF64()
+    const durationMs = reader.readF64()
+    const argBytes = reader.readU32()
+    const responseBytes = reader.readU32()
+    const ok = reader.readBool()
+    const blocked = reader.readBool()
+    entries.push({
+      name,
+      startMs,
+      durationMs,
+      argBytes,
+      responseBytes,
+      ok,
+      blocked,
+    })
+  }
+  return entries
+}
+
+function exportsBlobToExports(raw: unknown): SandboxExports {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new PayloadDecodeError(
+      `exports must decode to an object, got: ${
+        Array.isArray(raw) ? 'array' : typeof raw
+      }`,
+    )
+  }
+  return raw as SandboxExports
+}
+
+// ── PrecompileResultPayload decoder ────────────────────────────────────────
+
+export type PrecompileResult
+  = | { ok: true, prefixId: string }
+    | { ok: false, error: { code: string, name: string, message: string, stack?: string } }
+
+/**
+ * Decode a `PrecompileResultPayload` from a `PrecompileResult` frame.
+ *
+ * Wire layout per `docs/protocol.md` §5.6:
+ * ```
+ * u8    ok
+ * u8    prefixIdPresent   (1 when ok = true)
+ *   String  prefixId
+ * u8    errorPresent      (1 when ok = false)
+ *   RunErrorPayload  error
+ * ```
+ * @param buf
+ */
+export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult {
+  const reader = new PayloadReader(buf)
+  const ok = reader.readBool()
+
+  if (ok) {
+    const prefixIdPresent = reader.readU8()
+    if (prefixIdPresent !== 1)
+      throw new PayloadDecodeError('expected prefixId present byte = 1 when ok = true')
+    const prefixId = reader.readString()
+    reader.readU8() // errorPresent = 0
+    reader.assertDone()
+    return { ok: true, prefixId }
+  }
+
+  reader.readU8() // prefixIdPresent = 0
+  const errorPresent = reader.readU8()
+  if (errorPresent !== 1)
+    throw new PayloadDecodeError('expected error present byte = 1 when ok = false')
+  const code = reader.readString()
+  const name = reader.readString()
+  const message = reader.readString()
+  const stackPresent = reader.readU8()
+  const stack = stackPresent === 1 ? reader.readString() : undefined
+  reader.readOptionalValueBlob() // consume; precompile errors never carry fields
+  reader.assertDone()
+  return { ok: false, error: { code, name, message, stack } }
 }
 
 export function parseTsToRustMessageType(
@@ -824,6 +1227,7 @@ export function parseRustToTsMessageType(
     case RustToTsMessageTypes.Result:
     case RustToTsMessageTypes.PrecompileResult:
     case RustToTsMessageTypes.Log:
+    case RustToTsMessageTypes.Hello:
       return byte
     default:
       throw new Error(`unknown Rust->TS message type: ${formatByte(byte)}`)

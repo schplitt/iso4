@@ -190,7 +190,7 @@ function lowerNode(
     return { kind: 'object', entries }
   }
   // Data leaf — validated here so unsupported values fail with a pointer to
-  // their exact path, then carried as a WireValue.
+  // their exact path, then carried as a V8 serialization blob.
   validateDataLeaf(specifier, value as HostExportData, path)
   return { kind: 'data', value }
 }
@@ -224,7 +224,8 @@ function validateDataLeaf(
   if (value instanceof Uint8Array)
     return
   if (value instanceof Date || value instanceof Map || value instanceof Set) {
-    // Deliberately unsupported: the wire codec cannot carry these back out
+    // Deliberately outside the typed `HostExportData` contract (the wire
+    // itself would carry them fine; see the jsdoc above)
     // of the sandbox, so accepting them here would be a one-way asymmetry.
     throw new Error(
       `[@iso4/sandbox] imports['${specifier}'].${path.join('.')}: `

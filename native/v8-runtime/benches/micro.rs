@@ -4,11 +4,10 @@
 //! CI runs with `-- --output-format bencher` so `scripts/bench-compare.ts`
 //! can parse the results (see .github/workflows/bench.yml).
 //!
-//! Three groups:
-//! - `codec` — the wire codec legs in isolation (no V8).
-//! - `v8_value` — the value plane crossing into/out of V8: our
-//!   `wire_to_v8_value`/`value_to_wire` against V8's own
-//!   `ValueSerializer`/`ValueDeserializer` (the encoding we are moving to).
+//! Two groups:
+//! - `v8_value` — the value plane crossing into/out of V8: `blob::serialize_value`
+//!   / `blob::deserialize_value`, i.e. V8's own `ValueSerializer` /
+//!   `ValueDeserializer` (the only value codec in the protocol).
 //! - `exec` — per-run execution costs: fresh context, snapshot restore,
 //!   unique-source compile, and direct `Function::call` per event.
 //!
@@ -27,9 +26,8 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use iso4_v8_runtime::v8::{init_platform, value_to_wire, wire_to_v8_value};
-use iso4_v8_runtime::wire::{decode_wire_value, encode_wire_value, WireValue};
-use v8::{ValueDeserializerHelper, ValueSerializerHelper};
+use iso4_v8_runtime::blob;
+use iso4_v8_runtime::v8::init_platform;
 
 // ── Deterministic payload fixtures ─────────────────────────────────────────
 
@@ -58,12 +56,62 @@ fn sentence(rand: &mut impl FnMut() -> f64, words: usize) -> String {
         .join(" ")
 }
 
-fn obj(fields: Vec<(&str, WireValue)>) -> WireValue {
-    WireValue::Object(fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+/// A payload fixture, described independently of any codec and materialised
+/// into a V8 object graph by [`to_v8`]. The wire codec used to double as the
+/// fixture builder; with a single V8-native codec the benches build the object
+/// graph directly.
+#[derive(Clone)]
+enum Shape {
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Bytes(Vec<u8>),
+    Array(Vec<Shape>),
+    Object(Vec<(String, Shape)>),
+}
+
+fn to_v8<'s>(scope: &mut v8::HandleScope<'s>, shape: &Shape) -> v8::Local<'s, v8::Value> {
+    match shape {
+        Shape::Bool(b) => v8::Boolean::new(scope, *b).into(),
+        Shape::Number(n) => v8::Number::new(scope, *n).into(),
+        Shape::String(s) => v8::String::new(scope, s).unwrap().into(),
+        Shape::Bytes(bytes) => {
+            let len = bytes.len();
+            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.clone()).make_shared();
+            let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+            v8::Uint8Array::new(scope, buffer, 0, len).unwrap().into()
+        }
+        Shape::Array(items) => {
+            let array = v8::Array::new(scope, items.len() as i32);
+            for (i, item) in items.iter().enumerate() {
+                let v = to_v8(scope, item);
+                array.set_index(scope, i as u32, v);
+            }
+            array.into()
+        }
+        Shape::Object(fields) => {
+            let object = v8::Object::new(scope);
+            for (key, value) in fields {
+                let v = to_v8(scope, value);
+                let k = v8::String::new(scope, key).unwrap();
+                object.create_data_property(scope, k.into(), v);
+            }
+            object.into()
+        }
+    }
+}
+
+fn obj(fields: Vec<(&str, Shape)>) -> Shape {
+    Shape::Object(
+        fields
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+    )
 }
 
 /// ~10 keys, long string values, ~750 B — realistic analytics event.
-fn sparse1k() -> WireValue {
+fn sparse1k() -> Shape {
     let mut rand = prng(0x1504);
     let event_id = format!("evt_{}", (rand() * 1e9) as u64);
     let url = format!(
@@ -76,45 +124,45 @@ fn sparse1k() -> WireValue {
     );
     let description = sentence(&mut rand, 40);
     obj(vec![
-        ("eventId", WireValue::String(event_id)),
-        ("tenantId", WireValue::String("tenant_4c1f9a2b".into())),
-        ("type", WireValue::String("analytics.pageview".into())),
-        ("url", WireValue::String(url)),
+        ("eventId", Shape::String(event_id)),
+        ("tenantId", Shape::String("tenant_4c1f9a2b".into())),
+        ("type", Shape::String("analytics.pageview".into())),
+        ("url", Shape::String(url)),
         (
             "userAgent",
-            WireValue::String(
+            Shape::String(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                  (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
                     .into(),
             ),
         ),
-        ("referrer", WireValue::String(referrer)),
-        ("description", WireValue::String(description)),
+        ("referrer", Shape::String(referrer)),
+        ("description", Shape::String(description)),
         (
             "timestamp",
-            WireValue::Number(1_722_945_600_000.0 + (rand() * 86_400_000.0).floor()),
+            Shape::Number(1_722_945_600_000.0 + (rand() * 86_400_000.0).floor()),
         ),
-        ("sessionDurationMs", WireValue::Number(rand() * 900_000.0)),
-        ("isAuthenticated", WireValue::Bool(true)),
+        ("sessionDurationMs", Shape::Number(rand() * 900_000.0)),
+        ("isAuthenticated", Shape::Bool(true)),
     ])
 }
 
 /// ~200 values, ~1.3 KB — value-dense but small.
-fn dense1k() -> WireValue {
+fn dense1k() -> Shape {
     let mut rand = prng(0xD513);
-    let metrics = WireValue::Object(
+    let metrics = Shape::Object(
         (0..96)
-            .map(|i| (format!("m{i}"), WireValue::Number(rand() * 1000.0)))
+            .map(|i| (format!("m{i}"), Shape::Number(rand() * 1000.0)))
             .collect(),
     );
-    let tags = WireValue::Array(
+    let tags = Shape::Array(
         (0..48)
-            .map(|_| WireValue::String(WORDS[(rand() * WORDS.len() as f64) as usize].into()))
+            .map(|_| Shape::String(WORDS[(rand() * WORDS.len() as f64) as usize].into()))
             .collect(),
     );
-    let flags = WireValue::Array((0..48).map(|_| WireValue::Bool(rand() > 0.5)).collect());
+    let flags = Shape::Array((0..48).map(|_| Shape::Bool(rand() > 0.5)).collect());
     obj(vec![
-        ("kind", WireValue::String("metrics.batch".into())),
+        ("kind", Shape::String("metrics.batch".into())),
         ("metrics", metrics),
         ("tags", tags),
         ("flags", flags),
@@ -122,9 +170,9 @@ fn dense1k() -> WireValue {
 }
 
 /// 12k rows × 4 fields (~48k values, ~0.5–0.7 MB) — value-dense and large.
-fn dense2m() -> WireValue {
+fn dense2m() -> Shape {
     let mut rand = prng(0xDE2E);
-    let rows = WireValue::Array(
+    let rows = Shape::Array(
         (0..12_000)
             .map(|i| {
                 let name = format!(
@@ -133,32 +181,32 @@ fn dense2m() -> WireValue {
                     (rand() * 1e6) as u64
                 );
                 obj(vec![
-                    ("id", WireValue::Number(f64::from(i))),
-                    ("name", WireValue::String(name)),
-                    ("value", WireValue::Number(rand() * 10_000.0)),
-                    ("active", WireValue::Bool(rand() > 0.3)),
+                    ("id", Shape::Number(f64::from(i))),
+                    ("name", Shape::String(name)),
+                    ("value", Shape::Number(rand() * 10_000.0)),
+                    ("active", Shape::Bool(rand() > 0.3)),
                 ])
             })
             .collect(),
     );
     obj(vec![
-        ("kind", WireValue::String("rows.batch".into())),
+        ("kind", Shape::String("rows.batch".into())),
         ("rows", rows),
     ])
 }
 
 /// One 2 MB byte buffer — bytes plane.
-fn bytes2m() -> WireValue {
+fn bytes2m() -> Shape {
     let mut rand = prng(0xB2E5);
     let mut buf = vec![0u8; 2 * 1024 * 1024];
     for chunk in buf.chunks_exact_mut(4) {
         let n = (rand() * 4_294_967_296.0) as u32;
         chunk.copy_from_slice(&n.to_le_bytes());
     }
-    WireValue::Bytes(buf)
+    Shape::Bytes(buf)
 }
 
-fn shapes() -> Vec<(&'static str, WireValue)> {
+fn shapes() -> Vec<(&'static str, Shape)> {
     vec![
         ("sparse1k", sparse1k()),
         ("dense1k", dense1k()),
@@ -167,138 +215,58 @@ fn shapes() -> Vec<(&'static str, WireValue)> {
     ]
 }
 
-// ── V8 serializer delegates (minimal: no host objects in the matrix) ───────
-
-struct SerDelegate;
-impl v8::ValueSerializerImpl for SerDelegate {
-    fn throw_data_clone_error<'s>(
-        &self,
-        scope: &mut v8::HandleScope<'s>,
-        message: v8::Local<'s, v8::String>,
-    ) {
-        let exc = v8::Exception::error(scope, message);
-        scope.throw_exception(exc);
-    }
-}
-
-struct DeserDelegate;
-impl v8::ValueDeserializerImpl for DeserDelegate {}
-
 // ── Groups ─────────────────────────────────────────────────────────────────
 
-/// Wire codec legs in isolation — no V8 involved.
-fn bench_codec(c: &mut Criterion) {
-    let mut group = c.benchmark_group("codec");
-    for (name, wv) in &shapes() {
-        group.bench_function(BenchmarkId::new("encode_wire_value", name), |b| {
-            b.iter(|| {
-                let mut out = Vec::new();
-                encode_wire_value(black_box(wv), &mut out);
-                black_box(out)
-            });
-        });
-
-        let mut encoded = Vec::new();
-        encode_wire_value(wv, &mut encoded);
-        group.bench_function(BenchmarkId::new("decode_wire_value", name), |b| {
-            b.iter(|| {
-                let mut offset = 0usize;
-                black_box(decode_wire_value(black_box(&encoded), &mut offset).unwrap())
-            });
-        });
-    }
-    group.finish();
-}
-
-/// The value plane crossing the V8 boundary, per shape:
-/// our codec's V8 legs vs `ValueSerializer`/`ValueDeserializer`.
+/// The value plane crossing the V8 boundary, per shape: the blob codec both
+/// directions. These are the two legs every value on the wire now pays.
 fn bench_v8_value(c: &mut Criterion) {
     init_platform();
     let mut group = c.benchmark_group("v8_value");
 
-    for (name, wv) in &shapes() {
-        // WireValue → V8 object graph (current inbound leg).
-        group.bench_function(BenchmarkId::new("wire_to_v8_value", name), |b| {
-            let isolate = &mut v8::Isolate::new(Default::default());
-            let scope = &mut v8::HandleScope::new(isolate);
-            let context = v8::Context::new(scope, Default::default());
-            let scope = &mut v8::ContextScope::new(scope, context);
-            b.iter(|| {
-                // Per-iteration handle scope: without it, millions of locals
-                // accumulate in the outer scope over a bench run.
-                let scope = &mut v8::HandleScope::new(scope);
-                black_box(wire_to_v8_value(scope, black_box(wv)).unwrap());
-            });
-        });
-
-        // V8 object graph → WireValue (current outbound leg).
-        group.bench_function(BenchmarkId::new("value_to_wire", name), |b| {
-            let isolate = &mut v8::Isolate::new(Default::default());
-            let scope = &mut v8::HandleScope::new(isolate);
-            let context = v8::Context::new(scope, Default::default());
-            let scope = &mut v8::ContextScope::new(scope, context);
-            let value = wire_to_v8_value(scope, wv).unwrap();
-            b.iter(|| {
-                let scope = &mut v8::HandleScope::new(scope);
-                let scope = &mut v8::TryCatch::new(scope);
-                let mut visiting = Vec::new();
-                black_box(value_to_wire(scope, black_box(value), &mut visiting).unwrap());
-            });
-        });
-
-        // V8 value → v8-blob bytes (the outbound leg we are moving to).
+    for (name, shape) in &shapes() {
+        // V8 value → v8-blob bytes (outbound leg).
         group.bench_function(BenchmarkId::new("value_serializer", name), |b| {
             let isolate = &mut v8::Isolate::new(Default::default());
             let scope = &mut v8::HandleScope::new(isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
-            let value = wire_to_v8_value(scope, wv).unwrap();
+            let value = to_v8(scope, shape);
             b.iter(|| {
+                // Per-iteration handle scope: without it, millions of locals
+                // accumulate in the outer scope over a bench run.
                 let scope = &mut v8::HandleScope::new(scope);
-                let serializer = v8::ValueSerializer::new(scope, Box::new(SerDelegate));
-                serializer.write_header();
-                assert!(serializer.write_value(context, value) == Some(true));
-                black_box(serializer.release())
+                black_box(blob::serialize_value(scope, black_box(value)).unwrap())
             });
         });
 
-        // v8-blob bytes → V8 value (the inbound leg we are moving to).
-        // read_header() before read_value() is mandatory — see
-        // docs/protocol.md and the misleading host-object error it prevents.
+        // v8-blob bytes → V8 value (inbound leg).
         group.bench_function(BenchmarkId::new("value_deserializer", name), |b| {
             let isolate = &mut v8::Isolate::new(Default::default());
             let scope = &mut v8::HandleScope::new(isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
-            let value = wire_to_v8_value(scope, wv).unwrap();
-            let serializer = v8::ValueSerializer::new(scope, Box::new(SerDelegate));
-            serializer.write_header();
-            assert!(serializer.write_value(context, value) == Some(true));
-            let blob = serializer.release();
+            let value = to_v8(scope, shape);
+            let bytes = blob::serialize_value(scope, value).unwrap();
             b.iter(|| {
                 let scope = &mut v8::HandleScope::new(scope);
-                let deserializer =
-                    v8::ValueDeserializer::new(scope, Box::new(DeserDelegate), &blob);
-                assert!(deserializer.read_header(context) == Some(true));
-                black_box(deserializer.read_value(context).unwrap());
+                black_box(blob::deserialize_value(scope, black_box(&bytes)).unwrap());
             });
         });
-
     }
     group.finish();
 }
 
-/// ~150 B event for the RunCall-pattern benches, as a WireValue so no JSON
-/// is involved anywhere (the value plane is the v8 blob — decided item 1).
-fn small_event() -> WireValue {
+/// ~150 B event for the RunCall-pattern benches. No JSON is involved anywhere
+/// — the value plane is the v8 blob.
+fn small_event() -> Shape {
     obj(vec![
-        ("id", WireValue::Number(8412.0)),
-        ("type", WireValue::String("analytics.pageview".into())),
-        ("tenant", WireValue::String("tenant_4c1f9a2b".into())),
-        ("name", WireValue::String("checkout session".into())),
-        ("value", WireValue::Number(42.5)),
-        ("ts", WireValue::Number(1_722_945_600_000.0)),
-        ("authenticated", WireValue::Bool(true)),
+        ("id", Shape::Number(8412.0)),
+        ("type", Shape::String("analytics.pageview".into())),
+        ("tenant", Shape::String("tenant_4c1f9a2b".into())),
+        ("name", Shape::String("checkout session".into())),
+        ("value", Shape::Number(42.5)),
+        ("ts", Shape::Number(1_722_945_600_000.0)),
+        ("authenticated", Shape::Bool(true)),
     ])
 }
 
@@ -366,7 +334,7 @@ fn bench_exec(c: &mut Criterion) {
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let (func, recv) = compile_transform(scope);
-        let event = wire_to_v8_value(scope, &small_event()).unwrap();
+        let event = to_v8(scope, &small_event());
         b.iter(|| {
             let scope = &mut v8::HandleScope::new(scope);
             black_box(func.call(scope, recv, &[event]).unwrap());
@@ -382,22 +350,13 @@ fn bench_exec(c: &mut Criterion) {
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let (func, recv) = compile_transform(scope);
-        let event = wire_to_v8_value(scope, &small_event()).unwrap();
-        let serializer = v8::ValueSerializer::new(scope, Box::new(SerDelegate));
-        serializer.write_header();
-        assert!(serializer.write_value(context, event) == Some(true));
-        let args_blob = serializer.release();
+        let event = to_v8(scope, &small_event());
+        let args_blob = blob::serialize_value(scope, event).unwrap();
         b.iter(|| {
             let scope = &mut v8::HandleScope::new(scope);
-            let deserializer =
-                v8::ValueDeserializer::new(scope, Box::new(DeserDelegate), &args_blob);
-            assert!(deserializer.read_header(context) == Some(true));
-            let event = deserializer.read_value(context).unwrap();
+            let event = blob::deserialize_value(scope, &args_blob).unwrap();
             let result = func.call(scope, recv, &[event]).unwrap();
-            let serializer = v8::ValueSerializer::new(scope, Box::new(SerDelegate));
-            serializer.write_header();
-            assert!(serializer.write_value(context, result) == Some(true));
-            black_box(serializer.release());
+            black_box(blob::serialize_value(scope, result).unwrap());
         });
     });
 
@@ -460,6 +419,6 @@ fn configured() -> Criterion {
 criterion_group! {
     name = benches;
     config = configured();
-    targets = bench_codec, bench_v8_value, bench_exec
+    targets = bench_v8_value, bench_exec
 }
 criterion_main!(benches);

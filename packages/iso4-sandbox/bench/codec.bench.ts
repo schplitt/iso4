@@ -1,32 +1,34 @@
 /**
- * Host-side wire codec microbenchmarks — `encodeWireValue` /
- * `decodeWireValue` per payload shape, isolated from socket and V8 costs.
+ * Host-side value codec microbenchmarks — `serializeValue` /
+ * `deserializeValue` per payload shape, isolated from socket and V8-runtime
+ * costs.
  *
- * The Rust legs of the same codec (plus the V8-internal serializers this
- * codec is compared against) live in `native/v8-runtime/benches/micro.rs`.
+ * The Rust legs of the same codec live in
+ * `native/v8-runtime/benches/micro.rs` (`v8_value` group).
  */
 
 import { bench, describe } from 'vitest'
-import { decodeWireValue, encodeWireValue } from '../src/wire.js'
+import { deserializeValue, serializeValue } from '../src/v8-codec.js'
 import { PAYLOAD_MATRIX } from './payloads.js'
 import { MICRO_OPTS } from './profile.js'
 
-describe('codec encodeWireValue', () => {
+describe('codec serializeValue', () => {
   for (const { name, make } of PAYLOAD_MATRIX) {
     const payload = make()
     bench(name, () => {
-      encodeWireValue(payload)
+      serializeValue(payload)
     }, MICRO_OPTS)
   }
 })
 
-describe('codec decodeWireValue', () => {
+describe('codec deserializeValue', () => {
   for (const { name, make } of PAYLOAD_MATRIX) {
-    // encodeWireValue output is byte-compatible with the Rust encoder, so
-    // decoding it measures the same work as decoding a real Result frame.
-    const encoded = new Uint8Array(encodeWireValue(make()))
+    // serializeValue output is byte-identical to what the Rust serializer
+    // produces, so decoding it measures the same work as decoding a real
+    // Result frame.
+    const encoded = new Uint8Array(serializeValue(make()))
     bench(name, () => {
-      decodeWireValue(encoded)
+      deserializeValue(encoded)
     }, MICRO_OPTS)
   }
 })

@@ -146,6 +146,18 @@ impl SharedState {
     }
 }
 
+/// Best-effort `Hello` write on a rejected handshake. The connection is about
+/// to close either way, so a write failure here is only worth a log line.
+fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) {
+    if let Err(e) = ipc::write_rust_to_ts_frame(
+        stream,
+        ipc::RustToTsMessageType::Hello,
+        &ipc::encode_hello_payload(status, crate::blob::probe(), message),
+    ) {
+        eprintln!("[iso4-v8] failed to write rejection Hello frame: {e}");
+    }
+}
+
 pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
@@ -168,22 +180,68 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     let auth = match ipc::parse_authenticate_payload(&auth_frame.payload) {
         Ok(a) => a,
         Err(e) => {
+            // The payload shape itself is wrong — the peer is not speaking this
+            // protocol at all, so there is nothing meaningful to reply with.
             eprintln!("[iso4-v8] bad Authenticate payload: {e}");
             return;
         }
     };
 
     if auth.protocol_version != ipc::PROTOCOL_VERSION {
-        eprintln!(
-            "[iso4-v8] protocol version mismatch: got {}, expected {} — closing",
+        let message = format!(
+            "iso4 protocol version mismatch: host speaks v{}, this iso4-v8 binary speaks v{}. \
+             Update @iso4/sandbox and @iso4/v8-* together — they are released in lockstep.",
             auth.protocol_version,
             ipc::PROTOCOL_VERSION
+        );
+        eprintln!("[iso4-v8] {message} — closing");
+        send_hello(
+            &mut stream,
+            ipc::HelloStatus::ProtocolVersionMismatch,
+            &message,
         );
         return;
     }
 
+    // ── V8 serialization format check ────────────────────────────────────────
+    // Values cross this socket as V8 serialization blobs, so both V8s must
+    // agree on the format. The host's probe is a serialized `null` whose second
+    // byte is the format version Node writes; V8's ReadHeader hard-rejects
+    // anything newer than the reader knows. This is a byte comparison — the
+    // probe for this binary was computed once at process start in a throwaway
+    // isolate, so no isolate plumbing reaches the session layer.
+    let host_version = crate::blob::probe_format_version(&auth.probe);
+    let own_version = crate::blob::write_format_version();
+    match host_version {
+        Some(v) if v <= own_version => {}
+        _ => {
+            let message = format!(
+                "V8 serialization format mismatch between Node (writes format {}) and the \
+                 iso4-v8 binary (reads up to format {own_version}). \
+                 Update @iso4/sandbox and @iso4/v8-* together — they are released in lockstep.",
+                host_version
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "an unrecognised format".to_string()),
+            );
+            eprintln!("[iso4-v8] {message} — closing");
+            send_hello(&mut stream, ipc::HelloStatus::V8FormatMismatch, &message);
+            return;
+        }
+    }
+
     if auth.token != shared.token {
+        // Deliberately silent: an unauthenticated peer learns nothing about
+        // why it was refused.
         eprintln!("[iso4-v8] bad token — closing");
+        return;
+    }
+
+    if let Err(e) = ipc::write_rust_to_ts_frame(
+        &mut stream,
+        ipc::RustToTsMessageType::Hello,
+        &ipc::encode_hello_payload(ipc::HelloStatus::Ok, crate::blob::probe(), ""),
+    ) {
+        eprintln!("[iso4-v8] failed to write Hello frame: {e}");
         return;
     }
 
@@ -605,5 +663,102 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 }
             }
         }
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Drive `handle_client` over a socket pair with the given Authenticate
+    /// payload and return the first frame it writes back (if any).
+    fn handshake(payload: Vec<u8>, token: &str) -> Option<ipc::RustToTsFrame> {
+        let (mut host, runtime) = UnixStream::pair().unwrap();
+        let shared = Arc::new(SharedState::new(token.to_string()));
+        let server = std::thread::spawn(move || handle_client(runtime, shared));
+
+        ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)
+            .unwrap();
+        host.flush().unwrap();
+        let frame = ipc::read_rust_to_ts_frame(&mut host).ok();
+        drop(host);
+        server.join().unwrap();
+        frame
+    }
+
+    fn authenticate(probe: Vec<u8>, token: &str) -> Vec<u8> {
+        ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
+            protocol_version: ipc::PROTOCOL_VERSION,
+            probe,
+            token: token.to_string(),
+        })
+    }
+
+    /// `status`, `probe`, `message` out of a `Hello` payload.
+    fn parse_hello(payload: &[u8]) -> (u8, Vec<u8>, String) {
+        let status = payload[0];
+        let probe_len = u32::from_be_bytes(payload[1..5].try_into().unwrap()) as usize;
+        let probe = payload[5..5 + probe_len].to_vec();
+        let msg_start = 5 + probe_len + 4;
+        let msg_len =
+            u32::from_be_bytes(payload[5 + probe_len..msg_start].try_into().unwrap()) as usize;
+        let message = String::from_utf8(payload[msg_start..msg_start + msg_len].to_vec()).unwrap();
+        (status, probe, message)
+    }
+
+    #[test]
+    fn valid_handshake_is_acknowledged_with_the_runtime_probe() {
+        let frame = handshake(authenticate(crate::blob::probe().to_vec(), "tok"), "tok")
+            .expect("expected a Hello frame");
+        assert_eq!(frame.message_type, ipc::RustToTsMessageType::Hello);
+        let (status, probe, message) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::Ok as u8);
+        assert_eq!(probe, crate::blob::probe());
+        assert_eq!(message, "");
+    }
+
+    #[test]
+    fn impossible_v8_format_version_is_refused_loudly() {
+        // A probe claiming a serialization format far newer than anything this
+        // V8 can read. The old protocol closed the socket silently here.
+        let probe = vec![crate::blob::V8_BLOB_HEADER_TAG, 0x63, 0x30];
+        let frame = handshake(authenticate(probe, "tok"), "tok").expect("expected a Hello frame");
+        let (status, _, message) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::V8FormatMismatch as u8);
+        assert!(
+            message.contains("V8 serialization format mismatch"),
+            "unhelpful message: {message}"
+        );
+    }
+
+    #[test]
+    fn probe_that_is_not_a_blob_is_refused_loudly() {
+        let frame = handshake(authenticate(vec![0x01, 0x02], "tok"), "tok")
+            .expect("expected a Hello frame");
+        let (status, _, message) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::V8FormatMismatch as u8);
+        assert!(message.contains("unrecognised format"), "{message}");
+    }
+
+    #[test]
+    fn protocol_version_mismatch_is_refused_loudly() {
+        let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
+            protocol_version: ipc::PROTOCOL_VERSION + 1,
+            probe: crate::blob::probe().to_vec(),
+            token: "tok".to_string(),
+        });
+        let frame = handshake(payload, "tok").expect("expected a Hello frame");
+        let (status, _, message) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::ProtocolVersionMismatch as u8);
+        assert!(message.contains("protocol version mismatch"), "{message}");
+    }
+
+    #[test]
+    fn bad_token_closes_without_a_hello() {
+        // Deliberately silent: an unauthenticated peer learns nothing.
+        assert!(handshake(authenticate(crate::blob::probe().to_vec(), "wrong"), "tok").is_none());
     }
 }

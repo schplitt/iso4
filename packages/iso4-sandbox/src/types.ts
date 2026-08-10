@@ -69,8 +69,9 @@ export interface ResourceLimits {
   maxBridgeCallBytes?: number
 
   /**
-   * Maximum bytes allowed for the serialised export payload (all named exports
-   * combined). Exceeding this limit terminates the run with `ERR_EXPORT_TOO_LARGE`.
+   * Maximum bytes allowed for the serialised export payload — one V8
+   * serialization blob holding all exports combined. Exceeding this limit
+   * terminates the run with `ERR_EXPORT_TOO_LARGE`.
    * Zero disables the cap.
    * @default 16 * 1024 * 1024
    */
@@ -157,8 +158,9 @@ export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> 
  * A plain **constant** global — a data value installed directly on the sandbox
  * global object, with no host involvement and no code text anywhere.
  *
- * The value crosses the wire as a `WireValue` and Rust materialises it natively
- * with `wire_to_v8_value` (the same path host-module data leaves take):
+ * The value crosses the wire as a V8 serialization blob and Rust materialises
+ * it natively with `blob::deserialize_value` (the same path host-module data
+ * leaves take):
  *
  * ```ts
  * globals: { config: { kind: 'data', value: userConfig } }
@@ -297,8 +299,9 @@ export type ImportValue = string | HostModuleObject
  *
  * `Date`, `Map`, `Set`, circular references, class instances with
  * prototype methods, and stateful handles (streams, sockets) are rejected
- * at registration with a clear error. The supported set deliberately
- * matches what the wire codec can carry back out of the sandbox.
+ * at registration with a clear error, keeping the declared shape inside the
+ * `HostExportData` contract. (The runtime itself would carry a `Date` or `Map`
+ * fine — the typed contract is deliberately narrower than the wire.)
  */
 export interface HostModuleObject {
   [name: string]: HostModuleValue

@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem::ManuallyDrop;
-#[cfg(test)]
-use std::os::unix::io::AsRawFd;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -20,9 +18,10 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::RecvTimeoutError;
 
+use crate::blob;
 use crate::ipc;
 use crate::ipc::{HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
-use crate::wire::{self, BridgeErrorPayload, WireValue};
+use crate::wire::{self, BridgeErrorPayload};
 
 static INIT: Once = Once::new();
 
@@ -60,7 +59,7 @@ pub struct Limits {
     /// V8 heap cap enforced via `CreateParams::heap_limits` +
     /// `add_near_heap_limit_callback`. Zero means no limit.
     pub memory_mb: u32,
-    /// Maximum serialised byte length of the export WireValue.
+    /// Maximum byte length of the exports value blob.
     /// Zero means no limit. Violation → `RunError::ExportTooLarge`.
     pub max_export_bytes: u32,
     /// Maximum bytes captured across all stdout lines.
@@ -488,10 +487,11 @@ impl BridgeCallLog {
 /// The result of a successful JavaScript execution.
 #[derive(Debug)]
 pub struct Output {
-    /// All exports as a flat `WireValue::Object`.
-    /// The `default` export (if any) appears as the `"default"` key alongside
-    /// named exports. An empty module produces `WireValue::Object(vec![])`.
-    pub exports: WireValue,
+    /// All exports as **one** V8 serialization blob holding a plain
+    /// `{ name: value }` object. The `default` export (if any) appears as the
+    /// `"default"` key alongside named exports. An empty module produces a
+    /// blob holding `{}`.
+    pub exports: Vec<u8>,
 
     /// Lines written to console.log / console.debug / console.info.
     pub stdout: Vec<String>,
@@ -539,7 +539,10 @@ pub struct RuntimeErrorData {
     pub name: String,
     pub message: String,
     pub stack: Option<String>,
-    pub fields: Option<WireValue>,
+    /// Own-enumerable properties of the thrown value beyond
+    /// `name`/`message`/`stack`, as a V8 serialization blob holding a plain
+    /// object. `None` when there are none.
+    pub fields: Option<Vec<u8>>,
 }
 
 /// All the ways an execution can fail.
@@ -575,7 +578,7 @@ pub enum RunError {
     FunctionArgumentNotSupported,
     /// A bridge call payload (sandbox → host args) exceeded `limits.maxBridgeCallBytes`.
     BridgeCallPayloadTooLarge,
-    /// Serialised export WireValue exceeded `limits.maxExportBytes`.
+    /// Serialised exports blob exceeded `limits.maxExportBytes`.
     ExportTooLarge,
     /// Total bridge calls in this run exceeded `limits.maxBridgeCalls`.
     BridgeCallLimitExceeded,
@@ -1313,13 +1316,19 @@ fn run_module_inner(
                         if let Some(PendingResolver(global_resolver)) = entry {
                             let resolver = v8::Local::new(scope, global_resolver);
                             match result {
-                                Ok(wire_value) => {
-                                    if let Some(v8_val) = wire_to_v8_value(scope, &wire_value) {
+                                Ok(value_blob) => {
+                                    let decoded = match &value_blob {
+                                        // Absent value slot → the handler
+                                        // returned nothing.
+                                        None => Some(v8::undefined(scope).into()),
+                                        Some(bytes) => blob::deserialize_value(scope, bytes),
+                                    };
+                                    if let Some(v8_val) = decoded {
                                         resolver.resolve(scope, v8_val);
                                     } else {
                                         let msg = v8::String::new(
                                             scope,
-                                            "[iso4] bridge: failed to convert response value",
+                                            "[iso4] bridge: failed to deserialize response value",
                                         )
                                         .unwrap();
                                         resolver.reject(scope, msg.into());
@@ -1405,7 +1414,10 @@ fn run_module_inner(
             )
         })?;
 
-    let mut fields: Vec<(String, WireValue)> = Vec::new();
+    // Copy the exports into a fresh plain object and serialize that **once**.
+    // The module namespace is an exotic object the V8 serializer refuses, and
+    // a single blob for all exports beats one blob per export (measured).
+    let exports_object = v8::Object::new(scope);
 
     for i in 0..names.length() {
         let name_value = names.get_index(scope, i).ok_or_else(|| {
@@ -1434,20 +1446,43 @@ fn run_module_inner(
             )
         })?;
 
-        let wire =
-            export_to_wire(scope, &name, value).map_err(|error| failure(error, &logs, start))?;
-        fields.push((name, wire));
+        // Pre-check the two cases whose error message names the export. The
+        // serializer would reject them too, but only with a generic
+        // "could not be cloned" message, and the export name is the useful
+        // half of that diagnostic.
+        check_export_serializable(&name, value).map_err(|error| failure(error, &logs, start))?;
+
+        let export_key = v8::Local::<v8::Name>::try_from(name_value).map_err(|_| {
+            failure(
+                RunError::Internal(format!("export name {name} is not a property key")),
+                &logs,
+                start,
+            )
+        })?;
+        exports_object
+            .create_data_property(scope, export_key, value)
+            .ok_or_else(|| {
+                failure(
+                    RunError::Internal(format!("failed to stage export {name}")),
+                    &logs,
+                    start,
+                )
+            })?;
     }
 
-    let exports = WireValue::Object(fields);
+    let exports = blob::serialize_value(scope, exports_object.into()).map_err(|message| {
+        failure(
+            RunError::ExportNotSerializable(format!("exports could not be serialized: {message}")),
+            &logs,
+            start,
+        )
+    })?;
 
     // ── Export size limit ────────────────────────────────────────────────────
-    if limits.max_export_bytes > 0 {
-        let mut probe: Vec<u8> = Vec::new();
-        wire::encode_wire_value(&exports, &mut probe);
-        if probe.len() > limits.max_export_bytes as usize {
-            return Err(failure(RunError::ExportTooLarge, &logs, start));
-        }
+    // Measured on the blob itself — the payload that actually crosses the
+    // socket, so the limit is now free (no probe encode).
+    if limits.max_export_bytes > 0 && exports.len() > limits.max_export_bytes as usize {
+        return Err(failure(RunError::ExportTooLarge, &logs, start));
     }
 
     Ok(Output {
@@ -1897,7 +1932,7 @@ fn compile_source_module<'s>(
 //
 // — where only identifier-validated export names and integer indices are
 // interpolated. The values array is built natively (data leaves via
-// `wire_to_v8_value`, function leaves as trampolines from a fixed factory
+// `blob::deserialize_value`, function leaves as trampolines from a fixed factory
 // with the handle ID passed as a number) and handed to the module through
 // V8's import-meta callback. Using a plain source-text module keeps host
 // modules snapshot-safe: everything reachable from a prefix snapshot is
@@ -1981,7 +2016,7 @@ fn build_host_module<'s>(
 
 /// Build one host-module value natively: function leaves become trampolines
 /// (consuming the next handle ID), data leaves are materialised from their
-/// `WireValue`, and object nodes become plain objects built via the V8 API.
+/// value blob, and object nodes become plain objects built via the V8 API.
 fn build_host_value<'s>(
     scope: &mut v8::HandleScope<'s>,
     specifier: &str,
@@ -2001,7 +2036,7 @@ fn build_host_value<'s>(
                 ))
             })
         }
-        HostModuleNode::Data(wv) => wire_to_v8_value(scope, wv).ok_or_else(|| {
+        HostModuleNode::Data(bytes) => blob::deserialize_value(scope, bytes).ok_or_else(|| {
             RunError::Internal(format!(
                 "failed to materialise data leaf in host module '{specifier}'"
             ))
@@ -2009,11 +2044,6 @@ fn build_host_value<'s>(
         HostModuleNode::Object(entries) => {
             let obj = v8::Object::new(scope);
             for (key, child) in entries {
-                // "__proto__" never crosses the boundary in either direction —
-                // same policy as `wire_to_v8_value` / `serialize_object_fields`.
-                if key == "__proto__" {
-                    continue;
-                }
                 let v = build_host_value(scope, specifier, child, factory, next_id)?;
                 let k = v8::String::new(scope, key).ok_or_else(|| {
                     RunError::Internal(format!(
@@ -2228,13 +2258,13 @@ impl Drop for GuardCanceller<'_> {
 //
 // Every host-declared global (fetch, myTool, anything else) goes through the
 // same generic bridge callback. The callback:
-//   1. Serialises the JS arguments to WireValues (rejects function args).
+//   1. Serialises the JS arguments into one value blob (rejects function args).
 //   2. Calls cpu_budget.leave() to pause the CPU budget during host wait.
 //   3. Writes a BridgeCall frame on the session socket.
 //   4. Blocks reading a BridgeResponse frame (the V8 thread is already blocked
 //      in the host callback, so no V8 activity can happen during this wait).
 //   5. Calls cpu_budget.enter() to resume counting.
-//   6. On success: deserialises the WireValue result back to a V8 value.
+//   6. On success: deserialises the response blob back to a V8 value.
 //   7. On handler error: rejects the pending Promise with a real Error
 //      carrying the handler's name/message/fields (tagged via a private
 //      symbol). Sandbox code may catch it and continue; uncaught it
@@ -2397,11 +2427,11 @@ fn bridge_global_callback(
         return;
     }
 
-    // ── Serialise arguments ────────────────────────────────────────────────
-    let mut wire_args: Vec<WireValue> = Vec::with_capacity(args.length() as usize);
+    // ── Reject function arguments ──────────────────────────────────────────
+    // The serializer would refuse them anyway, but only with a generic
+    // data-clone message; a top-level function argument gets its own code.
     for i in 0..args.length() {
-        let arg = args.get(i);
-        if arg.is_function() {
+        if args.get(i).is_function() {
             record_blocked(0);
             fatal_bridge_error(
                 scope,
@@ -2409,14 +2439,6 @@ fn bridge_global_callback(
                 RunError::FunctionArgumentNotSupported,
             );
             return;
-        }
-        match arg_to_wire(scope, arg) {
-            Ok(wv) => wire_args.push(wv),
-            Err(e) => {
-                record_blocked(0);
-                fatal_bridge_error(scope, &data.bridge_error, e);
-                return;
-            }
         }
     }
 
@@ -2428,54 +2450,86 @@ fn bridge_global_callback(
     // owns the handle table, so the frame carries the resolved specifier and
     // leaf path (targetKind = 1) and the ID never leaves the process.
     #[allow(clippy::type_complexity)]
-    let (target_kind, specifier, export_name, call_args, record_name): (
+    let (target_kind, specifier, export_name, first_arg, record_name): (
         u8,
         Option<&str>,
         &str,
-        &[WireValue],
+        i32,
         String,
     ) = match &data.import_handles {
         None => (
             0,
             None,
             data.stub_name.as_str(),
-            &wire_args[..],
+            0,
             data.record_name.clone(),
         ),
         Some(table) => {
-            let entry = match wire_args.first() {
-                Some(WireValue::Number(n))
-                    if n.fract() == 0.0 && *n >= 0.0 && (*n as usize) < table.len() =>
-                {
-                    &table[*n as usize]
-                }
-                _ => {
-                    // Only reachable by sandbox code calling the reserved
-                    // dispatcher directly with a bogus handle — reject the
-                    // call catchably, mirroring a host handler error.
-                    record_blocked(0);
-                    reject_with_bridge_error(
-                        scope,
-                        &mut rv,
-                        "no host import handle for direct dispatcher call",
-                    );
-                    return;
-                }
+            let handle = args.get(0).number_value(scope).filter(|n| {
+                args.length() > 0 && n.fract() == 0.0 && *n >= 0.0 && (*n as usize) < table.len()
+            });
+            let Some(handle) = handle else {
+                // Only reachable by sandbox code calling the reserved
+                // dispatcher directly with a bogus handle — reject the
+                // call catchably, mirroring a host handler error.
+                record_blocked(0);
+                reject_with_bridge_error(
+                    scope,
+                    &mut rv,
+                    "no host import handle for direct dispatcher call",
+                );
+                return;
             };
+            let entry = &table[handle as usize];
             (
                 1,
                 Some(entry.specifier.as_str()),
                 entry.path.as_str(),
-                &wire_args[1..],
+                1, // the handle ID never leaves the process
                 entry.record_name(),
             )
+        }
+    };
+
+    // ── Serialise arguments ────────────────────────────────────────────────
+    // One blob for the whole argument list, not one per argument: measurably
+    // cheaper, and it preserves identity between arguments that reference the
+    // same object.
+    let args_array = v8::Array::new(scope, (args.length() - first_arg).max(0));
+    for i in first_arg..args.length() {
+        let arg = args.get(i);
+        if args_array
+            .set_index(scope, (i - first_arg) as u32, arg)
+            .is_none()
+        {
+            record_blocked(0);
+            fatal_bridge_error(
+                scope,
+                &data.bridge_error,
+                RunError::Internal("failed to stage bridge call arguments".to_string()),
+            );
+            return;
+        }
+    }
+    let args_blob = match blob::serialize_value(scope, args_array.into()) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            record_blocked(0);
+            fatal_bridge_error(
+                scope,
+                &data.bridge_error,
+                RunError::ExportNotSerializable(format!(
+                    "bridge call argument could not be serialized: {message}"
+                )),
+            );
+            return;
         }
     };
 
     // ── Assign call ID and build BridgeCall payload ────────────────────────
     let call_id = data.call_id.fetch_add(1, Ordering::Relaxed);
     let bridge_call_payload =
-        wire::encode_bridge_call_payload(call_id, target_kind, specifier, export_name, call_args);
+        wire::encode_bridge_call_payload(call_id, target_kind, specifier, export_name, &args_blob);
 
     if data.max_bridge_call_bytes > 0
         && bridge_call_payload.len() > data.max_bridge_call_bytes as usize
@@ -2653,8 +2707,8 @@ fn install_value_globals(
                 let value = eval_global_expression(scope, expr, name)?;
                 set_global(scope, name, value)?;
             }
-            HostGlobalDef::Data { name, value } => {
-                let v8_value = wire_to_v8_value(scope, value).ok_or_else(|| {
+            HostGlobalDef::Data { name, blob } => {
+                let v8_value = blob::deserialize_value(scope, blob).ok_or_else(|| {
                     RunError::Internal(format!("failed to materialise data global '{name}'"))
                 })?;
                 set_global(scope, name, v8_value)?;
@@ -2771,62 +2825,6 @@ fn eval_script<'s>(
     }
 }
 
-/// Convert a V8 value back to a `WireValue` for injection into the sandbox.
-///
-/// Used to materialise the host's bridge response back into the JS context.
-/// Returns `None` only when V8 string allocation fails (essentially never).
-pub fn wire_to_v8_value<'s>(
-    scope: &mut v8::HandleScope<'s>,
-    value: &WireValue,
-) -> Option<v8::Local<'s, v8::Value>> {
-    match value {
-        WireValue::Undefined => Some(v8::undefined(scope).into()),
-        WireValue::Null => Some(v8::null(scope).into()),
-        WireValue::Bool(b) => Some(v8::Boolean::new(scope, *b).into()),
-        WireValue::Number(n) => Some(v8::Number::new(scope, *n).into()),
-        WireValue::String(s) => v8::String::new(scope, s).map(|s| s.into()),
-        WireValue::BigInt(sign, words) => {
-            // Directly maps to V8's new_from_words: no base conversion needed.
-            // Words are LSW-first (matching the wire encoding and V8's representation).
-            // An empty words slice represents zero.
-            v8::BigInt::new_from_words(scope, *sign, words).map(|b| b.into())
-        }
-        WireValue::Bytes(b) => {
-            let len = b.len();
-            let store = v8::ArrayBuffer::new_backing_store_from_vec(b.to_vec()).make_shared();
-            let ab = v8::ArrayBuffer::with_backing_store(scope, &store);
-            v8::Uint8Array::new(scope, ab, 0, len).map(|a| a.into())
-        }
-        WireValue::Array(items) => {
-            let array = v8::Array::new(scope, items.len() as i32);
-            for (i, item) in items.iter().enumerate() {
-                let v = wire_to_v8_value(scope, item)?;
-                array.set_index(scope, i as u32, v)?;
-            }
-            Some(array.into())
-        }
-        WireValue::Object(fields) => {
-            let obj = v8::Object::new(scope);
-            for (key, val) in fields {
-                // Drop "__proto__" — silently elided in both directions.
-                // `serialize_object_fields` already drops it sandbox→host;
-                // we mirror that here for host→sandbox so the behaviour is
-                // symmetric.  Even though `create_data_property`
-                // ([[DefineOwnProperty]]) would store it as a plain own data
-                // property without touching the prototype chain, the protocol
-                // policy is: "__proto__" keys never cross either boundary.
-                if key == "__proto__" {
-                    continue;
-                }
-                let k = v8::String::new(scope, key)?;
-                let v = wire_to_v8_value(scope, val)?;
-                obj.create_data_property(scope, k.into(), v)?;
-            }
-            Some(obj.into())
-        }
-    }
-}
-
 /// Throw a plain Error into V8 with the given message.
 /// Splits the string-creation, exception-creation, and throw into separate
 /// borrows so the compiler doesn't see `scope` used twice simultaneously.
@@ -2893,16 +2891,10 @@ fn host_bridge_error_to_v8<'s>(
     // ever sends an Object here; skip reserved keys defensively so a crafted
     // payload cannot override Error identity or inject a fake stack, and drop
     // "__proto__" per the protocol-wide policy (it never crosses either way).
-    if let Some(WireValue::Object(entries)) = &err.fields {
-        for (key, value) in entries {
-            if matches!(key.as_str(), "name" | "message" | "stack" | "__proto__") {
-                continue;
-            }
-            if let (Some(k), Some(v)) =
-                (v8::String::new(scope, key), wire_to_v8_value(scope, value))
-            {
-                obj.create_data_property(scope, k.into(), v);
-            }
+    if let Some(bytes) = &err.fields {
+        if let Some(fields) = blob::deserialize_value(scope, bytes).and_then(|v| v.to_object(scope))
+        {
+            copy_own_properties_except(scope, fields, obj, &RESERVED_ERROR_KEYS);
         }
     }
     if let Some(tag) = host_bridge_tag(scope) {
@@ -2937,23 +2929,6 @@ fn host_bridge_error_from_rejection(
         message,
         fields: error_fields_from_value(scope, value),
     })))
-}
-
-/// Serialise a V8 value for use as a bridge call argument.
-///
-/// Like `value_to_wire` but uses `RunError::FunctionArgumentNotSupported` for
-/// function values instead of `ExportNotSerializable`.
-/// Wraps in a TryCatch internally so it can reuse `value_to_wire`.
-fn arg_to_wire(
-    scope: &mut v8::HandleScope,
-    value: v8::Local<v8::Value>,
-) -> Result<WireValue, RunError> {
-    if value.is_function() {
-        return Err(RunError::FunctionArgumentNotSupported);
-    }
-    let scope = &mut v8::TryCatch::new(scope);
-    let mut visiting = Vec::new();
-    value_to_wire(scope, value, &mut visiting)
 }
 
 fn install_console(scope: &mut v8::HandleScope, buffers: *mut LogBuffers) -> Result<(), RunError> {
@@ -3188,15 +3163,15 @@ fn install_async_context(scope: &mut v8::HandleScope) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Convert a top-level module export value to a `WireValue`.
+/// Reject the two export shapes whose diagnostic is only useful with the
+/// export name attached.
 ///
-/// Adds the export `name` to error messages for functions/promises.
-/// Initialises the identity-based visiting set used by `value_to_wire`.
-fn export_to_wire(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
-    name: &str,
-    value: v8::Local<v8::Value>,
-) -> Result<WireValue, RunError> {
+/// V8's serializer refuses functions and promises too, but with a generic
+/// "could not be cloned" message. Everything else it accepts —
+/// `Date`/`Map`/`Set`/`RegExp`/`Error`/`ArrayBuffer`/TypedArrays/`bigint`/
+/// cycles all round-trip as real instances — so there is nothing else to
+/// pre-check here.
+fn check_export_serializable(name: &str, value: v8::Local<v8::Value>) -> Result<(), RunError> {
     if value.is_function() {
         return Err(RunError::ExportNotSerializable(format!(
             "export \"{name}\" is a function"
@@ -3207,226 +3182,7 @@ fn export_to_wire(
             "export \"{name}\" is an unresolved Promise"
         )));
     }
-    let mut visiting: Vec<v8::Global<v8::Value>> = Vec::new();
-    value_to_wire(scope, value, &mut visiting)
-}
-
-/// Check whether `value` is already on the current recursion path (`visiting`).
-///
-/// Uses `strict_equals` - V8 reference equality - so two distinct JS objects
-/// that happen to have the same shape are never confused.
-///
-/// Returns `Ok(())` and pushes `value` if no cycle is found.
-/// Returns `Err` without pushing if a cycle is detected; the caller must NOT
-/// call `visiting.pop()` in the error branch.
-fn check_and_push(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
-    value: v8::Local<v8::Value>,
-    visiting: &mut Vec<v8::Global<v8::Value>>,
-) -> Result<(), RunError> {
-    for visited_global in visiting.iter() {
-        let visited_local = v8::Local::new(scope.as_mut(), visited_global);
-        if value.strict_equals(visited_local) {
-            return Err(RunError::ExportNotSerializable(
-                "cyclic or self-referential structure detected in export value".to_string(),
-            ));
-        }
-    }
-    visiting.push(v8::Global::new(scope.as_mut(), value));
     Ok(())
-}
-
-/// Serialise the items of a V8 array that has already been pushed onto
-/// `visiting` by the caller.
-fn serialize_array_items(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
-    array: v8::Local<v8::Array>,
-    visiting: &mut Vec<v8::Global<v8::Value>>,
-) -> Result<Vec<WireValue>, RunError> {
-    let len = array.length();
-    let mut items = Vec::with_capacity(len as usize);
-    for i in 0..len {
-        let item = array
-            .get_index(scope, i)
-            .ok_or_else(|| RunError::Internal(format!("failed to read array index {i}")))?;
-        items.push(value_to_wire(scope, item, visiting)?);
-    }
-    Ok(items)
-}
-
-/// Serialise the own enumerable string-keyed properties of a V8 object that
-/// has already been pushed onto `visiting` by the caller.
-fn serialize_object_fields(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
-    object: v8::Local<v8::Object>,
-    visiting: &mut Vec<v8::Global<v8::Value>>,
-) -> Result<Vec<(String, WireValue)>, RunError> {
-    let names = object
-        .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
-        .ok_or_else(|| RunError::Internal("failed to get own property names".to_string()))?;
-    let mut fields = Vec::with_capacity(names.length() as usize);
-    for i in 0..names.length() {
-        let name_value = names
-            .get_index(scope, i)
-            .ok_or_else(|| RunError::Internal("failed to read property name".to_string()))?;
-        let name = name_value
-            .to_string(scope)
-            .map(|s| s.to_rust_string_lossy(scope))
-            .ok_or_else(|| RunError::Internal("failed to stringify property name".to_string()))?;
-        // Drop "__proto__" before it crosses the bridge.  Protocol policy:
-        // "__proto__" keys are silently elided in both directions — here
-        // (sandbox→host) and in `wire_to_v8_value` (host→sandbox).
-        // Defence-in-depth: the TS decoder also uses Object.create(null)
-        // so even if this guard were absent the TS side would store
-        // "__proto__" as a plain data property without touching any
-        // prototype chain.  The guard remains for belt-and-suspenders
-        // and for symmetry with the host→sandbox drop.
-        if name == "__proto__" {
-            continue;
-        }
-        let val = object
-            .get(scope, name_value)
-            .ok_or_else(|| RunError::Internal(format!("failed to read property {name}")))?;
-        fields.push((name, value_to_wire(scope, val, visiting)?));
-    }
-    Ok(fields)
-}
-
-/// Recursively convert a V8 value to a `WireValue`.
-///
-/// `visiting` is the set of reference-type values (objects/arrays) currently
-/// on the recursion path. It acts as a call-stack to detect cycles:
-/// - pushed when entering an object or array
-/// - popped when leaving (whether success or error)
-/// - compared with `strict_equals` (V8 reference equality) at each entry
-///
-/// Shared but non-cyclic references (the same object appearing in two
-/// different fields) are serialised correctly: the object is popped after
-/// the first field, so it is not in the set when the second field is visited.
-pub fn value_to_wire(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
-    value: v8::Local<v8::Value>,
-    visiting: &mut Vec<v8::Global<v8::Value>>,
-) -> Result<WireValue, RunError> {
-    // ── Primitives (no cycle risk) ────────────────────────────────────────
-    if value.is_undefined() {
-        return Ok(WireValue::Undefined);
-    }
-    if value.is_null() {
-        return Ok(WireValue::Null);
-    }
-    if value.is_boolean() {
-        return Ok(WireValue::Bool(value.boolean_value(scope)));
-    }
-    if value.is_number() {
-        return Ok(WireValue::Number(
-            value.number_value(scope).unwrap_or(f64::NAN),
-        ));
-    }
-    if value.is_string() {
-        let s = value
-            .to_string(scope)
-            .map(|s| s.to_rust_string_lossy(scope))
-            .ok_or_else(|| RunError::Internal("failed to convert V8 string value".to_string()))?;
-        return Ok(WireValue::String(s));
-    }
-    if value.is_big_int() {
-        let bigint = v8::Local::<v8::BigInt>::try_from(value)
-            .map_err(|_| RunError::Internal("failed to cast to BigInt".to_string()))?;
-        // Use V8's word representation directly — no base conversion needed.
-        // word_count() returns 0 for zero, so an empty words slice encodes 0n.
-        let word_count = bigint.word_count();
-        let mut buf = vec![0u64; word_count];
-        let (sign, filled) = bigint.to_words_array(&mut buf);
-        return Ok(WireValue::BigInt(sign, filled.to_vec()));
-    }
-    if value.is_symbol() {
-        return Err(RunError::ExportNotSerializable(
-            "Symbol values cannot be serialized".to_string(),
-        ));
-    }
-    // ── Reference types - cycle detection applies ─────────────────────────
-    if value.is_function() {
-        return Err(RunError::ExportNotSerializable(
-            "function values cannot be serialized".to_string(),
-        ));
-    }
-    if value.is_promise() {
-        return Err(RunError::ExportNotSerializable(
-            "unresolved Promise values cannot be serialized".to_string(),
-        ));
-    }
-    // Uint8Array is the wire's binary primitive (WireValue::Bytes). Must be
-    // checked before the generic object branch — typed arrays are objects and
-    // would otherwise serialize as index-keyed fields.
-    if value.is_uint8_array() {
-        let view = v8::Local::<v8::ArrayBufferView>::try_from(value)
-            .map_err(|_| RunError::Internal("failed to cast to Uint8Array".to_string()))?;
-        let mut buf = vec![0u8; view.byte_length()];
-        let copied = view.copy_contents(&mut buf);
-        buf.truncate(copied);
-        return Ok(WireValue::Bytes(buf));
-    }
-    // Other binary containers are rejected rather than coerced to bytes:
-    // silently dropping the element type (e.g. Float32Array) would corrupt.
-    if value.is_array_buffer_view() {
-        return Err(RunError::ExportNotSerializable(
-            "typed array views other than Uint8Array cannot be serialized; \
-             send a Uint8Array of the underlying bytes"
-                .to_string(),
-        ));
-    }
-    if value.is_array_buffer() || value.is_shared_array_buffer() {
-        return Err(RunError::ExportNotSerializable(
-            "ArrayBuffer values cannot be serialized; wrap the buffer in a Uint8Array".to_string(),
-        ));
-    }
-    // Non-plain builtins are rejected loudly instead of silently serializing
-    // as their (usually empty) own-enumerable properties.
-    if value.is_date() {
-        return Err(RunError::ExportNotSerializable(
-            "Date values cannot be serialized; send an epoch number or ISO string".to_string(),
-        ));
-    }
-    if value.is_map() {
-        return Err(RunError::ExportNotSerializable(
-            "Map values cannot be serialized; copy the entries into a plain object or array"
-                .to_string(),
-        ));
-    }
-    if value.is_set() {
-        return Err(RunError::ExportNotSerializable(
-            "Set values cannot be serialized; copy the items into an array".to_string(),
-        ));
-    }
-    if value.is_reg_exp() {
-        return Err(RunError::ExportNotSerializable(
-            "RegExp values cannot be serialized; send the pattern as a string".to_string(),
-        ));
-    }
-    // Arrays must be checked before the generic object path (arrays are objects).
-    if value.is_array() {
-        check_and_push(scope, value, visiting)?;
-        let result = match v8::Local::<v8::Array>::try_from(value) {
-            Ok(arr) => serialize_array_items(scope, arr, visiting).map(WireValue::Array),
-            Err(_) => Err(RunError::Internal("failed to cast to Array".to_string())),
-        };
-        visiting.pop();
-        return result;
-    }
-    if value.is_object() {
-        check_and_push(scope, value, visiting)?;
-        let result = match value.to_object(scope) {
-            Some(obj) => serialize_object_fields(scope, obj, visiting).map(WireValue::Object),
-            None => Err(RunError::Internal("failed to cast to object".to_string())),
-        };
-        visiting.pop();
-        return result;
-    }
-
-    Err(RunError::ExportNotSerializable(
-        "unsupported or unknown value type".to_string(),
-    ))
 }
 
 fn runtime_error_from_value(
@@ -3517,15 +3273,54 @@ fn exception_name(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
         .unwrap_or_else(|| "Error".to_string())
 }
 
-/// Extract own enumerable properties from the thrown value, skipping `name`,
-/// `message`, and `stack` (reserved — captured in dedicated fields). Non-
-/// serializable properties (functions, symbols, unresolved promises) are
-/// silently dropped. Returns `None` for non-object throws or when no
-/// serializable own properties remain.
+/// Keys that never travel in an error's `fields`: the first three are carried
+/// in dedicated slots (and letting them through would let a payload spoof
+/// Error identity or inject a fake stack), and `__proto__` is skipped so a
+/// re-attached field can never land on the prototype accessor.
+const RESERVED_ERROR_KEYS: [&str; 4] = ["name", "message", "stack", "__proto__"];
+
+/// Copy `source`'s own enumerable string-keyed properties onto `target`,
+/// skipping `skip`. Uses `create_data_property` ([[DefineOwnProperty]]), so a
+/// copied key is always a plain own data property.
+fn copy_own_properties_except(
+    scope: &mut v8::HandleScope,
+    source: v8::Local<v8::Object>,
+    target: v8::Local<v8::Object>,
+    skip: &[&str],
+) {
+    let Some(names) = source.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+    else {
+        return;
+    };
+    for i in 0..names.length() {
+        let Some(key) = names.get_index(scope, i) else {
+            continue;
+        };
+        let Some(name) = key.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) else {
+            continue;
+        };
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        // May invoke a throwing getter; a failed read simply drops the key.
+        let Ok(property_key) = v8::Local::<v8::Name>::try_from(key) else {
+            continue;
+        };
+        let Some(value) = source.get(scope, key) else {
+            continue;
+        };
+        target.create_data_property(scope, property_key, value);
+    }
+}
+
+/// Extract own enumerable properties from the thrown value as a value blob,
+/// skipping [`RESERVED_ERROR_KEYS`]. Properties V8 refuses to clone
+/// (functions, symbols, unresolved promises) are silently dropped. Returns
+/// `None` for non-object throws or when no serializable own property remains.
 fn error_fields_from_value(
     scope: &mut v8::TryCatch<v8::HandleScope>,
     value: v8::Local<v8::Value>,
-) -> Option<WireValue> {
+) -> Option<Vec<u8>> {
     // Thrown primitives have no own properties of their own; to_object()
     // would create a wrapper (a String wrapper enumerates its character
     // indices) — never collect fields from those.
@@ -3533,41 +3328,44 @@ fn error_fields_from_value(
         return None;
     }
     let obj = value.to_object(scope)?;
-    let names = obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())?;
-    let skip = ["name", "message", "stack", "__proto__"];
-    let mut fields: Vec<(String, WireValue)> = Vec::new();
-    let mut visiting = Vec::new();
+    let fields = v8::Object::new(scope);
+    copy_own_properties_except(scope, obj, fields, &RESERVED_ERROR_KEYS);
+
+    let names = fields.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())?;
+    if names.length() == 0 {
+        return None;
+    }
+    if let Ok(bytes) = blob::serialize_value(scope, fields.into()) {
+        return Some(bytes);
+    }
+
+    // One property is unserializable. Rebuild, testing each in isolation, so a
+    // single function-valued field does not cost the caller every other one.
+    let kept = v8::Object::new(scope);
+    let mut any = false;
     for i in 0..names.length() {
-        let name_val = match names.get_index(scope, i) {
-            Some(v) => v,
-            None => continue,
+        let Some(key) = names.get_index(scope, i) else {
+            continue;
         };
-        let name = match name_val
-            .to_string(scope)
-            .map(|s| s.to_rust_string_lossy(scope))
-        {
-            Some(s) => s,
-            None => continue,
+        let Ok(property_key) = v8::Local::<v8::Name>::try_from(key) else {
+            continue;
         };
-        if skip.contains(&name.as_str()) {
+        let Some(prop) = fields.get(scope, key) else {
+            continue;
+        };
+        if blob::serialize_value(scope, prop).is_err() {
             continue;
         }
-        let prop = match obj.get(scope, name_val) {
-            Some(v) => v,
-            None => continue,
-        };
-        if let Ok(wire) = value_to_wire(scope, prop, &mut visiting) {
-            fields.push((name, wire));
-        }
+        kept.create_data_property(scope, property_key, prop);
+        any = true;
     }
-    if fields.is_empty() {
-        None
-    } else {
-        Some(WireValue::Object(fields))
+    if !any {
+        return None;
     }
+    blob::serialize_value(scope, kept.into()).ok()
 }
 
-fn exception_fields(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<WireValue> {
+fn exception_fields(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<Vec<u8>> {
     let exception = scope.exception()?;
     error_fields_from_value(scope, exception)
 }
@@ -3585,7 +3383,11 @@ fn exception_fields(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<WireVal
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::WireValue;
+    // The exports/args/fields slots are now V8 serialization blobs; the test
+    // suite asserts on the decoded shape, so it reads them back through the
+    // test-only value tree in `testval.rs`. `WireValue` is kept as the local
+    // alias so the assertions below still read as value shapes.
+    use crate::testval::{self, TestValue as WireValue};
 
     /// Shorthand: run a code string and return the full Output or RunError.
     /// Run code with explicit limits. Used for limit-enforcement tests.
@@ -3664,20 +3466,21 @@ mod tests {
         lines.iter().any(|line| line.contains(needle))
     }
 
-    // ── WireValue test helpers ────────────────────────────────────────────────
+    // ── Value-shape test helpers ──────────────────────────────────────────────
     //
-    // These convert the new WireValue-based Output back to the human-readable
-    // string representations that the original tests expected. This keeps the
-    // test bodies unchanged (or nearly so) while the internal representation
-    // moves from stringified exports to structured WireValue.
+    // `Output::exports` is one V8 serialization blob holding the flat
+    // `{ name: value }` export object. These helpers decode it into the
+    // `TestValue` tree so the assertions below can talk about value shapes.
+
+    /// Decode the exports blob into its value tree.
+    fn exports_of(out: &Output) -> WireValue {
+        testval::from_blob(&out.exports)
+    }
 
     /// Look up a field in the top-level exports Object by name.
     fn get_field(out: &Output, key: &str) -> Option<WireValue> {
-        if let WireValue::Object(fields) = &out.exports {
-            fields
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
+        if let WireValue::Object(fields) = exports_of(out) {
+            fields.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
         } else {
             None
         }
@@ -3695,8 +3498,8 @@ mod tests {
 
     /// Return all export key names.
     fn export_keys(out: &Output) -> Vec<String> {
-        if let WireValue::Object(fields) = &out.exports {
-            fields.iter().map(|(k, _)| k.clone()).collect()
+        if let WireValue::Object(fields) = exports_of(out) {
+            fields.into_iter().map(|(k, _)| k).collect()
         } else {
             vec![]
         }
@@ -3757,6 +3560,10 @@ mod tests {
             WireValue::String(s) => s.clone(),
             WireValue::BigInt(sign, words) => words_to_decimal(*sign, words),
             WireValue::Bytes(_) => "[Uint8Array]".to_string(),
+            // Real instances (Date/Map/Set/RegExp/Error/…) now cross the
+            // boundary intact; the value tree renders them as a description.
+            WireValue::Other(text) => text.clone(),
+            WireValue::Cycle => "[Circular]".to_string(),
             WireValue::Array(items) => {
                 let parts: Vec<String> = items.iter().map(wire_to_display_str).collect();
                 format!("[{}]", parts.join(","))
@@ -4050,44 +3857,57 @@ mod tests {
     }
 
     #[test]
-    fn exporting_non_plain_builtins_is_an_error() {
-        // Previously these silently serialized as `{}` (own enumerable
-        // properties of a Date/Map/Set/RegExp are empty).
-        for code in [
-            "export default new Date(1700000000000)",
-            "export default new Map([['a', 1]])",
-            "export default new Set([1, 2, 3])",
-            "export default /abc/g",
-            "export default new ArrayBuffer(8)",
+    fn exporting_non_plain_builtins_roundtrips_as_real_instances() {
+        // The V8 serialization format carries these natively, so they arrive
+        // as real instances rather than being rejected (the old wire codec)
+        // or silently flattened to `{}`.
+        for (code, expected) in [
+            (
+                "export default new Date(1700000000000)",
+                "Date(1700000000000)",
+            ),
+            ("export default new Map([['a', 1]])", r#"Map([["a",1]])"#),
+            ("export default new Set([1, 2, 3])", "Set([1,2,3])"),
+            ("export default /abc/g", "RegExp(abc/g)"),
+            (
+                "export default new Uint8Array([7, 8]).buffer",
+                "ArrayBuffer(7,8)",
+            ),
+            ("export default new TypeError('boom')", "TypeError(boom)"),
         ] {
-            let err = run_err(code);
-            assert!(
-                matches!(err, RunError::ExportNotSerializable(_)),
-                "expected ExportNotSerializable for {code}, got {err:?}"
-            );
+            let out = run_ok(code);
+            assert_eq!(get_default(&out).as_deref(), Some(expected), "{code}");
         }
     }
 
     #[test]
-    fn exporting_a_nested_builtin_is_an_error() {
-        // Nested corruption case: `{ when: new Date() }` must fail loudly,
-        // not decode as `{ when: {} }`.
-        let err = run_err("export default { when: new Date() }");
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    fn exporting_a_nested_builtin_roundtrips() {
+        // Nested case: `{ when: new Date() }` keeps the Date instance.
+        let out = run_ok("export default { when: new Date(1700000000000) }");
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Object(vec![(
+                "when".to_string(),
+                WireValue::Other("Date(1700000000000)".to_string()),
+            )]))
+        );
     }
 
     #[test]
-    fn exporting_a_non_uint8_typed_array_is_an_error() {
-        for code in [
-            "export default new Float32Array([1, 2])",
-            "export default new Int32Array([1, 2])",
-            "export default new DataView(new ArrayBuffer(4))",
+    fn exporting_a_non_uint8_typed_array_roundtrips_with_its_element_type() {
+        for (code, expected) in [
+            (
+                "export default new Float32Array([1, 2])",
+                "Float32Array(1,2)",
+            ),
+            ("export default new Int32Array([1, 2])", "Int32Array(1,2)"),
+            (
+                "export default new DataView(new ArrayBuffer(4))",
+                "DataView(0,0,0,0)",
+            ),
         ] {
-            let err = run_err(code);
-            assert!(
-                matches!(err, RunError::ExportNotSerializable(_)),
-                "expected ExportNotSerializable for {code}, got {err:?}"
-            );
+            let out = run_ok(code);
+            assert_eq!(get_default(&out).as_deref(), Some(expected), "{code}");
         }
     }
 
@@ -4248,33 +4068,49 @@ mod tests {
     // ── Cycle detection ───────────────────────────────────────────────────
 
     #[test]
-    fn cyclic_object_is_rejected() {
-        let err = run_err(
+    fn cyclic_object_roundtrips() {
+        // The V8 format has back-references, so a cycle survives intact
+        // instead of failing the run (the old wire codec rejected it).
+        let out = run_ok(
             r#"
             const obj = { x: 1 };
             obj.self = obj;
             export default obj;
             "#,
         );
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Object(vec![
+                ("x".to_string(), WireValue::Number(1.0)),
+                ("self".to_string(), WireValue::Cycle),
+            ]))
+        );
     }
 
     #[test]
-    fn cyclic_array_is_rejected() {
-        let err = run_err(
+    fn cyclic_array_roundtrips() {
+        let out = run_ok(
             r#"
             const arr = [1, 2, 3];
             arr.push(arr);
             export default arr;
             "#,
         );
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Array(vec![
+                WireValue::Number(1.0),
+                WireValue::Number(2.0),
+                WireValue::Number(3.0),
+                WireValue::Cycle,
+            ]))
+        );
     }
 
     #[test]
-    fn indirect_cycle_array_inside_object_inside_array() {
+    fn indirect_cycle_array_inside_object_inside_array_roundtrips() {
         // arr → obj → arr (cross-type indirect cycle)
-        let err = run_err(
+        let out = run_ok(
             r#"
             const arr = [];
             const obj = { arr };
@@ -4282,12 +4118,18 @@ mod tests {
             export default arr;
             "#,
         );
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Array(vec![WireValue::Object(vec![(
+                "arr".to_string(),
+                WireValue::Cycle,
+            )])]))
+        );
     }
 
     #[test]
-    fn indirect_cycle_two_objects() {
-        let err = run_err(
+    fn indirect_cycle_two_objects_roundtrips() {
+        let out = run_ok(
             r#"
             const a = {};
             const b = { a };
@@ -4295,7 +4137,13 @@ mod tests {
             export default a;
             "#,
         );
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Object(vec![(
+                "b".to_string(),
+                WireValue::Object(vec![("a".to_string(), WireValue::Cycle)]),
+            )]))
+        );
     }
 
     #[test]
@@ -5167,7 +5015,7 @@ mod tests {
 
     #[test]
     fn export_exceeding_size_limit_is_err_export_too_large() {
-        // User code exports a string whose serialised WireValue exceeds
+        // User code exports a string whose serialised blob exceeds
         // maxExportBytes. The run must fail with ExportTooLarge instead of
         // sending a huge payload over the wire.
         let limits = Limits {
@@ -5316,7 +5164,7 @@ mod tests {
             payload.extend_from_slice(&0u32.to_be_bytes()); // callId
             payload.push(1); // ok = true
             payload.push(1); // value present
-            wire::encode_wire_value(&WireValue::Number(1.0), &mut payload);
+            push_value_blob(&mut payload, &WireValue::Number(1.0));
             ipc::write_ts_to_rust_frame(
                 &mut server,
                 ipc::TsToRustMessageType::BridgeResponse,
@@ -5371,13 +5219,20 @@ mod tests {
     // a responder thread reads the BridgeCall frame and writes a BridgeResponse,
     // and we assert on the returned JS value or error code.
 
+    /// Append a value slot: `u32 byteLength` + V8 serialization blob.
+    fn push_value_blob(out: &mut Vec<u8>, value: &WireValue) {
+        let blob = testval::to_blob(value);
+        out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        out.extend_from_slice(&blob);
+    }
+
     /// Encode a successful BridgeResponse payload (callId, ok=1, value).
     fn bridge_resp_ok(call_id: u32, value: &WireValue) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&call_id.to_be_bytes());
         p.push(1); // ok
         p.push(1); // value present
-        wire::encode_wire_value(value, &mut p);
+        push_value_blob(&mut p, value);
         p
     }
 
@@ -5400,7 +5255,7 @@ mod tests {
         match fields {
             Some(f) => {
                 p.push(1);
-                wire::encode_wire_value(f, &mut p);
+                push_value_blob(&mut p, f);
             }
             None => p.push(0),
         }
@@ -5550,11 +5405,11 @@ mod tests {
             let mut server = server;
             let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
             assert_eq!(frame.message_type, ipc::RustToTsMessageType::BridgeCall);
-            // callId (4) + targetKind (1) + specifier absent (1) + name len (4) + "add" (3) + argCount (4) = 17
-            // Then first arg: tag NUMBER (1) + f64 (8) = 9
-            // Spot-check the arg count field (offset 13)
-            let arg_count = u32::from_be_bytes(frame.payload[13..17].try_into().unwrap());
-            assert_eq!(arg_count, 1);
+            // callId (4) + targetKind (1) + specifier absent (1) + name len (4)
+            // + "add" (3) = 13, then the args value slot: u32 length + blob.
+            let (_, _, _, export_name, args) = parse_bridge_call(&frame.payload);
+            assert_eq!(export_name, "add");
+            assert_eq!(args, vec![WireValue::Number(7.0)]);
             ipc::write_ts_to_rust_frame(
                 &mut server,
                 ipc::TsToRustMessageType::BridgeResponse,
@@ -5639,10 +5494,10 @@ mod tests {
                 assert_eq!(e.message, "took too long");
                 assert_eq!(
                     e.fields,
-                    Some(WireValue::Object(vec![(
+                    Some(testval::to_blob(&WireValue::Object(vec![(
                         "code".to_string(),
                         WireValue::String("E_FOO".into())
-                    )]))
+                    )])))
                 );
             }
             other => panic!("expected HostBridge, got {other:?}"),
@@ -6065,10 +5920,11 @@ mod tests {
     // ── __proto__ elision ─────────────────────────────────────────────────────
 
     #[test]
-    fn bridge_proto_key_in_host_response_is_dropped() {
-        // Host returns an object that contains "__proto__" as a key.
-        // wire_to_v8_value must drop it: the sandbox must NOT see __proto__
-        // as an own property of the returned object.
+    fn bridge_proto_own_key_in_host_response_stays_a_plain_own_key() {
+        // Host returns an object carrying "__proto__" as an own key. The V8
+        // deserializer stores it as a plain own data property — it never runs
+        // the Object.prototype __proto__ setter — so it reaches the sandbox
+        // as data and the object's prototype is untouched.
         let (out, h) = run_with_bridge(
             // Sort own property names to get a deterministic comma-joined string.
             "const r = await myTool(); \
@@ -6096,8 +5952,49 @@ mod tests {
             },
         );
         h.join().unwrap();
-        // "__proto__" was dropped; only "x" and "y" survive as own properties.
-        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("x,y"));
+        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("__proto__,x,y"));
+    }
+
+    #[test]
+    fn bridge_proto_own_key_in_host_response_does_not_pollute() {
+        // The companion to the test above: the key arrives as data, and
+        // neither the receiving object's prototype nor Object.prototype moves.
+        let (out, h) = run_with_bridge(
+            "const r = await myTool(); \
+             export default [ \
+               Object.getPrototypeOf(r) === Object.prototype, \
+               ({}).polluted === undefined, \
+               r.x, \
+             ].join(',')",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(
+                        0,
+                        &WireValue::Object(vec![
+                            ("x".to_string(), WireValue::Number(1.0)),
+                            (
+                                "__proto__".to_string(),
+                                WireValue::Object(vec![(
+                                    "polluted".to_string(),
+                                    WireValue::Bool(true),
+                                )]),
+                            ),
+                        ]),
+                    ),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        assert_eq!(get_default(&out.unwrap()).as_deref(), Some("true,true,1"));
     }
 
     // ── max_bridge_calls limit ─────────────────────────────────────────────
@@ -6771,11 +6668,13 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_export_with_proto_own_property_is_dropped() {
+    fn sandbox_export_with_proto_own_property_crosses_as_a_plain_own_key() {
         // Sandbox creates an object with __proto__ as an explicit own
         // enumerable property via Object.defineProperty (a plain object
-        // literal `{ __proto__: x }` sets the prototype instead).
-        // serialize_object_fields must drop it before crossing to the host.
+        // literal `{ __proto__: x }` sets the prototype instead). V8's
+        // serializer carries it as an own data property in both directions —
+        // it is never re-applied through the prototype accessor, so no
+        // pollution is possible. (The old wire codec dropped the key.)
         let out = run_ok(
             r#"
             const obj = {};
@@ -6788,12 +6687,12 @@ mod tests {
         if let WireValue::Object(fields) = default_val {
             let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
             assert!(
-                !keys.contains(&"__proto__"),
-                "expected __proto__ to be dropped, got keys: {keys:?}"
+                keys.contains(&"__proto__"),
+                "expected __proto__ to survive as a plain own key, got: {keys:?}"
             );
             assert!(keys.contains(&"x"), "expected x to survive");
         } else {
-            panic!("expected WireValue::Object");
+            panic!("expected an object export");
         }
     }
 
@@ -6991,12 +6890,13 @@ mod tests {
         off += 4;
         let export_name = String::from_utf8(payload[off..off + len].to_vec()).unwrap();
         off += len;
-        let arg_count = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+        // The whole argument list is one value slot holding an array.
+        let blob_len = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
-        let mut args = Vec::with_capacity(arg_count);
-        for _ in 0..arg_count {
-            args.push(wire::decode_wire_value(payload, &mut off).unwrap());
-        }
+        let args = match testval::from_blob(&payload[off..off + blob_len]) {
+            WireValue::Array(items) => items,
+            other => panic!("BridgeCall args must decode to an array, got {other:?}"),
+        };
         (call_id, target_kind, specifier, export_name, args)
     }
 
@@ -7034,17 +6934,20 @@ mod tests {
         let imports = [host_import(
             "conf:app",
             vec![
-                ("retries", HostModuleNode::Data(WireValue::Number(3.0))),
+                (
+                    "retries",
+                    HostModuleNode::Data(testval::to_blob(&WireValue::Number(3.0))),
+                ),
                 (
                     "region",
-                    HostModuleNode::Data(WireValue::String("eu".to_string())),
+                    HostModuleNode::Data(testval::to_blob(&WireValue::String("eu".to_string()))),
                 ),
                 (
                     "flags",
-                    HostModuleNode::Data(WireValue::Array(vec![
+                    HostModuleNode::Data(testval::to_blob(&WireValue::Array(vec![
                         WireValue::Bool(true),
                         WireValue::Null,
-                    ])),
+                    ]))),
                 ),
             ],
         )];
@@ -7064,15 +6967,18 @@ mod tests {
         let imports = [host_import(
             "conf:shape",
             vec![
-                ("default", HostModuleNode::Data(WireValue::Number(7.0))),
+                (
+                    "default",
+                    HostModuleNode::Data(testval::to_blob(&WireValue::Number(7.0))),
+                ),
                 (
                     "nested",
                     HostModuleNode::Object(vec![(
                         "deep".to_string(),
-                        HostModuleNode::Data(WireValue::Object(vec![(
+                        HostModuleNode::Data(testval::to_blob(&WireValue::Object(vec![(
                             "x".to_string(),
                             WireValue::Number(1.0),
-                        )])),
+                        )]))),
                     )]),
                 ),
             ],
@@ -7182,7 +7088,10 @@ mod tests {
     fn host_module_invalid_export_name_is_compile_error() {
         let imports = [host_import(
             "bad:name",
-            vec![("not a name", HostModuleNode::Data(WireValue::Null))],
+            vec![(
+                "not a name",
+                HostModuleNode::Data(testval::to_blob(&WireValue::Null)),
+            )],
         )];
         let err = run_with_source_imports(
             r#"import * as x from "bad:name"; export default 1"#,
@@ -7237,7 +7146,10 @@ mod tests {
         // code's own import.meta must stay empty.
         let imports = [host_import(
             "conf:x",
-            vec![("v", HostModuleNode::Data(WireValue::Number(1.0)))],
+            vec![(
+                "v",
+                HostModuleNode::Data(testval::to_blob(&WireValue::Number(1.0))),
+            )],
         )];
         let out = run_with_source_imports(
             r#"
@@ -7263,7 +7175,10 @@ mod tests {
             "tools:search",
             vec![
                 ("query", HostModuleNode::Function),
-                ("limit", HostModuleNode::Data(WireValue::Number(5.0))),
+                (
+                    "limit",
+                    HostModuleNode::Data(testval::to_blob(&WireValue::Number(5.0))),
+                ),
             ],
         )];
         let snapshot = precompile_module(
@@ -7366,7 +7281,10 @@ mod tests {
                 "a",
                 vec![
                     ("one", HostModuleNode::Function),
-                    ("data", HostModuleNode::Data(WireValue::Null)),
+                    (
+                        "data",
+                        HostModuleNode::Data(testval::to_blob(&WireValue::Null)),
+                    ),
                     (
                         "obj",
                         HostModuleNode::Object(vec![

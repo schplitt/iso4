@@ -3,13 +3,19 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::session;
+use iso4_v8_runtime::{blob, session};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
     let (socket_path, token) = parse_args();
+
+    // Compute the V8 serialization probe (and with it this binary's write
+    // format version) once, in a throwaway isolate, before any connection
+    // arrives. The handshake in `session.rs` is then a byte comparison — no
+    // isolate plumbing in the session layer, no per-connection cost.
+    blob::probe();
 
     // Remove stale socket from a previous run if present.
     let _ = std::fs::remove_file(&socket_path);
