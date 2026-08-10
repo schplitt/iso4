@@ -741,17 +741,27 @@ direction. Both tables start at `0x01`.
 | ------ | ---------------- | -------------------------------------------------- |
 | `0x01` | `Authenticate`   | First message on connect: protocol version + token |
 | `0x02` | `Run`            | Start a sandboxed execution                        |
-| `0x03` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                  |
-| `0x04` | `Terminate`      | Ask Rust to abort a running run and reply with an `ERR_ABORTED` result (§14.7) |
+| `0x03` | `Precompile`     | Compile a prefix into a V8 snapshot                |
+| `0x04` | `PrefixRun`      | Run postfix code against a stored snapshot         |
+| `0x05` | `DisposePrefix`  | Release a stored snapshot; idempotent              |
+| `0x06` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                  |
+| `0x07` | `Terminate`      | Ask Rust to abort a running run and reply with an `ERR_ABORTED` result (§14.7) |
 
 **Rust → TS**
 
-| Byte   | Name         | Purpose                                             |
-| ------ | ------------ | --------------------------------------------------- |
-| `0x01` | `BridgeCall` | Sandbox called `fetch` or a host-module function    |
-| `0x02` | `StdioChunk` | Eager `console.*` output (stdout or stderr)         |
-| `0x03` | `Result`     | Final result for a `Run` (always sent exactly once) |
-| `0x04` | `Log`        | Internal runtime diagnostics                        |
+| Byte   | Name               | Purpose                                                             |
+| ------ | ------------------ | ------------------------------------------------------------------- |
+| `0x01` | `BridgeCall`       | Sandbox called `fetch` or a host-module function                    |
+| `0x02` | `Result`           | Final result for a `Run`/`PrefixRun` (always sent exactly once)     |
+| `0x03` | `PrecompileResult` | Result of a `Precompile`                                            |
+| `0x04` | `Log`              | Internal runtime diagnostics                                        |
+| `0x05` | `Hello`            | Handshake acknowledgement; the first frame the runtime sends        |
+
+There is **no `StdioChunk` frame**. `console.*` output is captured in Rust and
+returned inside the `Result` payload at the end of the run
+(`native/v8-runtime/src/ipc.rs`). Next free type bytes: `0x08` (TS → Rust) and
+`0x06` (Rust → TS). The byte table in the archived §13.4 predates this one and
+its allocations collide with the rows above — do not size new frames off it.
 
 ### 6.3 Payload encoding
 
@@ -1005,6 +1015,17 @@ To be resolved as we build, not blocking the start:
   hygiene (header/URL validation) at the bridge; the host author decides
   policy (allow/deny). `@iso4/fetch` ships hardened defaults but is opt-in.
   Documented strongly.
+
+- **Host → sandbox function calls (`call(exportPath, argsBlob)`).** There is no
+  way to call a function that already lives inside the isolate: `BridgeCall` runs
+  sandbox → host, and `Run`/`PrefixRun` is whole-module evaluation with no
+  argument channel. This blocks `export default { fetch(request) }` as a
+  first-class shape and blocks passing real typed arguments in without source
+  interpolation. Seven sub-decisions (where the callable lives, addressing,
+  receiver, async, isolate lifetime, frame shape, error mapping) plus the
+  adjacent SQLite access-path decision are laid out with options,
+  measurements and a recommendation for each in
+  **`docs/rfc-0001-host-to-sandbox-call.md`**. Nothing there is decided.
 
 - **`Session.call()` input/output serialization contract.** For the
   persistent-session API of the analytics product, the host calls a function that was
