@@ -21,6 +21,37 @@ use crate::ipc;
 use crate::v8 as sandbox;
 use crate::wire;
 
+/// Per-run trace lines (`Run`/`PrefixRun` received / succeeded / failed) are
+/// **off by default**. They are two unbuffered `eprintln!`s on the hot path,
+/// and the runtime's stderr is inherited by the host process, so they cost
+/// ~13 µs per run when stderr is discarded and ~23 µs when it is a real file or
+/// pipe — 2-4 % of a hot `prefix.execute()` (measured 2026-08-10, release
+/// build, 10-core Apple Silicon).
+///
+/// Set `ISO4_V8_TRACE=1` to get them back. Everything else the runtime logs —
+/// handshake failures, protocol violations, prefix lifecycle, frame-write
+/// errors — is unconditional: those are rare, and they are the only signal for
+/// failures the host cannot observe from a `Result` frame.
+fn trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ISO4_V8_TRACE").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// `eprintln!` gated on [`trace_enabled`]. Arguments are only evaluated when
+/// tracing is on, so a disabled trace line costs one relaxed atomic load.
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if crate::session::trace_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// True when the run needs the session socket for bridge calls: some global
 /// installs a bridge stub (a plain function or a shim handler), or some host
 /// import declares a function leaf (the runtime then installs the reserved
@@ -109,7 +140,10 @@ fn find_host_node<'a>(
 
 /// Snapshot + declared global / import shape for one precompiled prefix.
 pub struct PrefixData {
-    pub snapshot: Vec<u8>,
+    /// The V8 startup snapshot, held behind an `Arc` so a `PrefixRun` can take
+    /// a handle to it under the store lock instead of copying ~460 KB, and can
+    /// then hand that same handle to `CreateParams` without a second copy.
+    pub snapshot: Arc<[u8]>,
     /// Global names declared at precompile time. PrefixRun globals must be a
     /// subset of this set; extras are rejected with ERR_UNDECLARED_BINDING.
     pub declared_globals: Vec<String>,
@@ -282,7 +316,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                 };
 
-                eprintln!(
+                trace!(
                     "[iso4-v8] Run {} received ({} code bytes, {} globals)",
                     payload.run_id,
                     payload.code.len(),
@@ -316,7 +350,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     Arc::clone(&call_id_counter),
                 ) {
                     Ok(output) => {
-                        eprintln!("[iso4-v8] run succeeded in {:.3}ms", output.duration_ms);
+                        trace!("[iso4-v8] run succeeded in {:.3}ms", output.duration_ms);
                         wire::encode_run_completion_payload(
                             payload.run_id,
                             wire::RunCompletion::Success(wire::RunSuccessPayload {
@@ -330,9 +364,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         )
                     }
                     Err(failure) => {
-                        eprintln!(
+                        trace!(
                             "[iso4-v8] run failed in {:.3}ms: {:?}",
-                            failure.duration_ms, failure.error
+                            failure.duration_ms,
+                            failure.error
                         );
                         wire::encode_run_completion_payload(
                             payload.run_id,
@@ -447,6 +482,9 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                 };
 
+                // `d.snapshot.clone()` is an `Arc` handle, so the store lock is
+                // held for three refcount bumps and two small Vec clones — not
+                // for a ~460 KB memcpy on every run of every slot.
                 let prefix_data_clone = shared
                     .prefix_store
                     .lock()
@@ -454,7 +492,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     .get(&payload.prefix_id)
                     .map(|d| {
                         (
-                            d.snapshot.clone(),
+                            Arc::clone(&d.snapshot),
                             d.declared_globals.clone(),
                             d.declared_imports.clone(),
                         )
@@ -545,13 +583,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 } else {
                                     None
                                 };
-                            eprintln!(
+                            trace!(
                             "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports)",
                             payload.run_id, payload.prefix_id, payload.code.len(),
                             payload.globals.len(), declared_imports.len(),
                         );
                             match sandbox::execute_with_prefix(
-                                &snapshot_bytes,
+                                snapshot_bytes,
                                 &payload.code,
                                 payload.filename.as_deref(),
                                 sandbox::Limits {
@@ -570,9 +608,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 Arc::clone(&call_id_counter),
                             ) {
                                 Ok(output) => {
-                                    eprintln!(
+                                    trace!(
                                         "[iso4-v8] PrefixRun {} succeeded in {:.3}ms",
-                                        payload.run_id, output.duration_ms
+                                        payload.run_id,
+                                        output.duration_ms
                                     );
                                     wire::encode_run_completion_payload(
                                         payload.run_id,
@@ -587,9 +626,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     )
                                 }
                                 Err(failure) => {
-                                    eprintln!(
+                                    trace!(
                                         "[iso4-v8] PrefixRun {} failed in {:.3}ms: {:?}",
-                                        payload.run_id, failure.duration_ms, failure.error
+                                        payload.run_id,
+                                        failure.duration_ms,
+                                        failure.error
                                     );
                                     wire::encode_run_completion_payload(
                                         payload.run_id,

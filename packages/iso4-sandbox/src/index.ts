@@ -90,7 +90,12 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
 
   const proc = spawn(binaryPath, ['--socket', socketPath, '--token', token], {
     // stdin closed, stdout ignored, stderr forwarded so runtime diagnostics
-    // (the [iso4-v8] eprintln! lines) appear in the host process's stderr.
+    // (the [iso4-v8] lines) appear in the host process's stderr.
+    //
+    // Per-run trace lines are off by default — writing two lines to an
+    // inherited stderr costs 2-4 % of a hot run. Set `ISO4_V8_TRACE=1` in the
+    // environment to re-enable them; errors and lifecycle events are always
+    // logged.
     stdio: ['ignore', 'ignore', 'inherit'],
   })
 
