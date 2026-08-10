@@ -19,9 +19,12 @@ import {
   encodePrefixRunPayload,
   encodeDisposePrefixPayload,
   bridgeErrorPayloadFromUnknown,
+  decodeHelloPayload,
   encodeBridgeResponsePayload,
+  encodeHelloPayload,
+  HelloStatus,
 } from '../src/ipc'
-import { decodeWireValueFromSlice, encodeWireValue } from '../src/wire'
+import { deserializeValue, serializationProbe, serializeValue } from '../src/v8-codec'
 
 import { Buffer } from 'node:buffer'
 
@@ -155,22 +158,67 @@ describe('buffered frame reader', () => {
 })
 
 describe('Authenticate payload', () => {
-  test('auth payload roundtrip preserves protocol version and token', () => {
+  test('auth payload roundtrip preserves protocol version, probe and token', () => {
+    const probe = serializationProbe()
     const payload = encodeAuthenticatePayload({
       protocolVersion: PROTOCOL_VERSION,
+      probe,
       token: 'secret-token',
     })
     const auth = decodeAuthenticatePayload(payload)
 
-    expect(auth).toEqual({
-      protocolVersion: PROTOCOL_VERSION,
-      token: 'secret-token',
-    })
+    expect(auth.protocolVersion).toBe(PROTOCOL_VERSION)
+    expect(auth.token).toBe('secret-token')
+    expect(Buffer.from(auth.probe)).toEqual(probe)
+  })
+
+  test('the probe is a serialized null carrying the format version', () => {
+    const probe = serializationProbe()
+    expect(probe[0]).toBe(0xFF) // V8 serialization header tag
+    expect(probe[1]).toBeGreaterThan(0) // format version
+    expect(deserializeValue(probe)).toBeNull()
   })
 
   test('auth payload rejects too-short payload', () => {
     expect(() => decodeAuthenticatePayload(Buffer.from([0x00]))).toThrow(
       /payload too short for Authenticate/,
+    )
+  })
+
+  test('auth payload rejects a probe length past the end', () => {
+    const payload = Buffer.from([0x00, 0x02, 0x00, 0x00, 0x00, 0x63, 0xFF])
+    expect(() => decodeAuthenticatePayload(payload)).toThrow(
+      /Authenticate payload truncated/,
+    )
+  })
+})
+
+describe('Hello payload', () => {
+  test('roundtrip preserves status, probe and message', () => {
+    const probe = serializationProbe()
+    const hello = decodeHelloPayload(
+      encodeHelloPayload({
+        status: HelloStatus.V8FormatMismatch,
+        probe,
+        message: 'format mismatch',
+      }),
+    )
+    expect(hello.status).toBe(HelloStatus.V8FormatMismatch)
+    expect(Buffer.from(hello.probe)).toEqual(probe)
+    expect(hello.message).toBe('format mismatch')
+  })
+
+  test('an accepting Hello carries an empty message', () => {
+    const hello = decodeHelloPayload(
+      encodeHelloPayload({ status: HelloStatus.Ok, probe: serializationProbe(), message: '' }),
+    )
+    expect(hello.status).toBe(HelloStatus.Ok)
+    expect(hello.message).toBe('')
+  })
+
+  test('rejects a truncated payload', () => {
+    expect(() => decodeHelloPayload(Buffer.from([0x00, 0x00]))).toThrow(
+      /payload too short for Hello/,
     )
   })
 })
@@ -288,8 +336,10 @@ describe('payload encoders', () => {
     const { value: n2, end: e3 } = readString(buf, off)
     expect(n2).toBe('limit')
     expect(buf[e3]).toBe(1) // node tag: data
-    expect(buf[e3 + 1]).toBe(0x03) // WireValue TAG_TRUE
-    off = e3 + 2
+    // Value slot: u32 byteLength + blob (no tag byte — one codec).
+    const dataLength = readU32BE(buf, e3 + 1)
+    expect(deserializeValue(buf.subarray(e3 + 5, e3 + 5 + dataLength))).toBe(true)
+    off = e3 + 5 + dataLength
     const { value: n3, end: e4 } = readString(buf, off)
     expect(n3).toBe('nested')
     expect(buf[e4]).toBe(2) // node tag: object
@@ -368,8 +418,7 @@ describe('bridgeErrorPayloadFromUnknown', () => {
     const payload = bridgeErrorPayloadFromUnknown(err)
     expect(payload.name).toBe('Error')
     expect(payload.encodedFields).toBeDefined()
-    const [data] = decodeWireValueFromSlice(payload.encodedFields!)
-    expect(data).toEqual({ code: 'E_FOO', attempt: 2 })
+    expect(deserializeValue(payload.encodedFields!)).toEqual({ code: 'E_FOO', attempt: 2 })
   })
 
   test('never carries name/message/stack inside fields', () => {
@@ -400,7 +449,7 @@ describe('bridgeErrorPayloadFromUnknown', () => {
 
 describe('encodeBridgeResponsePayload error layout', () => {
   test('writes code, name, message, absent stack, and fields per §5.4', () => {
-    const encodedFields = encodeWireValue({ code: 'E_FOO' })
+    const encodedFields = serializeValue({ code: 'E_FOO' })
     const buf = encodeBridgeResponsePayload(7, false, undefined, {
       name: 'WorkflowTimeout',
       message: 'took too long',
@@ -419,8 +468,10 @@ describe('encodeBridgeResponsePayload error layout', () => {
     expect(message).toBe('took too long')
     expect(buf[e3]).toBe(0) // stack: always absent host → sandbox
     expect(buf[e3 + 1]).toBe(1) // fields present
-    const [data] = decodeWireValueFromSlice(buf.subarray(e3 + 2))
-    expect(data).toEqual({ code: 'E_FOO' })
+    // Value slot: u32 byteLength + blob.
+    const fieldsLength = readU32BE(buf, e3 + 2)
+    const fieldsBlob = buf.subarray(e3 + 6, e3 + 6 + fieldsLength)
+    expect(deserializeValue(fieldsBlob)).toEqual({ code: 'E_FOO' })
   })
 
   test('omits fields when the error has none', () => {

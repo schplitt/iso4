@@ -20,7 +20,7 @@ import { ConnectionPool } from './pool'
 import {
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
-} from './wire'
+} from './ipc'
 import type {
   HostGlobals,
   PrecompileOptions,

@@ -918,14 +918,16 @@ describe('error handling', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7b. Wire boundary contract — data, not behavior (GH #9)
+// 7b. Value boundary contract — data, not behavior (GH #9)
 //
-// Supported across the boundary: primitives, bigint, string, Uint8Array,
-// plain objects/arrays. Everything else fails loudly in BOTH directions
-// instead of silently corrupting to `{}`.
+// Values cross as V8 serialization blobs, so everything the V8 format carries
+// arrives as a real instance in BOTH directions: primitives, bigint, string,
+// Date, Map, Set, RegExp, Error, ArrayBuffer, every TypedArray, and cycles.
+// Behavior still cannot cross: functions, symbols, promises, and WeakMaps
+// fail loudly rather than silently corrupting to `{}`.
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('wire boundary contract', () => {
+describe('value boundary contract', () => {
   let runtime: Runtime
 
   beforeAll(async () => {
@@ -965,48 +967,130 @@ describe('wire boundary contract', () => {
   })
 
   test.each([
-    ['Date', 'new Date(1700000000000)'],
-    ['Map', 'new Map([["a", 1]])'],
-    ['Set', 'new Set([1, 2, 3])'],
-    ['RegExp', '/abc/g'],
-    ['ArrayBuffer', 'new ArrayBuffer(8)'],
-    ['Float32Array', 'new Float32Array([1, 2])'],
-  ])('exporting a %s → ERR_EXPORT_NOT_SERIALIZABLE', async (_name, expr) => {
+    ['Date', 'new Date(1700000000000)', (v: unknown) => {
+      expect(v).toBeInstanceOf(Date)
+      expect((v as Date).getTime()).toBe(1700000000000)
+    }],
+    ['Map', 'new Map([["a", 1]])', (v: unknown) => {
+      expect(v).toBeInstanceOf(Map)
+      expect((v as Map<string, number>).get('a')).toBe(1)
+    }],
+    ['Set', 'new Set([1, 2, 3])', (v: unknown) => {
+      expect(v).toBeInstanceOf(Set)
+      expect([...(v as Set<number>)]).toEqual([1, 2, 3])
+    }],
+    ['RegExp', '/abc/g', (v: unknown) => {
+      expect(v).toBeInstanceOf(RegExp)
+      expect((v as RegExp).source).toBe('abc')
+      expect((v as RegExp).flags).toBe('g')
+    }],
+    ['ArrayBuffer', 'new Uint8Array([7, 8]).buffer', (v: unknown) => {
+      expect(v).toBeInstanceOf(ArrayBuffer)
+      expect([...new Uint8Array(v as ArrayBuffer)]).toEqual([7, 8])
+    }],
+    ['Float32Array', 'new Float32Array([1, 2])', (v: unknown) => {
+      expect(v).toBeInstanceOf(Float32Array)
+      expect([...(v as Float32Array)]).toEqual([1, 2])
+    }],
+    ['Error', 'new TypeError("boom")', (v: unknown) => {
+      expect(v).toBeInstanceOf(TypeError)
+      expect((v as Error).message).toBe('boom')
+    }],
+    ['bigint', '2n ** 70n', (v: unknown) => {
+      expect(v).toBe(2n ** 70n)
+    }],
+  ])('exporting a %s round-trips as a real instance', async (_name, expr, assertValue) => {
     const result = await runtime.run({ code: `export default ${expr}` })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    assertValue(result.exports.default)
   })
 
-  test('builtin nested inside a plain object also fails loudly', async () => {
+  test('a builtin nested inside a plain object round-trips too', async () => {
     const result = await runtime.run({
-      code: 'export default { when: new Date() }',
+      code: 'export default { when: new Date(1700000000000) }',
     })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    const exported = result.exports.default as { when: Date }
+    expect(exported.when).toBeInstanceOf(Date)
+    expect(exported.when.getTime()).toBe(1700000000000)
   })
 
-  test('host handler returning a Date → ERR_HOST_BRIDGE', async () => {
+  test('a cyclic export round-trips with its cycle intact', async () => {
     const result = await runtime.run({
-      code: 'export default await now()',
-      globals: { now: async () => new Date() },
+      code: 'const o = { x: 1 }; o.self = o; export default o',
     })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+    const exported = result.exports.default as { x: number, self: unknown }
+    expect(exported.x).toBe(1)
+    expect(exported.self).toBe(exported)
   })
 
-  test('host handler returning a class instance → ERR_HOST_BRIDGE', async () => {
+  test('host handler returning a Date delivers a real Date to the sandbox', async () => {
+    const result = await runtime.run({
+      code: 'const d = await now(); export default { isDate: d instanceof Date, t: d.getTime() }',
+      globals: { now: async () => new Date(1700000000000) },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({ isDate: true, t: 1700000000000 })
+  })
+
+  test('host handler returning a class instance flattens to its own properties', async () => {
+    // Accepted trade-off: Node's serializer has no hook to reject class
+    // instances (workerd's `treatClassInstancesAsPlainObjects = false` is not
+    // available), so an instance arrives as a plain object of its own
+    // enumerable properties. Documented in docs/protocol.md §4.2.
     class Row {
       value = 1
+      label = 'x'
+      describe(): string {
+        return this.label
+      }
     }
     const result = await runtime.run({
-      code: 'export default await fetchRow()',
+      code: `
+        const r = await fetchRow()
+        export default { keys: Object.keys(r).sort(), value: r.value, hasMethod: typeof r.describe }
+      `,
       globals: { fetchRow: async () => new Row() },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      keys: ['label', 'value'],
+      value: 1,
+      hasMethod: 'undefined',
+    })
+  })
+
+  test('exporting a function still fails loudly', async () => {
+    const result = await runtime.run({ code: 'export default () => 1' })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+  })
+
+  test('a function nested inside a plain object still fails loudly', async () => {
+    const result = await runtime.run({ code: 'export default { fn: () => 1 }' })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+  })
+
+  test('host handler returning a function → ERR_HOST_BRIDGE', async () => {
+    const result = await runtime.run({
+      code: 'export default await give()',
+      globals: { give: async () => () => 1 },
     })
     expect(result.ok).toBe(false)
     if (result.ok)

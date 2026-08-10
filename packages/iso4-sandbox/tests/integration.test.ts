@@ -1606,37 +1606,44 @@ describe('export types — full coverage', () => {
     expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
   })
 
-  test('cyclic object → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  // Cycles used to be rejected by the hand-written codec. The V8
+  // serialization format has back-references, so they now round-trip with
+  // object identity preserved.
+  test('cyclic object round-trips with its self-reference', async () => {
     const result = await runtime.run({
       code: 'const o = {}; o.self = o; export default o',
     })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    const d = result.exports['default'] as { self: unknown }
+    expect(d.self).toBe(d)
   })
 
-  test('cyclic array → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  test('cyclic array round-trips with its self-reference', async () => {
     const result = await runtime.run({
       code: 'const a = [1, 2]; a.push(a); export default a',
     })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    const d = result.exports['default'] as unknown[]
+    expect(d.slice(0, 2)).toEqual([1, 2])
+    expect(d[2]).toBe(d)
   })
 
-  test('cross-type indirect cycle → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  test('cross-type indirect cycle round-trips', async () => {
     const result = await runtime.run({
       code: 'const a = []; const o = { a }; a.push(o); export default a',
     })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    const d = result.exports['default'] as { a: unknown }[]
+    expect(d[0]?.a).toBe(d)
   })
 
-  test('shared (non-cyclic) reference succeeds', async () => {
+  test('shared (non-cyclic) reference succeeds and keeps its identity', async () => {
     const result = await runtime.run({
       code: 'const s = { x: 1 }; export default { a: s, b: s }',
     })
@@ -1646,6 +1653,9 @@ describe('export types — full coverage', () => {
     const d = result.exports['default'] as any
     expect(d.a).toEqual({ x: 1 })
     expect(d.b).toEqual({ x: 1 })
+    // The V8 format writes the second occurrence as a back-reference, so the
+    // two fields decode to the same object rather than two copies.
+    expect(d.a).toBe(d.b)
   })
 })
 
@@ -2221,6 +2231,44 @@ describe('globals bridge — BridgeWithShim (Phase 4)', () => {
       len: 3,
       big: '9007199254740994',
       nothing: null,
+    })
+  })
+
+  test('data global: survives the snapshot creator and reaches a prefix run', async () => {
+    // Data globals and host-module data leaves are materialised from their
+    // value blob inside the *snapshot-creator* isolate at prepare() time, then
+    // frozen into the snapshot. This is the one place the value codec runs
+    // outside a normal isolate, so it gets its own coverage.
+    await using prefix = await runtime.prepare({
+      code: 'export const ready = true',
+      globals: {
+        CONFIG: { kind: 'data', value: { region: 'eu', retries: 3, nested: { a: [1, 2] } } },
+        BLOB: { kind: 'data', value: new Uint8Array([7, 8, 9]) },
+      },
+      imports: { 'tools:cfg': { version: '1.2.3', limits: { max: 5 } } },
+    })
+
+    const result = await prefix.execute({
+      code: `
+        import { version, limits } from 'tools:cfg'
+        export default {
+          region: CONFIG.region,
+          deep: CONFIG.nested.a,
+          bytes: Array.from(BLOB),
+          version,
+          max: limits.max,
+        }
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual({
+      region: 'eu',
+      deep: [1, 2],
+      bytes: [7, 8, 9],
+      version: '1.2.3',
+      max: 5,
     })
   })
 

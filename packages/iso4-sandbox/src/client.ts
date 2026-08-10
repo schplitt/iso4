@@ -3,11 +3,13 @@ import { createConnection } from 'node:net'
 import type { Socket } from 'node:net'
 import {
   FrameReader,
+  HelloStatus,
   PROTOCOL_VERSION,
 
   RustToTsMessageTypes,
   TsToRustMessageTypes,
   decodeBridgeCallPayload,
+  decodeHelloPayload,
   bridgeErrorPayloadFromUnknown,
   encodeBridgeResponsePayload,
   encodeAuthenticatePayload,
@@ -22,7 +24,7 @@ import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
-import { encodeWireValue } from './wire'
+import { deserializeValue, serializationProbe, serializeValue } from './v8-codec.js'
 
 export interface RuntimeIpcClientOptions {
   socketPath: string
@@ -60,6 +62,29 @@ export type { ResourceLimits }
  * Kept comfortably under the abort-latency the runtime aims for.
  */
 const TERMINATE_GRACE_MS = 100
+
+/**
+ * How long `connect()` waits for the runtime's `Hello` frame before giving up.
+ * The runtime answers a handshake without touching V8 (the probe is computed
+ * once at process start), so this only bites when the binary is wedged.
+ */
+const HELLO_TIMEOUT_MS = 5_000
+
+/**
+ * Thrown out of `createSandbox()` when the connection handshake fails.
+ *
+ * The common cause is a V8 serialization format-version mismatch between this
+ * Node and the `@iso4/v8-*` binary: values cross the boundary as V8
+ * serialization blobs, so the two V8s must agree on the format. Internal —
+ * `@iso4/sandbox` does not export this type; it reaches callers as a plain
+ * `Error` with `name = 'Iso4HandshakeError'`.
+ */
+export class HandshakeError extends Error {
+  constructor(message: string) {
+    super(`[@iso4/sandbox] ${message}`)
+    this.name = 'Iso4HandshakeError'
+  }
+}
 
 /**
  * Thrown out of a run when its `AbortSignal` fires mid-flight and the graceful
@@ -120,21 +145,96 @@ export class RuntimeIpcClient {
     return !this.disposed && !this.broken
   }
 
+  /**
+   * Open a connection and complete the v2 handshake.
+   *
+   * Values cross this socket as V8 serialization blobs, so both V8s must agree
+   * on the serialization format version. Each side sends a probe (a serialized
+   * `null`, whose second byte is the writer's format version) in the handshake
+   * and the mismatch is fatal here — at `createSandbox()` time, once per
+   * connection — rather than corrupting a value mid-run. The runtime answers
+   * with exactly one `Hello` frame; anything else tears the connection down.
+   * @param options
+   */
   static async connect(options: RuntimeIpcClientOptions): Promise<RuntimeIpcClient> {
     const socket = await connectSocket(options.socketPath)
     const client = new RuntimeIpcClient(socket)
 
-    await client.write(
-      encodeTsToRustFrame(
-        TsToRustMessageTypes.Authenticate,
-        encodeAuthenticatePayload({
-          protocolVersion: PROTOCOL_VERSION,
-          token: options.token,
-        }),
-      ),
-    )
+    try {
+      await client.write(
+        encodeTsToRustFrame(
+          TsToRustMessageTypes.Authenticate,
+          encodeAuthenticatePayload({
+            protocolVersion: PROTOCOL_VERSION,
+            probe: serializationProbe(),
+            token: options.token,
+          }),
+        ),
+      )
+      await client.awaitHello()
+    } catch (error) {
+      await client.dispose()
+      throw error
+    }
 
     return client
+  }
+
+  /**
+   * Read and validate the runtime's `Hello` frame.
+   *
+   * Three ways this fails, all fatal and all reported with the same actionable
+   * remedy — the host package and the native binary are released in lockstep
+   * (`docs/protocol.md` §8), so a mismatch means they are out of sync:
+   * the runtime reports a bad status, the frame never arrives, or the
+   * runtime's own probe cannot be read by this Node.
+   */
+  private async awaitHello(): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const frame = await Promise.race([
+      this.reader.readRustToTsFrame(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new HandshakeError(
+            `V8 runtime did not answer the handshake within ${HELLO_TIMEOUT_MS}ms`,
+          ))
+        }, HELLO_TIMEOUT_MS)
+        timer.unref?.()
+      }),
+    ]).finally(() => {
+      if (timer !== undefined)
+        clearTimeout(timer)
+    })
+
+    if (frame.messageType !== RustToTsMessageTypes.Hello) {
+      throw new HandshakeError(
+        `expected a Hello frame from the V8 runtime, got message type 0x${
+          frame.messageType.toString(16).padStart(2, '0')
+        }`,
+      )
+    }
+
+    const hello = decodeHelloPayload(frame.payload)
+    if (hello.status !== HelloStatus.Ok) {
+      throw new HandshakeError(
+        hello.message.length > 0
+          ? hello.message
+          : `V8 runtime rejected the handshake (status ${hello.status})`,
+      )
+    }
+
+    // Prove empirically — not just from the version byte — that this Node can
+    // read what the runtime writes.
+    try {
+      if (deserializeValue(hello.probe) !== null)
+        throw new Error('probe did not decode to null')
+    } catch (error) {
+      throw new HandshakeError(
+        `V8 serialization format mismatch: this Node cannot read values written by the `
+        + `iso4-v8 binary (${error instanceof Error ? error.message : String(error)}). `
+        + `Update @iso4/sandbox and @iso4/v8-* together — they are released in lockstep.`,
+      )
+    }
   }
 
   private nextRunId = 0
@@ -436,12 +536,13 @@ export class RuntimeIpcClient {
               args: call.args,
             }).then(
               (value) => {
-                // encodeWireValue throws for unrepresentable types (function,
-                // symbol, Date, etc.). Catch and send an error response so the
-                // sandbox receives ERR_HOST_BRIDGE rather than hanging.
+                // serializeValue throws for the handful of types V8 refuses to
+                // clone (function, symbol, promise, WeakMap, proxy). Catch and
+                // send an error response so the sandbox receives
+                // ERR_HOST_BRIDGE rather than hanging.
                 let encoded: Uint8Array
                 try {
-                  encoded = encodeWireValue(value)
+                  encoded = serializeValue(value)
                 } catch (e) {
                   return this.write(
                     encodeTsToRustFrame(

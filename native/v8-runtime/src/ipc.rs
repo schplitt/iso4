@@ -25,13 +25,11 @@
 
 use std::io::{self, Read, Write};
 
-use crate::wire::{decode_wire_value, WireValue};
-
 /// Current wire protocol version.
 ///
 /// This must stay in sync with `docs/protocol.md` and the TypeScript codec in
 /// `packages/iso4-sandbox/src/ipc.ts`.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Default maximum frame length in bytes, including the 1-byte message type.
 pub const DEFAULT_MAX_FRAME_LENGTH: u32 = 64 * 1024 * 1024;
@@ -74,6 +72,21 @@ pub enum RustToTsMessageType {
     PrecompileResult = 0x03,
     /// Internal runtime diagnostic log (not sandbox stdout/stderr).
     Log = 0x04,
+    /// Handshake acknowledgement — the first frame sent on a new connection,
+    /// answering `Authenticate` (protocol v2).
+    Hello = 0x05,
+}
+
+/// Handshake status reported on a `Hello` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HelloStatus {
+    /// Handshake accepted; the connection is live.
+    Ok = 0,
+    /// The host speaks a different `PROTOCOL_VERSION`.
+    ProtocolVersionMismatch = 1,
+    /// The host writes a V8 serialization format this binary cannot read.
+    V8FormatMismatch = 2,
 }
 
 /// A raw wire frame after the outer envelope has been decoded.
@@ -102,12 +115,17 @@ pub type RustToTsFrame = TypedFrame<RustToTsMessageType>;
 
 /// Parsed contents of an `Authenticate` payload.
 ///
-/// Payload layout:
-/// - first 2 bytes: protocol version (`u16`, big-endian)
+/// Payload layout (protocol v2):
+/// - `u16` protocol version (big-endian)
+/// - `u32` probe length + probe bytes
 /// - remaining bytes: UTF-8 token
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatePayload {
     pub protocol_version: u16,
+    /// The host's V8 serialization probe — a serialized `null` whose second
+    /// byte is the format version Node writes. Compared against this binary's
+    /// own write version during the handshake.
+    pub probe: Vec<u8>,
     pub token: String,
 }
 
@@ -226,32 +244,58 @@ pub fn write_rust_to_ts_frame(
     write_frame(writer, message_type as u8, payload)
 }
 
-/// Parse the payload bytes of an `Authenticate` frame.
+/// Parse the payload bytes of an `Authenticate` frame per
+/// `docs/protocol.md` §5.1.
 pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayload> {
-    if payload.len() < 2 {
+    if payload.len() < 6 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "payload too short for Authenticate",
         ));
     }
     let protocol_version = u16::from_be_bytes([payload[0], payload[1]]);
-    let token_bytes = &payload[2..];
-    let token = String::from_utf8(token_bytes.to_vec())
+    let probe_len = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
+    let token_start = 6usize
+        .checked_add(probe_len)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Authenticate payload truncated (probe)",
+            )
+        })?;
+    let probe = payload[6..token_start].to_vec();
+    let token = String::from_utf8(payload[token_start..].to_vec())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "token is not valid UTF-8"))?;
     Ok(AuthenticatePayload {
         protocol_version,
+        probe,
         token,
     })
 }
 
-/// Encode an `Authenticate` payload from structured fields.
-///
-/// This is optional for the first Rust milestone, but useful for tests and for
-/// understanding the inverse of `parse_authenticate_payload`.
+/// Encode an `Authenticate` payload from structured fields — the inverse of
+/// `parse_authenticate_payload`, used by tests.
 pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(2 + auth.token.len());
+    let mut payload = Vec::with_capacity(6 + auth.probe.len() + auth.token.len());
     payload.extend_from_slice(&auth.protocol_version.to_be_bytes());
+    payload.extend_from_slice(&(auth.probe.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&auth.probe);
     payload.extend_from_slice(auth.token.as_bytes());
+    payload
+}
+
+/// Encode a `Hello` payload — the handshake acknowledgement.
+///
+/// Layout: `u8 status`, `u32 probeLength + probe bytes`, `String message`
+/// (empty when `status = Ok`). See `docs/protocol.md` §5.1.
+pub fn encode_hello_payload(status: HelloStatus, probe: &[u8], message: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(1 + 4 + probe.len() + 4 + message.len());
+    payload.push(status as u8);
+    payload.extend_from_slice(&(probe.len() as u32).to_be_bytes());
+    payload.extend_from_slice(probe);
+    payload.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    payload.extend_from_slice(message.as_bytes());
     payload
 }
 
@@ -320,8 +364,8 @@ pub enum HostGlobalDef {
     /// A JS expression the runtime evaluates as its own script and sets on
     /// `globalThis[name]`.
     StringExpr { name: String, expr: String },
-    /// A constant carried as a `WireValue`, materialised natively.
-    Data { name: String, value: WireValue },
+    /// A constant carried as a V8 serialization blob, materialised natively.
+    Data { name: String, blob: Vec<u8> },
     /// A bridge handler (installed as a stub under `handler_name`) plus a shim
     /// expression the runtime wraps and sets on `globalThis[name]`.
     Shim {
@@ -364,8 +408,9 @@ pub enum HostModuleNode {
     /// order over the declared bindings) and installs an async trampoline
     /// that dispatches through the reserved `__iso4_call` bridge stub.
     Function,
-    /// A constant data leaf, materialised natively via `wire_to_v8_value`.
-    Data(WireValue),
+    /// A constant data leaf carried as a V8 serialization blob, materialised
+    /// natively via `blob::deserialize_value`.
+    Data(Vec<u8>),
     /// A nested object of named children (may mix functions and data).
     Object(Vec<(String, HostModuleNode)>),
 }
@@ -534,9 +579,12 @@ impl<'a> PayloadReader<'a> {
         })
     }
 
-    /// Decode a single `WireValue` at the current cursor, advancing past it.
-    fn read_wire_value(&mut self) -> io::Result<WireValue> {
-        decode_wire_value(self.data, &mut self.offset)
+    /// Read a value slot: `u32 byteLength` + V8 serialization blob. The bytes
+    /// are carried as-is; materialising them needs an isolate, which this
+    /// layer deliberately does not have (see `blob::deserialize_value`).
+    fn read_value_blob(&mut self) -> io::Result<Vec<u8>> {
+        let len = self.read_u32()? as usize;
+        self.read_bytes(len)
     }
 
     /// Read the `List<GlobalDef>` block: a `u32` count followed by one tagged
@@ -556,7 +604,7 @@ impl<'a> PayloadReader<'a> {
                 },
                 2 => HostGlobalDef::Data {
                     name,
-                    value: self.read_wire_value()?,
+                    blob: self.read_value_blob()?,
                 },
                 3 => HostGlobalDef::Shim {
                     name,
@@ -577,11 +625,11 @@ impl<'a> PayloadReader<'a> {
 
     /// Read one host-module shape node. Tags mirror `writeHostModuleNode` in
     /// the TS codec (`ipc.ts`) and `docs/protocol.md` §5.2:
-    /// `0 = function`, `1 = data (WireValue)`, `2 = object`.
+    /// `0 = function`, `1 = data (value blob)`, `2 = object`.
     fn read_host_module_node(&mut self) -> io::Result<HostModuleNode> {
         match self.read_u8()? {
             0 => Ok(HostModuleNode::Function),
-            1 => Ok(HostModuleNode::Data(self.read_wire_value()?)),
+            1 => Ok(HostModuleNode::Data(self.read_value_blob()?)),
             2 => {
                 let count = self.read_u32()? as usize;
                 let mut entries = Vec::with_capacity(count);
@@ -795,6 +843,7 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
         0x02 => Ok(RustToTsMessageType::Result),
         0x03 => Ok(RustToTsMessageType::PrecompileResult),
         0x04 => Ok(RustToTsMessageType::Log),
+        0x05 => Ok(RustToTsMessageType::Hello),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown Rust->TS message type: {byte:#04x}"),
@@ -823,9 +872,10 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_payload_roundtrip_preserves_version_and_token() {
+    fn authenticate_payload_roundtrip_preserves_version_probe_and_token() {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
+            probe: vec![0xff, 0x0f, 0x30],
             token: "secret-token".to_string(),
         };
 
@@ -833,6 +883,39 @@ mod tests {
         let parsed = parse_authenticate_payload(&payload).unwrap();
 
         assert_eq!(parsed, auth);
+    }
+
+    #[test]
+    fn authenticate_payload_rejects_truncated_probe() {
+        // protocolVersion + a probe length that runs past the payload end.
+        let mut v = Vec::new();
+        v.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        push_u32(&mut v, 99);
+        v.extend_from_slice(&[0xff, 0x0f]);
+
+        let err = parse_authenticate_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "Authenticate payload truncated (probe)");
+    }
+
+    #[test]
+    fn hello_payload_encodes_status_probe_and_message() {
+        let payload =
+            encode_hello_payload(HelloStatus::V8FormatMismatch, &[0xff, 0x0f, 0x30], "no");
+        assert_eq!(payload[0], HelloStatus::V8FormatMismatch as u8);
+        assert_eq!(&payload[1..5], &3u32.to_be_bytes());
+        assert_eq!(&payload[5..8], &[0xff, 0x0f, 0x30]);
+        assert_eq!(&payload[8..12], &2u32.to_be_bytes());
+        assert_eq!(&payload[12..], b"no");
+    }
+
+    #[test]
+    fn hello_byte_matches_protocol_spec() {
+        assert_eq!(RustToTsMessageType::Hello as u8, 0x05);
+        assert_eq!(
+            parse_rust_to_ts_message_type(0x05).unwrap(),
+            RustToTsMessageType::Hello
+        );
     }
 
     #[test]
@@ -853,7 +936,9 @@ mod tests {
 
     #[test]
     fn parse_authenticate_payload_rejects_invalid_utf8_token() {
-        let err = parse_authenticate_payload(&[0x00, 0x01, 0xff]).unwrap_err();
+        // version(2) + probeLen(0) + a token byte that is not valid UTF-8.
+        let err =
+            parse_authenticate_payload(&[0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xff]).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "token is not valid UTF-8");
@@ -1127,10 +1212,12 @@ mod tests {
         v.push(1);
         push_string(&mut v, "PI");
         push_string(&mut v, "3.14159");
-        // data: a WireValue::Bool(true) → tag 0x03 (TAG_TRUE), no body
+        // data: a value slot — u32 length + V8 serialization blob. The parser
+        // carries the bytes verbatim (materialising them needs an isolate).
         v.push(2);
         push_string(&mut v, "flag");
-        v.push(0x03);
+        push_u32(&mut v, 3);
+        v.extend_from_slice(&[0xff, 0x0f, 0x54]);
         // shim
         v.push(3);
         push_string(&mut v, "wrapped");
@@ -1145,7 +1232,7 @@ mod tests {
             matches!(&p.globals[1], HostGlobalDef::StringExpr { name, expr } if name == "PI" && expr == "3.14159")
         );
         assert!(
-            matches!(&p.globals[2], HostGlobalDef::Data { name, value } if name == "flag" && *value == WireValue::Bool(true))
+            matches!(&p.globals[2], HostGlobalDef::Data { name, blob } if name == "flag" && blob == &[0xff, 0x0f, 0x54])
         );
         assert!(matches!(
             &p.globals[3],
@@ -1226,10 +1313,11 @@ mod tests {
                              // "query": function leaf
         push_string(&mut v, "query");
         v.push(0);
-        // "config": data leaf — WireValue::Bool(true) is tag 0x03, no body
+        // "config": data leaf — u32 length + V8 serialization blob.
         push_string(&mut v, "config");
         v.push(1);
-        v.push(0x03);
+        push_u32(&mut v, 3);
+        v.extend_from_slice(&[0xff, 0x0f, 0x54]);
         // "nested": object with one function leaf "inner"
         push_string(&mut v, "nested");
         v.push(2);
@@ -1247,10 +1335,7 @@ mod tests {
         assert_eq!(exports[0].0, "query");
         assert!(matches!(exports[0].1, HostModuleNode::Function));
         assert_eq!(exports[1].0, "config");
-        assert!(matches!(
-            &exports[1].1,
-            HostModuleNode::Data(WireValue::Bool(true))
-        ));
+        assert!(matches!(&exports[1].1, HostModuleNode::Data(blob) if blob == &[0xff, 0x0f, 0x54]));
         assert_eq!(exports[2].0, "nested");
         let HostModuleNode::Object(entries) = &exports[2].1 else {
             panic!("expected object node");

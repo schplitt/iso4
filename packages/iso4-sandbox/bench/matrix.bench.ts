@@ -3,10 +3,10 @@
  * throughput. See `bench/payloads.ts` for why these four shapes.
  *
  * per-run round trip — one full `runtime.run()` per iteration. The payload
- * enters the sandbox as a data global (host `encodeWireValue` → socket →
- * Rust `wire_to_v8_value`) and returns as the default export (Rust
- * `value_to_wire` → socket → host `decodeWireValue`), so each iteration
- * measures both codec directions plus the fixed per-run tax.
+ * enters the sandbox as a data global (host `serializeValue` → socket →
+ * Rust `blob::deserialize_value`) and returns as the default export (Rust
+ * `blob::serialize_value` → socket → host `deserializeValue`), so each
+ * iteration measures both codec directions plus the fixed per-run tax.
  *
  * loop-mode — one long-lived run performs N bridge round trips: the sandbox
  * calls `next(prevResult)` in a loop and the host hands back the event.

@@ -2,8 +2,18 @@
 
 Communication between the TypeScript host (`@iso4/sandbox`) and the Rust V8
 binary (`iso4-v8`) happens over a Unix domain socket using length-prefixed
-binary frames. The frame envelope is small and stable; structured message
-payloads use the iso4 binary `WireValue` codec defined below.
+binary frames. The frame envelope is small and stable; **every JavaScript
+value** inside a payload travels as a V8 serialization blob (§4).
+
+Two planes, deliberately separated:
+
+- **Control plane** — callIds, export names, specifiers, prefix ids, limits,
+  error codes/names/messages. Plain integers and length-prefixed strings, so
+  either side can read a frame's routing without touching V8.
+- **Data plane** — every JS value. One `ValueBlob` slot per crossing, produced
+  by V8's own serializer on the writing side and read by V8's own
+  deserializer on the other. No hand-written value codec sits between the two
+  V8s.
 
 The direction a frame travels is known from context, so message type bytes are
 scoped per direction. A `0x01` frame from TS means `Authenticate`; a `0x01`
@@ -37,7 +47,7 @@ Frame readers MUST reject:
 | EOF before all `length` bytes arrive           | connection error |
 | unknown message type for the current direction | protocol error   |
 
-Current protocol version: **`1`**.
+Current protocol version: **`2`**.
 
 ---
 
@@ -47,7 +57,7 @@ Current protocol version: **`1`**.
 
 |   Byte | Name             | Payload                 | Response                                                                                                                         |
 | -----: | ---------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `0x01` | `Authenticate`   | `AuthenticatePayload`   | no frame; Rust closes the socket on mismatch                                                                                     |
+| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a bad token Rust closes the socket without replying                                                      |
 | `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
 | `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                   |
 | `0x04` | `PrefixRun`      | `PrefixRunPayload`      | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
@@ -63,6 +73,7 @@ Current protocol version: **`1`**.
 | `0x02` | `Result`           | `RunCompletionPayload`    | Final completion for `Run` or `PrefixRun`; sent exactly once. Includes captured stdout/stderr arrays. |
 | `0x03` | `PrecompileResult` | `PrecompileResultPayload` | Result of `Precompile`.                                                                               |
 | `0x04` | `Log`              | `DiagnosticLogPayload`    | Internal runtime diagnostic; not sandbox stdout/stderr.                                               |
+| `0x05` | `Hello`            | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.               |
 
 ---
 
@@ -82,140 +93,125 @@ All integers are big-endian.
 | `Bytes`       | `u32 byteLength` + raw bytes          |
 | `Optional<T>` | `u8 present`; if `1`, followed by `T` |
 | `List<T>`     | `u32 length` + repeated `T`           |
+| `ValueBlob`   | `u32 byteLength` + V8 blob (§4)       |
 
 Strings MUST be valid UTF-8. Decoders MUST reject invalid booleans and invalid
 optional presence bytes.
 
 ---
 
-## 4. WireValue codec
+## 4. Value encoding
 
-`WireValue` is the data-only value format used for exports, bridge arguments,
-and bridge return values. It is intentionally independent of V8’s internal
-serializer so the TypeScript host can decode it without native APIs.
+Every JavaScript value that crosses the boundary — exports, data globals,
+host-module data leaves, bridge arguments, bridge return values, error
+`fields` — is a **V8 serialization blob**: the byte format produced by V8's
+`ValueSerializer` and consumed by V8's `ValueDeserializer`.
 
-### 4.1 Value tags
+The slot is always the same shape, in both directions:
 
-|    Tag | Name        | Payload             | Decodes to Ts |
-| -----: | ----------- | ------------------- | ------------- |
-| `0x00` | `Undefined` | none                | `undefined`   |
-| `0x01` | `Null`      | none                | `null`        |
-| `0x02` | `False`     | none                | `false`       |
-| `0x03` | `True`      | none                | `true`        |
-| `0x04` | `Number`    | `f64`               | `number`      |
-| `0x05` | `String`    | `String`            | `string`      |
-| `0x06` | `BigInt`    | see below           | `bigint`      |
-| `0x07` | `Bytes`     | `Bytes`             | `Uint8Array`  |
-| `0x08` | `Array`     | `List<WireValue>`   | `unknown[]`   |
-| `0x09` | `Object`    | `List<ObjectField>` | plain object  |
+```txt
+┌──────────────────────┬────────────────────────────┐
+│  byteLength (u32 BE) │  V8 serialization blob     │
+└──────────────────────┴────────────────────────────┘
+```
 
-`BigInt` payload:
+There is **no tag byte**: there is exactly one value codec, so nothing needs
+discriminating. Where a slot is optional it keeps the usual `Optional<T>`
+presence byte in front (`u8 present`, then the slot).
 
-| Field        | Encoding                                  | Notes                                                                         |
-| ------------ | ----------------------------------------- | ----------------------------------------------------------------------------- |
-| `sign_bit`   | `u8` (`0` = non-negative, `1` = negative) | Always `0` for zero.                                                          |
-| `word_count` | `u32`                                     | Number of 64-bit words that follow. `0` for zero.                             |
-| `words`      | `word_count × u64` (big-endian each)      | Least-significant word first (index 0 = bits 0–63, index 1 = bits 64–127, …). |
+| Direction | Slot                      | Frame                          | Blob Content                        |
+| --------- | ------------------------- | ------------------------------ | ----------------------------------- |
+| TS → Rust | data-global value         | `Run`/`Precompile`/`PrefixRun` | the value                           |
+| TS → Rust | host-module data leaf     | `Run`/`Precompile`             | the value                           |
+| TS → Rust | bridge resolve value      | `BridgeResponse` (ok = 1)      | the value                           |
+| TS → Rust | bridge error `fields`     | `BridgeResponse` (ok = 0)      | the fields object                   |
+| Rust → TS | bridge call `args`        | `BridgeCall`                   | **one blob = the whole args array** |
+| Rust → TS | module exports            | `Result` (ok = 1)              | **one blob = one `{name: value}`**  |
+| Rust → TS | run error `fields`        | `Result` (ok = 0)              | the fields object                   |
+| Rust → TS | precompile error `fields` | `PrecompileResult`             | the fields object                   |
 
-This encoding maps directly to V8's `BigInt::new_from_words` / `to_words_array` API — no base conversion is needed on either side of the bridge. The TypeScript side uses native `bigint` bit-shift arithmetic to pack/unpack words.
+One blob per crossing, never one blob per value: serializing N values together
+is measurably faster than N blobs, produces the same total bytes, and
+preserves identity between values that reference the same object.
 
-`ObjectField`:
+### 4.1 Implementation requirements
 
-| Field   | Encoding    |
-| ------- | ----------- |
-| `key`   | `String`    |
-| `value` | `WireValue` |
+Both sides must set these up exactly; each detail is load-bearing.
 
-### 4.2 Value extraction rules
+**TypeScript host** (`src/v8-codec.ts`):
 
-Rust MUST reject the following when extracting sandbox values:
+- Out: `new v8.DefaultSerializer()`, then
+  `_setTreatArrayBufferViewsAsHostObjects(false)` — **mandatory**. Node's
+  default `v8.serialize()` writes typed arrays with a Node-private
+  host-object tag that a plain (non-Node) V8 rejects at read time. Then
+  `writeHeader()`, `writeValue()`, `releaseBuffer()`.
+- In: `v8.deserialize()` (handles byteOffset views correctly).
 
-| Js Value                  | Error                                                                                        |
-| ------------------------- | -------------------------------------------------------------------------------------------- |
-| function                  | `ERR_EXPORT_NOT_SERIALIZABLE` or `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` depending on boundary |
-| unresolved Promise        | `ERR_EXPORT_UNRESOLVED_PROMISE` for exports                                                  |
-| Symbol                    | `ERR_EXPORT_NOT_SERIALIZABLE`                                                                |
-| cyclic object/array graph | `ERR_EXPORT_NOT_SERIALIZABLE`                                                                |
+**Rust runtime** (`src/blob.rs`):
 
-Objects are serialized as own enumerable string-keyed properties only. Prototype
-methods and non-enumerable properties are not serialized.
+- Out: `v8::ValueSerializer` with `write_header()` **before** `write_value()`.
+- In: `v8::ValueDeserializer` with `read_header()` **before** `read_value()`.
+  Skipping `read_header` does not fail cleanly — the format-version byte is
+  then read as a value tag and every payload dies with a misleading
+  host-object error.
+- Neither delegate claims host objects, so the bytes stay plain-V8 readable.
 
-The key `"__proto__"` is **silently elided in both directions**:
+### 4.2 What crosses
 
-- **Sandbox → host** (`serialize_object_fields` in `v8.rs`): dropped before the
-  `BridgeCall` or export payload is encoded.
-- **Host → sandbox** (`wire_to_v8_value` in `v8.rs`): dropped before the value
-  is injected into the V8 object.
+The boundary carries **data, not behavior**. What V8's format can represent,
+arrives as a real instance:
 
-The TS WireValue encoder (`encodeWireValue`) and decoder (`decodeWireValue`)
-apply the same guard for defence-in-depth.
+| Value                                             | Result                                        |
+| ------------------------------------------------- | --------------------------------------------- |
+| `undefined`, `null`, boolean, number, string      | as-is                                         |
+| `bigint`                                          | as-is, arbitrary precision                    |
+| `Date`, `Map`, `Set`, `RegExp`                    | real instance                                 |
+| `Error` (and subclasses)                          | real instance; `message` and `name` survive   |
+| `ArrayBuffer`, every `TypedArray`, `DataView`     | real instance, element type preserved         |
+| a `subarray` window                               | only the window's bytes                       |
+| plain objects and arrays, including sparse arrays | as-is                                         |
+| cyclic and shared references                      | back-references; object identity is preserved |
 
-A host returning `{ "__proto__": { polluted: true }, x: 1 }` delivers only
-`{ x: 1 }` to the sandbox. A sandbox exporting
-`Object.defineProperty({}, "__proto__", { value: 1, enumerable: true })`
-delivers only `{}` to the host. The key is not re-encoded under a mangled
-safe name — it is simply dropped.
+What cannot be represented is rejected **loudly**, in both directions:
 
-### 4.3 Encoding examples
+| Value                                       | Error                                                                                        |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| function                                    | `ERR_EXPORT_NOT_SERIALIZABLE` or `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` depending on boundary |
+| unresolved `Promise`                        | `ERR_EXPORT_NOT_SERIALIZABLE`                                                                |
+| `Symbol`                                    | `ERR_EXPORT_NOT_SERIALIZABLE`                                                                |
+| `WeakMap` / `WeakSet` / `Proxy`             | `ERR_EXPORT_NOT_SERIALIZABLE`                                                                |
+| any of the above returned by a host handler | `ERR_HOST_BRIDGE`                                                                            |
 
-#### Example: nested object and array export
+A run whose exports contain a function or an unresolved promise reports the
+offending export by name (`export "handler" is a function`); anything V8
+refuses deeper in the graph reports V8's own data-clone message.
 
-Sandbox code:
+**Class instances flatten silently.** `new Tenant()` arrives as
+`{ id: "t1" }` — its own enumerable properties, no prototype, no methods.
+This is an accepted trade-off, not an oversight: Node's serializer exposes no
+hook to reject class instances (workerd's `treatClassInstancesAsPlainObjects
+= false` is a V8 patch that is not available here). Copy what you mean to
+send into a plain object. Custom classes that must survive intact need a
+per-type serializer, which is roadmap work, not a flag.
+
+**`"__proto__"` as an own key passes through as a plain own key.** V8's
+serializer writes it as an own data property and the deserializer _defines_
+it (never `[[Set]]`s it), so the receiving object's prototype is untouched
+and no prototype pollution is possible:
 
 ```js
-export const someExport = { hello: ['some', 123] }
+// host handler returns:
+Object.defineProperty({ x: 1 }, '__proto__', { value: { polluted: true }, enumerable: true })
+// sandbox receives an object where:
+//   Object.hasOwn(v, '__proto__') === true
+//   Object.getPrototypeOf(v)      === Object.prototype
+//   ({}).polluted                 === undefined
 ```
 
-Public TypeScript result shape:
+Objects are serialized with their own enumerable string-keyed properties;
+prototype methods and non-enumerable properties are not carried.
 
-```ts
-const result = {
-  ok: true,
-  exports: {
-    someExport: {
-      hello: ['some', 123],
-    },
-  },
-  stdout: [],
-  stderr: [],
-  durationMs: 1,
-}
-```
-
-Wire representation of only the `exports` value:
-
-```txt
-WireValue::Object
-└─ field count: 1
-   └─ key: "someExport"
-      value: WireValue::Object
-      └─ field count: 1
-         └─ key: "hello"
-            value: WireValue::Array
-            └─ item count: 2
-               ├─ WireValue::String "some"
-               └─ WireValue::Number 123.0
-```
-
-Byte-level layout of that `exports` value:
-
-```txt
-09                                  # Object
-00 00 00 01                         # 1 field
-00 00 00 0a 73 6f 6d 65 45 78 70 6f 72 74
-                                    # key "someExport"
-09                                  # Object
-00 00 00 01                         # 1 field
-00 00 00 05 68 65 6c 6c 6f          # key "hello"
-08                                  # Array
-00 00 00 02                         # 2 items
-05                                  # String
-00 00 00 04 73 6f 6d 65             # "some"
-04                                  # Number
-40 5e c0 00 00 00 00 00             # f64 123.0
-```
-
-#### Example: default plus named exports
+### 4.3 Example
 
 Sandbox code:
 
@@ -224,44 +220,73 @@ export default { ok: true }
 export const count = 2
 ```
 
-The `exports` payload is a single flat object. `default` is not a separate
-field in the run result; it is just the property named `"default"`:
-
-```txt
-WireValue::Object
-└─ field count: 2
-   ├─ key: "default"
-   │  value: WireValue::Object
-   │  └─ key: "ok"
-   │     value: WireValue::True
-   └─ key: "count"
-      value: WireValue::Number 2.0
-```
-
-This decodes to:
+The `exports` slot is **one** blob holding a single flat object — `default`
+is not a separate field in the run result, it is just the property named
+`"default"`:
 
 ```ts
 const result = {
-  default: { ok: true },
-  count: 2,
+  ok: true,
+  exports: {
+    default: { ok: true },
+    count: 2,
+  },
+  stdout: [],
+  stderr: [],
+  durationMs: 1,
 }
 ```
+
+Byte-level, the frame slot is `u32 byteLength` followed by the blob, whose
+first two bytes are V8's header tag `0xFF` and the serialization **format
+version** (the value the handshake in §5.1 agrees on).
 
 ---
 
 ## 5. Message payload schemas
 
-### 5.1 Authentication
+### 5.1 Handshake
 
-`AuthenticatePayload`:
+`AuthenticatePayload` (TS → Rust, MUST be the first frame on every connection):
 
-| Field             | Encoding                                     |
-| ----------------- | -------------------------------------------- |
-| `protocolVersion` | `u16`                                        |
-| `token`           | UTF-8 bytes for the remainder of the payload |
+| Field             | Encoding                                     | Notes                                              |
+| ----------------- | -------------------------------------------- | -------------------------------------------------- |
+| `protocolVersion` | `u16`                                        | Must equal the runtime's `PROTOCOL_VERSION`.       |
+| `probe`           | `u32 byteLength` + bytes                     | A serialized `null` — see below.                   |
+| `token`           | UTF-8 bytes for the remainder of the payload | Must equal the token the runtime was started with. |
 
-Authentication MUST be the first frame on every connection. Rust closes the
-socket immediately on version or token mismatch.
+`HelloPayload` (Rust → TS, the first frame the runtime sends):
+
+| Field     | Encoding                 | Notes                                                                |
+| --------- | ------------------------ | -------------------------------------------------------------------- |
+| `status`  | `u8`                     | `0 = ok`, `1 = protocol version mismatch`, `2 = V8 format mismatch`. |
+| `probe`   | `u32 byteLength` + bytes | The runtime's own serialized `null`.                                 |
+| `message` | `String`                 | Actionable detail for a non-zero status; empty when `status = 0`.    |
+
+**Why the probe.** Values cross as V8 serialization blobs, so both V8s must
+agree on the serialization **format version**. V8 bumps that version over
+time and `ReadHeader` hard-rejects anything newer than the reader knows;
+neither Node nor rusty_v8 exposes a way to pin what they write. The probe is
+a serialized `null`: byte 0 is the header tag `0xFF` and byte 1 is the
+writer's format version.
+
+**The check is startup-only and hard-fails.** There is no per-frame
+negotiation and no fallback codec:
+
+1. The runtime computes its own probe once at process start, in a throwaway
+   isolate. At handshake time the check is a byte comparison — no isolate
+   plumbing reaches the session layer, and no per-connection V8 work happens.
+2. On a protocol-version or format-version mismatch the runtime sends a
+   `Hello` carrying the error status and an actionable message, then closes.
+   (On a **bad token** it closes silently — an unauthenticated peer learns
+   nothing.)
+3. The host awaits the `Hello`, and empirically `v8.deserialize`s the
+   runtime's probe rather than trusting the version byte alone. Any failure
+   rejects `createSandbox()` with a typed error naming the remedy: update
+   `@iso4/sandbox` and `@iso4/v8-*` together (§8).
+
+Cost: one small frame each way, once per connection at `createSandbox()`
+time. Never per run, never per value.
 
 ### 5.2 Run payloads
 
@@ -312,7 +337,7 @@ distinct from absent.
 | `memoryMb`           | `Optional<u32>` | `64`     | Zero = no limit.                                                                                                                                                 |
 | `cpuTimeMs`          | `Optional<u32>` | `5000`   | Zero = no limit.                                                                                                                                                 |
 | `wallTimeMs`         | `Optional<u32>` | `30000`  | Zero = no limit.                                                                                                                                                 |
-| `maxExportBytes`     | `Optional<u32>` | `16 MiB` | Max serialised byte length of the export `WireValue`. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                       |
+| `maxExportBytes`     | `Optional<u32>` | `16 MiB` | Max byte length of the exports value blob. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                                  |
 | `maxStdoutBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stdout lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
 | `maxStderrBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
 | `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
@@ -330,7 +355,7 @@ and a global's name reaches the sandbox global object through the V8 API
 | --------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `0x00`    | `bridge` | —                                 | Bridge stub under `name` (issues `BridgeCall` frames).                                                                             |
 | `0x01`    | `string` | `String expr`                     | Runtime evaluates `(expr)` as its own script; sets `globalThis[name]`.                                                             |
-| `0x02`    | `data`   | `WireValue value`                 | Materialised via the value codec; sets `globalThis[name]`.                                                                         |
+| `0x02`    | `data`   | `ValueBlob value`                 | Materialised via the value codec (§4); sets `globalThis[name]`.                                                                    |
 | `0x03`    | `shim`   | `String shim, String handlerName` | Installs a bridge stub under `handlerName` and a wrapper `async (...a) => shim(await globalThis[handlerName](...a))` under `name`. |
 
 Only `bridge` and `shim` install a bridge stub (and so require the session
@@ -344,8 +369,8 @@ per run.
 Both public import flavors cross the wire structurally — the client never
 generates sandbox source. A source module carries ESM text verbatim; a host
 module carries its **shape** as a tree of data. The runtime builds host
-modules natively (see DESIGN.md §4.3): data leaves are materialised with the
-value codec, function leaves become async trampolines produced by a fixed
+modules natively (see DESIGN.md §4.3): data leaves are materialised from their
+value blob, function leaves become async trampolines produced by a fixed
 factory with a runtime-assigned handle ID passed as a number, and the values
 reach the module through V8's `import.meta` callback — no value is ever
 printed into source text.
@@ -359,11 +384,11 @@ printed into source text.
 
 `HostModuleNode`:
 
-| Tag Byte | Kind       | Tail                                 | Meaning                                                                                                                    |
-| -------- | ---------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| `0x00`   | `function` | —                                    | Host function leaf; the runtime assigns handle IDs in tree-walk order over all declared bindings.                          |
-| `0x01`   | `data`     | `WireValue value`                    | Constant materialised via the value codec.                                                                                 |
-| `0x02`   | `object`   | `List<(String key, HostModuleNode)>` | Nested plain object; may mix functions and data. Keys are property keys (any string except `__proto__`, which is dropped). |
+| Tag Byte | Kind       | Tail                                 | Meaning                                                                                           |
+| -------- | ---------- | ------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `0x00`   | `function` | —                                    | Host function leaf; the runtime assigns handle IDs in tree-walk order over all declared bindings. |
+| `0x01`   | `data`     | `ValueBlob value`                    | Constant materialised via the value codec (§4).                                                   |
+| `0x02`   | `object`   | `List<(String key, HostModuleNode)>` | Nested plain object; may mix functions and data. Keys are plain property keys.                    |
 
 Handle IDs never cross the wire: the runtime derives them from the declared
 shape (depth-first over each binding, bindings in wire order) and resolves
@@ -402,7 +427,7 @@ the same enforcement point that guards undeclared globals.
 | `targetKind` | `u8`               | `0 = global`, `1 = import`.                                                  |
 | `specifier`  | `Optional<String>` | Import specifier when `targetKind = import`.                                 |
 | `exportName` | `String`           | Global/stub name for globals; the dot-joined function-leaf path for imports. |
-| `args`       | `List<WireValue>`  | Function arguments.                                                          |
+| `args`       | `ValueBlob`        | **One** blob holding the whole argument array (§4).                          |
 
 Host-module function leaves dispatch through the reserved `__iso4_call`
 bridge stub (installed by the runtime, never declared by the client) with
@@ -416,12 +441,12 @@ attempt is recorded as `blocked`.
 
 `BridgeResponsePayload`:
 
-| Field    | Encoding                    | Notes                                |
-| -------- | --------------------------- | ------------------------------------ |
-| `callId` | `u32`                       | Must match the pending `BridgeCall`. |
-| `ok`     | `bool`                      | Whether the host handler succeeded.  |
-| `value`  | `Optional<WireValue>`       | Present when `ok = true`.            |
-| `error`  | `Optional<RunErrorPayload>` | Present when `ok = false`.           |
+| Field    | Encoding                    | Notes                                           |
+| -------- | --------------------------- | ----------------------------------------------- |
+| `callId` | `u32`                       | Must match the pending `BridgeCall`.            |
+| `ok`     | `bool`                      | Whether the host handler succeeded.             |
+| `value`  | `Optional<ValueBlob>`       | Present when `ok = true`; absent → `undefined`. |
+| `error`  | `Optional<RunErrorPayload>` | Present when `ok = false`.                      |
 
 The `error` field uses the `RunErrorPayload` layout with `code` always
 `ERR_HOST_BRIDGE` and the `stack` slot always absent: the host stack never
@@ -462,10 +487,14 @@ When `memoryMb = 0` (unconstrained) the fallback is the global 64 MiB
 `DEFAULT_MAX_FRAME_LENGTH`. There is no separate per-response configuration
 field — to allow responses larger than 64 MiB, increase `memoryMb`.
 
-**`maxExportBytes` enforcement:** After all exports are serialised to a `WireValue`,
-Rust encodes the value to bytes and checks the length against `maxExportBytes`.
-If exceeded the run terminates with `ERR_EXPORT_TOO_LARGE` before the `Result`
-frame is written.
+**`maxExportBytes` enforcement:** Rust copies the module namespace into a
+plain object, serializes it once, and checks the resulting **blob** length
+against `maxExportBytes`. If exceeded the run terminates with
+`ERR_EXPORT_TOO_LARGE` before the `Result` frame is written. The limit is
+measured on the bytes that actually cross the socket, so it costs nothing
+extra; note a blob is roughly a third smaller than the codec it replaced at
+dense payloads, so an existing `maxExportBytes` is now slightly more
+permissive in terms of value count.
 
 **`maxStdoutBytes` / `maxStderrBytes` enforcement:** Rust tracks running byte
 totals in `LogBuffers`. Any console line whose addition would push the total
@@ -508,14 +537,14 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 
 `RunSuccessPayload`:
 
-| Field         | Encoding                 | Notes                                                       |
-| ------------- | ------------------------ | ----------------------------------------------------------- |
-| `exports`     | `WireValue::Object`      | Contains `default` plus named exports as direct properties. |
-| `stdout`      | `List<String>`           | Captured stdout log lines.                                  |
-| `stderr`      | `List<String>`           | Captured stderr log lines.                                  |
-| `durationMs`  | `f64`                    | Wall-clock runtime duration.                                |
-| `cpuTimeMs`   | `f64`                    | Active V8 execution time; bridge waits excluded.            |
-| `bridgeCalls` | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.       |
+| Field         | Encoding                 | Notes                                                                              |
+| ------------- | ------------------------ | ---------------------------------------------------------------------------------- |
+| `exports`     | `ValueBlob`              | One blob holding a flat object: `default` plus named exports as direct properties. |
+| `stdout`      | `List<String>`           | Captured stdout log lines.                                                         |
+| `stderr`      | `List<String>`           | Captured stderr log lines.                                                         |
+| `durationMs`  | `f64`                    | Wall-clock runtime duration.                                                       |
+| `cpuTimeMs`   | `f64`                    | Active V8 execution time; bridge waits excluded.                                   |
+| `bridgeCalls` | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.                              |
 
 `RunFailurePayload`:
 
@@ -535,20 +564,20 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 | `name`          | `String` | Public call name, resolved by the runtime: plain globals as-is (`fetch`), shims under their public name, host-module import leaves as `<specifier>.<path>`. |
 | `startMs`       | `f64`    | Offset from run start (same clock as `durationMs`).                                                                                                         |
 | `durationMs`    | `f64`    | Round-trip the sandbox waited; time-until-run-end for calls that never settled.                                                                             |
-| `argBytes`      | `u32`    | Serialized call payload size — what `maxBridgeCallBytes` is enforced against.                                                                               |
-| `responseBytes` | `u32`    | Serialized response value size; `0` on handler error or unsettled.                                                                                          |
+| `argBytes`      | `u32`    | Serialized call payload size in bytes (envelope + args blob) — what `maxBridgeCallBytes` is enforced against.                                               |
+| `responseBytes` | `u32`    | Serialized response value size in bytes (the blob); `0` on handler error or unsettled.                                                                      |
 | `ok`            | `bool`   | Handler resolved and the response reached the sandbox.                                                                                                      |
 | `blocked`       | `bool`   | Blocked runtime-side (limit, oversized payload, function argument, invalid import handle); never sent.                                                      |
 
 `RunErrorPayload`:
 
-| Field     | Encoding              | Notes                                                 |
-| --------- | --------------------- | ----------------------------------------------------- |
-| `code`    | `String`              |                                                       |
-| `name`    | `String`              |                                                       |
-| `message` | `String`              |                                                       |
-| `stack`   | `Optional<String>`    | Always absent host → sandbox (BridgeResponse).        |
-| `fields`  | `Optional<WireValue>` | Own-enumerable props beyond `name`/`message`/`stack`. |
+| Field     | Encoding              | Notes                                                                |
+| --------- | --------------------- | -------------------------------------------------------------------- |
+| `code`    | `String`              |                                                                      |
+| `name`    | `String`              |                                                                      |
+| `message` | `String`              |                                                                      |
+| `stack`   | `Optional<String>`    | Always absent host → sandbox (BridgeResponse).                       |
+| `fields`  | `Optional<ValueBlob>` | Own-enumerable props beyond `name`/`message`/`stack`, as one object. |
 
 `PrecompileResultPayload`:
 
@@ -569,7 +598,8 @@ from multiple connections, not message-level multiplexing.
 ```txt
 TS (one connection slot)              Rust (one isolate thread)
 │                                       │
-│──── Authenticate ────────────────────▶│  version + token check
+│──── Authenticate ────────────────────▶│  version + V8 format + token check
+│◀─── Hello ────────────────────────────│  handshake accepted (or refused)
 │                                       │
 │──── Run / PrefixRun ─────────────────▶│  create or restore isolate
 │                                       │
@@ -599,7 +629,7 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                            |
 | `ERR_COMPILE`                         | Syntax/module compile error.                                                |
 | `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                       |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export contains unsupported value or cycle.                                 |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.        |
 | `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                             |
 | `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                          |
 | `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.     |
@@ -613,10 +643,20 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 
 ## 8. Versioning
 
-The `Authenticate` frame carries the `u16` protocol version. Rust closes the
-socket immediately on mismatch because the connection is untrusted before auth
-succeeds.
+Two independent versions are checked at handshake time (§5.1), both fatal:
 
-Bump the protocol version whenever the frame envelope, message tables, or
-payload codecs change incompatibly. `@iso4/sandbox` and every `@iso4/v8-*`
-package must be released together on an incompatible protocol change.
+1. **The iso4 protocol version** — the `u16` in the `Authenticate` frame.
+   Bump it whenever the frame envelope, message tables, or payload layouts
+   change incompatibly.
+2. **The V8 serialization format version** — carried in each side's probe.
+   Not ours to bump: V8 changes it, and neither Node nor rusty_v8 lets an
+   embedder pin what it writes. The runtime accepts a host that writes a
+   format it can read (`hostVersion <= runtimeWriteVersion`), and the host
+   proves the reverse direction by deserializing the runtime's probe.
+
+`@iso4/sandbox` and every `@iso4/v8-*` package must be released together on
+an incompatible protocol change — and, because the V8 format version rides
+along with whichever V8 each side embeds, on any V8 bump too. That lockstep
+release policy is what makes the hard-fail handshake acceptable: a mismatch
+means the two halves were installed out of sync, which the error message says
+outright.

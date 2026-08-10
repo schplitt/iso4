@@ -264,7 +264,9 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 
 - **Only data crosses the sandbox boundary.** Functions never cross by
   value. V8 `ValueSerializer` enforces this naturally on exports; the
-  bridge enforces it explicitly on host import calls.
+  bridge enforces it explicitly on host import calls. Note that "data" is
+  everything V8's format carries — `Date`, `Map`, `Set`, `RegExp`, `Error`,
+  typed arrays, cycles — not just JSON-shaped values.
 - **User code is always ESM.** Results come back via `export default` /
   named `export`s, never via globals or `console`.
 - **Globals are runtime-curated.** The host can only contribute names
@@ -321,10 +323,8 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   crossing the sandbox boundary. The wire envelope (4-byte length + 1-byte
   type) is already minimal; don't wrap it in a schema library.
 - Do not use `num-bigint` (or any other arbitrary-precision crate) for BigInt
-  wire encoding. The `WireValue::BigInt(bool, Vec<u64>)` representation uses
-  V8's native word format directly (`new_from_words` / `to_words_array`); no
-  base conversion is needed. The TS side uses native `bigint` bitshift arithmetic.
-  Adding a crate for this is net overhead with zero benefit.
+  handling. V8's serialization format carries BigInts natively in both
+  directions, so no base conversion — and no crate — is needed anywhere.
 - Do not add an in-process (NAPI) backend to `@iso4/sandbox`. It belongs
   to the future analytics product (DESIGN.md §9.1), not as a
   `SandboxOptions.backend` flag. rusty_v8 cannot be used in-process with
