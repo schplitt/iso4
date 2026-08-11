@@ -62,10 +62,15 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 
+      # Node 24, not 26: @codspeed/core's prebuilt measurement addon links
+      # v8::String::Utf8Length(Isolate*), which Node 26's V8 removed — the
+      # vitest workers die with a symbol lookup error there. Node 24 (>= the
+      # repo's engines floor) still exports it. Revisit when codspeed-node
+      # ships Node-26-compatible prebuilds.
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 26
+          node-version: 24
 
       # The codec benches import src/v8-codec.ts directly — no native binary
       # or package build needed for this suite.
