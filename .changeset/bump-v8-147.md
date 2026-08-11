@@ -45,3 +45,19 @@ Also in this bump: V8 dropped `ArrayBuffer::Allocator::Reallocate`, so the
 memory-budget allocator no longer has a `reallocate` hook. Resizes run through
 `allocate` + `free`, so the budget still sees every byte, and sees the new size
 before the old one is released.
+
+**The host-type shells now zero their internal field.** `Headers`, `Request` and
+`Response` extend a native shell that declares one internal field purely so V8
+routes the object to `WriteHostObject`; the field carried no data and was never
+written. That is no longer safe. `rusty_v8` documents
+`get_aligned_pointer_from_internal_field` as undefined behaviour unless
+`SetAlignedPointerInInternalField` wrote the field first, and since V8 14.7 the
+read decodes through the *tagged* external-pointer table instead of loading a
+raw word. V8's snapshot callback does exactly that read, so an unwritten field
+handed V8 a garbage pointer and `CreateBlob` died with SIGBUS in
+`ReadOnlyPromotion::Promote` whenever a prefix snapshot contained a live
+instance. On V8 13.0 the same read happened to yield null, which is why the
+never-write design worked there. The shells now write a null aligned pointer at
+construction — the same write the crate performs when restoring an empty
+payload. The field still carries no data; the type tag still comes from an
+`instanceof` check.

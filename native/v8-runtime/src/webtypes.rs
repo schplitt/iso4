@@ -69,30 +69,64 @@ pub const INTERNAL_FIELD_COUNT: usize = 1;
 
 // ── Native shells ────────────────────────────────────────────────────────────
 
-/// The shells take no constructor action at all.
+/// V8's `kEmbedderDataTypeTagDefault` (`v8-object.h`), which the crate does not
+/// re-export. It is the tag `binding.cc` uses on both sides of the snapshot
+/// callback, so it is the tag the field must be written with.
+const EMBEDDER_DATA_TYPE_TAG_DEFAULT: u16 = 0;
+
+/// Zero the shell instance's internal field.
+///
+/// The field's *value* is still never used — the type tag comes from an
+/// `instanceof` check in `write_host_object`. But the slot must be a real
+/// external-pointer slot before V8's snapshot callback reads it. `rusty_v8`
+/// documents `get_aligned_pointer_from_internal_field` as undefined behaviour
+/// unless `SetAlignedPointerInInternalField` wrote the field first, and since
+/// V8 14.7 that read decodes through the *tagged* external-pointer table rather
+/// than loading a raw word.
+///
+/// Leaving the field at its default `undefined` therefore made
+/// `SerializeInternalFields` hand V8 a garbage pointer, and `CreateBlob` died
+/// with SIGBUS in `ReadOnlyPromotion::Promote` whenever a prefix snapshot
+/// contained a live instance. On V8 13.0 the same untagged read happened to
+/// yield null, which is why the never-write design worked there.
+///
+/// This is the identical write the crate's own `DeserializeInternalFields`
+/// performs when it restores an empty payload (`binding.cc`).
+fn zero_internal_field(args: &v8::FunctionCallbackArguments) {
+    args.this().set_aligned_pointer_in_internal_field(
+        0,
+        std::ptr::null(),
+        EMBEDDER_DATA_TYPE_TAG_DEFAULT,
+    );
+}
+
+/// The shells do nothing beyond making their internal field readable.
 ///
 /// They exist so that `super()` produces an object built from an instance
 /// template with one internal field — which is what V8 dispatches on. See the
-/// module docs on why the field stays empty.
+/// module docs on why the field carries no data.
 fn headers_shell_ctor(
     _scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
+    args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+    zero_internal_field(&args);
 }
 
 fn request_shell_ctor(
     _scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
+    args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+    zero_internal_field(&args);
 }
 
 fn response_shell_ctor(
     _scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
+    args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+    zero_internal_field(&args);
 }
 
 /// The external-reference table for every native callback that can end up in a
