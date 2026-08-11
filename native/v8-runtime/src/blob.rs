@@ -62,7 +62,7 @@ pub fn take_codec_error() -> Option<CodecError> {
 /// reports **success** having written a truncated payload. Found by the
 /// oversized-headers test, which passed serialization when it should have
 /// failed.
-fn record(scope: &mut v8::HandleScope, error: CodecError) {
+fn record(scope: &mut v8::PinScope, error: CodecError) {
     let message =
         v8::String::new(scope, error.message()).unwrap_or_else(|| v8::String::empty(scope));
     let exception = v8::Exception::type_error(scope, message);
@@ -82,7 +82,7 @@ struct SerDelegate;
 impl v8::ValueSerializerImpl for SerDelegate {
     fn throw_data_clone_error<'s>(
         &self,
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         message: v8::Local<'s, v8::String>,
     ) {
         let exc = v8::Exception::error(scope, message);
@@ -93,7 +93,7 @@ impl v8::ValueSerializerImpl for SerDelegate {
     /// without consulting `is_host_object`. See the module docs.
     fn write_host_object<'s>(
         &self,
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         object: v8::Local<'s, v8::Object>,
         value_serializer: &dyn ValueSerializerHelper,
     ) -> Option<bool> {
@@ -128,7 +128,7 @@ struct DeserDelegate;
 impl v8::ValueDeserializerImpl for DeserDelegate {
     fn read_host_object<'s>(
         &self,
-        scope: &mut v8::HandleScope<'s>,
+        scope: &mut v8::PinScope<'s, '_>,
         value_deserializer: &dyn ValueDeserializerHelper,
     ) -> Option<v8::Local<'s, v8::Object>> {
         match webcodec::decode(scope, value_deserializer) {
@@ -150,12 +150,12 @@ impl v8::ValueDeserializerImpl for DeserDelegate {
 /// `WeakMap`, proxies). Callers wrap it in the typed `RunError` their boundary
 /// uses, naming the offending export or argument.
 pub fn serialize_value(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     value: v8::Local<v8::Value>,
 ) -> Result<Vec<u8>, String> {
     clear_codec_error();
     let context = scope.get_current_context();
-    let tc = &mut v8::TryCatch::new(scope);
+    v8::tc_scope!(let tc, scope);
     let serializer = v8::ValueSerializer::new(tc, Box::new(SerDelegate));
     serializer.write_header();
     if serializer.write_value(context, value) == Some(true) {
@@ -188,7 +188,7 @@ pub fn serialize_value(
 /// The walk is guarded by a byte scan for the brand, so a payload with no host
 /// types pays only that scan.
 pub fn deserialize_value_with_web_types<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
 ) -> Option<v8::Local<'s, v8::Value>> {
     let value = deserialize_value(scope, bytes)?;
@@ -211,12 +211,12 @@ pub fn deserialize_value_with_web_types<'s>(
 /// checked once per connection at handshake time (see `session.rs`), so
 /// reaching `None` at run time means a corrupt payload.
 pub fn deserialize_value<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
 ) -> Option<v8::Local<'s, v8::Value>> {
     clear_codec_error();
     let context = scope.get_current_context();
-    let tc = &mut v8::TryCatch::new(scope);
+    v8::tc_scope!(let tc, scope);
     let deserializer = v8::ValueDeserializer::new(tc, Box::new(DeserDelegate), bytes);
     // read_header() BEFORE read_value() — see the module docblock.
     if deserializer.read_header(context) != Some(true) {
@@ -246,7 +246,7 @@ pub fn probe() -> &'static [u8] {
     PROBE.get_or_init(|| {
         crate::v8::init_platform();
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let null = v8::null(scope).into();
@@ -276,10 +276,10 @@ mod tests {
     use crate::v8::init_platform;
 
     /// Run `body` inside a fresh isolate + context.
-    fn with_scope<R>(body: impl FnOnce(&mut v8::HandleScope) -> R) -> R {
+    fn with_scope<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
         init_platform();
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         body(scope)
@@ -298,14 +298,14 @@ mod tests {
         })
     }
 
-    fn eval<'s>(scope: &mut v8::HandleScope<'s>, expr: &str) -> v8::Local<'s, v8::Value> {
+    fn eval<'s>(scope: &mut v8::PinScope<'s, '_>, expr: &str) -> v8::Local<'s, v8::Value> {
         let src = v8::String::new(scope, expr).unwrap();
         let script = v8::Script::compile(scope, src, None).unwrap();
         script.run(scope).unwrap()
     }
 
     /// `JSON.stringify`-free stringification that survives Map/Set/BigInt.
-    fn display(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> String {
+    fn display(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> String {
         let global = scope.get_current_context().global(scope);
         let key = v8::String::new(scope, "__display").unwrap();
         global.set(scope, key.into(), value);
