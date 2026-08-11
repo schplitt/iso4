@@ -40,7 +40,10 @@ libc = "0.2"
 [dev-dependencies]
 # Wall-time microbenchmarks (benches/micro.rs). Plots and rayon disabled:
 # CI only needs `--output-format bencher` text output.
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# CodSpeed drop-in layer: plain `cargo bench` behaves like criterion (so
+# bench.yml's bencher output is unchanged); under `cargo codspeed run` in CI
+# the same benches are measured by instrumentation (.github/workflows/codspeed.yml).
+criterion = { package = "codspeed-criterion-compat", version = "5.0", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.release]
 # LTO and panic=abort produce a smaller, faster binary with no unwinding tables
