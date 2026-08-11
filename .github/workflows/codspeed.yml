@@ -1,19 +1,19 @@
 name: CodSpeed
 
 # Instrumented (simulation-mode) benchmarks via CodSpeed — deterministic CPU
-# measurement, immune to runner noise. Complements bench.yml, which keeps
-# covering wall time:
+# measurement, immune to runner noise. This is the only benchmark workflow:
 #
-#   - CodSpeed (this file): everything that runs IN-PROCESS in the measured
-#     process — the Rust criterion micro suite (native/v8-runtime/benches/)
-#     and the host-side codec benches (bench/codec.bench.ts). Push to main
-#     sets the baseline; every PR push gets a diff comment from the CodSpeed
-#     GitHub app, with ~1-2 % regression resolution.
+#   - Covered here: everything that runs IN-PROCESS in the measured process —
+#     the Rust criterion micro suite (native/v8-runtime/benches/) and the
+#     host-side codec benches (bench/codec.bench.ts). Push to main sets the
+#     baseline; every PR push gets a diff comment from the CodSpeed GitHub
+#     app, with ~1-2 % regression resolution.
 #
-#   - bench.yml: the two-process end-to-end suites (matrix/runtime.bench.ts).
+#   - NOT covered: the two-process end-to-end suites (matrix/runtime.bench.ts).
 #     Those spawn the iso4-v8 child process and wait on a Unix socket, so
 #     instrumenting the vitest process would measure only the host-side
-#     slice — wall time on a same-VM A/B is the honest metric there.
+#     slice. They are wall-time only: bench both sides back-to-back on the
+#     same idle machine and compare with scripts/bench-compare.ts.
 #
 # Auth is OIDC (id-token: write) — no long-lived token. The repo must be
 # added on https://codspeed.io for reports/comments to appear.
