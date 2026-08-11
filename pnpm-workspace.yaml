@@ -13,6 +13,7 @@ packages:
   - 'packages/*'
 catalog:
   '@changesets/cli': ^2.27.10
+  '@codspeed/vitest-plugin': ^5.7.1
   '@schplitt/eslint-config': ^1.5.0
   '@types/node': ^24.12.4
   eslint: ^10.2.1
@@ -23,5 +24,4 @@ catalog:
   vitest: ^4.1.5
 onlyBuiltDependencies:
   - esbuild
-
 

@@ -2,9 +2,9 @@
  * Bench iteration profiles.
  *
  * `ISO4_BENCH_PROFILE=pr` trims iteration counts for quick local runs
- * (e.g. a fast same-machine A/B while iterating on an optimization). CI
- * always runs the full profile so the stored main baseline and PR numbers
- * are collected the same way — see .github/workflows/bench.yml.
+ * (e.g. a fast same-machine A/B while iterating on an optimization). For
+ * numbers meant to be compared via scripts/bench-compare.ts, run the full
+ * profile on both sides so they are collected the same way.
  */
 
 import process from 'node:process'

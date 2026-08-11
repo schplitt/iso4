@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 /**
- * Compare a PR benchmark run against the stored main-branch baseline and
- * emit a markdown report for the sticky PR comment
- * (see .github/workflows/bench.yml).
+ * Compare two local benchmark runs (e.g. main vs. a PR head, benched
+ * back-to-back on the same idle machine) and emit a markdown report.
  *
- * Interpretation caveat, also printed in the report: the baseline was
- * recorded by the last main-branch bench job on a DIFFERENT shared VM.
- * GitHub-hosted runners carry 10–30 % wall-time variance between jobs, so
- * deltas inside that band are noise — only slowdowns above `WARN_RATIO` get
- * flagged. For a trustworthy verdict on a specific change, run both sides
+ * This is the wall-time half of the bench setup: CI regression gating is
+ * instrumented CodSpeed (.github/workflows/codspeed.yml), which covers the
+ * in-process suites; the two-process e2e suites are wall-time only and are
+ * measured with this script. Deltas from runs on DIFFERENT machines (or a
+ * busy one) are noise — only slowdowns above `WARN_RATIO` get flagged. For
+ * a trustworthy verdict on a specific change, run both sides
  * locally on the same machine (this script accepts any two result dirs).
  *
  * Inputs: two directories (base = stored baseline, head = PR run), each
@@ -180,11 +180,10 @@ const node = compareSuite(baseNode, headNode)
 const rust = compareSuite(baseRust, headRust)
 
 const baselineLabel = baseNode.length + baseRust.length === 0
-  ? '**No main baseline available yet** — showing PR numbers only. The next push to `main` records one.'
-  : `Baseline: \`main@${(meta.sha ?? 'unknown').slice(0, 7)}\`${meta.date ? ` (${meta.date})` : ''}. `
-    + 'Baseline and PR ran on different shared VMs (10–30 % wall-time variance) — '
-    + `deltas inside that band are noise; ⚠️ marks slowdowns ≥ ${Math.round((WARN_RATIO - 1) * 100)} %. `
-    + 'For a trustworthy verdict on a specific change, A/B locally with `scripts/bench-compare.ts`.'
+  ? '**No baseline results found** — showing head numbers only.'
+  : `Baseline: \`${(meta.sha ?? 'unknown').slice(0, 7)}\`${meta.date ? ` (${meta.date})` : ''}. `
+    + `⚠️ marks slowdowns ≥ ${Math.round((WARN_RATIO - 1) * 100)} %. `
+    + 'Wall-time deltas are only trustworthy when both sides ran back-to-back on the same idle machine.'
 
 const out: string[] = [
   '<!-- iso4-bench-ab -->',
