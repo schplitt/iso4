@@ -171,47 +171,23 @@ unsafe extern "C" fn budget_alloc_free(state: &BudgetAllocState, data: *mut c_vo
     drop(Box::from_raw(slice));
 }
 
-unsafe extern "C" fn budget_alloc_realloc(
-    state: &BudgetAllocState,
-    prev: *mut c_void,
-    old_len: usize,
-    new_len: usize,
-) -> *mut c_void {
-    if new_len == 0 {
-        budget_alloc_free(state, prev, old_len);
-        return std::ptr::null_mut();
-    }
-    // Track the delta.  wrapping_sub produces the correct two's-complement
-    // delta for both growth and shrinkage on an AtomicUsize.
-    state
-        .used
-        .fetch_add(new_len.wrapping_sub(old_len), Ordering::Relaxed);
-    if new_len > old_len {
-        let prev_used = state.used.load(Ordering::Relaxed);
-        if prev_used > state.budget {
-            if let Some(h) = state.handle.get() {
-                state.reason.set(TerminationReason::Memory).ok();
-                h.terminate_execution();
-            }
-        }
-    }
-    let old_slice = Box::from_raw(std::ptr::slice_from_raw_parts_mut(prev as *mut u8, old_len));
-    let mut new_vec = Vec::with_capacity(new_len);
-    new_vec.extend_from_slice(&old_slice[..old_len.min(new_len)]);
-    new_vec.resize(new_len, 0u8);
-    Box::into_raw(new_vec.into_boxed_slice()) as *mut c_void
-}
-
 unsafe extern "C" fn budget_alloc_drop(state: *const BudgetAllocState) {
     // Reconstruct + drop the Arc reference that was created via Arc::into_raw.
     drop(Arc::from_raw(state));
 }
 
+/// The allocator V8 uses for ArrayBuffer backing stores, so growth is charged
+/// against the run's memory budget.
+///
+/// There is deliberately no `reallocate` hook: V8 dropped
+/// `ArrayBuffer::Allocator::Reallocate` and `rusty_v8` removed the vtable slot
+/// with it. Resizes now run through `allocate` + copy + `free`, so every byte
+/// still passes `check_and_maybe_terminate` — the budget sees the new size
+/// before the old one is released, which is the conservative direction.
 static BUDGET_ALLOC_VTABLE: v8::RustAllocatorVtable<BudgetAllocState> = v8::RustAllocatorVtable {
     allocate: budget_alloc_alloc,
     allocate_uninitialized: budget_alloc_alloc_uninit,
     free: budget_alloc_free,
-    reallocate: budget_alloc_realloc,
     drop: budget_alloc_drop,
 };
 
@@ -846,13 +822,22 @@ fn run_module_inner(
     };
 
     let mut isolate = {
-        // `snapshot_blob` takes `impl Allocated<[u8]>`, which has a dedicated
-        // `Arc` variant — the handle is stored, the bytes are not copied. V8
-        // requires the blob to outlive the isolate; `CreateParams` moves the
-        // allocation into the isolate, which is what keeps it alive.
+        // `snapshot_blob` takes a `StartupData`, which can only wrap a
+        // `Cow<'static, [u8]>` or a C++-owned pointer — the `Arc` variant of
+        // the old `Allocated<[u8]>` trait is gone. So the prefix blob is copied
+        // here, once per isolate, instead of having its handle cloned. V8
+        // requires the blob to outlive the isolate; the copy moves into
+        // `CreateParams` and then into the isolate, which is what keeps it
+        // alive.
+        //
+        // This costs a memcpy of the snapshot (~530 KB today) on every
+        // prefix run — see `exec/snapshot_restore`. Avoiding it means handing
+        // V8 a `Cow::Borrowed` over the cached `Arc`, which is only sound if a
+        // prefix cannot be disposed while a run holds it; that invariant is not
+        // established today, so the copy stays.
         let params = match snapshot {
             None => v8::Isolate::create_params(),
-            Some(bytes) => v8::Isolate::create_params().snapshot_blob(bytes),
+            Some(bytes) => v8::Isolate::create_params().snapshot_blob(bytes.to_vec().into()),
         };
         // MANDATORY, and it moves in lockstep with the `snapshot_creator` call
         // in `precompile_module`. A snapshot containing native callbacks that
@@ -860,7 +845,7 @@ fn run_module_inner(
         // still reports "function", then the process dies with
         // `V8_Fatal: No external references provided via API` on the first
         // `new Response()`.
-        let params = params.external_references(crate::webtypes::external_references().to_vec());
+        let params = params.external_references(crate::webtypes::external_references().into());
         // Cap the V8 heap (strings, plain objects). The near-heap callback
         // converts a heap-OOM into a clean terminate_execution().
         let params = if limits.memory_mb > 0 {
@@ -979,7 +964,7 @@ fn run_module_inner(
         budget: &cpu_budget,
     };
 
-    let scope = &mut v8::HandleScope::new(&mut isolate);
+    v8::scope!(let scope, &mut isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
     install_console(scope, &mut logs as *mut LogBuffers)
@@ -1072,7 +1057,7 @@ fn run_module_inner(
     // and this is a no-op.
     install_value_globals(scope, globals).map_err(|e| failure(e, &logs, start))?;
 
-    let scope = &mut v8::TryCatch::new(scope);
+    v8::tc_scope!(let scope, scope);
 
     let source_string = v8::String::new(scope, code).ok_or_else(|| {
         failure(
@@ -1607,7 +1592,7 @@ fn run_module_inner(
 /// per `execute_with_prefix`), and `node:async_hooks` is not resolvable because
 /// the native async-context bindings cannot be captured in a snapshot.
 fn evaluate_prefix_module(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     code: &str,
     filename: &str,
     globals: &[HostGlobalDef],
@@ -1735,14 +1720,14 @@ fn precompile_module(
         let mut isolate = v8::Isolate::new(Default::default());
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
-        let scope = &mut v8::HandleScope::new(&mut isolate);
+        v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         // Same environment as pass 2 and as a run, so prefix code that touches
         // a web global is validated rather than dying only at snapshot time.
         crate::webtypes::install(scope)
             .map_err(|e| failure(RunError::Internal(e), &logs, start))?;
-        let scope = &mut v8::TryCatch::new(scope);
+        v8::tc_scope!(let scope, scope);
         evaluate_prefix_module(scope, code, filename, globals, imports)
             .map_err(|error| failure(error, &logs, start))?;
     }
@@ -1753,12 +1738,12 @@ fn precompile_module(
     // The external-reference table must match the one `run_module` passes when
     // restoring — see the comment there.
     let mut isolate =
-        v8::Isolate::snapshot_creator(Some(crate::webtypes::external_references()), None);
+        v8::Isolate::snapshot_creator(Some(crate::webtypes::external_references().into()), None);
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
 
     let compile_result: Result<(), FailureOutput> = (|| {
-        let scope = &mut v8::HandleScope::new(&mut isolate);
+        v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         // Mark this context as the snapshot default BEFORE creating TryCatch.
@@ -1767,7 +1752,7 @@ fn precompile_module(
         // snapshot; every later run restores them for free.
         crate::webtypes::install(scope)
             .map_err(|e| failure(RunError::Internal(e), &logs, start))?;
-        let scope = &mut v8::TryCatch::new(scope);
+        v8::tc_scope!(let scope, scope);
         evaluate_prefix_module(scope, code, filename, globals, imports)
             .map_err(|error| failure(error, &logs, start))
     })();
@@ -1969,8 +1954,11 @@ fn module_resolver_callback<'a>(
     _import_assertions: v8::Local<'a, v8::FixedArray>,
     _referrer: v8::Local<'a, v8::Module>,
 ) -> Option<v8::Local<'a, v8::Module>> {
-    let scope = &mut unsafe { v8::CallbackScope::new(context) };
-    let scope = &mut v8::EscapableHandleScope::new(scope);
+    v8::callback_scope!(unsafe let callback_scope, context);
+    // `NewEscapableHandleScope` is implemented for a pinned `HandleScope`, not
+    // for a pinned `CallbackScope`, so deref through to the handle scope the
+    // callback scope bootstrapped.
+    v8::escapable_handle_scope!(let scope, &mut **callback_scope);
     let specifier_str = specifier.to_rust_string_lossy(scope);
 
     if let Some(g) = cache_get(&specifier_str) {
@@ -2002,7 +1990,7 @@ fn module_resolver_callback<'a>(
 }
 
 fn compile_source_module<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     specifier: &str,
     source: &str,
 ) -> Option<v8::Local<'s, v8::Module>> {
@@ -2022,7 +2010,7 @@ fn compile_source_module<'s>(
         None,
     );
     let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
-    let tc = &mut v8::TryCatch::new(scope);
+    v8::tc_scope!(let tc, scope);
     match v8::script_compiler::compile_module(tc, &mut source) {
         Some(m) => Some(m),
         None => {
@@ -2069,7 +2057,7 @@ const IMPORT_TRAMPOLINE_FACTORY_SRC: &str =
 /// On failure records a resolver error (surfaced after `instantiate_module`)
 /// and returns `None`, like `compile_source_module`.
 fn build_host_module<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     specifier: &str,
     exports: &[(String, HostModuleNode)],
 ) -> Option<v8::Local<'s, v8::Module>> {
@@ -2131,7 +2119,7 @@ fn build_host_module<'s>(
 /// (consuming the next handle ID), data leaves are materialised from their
 /// value blob, and object nodes become plain objects built via the V8 API.
 fn build_host_value<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     specifier: &str,
     node: &HostModuleNode,
     factory: v8::Local<v8::Function>,
@@ -2172,7 +2160,7 @@ fn build_host_value<'s>(
 
 /// Build the trampoline factory from [`IMPORT_TRAMPOLINE_FACTORY_SRC`].
 fn build_import_trampoline_factory<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Function>, RunError> {
     let value = eval_script(
         scope,
@@ -2194,7 +2182,7 @@ extern "C" fn host_import_meta_callback(
 ) {
     // SAFETY: standard embedder-callback re-entry, same pattern as
     // `module_resolver_callback`.
-    let scope = &mut unsafe { v8::CallbackScope::new(context) };
+    v8::callback_scope!(unsafe let scope, context);
     let values = RESOLVER_CTX.with(|c| {
         c.borrow().as_ref().and_then(|ctx| {
             ctx.pending_meta
@@ -2454,7 +2442,7 @@ struct GlobalCallbackData {
 /// when a call is refused before any I/O (e.g. a direct dispatcher call with
 /// an invalid handle) — sandbox code may catch it, exactly like a host
 /// handler rejection; uncaught it surfaces as `ERR_HOST_BRIDGE`.
-fn reject_with_bridge_error(scope: &mut v8::HandleScope, rv: &mut v8::ReturnValue, message: &str) {
+fn reject_with_bridge_error(scope: &mut v8::PinScope, rv: &mut v8::ReturnValue, message: &str) {
     let error = host_bridge_error_to_v8(
         scope,
         &BridgeErrorPayload {
@@ -2483,7 +2471,7 @@ fn reject_with_bridge_error(scope: &mut v8::HandleScope, rv: &mut v8::ReturnValu
 /// `bridge_error` to the run failure on both exit paths (evaluate bail-out and
 /// poll-loop checkpoint), checked before termination reasons.
 fn fatal_bridge_error(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     bridge_error: &OnceLock<RunError>,
     error: RunError,
 ) {
@@ -2498,7 +2486,7 @@ fn fatal_bridge_error(
 /// The run_module poll loop drives resolution by reading BridgeResponse frames
 /// and calling perform_microtask_checkpoint().
 fn bridge_global_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -2733,7 +2721,7 @@ struct BridgeStubSpec {
 /// `out_boxes` so their heap allocations outlive the V8 evaluation.
 #[allow(clippy::too_many_arguments)] // bridge setup genuinely needs all these params
 fn install_bridge_globals(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     stubs: &[BridgeStubSpec],
     stream_fd: RawFd,
     call_id: Arc<AtomicU32>,
@@ -2839,7 +2827,7 @@ fn check_not_reserved(name: &str) -> Result<(), RunError> {
 }
 
 fn install_value_globals(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     globals: &[HostGlobalDef],
 ) -> Result<(), RunError> {
     // Built lazily on the first shim global, then reused for the rest.
@@ -2903,7 +2891,7 @@ fn install_value_globals(
 /// Set `globalThis[name] = value` via the V8 API. The name is a property key,
 /// never code.
 fn set_global(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     name: &str,
     value: v8::Local<v8::Value>,
 ) -> Result<(), RunError> {
@@ -2920,7 +2908,7 @@ fn set_global(
 /// bare function/object expression parses) as its own script, tagged with a
 /// dedicated filename so it never appears in a user-code stack trace.
 fn eval_global_expression<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     expr: &str,
     name: &str,
 ) -> Result<v8::Local<'s, v8::Value>, RunError> {
@@ -2931,7 +2919,7 @@ fn eval_global_expression<'s>(
 
 /// Build the shim-wrapper factory function from [`SHIM_FACTORY_SRC`].
 fn build_shim_factory<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Function>, RunError> {
     let value = eval_script(scope, SHIM_FACTORY_SRC, "<iso4:shim-factory>")?;
     v8::Local::<v8::Function>::try_from(value)
@@ -2943,7 +2931,7 @@ fn build_shim_factory<'s>(
 /// V8 exception. Runs inside its own `TryCatch`; the returned value lives in the
 /// caller's handle scope.
 fn eval_script<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     source: &str,
     filename: &str,
 ) -> Result<v8::Local<'s, v8::Value>, RunError> {
@@ -2966,7 +2954,7 @@ fn eval_script<'s>(
         false,
         None,
     );
-    let tc = &mut v8::TryCatch::new(scope);
+    v8::tc_scope!(let tc, scope);
     let script = match v8::Script::compile(tc, source_str, Some(&origin)) {
         Some(s) => s,
         None => return Err(RunError::CompileError(exception_message(tc))),
@@ -2985,7 +2973,7 @@ fn eval_script<'s>(
 /// Throw a plain Error into V8 with the given message.
 /// Splits the string-creation, exception-creation, and throw into separate
 /// borrows so the compiler doesn't see `scope` used twice simultaneously.
-fn throw_v8_error(scope: &mut v8::HandleScope, message: &str) {
+fn throw_v8_error(scope: &mut v8::PinScope, message: &str) {
     if let Some(s) = v8::String::new(scope, message) {
         let exc = v8::Exception::error(scope, s);
         scope.throw_exception(exc);
@@ -2997,7 +2985,7 @@ fn throw_v8_error(scope: &mut v8::HandleScope, message: &str) {
 /// (→ `ERR_HOST_BRIDGE`) from an uncaught sandbox error (→ `ERR_USER_CODE`).
 const HOST_BRIDGE_ERROR_TAG: &str = "iso4::hostBridgeError";
 
-fn host_bridge_tag<'s>(scope: &mut v8::HandleScope<'s>) -> Option<v8::Local<'s, v8::Private>> {
+fn host_bridge_tag<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
     let key = v8::String::new(scope, HOST_BRIDGE_ERROR_TAG)?;
     Some(v8::Private::for_api(scope, Some(key)))
 }
@@ -3022,7 +3010,7 @@ const INTRINSIC_ERROR_NAMES: [&str; 5] = [
 /// with [`HOST_BRIDGE_ERROR_TAG`] so an uncaught rejection classifies as
 /// `ERR_HOST_BRIDGE`.
 fn host_bridge_error_to_v8<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     err: &BridgeErrorPayload,
 ) -> v8::Local<'s, v8::Value> {
     let message = v8::String::new(scope, &err.message).unwrap_or_else(|| v8::String::empty(scope));
@@ -3070,7 +3058,7 @@ fn host_bridge_error_to_v8<'s>(
 /// own-enumerable properties also means a field added by sandbox code before
 /// rethrowing survives to the host.
 fn host_bridge_error_from_rejection(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
 ) -> Option<RunError> {
     let obj = value.to_object(scope)?;
@@ -3088,7 +3076,7 @@ fn host_bridge_error_from_rejection(
     })))
 }
 
-fn install_console(scope: &mut v8::HandleScope, buffers: *mut LogBuffers) -> Result<(), RunError> {
+fn install_console(scope: &mut v8::PinScope, buffers: *mut LogBuffers) -> Result<(), RunError> {
     let console = v8::Object::new(scope);
     let data = v8::External::new(scope, buffers.cast::<c_void>());
 
@@ -3127,7 +3115,7 @@ fn install_console(scope: &mut v8::HandleScope, buffers: *mut LogBuffers) -> Res
 }
 
 fn console_stdout_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3136,7 +3124,7 @@ fn console_stdout_callback(
 }
 
 fn console_stderr_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3145,7 +3133,7 @@ fn console_stderr_callback(
 }
 
 fn append_console_line(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     stdout: bool,
 ) {
@@ -3266,7 +3254,7 @@ const ASYNC_HOOKS_MODULE_SRC: &str = "export const AsyncLocalStorage = \
 
 /// Native getter for the continuation-preserved embedder data slot.
 fn async_context_get_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3276,7 +3264,7 @@ fn async_context_get_callback(
 
 /// Native setter for the continuation-preserved embedder data slot.
 fn async_context_set_callback(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
@@ -3287,7 +3275,7 @@ fn async_context_set_callback(
 /// Install the `AsyncLocalStorage` class on `globalThis` under
 /// `Symbol.for(ASYNC_CONTEXT_SYMBOL)`. Called once per run before module
 /// instantiation so the built-in `node:async_hooks` module can read it.
-fn install_async_context(scope: &mut v8::HandleScope) -> Result<(), RunError> {
+fn install_async_context(scope: &mut v8::PinScope) -> Result<(), RunError> {
     let get_fn = v8::Function::builder(async_context_get_callback)
         .build(scope)
         .ok_or_else(|| RunError::Internal("failed to build async-context getter".to_string()))?;
@@ -3343,7 +3331,7 @@ fn check_export_serializable(name: &str, value: v8::Local<v8::Value>) -> Result<
 }
 
 fn runtime_error_from_value(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
 ) -> RunError {
     let name = error_name_from_value(scope, value).unwrap_or_else(|| "Error".to_string());
@@ -3363,7 +3351,7 @@ fn runtime_error_from_value(
 }
 
 fn error_message_from_value(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
 ) -> Option<String> {
     let object = value.to_object(scope)?;
@@ -3379,7 +3367,7 @@ fn error_message_from_value(
 }
 
 fn stack_from_value(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
 ) -> Option<String> {
     let object = value.to_object(scope)?;
@@ -3395,7 +3383,9 @@ fn stack_from_value(
         .map(|s| s.to_rust_string_lossy(scope))
 }
 
-fn exception_message(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
+fn exception_message(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> String {
     scope
         .exception()
         .and_then(|e| e.to_string(scope))
@@ -3403,13 +3393,15 @@ fn exception_message(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
         .unwrap_or_else(|| "(no exception message)".to_string())
 }
 
-fn exception_stack(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<String> {
+fn exception_stack(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Option<String> {
     let exception = scope.exception()?;
     stack_from_value(scope, exception)
 }
 
 fn error_name_from_value(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
 ) -> Option<String> {
     let obj = value.to_object(scope)?;
@@ -3423,7 +3415,9 @@ fn error_name_from_value(
         .map(|s| s.to_rust_string_lossy(scope))
 }
 
-fn exception_name(scope: &mut v8::TryCatch<v8::HandleScope>) -> String {
+fn exception_name(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> String {
     scope
         .exception()
         .and_then(|e| error_name_from_value(scope, e))
@@ -3440,7 +3434,7 @@ const RESERVED_ERROR_KEYS: [&str; 4] = ["name", "message", "stack", "__proto__"]
 /// skipping `skip`. Uses `create_data_property` ([[DefineOwnProperty]]), so a
 /// copied key is always a plain own data property.
 fn copy_own_properties_except(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     source: v8::Local<v8::Object>,
     target: v8::Local<v8::Object>,
     skip: &[&str],
@@ -3475,7 +3469,7 @@ fn copy_own_properties_except(
 /// (functions, symbols, unresolved promises) are silently dropped. Returns
 /// `None` for non-object throws or when no serializable own property remains.
 fn error_fields_from_value(
-    scope: &mut v8::TryCatch<v8::HandleScope>,
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
 ) -> Option<Vec<u8>> {
     // Thrown primitives have no own properties of their own; to_object()
@@ -3522,7 +3516,9 @@ fn error_fields_from_value(
     blob::serialize_value(scope, kept.into()).ok()
 }
 
-fn exception_fields(scope: &mut v8::TryCatch<v8::HandleScope>) -> Option<Vec<u8>> {
+fn exception_fields(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Option<Vec<u8>> {
     let exception = scope.exception()?;
     error_fields_from_value(scope, exception)
 }

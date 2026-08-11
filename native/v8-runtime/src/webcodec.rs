@@ -126,7 +126,7 @@ fn read_u32(helper: &dyn ValueDeserializerHelper) -> Codec<u32> {
 /// rather than `write_value` so the reader can rebuild it without a nested
 /// deserialize — the host side has to be able to hand-write this.
 fn write_v8_string(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
     value: v8::Local<v8::Value>,
 ) -> Codec<()> {
@@ -138,7 +138,7 @@ fn write_v8_string(
     Ok(())
 }
 
-fn v8_string<'s>(scope: &mut v8::HandleScope<'s>, s: &str) -> Codec<v8::Local<'s, v8::Value>> {
+fn v8_string<'s>(scope: &mut v8::PinScope<'s, '_>, s: &str) -> Codec<v8::Local<'s, v8::Value>> {
     match v8::String::new(scope, s) {
         Some(v) => Ok(v.into()),
         None => malformed("could not intern string"),
@@ -148,7 +148,7 @@ fn v8_string<'s>(scope: &mut v8::HandleScope<'s>, s: &str) -> Codec<v8::Local<'s
 // ── Headers ──────────────────────────────────────────────────────────────────
 
 fn encode_headers(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
     headers: v8::Local<v8::Object>,
 ) -> Codec<()> {
@@ -177,7 +177,7 @@ fn encode_headers(
 }
 
 fn decode_headers<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     helper: &dyn ValueDeserializerHelper,
 ) -> Codec<v8::Local<'s, v8::Object>> {
     let context = scope.get_current_context();
@@ -228,7 +228,7 @@ fn check_body(body: v8::Local<v8::Value>) -> Codec<v8::Local<v8::Value>> {
 }
 
 fn encode_body(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
     body: v8::Local<v8::Value>,
 ) -> Codec<()> {
@@ -244,7 +244,7 @@ fn encode_body(
 }
 
 fn decode_body<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     helper: &dyn ValueDeserializerHelper,
 ) -> Codec<v8::Local<'s, v8::Value>> {
     let context = scope.get_current_context();
@@ -274,7 +274,7 @@ fn skip_extras(helper: &dyn ValueDeserializerHelper) -> Codec<()> {
 // ── Request / Response ───────────────────────────────────────────────────────
 
 fn encode_request(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
     obj: v8::Local<v8::Object>,
 ) -> Codec<()> {
@@ -291,7 +291,7 @@ fn encode_request(
 }
 
 fn decode_request<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     helper: &dyn ValueDeserializerHelper,
 ) -> Codec<v8::Local<'s, v8::Object>> {
     let url = read_string(helper)?;
@@ -309,7 +309,7 @@ fn decode_request<'s>(
 }
 
 fn encode_response(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
     obj: v8::Local<v8::Object>,
 ) -> Codec<()> {
@@ -326,7 +326,7 @@ fn encode_response(
 }
 
 fn decode_response<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     helper: &dyn ValueDeserializerHelper,
 ) -> Codec<v8::Local<'s, v8::Object>> {
     let status = read_u32(helper)?;
@@ -350,7 +350,7 @@ fn decode_response<'s>(
 /// routed it here via an internal field, or a slot-boundary lookalike check
 /// matched. `tag` comes from whichever of those it was.
 pub fn encode(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
     obj: v8::Local<v8::Object>,
     tag: u32,
@@ -370,7 +370,7 @@ pub fn encode(
 
 /// Read a host-object payload, tag first.
 pub fn decode<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     helper: &dyn ValueDeserializerHelper,
 ) -> Codec<v8::Local<'s, v8::Object>> {
     let tag = read_u32(helper)?;
@@ -410,7 +410,7 @@ pub fn might_contain_web_types(blob: &[u8]) -> bool {
 /// a request/response payload needs, and exceeding it is a refusal rather than
 /// silent truncation.
 pub fn rehydrate<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
 ) -> Codec<v8::Local<'s, v8::Value>> {
     rehydrate_at(scope, value, 0)
@@ -419,7 +419,7 @@ pub fn rehydrate<'s>(
 const MAX_DEPTH: u32 = 32;
 
 fn rehydrate_at<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
     depth: u32,
 ) -> Codec<v8::Local<'s, v8::Value>> {
@@ -471,7 +471,7 @@ fn rehydrate_at<'s>(
     Ok(value)
 }
 
-fn brand_of(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>) -> Codec<Option<u32>> {
+fn brand_of(scope: &mut v8::PinScope, obj: v8::Local<v8::Object>) -> Codec<Option<u32>> {
     let Some(key) = v8::String::new(scope, BRAND) else {
         return malformed("could not intern the brand key");
     };
@@ -482,7 +482,7 @@ fn brand_of(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>) -> Codec<Op
 }
 
 fn descriptor_field<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     obj: v8::Local<v8::Object>,
     name: &str,
 ) -> Codec<v8::Local<'s, v8::Value>> {
@@ -500,7 +500,7 @@ fn descriptor_field<'s>(
 /// Adding a type here plus a tag is the whole cost of making a new class cross
 /// in this direction.
 fn build_from_descriptor<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     desc: v8::Local<v8::Object>,
     tag: u32,
 ) -> Codec<v8::Local<'s, v8::Object>> {
@@ -559,17 +559,17 @@ mod tests {
     use crate::blob;
 
     /// Fresh isolate + context with the web globals installed.
-    fn with_web<R>(body: impl FnOnce(&mut v8::HandleScope) -> R) -> R {
+    fn with_web<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
         crate::v8::init_platform();
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         crate::webtypes::install(scope).expect("install web globals");
         body(scope)
     }
 
-    fn eval<'s>(scope: &mut v8::HandleScope<'s>, src: &str) -> v8::Local<'s, v8::Value> {
+    fn eval<'s>(scope: &mut v8::PinScope<'s, '_>, src: &str) -> v8::Local<'s, v8::Value> {
         let s = v8::String::new(scope, src).unwrap();
         let script = v8::Script::compile(scope, s, None).expect("compile");
         script.run(scope).expect("run")

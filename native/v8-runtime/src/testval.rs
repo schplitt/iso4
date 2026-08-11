@@ -37,10 +37,10 @@ pub enum TestValue {
 }
 
 /// Run `body` inside a fresh isolate + context.
-fn with_scope<R>(body: impl FnOnce(&mut v8::HandleScope) -> R) -> R {
+fn with_scope<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
     init_platform();
     let isolate = &mut v8::Isolate::new(Default::default());
-    let scope = &mut v8::HandleScope::new(isolate);
+    v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
     body(scope)
@@ -74,7 +74,7 @@ pub fn display_blob(bytes: &[u8]) -> String {
 }
 
 fn read(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     value: v8::Local<v8::Value>,
     path: &mut Vec<v8::Global<v8::Value>>,
 ) -> TestValue {
@@ -152,7 +152,7 @@ fn read(
 
 /// A "plain object" for test purposes: prototype is `Object.prototype` or
 /// `null`. Everything else (Date, Map, Error, class instances, …) is `Other`.
-fn is_plain_object(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> bool {
+fn is_plain_object(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> bool {
     let Some(obj) = value.to_object(scope) else {
         return false;
     };
@@ -174,7 +174,7 @@ fn is_plain_object(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> 
 }
 
 /// JS-side description used for the `Other` variant.
-fn describe(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> String {
+fn describe(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> String {
     let global = scope.get_current_context().global(scope);
     let key = v8::String::new(scope, "__describe").unwrap();
     global.set(scope, key.into(), value);
@@ -200,7 +200,7 @@ fn describe(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> String 
         .unwrap_or_else(|| "<undescribable>".to_string())
 }
 
-fn build<'s>(scope: &mut v8::HandleScope<'s>, value: &TestValue) -> v8::Local<'s, v8::Value> {
+fn build<'s>(scope: &mut v8::PinScope<'s, '_>, value: &TestValue) -> v8::Local<'s, v8::Value> {
     match value {
         TestValue::Undefined => v8::undefined(scope).into(),
         TestValue::Null => v8::null(scope).into(),

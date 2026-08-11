@@ -26,7 +26,7 @@ harness = false
 
 [dependencies]
 # Embedded V8 via the official rusty_v8 crate
-v8 = "130"
+v8 = "147"
 
 # Lock-free channels between session, writer, and timeout threads
 crossbeam-channel = "0.5"

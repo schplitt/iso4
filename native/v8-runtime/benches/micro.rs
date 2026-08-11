@@ -70,7 +70,7 @@ enum Shape {
     Object(Vec<(String, Shape)>),
 }
 
-fn to_v8<'s>(scope: &mut v8::HandleScope<'s>, shape: &Shape) -> v8::Local<'s, v8::Value> {
+fn to_v8<'s>(scope: &mut v8::PinScope<'s, '_>, shape: &Shape) -> v8::Local<'s, v8::Value> {
     match shape {
         Shape::Bool(b) => v8::Boolean::new(scope, *b).into(),
         Shape::Number(n) => v8::Number::new(scope, *n).into(),
@@ -227,14 +227,14 @@ fn bench_v8_value(c: &mut Criterion) {
         // V8 value → v8-blob bytes (outbound leg).
         group.bench_function(BenchmarkId::new("value_serializer", name), |b| {
             let isolate = &mut v8::Isolate::new(Default::default());
-            let scope = &mut v8::HandleScope::new(isolate);
+            v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
             let value = to_v8(scope, shape);
             b.iter(|| {
                 // Per-iteration handle scope: without it, millions of locals
                 // accumulate in the outer scope over a bench run.
-                let scope = &mut v8::HandleScope::new(scope);
+                v8::scope!(let scope, scope);
                 black_box(blob::serialize_value(scope, black_box(value)).unwrap())
             });
         });
@@ -242,13 +242,13 @@ fn bench_v8_value(c: &mut Criterion) {
         // v8-blob bytes → V8 value (inbound leg).
         group.bench_function(BenchmarkId::new("value_deserializer", name), |b| {
             let isolate = &mut v8::Isolate::new(Default::default());
-            let scope = &mut v8::HandleScope::new(isolate);
+            v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
             let value = to_v8(scope, shape);
             let bytes = blob::serialize_value(scope, value).unwrap();
             b.iter(|| {
-                let scope = &mut v8::HandleScope::new(scope);
+                v8::scope!(let scope, scope);
                 black_box(blob::deserialize_value(scope, black_box(&bytes)).unwrap());
             });
         });
@@ -283,9 +283,9 @@ fn bench_exec(c: &mut Criterion) {
     // the dominant slice of the per-run tax — see backlog item 3).
     group.bench_function("context_create", |b| {
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         b.iter(|| {
-            let scope = &mut v8::HandleScope::new(scope);
+            v8::scope!(let scope, scope);
             black_box(v8::Context::new(scope, Default::default()));
         });
     });
@@ -297,9 +297,9 @@ fn bench_exec(c: &mut Criterion) {
     group.bench_function("snapshot_restore", |b| {
         let blob = make_snapshot_blob();
         b.iter(|| {
-            let params = v8::Isolate::create_params().snapshot_blob(blob.clone());
+            let params = v8::Isolate::create_params().snapshot_blob(blob.clone().into());
             let isolate = &mut v8::Isolate::new(params);
-            let scope = &mut v8::HandleScope::new(isolate);
+            v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             black_box(context);
         });
@@ -310,13 +310,13 @@ fn bench_exec(c: &mut Criterion) {
     // ~5x too fast (measured 2.9 µs cached vs 15.6 µs unique).
     group.bench_function("compile_run_unique_source", |b| {
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let mut n: u64 = 0;
         b.iter(|| {
             n += 1;
-            let scope = &mut v8::HandleScope::new(scope);
+            v8::scope!(let scope, scope);
             let src = format!(
                 "const e{n} = {{ id: {n}, type: 'analytics.pageview', value: {n}.5, ts: 1722945600000 }}; e{n}.id"
             );
@@ -330,13 +330,13 @@ fn bench_exec(c: &mut Criterion) {
     // (backlog item 2): no per-event compile, argument already materialised.
     group.bench_function("function_call", |b| {
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let (func, recv) = compile_transform(scope);
         let event = to_v8(scope, &small_event());
         b.iter(|| {
-            let scope = &mut v8::HandleScope::new(scope);
+            v8::scope!(let scope, scope);
             black_box(func.call(scope, recv, &[event]).unwrap());
         });
     });
@@ -346,14 +346,14 @@ fn bench_exec(c: &mut Criterion) {
     // ValueSerializer → result blob out.
     group.bench_function("call_per_event", |b| {
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let (func, recv) = compile_transform(scope);
         let event = to_v8(scope, &small_event());
         let args_blob = blob::serialize_value(scope, event).unwrap();
         b.iter(|| {
-            let scope = &mut v8::HandleScope::new(scope);
+            v8::scope!(let scope, scope);
             let event = blob::deserialize_value(scope, &args_blob).unwrap();
             let result = func.call(scope, recv, &[event]).unwrap();
             black_box(blob::serialize_value(scope, result).unwrap());
@@ -366,7 +366,7 @@ fn bench_exec(c: &mut Criterion) {
 /// Evaluate `TRANSFORM_SRC` and hand back the function plus an `undefined`
 /// receiver for `Function::call`.
 fn compile_transform<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
 ) -> (v8::Local<'s, v8::Function>, v8::Local<'s, v8::Value>) {
     let code = v8::String::new(scope, TRANSFORM_SRC).unwrap();
     let script = v8::Script::compile(scope, code, None).unwrap();
@@ -381,7 +381,7 @@ fn compile_transform<'s>(
 fn make_snapshot_blob() -> Vec<u8> {
     let mut isolate = v8::Isolate::snapshot_creator(None, None);
     {
-        let scope = &mut v8::HandleScope::new(&mut isolate);
+        v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         scope.set_default_context(context);

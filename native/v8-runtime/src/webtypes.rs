@@ -20,9 +20,11 @@
 //! field as an *aligned pointer* and memcpy's out of it:
 //!
 //! ```cpp
-//! // v8 crate, src/binding.cc — identical in 130 and 146
+//! // v8 crate, src/binding.cc — same shape from 130 through 147; 147 added
+//! // the embedder type-tag argument, and still reads an aligned pointer.
 //! InternalFieldData* embedder_field = static_cast<InternalFieldData*>(
-//!     holder->GetAlignedPointerFromInternalField(index));
+//!     holder->GetAlignedPointerFromInternalField(
+//!         index, v8::kEmbedderDataTypeTagDefault));
 //! if (embedder_field == nullptr) return {nullptr, 0};
 //! memcpy(payload, embedder_field, sizeof(*embedder_field));
 //! ```
@@ -46,7 +48,7 @@
 //! # Snapshot coupling — read this before touching either call site
 //!
 //! Native callbacks cannot be serialized into a V8 startup snapshot unless the
-//! embedder supplies an `ExternalReferences` table, and the **same** table must
+//! embedder supplies an external-references table, and the **same** table must
 //! be supplied again when the snapshot is restored. The two call sites are
 //! `Isolate::snapshot_creator(...)` in `precompile_module` and
 //! `CreateParams::external_references(...)` in `run_module`. They move
@@ -54,8 +56,6 @@
 //! fail cleanly: `typeof Response` still reports `"function"`, and the process
 //! then dies with `V8_Fatal: No external references provided via API` on the
 //! first `new Response()`.
-
-use std::sync::OnceLock;
 
 use v8::MapFnTo;
 
@@ -75,45 +75,48 @@ pub const INTERNAL_FIELD_COUNT: usize = 1;
 /// template with one internal field — which is what V8 dispatches on. See the
 /// module docs on why the field stays empty.
 fn headers_shell_ctor(
-    _scope: &mut v8::HandleScope,
+    _scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
 }
 
 fn request_shell_ctor(
-    _scope: &mut v8::HandleScope,
+    _scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
 }
 
 fn response_shell_ctor(
-    _scope: &mut v8::HandleScope,
+    _scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
 }
 
-static EXTERNAL_REFS: OnceLock<v8::ExternalReferences> = OnceLock::new();
-
 /// The external-reference table for every native callback that can end up in a
 /// snapshot. Must be passed to **both** `Isolate::snapshot_creator` and
 /// `CreateParams::external_references` — see the module docs.
-pub fn external_references() -> &'static v8::ExternalReferences {
-    EXTERNAL_REFS.get_or_init(|| {
-        v8::ExternalReferences::new(&[
-            v8::ExternalReference {
-                function: headers_shell_ctor.map_fn_to(),
-            },
-            v8::ExternalReference {
-                function: request_shell_ctor.map_fn_to(),
-            },
-            v8::ExternalReference {
-                function: response_shell_ctor.map_fn_to(),
-            },
-        ])
-    })
+///
+/// The `ExternalReferences` wrapper type is gone; both call sites now take a
+/// `Cow<'static, [ExternalReference]>` and append the null terminator
+/// themselves, so a plain vec is the whole table. It is rebuilt per call rather
+/// than cached in a `OnceLock`, because `ExternalReference` is a union of raw
+/// pointers and so is neither `Send` nor `Sync`. Three function pointers; both
+/// call sites are once-per-isolate.
+pub fn external_references() -> Vec<v8::ExternalReference> {
+    vec![
+        v8::ExternalReference {
+            function: headers_shell_ctor.map_fn_to(),
+        },
+        v8::ExternalReference {
+            function: request_shell_ctor.map_fn_to(),
+        },
+        v8::ExternalReference {
+            function: response_shell_ctor.map_fn_to(),
+        },
+    ]
 }
 
 // ── Installation ─────────────────────────────────────────────────────────────
@@ -124,7 +127,7 @@ pub fn external_references() -> &'static v8::ExternalReferences {
 /// no-prefix run path — so prefix and postfix code see the same environment.
 /// When a prefix snapshot is restored the classes come back with it and this is
 /// not called again.
-pub fn install(scope: &mut v8::HandleScope) -> Result<(), String> {
+pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
     let mut shells = Vec::with_capacity(3);
     for (name, ctor) in [
         ("HeadersShell", headers_shell_ctor.map_fn_to()),
@@ -164,7 +167,7 @@ pub fn install(scope: &mut v8::HandleScope) -> Result<(), String> {
         None,
     );
 
-    let tc = &mut v8::TryCatch::new(scope);
+    v8::tc_scope!(let tc, scope);
     let script = v8::Script::compile(tc, source, Some(&origin))
         .ok_or_else(|| exception_text(tc, "compile web runtime"))?;
     let factory = script
@@ -181,7 +184,10 @@ pub fn install(scope: &mut v8::HandleScope) -> Result<(), String> {
     Ok(())
 }
 
-fn exception_text(tc: &mut v8::TryCatch<v8::HandleScope>, what: &str) -> String {
+fn exception_text(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    what: &str,
+) -> String {
     let detail = tc
         .exception()
         .and_then(|e| e.to_string(tc))
@@ -242,7 +248,7 @@ pub struct ResponseView<'s> {
 }
 
 fn get<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     obj: v8::Local<v8::Object>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
@@ -258,7 +264,7 @@ fn get<'s>(
 /// process. `CreateDataProperty` defines the property directly. workerd hit the
 /// same wall and left the same note in `jsg/ser.c++`.
 fn define(
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope,
     obj: v8::Local<v8::Object>,
     name: &str,
     value: v8::Local<v8::Value>,
@@ -274,7 +280,7 @@ fn define(
 /// restored into a fresh isolate per run, so any cache would have to be
 /// per-run anyway, and this is a single property get on a value we are about
 /// to do far more work with.
-fn class<'s>(scope: &mut v8::HandleScope<'s>, name: &str) -> Option<v8::Local<'s, v8::Function>> {
+fn class<'s>(scope: &mut v8::PinScope<'s, '_>, name: &str) -> Option<v8::Local<'s, v8::Function>> {
     let global = scope.get_current_context().global(scope);
     let key = v8::String::new(scope, name)?;
     global.get(scope, key.into())?.try_into().ok()
@@ -286,7 +292,7 @@ fn class<'s>(scope: &mut v8::HandleScope<'s>, name: &str) -> Option<v8::Local<'s
 /// objects carrying an internal field — so the `instanceof` walk here never
 /// runs for ordinary values. Returns `None` for an internal-field object that
 /// is not one of ours; no such object exists in this runtime today.
-pub fn tag_of(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>) -> Option<u32> {
+pub fn tag_of(scope: &mut v8::PinScope, obj: v8::Local<v8::Object>) -> Option<u32> {
     if obj.internal_field_count() < INTERNAL_FIELD_COUNT {
         return None;
     }
@@ -304,7 +310,7 @@ pub fn tag_of(scope: &mut v8::HandleScope, obj: v8::Local<v8::Object>) -> Option
 }
 
 pub fn headers_view<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     obj: v8::Local<v8::Object>,
 ) -> Option<HeadersView<'s>> {
     Some(HeadersView {
@@ -313,7 +319,7 @@ pub fn headers_view<'s>(
 }
 
 pub fn request_view<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     obj: v8::Local<v8::Object>,
 ) -> Option<RequestView<'s>> {
     Some(RequestView {
@@ -325,7 +331,7 @@ pub fn request_view<'s>(
 }
 
 pub fn response_view<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     obj: v8::Local<v8::Object>,
 ) -> Option<ResponseView<'s>> {
     let status = get(scope, obj, "_s")?.uint32_value(scope)?;
@@ -353,7 +359,7 @@ pub fn response_view<'s>(
 /// constructor also means a value round-trips exactly as sent rather than being
 /// re-normalised (a GET with a body, an unusual status text).
 fn make_instance<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     class_name: &str,
     tag: u32,
 ) -> Option<v8::Local<'s, v8::Object>> {
@@ -381,7 +387,7 @@ fn make_instance<'s>(
 
 /// Build a `Headers` from a flat `[name, value, …]` array.
 pub fn make_headers<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     list: v8::Local<v8::Array>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let obj = make_instance(scope, "Headers", TAG_HEADERS)?;
@@ -390,7 +396,7 @@ pub fn make_headers<'s>(
 }
 
 pub fn make_request<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     url: v8::Local<v8::Value>,
     method: v8::Local<v8::Value>,
     headers: v8::Local<v8::Object>,
@@ -407,7 +413,7 @@ pub fn make_request<'s>(
 }
 
 pub fn make_response<'s>(
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     status: u32,
     status_text: v8::Local<v8::Value>,
     headers: v8::Local<v8::Object>,
@@ -429,19 +435,19 @@ mod tests {
     use super::*;
 
     /// Run `body` in a fresh isolate + context with the web globals installed.
-    fn with_web<R>(body: impl FnOnce(&mut v8::HandleScope) -> R) -> R {
+    fn with_web<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
         crate::v8::init_platform();
         let isolate = &mut v8::Isolate::new(Default::default());
-        let scope = &mut v8::HandleScope::new(isolate);
+        v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         install(scope).expect("install web globals");
         body(scope)
     }
 
-    fn eval_str(scope: &mut v8::HandleScope, src: &str) -> String {
+    fn eval_str(scope: &mut v8::PinScope, src: &str) -> String {
         let s = v8::String::new(scope, src).unwrap();
-        let tc = &mut v8::TryCatch::new(scope);
+        v8::tc_scope!(let tc, scope);
         let script = match v8::Script::compile(tc, s, None) {
             Some(sc) => sc,
             None => return exception_text(tc, "compile"),
