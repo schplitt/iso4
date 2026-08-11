@@ -411,6 +411,20 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: None,
             fields: None,
         },
+        RunError::PrefixDidNotSettle(msg) => RunErrorPayload {
+            code: "ERR_PREFIX_DID_NOT_SETTLE".to_string(),
+            name: "Error".to_string(),
+            message: msg.clone(),
+            stack: None,
+            fields: None,
+        },
+        RunError::PrefixBridgeCall(msg) => RunErrorPayload {
+            code: "ERR_PREFIX_BRIDGE_CALL".to_string(),
+            name: "Error".to_string(),
+            message: msg.clone(),
+            stack: None,
+            fields: None,
+        },
         RunError::FunctionArgumentNotSupported => RunErrorPayload {
             code: "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED".to_string(),
             name: "Error".to_string(),

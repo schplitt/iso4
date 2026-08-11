@@ -565,6 +565,14 @@ pub enum RunError {
     /// Raised in session.rs when a PrefixRun global was not declared in Precompile.
     #[allow(dead_code)]
     UndeclaredBinding(String),
+    /// Prefix top-level evaluation stayed pending after draining the
+    /// microtask queue — it awaits something that can never resolve at
+    /// precompile time (a never-settling promise).
+    PrefixDidNotSettle(String),
+    /// Prefix code called a bridge callable (bridge global, shim handler, or
+    /// host-import function) at precompile time. No host session exists while
+    /// the snapshot is built, so the call can never be served.
+    PrefixBridgeCall(String),
     /// A function value was passed as a bridge argument.
     FunctionArgumentNotSupported,
     /// A bridge call payload (sandbox → host args) exceeded `limits.maxBridgeCallBytes`.
@@ -1583,6 +1591,13 @@ fn run_module_inner(
     })
 }
 
+/// Checkpoint bound for settling a prefix's top-level await. Every realistic
+/// prefix settles after one checkpoint (a checkpoint drains the whole queue);
+/// the bound exists so a never-settling promise fails cleanly instead of
+/// looping. Checkpoints on an empty queue are near-free, so the headroom
+/// costs nothing.
+const PREFIX_SETTLE_MAX_CHECKPOINTS: usize = 1000;
+
 /// Compile, instantiate, and evaluate prefix `code` as an ESM module in the
 /// current context, returning `Ok(())` once it settles successfully.
 ///
@@ -1602,7 +1617,11 @@ fn evaluate_prefix_module(
     // the snapshot context before evaluating the prefix, so prefix code sees
     // them and they are captured in the snapshot. Bridge stubs are NOT
     // installed here — they are re-created per run against a live socket.
+    // Their names get throwing placeholders instead, so a prefix that calls
+    // one fails with ERR_PREFIX_BRIDGE_CALL rather than an accidental
+    // ReferenceError/TypeError.
     install_value_globals(scope, globals)?;
+    install_prefix_bridge_placeholders(scope, globals, imports)?;
 
     let source_string = v8::String::new(scope, code)
         .ok_or_else(|| RunError::Internal("failed to intern module source".to_string()))?;
@@ -1649,12 +1668,17 @@ fn evaluate_prefix_module(
     let evaluation = match module.evaluate(scope) {
         Some(v) => v,
         None => {
+            if let Some(exception) = scope.exception() {
+                if let Some(err) = prefix_bridge_call_from_value(scope, exception) {
+                    return Err(err);
+                }
+            }
             return Err(RunError::RuntimeError(Box::new(RuntimeErrorData {
                 name: exception_name(scope),
                 message: exception_message(scope),
                 stack: exception_stack(scope),
                 fields: exception_fields(scope),
-            })))
+            })));
         }
     };
 
@@ -1662,15 +1686,33 @@ fn evaluate_prefix_module(
         let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
             RunError::Internal("failed to inspect module evaluation promise".to_string())
         })?;
+        // Any top-level `await` leaves the evaluation promise pending until
+        // the microtask queue is drained; the isolate runs under
+        // MicrotasksPolicy::Explicit, so drain it here. One checkpoint drains
+        // the whole queue, chained awaits included, so it settles everything
+        // that does not wait on an external event. The bound only caps a
+        // promise that can never settle — there is no bridge and no session
+        // at precompile time, so awaited host I/O never resolves.
+        for _ in 0..PREFIX_SETTLE_MAX_CHECKPOINTS {
+            if !matches!(promise.state(), v8::PromiseState::Pending) {
+                break;
+            }
+            scope.perform_microtask_checkpoint();
+        }
         match promise.state() {
             v8::PromiseState::Fulfilled => {}
             v8::PromiseState::Rejected => {
                 let rejection = promise.result(scope);
+                if let Some(err) = prefix_bridge_call_from_value(scope, rejection) {
+                    return Err(err);
+                }
                 return Err(runtime_error_from_value(scope, rejection));
             }
             v8::PromiseState::Pending => {
-                return Err(RunError::ExportNotSerializable(
-                    "module evaluation promise is still pending".to_string(),
+                return Err(RunError::PrefixDidNotSettle(
+                    "prefix top-level await never settled: nothing in the isolate can \
+                     resolve the awaited promise at precompile time"
+                        .to_string(),
                 ));
             }
         }
@@ -2790,6 +2832,26 @@ fn install_bridge_globals(
 const SHIM_FACTORY_SRC: &str =
     "(shim, handlerName) => (async (...args) => await shim(await globalThis[handlerName](...args)))";
 
+/// Marker property the prepare()-time bridge placeholders set on the errors
+/// they throw, so `evaluate_prefix_module` can map the rejection to
+/// `RunError::PrefixBridgeCall`. An ordinary property, not a `v8::Private` —
+/// the placeholders are plain JS (see below) and JS cannot create privates.
+/// Prefix code is host-authored setup, so spoofing is not a concern.
+/// Keep the name in sync with [`PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC`].
+const PREFIX_BRIDGE_CALL_MARKER: &str = "__iso4_prefix_bridge_call";
+
+/// Factory for prepare()-time bridge placeholders, evaluated as its own
+/// script. The placeholders must be plain JS closures: they are captured in
+/// the startup snapshot, and native callbacks would need external-reference
+/// table entries there. `kind` 0 is a named global; 1 is the host-import
+/// dispatch target, whose callable names are not known at install time.
+const PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC: &str = r#"(name, kind) => (...args) => {
+  const what = kind === 0 ? `bridge global '${name}'` : 'a host import function'
+  const e = new Error(`${what} cannot be called during prepare(): no host session exists at precompile time. Do the call in run() code instead.`)
+  e.__iso4_prefix_bridge_call = true
+  throw e
+}"#;
+
 /// Install the value globals — string expressions, data constants, and shim
 /// wrappers — natively on the sandbox global object. Plain bridge stubs are
 /// installed separately by [`install_bridge_globals`]; their defs are skipped
@@ -2890,6 +2952,76 @@ fn install_value_globals(
 
 /// Set `globalThis[name] = value` via the V8 API. The name is a property key,
 /// never code.
+/// Install throwing placeholders for every bridge callable a prefix could
+/// reach at prepare() time: plain bridge globals (public name), shim handler
+/// targets (`__iso4_<name>_h`), and the host-import dispatch global
+/// (`__iso4_call`). No host session exists at precompile time, so a bridge
+/// call can never be served — without these the failure shape is an
+/// accidental `ReferenceError`/`TypeError` suggesting the binding does not
+/// exist at all. With them, a call fails as `ERR_PREFIX_BRIDGE_CALL`, and
+/// `typeof fetch` inside a prefix matches what run() code sees.
+///
+/// The placeholders are captured in the snapshot; every run overwrites the
+/// same names with live socket-backed stubs (`install_bridge_globals`).
+fn install_prefix_bridge_placeholders(
+    scope: &mut v8::PinScope,
+    globals: &[HostGlobalDef],
+    imports: &[ImportBinding],
+) -> Result<(), RunError> {
+    // (install name, display name, kind) per the factory's parameters.
+    let mut targets: Vec<(String, String, i32)> = Vec::new();
+    for def in globals {
+        match def {
+            HostGlobalDef::Bridge { name } => {
+                check_not_reserved(name)?;
+                targets.push((name.clone(), name.clone(), 0));
+            }
+            HostGlobalDef::Shim {
+                name, handler_name, ..
+            } => targets.push((handler_name.clone(), name.clone(), 0)),
+            HostGlobalDef::StringExpr { .. } | HostGlobalDef::Data { .. } => {}
+        }
+    }
+    if imports
+        .iter()
+        .any(|binding| matches!(binding.module, ImportModule::Host(_)))
+    {
+        targets.push((
+            BRIDGE_DISPATCH_GLOBAL.to_string(),
+            BRIDGE_DISPATCH_GLOBAL.to_string(),
+            1,
+        ));
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let factory_value = eval_script(
+        scope,
+        PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC,
+        "<iso4:prefix-bridge-placeholder>",
+    )?;
+    let factory = v8::Local::<v8::Function>::try_from(factory_value).map_err(|_| {
+        RunError::Internal("placeholder factory did not evaluate to a function".to_string())
+    })?;
+    let receiver: v8::Local<v8::Value> = v8::undefined(scope).into();
+    for (install_name, display_name, kind) in targets {
+        let name_arg = v8::String::new(scope, &display_name).ok_or_else(|| {
+            RunError::Internal(format!("failed to intern placeholder name '{display_name}'"))
+        })?;
+        let kind_arg = v8::Integer::new(scope, kind);
+        let placeholder = factory
+            .call(scope, receiver, &[name_arg.into(), kind_arg.into()])
+            .ok_or_else(|| {
+                RunError::Internal(format!(
+                    "failed to build bridge placeholder for '{display_name}'"
+                ))
+            })?;
+        set_global(scope, &install_name, placeholder)?;
+    }
+    Ok(())
+}
+
 fn set_global(
     scope: &mut v8::PinScope,
     name: &str,
@@ -3074,6 +3206,23 @@ fn host_bridge_error_from_rejection(
         message,
         fields: error_fields_from_value(scope, value),
     })))
+}
+
+/// Map an exception carrying the prefix-bridge-call marker (thrown by the
+/// prepare()-time placeholders) to `RunError::PrefixBridgeCall`. Returns
+/// `None` for anything else.
+fn prefix_bridge_call_from_value(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Local<v8::Value>,
+) -> Option<RunError> {
+    let obj = value.to_object(scope)?;
+    let key = v8::String::new(scope, PREFIX_BRIDGE_CALL_MARKER)?;
+    if !obj.has_own_property(scope, key.into()).unwrap_or(false) {
+        return None;
+    }
+    let message = error_message_from_value(scope, value)
+        .unwrap_or_else(|| "bridge call during prepare()".to_string());
+    Some(RunError::PrefixBridgeCall(message))
 }
 
 fn install_console(scope: &mut v8::PinScope, buffers: *mut LogBuffers) -> Result<(), RunError> {
@@ -4978,6 +5127,212 @@ mod tests {
     fn precompile_runtime_error_is_reported() {
         let err = precompile(r#"throw new Error("prefix failed")"#, None, &[], &[]).unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
+    }
+
+    // GH #55: top-level `await` used to fail every prefix because nothing
+    // drained the microtask queue after module evaluation.
+
+    #[test]
+    fn precompile_top_level_await_settles() {
+        let snapshot = precompile(
+            "globalThis.a = await Promise.resolve(40)\n\
+             globalThis.b = await new Response('x').text()",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let out = execute_with_prefix(
+            snapshot.into(),
+            "export default [globalThis.a + 1, globalThis.b].join('|')",
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("41|x"));
+    }
+
+    #[test]
+    fn precompile_top_level_await_in_plain_exports_settles() {
+        // The common bundled-handler shapes: the awaited value lands in a
+        // module binding (or is discarded), not on globalThis. A prefix's
+        // namespace is discarded by design, so there is nothing for a postfix
+        // to observe — the point is that precompile itself succeeds. The
+        // failure never depended on where the value lands, only on the
+        // module evaluation promise.
+        for code in [
+            "export const a = await 1",
+            "export default await 1",
+            "const a = await 1",
+            "await 1",
+            "export default await (async () => 1)()",
+        ] {
+            let result = precompile(code, None, &[], &[]);
+            assert!(
+                result.is_ok(),
+                "prefix {code:?} failed: {:?}",
+                result.err().map(|f| f.error)
+            );
+        }
+    }
+
+    #[test]
+    fn precompile_imported_module_with_top_level_await_settles() {
+        // Top-level await inside an *imported* source module resolves as part
+        // of the same module-graph evaluation promise as the prefix itself.
+        let imports = [source_import(
+            "lib:config",
+            "export const config = await Promise.resolve({ level: 3 })",
+        )];
+        let snapshot = precompile(
+            "import { config } from 'lib:config'; globalThis.level = config.level",
+            None,
+            &[],
+            &imports,
+        )
+        .unwrap();
+        let out = execute_with_prefix(
+            snapshot.into(),
+            "export default globalThis.level",
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn precompile_chained_top_level_awaits_settle() {
+        // Chained awaits all resolve within one checkpoint — a checkpoint
+        // drains the whole queue, newly enqueued microtasks included.
+        let snapshot = precompile(
+            "let n = 0; for (let i = 0; i < 10; i++) { n = await Promise.resolve(n + 1) } \
+             globalThis.n = n",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let out = execute_with_prefix(
+            snapshot.into(),
+            "export default globalThis.n",
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("10"));
+    }
+
+    #[test]
+    fn precompile_rejected_top_level_await_is_runtime_error() {
+        let err = precompile(
+            r#"await Promise.reject(new Error("prefix rejected"))"#,
+            None,
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err.error, RunError::RuntimeError(_)));
+    }
+
+    #[test]
+    fn precompile_never_settling_prefix_fails_with_did_not_settle() {
+        let err = precompile("await new Promise(() => {})", None, &[], &[]).unwrap_err();
+        assert!(matches!(err.error, RunError::PrefixDidNotSettle(_)));
+    }
+
+    // Bridge callables exist at prepare() time as throwing placeholders:
+    // referencing them works, calling them is ERR_PREFIX_BRIDGE_CALL.
+
+    #[test]
+    fn precompile_calling_bridge_global_fails_with_prefix_bridge_call() {
+        let globals = [HostGlobalDef::bridge("fetch")];
+        // Awaited and fire-and-forget-at-top-level both throw synchronously
+        // inside the placeholder, before any await could park the module.
+        for code in [
+            "await fetch('https://example.com')",
+            "fetch('https://example.com')",
+        ] {
+            let err = precompile(code, None, &globals, &[]).unwrap_err();
+            match err.error {
+                RunError::PrefixBridgeCall(msg) => {
+                    assert!(msg.contains("bridge global 'fetch'"), "message: {msg}");
+                }
+                other => panic!("expected PrefixBridgeCall for {code:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn precompile_calling_shim_global_fails_with_prefix_bridge_call() {
+        let globals = [HostGlobalDef::Shim {
+            name: "fetch".to_string(),
+            shim: "(raw) => raw".to_string(),
+            handler_name: "__iso4_fetch_h".to_string(),
+        }];
+        let err = precompile("await fetch('https://example.com')", None, &globals, &[])
+            .unwrap_err();
+        match err.error {
+            // The placeholder sits under the handler name but reports the
+            // public name — the user called `fetch`, not `__iso4_fetch_h`.
+            RunError::PrefixBridgeCall(msg) => {
+                assert!(msg.contains("bridge global 'fetch'"), "message: {msg}");
+            }
+            other => panic!("expected PrefixBridgeCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn precompile_calling_host_import_function_fails_with_prefix_bridge_call() {
+        let imports = [host_import(
+            "tools:search",
+            vec![("query", HostModuleNode::Function)],
+        )];
+        let err = precompile(
+            "import { query } from 'tools:search'; await query('dogs')",
+            None,
+            &[],
+            &imports,
+        )
+        .unwrap_err();
+        assert!(matches!(err.error, RunError::PrefixBridgeCall(_)));
+    }
+
+    #[test]
+    fn precompile_bridge_global_is_visible_but_not_callable() {
+        // typeof matches run() code, and stashing a reference is fine — only
+        // the call is rejected.
+        let snapshot = precompile(
+            "globalThis.kind = typeof fetch",
+            None,
+            &[HostGlobalDef::bridge("fetch")],
+            &[],
+        )
+        .unwrap();
+        let out = execute_with_prefix(
+            snapshot.into(),
+            "export default globalThis.kind",
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("function"));
     }
 
     #[test]

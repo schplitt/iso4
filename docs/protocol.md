@@ -853,6 +853,8 @@ returns `PrecompileResult` and stores the snapshot in the Rust process under a
 | `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                             |
 | `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5. |
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                  |
+| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                  |
+| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function) at `Precompile` time. No host session exists while the snapshot is built.                         |
 | `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                                                                                                                                     |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                              |
 

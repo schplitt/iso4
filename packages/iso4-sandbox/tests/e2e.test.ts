@@ -323,6 +323,80 @@ describe('precompile + prefix.run()', () => {
     await prefix.dispose()
   })
 
+  test('prefix with top-level await settles and snapshots (GH #55)', async () => {
+    const prefix = await runtime.precompile({
+      code: `globalThis.a = await Promise.resolve(41)
+globalThis.b = await new Response('body').text()`,
+    })
+    const result = await prefix.run({
+      code: 'export default [globalThis.a + 1, globalThis.b].join("|")',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('42|body')
+    await prefix.dispose()
+  })
+
+  test('prefix with top-level await in plain exports settles (bundled-handler shape)', async () => {
+    // A prefix's module namespace is discarded by design, so these bindings
+    // are unobservable from a postfix — the point is that prepare() itself
+    // succeeds for the shapes bundled handlers commonly produce.
+    const prefix = await runtime.precompile({
+      code: `export const test = await 1
+export default await Promise.resolve(2)`,
+    })
+    const result = await prefix.run({ code: 'export default "ran"' })
+    expect(result.ok).toBe(true)
+    await prefix.dispose()
+  })
+
+  test('prefix importing a module with top-level await settles', async () => {
+    const prefix = await runtime.precompile({
+      code: `import { config } from 'lib:config'
+globalThis.retries = config.retries`,
+      imports: {
+        'lib:config': 'export const config = await Promise.resolve({ retries: 3 })',
+      },
+    })
+    const result = await prefix.run({ code: 'export default globalThis.retries' })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe(3)
+    await prefix.dispose()
+  })
+
+  test('prefix that never settles rejects with ERR_PREFIX_DID_NOT_SETTLE', async () => {
+    await expect(
+      runtime.precompile({ code: 'await new Promise(() => {})' }),
+    ).rejects.toMatchObject({ code: 'ERR_PREFIX_DID_NOT_SETTLE' })
+  })
+
+  test('prefix calling a declared bridge global rejects with ERR_PREFIX_BRIDGE_CALL', async () => {
+    // No host session exists at prepare() time — the declared global is
+    // visible (typeof matches run() code) but calling it must fail with the
+    // dedicated code, not a misleading ReferenceError.
+    await expect(
+      runtime.precompile({
+        code: 'await fetch("https://example.com")',
+        globals: { fetch: async () => ({ status: 200 }) },
+      }),
+    ).rejects.toMatchObject({ code: 'ERR_PREFIX_BRIDGE_CALL' })
+  })
+
+  test('prefix calling a host-import function rejects with ERR_PREFIX_BRIDGE_CALL', async () => {
+    await expect(
+      runtime.precompile({
+        code: `import { search } from 'tools:web'
+await search('dogs')`,
+        imports: {
+          'tools:web': { search: async () => [] },
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'ERR_PREFIX_BRIDGE_CALL' })
+  })
+
   test('prefix.alive is false after dispose', async () => {
     const prefix = await runtime.precompile({ code: '' })
     expect(prefix.alive).toBe(true)

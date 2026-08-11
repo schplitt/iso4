@@ -875,5 +875,18 @@ export type RunErrorCode
     | 'ERR_BRIDGE_PAYLOAD_TOO_LARGE'
     | 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED'
     | 'ERR_UNDECLARED_BINDING'
+    /**
+     * Prefix top-level evaluation never settled at `prepare()` time —
+     * nothing in the isolate can resolve the awaited promise while the
+     * snapshot is built.
+     */
+    | 'ERR_PREFIX_DID_NOT_SETTLE'
+    /**
+     * Prefix code called a bridge callable (bridge global, shim global, or
+     * host-import function) at `prepare()` time. No host session exists
+     * while the snapshot is built, so bridge calls in a prefix are not
+     * supported (yet) — do the call in `run()` code instead.
+     */
+    | 'ERR_PREFIX_BRIDGE_CALL'
     | 'ERR_PREFIX_DISPOSED'
     | 'ERR_INTERNAL'

@@ -217,7 +217,9 @@ Every call to `runtime.run(opts)`:
    - For source modules: compiles and caches the `v8::Module`.
    - For host-implemented modules: builds a synthetic module whose
      exports are stubs that bridge to the host.
-5. Rust evaluates the module. Top-level `await` works.
+5. Rust evaluates the module. Top-level `await` works. (In a prefix at
+   `prepare()` time it works as long as it settles without host I/O — see
+   §11.3.)
 6. Once evaluation settles, Rust copies the module namespace into a plain
    object and serializes it **once** as a V8 blob — `default` and every named
    export in one payload. Functions, promises, symbols, `WeakMap`s, and
@@ -1081,7 +1083,23 @@ finishes evaluating. That means:
 - **Forbidden:**
   - You cannot snapshot an isolate with pending Promises, in-flight bridge
     calls, or any external resource state. The prefix module must complete
-    evaluation (top-level await included) before the snapshot is taken.
+    evaluation before the snapshot is taken. Top-level `await` is fine as
+    long as it settles without host I/O: the runtime drains the microtask
+    queue after evaluation, which settles any await chain that doesn't wait
+    on an external event (`await 1`, `await Promise.resolve(x)`,
+    `await new Response(body).text()`, chained awaits).
+  - Prefix code cannot *call* the bridge. No host session exists at
+    `prepare()` time, so every declared bridge callable — bridge globals,
+    shim globals, host-import functions — is installed as a throwing
+    placeholder during precompile: it exists (`typeof fetch` matches what
+    run() code sees) and may be referenced, stashed, or closed over, but
+    calling it fails `prepare()` with `ERR_PREFIX_BRIDGE_CALL`. Whether
+    bridge calls at prepare() time ever become supported is a deliberate
+    future decision; the error code is the gate.
+  - A prefix whose evaluation promise can never settle (e.g.
+    `await new Promise(() => {})`) fails `prepare()` with
+    `ERR_PREFIX_DID_NOT_SETTLE`; the checkpoint loop is bounded, so it
+    cannot hang.
 
 ### 11.4 Rebinding rules
 
