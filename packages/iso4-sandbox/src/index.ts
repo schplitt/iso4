@@ -248,7 +248,7 @@ class SandboxImpl implements Sandbox {
   }
 
   /**
-   * Pre-compile a prefix of code into a V8 startup snapshot. See
+   * Validate and prepare a prefix for repeated runs. See
    * {@link Sandbox.prepare}.
    * @param options
    */
@@ -334,7 +334,7 @@ implements Prefix<G, M> {
    * `(specifier, path)`. Same rebinding rules as `defaultGlobals` — a
    * `prefix.run()` may override a subset of function leaves; everything else
    * falls back to these. Source modules and data leaves are frozen in the
-   * snapshot and not represented here. The declared shape itself lives with
+   * declared prefix state and not represented here. The declared shape itself lives with
    * the prefix in the Rust runtime, which enforces `ERR_UNDECLARED_BINDING`
    * for rebind attempts outside it.
    */
@@ -358,7 +358,7 @@ implements Prefix<G, M> {
   }
 
   /**
-   * Execute dynamic code against this prefix's snapshot. See
+   * Execute dynamic code against this prefix. See
    * {@link Prefix.execute}.
    * @param options
    */
@@ -393,7 +393,7 @@ implements Prefix<G, M> {
     }
     // Extract bridge globals, routing shimmed overrides to their private keys.
     // String/data globals and shim wrappers are already compiled into the
-    // snapshot — only the bridge stubs they call are re-installed per run.
+    // declared prefix state — only the bridge stubs they call are re-installed per run.
     const { defs, dispatch } = extractBridgeGlobals(
       (options.globals ?? {}) as RebindGlobals<HostGlobals>,
       this.defaultGlobals as HostGlobals,

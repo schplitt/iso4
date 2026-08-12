@@ -138,21 +138,31 @@ fn find_host_node<'a>(
     Some(node)
 }
 
-/// Snapshot + declared global / import shape for one precompiled prefix.
+/// Validated source + declared global / import shape for one prepared prefix.
+///
+/// Stored behind an `Arc` in the store so a `PrefixRun` takes a handle under
+/// the lock instead of deep-cloning the source and global defs on every run.
+/// Each run re-evaluates the source into its fresh context; there is no
+/// runtime snapshot (V8 14.x cannot create snapshots safely in a live
+/// multi-isolate process — #60/#61).
 pub struct PrefixData {
-    /// The V8 startup snapshot, held behind an `Arc` so a `PrefixRun` can take
-    /// a handle to it under the store lock instead of copying ~460 KB, and can
-    /// then hand that same handle to `CreateParams` without a second copy.
-    pub snapshot: Arc<[u8]>,
+    /// The prefix module source, exactly as validated at precompile time.
+    pub code: String,
+    /// Filename the prefix was declared with (module origin in stacks).
+    pub filename: Option<String>,
+    /// The full precompile-time global defs, replayed into every run's
+    /// context before the prefix evaluates (value globals as values, bridge
+    /// callables as throwing placeholders).
+    pub globals: Vec<ipc::HostGlobalDef>,
     /// Global names declared at precompile time. PrefixRun globals must be a
     /// subset of this set; extras are rejected with ERR_UNDECLARED_BINDING.
     pub declared_globals: Vec<String>,
-    /// Imports declared at precompile time. Re-used as-is on PrefixRun: source
-    /// modules and host data exports are frozen, and host import function
-    /// shape (specifier + name) must match what the snapshot was compiled
-    /// against. Run-time `imports` in the PrefixRun payload only carry
-    /// re-binding of host function handlers (TS dispatch); the wire-level
-    /// binding shape comes from here.
+    /// Imports declared at precompile time. Re-used as-is on PrefixRun:
+    /// source modules and host data exports are frozen at declaration, and
+    /// host import function shape (specifier + name) must match what the
+    /// prefix was validated against. Run-time `imports` in the PrefixRun
+    /// payload only carry re-binding of host function handlers (TS
+    /// dispatch); the wire-level binding shape comes from here.
     pub declared_imports: Vec<ipc::ImportBinding>,
 }
 
@@ -163,7 +173,7 @@ pub struct PrefixData {
 /// pool to route any run to any free slot.
 pub struct SharedState {
     /// Prefix data keyed by their string PrefixId.
-    pub prefix_store: Mutex<HashMap<String, PrefixData>>,
+    pub prefix_store: Mutex<HashMap<String, Arc<PrefixData>>>,
     /// Monotonically increasing counter for generating unique PrefixIds.
     pub next_prefix_id: AtomicU64,
     /// Auth token — must match the token sent in every Authenticate frame.
@@ -407,28 +417,27 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     &payload.globals,
                     &payload.imports,
                 ) {
-                    Ok(snapshot_bytes) => {
+                    Ok(()) => {
                         let prefix_id = shared
                             .next_prefix_id
                             .fetch_add(1, Ordering::Relaxed)
                             .to_string();
                         // Only bridge-backed globals are re-installable per run
-                        // (string/data globals and shim wrappers are frozen in
-                        // the snapshot). The declared set is the bridge stub
-                        // names a PrefixRun may re-bind; the undeclared-binding
-                        // check validates against it.
+                        // (string/data globals and shim wrappers are replayed
+                        // from the stored prefix defs). The declared set is the
+                        // bridge stub names a PrefixRun may re-bind; the
+                        // undeclared-binding check validates against it.
                         let declared_globals: Vec<String> = payload
                             .globals
                             .iter()
                             .filter_map(|g| g.bridge_stub_name().map(str::to_string))
                             .collect();
-                        let declared_imports = payload.imports.clone();
                         eprintln!(
                             "[iso4-v8] precompile succeeded — prefix_id={prefix_id} \
-                                 ({} snapshot bytes, {} declared globals, {} declared imports)",
-                            snapshot_bytes.len(),
+                                 ({} source bytes, {} declared globals, {} declared imports)",
+                            payload.code.len(),
                             declared_globals.len(),
-                            declared_imports.len(),
+                            payload.imports.len(),
                         );
                         // unwrap_or_else(|p| p.into_inner()): if a thread panicked
                         // while holding this lock, Rust marks the Mutex "poisoned"
@@ -444,11 +453,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             .unwrap_or_else(|p| p.into_inner())
                             .insert(
                                 prefix_id.clone(),
-                                PrefixData {
-                                    snapshot: snapshot_bytes,
+                                Arc::new(PrefixData {
+                                    code: payload.code,
+                                    filename: payload.filename,
+                                    globals: payload.globals,
                                     declared_globals,
-                                    declared_imports,
-                                },
+                                    declared_imports: payload.imports,
+                                }),
                             );
                         wire::encode_precompile_result_payload(Some(&prefix_id), None)
                     }
@@ -482,23 +493,17 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                 };
 
-                // `d.snapshot.clone()` is an `Arc` handle, so the store lock is
-                // held for three refcount bumps and two small Vec clones — not
-                // for a ~460 KB memcpy on every run of every slot.
-                let prefix_data_clone = shared
+                // An `Arc` handle, so the store lock is held for one refcount
+                // bump — not for a deep clone of the source and global defs on
+                // every run of every slot.
+                let prefix_data = shared
                     .prefix_store
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) // see poison comment above
                     .get(&payload.prefix_id)
-                    .map(|d| {
-                        (
-                            Arc::clone(&d.snapshot),
-                            d.declared_globals.clone(),
-                            d.declared_imports.clone(),
-                        )
-                    });
+                    .map(Arc::clone);
 
-                let result_payload = match prefix_data_clone {
+                let result_payload = match prefix_data {
                     None => {
                         eprintln!(
                             "[iso4-v8] PrefixRun {} — prefix_id={} not found",
@@ -525,16 +530,17 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             }),
                         )
                     }
-                    Some((snapshot_bytes, declared_globals, declared_imports)) => {
+                    Some(prefix_data) => {
                         // ── ERR_UNDECLARED_BINDING check ─────────────────────────────────
                         // Every global in payload.globals must have been declared at
                         // precompile time. Adding a new name at run time would silently
-                        // mutate the snapshot's global object shape, breaking the
-                        // invariant that the prefix captures the full bridge surface.
-                        // The same rule covers host-import rebinds: only function
-                        // leaves declared at precompile time may be re-pointed.
+                        // widen the global surface the prefix was validated against,
+                        // breaking the invariant that the prefix declares the full
+                        // bridge surface. The same rule covers host-import rebinds:
+                        // only function leaves declared at precompile time may be
+                        // re-pointed.
                         let declared_set: std::collections::HashSet<&str> =
-                            declared_globals.iter().map(String::as_str).collect();
+                            prefix_data.declared_globals.iter().map(String::as_str).collect();
                         let violation: Option<String> = payload
                             .globals
                             .iter()
@@ -544,8 +550,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 format!("global '{name}' was not declared at precompile time")
                             })
                             .or_else(|| {
-                                validate_import_rebinds(&payload.import_rebinds, &declared_imports)
-                                    .err()
+                                validate_import_rebinds(
+                                    &payload.import_rebinds,
+                                    &prefix_data.declared_imports,
+                                )
+                                .err()
                             });
                         if let Some(msg) = violation {
                             eprintln!(
@@ -573,23 +582,30 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             // PrefixRun reuses the declared imports shape
                             // verbatim — rebinds only re-point host function
                             // handlers on the TS side (data exports + source
-                            // modules are frozen in the snapshot), validated
+                            // modules are frozen at declaration), validated
                             // above. Every run global here is a bridge stub to
                             // re-install (string/data globals and shim
-                            // wrappers live in the snapshot).
-                            let stream_fd =
-                                if needs_bridge_stub(&payload.globals, &declared_imports) {
-                                    Some(stream.as_raw_fd())
-                                } else {
-                                    None
-                                };
+                            // wrappers are replayed from the stored prefix
+                            // defs during prefix evaluation).
+                            let stream_fd = if needs_bridge_stub(
+                                &payload.globals,
+                                &prefix_data.declared_imports,
+                            ) {
+                                Some(stream.as_raw_fd())
+                            } else {
+                                None
+                            };
                             trace!(
                             "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports)",
                             payload.run_id, payload.prefix_id, payload.code.len(),
-                            payload.globals.len(), declared_imports.len(),
+                            payload.globals.len(), prefix_data.declared_imports.len(),
                         );
                             match sandbox::execute_with_prefix(
-                                snapshot_bytes,
+                                sandbox::PrefixSpec {
+                                    code: &prefix_data.code,
+                                    filename: prefix_data.filename.as_deref().unwrap_or("<prefix>"),
+                                    globals: &prefix_data.globals,
+                                },
                                 &payload.code,
                                 payload.filename.as_deref(),
                                 sandbox::Limits {
@@ -603,7 +619,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     max_bridge_calls: payload.limits.max_bridge_calls,
                                 },
                                 &payload.globals,
-                                &declared_imports,
+                                &prefix_data.declared_imports,
                                 stream_fd,
                                 Arc::clone(&call_id_counter),
                             ) {

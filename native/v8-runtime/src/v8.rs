@@ -621,15 +621,33 @@ pub fn execute(
     )
 }
 
-/// Execute a postfix against a pre-compiled prefix snapshot.
+/// The prefix a run evaluates before its postfix: validated source plus the
+/// globals declared at `prepare()` time, replayed into the fresh context.
 ///
-/// `globals` here are all `HostGlobalDef::Bridge` stubs re-installed fresh and
-/// bound to `stream_fd` for this run. Bridge stubs are never part of the
-/// snapshot — they are always installed from scratch at run time. String/data
-/// globals and shim wrappers are already baked into the snapshot and are not
-/// re-sent.
+/// Runtime snapshots used to carry this state (prefix heap frozen once,
+/// restored per run). V8 14.x removed the ground that stood on: snapshot
+/// creation mutates the process-shared read-only heap and the shared
+/// artifacts die with the last isolate, so runtime `create_blob` is only
+/// safe in the single-isolate, single-shot workflow V8 itself uses
+/// (issue #60, decision in #61). The prefix is now re-evaluated per run.
+#[derive(Clone, Copy)]
+pub struct PrefixSpec<'a> {
+    pub code: &'a str,
+    pub filename: &'a str,
+    /// The full `prepare()`-time global defs — value globals installed before
+    /// the prefix evaluates, bridge callables as throwing placeholders.
+    pub globals: &'a [HostGlobalDef],
+}
+
+/// Execute a postfix against a prepared prefix.
+///
+/// The prefix source is evaluated into the fresh context first (under the
+/// run's limits), then `globals` — all `HostGlobalDef::Bridge` stubs bound to
+/// `stream_fd` for this run — overwrite the prefix-time placeholders, then
+/// the postfix runs. String/data globals and shim wrappers are replayed from
+/// `prefix.globals` and are not re-sent per run.
 pub fn execute_with_prefix(
-    snapshot_bytes: Arc<[u8]>,
+    prefix: PrefixSpec<'_>,
     code: &str,
     filename: Option<&str>,
     limits: Limits,
@@ -642,7 +660,7 @@ pub fn execute_with_prefix(
     run_module(
         code,
         filename.unwrap_or("<iso4>"),
-        Some(snapshot_bytes),
+        Some(prefix),
         limits,
         globals,
         imports,
@@ -651,83 +669,36 @@ pub fn execute_with_prefix(
     )
 }
 
-static BASE_SNAPSHOT: OnceLock<Arc<[u8]>> = OnceLock::new();
-
-/// A snapshot containing nothing but the web runtime.
-///
-/// A run without a prefix restores this instead of evaluating
-/// `webtypes::install` into a fresh context. Installing costs ~0.535 ms —
-/// measured — and it was being paid on every `sandbox.run()`, which showed up as
-/// an 11 % regression on the `hot run > direct` benchmark. Restoring a snapshot
-/// is the same work the prefix path already does.
-///
-/// Built once per process, lazily, so a host that only ever uses prefixes never
+/// Validate prefix code: compile, instantiate, and evaluate it exactly as a
+/// run will, in a throwaway isolate, so `prepare()` rejects a broken prefix
+/// (syntax error, unresolved import, throwing top-level code) before any run
 /// pays for it.
-fn base_snapshot() -> Option<Arc<[u8]>> {
-    BASE_SNAPSHOT
-        .get_or_init(|| {
-            // An empty prefix: `precompile_module` installs the web runtime on
-            // the snapshot path already.
-            match precompile_module("", "<iso4:base>", &[], &[]) {
-                Ok(bytes) => Arc::from(bytes),
-                // A failure here is a runtime bug, not a user error. Fall back
-                // to per-run installation rather than failing the run.
-                Err(_) => Arc::from(Vec::new()),
-            }
-        })
-        .clone()
-        .pipe_non_empty()
-}
-
-/// `None` for the empty placeholder the fallback above stores.
-trait PipeNonEmpty {
-    fn pipe_non_empty(self) -> Option<Arc<[u8]>>;
-}
-
-impl PipeNonEmpty for Arc<[u8]> {
-    fn pipe_non_empty(self) -> Option<Arc<[u8]>> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(self)
-        }
-    }
-}
-
-/// Compile prefix code into a V8 startup snapshot blob.
-///
-/// Returns the raw snapshot bytes on success. The bytes can be stored and
-/// passed to `execute_with_prefix` for many subsequent postfix runs.
-///
-/// Note: `console` is **not** available inside prefix code - native callbacks
-/// cannot be snapshotted without `ExternalReferences` (a Phase 2 concern).
-/// Prefix code that calls `console.*` will receive a `TypeError`.
 ///
 /// No execution-time limits are applied: prefix code is host-authored and
-/// trusted. If execution limits are needed for snapshot creation in future,
-/// add an optional `limits: Limits` parameter here.
+/// trusted. Runs re-evaluate the prefix under their own limits.
 pub fn precompile(
     code: &str,
     filename: Option<&str>,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-) -> Result<Arc<[u8]>, FailureOutput> {
+) -> Result<(), FailureOutput> {
     init_platform();
-    precompile_module(code, filename.unwrap_or("<prefix>"), globals, imports).map(Arc::from)
+    validate_prefix_module(code, filename.unwrap_or("<prefix>"), globals, imports)
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
 /// inspect the module namespace object for `default` and named exports.
 ///
-/// When `snapshot` is `Some(bytes)`, the isolate is created from that V8
-/// startup snapshot so the prefix context is restored before postfix code runs.
-/// When `globals` is non-empty, bridge stubs are installed for each name.
+/// When `prefix` is `Some`, its source is evaluated into the fresh context
+/// (value globals + throwing bridge placeholders first) before postfix code
+/// runs. When `globals` is non-empty, live bridge stubs are installed for
+/// each name, overwriting any same-named prefix placeholder.
 /// `stream_fd` is the raw file-descriptor of the session socket; it is used
 /// only during bridge calls and is never closed by this function.
 fn run_module(
     code: &str,
     filename: &str,
-    snapshot: Option<Arc<[u8]>>,
+    prefix: Option<PrefixSpec<'_>>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
@@ -744,7 +715,7 @@ fn run_module(
     let mut result = run_module_inner(
         code,
         filename,
-        snapshot,
+        prefix,
         limits,
         globals,
         imports,
@@ -776,7 +747,7 @@ fn run_module(
 fn run_module_inner(
     code: &str,
     filename: &str,
-    snapshot: Option<Arc<[u8]>>,
+    prefix: Option<PrefixSpec<'_>>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
@@ -796,19 +767,6 @@ fn run_module_inner(
         max_stderr_bytes: limits.max_stderr_bytes,
         ..LogBuffers::default()
     };
-
-    // A prefix snapshot already contains the web globals, so restoring one must
-    // not reinstall them: that would burn per-run time re-evaluating the
-    // runtime source and hand user code different class identities than the
-    // prefix captured.
-    //
-    // With no prefix we restore the base snapshot, which contains the runtime
-    // and nothing else — far cheaper than evaluating it (see `base_snapshot`).
-    let snapshot = match snapshot {
-        Some(bytes) => Some(bytes),
-        None => base_snapshot(),
-    };
-    let restores_snapshot = snapshot.is_some();
 
     // `reason` is created before the isolate so it can be shared with the
     // ArrayBuffer allocator (which is registered in CreateParams, before the
@@ -830,30 +788,7 @@ fn run_module_inner(
     };
 
     let mut isolate = {
-        // `snapshot_blob` takes a `StartupData`, which can only wrap a
-        // `Cow<'static, [u8]>` or a C++-owned pointer — the `Arc` variant of
-        // the old `Allocated<[u8]>` trait is gone. So the prefix blob is copied
-        // here, once per isolate, instead of having its handle cloned. V8
-        // requires the blob to outlive the isolate; the copy moves into
-        // `CreateParams` and then into the isolate, which is what keeps it
-        // alive.
-        //
-        // This costs a memcpy of the snapshot (~530 KB today) on every
-        // prefix run — see `exec/snapshot_restore`. Avoiding it means handing
-        // V8 a `Cow::Borrowed` over the cached `Arc`, which is only sound if a
-        // prefix cannot be disposed while a run holds it; that invariant is not
-        // established today, so the copy stays.
-        let params = match snapshot {
-            None => v8::Isolate::create_params(),
-            Some(bytes) => v8::Isolate::create_params().snapshot_blob(bytes.to_vec().into()),
-        };
-        // MANDATORY, and it moves in lockstep with the `snapshot_creator` call
-        // in `precompile_module`. A snapshot containing native callbacks that
-        // is restored without the table does not fail cleanly: `typeof Response`
-        // still reports "function", then the process dies with
-        // `V8_Fatal: No external references provided via API` on the first
-        // `new Response()`.
-        let params = params.external_references(crate::webtypes::external_references().into());
+        let params = v8::Isolate::create_params();
         // Cap the V8 heap (strings, plain objects). The near-heap callback
         // converts a heap-OOM into a clean terminate_execution().
         let params = if limits.memory_mb > 0 {
@@ -978,17 +913,28 @@ fn run_module_inner(
     install_console(scope, &mut logs as *mut LogBuffers)
         .map_err(|error| failure(error, &logs, start))?;
 
-    // Web globals (Headers/Request/Response/URL/TextEncoder/…). Only for a
-    // fresh context: a restored prefix brings its own, already snapshotted.
-    if !restores_snapshot {
-        crate::webtypes::install(scope)
-            .map_err(|e| failure(RunError::Internal(e), &logs, start))?;
-    }
+    // Web globals (Headers/Request/Response/URL/TextEncoder/…).
+    crate::webtypes::install(scope).map_err(|e| failure(RunError::Internal(e), &logs, start))?;
 
     // Install AsyncLocalStorage (importable via `node:async_hooks`) for this
     // run. Always installed: it registers no promise hooks, so runs that never
     // use it pay only for the class setup, not per-promise overhead.
     install_async_context(scope).map_err(|error| failure(error, &logs, start))?;
+
+    // ── Prefix evaluation ────────────────────────────────────────────────────
+    //
+    // The prefix runs before the bridge exists, exactly as it did at
+    // prepare() time when prefixes were snapshotted: its value globals are
+    // installed first, its bridge callables are throwing placeholders
+    // (ERR_PREFIX_BRIDGE_CALL), and node:async_hooks is not resolvable. The
+    // live stubs installed below overwrite the placeholder names for the
+    // postfix. Runs under the run's wall/CPU guards — a prefix that loops
+    // now costs the run its budget instead of hanging prepare().
+    if let Some(prefix) = &prefix {
+        v8::tc_scope!(let tc, scope);
+        evaluate_prefix_module(tc, prefix.code, prefix.filename, prefix.globals, imports)
+            .map_err(|error| failure(error, &logs, start))?;
+    }
 
     // ── Bridge globals setup ─────────────────────────────────────────────────
     //
@@ -1060,9 +1006,9 @@ fn run_module_inner(
     }
 
     // Install the value globals (string exprs, constants, shim wrappers)
-    // natively. For a direct run these arrive here; for a PrefixRun they are
-    // already baked into the snapshot, so `globals` carries only bridge stubs
-    // and this is a no-op.
+    // natively. For a direct run these arrive here; for a PrefixRun they were
+    // replayed from the prefix defs during prefix evaluation above, so
+    // `globals` carries only bridge stubs and this is a no-op.
     install_value_globals(scope, globals).map_err(|e| failure(e, &logs, start))?;
 
     v8::tc_scope!(let scope, scope);
@@ -1613,13 +1559,12 @@ fn evaluate_prefix_module(
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
 ) -> Result<(), RunError> {
-    // Install the value globals (string exprs, constants, shim wrappers) into
-    // the snapshot context before evaluating the prefix, so prefix code sees
-    // them and they are captured in the snapshot. Bridge stubs are NOT
-    // installed here — they are re-created per run against a live socket.
-    // Their names get throwing placeholders instead, so a prefix that calls
-    // one fails with ERR_PREFIX_BRIDGE_CALL rather than an accidental
-    // ReferenceError/TypeError.
+    // Install the value globals (string exprs, constants, shim wrappers)
+    // before evaluating the prefix, so prefix code sees them. Bridge stubs
+    // are NOT installed here — they are created against a live socket only
+    // for the postfix stage. Their names get throwing placeholders instead,
+    // so a prefix that calls one fails with ERR_PREFIX_BRIDGE_CALL rather
+    // than an accidental ReferenceError/TypeError.
     install_value_globals(scope, globals)?;
     install_prefix_bridge_placeholders(scope, globals, imports)?;
 
@@ -1691,8 +1636,8 @@ fn evaluate_prefix_module(
         // MicrotasksPolicy::Explicit, so drain it here. One checkpoint drains
         // the whole queue, chained awaits included, so it settles everything
         // that does not wait on an external event. The bound only caps a
-        // promise that can never settle — there is no bridge and no session
-        // at precompile time, so awaited host I/O never resolves.
+        // promise that can never settle — the bridge does not exist while a
+        // prefix evaluates, so awaited host I/O never resolves.
         for _ in 0..PREFIX_SETTLE_MAX_CHECKPOINTS {
             if !matches!(promise.state(), v8::PromiseState::Pending) {
                 break;
@@ -1721,99 +1666,42 @@ fn evaluate_prefix_module(
     Ok(())
 }
 
-/// Compile and snapshot prefix code into a raw V8 startup blob.
+/// Validate prefix code in a throwaway regular isolate: compile + instantiate
+/// + evaluate exactly as a run will. Any failure (syntax error, unresolved
+/// import, throwing top-level code) returns a clean error at `prepare()` time
+/// instead of on the first run.
 ///
-/// Runs in two passes:
-///   1. **Validation** in a throwaway regular isolate: compile + instantiate +
-///      evaluate exactly as the snapshot pass will. Any failure (syntax error,
-///      unresolved import, throwing top-level code) returns a clean error here.
-///   2. **Snapshot** in a `snapshot_creator` isolate, only reached if pass 1
-///      succeeded.
-///
-/// The two passes exist because `create_blob` **must** be called before a
-/// snapshot-creator isolate is dropped (the binding asserts it), yet calling it
-/// after a failed `instantiate_module` segfaults V8 — the creator must only
-/// ever see code known to be valid. A regular isolate, by contrast, fails an
-/// instantiate as a recoverable error, so it's the only safe place to find out
-/// whether the prefix is snapshot-able. Prefix code is host-authored setup with
-/// no bridge/network side effects, so evaluating it twice is safe.
-///
-/// TODO(async-context PR): revisit whether the validation pass can be made
-/// cheaper (e.g. compile + resolve the full import graph without a second
-/// eval, or recover a snapshot creator after a failed instantiate) instead of
-/// running the prefix twice. Blocked on there being no V8 "dry-run instantiate"
-/// and imports being transitive, so a static check can't see the whole graph.
-fn precompile_module(
+/// The environment matches a run's prefix stage — web globals installed,
+/// value globals + throwing bridge placeholders, no `node:async_hooks` — so
+/// what validates here evaluates identically per run. Prefix code is
+/// host-authored setup with no bridge/network side effects, so evaluating it
+/// here and again on every run is safe.
+fn validate_prefix_module(
     code: &str,
     filename: &str,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-) -> Result<Vec<u8>, FailureOutput> {
+) -> Result<(), FailureOutput> {
     let start = std::time::Instant::now();
     let logs = LogBuffers::default();
 
-    // Pass 1 creates a regular isolate, which requires the platform to be
-    // initialized. `precompile()` already does this, but call it here too so
-    // direct callers (tests) work; it is idempotent.
+    // A regular isolate requires the platform to be initialized.
+    // `precompile()` already does this, but call it here too so direct
+    // callers (tests) work; it is idempotent.
     init_platform();
 
-    // ── Pass 1: validate in a throwaway regular isolate ──────────────────────
-    {
-        let mut isolate = v8::Isolate::new(Default::default());
-        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-        isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
-        v8::scope!(let scope, &mut isolate);
-        let context = v8::Context::new(scope, Default::default());
-        let scope = &mut v8::ContextScope::new(scope, context);
-        // Same environment as pass 2 and as a run, so prefix code that touches
-        // a web global is validated rather than dying only at snapshot time.
-        crate::webtypes::install(scope)
-            .map_err(|e| failure(RunError::Internal(e), &logs, start))?;
-        v8::tc_scope!(let scope, scope);
-        evaluate_prefix_module(scope, code, filename, globals, imports)
-            .map_err(|error| failure(error, &logs, start))?;
-    }
-
-    // ── Pass 2: build the snapshot ───────────────────────────────────────────
-    // Validation passed, so instantiate/evaluate succeed here and create_blob
-    // is safe. All V8 scopes must drop before create_blob, hence the IIFE.
-    // The external-reference table must match the one `run_module` passes when
-    // restoring — see the comment there.
-    let mut isolate =
-        v8::Isolate::snapshot_creator(Some(crate::webtypes::external_references().into()), None);
+    let mut isolate = v8::Isolate::new(Default::default());
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
-
-    let compile_result: Result<(), FailureOutput> = (|| {
-        v8::scope!(let scope, &mut isolate);
-        let context = v8::Context::new(scope, Default::default());
-        let scope = &mut v8::ContextScope::new(scope, context);
-        // Mark this context as the snapshot default BEFORE creating TryCatch.
-        scope.set_default_context(context);
-        // Installed before the prefix runs so the classes are captured in the
-        // snapshot; every later run restores them for free.
-        crate::webtypes::install(scope)
-            .map_err(|e| failure(RunError::Internal(e), &logs, start))?;
-        v8::tc_scope!(let scope, scope);
-        evaluate_prefix_module(scope, code, filename, globals, imports)
-            .map_err(|error| failure(error, &logs, start))
-    })();
-
-    // V8 requires create_blob before dropping a snapshot-creator isolate.
-    let snapshot_opt = isolate.create_blob(v8::FunctionCodeHandling::Keep);
-
-    compile_result?;
-
-    snapshot_opt
-        .map(|s| s.to_vec())
-        .ok_or_else(|| FailureOutput {
-            error: RunError::Internal("V8 snapshot creation returned an empty blob".to_string()),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms: elapsed_ms(start),
-            cpu_time_ms: 0.0,
-            bridge_calls: Vec::new(),
-        })
+    v8::scope!(let scope, &mut isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    // Same environment as a run, so prefix code that touches a web global is
+    // validated here rather than failing on the first run.
+    crate::webtypes::install(scope).map_err(|e| failure(RunError::Internal(e), &logs, start))?;
+    v8::tc_scope!(let scope, scope);
+    evaluate_prefix_module(scope, code, filename, globals, imports)
+        .map_err(|error| failure(error, &logs, start))
 }
 
 /// Wall-clock elapsed time since `start` in milliseconds, rounded to
@@ -1882,9 +1770,10 @@ struct ResolverContext {
     resolve_error: Option<RunError>,
     /// When true, the reserved specifier `node:async_hooks` resolves to the
     /// built-in `AsyncLocalStorage` module (see [`install_async_context`]).
-    /// Enabled for runs (`run_module`), disabled for snapshot creation
-    /// (`precompile_module`) because the native async-context bindings cannot
-    /// be captured in a V8 startup snapshot.
+    /// Enabled for postfix code (`run_module`), disabled while a prefix
+    /// evaluates (`validate_prefix_module` and the prefix stage of a run) —
+    /// prefix code predates the per-run async-context machinery, a contract
+    /// kept from the snapshot era so prefixes behave identically.
     async_context_builtin: bool,
 }
 
@@ -4738,9 +4627,9 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_infinite_loop_is_killed() {
-        let snapshot = precompile("globalThis.base = 10", None, &[], &[]).unwrap();
+        let prefix = prepared("globalThis.base = 10", &[], &[]);
         let err = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "while (true) {}",
             None,
             Limits {
@@ -5109,12 +4998,27 @@ mod tests {
         assert!(out.duration_ms < 5_000.0);
     }
 
-    // ── Precompile / snapshots ──────────────────────────────────────────────
+    // ── Precompile / prefixes ───────────────────────────────────────────────
+
+    /// prepare()-shaped helper: validate `code` exactly as `precompile` does,
+    /// then hand back the spec a run replays — mirroring what session.rs
+    /// stores per prefix.
+    fn prepared<'a>(
+        code: &'a str,
+        globals: &'a [HostGlobalDef],
+        imports: &[ImportBinding],
+    ) -> PrefixSpec<'a> {
+        precompile(code, None, globals, imports).expect("prefix must validate");
+        PrefixSpec {
+            code,
+            filename: "<prefix>",
+            globals,
+        }
+    }
 
     #[test]
-    fn precompile_returns_non_empty_snapshot_bytes() {
-        let bytes = precompile("const x = 1", None, &[], &[]).unwrap();
-        assert!(!bytes.is_empty());
+    fn precompile_accepts_a_valid_prefix() {
+        precompile("const x = 1", None, &[], &[]).unwrap();
     }
 
     #[test]
@@ -5134,16 +5038,14 @@ mod tests {
 
     #[test]
     fn precompile_top_level_await_settles() {
-        let snapshot = precompile(
+        let prefix = prepared(
             "globalThis.a = await Promise.resolve(40)\n\
              globalThis.b = await new Response('x').text()",
-            None,
             &[],
             &[],
-        )
-        .unwrap();
+        );
         let out = execute_with_prefix(
-            snapshot.into(),
+            prefix,
             "export default [globalThis.a + 1, globalThis.b].join('|')",
             None,
             Limits::default(),
@@ -5188,20 +5090,18 @@ mod tests {
             "lib:config",
             "export const config = await Promise.resolve({ level: 3 })",
         )];
-        let snapshot = precompile(
+        let prefix = prepared(
             "import { config } from 'lib:config'; globalThis.level = config.level",
-            None,
             &[],
             &imports,
-        )
-        .unwrap();
+        );
         let out = execute_with_prefix(
-            snapshot.into(),
+            prefix,
             "export default globalThis.level",
             None,
             Limits::default(),
             &[],
-            &[],
+            &imports,
             None,
             Arc::new(AtomicU32::new(0)),
         )
@@ -5213,16 +5113,14 @@ mod tests {
     fn precompile_chained_top_level_awaits_settle() {
         // Chained awaits all resolve within one checkpoint — a checkpoint
         // drains the whole queue, newly enqueued microtasks included.
-        let snapshot = precompile(
+        let prefix = prepared(
             "let n = 0; for (let i = 0; i < 10; i++) { n = await Promise.resolve(n + 1) } \
              globalThis.n = n",
-            None,
             &[],
             &[],
-        )
-        .unwrap();
+        );
         let out = execute_with_prefix(
-            snapshot.into(),
+            prefix,
             "export default globalThis.n",
             None,
             Limits::default(),
@@ -5314,15 +5212,10 @@ mod tests {
     fn precompile_bridge_global_is_visible_but_not_callable() {
         // typeof matches run() code, and stashing a reference is fine — only
         // the call is rejected.
-        let snapshot = precompile(
-            "globalThis.kind = typeof fetch",
-            None,
-            &[HostGlobalDef::bridge("fetch")],
-            &[],
-        )
-        .unwrap();
+        let globals = [HostGlobalDef::bridge("fetch")];
+        let prefix = prepared("globalThis.kind = typeof fetch", &globals, &[]);
         let out = execute_with_prefix(
-            snapshot.into(),
+            prefix,
             "export default globalThis.kind",
             None,
             Limits::default(),
@@ -5339,9 +5232,9 @@ mod tests {
     fn execute_with_prefix_basic_postfix() {
         // Module-scoped `const` stays in the prefix module's scope.
         // Use globalThis to share values with the postfix module.
-        let snapshot = precompile("globalThis.base = 100", None, &[], &[]).unwrap();
+        let prefix = prepared("globalThis.base = 100", &[], &[]);
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "export default globalThis.base + 1",
             None,
             Limits::default(),
@@ -5354,22 +5247,18 @@ mod tests {
         assert_eq!(get_default(&out).as_deref(), Some("101"));
     }
 
-    /// The load-bearing test for the whole design: the web classes are native
-    /// `FunctionTemplate`s, so they only survive a startup snapshot because
-    /// `precompile_module` and `run_module` pass the same `ExternalReferences`
-    /// table. Get that wrong and this test does not fail politely — the process
-    /// aborts with `V8_Fatal: No external references provided via API`.
+    /// The web classes are native `FunctionTemplate`s installed fresh into
+    /// every run's context; a closure the prefix creates over them must still
+    /// work when the postfix stage of the same run calls it.
     #[test]
-    fn web_globals_survive_a_prefix_snapshot() {
-        let snapshot = precompile(
+    fn web_globals_are_usable_from_prefix_code() {
+        let prefix = prepared(
             "globalThis.mk = () => new Response('hi', { status: 201 })",
-            None,
             &[],
             &[],
-        )
-        .unwrap();
+        );
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "const r = globalThis.mk(); \
              export default [r instanceof Response, r.status, r.headers.get('content-type')].join('|')",
             None,
@@ -5386,24 +5275,24 @@ mod tests {
         );
     }
 
-    /// Regression test for a process-level crash: a snapshot containing a live
-    /// instance used to segfault.
-    ///
-    /// `rusty_v8`'s snapshot callback reads every embedder field as an aligned
-    /// pointer and memcpy's out of it, so the type tag must never be stored
-    /// there (see `webtypes.rs`). This is the case the original spike missed —
-    /// it snapshotted the *classes* but never an *instance*.
+    /// A live web-type instance created by prefix code must be visible to
+    /// the postfix stage of the run (and validate cleanly at prepare() time).
     #[test]
-    fn a_live_instance_can_be_captured_in_a_snapshot() {
+    fn a_live_instance_in_the_prefix_is_visible_to_the_postfix() {
         for expr in [
             "new Response('x', { status: 201 })",
             "new Request('https://ex.com/a')",
             "new Headers([['content-type', 'text/plain']])",
         ] {
-            let snapshot = precompile(&format!("globalThis.v = {expr}"), None, &[], &[])
+            let prefix_src = format!("globalThis.v = {expr}");
+            precompile(&prefix_src, None, &[], &[])
                 .unwrap_or_else(|_| panic!("precompile with a live {expr} must not fail"));
             let out = execute_with_prefix(
-                snapshot.clone().into(),
+                PrefixSpec {
+                    code: &prefix_src,
+                    filename: "<prefix>",
+                    globals: &[],
+                },
                 "export default typeof globalThis.v",
                 None,
                 Limits::default(),
@@ -5412,19 +5301,18 @@ mod tests {
                 None,
                 Arc::new(AtomicU32::new(0)),
             )
-            .unwrap_or_else(|_| panic!("run against a snapshot holding {expr} must not fail"));
+            .unwrap_or_else(|_| panic!("run with a prefix holding {expr} must not fail"));
             assert_eq!(get_default(&out).as_deref(), Some("object"), "{expr}");
         }
     }
 
-    /// A postfix constructing a `Response` against classes restored from the
-    /// snapshot must still serialize through the host-object path on the way
-    /// out — i.e. the internal fields survived the snapshot too.
+    /// A postfix constructing a `Response` in a prefix run must still
+    /// serialize through the host-object path on the way out.
     #[test]
-    fn a_response_built_after_snapshot_restore_still_serializes() {
-        let snapshot = precompile("", None, &[], &[]).unwrap();
+    fn a_response_built_in_a_prefix_run_still_serializes() {
+        let prefix = prepared("", &[], &[]);
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "export default new Response('body', { status: 418, headers: { 'x-a': 'b' } })",
             None,
             Limits::default(),
@@ -5442,9 +5330,9 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_global_mutation_visible_in_postfix() {
-        let snapshot = precompile("globalThis.answer = 42", None, &[], &[]).unwrap();
+        let prefix = prepared("globalThis.answer = 42", &[], &[]);
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "export default globalThis.answer",
             None,
             Limits::default(),
@@ -5459,10 +5347,10 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_multiple_postfixes_are_independent() {
-        let snapshot = precompile("globalThis.base = 10", None, &[], &[]).unwrap();
+        let prefix = prepared("globalThis.base = 10", &[], &[]);
         let b = "globalThis.base";
         let out1 = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             &format!("export default {b} * 2"),
             None,
             Limits::default(),
@@ -5473,7 +5361,7 @@ mod tests {
         )
         .unwrap();
         let out2 = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             &format!("export default {b} * 3"),
             None,
             Limits::default(),
@@ -5484,7 +5372,7 @@ mod tests {
         )
         .unwrap();
         let out3 = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             &format!("export default {b} * 4"),
             None,
             Limits::default(),
@@ -5501,9 +5389,9 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
-        let snapshot = precompile("globalThis.counter = 0", None, &[], &[]).unwrap();
+        let prefix = prepared("globalThis.counter = 0", &[], &[]);
         execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "globalThis.counter = 99; export default 1",
             None,
             Limits::default(),
@@ -5514,7 +5402,7 @@ mod tests {
         )
         .unwrap();
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "export default globalThis.counter",
             None,
             Limits::default(),
@@ -5529,15 +5417,13 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_complex_prefix_computation() {
-        let snapshot = precompile(
+        let prefix = prepared(
             r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
-            None,
             &[],
             &[],
-        )
-        .unwrap();
+        );
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             "export default globalThis.sq[7]",
             None,
             Limits::default(),
@@ -5552,9 +5438,9 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_console_is_available_in_postfix() {
-        let snapshot = precompile("const x = 1", None, &[], &[]).unwrap();
+        let prefix = prepared("const x = 1", &[], &[]);
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             r#"console.log("hello from postfix"); export default 1"#,
             None,
             Limits::default(),
@@ -5569,9 +5455,9 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_postfix_runtime_error_is_reported() {
-        let snapshot = precompile("", None, &[], &[]).unwrap();
+        let prefix = prepared("", &[], &[]);
         let err = execute_with_prefix(
-            snapshot.clone().into(),
+            prefix,
             r#"throw new Error("postfix failed")"#,
             None,
             Limits::default(),
@@ -7405,11 +7291,11 @@ mod tests {
 
     #[test]
     fn async_context_not_available_in_prefix_code() {
-        // Snapshot creation cannot capture the native async-context bindings,
-        // so importing `node:async_hooks` from prefix code does not resolve.
-        // It returns a clean ModuleNotFound (no crash — see the two-pass
-        // validation in precompile_module).
-        let err = precompile_module(
+        // Prefix code predates the per-run async-context machinery, so
+        // importing `node:async_hooks` from a prefix does not resolve — a
+        // contract kept from the snapshot era (see ResolverContext::
+        // async_context_builtin). It returns a clean ModuleNotFound.
+        let err = validate_prefix_module(
             "import { AsyncLocalStorage } from 'node:async_hooks'; export default 1;",
             "<prefix>",
             &[],
@@ -7425,10 +7311,10 @@ mod tests {
 
     #[test]
     fn precompile_unresolved_import_is_clean_error_not_crash() {
-        // Regression: precompiling prefix code with any unresolvable import
-        // used to segfault (unconditional create_blob after a failed
-        // instantiate). It must now return a clean ModuleNotFound.
-        let err = precompile_module(
+        // Regression (snapshot era): an unresolvable import used to segfault
+        // (unconditional create_blob after a failed instantiate). Validation
+        // must return a clean ModuleNotFound.
+        let err = validate_prefix_module(
             "import x from 'totally-nonexistent-xyz'; export default x;",
             "<prefix>",
             &[],
@@ -7443,16 +7329,14 @@ mod tests {
     }
 
     #[test]
-    fn precompile_still_succeeds_for_valid_prefix() {
-        // The two-pass validation must not break the happy path.
-        let snapshot = precompile_module(
+    fn validate_prefix_module_accepts_valid_prefix() {
+        validate_prefix_module(
             "globalThis.base = 100; export default 1;",
             "<prefix>",
             &[],
             &[],
         )
         .unwrap();
-        assert!(!snapshot.is_empty());
     }
 
     // ── Host modules built natively from shape data (#37) ────────────────────
@@ -7757,10 +7641,10 @@ mod tests {
     }
 
     #[test]
-    fn precompile_with_host_module_data_and_stored_trampoline_survives_snapshot() {
+    fn prefix_with_host_module_data_and_stored_trampoline_works_per_run() {
         // The documented pattern: prefix imports a host module and stashes a
         // function leaf on globalThis. The trampoline and data leaves are
-        // plain JS, so the snapshot must capture them; the postfix call then
+        // plain JS re-created at each run's prefix stage; the postfix call
         // dispatches through the fresh per-run `__iso4_call` stub.
         use std::mem::ManuallyDrop;
         use std::os::unix::io::AsRawFd;
@@ -7775,18 +7659,13 @@ mod tests {
                 ),
             ],
         )];
-        let snapshot = precompile_module(
-            r#"
+        let prefix_src = r#"
             import { query, limit } from "tools:search";
             globalThis.search = query;
             globalThis.maxResults = limit;
             export default 1;
-            "#,
-            "<prefix>",
-            &[],
-            &imports,
-        )
-        .unwrap();
+            "#;
+        validate_prefix_module(prefix_src, "<prefix>", &[], &imports).unwrap();
 
         let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let client = ManuallyDrop::new(client);
@@ -7808,7 +7687,11 @@ mod tests {
         });
 
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            PrefixSpec {
+                code: prefix_src,
+                filename: "<prefix>",
+                globals: &[],
+            },
             "export default (await globalThis.search('dogs')) + globalThis.maxResults",
             None,
             Limits::default(),
@@ -7834,8 +7717,8 @@ mod tests {
             "tools:t",
             vec![("f", HostModuleNode::Function)],
         )];
-        let snapshot =
-            precompile_module("globalThis.ready = true;", "<prefix>", &[], &imports).unwrap();
+        let prefix_src = "globalThis.ready = true;";
+        validate_prefix_module(prefix_src, "<prefix>", &[], &imports).unwrap();
 
         let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let client = ManuallyDrop::new(client);
@@ -7854,7 +7737,11 @@ mod tests {
         });
 
         let out = execute_with_prefix(
-            snapshot.clone().into(),
+            PrefixSpec {
+                code: prefix_src,
+                filename: "<prefix>",
+                globals: &[],
+            },
             r#"import { f } from "tools:t"; export default await f()"#,
             None,
             Limits::default(),
