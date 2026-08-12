@@ -793,17 +793,19 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 | `durationMs`     | `f64`                    | Wall-clock runtime duration.                                                                                                                                                                                                                |
 | `cpuTimeMs`      | `f64`                    | Active V8 execution time; bridge waits excluded.                                                                                                                                                                                            |
 | `bridgeCalls`    | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.                                                                                                                                                                                       |
+| `heapUsedBytes`  | `Optional<u64>`          | `used_heap_size` of the isolate that served the run, measured after it settled (#64). Present for `PrefixRun` (warm instances — feeds eviction); absent for one-off `Run`, whose isolate is already gone.                                   |
 
 `RunFailurePayload`:
 
-| Field         | Encoding                 |
-| ------------- | ------------------------ |
-| `error`       | `RunErrorPayload`        |
-| `stdout`      | `List<String>`           |
-| `stderr`      | `List<String>`           |
-| `durationMs`  | `f64`                    |
-| `cpuTimeMs`   | `f64`                    |
-| `bridgeCalls` | `List<BridgeCallRecord>` |
+| Field           | Encoding                 |
+| --------------- | ------------------------ |
+| `error`         | `RunErrorPayload`        |
+| `stdout`        | `List<String>`           |
+| `stderr`        | `List<String>`           |
+| `durationMs`    | `f64`                    |
+| `cpuTimeMs`     | `f64`                    |
+| `bridgeCalls`   | `List<BridgeCallRecord>` |
+| `heapUsedBytes` | `Optional<u64>`          |
 
 `BridgeCallRecord` — per-call metadata (names, timing, sizes; never payloads):
 
@@ -861,39 +863,52 @@ TS (one connection slot)              Rust (one isolate thread)
 
 `Precompile` uses the same authenticated connection but is not a run. It
 validates the prefix (compile + instantiate + evaluate in a throwaway
-isolate) and stores the **source and declared shape** in the Rust process
-under a `PrefixId`. Every `PrefixRun` re-evaluates that source into its fresh
-context before the postfix runs — there is no runtime snapshot (V8 14.x
-cannot create startup snapshots safely in a live multi-isolate process; see
-DESIGN.md on the removal).
+isolate, under the fixed warm-up budget) and stores the **source and declared
+shape** in the Rust process under a `PrefixId`. There is no runtime snapshot
+(V8 14.x cannot create startup snapshots safely in a live multi-isolate
+process; see DESIGN.md on the removal).
+
+`PrefixRun` is served by **warm instances** (#64): the runtime keeps a
+registry of resident isolates per prefix, each owned by a dedicated runtime
+thread. The first run cold-starts an instance (prefix evaluated under the
+warm-up budget, never billed to the triggering run); later runs reuse it and
+skip isolate boot and prefix evaluation entirely. This is invisible on the
+wire — the frames are identical warm or cold; only `heapUsedBytes` on the
+Result reports it. Instances are discarded on taint (any fired guard, abort
+mid-call, fatal bridge error), on `DisposePrefix`, and by LRU eviction when
+the slot cap (`--max-isolates`, the host pool size) is reached. State inside
+one instance survives between its calls as a cache, never a guarantee;
+instances of one prefix share no state with each other. One-off `Run` frames
+always get a fresh isolate.
 
 ---
 
 ## 7. Error codes
 
-| Code                                  | Cause                                                                                                                                                                                                   |
-| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                           |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                                                                                                                                                       |
-| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                        |
-| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                             |
-| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                  |
-| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                        |
-| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                            |
-| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                   |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.6).           |
-| `ERR_CALL_TARGET_NOT_FOUND`           | A `call.exportPath` (§5.2) does not resolve against the module's exports, or resolves to a value that is not callable. The message says which and names the path.                                       |
-| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                         |
-| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                                      |
-| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                 |
-| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                               |
-| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                                        |
-| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5.            |
-| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                             |
-| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                             |
-| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage. |
-| `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                         |
-| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                         |
+| Code                                  | Cause                                                                                                                                                                                                                                                                       |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                                                                                               |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's heap cap (`memoryMb` — a Runtime-level setting since #64, carried in the limits slot of every frame by the host).                                                                                                              |
+| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                            |
+| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                 |
+| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                      |
+| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                                                                                            |
+| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                                                                                                |
+| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                                                                                       |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.6).                                                                               |
+| `ERR_CALL_TARGET_NOT_FOUND`           | A `call.exportPath` (§5.2) does not resolve against the module's exports, or resolves to a value that is not callable. The message says which and names the path.                                                                                                           |
+| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                                                                                             |
+| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                                                                                                          |
+| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                                                                                     |
+| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                                                                                                   |
+| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                                                                                                            |
+| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5.                                                                                |
+| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                                                                                                 |
+| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                                                                                                 |
+| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage.                                                                     |
+| `ERR_WARMUP_LIMIT`                    | Warm-up (isolate boot + prefix evaluation) exceeded its fixed budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model, #64). Enforced at `Precompile` and at instance cold-start. Move expensive setup into the handler (lazy init on first call). |
+| `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                             |
+| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                             |
 
 ---
 

@@ -29,18 +29,6 @@
  */
 export interface ResourceLimits {
   /**
-   * Hard cap on memory the isolate can use, in megabytes.
-   * Covers the V8 heap and all external `ArrayBuffer` allocations.
-   *
-   * Also determines the BridgeResponse frame read cap: the sandbox cannot
-   * receive a response larger than its own memory budget.
-   *
-   * Zero means no cap.
-   * @default 64
-   */
-  memoryMb?: number
-
-  /**
    * Maximum *active* execution time in milliseconds. Time spent waiting on
    * host bridge calls (globals, host imports) is excluded.
    * @default 5_000
@@ -448,9 +436,31 @@ export interface SandboxOptions {
    * Multiple MCP agents / concurrent callers each get their own slot and
    * run in parallel up to this limit.
    *
+   * Also the warm-instance cap (#64): running isolates plus idle warm
+   * instances never exceed this number — taking a slot at the cap evicts
+   * the least-recently-used idle instance.
+   *
    * Defaults to the number of logical CPUs on the host machine.
    */
   maxIsolates?: number
+
+  /**
+   * Hard cap on memory each isolate can use, in megabytes. Covers the V8
+   * heap and all external `ArrayBuffer` allocations; also determines the
+   * BridgeResponse frame read cap (the sandbox cannot receive a response
+   * larger than its own memory budget).
+   *
+   * Uniform across ALL isolates of this Sandbox and settable only here —
+   * never per run or per prefix (#64). The cap is baked into the isolate at
+   * creation, and prefix runs reuse warm isolates, so a per-run value is
+   * structurally impossible; a uniform cap also keeps capacity math simple
+   * (slots × cap). Memory accumulates across calls on a warm instance —
+   * hitting the cap taints the instance and the next call cold-starts.
+   *
+   * Zero means no cap.
+   * @default 128
+   */
+  memoryMb?: number
 
   /**
    * Override the path to the Rust V8 binary.
@@ -597,11 +607,12 @@ export interface PrecompileOptions<
   /**
    * Resource limits applied to prefix code evaluation.
    *
-   * **Important:** limits are NOT enforced during `precompile()`. Prefix code
-   * is assumed to be developer-authored, not AI-agent-generated.
-   *
    * **Currently a no-op placeholder.** Pass limits directly to each
-   * `prefix.run()` call.
+   * `prefix.run()` call. The one budget that DOES apply here is not
+   * configurable: prefix evaluation runs under the fixed warm-up budget
+   * (1 s wall / 1 s CPU, #64) — a prefix that cannot evaluate inside it is
+   * rejected with `ERR_WARMUP_LIMIT` at `prepare()` time, because it could
+   * never cold-start a warm instance either.
    */
   limits?: ResourceLimits
 
@@ -618,6 +629,19 @@ export interface PrecompileOptions<
  * accepts only `Partial<G>` for its `globals` field — you may override any
  * declared global's implementation per run, but you cannot add names that
  * were not declared at precompile time.
+ *
+ * **Warm instances (#64).** Runs on a prefix are served by resident
+ * isolates: the first run cold-starts one (prefix evaluated once, under the
+ * fixed warm-up budget), later runs reuse it and skip isolate boot and
+ * prefix re-evaluation. Warmth is a cache, never a guarantee — module-scope
+ * state MAY survive between runs on one instance, but any instance can be
+ * evicted at any moment (a fired limit, an abort, memory pressure,
+ * `dispose()`), and concurrent runs of one prefix are served by separate
+ * instances that share no state. Do not rely on carryover, and do not rely
+ * on per-run isolation within a prefix either: keep durable state outside
+ * the sandbox, and do per-request setup inside the handler — lazy init
+ * (`conn ??= await setup()`) runs under that call's budget and re-runs
+ * correctly after any eviction.
  */
 export interface Prefix<
   G extends HostGlobals = {},
@@ -648,9 +672,9 @@ export interface Prefix<
 
   /**
    * Call a function exported by this prefix's module — nothing is compiled
-   * per request. The prefix is evaluated into a fresh isolate, `export` is
-   * resolved against its exports, and the result carries the function's
-   * return value:
+   * per request. On a warm instance the prefix is not even re-evaluated:
+   * `export` resolves against the retained module and the result carries
+   * the function's return value:
    *
    * ```ts
    * const prefix = await sandbox.prepare({ code: bundle })
@@ -858,6 +882,12 @@ export interface CallSuccess {
   durationMs: number
   cpuTimeMs: number
   bridgeCalls: BridgeCallEntry[]
+  /**
+   * `used_heap_size` of the isolate that served this call, measured after
+   * the call settled (#64). Reported for prefix calls (warm instances);
+   * `undefined` for one-off `sandbox.run({ call })`.
+   */
+  heapUsedBytes?: number
 }
 
 /**
@@ -947,6 +977,13 @@ export interface RunSuccess {
    * Recorded by the Rust runtime.
    */
   bridgeCalls: BridgeCallEntry[]
+  /**
+   * `used_heap_size` of the isolate that served this run, measured after the
+   * run settled (#64). Reported for prefix runs — warm instances keep their
+   * heap between calls, and this number feeds eviction. `undefined` for
+   * one-off `sandbox.run()` runs, whose isolate is disposed with the run.
+   */
+  heapUsedBytes?: number
 }
 
 export interface RunFailure {
@@ -958,6 +995,13 @@ export interface RunFailure {
   durationMs: number
   cpuTimeMs: number
   bridgeCalls: BridgeCallEntry[]
+  /**
+   * `used_heap_size` of the isolate that served this run, measured after the
+   * run settled (#64). Reported for prefix runs — warm instances keep their
+   * heap between calls, and this number feeds eviction. `undefined` for
+   * one-off `sandbox.run()` runs, whose isolate is disposed with the run.
+   */
+  heapUsedBytes?: number
 }
 
 /**
@@ -1060,5 +1104,13 @@ export type RunErrorCode
      * the call in `run()` code instead.
      */
     | 'ERR_PREFIX_BRIDGE_CALL'
+    /**
+     * Warm-up (isolate boot + prefix evaluation) exceeded its fixed budget
+     * (1 s wall / 1 s CPU — not configurable; Cloudflare's script-startup
+     * model, #64). Enforced at `prepare()` and again at every instance
+     * cold-start. Move expensive setup into the handler: lazy init on first
+     * call runs under that call's budget and survives warm reuse.
+     */
+    | 'ERR_WARMUP_LIMIT'
     | 'ERR_PREFIX_DISPOSED'
     | 'ERR_INTERNAL'

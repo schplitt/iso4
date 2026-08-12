@@ -288,10 +288,13 @@ describe('precompile + prefix.run()', () => {
     await prefix.dispose()
   })
 
-  test('postfix runs are isolated from each other', async () => {
+  test('warm reuse: a later run may see an earlier run\'s globals', async () => {
     const prefix = await runtime.precompile({ code: '' })
 
-    // First run mutates globalThis — second must not see it.
+    // Since #64 prefix runs reuse warm instances of the same prefix, so a
+    // mutation made by one run MAY be visible to the next — permitted,
+    // unguaranteed, evictable at any time (warmth is a cache). Back-to-back
+    // runs on one prefix reuse deterministically, so assert the carryover.
     await prefix.run({ code: 'globalThis.__secret = 42; export default 1' })
     const second = await prefix.run({
       code: 'export default globalThis.__secret ?? "clean"',
@@ -300,7 +303,7 @@ describe('precompile + prefix.run()', () => {
     expect(second.ok).toBe(true)
     if (!second.ok)
       return
-    expect(second.exports.default).toBe('clean')
+    expect(second.exports.default).toBe(42)
 
     await prefix.dispose()
   })
@@ -1585,34 +1588,57 @@ describe('resource limits', () => {
   })
 
   test('memory limit is enforced — TypedArray', async () => {
-    const result = await runtime.run({
-      code: `
-        const arrays = []
-        while (true) { arrays.push(new Uint8Array(1024 * 1024)) }
-      `,
-      limits: { memoryMb: 32, wallTimeMs: 10_000, cpuTimeMs: 10_000 },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
+    // The heap cap is per-Runtime since #64 (uniform across isolates, set at
+    // createSandbox) — a dedicated small-cap sandbox exercises it.
+    const small = await createRuntime({ maxIsolates: 1, memoryMb: 32 })
+    try {
+      const result = await small.run({
+        code: `
+          const arrays = []
+          while (true) { arrays.push(new Uint8Array(1024 * 1024)) }
+        `,
+        limits: { wallTimeMs: 10_000, cpuTimeMs: 10_000 },
+      })
+      expect(result.ok).toBe(false)
+      if (result.ok)
+        return
+      expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
+    } finally {
+      await small.dispose()
+    }
   }, 15_000)
 
   test('memory limit is enforced — logs emitted before OOM are preserved', async () => {
-    const result = await runtime.run({
-      code: `
-        console.log('before oom')
-        const arrays = []
-        while (true) { arrays.push(new Uint8Array(1024 * 1024)) }
-      `,
-      limits: { memoryMb: 32, wallTimeMs: 10_000, cpuTimeMs: 10_000 },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
-    expect(result.stdout.some((l: string) => l.includes('before oom'))).toBe(true)
+    const small = await createRuntime({ maxIsolates: 1, memoryMb: 32 })
+    try {
+      const result = await small.run({
+        code: `
+          console.log('before oom')
+          const arrays = []
+          while (true) { arrays.push(new Uint8Array(1024 * 1024)) }
+        `,
+        limits: { wallTimeMs: 10_000, cpuTimeMs: 10_000 },
+      })
+      expect(result.ok).toBe(false)
+      if (result.ok)
+        return
+      expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
+      expect(result.stdout.some((l: string) => l.includes('before oom'))).toBe(true)
+    } finally {
+      await small.dispose()
+    }
   }, 15_000)
+
+  test('per-run memoryMb is rejected loudly', async () => {
+    // Removed in #64: the cap is baked into each isolate at creation and
+    // prefix runs reuse warm isolates, so a per-run value is impossible.
+    await expect(
+      runtime.run({
+        code: 'export default 1',
+        limits: { memoryMb: 32 } as never,
+      }),
+    ).rejects.toThrow(/memoryMb was removed/)
+  })
 
   test('wall guard fires before cpu guard (tight loop)', async () => {
     // Pure async hang (await neverResolvingPromise) requires Phase 4 bridge.
@@ -1630,7 +1656,7 @@ describe('resource limits', () => {
   test('a run within limits completes successfully', async () => {
     const result = await runtime.run({
       code: 'export default 1 + 1',
-      limits: { cpuTimeMs: 5000, wallTimeMs: 10000, memoryMb: 128 },
+      limits: { cpuTimeMs: 5000, wallTimeMs: 10000 },
     })
     expect(result.ok).toBe(true)
   })

@@ -21,6 +21,10 @@ fn encode_u32(n: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&n.to_be_bytes());
 }
 
+fn encode_u64(n: u64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&n.to_be_bytes());
+}
+
 fn encode_f64(n: f64, out: &mut Vec<u8>) {
     out.extend_from_slice(&n.to_be_bytes());
 }
@@ -182,6 +186,11 @@ pub struct RunSuccessPayload {
     pub cpu_time_ms: f64,
     /// One record per bridge call attempt, in attempt order.
     pub bridge_calls: Vec<BridgeCallRecord>,
+    /// `used_heap_size` of the isolate that served the run, measured after
+    /// the run settled (#64). Present for prefix runs (warm instances —
+    /// feeds eviction scoring, #66); absent for one-off runs, whose isolate
+    /// is already gone.
+    pub heap_used_bytes: Option<u64>,
 }
 
 /// Payload for a failed run.
@@ -194,6 +203,8 @@ pub struct RunFailurePayload {
     pub cpu_time_ms: f64,
     /// One record per bridge call attempt, in attempt order.
     pub bridge_calls: Vec<BridgeCallRecord>,
+    /// See `RunSuccessPayload::heap_used_bytes`.
+    pub heap_used_bytes: Option<u64>,
 }
 
 /// The two variants of a completed run.
@@ -218,6 +229,7 @@ pub enum RunCompletion {
 ///   f64  durationMs
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
+///   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
 /// u8    failurePresent  (1 when ok = 0)
 ///   RunErrorPayload  error
 ///   List<String>  stdout
@@ -225,6 +237,7 @@ pub enum RunCompletion {
 ///   f64  durationMs
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
+///   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
 /// ```
 pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> Vec<u8> {
     let mut out = Vec::new();
@@ -241,6 +254,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_f64(s.duration_ms, &mut out);
             encode_f64(s.cpu_time_ms, &mut out);
             encode_bridge_call_records(&s.bridge_calls, &mut out);
+            encode_optional_u64(s.heap_used_bytes, &mut out);
             out.push(0); // Optional<RunFailurePayload> absent
         }
         RunCompletion::Failure(f) => {
@@ -253,10 +267,21 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_f64(f.duration_ms, &mut out);
             encode_f64(f.cpu_time_ms, &mut out);
             encode_bridge_call_records(&f.bridge_calls, &mut out);
+            encode_optional_u64(f.heap_used_bytes, &mut out);
         }
     }
 
     out
+}
+
+fn encode_optional_u64(value: Option<u64>, out: &mut Vec<u8>) {
+    match value {
+        Some(v) => {
+            out.push(1);
+            encode_u64(v, out);
+        }
+        None => out.push(0),
+    }
 }
 
 /// Encode `List<BridgeCallRecord>`. Per record:
@@ -472,6 +497,19 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             code: "ERR_ABORTED".to_string(),
             name: "AbortError".to_string(),
             message: "run was aborted".to_string(),
+            stack: None,
+            fields: None,
+        },
+        RunError::WarmupLimit => RunErrorPayload {
+            code: "ERR_WARMUP_LIMIT".to_string(),
+            name: "Error".to_string(),
+            message: format!(
+                "prefix warm-up (isolate boot + prefix evaluation) exceeded its fixed \
+                 budget ({}ms wall / {}ms CPU); move expensive setup into the handler \
+                 (lazy init on first call)",
+                crate::v8::WARMUP_WALL_MS,
+                crate::v8::WARMUP_CPU_MS,
+            ),
             stack: None,
             fields: None,
         },

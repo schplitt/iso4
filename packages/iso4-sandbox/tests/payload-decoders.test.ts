@@ -29,6 +29,15 @@ function u32(n: number): Buffer {
   return b
 }
 
+function optionalU64(n: number | undefined): Buffer {
+  if (n === undefined)
+    return Buffer.from([0])
+  const b = Buffer.alloc(9)
+  b[0] = 1
+  b.writeBigUInt64BE(BigInt(n), 1)
+  return b
+}
+
 function f64(n: number): Buffer {
   const b = Buffer.allocUnsafe(8)
   b.writeDoubleBE(n, 0)
@@ -102,6 +111,7 @@ interface SuccessSpec {
   durationMs?: number
   cpuTimeMs?: number
   bridgeCalls?: readonly TestBridgeRecord[]
+  heapUsedBytes?: number
 }
 
 interface FailureSpec {
@@ -116,6 +126,7 @@ interface FailureSpec {
   durationMs?: number
   cpuTimeMs?: number
   bridgeCalls?: readonly TestBridgeRecord[]
+  heapUsedBytes?: number
 }
 
 function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec): Buffer {
@@ -125,6 +136,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
     f64(spec.durationMs ?? 0),
     f64(spec.cpuTimeMs ?? 0),
     bridgeRecords(spec.bridgeCalls ?? []),
+    optionalU64(spec.heapUsedBytes), // #64: Optional<u64> heapUsedBytes
   ])
 
   if (spec.ok) {

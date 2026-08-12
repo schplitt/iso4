@@ -9,7 +9,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
-    let (socket_path, token) = parse_args();
+    let (socket_path, token, max_isolates) = parse_args();
 
     // Compute the V8 serialization probe (and with it this binary's write
     // format version) once, in a throwaway isolate, before any connection
@@ -32,7 +32,7 @@ fn main() {
 
     // Shared state across all connection threads: prefix snapshots, the
     // counter used to generate unique PrefixIds, and the auth token.
-    let shared = Arc::new(session::SharedState::new(token));
+    let shared = Arc::new(session::SharedState::new(token, max_isolates));
 
     for stream in listener.incoming() {
         match stream {
@@ -48,10 +48,11 @@ fn main() {
     }
 }
 
-fn parse_args() -> (String, String) {
+fn parse_args() -> (String, String, usize) {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
     let mut token: Option<String> = None;
+    let mut max_isolates: Option<usize> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -62,6 +63,19 @@ fn parse_args() -> (String, String) {
             }
             "--token" if i + 1 < args.len() => {
                 token = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--max-isolates" if i + 1 < args.len() => {
+                match args[i + 1].parse::<usize>() {
+                    Ok(n) if n > 0 => max_isolates = Some(n),
+                    _ => {
+                        eprintln!(
+                            "[iso4-v8] --max-isolates must be a positive integer, got {:?}",
+                            args[i + 1]
+                        );
+                        std::process::exit(1);
+                    }
+                }
                 i += 2;
             }
             arg => {
@@ -80,5 +94,14 @@ fn parse_args() -> (String, String) {
         std::process::exit(1);
     });
 
-    (socket, token)
+    // The warm registry's global isolate cap (#64). The host passes its pool
+    // size; when absent (old host, direct invocation) fall back to the core
+    // count — the same default the host uses for maxIsolates.
+    let max_isolates = max_isolates.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
+
+    (socket, token, max_isolates)
 }

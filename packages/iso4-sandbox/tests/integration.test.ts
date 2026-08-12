@@ -340,7 +340,12 @@ describe('precompile + prefix.run()', () => {
     }
   })
 
-  test('postfix mutations do not leak between runs', async () => {
+  test('warm reuse: state carryover is permitted, never guaranteed', async () => {
+    // Since #64 prefix runs reuse warm instances: mutations MAY survive into
+    // the next run on the same instance (warmth is a cache — the workerd
+    // stance). Relying on carryover is a documented antipattern; relying on
+    // isolation per run is simply wrong now. With one connection and
+    // back-to-back runs, reuse is deterministic, so assert the carryover.
     await using prefix = await runtime.precompile({
       code: 'globalThis.counter = 0',
     })
@@ -351,8 +356,7 @@ describe('precompile + prefix.run()', () => {
     expect(second.ok).toBe(true)
     if (!second.ok)
       return
-    // Must still be 0, not 99 from the previous run
-    expect(second.exports['default']).toBe(0)
+    expect(second.exports['default']).toBe(99)
   })
 
   test('prefix with pre-computed data structure', async () => {
@@ -1311,7 +1315,7 @@ describe('resource limits (Phase 3/8)', () => {
   test('zero limits accepted — run completes', async () => {
     const result = await runtime.run({
       code: 'export default 42',
-      limits: { cpuTimeMs: 0, wallTimeMs: 0, memoryMb: 0 },
+      limits: { cpuTimeMs: 0, wallTimeMs: 0 },
     })
     expect(result.ok).toBe(true)
   })
@@ -1323,7 +1327,7 @@ describe('resource limits (Phase 3/8)', () => {
         for (let i = 0; i < 100_000; i++) sum += i
         export default sum
       `,
-      limits: { cpuTimeMs: 5_000, wallTimeMs: 10_000, memoryMb: 128 },
+      limits: { cpuTimeMs: 5_000, wallTimeMs: 10_000 },
     })
     expect(result.ok).toBe(true)
     if (!result.ok)
@@ -1334,7 +1338,7 @@ describe('resource limits (Phase 3/8)', () => {
   test('limits flow through to concurrent runs', async () => {
     const results = await Promise.all(
       Array.from({ length: 4 }, (_, i) =>
-        runtime.run({ code: `export default ${i}`, limits: { cpuTimeMs: 1_000, memoryMb: 64 } })),
+        runtime.run({ code: `export default ${i}`, limits: { cpuTimeMs: 1_000 } })),
     )
     for (const [i, r] of results.entries()) {
       expect(r.ok).toBe(true)
@@ -1411,14 +1415,20 @@ describe('resource limits (Phase 3/8)', () => {
   }, 5_000)
 
   test('heap limit kills memory hog via TypedArray', async () => {
-    const result = await runtime.run({
-      code: 'const bufs = []; while(true) bufs.push(new Uint8Array(512*1024))',
-      limits: { memoryMb: 16, wallTimeMs: 10_000, cpuTimeMs: 10_000 },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
+    // Heap cap is per-Runtime since #64 — dedicated small-cap sandbox.
+    const small = await createRuntime({ maxIsolates: 1, memoryMb: 16 })
+    try {
+      const result = await small.run({
+        code: 'const bufs = []; while(true) bufs.push(new Uint8Array(512*1024))',
+        limits: { wallTimeMs: 10_000, cpuTimeMs: 10_000 },
+      })
+      expect(result.ok).toBe(false)
+      if (result.ok)
+        return
+      expect(result.error.code).toBe('ERR_MEMORY_LIMIT')
+    } finally {
+      await small.dispose()
+    }
   }, 15_000)
 
   test('cpu budget excludes bridge wait time (Phase 3)', async () => {

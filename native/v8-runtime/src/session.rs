@@ -178,14 +178,20 @@ pub struct SharedState {
     pub next_prefix_id: AtomicU64,
     /// Auth token — must match the token sent in every Authenticate frame.
     pub token: String,
+    /// Warm instance registry (#64): every PrefixRun is served by a resident
+    /// isolate from here; one-off runs share the same slot accounting.
+    pub warm: crate::warm::WarmRegistry,
 }
 
 impl SharedState {
-    pub fn new(token: String) -> Self {
+    /// `max_isolates` is the host pool size (`--max-isolates`) — the global
+    /// cap on live isolates (running + idle warm).
+    pub fn new(token: String, max_isolates: usize) -> Self {
         Self {
             prefix_store: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),
             token,
+            warm: crate::warm::WarmRegistry::new(max_isolates),
         }
     }
 }
@@ -346,6 +352,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 } else {
                     None
                 };
+                // One-off runs always get a fresh isolate (never the warm
+                // registry), but they share the slot budget with warm
+                // instances — taking a slot may evict an idle one (#64).
+                shared.warm.reserve_oneoff();
                 let result_payload = match sandbox::execute(
                     &payload.code,
                     payload.filename.as_deref(),
@@ -377,6 +387,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 duration_ms: output.duration_ms,
                                 cpu_time_ms: output.cpu_time_ms,
                                 bridge_calls: output.bridge_calls,
+                                heap_used_bytes: None,
                             }),
                         )
                     }
@@ -395,10 +406,12 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 duration_ms: failure.duration_ms,
                                 cpu_time_ms: failure.cpu_time_ms,
                                 bridge_calls: failure.bridge_calls,
+                                heap_used_bytes: None,
                             }),
                         )
                     }
                 };
+                shared.warm.release_oneoff();
 
                 if let Err(e) = ipc::write_rust_to_ts_frame(
                     &mut stream,
@@ -534,6 +547,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 duration_ms: 0.0,
                                 cpu_time_ms: 0.0,
                                 bridge_calls: Vec::new(),
+                                heap_used_bytes: None,
                             }),
                         )
                     }
@@ -586,6 +600,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     duration_ms: 0.0,
                                     cpu_time_ms: 0.0,
                                     bridge_calls: Vec::new(),
+                                    heap_used_bytes: None,
                                 }),
                             )
                         } else {
@@ -612,15 +627,24 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             payload.globals.len(), prefix_data.declared_imports.len(),
                             payload.call.as_ref().map(|c| c.export_path.as_str()).unwrap_or("-"),
                         );
-                            match sandbox::execute_with_prefix(
-                                sandbox::PrefixSpec {
-                                    code: &prefix_data.code,
-                                    filename: prefix_data.filename.as_deref().unwrap_or("<prefix>"),
-                                    globals: &prefix_data.globals,
-                                },
-                                payload.code.as_deref(),
-                                payload.filename.as_deref(),
-                                sandbox::Limits {
+                            // ── Warm instance flow (#64) ─────────────────────
+                            // Reuse the warmest idle instance of this prefix,
+                            // or take a slot (evicting an idle LRU victim if
+                            // the cap is full) and cold-start a fresh one on
+                            // its own owner thread. The session thread parks
+                            // on the response channel for the duration, so
+                            // the socket has one user at a time.
+                            let handle = match shared.warm.acquire(&payload.prefix_id) {
+                                crate::warm::Acquired::Reused(h) => h,
+                                crate::warm::Acquired::CreateNew => crate::warm::spawn_instance(
+                                    Arc::clone(&prefix_data),
+                                    payload.limits.memory_mb,
+                                ),
+                            };
+                            let outcome = handle.call(crate::warm::CallJob {
+                                code: payload.code,
+                                filename: payload.filename,
+                                limits: sandbox::Limits {
                                     wall_time_ms: payload.limits.wall_time_ms,
                                     cpu_time_ms: payload.limits.cpu_time_ms,
                                     memory_mb: payload.limits.memory_mb,
@@ -630,12 +654,26 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
                                     max_bridge_calls: payload.limits.max_bridge_calls,
                                 },
-                                &payload.globals,
-                                &prefix_data.declared_imports,
+                                globals: payload.globals,
                                 stream_fd,
-                                Arc::clone(&call_id_counter),
-                                payload.call.as_ref(),
-                            ) {
+                                call_id_counter: Arc::clone(&call_id_counter),
+                                call: payload.call,
+                            });
+                            // An instance of a since-disposed prefix must not
+                            // return to the pool.
+                            let prefix_alive = shared
+                                .prefix_store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .contains_key(&payload.prefix_id);
+                            shared.warm.release(
+                                &payload.prefix_id,
+                                handle,
+                                outcome.tainted,
+                                outcome.heap_used_bytes,
+                                prefix_alive,
+                            );
+                            match outcome.result {
                                 Ok(output) => {
                                     trace!(
                                         "[iso4-v8] PrefixRun {} succeeded in {:.3}ms",
@@ -652,6 +690,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                             duration_ms: output.duration_ms,
                                             cpu_time_ms: output.cpu_time_ms,
                                             bridge_calls: output.bridge_calls,
+                                            heap_used_bytes: Some(outcome.heap_used_bytes),
                                         }),
                                     )
                                 }
@@ -671,6 +710,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                             duration_ms: failure.duration_ms,
                                             cpu_time_ms: failure.cpu_time_ms,
                                             bridge_calls: failure.bridge_calls,
+                                            heap_used_bytes: Some(outcome.heap_used_bytes),
                                         }),
                                     )
                                 }
@@ -697,6 +737,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             .unwrap_or_else(|p| p.into_inner())
                             .remove(&prefix_id)
                             .is_some();
+                        // Idle warm instances of this prefix die now; busy
+                        // ones are dropped at release time (the store lookup
+                        // there sees the prefix gone).
+                        shared.warm.dispose_prefix(&prefix_id);
                         eprintln!(
                             "[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})"
                         );
@@ -748,7 +792,7 @@ mod tests {
     /// payload and return the first frame it writes back (if any).
     fn handshake(payload: Vec<u8>, token: &str) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(token.to_string()));
+        let shared = Arc::new(SharedState::new(token.to_string(), 4));
         let server = std::thread::spawn(move || handle_client(runtime, shared));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)

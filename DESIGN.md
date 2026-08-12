@@ -1379,17 +1379,19 @@ want. A host author who isn't an HTTP-security expert should reach for
 
 ## 13. Execution model
 
-`@iso4/sandbox` ships exactly one execution model: **one-shot runs**.
+`@iso4/sandbox` ships one call shape — **independent runs**:
 
 ```
-prefix.run({ code }) → RunResult
+prefix.execute({ code }) / prefix.call({ export, args }) → RunResult / CallResult
 ```
 
-The isolate is created fresh (prefix re-evaluated), executes a code string, returns
-named exports, and is torn down. Every run is independent. IPC cost: one
-round trip (Run → … → Result). Suitable when the work per run is
-non-trivial and async (fetch, host imports). This is the AI-agent
-prefix/postfix pattern described in §11.
+Each run executes against the prefix and returns its result in one IPC round
+trip (Run → … → Result). One-off `sandbox.run()` creates a fresh isolate per
+run and tears it down. Prefix runs are served by **warm instances** (#64,
+§13.2.1): resident isolates that skip boot and prefix re-evaluation on
+reuse — a transparent cache, not a semantic change; state carryover between
+runs is permitted but never guaranteed. This is the AI-agent prefix/postfix
+pattern described in §11 and the request-handler pattern from §5.3.
 
 ### 13.1 Persistent sessions are a separate product
 
@@ -1569,57 +1571,90 @@ user code (for example, a missing binding), not with a fetch-specific runtime
 error. The session API is intentionally narrow: pure data in, pure data out,
 no async I/O.
 
-### 13.2.1 Warm-mode capacity & eviction sketch (feeds epic #61)
+### 13.2.1 Warm instances (#64 — shipped)
 
-Design notes for the resident-isolate ("warm") mode, recorded when runtime
-snapshotting was removed (§11.6) so the later design pass starts here
-instead of re-deriving:
+Every prepared prefix is served by **warm instances**: resident isolates
+with the prefix already evaluated. The first `execute()`/`call()` on a
+prefix cold-starts an instance; later runs reuse it, skipping isolate boot
+(~190 µs), context creation (~115 µs), the runtime installs, prefix
+evaluation (scales with prefix size), and teardown (~180 µs). This is
+automatic — no flag, no separate API, no wire change. The host decides
+nothing; the runtime reuses or cold-starts transparently per `PrefixRun`.
 
-- **Contract: warmth is a cache, never a guarantee.** State carryover
-  between calls is permitted but undocumented behavior may vanish at any
-  moment — the workerd stance. Relying on it is an antipattern; the docs
-  say so explicitly.
-- **Taint-and-evict.** Any limit violation (CPU, wall, heap) terminates the
-  call AND discards the isolate — a terminated isolate's heap is untrusted
-  by definition. The next call pays a cold start; the misbehaving tenant
-  pays, everyone else is unaffected. Never reuse a tainted isolate; never
-  evict a running one.
-- **Uniform heap cap.** Default 128 MB per isolate (workerd's number),
-  overridable per Runtime instance only — never per prefix — so capacity
-  math stays `slots × cap`.
-- **Two capacity knobs, two resources.** Max concurrent runs (threads/CPU;
-  default from `os.availableParallelism()`, queue beyond it with
-  wait-vs-fail-fast policy per call) and warm-memory budget (RAM; default
-  from `process.constrainedMemory()` — cgroup-aware, `os.freemem()` lies in
-  containers; maxWarm = budget ÷ cap). Idle warm isolates hold memory, not
-  threads.
-- **Eviction scoring.** `score = heapUsed × idleTime`, evict highest: an
-  old 3 MB idler outlives a young 90 MB hoarder; ties evict oldest. Heap
-  usage is reported per Result frame (no polling). Soft watermark: evict by
-  score until under budget. Hard watermark: additionally refuse new warm
-  admissions and degrade to one-off (cold per call) — correctness never
-  depends on warmth.
-- **Instance pools, not singletons.** The registry maps prefix →
-  **pool of instances**, because the same trigger (workflow event, web
-  request) fires concurrently: a call takes a free instance, cold-starts
-  another up to `maxInstancesPerPrefix` (fairness guard — one hot tenant
-  must not convert the whole warm budget into copies of itself), then
-  queues. Instances of the same prefix share **no state** with each other
-  (intended — same contract as workerd instances across machines); durable
-  state belongs in the DB (SQLite direction), instance memory is only ever
-  an optimization. Eviction scoring applies per instance.
-- **v1 concurrency: one call at a time per instance.** Parallelism for one
-  prefix = more instances. Async interleaving of multiple in-flight calls
-  inside one isolate (the full workerd model) is explicitly deferred: it
-  requires multiplexed bridge calls (today the bridge is sequential within
-  a run) and per-request context separation — only worth it for I/O-heavy
-  handlers under tight memory budgets.
-- **One-off runs are untouched** — agent code always gets a fresh isolate
-  and never touches the registry; warm calls and one-off runs share the
-  same run-slot budget, arbitrated by the queue.
-- **Open decision:** warm mode as a flag on `prepare()` vs a separate entry
-  point / product (this section's parent, §13, currently says separate
-  product). To be settled in the #64 design pass.
+**Contract: warmth is a cache, never a guarantee.** State carryover between
+calls on one instance is permitted but may vanish at any moment (taint, LRU
+eviction, dispose) — the workerd stance. Relying on carryover is an
+antipattern; relying on per-run isolation within one prefix is simply wrong.
+Durable state belongs in the DB; instance memory is only an optimization.
+The supported pattern for expensive setup is **lazy init inside the
+handler** (`conn ??= await setup()` on first call): it runs under that
+call's budget, through that call's bridge, and re-runs correctly after any
+eviction.
+
+**Threading.** rusty_v8 pins isolates to their creating thread
+(`OwnedIsolate` is `!Send`, `Drop` asserts current-thread ownership and
+reverse creation order, no `Locker` exposed — re-verified on v8 147.4.0).
+Each instance is therefore owned cradle-to-grave by a dedicated runtime
+thread; session threads forward calls over a channel and park on the
+response, so the session socket keeps exactly one user at a time (the
+instance thread does bridge I/O during a call). Idle instances hold memory,
+not threads-in-use, and no clocks are armed while idle.
+
+**Warm-up budget.** Isolate boot + prefix evaluation runs under a fixed
+1 s wall / 1 s CPU budget — never the triggering request's limits
+(Cloudflare's separate script-startup limit is the model; theirs is 1 s
+since 2025-10 and likewise not configurable). Blowing it reports
+`ERR_WARMUP_LIMIT`. `prepare()` enforces the same budget, so an un-warmable
+prefix fails at deploy time, not on every cold start. (Bonus: a prefix with
+a synchronous infinite loop used to hang `prepare()` forever.) Prefix
+evaluation stays bridge-less: `ERR_PREFIX_BRIDGE_CALL` /
+`ERR_PREFIX_DID_NOT_SETTLE` fire at warm-up exactly as at `prepare()`.
+
+**Per-call semantics on a warm instance** are identical to a one-off run:
+fresh wall/CPU guards and a fresh CPU meter from dispatch to settle, bridge
+stubs re-installed per call (throwing placeholders re-armed first so a stub
+the next call does not re-bind can never dangle), per-call console caps.
+The heap cap is the exception — see below.
+
+**Taint-and-evict.** Any fired guard (CPU, wall, heap), an abort landing
+mid-call, a fatal bridge violation, or an internal failure discards the
+instance: `terminate_execution` rips arbitrary mid-execution state, so
+prefix coherence is unprovable afterwards. Ordinary uncaught exceptions are
+clean completions and do NOT taint. The next call pays a cold start; the
+misbehaving tenant pays, everyone else is unaffected. Never reuse a tainted
+instance; never evict a running one.
+
+**Uniform heap cap.** `memoryMb` moved from per-run `ResourceLimits` to
+`createSandbox()` (default 128 MB, workerd's number): the cap is baked into
+`Isolate::new` and instances are reused, so a per-run value is structurally
+impossible, and a uniform cap keeps capacity math `slots × cap`. Heap and
+ArrayBuffer usage accumulate across calls on an instance — hitting the cap
+taints it. Passing the old per-run field throws.
+
+**Capacity (v1) and eviction.** One global cap: `maxIsolates` (the host
+pool size, passed as `--max-isolates`), counting running isolates + idle
+warm instances. A run needing a slot when all are held evicts the
+least-recently-used **idle** instance — the host pool admits at most
+`maxIsolates` concurrent runs, so a full cap always contains an idle
+victim. One-off runs never touch the registry but share the slot budget
+(they may evict an idle instance to take a slot). `used_heap_size` is
+reported on every `PrefixRun` Result frame (`heapUsedBytes`), so the
+`heapUsed × idleTime` scoring (#66) can replace oldest-first without new
+wire plumbing. The capacity manager (#65) adds the memory budget
+(`process.constrainedMemory()`-derived), per-prefix fairness caps, and
+queue policy; none of that is in #64.
+
+**Instance pools, not singletons.** The registry maps prefix → pool of
+instances, because the same trigger fires concurrently: a call takes an
+idle instance or cold-starts another. Instances of one prefix share **no
+state** with each other (same contract as workerd instances across
+machines). **v1 concurrency: one call at a time per instance** —
+parallelism for one prefix = more instances. Async interleaving of multiple
+in-flight calls inside one isolate (the full workerd model) stays deferred:
+it needs multiplexed bridge calls and per-request context separation.
+
+**One-off runs are untouched**: `sandbox.run()` always gets a fresh isolate
+with unchanged semantics.
 
 ### 13.3 In-process backend (Phase 12)
 

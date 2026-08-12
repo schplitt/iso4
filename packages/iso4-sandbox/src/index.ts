@@ -104,7 +104,16 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const socketPath = join(tmpdir(), `iso4-v8-${process.pid}-${randomUUID().slice(0, 8)}.sock`)
   const token = randomUUID()
 
-  const proc = spawn(binaryPath, ['--socket', socketPath, '--token', token], {
+  // The runtime needs the pool size for the warm registry's global isolate
+  // cap (#64): idle warm instances + running isolates never exceed it.
+  const proc = spawn(binaryPath, [
+    '--socket',
+    socketPath,
+    '--token',
+    token,
+    '--max-isolates',
+    String(maxIsolates),
+  ], {
     // stdin closed, stdout ignored, stderr forwarded so runtime diagnostics
     // (the [iso4-v8] lines) appear in the host process's stderr.
     //
@@ -131,7 +140,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   // The pool uses `connect` to reopen any slot torn down by an in-flight abort,
   // keeping the pool at `maxIsolates`.
   const pool = new ConnectionPool(clients, connect)
-  return new SandboxImpl(proc, pool, socketPath)
+  return new SandboxImpl(proc, pool, socketPath, options?.memoryMb)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -191,12 +200,20 @@ class SandboxImpl implements Sandbox {
   private readonly proc: ChildProcess
   private readonly pool: ConnectionPool
   private readonly socketPath: string
+  /**
+   * Uniform per-isolate heap cap (#64), set once at `createSandbox` and
+   * injected into every frame's limits — the wire still carries `memoryMb`
+   * per run, this is simply the only writer. `undefined` defers to the
+   * runtime default (128 MB).
+   */
+  private readonly memoryMb: number | undefined
   private _alive = true
 
-  constructor(proc: ChildProcess, pool: ConnectionPool, socketPath: string) {
+  constructor(proc: ChildProcess, pool: ConnectionPool, socketPath: string, memoryMb?: number) {
     this.proc = proc
     this.pool = pool
     this.socketPath = socketPath
+    this.memoryMb = memoryMb
     proc.once('exit', () => {
       this._alive = false
     })
@@ -211,6 +228,13 @@ class SandboxImpl implements Sandbox {
   async run(options: RunOptions & Partial<RunCallOptions>): Promise<RunResult | CallResult> {
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
+    }
+    if (options.limits !== undefined && 'memoryMb' in options.limits) {
+      throw new TypeError(
+        '[@iso4/sandbox] limits.memoryMb was removed: the heap cap is uniform '
+        + 'per Runtime and baked into each isolate at creation (#64) — set it '
+        + 'once via createSandbox({ memoryMb }) instead',
+      )
     }
     const { defs, dispatch } = processGlobals(options.globals ?? {})
     // Drain any Request/Response body before the payload encoder, which is
@@ -235,7 +259,7 @@ class SandboxImpl implements Sandbox {
         // always starts at line 1.
         const raw = await client.runRawCode(options.code, {
           filename: options.filename,
-          limits: options.limits,
+          limits: { ...options.limits, memoryMb: this.memoryMb },
           globals: defs,
           dispatch,
           imports: bindings,
@@ -330,7 +354,7 @@ class SandboxImpl implements Sandbox {
       const raw = await client.precompile({
         code: options.code,
         filename: options.filename,
-        limits: options.limits,
+        limits: { ...options.limits, memoryMb: this.memoryMb },
         globals: defs,
         imports: bindings,
       })
@@ -349,7 +373,7 @@ class SandboxImpl implements Sandbox {
         throw err
       }
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers)
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers, this.memoryMb)
     })
   }
 
@@ -397,6 +421,12 @@ implements Prefix<G, M> {
    * for rebind attempts outside it.
    */
   private readonly defaultImportHandlers: ImportHandlerMap
+  /**
+   * The sandbox-level uniform heap cap — see `SandboxImpl.memoryMb`. Warm
+   * instances (#64) are created with this cap; per-run values no longer
+   * exist (the cap is baked into the isolate at creation).
+   */
+  private readonly memoryMb: number | undefined
   private _alive = true
 
   constructor(
@@ -404,11 +434,13 @@ implements Prefix<G, M> {
     pool: ConnectionPool,
     defaultGlobals: G,
     defaultImportHandlers: ImportHandlerMap,
+    memoryMb?: number,
   ) {
     this.id = id
     this.pool = pool
     this.defaultGlobals = defaultGlobals
     this.defaultImportHandlers = defaultImportHandlers
+    this.memoryMb = memoryMb
   }
 
   get alive(): boolean {
@@ -492,6 +524,13 @@ implements Prefix<G, M> {
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
     }
+    if (options.limits !== undefined && 'memoryMb' in options.limits) {
+      throw new TypeError(
+        '[@iso4/sandbox] limits.memoryMb was removed: the heap cap is uniform '
+        + 'per Runtime and baked into each isolate at creation (#64) — set it '
+        + 'once via createSandbox({ memoryMb }) instead',
+      )
+    }
     // Extract bridge globals, routing shimmed overrides to their private keys.
     // String/data globals and shim wrappers are already compiled into the
     // declared prefix state — only the bridge stubs they call are re-installed per run.
@@ -533,7 +572,7 @@ implements Prefix<G, M> {
           prefixId: this.id,
           code: payload.code,
           filename: options.filename,
-          limits: options.limits,
+          limits: { ...options.limits, memoryMb: this.memoryMb },
           globals: defs,
           dispatch,
           importRebinds: merged.rebinds,

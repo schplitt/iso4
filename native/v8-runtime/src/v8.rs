@@ -80,14 +80,47 @@ pub struct Limits {
 
 /// Termination reason set by the first limit-guard thread to fire.
 ///
-/// Stored in a `OnceLock` - first write wins, subsequent writes are no-ops.
-/// The two-variant enum means absence of timeout is represented naturally
-/// by `OnceLock::get()` returning `None`.
+/// Stored in a [`ReasonCell`] - first write wins, subsequent writes are
+/// no-ops. Absence of a fired guard is represented naturally by
+/// `ReasonCell::get()` returning `None`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TerminationReason {
     Wall,
     Cpu,
     Memory,
+}
+
+/// First-writer-wins slot for the run's termination reason, shared between
+/// the guard threads, the near-heap callback, the ArrayBuffer allocator, and
+/// the classification sites.
+///
+/// Used to be a `OnceLock`, which cannot be re-armed. The allocator and the
+/// near-heap callback are registered once per *isolate* while guards and
+/// classification are per *call*, so a reused isolate (warm instances, #64)
+/// needs one long-lived cell that resets between calls instead of a fresh
+/// `OnceLock` the isolate-lifetime consumers can never re-point to.
+struct ReasonCell(Mutex<Option<TerminationReason>>);
+
+impl ReasonCell {
+    fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// First write wins; later writes are no-ops, matching `OnceLock::set`.
+    fn set(&self, reason: TerminationReason) {
+        let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        slot.get_or_insert(reason);
+    }
+
+    fn get(&self) -> Option<TerminationReason> {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Clear the slot for the next call on a reused isolate. Only safe while
+    /// no JS is executing and no guards are armed — i.e. between calls.
+    fn reset(&self) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 /// Heap data passed to [`near_heap_limit_cb`] as a raw pointer.
@@ -98,7 +131,7 @@ enum TerminationReason {
 /// callbacks during `Isolate::Dispose()`.
 struct NearHeapData {
     handle: v8::IsolateHandle,
-    reason: Arc<OnceLock<TerminationReason>>,
+    reason: Arc<ReasonCell>,
 }
 
 // ── ArrayBuffer budget allocator ─────────────────────────────────────────────
@@ -123,7 +156,7 @@ struct BudgetAllocState {
     /// Set once, immediately after `Isolate::new` returns.
     handle: OnceLock<v8::IsolateHandle>,
     /// Shared with wall / cpu guards — first writer wins.
-    reason: Arc<OnceLock<TerminationReason>>,
+    reason: Arc<ReasonCell>,
 }
 
 impl BudgetAllocState {
@@ -135,7 +168,7 @@ impl BudgetAllocState {
         let prev = self.used.fetch_add(n, Ordering::Relaxed);
         if prev.saturating_add(n) > self.budget {
             if let Some(h) = self.handle.get() {
-                self.reason.set(TerminationReason::Memory).ok();
+                self.reason.set(TerminationReason::Memory);
                 h.terminate_execution();
             }
         }
@@ -204,7 +237,7 @@ extern "C" fn near_heap_limit_cb(
     _initial_heap_limit: usize,
 ) -> usize {
     let d = unsafe { &*(data as *const NearHeapData) };
-    d.reason.set(TerminationReason::Memory).ok();
+    d.reason.set(TerminationReason::Memory);
     d.handle.terminate_execution();
     // Return a larger limit so V8 has headroom to unwind the stack cleanly
     // after terminate_execution() without immediately crashing the process.
@@ -583,6 +616,11 @@ pub enum RunError {
     /// host-import function) at precompile time. No host session exists while
     /// the snapshot is built, so the call can never be served.
     PrefixBridgeCall(String),
+    /// Warm-up (isolate boot + prefix evaluation) blew its fixed budget
+    /// ([`WARMUP_WALL_MS`]/[`WARMUP_CPU_MS`]). Not a per-request timeout —
+    /// the caller's limits are not armed during warm-up, and the budget is
+    /// deliberately not configurable (Cloudflare's script-startup model).
+    WarmupLimit,
     /// A requested host → sandbox call's export path does not resolve against
     /// the module's exports, or resolves to something that is not callable
     /// (#58). The message says which, and names the path.
@@ -627,7 +665,6 @@ pub fn execute(
     run_module(
         Some(code),
         filename.unwrap_or("<iso4>"),
-        None,
         limits,
         globals,
         imports,
@@ -674,10 +711,18 @@ pub fn execute_with_prefix(
     call: Option<&ipc::CallSpec>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
-    run_module(
+    // Cold start of a warm-capable instance: warm-up (isolate boot + prefix
+    // evaluation) runs under its own fixed budget, never the caller's limits
+    // (#64) — a prefix that loops reports ERR_WARMUP_LIMIT, not the run's
+    // timeout. The call itself then gets fresh guards from dispatch to
+    // settle. The warm registry keeps the core alive between calls; this
+    // one-shot wrapper drops it.
+    let mut core = create_instance_core(Some(prefix), imports, limits.memory_mb)?;
+    run_call_on_core(
+        &mut core,
         code,
         filename.unwrap_or("<iso4>"),
-        Some(prefix),
+        prefix.globals,
         limits,
         globals,
         imports,
@@ -685,6 +730,7 @@ pub fn execute_with_prefix(
         call_id_counter,
         call,
     )
+    .result
 }
 
 /// Validate prefix code: compile, instantiate, and evaluate it exactly as a
@@ -721,7 +767,6 @@ pub fn precompile(
 fn run_module(
     code: Option<&str>,
     filename: &str,
-    prefix: Option<PrefixSpec<'_>>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
@@ -739,7 +784,6 @@ fn run_module(
     let mut result = run_module_inner(
         code,
         filename,
-        prefix,
         limits,
         globals,
         imports,
@@ -772,7 +816,6 @@ fn run_module(
 fn run_module_inner(
     code: Option<&str>,
     filename: &str,
-    prefix: Option<PrefixSpec<'_>>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
@@ -797,7 +840,7 @@ fn run_module_inner(
     // `reason` is created before the isolate so it can be shared with the
     // ArrayBuffer allocator (which is registered in CreateParams, before the
     // isolate exists).
-    let reason = Arc::new(OnceLock::<TerminationReason>::new());
+    let reason = Arc::new(ReasonCell::new());
 
     // ── ArrayBuffer budget allocator ──────────────────────────────────────────
     // Built before the isolate so we can pass it into CreateParams.
@@ -933,9 +976,10 @@ fn run_module_inner(
         budget: &cpu_budget,
     };
 
-    v8::scope!(let scope, &mut isolate);
-    let context = v8::Context::new(scope, Default::default());
-    let scope = &mut v8::ContextScope::new(scope, context);
+    let context_global = {
+        v8::scope!(let scope, &mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
     // Every setup step below runs with the guards already armed, so each
     // failure classifies through `termination_or` — a guard firing mid-setup
     // (a very tight wall limit on a slow machine) must report the timeout,
@@ -953,28 +997,100 @@ fn run_module_inner(
     install_async_context(scope)
         .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
 
-    // ── Prefix evaluation ────────────────────────────────────────────────────
-    //
-    // The prefix runs before the bridge exists, exactly as it did at
-    // prepare() time when prefixes were snapshotted: its value globals are
-    // installed first, its bridge callables are throwing placeholders
-    // (ERR_PREFIX_BRIDGE_CALL), and node:async_hooks is not resolvable. The
-    // live stubs installed below overwrite the placeholder names for the
-    // postfix. Runs under the run's wall/CPU guards — a prefix that loops
-    // now costs the run its budget instead of hanging prepare().
-    // For a call-only prefix run (`code` = None) the prefix module is the
-    // call target, so its handle is kept; postfix runs drop it.
-    let mut prefix_module: Option<v8::Global<v8::Module>> = None;
-    if let Some(prefix) = &prefix {
-        v8::tc_scope!(let tc, scope);
-        let module =
-            evaluate_prefix_module(tc, prefix.code, prefix.filename, prefix.globals, imports)
-                .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
-        prefix_module = Some(module);
-    }
+        v8::Global::new(scope, context)
+    };
 
-    // ── Bridge globals setup ─────────────────────────────────────────────────
-    //
+    // Setup is done — hand over to the per-call phase shared with warm
+    // instances (#64). Globals carry the context and prefix module across the
+    // scope boundary; the guards stay armed, so a one-off run covers setup +
+    // execution with a single budget exactly as before.
+    run_call_phase(
+        &mut isolate,
+        &context_global,
+        None,
+        code,
+        filename,
+        CallPhaseCtx {
+            limits: &limits,
+            globals,
+            imports,
+            stream_fd,
+            call_id_counter,
+            call,
+            start,
+            cpu_budget: &cpu_budget,
+            bridge_log: &bridge_log,
+            reason: &reason,
+            logs: std::ptr::addr_of!(logs),
+            cancel_wall: &cancel_wall,
+            cancel_cpu: &cancel_cpu,
+            cancel_handle: &cancel_handle,
+        },
+    )
+}
+
+/// Per-call parameters for [`run_call_phase`] — bundled so the one-off path
+/// (`run_module_inner`) and warm instances (#64, `run_call_on_core`) drive
+/// the identical phase with their own guard and telemetry lifetimes.
+struct CallPhaseCtx<'a> {
+    limits: &'a Limits,
+    globals: &'a [HostGlobalDef],
+    imports: &'a [ImportBinding],
+    stream_fd: Option<RawFd>,
+    call_id_counter: Arc<AtomicU32>,
+    call: Option<&'a ipc::CallSpec>,
+    start: std::time::Instant,
+    cpu_budget: &'a Arc<CpuBudget>,
+    bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
+    reason: &'a Arc<ReasonCell>,
+    /// Read-only view of the console sink for failure snapshots. A raw
+    /// pointer (not `&`) because the console concurrently holds the writing
+    /// pointer; only transient borrows are taken, never across JS execution
+    /// — the same discipline the pre-split code applied to its `logs` local.
+    logs: *const LogBuffers,
+    cancel_wall: &'a crossbeam_channel::Sender<()>,
+    cancel_cpu: &'a crossbeam_channel::Sender<()>,
+    cancel_handle: &'a v8::IsolateHandle,
+}
+
+/// The per-call half of a run: bridge stubs in, postfix/call executed and
+/// settled, value blob out. Everything before this (isolate boot, web
+/// runtime, prefix evaluation) is instance-lifetime state that one-off runs
+/// rebuild per run and warm instances retain across calls. Opens its own
+/// scopes on `isolate`/`context`; the caller owns the guards and stamps the
+/// final cpu/bridge telemetry.
+fn run_call_phase(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    prefix_module: Option<&v8::Global<v8::Module>>,
+    code: Option<&str>,
+    filename: &str,
+    ctx: CallPhaseCtx<'_>,
+) -> Result<Output, FailureOutput> {
+    let CallPhaseCtx {
+        limits,
+        globals,
+        imports,
+        stream_fd,
+        call_id_counter,
+        call,
+        start,
+        cpu_budget,
+        bridge_log,
+        reason,
+        logs,
+        cancel_wall,
+        cancel_cpu,
+        cancel_handle,
+    } = ctx;
+
+    v8::scope!(let scope, isolate);
+    let context_local = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context_local);
+
+    // Shared state for all bridge callbacks in this call. All three are Arcs-
+    // call_id, bridge_error, and pending_resolvers are shared between the
+    // callback stubs (via GlobalCallbackData) and the poll loop below.
     // Shared state for all bridge callbacks in this run. All three are Arcs-
     // call_id, bridge_error, and pending_resolvers are shared between the
     // callback stubs (via GlobalCallbackData) and the poll loop below.
@@ -1036,10 +1152,10 @@ fn run_module_inner(
             limits.max_bridge_calls,
             Arc::clone(&pending_resolvers),
             start,
-            Arc::clone(&bridge_log),
+            Arc::clone(bridge_log),
             &mut callback_data_boxes,
         )
-        .map_err(|e| failure(termination_or(&reason, e), &logs, start))?;
+        .map_err(|e| failure(termination_or(reason, e), unsafe { &*logs }, start))?;
     }
 
     // Install the value globals (string exprs, constants, shim wrappers)
@@ -1047,7 +1163,7 @@ fn run_module_inner(
     // replayed from the prefix defs during prefix evaluation above, so
     // `globals` carries only bridge stubs and this is a no-op.
     install_value_globals(scope, globals)
-        .map_err(|e| failure(termination_or(&reason, e), &logs, start))?;
+        .map_err(|e| failure(termination_or(reason, e), unsafe { &*logs }, start))?;
 
     v8::tc_scope!(let scope, scope);
 
@@ -1055,14 +1171,14 @@ fn run_module_inner(
     // call's return promise (#58) drive the same poll loop.
     let settle_ctx = SettleCtx {
         stream_fd,
-        limits: &limits,
+        limits,
         start,
-        reason: &reason,
-        cpu_budget: &cpu_budget,
-        bridge_log: &bridge_log,
+        reason,
+        cpu_budget,
+        bridge_log,
         bridge_error: &bridge_error,
         pending_resolvers: &pending_resolvers,
-        cancel_handle: &cancel_handle,
+        cancel_handle,
     };
 
     // Compile, instantiate, evaluate, and settle the postfix module when the
@@ -1072,14 +1188,14 @@ fn run_module_inner(
         let source_string = v8::String::new(scope, code).ok_or_else(|| {
             failure(
                 RunError::Internal("failed to intern module source".to_string()),
-                &logs,
+                unsafe { &*logs },
                 start,
             )
         })?;
         let filename = v8::String::new(scope, filename).ok_or_else(|| {
             failure(
                 RunError::Internal("failed to intern filename".to_string()),
-                &logs,
+                unsafe { &*logs },
                 start,
             )
         })?;
@@ -1102,8 +1218,8 @@ fn run_module_inner(
             Some(m) => m,
             None => {
                 return Err(failure(
-                    termination_or(&reason, RunError::CompileError(exception_message(scope))),
-                    &logs,
+                    termination_or(reason, RunError::CompileError(exception_message(scope))),
+                    unsafe { &*logs },
                     start,
                 ))
             }
@@ -1128,14 +1244,14 @@ fn run_module_inner(
             let err = take_resolver()
                 .and_then(|ctx| ctx.resolve_error)
                 .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
-            return Err(failure(termination_or(&reason, err), &logs, start));
+            return Err(failure(termination_or(reason, err), unsafe { &*logs }, start));
         }
 
         cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
         let evaluation = match module.evaluate(scope) {
             Some(value) => value,
             None => {
-                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+                cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
                 if let Some(err) = bridge_error.get() {
                     let owned = match err {
                         RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
@@ -1147,9 +1263,9 @@ fn run_module_inner(
                         RunError::Internal(m) => RunError::Internal(m.clone()),
                         other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
                     };
-                    return Err(failure(owned, &logs, start));
+                    return Err(failure(owned, unsafe { &*logs }, start));
                 }
-                let error = match reason.get().copied() {
+                let error = match reason.get() {
                     Some(TerminationReason::Wall) => RunError::WallTimeout,
                     Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                     Some(TerminationReason::Memory) => RunError::MemoryLimit,
@@ -1160,7 +1276,7 @@ fn run_module_inner(
                         fields: exception_fields(scope),
                     })),
                 };
-                return Err(failure(error, &logs, start));
+                return Err(failure(error, unsafe { &*logs }, start));
             }
         };
 
@@ -1188,20 +1304,20 @@ fn run_module_inner(
         // ESM Module::Evaluate() always returns a Promise.  The try_from is a
         // belt-and-suspenders guard; failure would be an internal V8 bug.
         let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
-            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+            cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
             failure(
                 RunError::Internal("module evaluation did not return a Promise".into()),
-                &logs,
+                unsafe { &*logs },
                 start,
             )
         })?;
 
-        match settle_promise(scope, promise, &settle_ctx).map_err(|e| failure(e, &logs, start))? {
+        match settle_promise(scope, promise, &settle_ctx).map_err(|e| failure(e, unsafe { &*logs }, start))? {
             v8::PromiseState::Fulfilled => {}
             _ => {
                 // Pending with no socket to wait on — an un-awaited Promise that
                 // nothing in the isolate can ever resolve.
-                let error = match reason.get().copied() {
+                let error = match reason.get() {
                     Some(TerminationReason::Wall) => RunError::WallTimeout,
                     Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                     Some(TerminationReason::Memory) => RunError::MemoryLimit,
@@ -1209,7 +1325,7 @@ fn run_module_inner(
                         "module evaluation promise is still pending after poll loop".to_string(),
                     ),
                 };
-                return Err(failure(error, &logs, start));
+                return Err(failure(error, unsafe { &*logs }, start));
             }
         }
 
@@ -1222,9 +1338,7 @@ fn run_module_inner(
         cpu_budget.enter();
         v8::Local::new(
             scope,
-            prefix_module
-                .as_ref()
-                .expect("call-only run without a prefix module"),
+            prefix_module.expect("call-only run without a prefix module"),
         )
     };
 
@@ -1233,7 +1347,7 @@ fn run_module_inner(
         // serialization, exactly where the old poll loop cancelled them on
         // fulfilment. When a call follows, the guards stay armed until the
         // call settles.
-        cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+        cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
         cancel_handle.cancel_terminate_execution();
     }
 
@@ -1243,7 +1357,7 @@ fn run_module_inner(
         .ok_or_else(|| {
             failure(
                 RunError::Internal("module namespace is not an object".to_string()),
-                &logs,
+                unsafe { &*logs },
                 start,
             )
         })?;
@@ -1256,7 +1370,7 @@ fn run_module_inner(
         // inside the CPU budget — a path segment can be an accessor, so
         // resolution itself is sandbox code.
         let (target, receiver) = resolve_call_target(scope, namespace, &call.export_path)
-            .map_err(|e| failure(e, &logs, start))?;
+            .map_err(|e| failure(e, unsafe { &*logs }, start))?;
 
         // The argument list crosses as one blob holding an array (identity
         // between arguments preserved, same convention as BridgeCall args);
@@ -1267,12 +1381,12 @@ fn run_module_inner(
                     Some(e) => codec_error_to_run_error(e),
                     None => RunError::Internal("failed to deserialize call arguments".to_string()),
                 };
-                failure(error, &logs, start)
+                failure(error, unsafe { &*logs }, start)
             })?;
         let args_array = v8::Local::<v8::Array>::try_from(args_value).map_err(|_| {
             failure(
                 RunError::Internal("call arguments blob did not hold an array".to_string()),
-                &logs,
+                unsafe { &*logs },
                 start,
             )
         })?;
@@ -1281,7 +1395,7 @@ fn run_module_inner(
             let arg = args_array.get_index(scope, i).ok_or_else(|| {
                 failure(
                     RunError::Internal(format!("failed to read call argument {i}")),
-                    &logs,
+                    unsafe { &*logs },
                     start,
                 )
             })?;
@@ -1295,9 +1409,9 @@ fn run_module_inner(
                 // promise, so sync and async throws report the same
                 // name/message/stack/fields shape.
                 if let Some(err) = bridge_error.get() {
-                    return Err(failure(owned_bridge_error(err), &logs, start));
+                    return Err(failure(owned_bridge_error(err), unsafe { &*logs }, start));
                 }
-                let error = match reason.get().copied() {
+                let error = match reason.get() {
                     Some(TerminationReason::Wall) => RunError::WallTimeout,
                     Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                     Some(TerminationReason::Memory) => RunError::MemoryLimit,
@@ -1311,7 +1425,7 @@ fn run_module_inner(
                         })),
                     },
                 };
-                return Err(failure(error, &logs, start));
+                return Err(failure(error, unsafe { &*logs }, start));
             }
         };
 
@@ -1323,20 +1437,20 @@ fn run_module_inner(
             let promise = v8::Local::<v8::Promise>::try_from(result).map_err(|_| {
                 failure(
                     RunError::Internal("call result claimed to be a promise but is not".into()),
-                    &logs,
+                    unsafe { &*logs },
                     start,
                 )
             })?;
             scope.perform_microtask_checkpoint();
             if let Some(err) = bridge_error.get() {
-                return Err(failure(owned_bridge_error(err), &logs, start));
+                return Err(failure(owned_bridge_error(err), unsafe { &*logs }, start));
             }
             match settle_promise(scope, promise, &settle_ctx)
-                .map_err(|e| failure(e, &logs, start))?
+                .map_err(|e| failure(e, unsafe { &*logs }, start))?
             {
                 v8::PromiseState::Fulfilled => promise.result(scope),
                 _ => {
-                    let error = match reason.get().copied() {
+                    let error = match reason.get() {
                         Some(TerminationReason::Wall) => RunError::WallTimeout,
                         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                         Some(TerminationReason::Memory) => RunError::MemoryLimit,
@@ -1346,7 +1460,7 @@ fn run_module_inner(
                             call.export_path
                         )),
                     };
-                    return Err(failure(error, &logs, start));
+                    return Err(failure(error, unsafe { &*logs }, start));
                 }
             }
         } else {
@@ -1355,7 +1469,7 @@ fn run_module_inner(
 
         // The call settled — now the guards can go, before serialization,
         // mirroring the exports path.
-        cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+        cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
         cancel_handle.cancel_terminate_execution();
 
         blob::serialize_value(scope, value).map_err(|message| {
@@ -1366,7 +1480,7 @@ fn run_module_inner(
                     call.export_path
                 )),
             };
-            failure(error, &logs, start)
+            failure(error, unsafe { &*logs }, start)
         })?
     } else {
         // ── Exports extraction ───────────────────────────────────────────────
@@ -1375,7 +1489,7 @@ fn run_module_inner(
             .ok_or_else(|| {
                 failure(
                     RunError::Internal("failed to read module export names".to_string()),
-                    &logs,
+                    unsafe { &*logs },
                     start,
                 )
             })?;
@@ -1396,7 +1510,7 @@ fn run_module_inner(
             let name_value = names.get_index(scope, i).ok_or_else(|| {
                 failure(
                     RunError::Internal("failed to read export name".to_string()),
-                    &logs,
+                    unsafe { &*logs },
                     start,
                 )
             })?;
@@ -1406,7 +1520,7 @@ fn run_module_inner(
                 .ok_or_else(|| {
                     failure(
                         RunError::Internal("failed to stringify export name".to_string()),
-                        &logs,
+                        unsafe { &*logs },
                         start,
                     )
                 })?;
@@ -1414,7 +1528,7 @@ fn run_module_inner(
             let value = namespace.get(scope, name_value).ok_or_else(|| {
                 failure(
                     RunError::Internal(format!("failed to read export {name}")),
-                    &logs,
+                    unsafe { &*logs },
                     start,
                 )
             })?;
@@ -1430,7 +1544,7 @@ fn run_module_inner(
             let export_key = v8::Local::<v8::Name>::try_from(name_value).map_err(|_| {
                 failure(
                     RunError::Internal(format!("export name {name} is not a property key")),
-                    &logs,
+                    unsafe { &*logs },
                     start,
                 )
             })?;
@@ -1439,7 +1553,7 @@ fn run_module_inner(
                 .ok_or_else(|| {
                     failure(
                         RunError::Internal(format!("failed to stage export {name}")),
-                        &logs,
+                        unsafe { &*logs },
                         start,
                     )
                 })?;
@@ -1453,7 +1567,7 @@ fn run_module_inner(
                 // loud diagnostic (stream bodies etc. must not vanish
                 // silently); only generic clone refusals are skippable.
                 if let Some(e) = blob::take_codec_error() {
-                    return Err(failure(codec_error_to_run_error(e), &logs, start));
+                    return Err(failure(codec_error_to_run_error(e), unsafe { &*logs }, start));
                 }
                 // Something nested inside an export refuses to clone (e.g. the
                 // function in `export default { fetch }`). Trial-serialize
@@ -1465,7 +1579,7 @@ fn run_module_inner(
                             let key = v8::String::new(scope, name).ok_or_else(|| {
                                 failure(
                                     RunError::Internal("failed to intern export name".to_string()),
-                                    &logs,
+                                    unsafe { &*logs },
                                     start,
                                 )
                             })?;
@@ -1476,14 +1590,14 @@ fn run_module_inner(
                                         RunError::Internal(format!(
                                             "failed to stage export {name}"
                                         )),
-                                        &logs,
+                                        unsafe { &*logs },
                                         start,
                                     )
                                 })?;
                         }
                         Err(_) => {
                             if let Some(e) = blob::take_codec_error() {
-                                return Err(failure(codec_error_to_run_error(e), &logs, start));
+                                return Err(failure(codec_error_to_run_error(e), unsafe { &*logs }, start));
                             }
                             skipped_exports.push(name.clone());
                         }
@@ -1494,7 +1608,7 @@ fn run_module_inner(
                         RunError::ExportNotSerializable(format!(
                             "exports could not be serialized: {retry_message}"
                         )),
-                        &logs,
+                        unsafe { &*logs },
                         start,
                     )
                 })?
@@ -1507,19 +1621,347 @@ fn run_module_inner(
     // socket, so the limit is now free (no probe encode). A call's return
     // value is capped by the same limit.
     if limits.max_export_bytes > 0 && exports.len() > limits.max_export_bytes as usize {
-        return Err(failure(RunError::ExportTooLarge, &logs, start));
+        return Err(failure(RunError::ExportTooLarge, unsafe { &*logs }, start));
     }
 
     Ok(Output {
         exports,
         skipped_exports,
-        stdout: logs.stdout.clone(),
-        stderr: logs.stderr.clone(),
+        stdout: unsafe { &*logs }.stdout.clone(),
+        stderr: unsafe { &*logs }.stderr.clone(),
         duration_ms: elapsed_ms(start),
         // Stamped by run_module from the shared run state.
         cpu_time_ms: 0.0,
         bridge_calls: Vec::new(),
     })
+}
+
+// ── Warm instances (#64) ────────────────────────────────────────────────────
+
+/// Fixed budget for warm-up (isolate boot + prefix evaluation), deliberately
+/// not user-configurable — Cloudflare's script-startup limit (1 s since
+/// 2025-10) is the model. Warm-up is never billed to the request that
+/// triggered it; blowing this budget reports `ERR_WARMUP_LIMIT`.
+pub const WARMUP_WALL_MS: u32 = 1_000;
+/// CPU half of the warm-up budget; see [`WARMUP_WALL_MS`].
+pub const WARMUP_CPU_MS: u32 = 1_000;
+
+/// Everything that lives as long as an isolate: the isolate itself, its
+/// context, the once-per-instance installs (console, web runtime, async
+/// context), and the evaluated prefix module. One-off runs build the same
+/// state inline per run (`run_module_inner`); warm instances retain an
+/// `InstanceCore` across calls on a dedicated owner thread.
+pub struct InstanceCore {
+    // Field order is drop order: the Globals must die before the isolate.
+    context: v8::Global<v8::Context>,
+    prefix_module: Option<v8::Global<v8::Module>>,
+    isolate: v8::OwnedIsolate,
+    /// Console sink. The console holds a raw pointer into this Box (stable
+    /// address), so the buffers live exactly as long as the isolate; caps
+    /// are re-pointed and contents drained per call.
+    logs: Box<LogBuffers>,
+    /// Termination-reason slot shared with the near-heap callback and the
+    /// ArrayBuffer allocator, which are registered once per isolate. Reset
+    /// per call — the reason a [`ReasonCell`] replaced the old `OnceLock`.
+    reason: Arc<ReasonCell>,
+    /// Keeps the identity of the allocator state visible to the core. The
+    /// allocator holds its own Arc reference (via `Arc::into_raw`), and its
+    /// `used` counter deliberately accumulates across calls: the heap cap is
+    /// per instance, not per call.
+    #[allow(dead_code)]
+    alloc_state: Option<Arc<BudgetAllocState>>,
+    /// Owns the near-heap callback's data for the isolate's lifetime.
+    #[allow(dead_code)]
+    near_heap: Option<Box<NearHeapData>>,
+}
+
+/// Build a fresh isolate + context, run the once-per-instance installs, and
+/// evaluate the prefix — all under the fixed warm-up budget. This is the
+/// cold-start half of a warm instance; `run_call_on_core` is the per-call
+/// half. Any fired guard reports `ERR_WARMUP_LIMIT` (the caller's limits are
+/// not armed during warm-up, so neither timeout code would be honest).
+pub fn create_instance_core(
+    prefix: Option<PrefixSpec<'_>>,
+    imports: &[ImportBinding],
+    memory_mb: u32,
+) -> Result<InstanceCore, FailureOutput> {
+    init_platform();
+    let start = std::time::Instant::now();
+
+    let mut logs = Box::new(LogBuffers::default());
+    let reason = Arc::new(ReasonCell::new());
+
+    // Same CreateParams dance as run_module_inner: heap cap + budget
+    // allocator wired before the isolate exists.
+    let alloc_state: Option<Arc<BudgetAllocState>> = if memory_mb > 0 {
+        Some(Arc::new(BudgetAllocState {
+            used: AtomicUsize::new(0),
+            budget: memory_mb as usize * 1024 * 1024,
+            handle: OnceLock::new(),
+            reason: Arc::clone(&reason),
+        }))
+    } else {
+        None
+    };
+
+    let mut isolate = {
+        let params = v8::Isolate::create_params();
+        let params = if memory_mb > 0 {
+            params.heap_limits(0, memory_mb as usize * 1024 * 1024)
+        } else {
+            params
+        };
+        let params = match &alloc_state {
+            Some(state) => {
+                let raw = Arc::into_raw(Arc::clone(state));
+                unsafe {
+                    params.array_buffer_allocator(v8::new_rust_allocator(raw, &BUDGET_ALLOC_VTABLE))
+                }
+            }
+            None => params,
+        };
+        v8::Isolate::new(params)
+    };
+    if let Some(state) = &alloc_state {
+        state.handle.set(isolate.thread_safe_handle()).ok();
+    }
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+    isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
+
+    let handle = isolate.thread_safe_handle();
+    let warmup_budget = Arc::new(CpuBudget::new());
+    let cancel_wall = start_wall_guard(handle.clone(), Arc::clone(&reason), WARMUP_WALL_MS);
+    let cancel_cpu = start_cpu_guard(
+        handle.clone(),
+        Arc::clone(&reason),
+        Arc::clone(&warmup_budget),
+        WARMUP_CPU_MS,
+    );
+    let near_heap: Option<Box<NearHeapData>> = if memory_mb > 0 {
+        let data = Box::new(NearHeapData {
+            handle: handle.clone(),
+            reason: Arc::clone(&reason),
+        });
+        let raw = &*data as *const NearHeapData as *mut std::ffi::c_void;
+        isolate.add_near_heap_limit_callback(near_heap_limit_cb, raw);
+        Some(data)
+    } else {
+        None
+    };
+    let guard_canceller = GuardCanceller {
+        cancel_wall: &cancel_wall,
+        cancel_cpu: &cancel_cpu,
+        budget: &warmup_budget,
+    };
+
+    let logs_ptr: *mut LogBuffers = &mut *logs;
+    let setup = (|| -> Result<(v8::Global<v8::Context>, Option<v8::Global<v8::Module>>), RunError> {
+        v8::scope!(let scope, &mut isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        install_console(scope, logs_ptr)?;
+        crate::webtypes::install(scope).map_err(RunError::Internal)?;
+        install_async_context(scope)?;
+        let mut prefix_module: Option<v8::Global<v8::Module>> = None;
+        if let Some(prefix) = &prefix {
+            // Enter the CPU meter for compile + evaluate only — isolate boot
+            // is ours, the prefix's code is what the budget polices.
+            warmup_budget.enter();
+            v8::tc_scope!(let tc, scope);
+            let module =
+                evaluate_prefix_module(tc, prefix.code, prefix.filename, prefix.globals, imports)?;
+            prefix_module = Some(module);
+            warmup_budget.leave();
+        }
+        Ok((v8::Global::new(scope, context), prefix_module))
+    })();
+    drop(guard_canceller);
+
+    match setup {
+        // A guard that fired *after* evaluation completed still taints: the
+        // pending terminate may have landed anywhere. Fired guard ⇒ discard,
+        // no exceptions to the doctrine.
+        Ok(_) if reason.get().is_some() => {
+            Err(failure(RunError::WarmupLimit, &logs, start))
+        }
+        Ok((context, prefix_module)) => {
+            handle.cancel_terminate_execution();
+            Ok(InstanceCore {
+                context,
+                prefix_module,
+                isolate,
+                logs,
+                reason,
+                alloc_state,
+                near_heap,
+            })
+        }
+        Err(error) => {
+            let error = if reason.get().is_some() {
+                RunError::WarmupLimit
+            } else {
+                error
+            };
+            Err(failure(error, &logs, start))
+        }
+    }
+}
+
+/// What the warm layer needs to know after each call on an instance.
+pub struct CallOutcome {
+    pub result: Result<Output, FailureOutput>,
+    /// True when the isolate's state can no longer be trusted: a guard
+    /// fired, the call was aborted mid-execution, or a fatal bridge/runtime
+    /// error terminated execution. Tainted instances MUST be evicted; only
+    /// clean completions (including ordinary uncaught exceptions) leave the
+    /// instance reusable.
+    pub tainted: bool,
+    /// `used_heap_size` after the call — reported on the Result frame and
+    /// the input to eviction scoring (#66).
+    pub heap_used_bytes: u64,
+}
+
+/// Run one call (postfix or export call) on a retained instance: fresh
+/// guards and CPU budget from dispatch to settle, per-call bridge stubs,
+/// per-call console caps — the same per-request semantics a one-off run has,
+/// minus the isolate boot and prefix evaluation.
+#[allow(clippy::too_many_arguments)] // mirrors run_module; bundled state is the instance itself
+pub fn run_call_on_core(
+    core: &mut InstanceCore,
+    code: Option<&str>,
+    filename: &str,
+    prefix_globals: &[HostGlobalDef],
+    limits: Limits,
+    globals: &[HostGlobalDef],
+    imports: &[ImportBinding],
+    stream_fd: Option<RawFd>,
+    call_id_counter: Arc<AtomicU32>,
+    call: Option<&ipc::CallSpec>,
+) -> CallOutcome {
+    let start = std::time::Instant::now();
+    let cpu_budget = Arc::new(CpuBudget::new());
+    let bridge_log: Arc<Mutex<BridgeCallLog>> = Arc::new(Mutex::new(BridgeCallLog::default()));
+
+    // Per-call reset of instance-lifetime state: the termination-reason slot
+    // and the console sink (whose caps are per-call limits).
+    core.reason.reset();
+    {
+        let logs = &mut *core.logs;
+        logs.stdout.clear();
+        logs.stderr.clear();
+        logs.stdout_bytes = 0;
+        logs.stderr_bytes = 0;
+        logs.max_stdout_bytes = limits.max_stdout_bytes;
+        logs.max_stderr_bytes = limits.max_stderr_bytes;
+    }
+
+    // Re-arm throwing placeholders over every bridge-callable name BEFORE the
+    // live stubs bind. A name the previous call bound live but this call does
+    // not re-bind would otherwise still point at the previous call's freed
+    // callback state — a placeholder throw is correct; a dangling stub is UB.
+    let placeholder_result = {
+        v8::scope!(let scope, &mut core.isolate);
+        let context = v8::Local::new(scope, &core.context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        install_prefix_bridge_placeholders(scope, prefix_globals, imports)
+    };
+    if let Err(error) = placeholder_result {
+        let result = Err(failure(error, &core.logs, start));
+        return CallOutcome {
+            result,
+            tainted: true,
+            heap_used_bytes: heap_used(&mut core.isolate),
+        };
+    }
+
+    let handle = core.isolate.thread_safe_handle();
+    let cancel_handle = handle.clone();
+    let cancel_wall =
+        start_wall_guard(handle.clone(), Arc::clone(&core.reason), limits.wall_time_ms);
+    let cancel_cpu = start_cpu_guard(
+        handle,
+        Arc::clone(&core.reason),
+        Arc::clone(&cpu_budget),
+        limits.cpu_time_ms,
+    );
+    let guard_canceller = GuardCanceller {
+        cancel_wall: &cancel_wall,
+        cancel_cpu: &cancel_cpu,
+        budget: &cpu_budget,
+    };
+
+    let mut result = run_call_phase(
+        &mut core.isolate,
+        &core.context,
+        core.prefix_module.as_ref(),
+        code,
+        filename,
+        CallPhaseCtx {
+            limits: &limits,
+            globals,
+            imports,
+            stream_fd,
+            call_id_counter,
+            call,
+            start,
+            cpu_budget: &cpu_budget,
+            bridge_log: &bridge_log,
+            reason: &core.reason,
+            logs: std::ptr::addr_of!(*core.logs),
+            cancel_wall: &cancel_wall,
+            cancel_cpu: &cancel_cpu,
+            cancel_handle: &cancel_handle,
+        },
+    );
+    drop(guard_canceller);
+
+    // Stamp telemetry exactly as `run_module` does for the one-off path.
+    let cpu_time_ms = cpu_budget.elapsed_ms_precise();
+    let records = bridge_log
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .finalize(elapsed_ms(start));
+    match &mut result {
+        Ok(output) => {
+            output.cpu_time_ms = cpu_time_ms;
+            output.bridge_calls = records;
+        }
+        Err(f) => {
+            f.cpu_time_ms = cpu_time_ms;
+            f.bridge_calls = records;
+        }
+    }
+
+    // Taint verdict. A fired guard means terminate_execution ripped
+    // arbitrary mid-execution state; the error-shape check catches the fatal
+    // paths that terminate without setting a reason (abort, fatal bridge
+    // violations, internal faults). When in doubt, evict — cold starts are
+    // correct, reuse is only the optimization.
+    let tainted = core.reason.get().is_some()
+        || match &result {
+            Ok(_) => false,
+            Err(f) => matches!(
+                f.error,
+                RunError::Aborted
+                    | RunError::WallTimeout
+                    | RunError::CpuTimeout
+                    | RunError::MemoryLimit
+                    | RunError::Internal(_)
+                    | RunError::BridgeCallPayloadTooLarge
+                    | RunError::BridgeCallLimitExceeded
+                    | RunError::FunctionArgumentNotSupported
+            ),
+        };
+
+    CallOutcome {
+        result,
+        tainted,
+        heap_used_bytes: heap_used(&mut core.isolate),
+    }
+}
+
+fn heap_used(isolate: &mut v8::OwnedIsolate) -> u64 {
+    isolate.get_heap_statistics().used_heap_size() as u64
 }
 
 /// Clone the shared `bridge_error` OnceLock's content into an owned RunError.
@@ -1542,7 +1984,7 @@ struct SettleCtx<'a> {
     stream_fd: Option<RawFd>,
     limits: &'a Limits,
     start: std::time::Instant,
-    reason: &'a Arc<OnceLock<TerminationReason>>,
+    reason: &'a Arc<ReasonCell>,
     cpu_budget: &'a Arc<CpuBudget>,
     bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
     bridge_error: &'a Arc<OnceLock<RunError>>,
@@ -1650,7 +2092,7 @@ fn settle_promise(
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 // Wall budget exhausted during blocking wait.
-                ctx.reason.set(TerminationReason::Wall).ok();
+                ctx.reason.set(TerminationReason::Wall);
                 return Err(RunError::WallTimeout);
             }
             Err(e) => {
@@ -1799,7 +2241,7 @@ fn settle_promise(
             return Err(owned_bridge_error(err));
         }
         // Check if a guard thread fired termination during the checkpoint.
-        if let Some(r) = ctx.reason.get().copied() {
+        if let Some(r) = ctx.reason.get() {
             return Err(match r {
                 TerminationReason::Wall => RunError::WallTimeout,
                 TerminationReason::Cpu => RunError::CpuTimeout,
@@ -2017,6 +2459,12 @@ fn evaluate_prefix_module(
 /// what validates here evaluates identically per run. Prefix code is
 /// host-authored setup with no bridge/network side effects, so evaluating it
 /// here and again on every run is safe.
+///
+/// Runs under the same fixed warm-up budget as a cold start (#64): a prefix
+/// that cannot evaluate inside [`WARMUP_WALL_MS`]/[`WARMUP_CPU_MS`] would
+/// fail *every* instance creation with `ERR_WARMUP_LIMIT`, so it is rejected
+/// here, at deploy time — the same reason wrangler enforces Cloudflare's
+/// startup limit at upload.
 fn validate_prefix_module(
     code: &str,
     filename: &str,
@@ -2034,16 +2482,45 @@ fn validate_prefix_module(
     let mut isolate = v8::Isolate::new(Default::default());
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
+
+    let reason = Arc::new(ReasonCell::new());
+    let warmup_budget = Arc::new(CpuBudget::new());
+    let handle = isolate.thread_safe_handle();
+    let cancel_wall = start_wall_guard(handle.clone(), Arc::clone(&reason), WARMUP_WALL_MS);
+    let cancel_cpu = start_cpu_guard(
+        handle,
+        Arc::clone(&reason),
+        Arc::clone(&warmup_budget),
+        WARMUP_CPU_MS,
+    );
+    let _guard_canceller = GuardCanceller {
+        cancel_wall: &cancel_wall,
+        cancel_cpu: &cancel_cpu,
+        budget: &warmup_budget,
+    };
+
     v8::scope!(let scope, &mut isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
     // Same environment as a run, so prefix code that touches a web global is
     // validated here rather than failing on the first run.
-    crate::webtypes::install(scope).map_err(|e| failure(RunError::Internal(e), &logs, start))?;
+    crate::webtypes::install(scope).map_err(|e| {
+        failure(
+            termination_or(&reason, RunError::Internal(e)),
+            &logs,
+            start,
+        )
+    })?;
     v8::tc_scope!(let scope, scope);
-    evaluate_prefix_module(scope, code, filename, globals, imports)
-        .map(|_| ())
-        .map_err(|error| failure(error, &logs, start))
+    warmup_budget.enter();
+    let result = evaluate_prefix_module(scope, code, filename, globals, imports);
+    warmup_budget.leave();
+    match result {
+        Ok(_) if reason.get().is_some() => Err(failure(RunError::WarmupLimit, &logs, start)),
+        Ok(_) => Ok(()),
+        Err(_) if reason.get().is_some() => Err(failure(RunError::WarmupLimit, &logs, start)),
+        Err(error) => Err(failure(error, &logs, start)),
+    }
 }
 
 /// Wall-clock elapsed time since `start` in milliseconds, rounded to
@@ -2060,8 +2537,8 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
 /// `ERR_COMPILE`. The guard stores its reason *before* it calls
 /// `terminate_execution`, so a set reason here is always the real cause;
 /// otherwise the fallback stands.
-fn termination_or(reason: &OnceLock<TerminationReason>, fallback: RunError) -> RunError {
-    match reason.get().copied() {
+fn termination_or(reason: &ReasonCell, fallback: RunError) -> RunError {
+    match reason.get() {
         Some(TerminationReason::Wall) => RunError::WallTimeout,
         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
@@ -2568,7 +3045,7 @@ fn is_valid_export_identifier(name: &str) -> bool {
 /// If `wall_time_ms == 0`, no thread is spawned but a sender is still returned.
 fn start_wall_guard(
     handle: v8::IsolateHandle,
-    reason: Arc<OnceLock<TerminationReason>>,
+    reason: Arc<ReasonCell>,
     wall_time_ms: u32,
 ) -> crossbeam_channel::Sender<()> {
     let (tx, rx) = crossbeam_channel::bounded::<()>(1);
@@ -2576,7 +3053,7 @@ fn start_wall_guard(
         std::thread::spawn(move || {
             let timeout = Duration::from_millis(wall_time_ms as u64);
             if let Err(crossbeam_channel::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
-                reason.set(TerminationReason::Wall).ok(); // first writer wins
+                reason.set(TerminationReason::Wall); // first writer wins
                 handle.terminate_execution();
             }
             // Err(Disconnected) means cancel_guards() fired first - do nothing.
@@ -2591,7 +3068,7 @@ fn start_wall_guard(
 /// after to exclude host wait time from the measurement.
 fn start_cpu_guard(
     handle: v8::IsolateHandle,
-    reason: Arc<OnceLock<TerminationReason>>,
+    reason: Arc<ReasonCell>,
     budget: Arc<CpuBudget>,
     cpu_time_ms: u32,
 ) -> crossbeam_channel::Sender<()> {
@@ -2602,7 +3079,7 @@ fn start_cpu_guard(
                 Ok(_) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
                     if budget.elapsed_ms() >= cpu_time_ms as u64 {
-                        reason.set(TerminationReason::Cpu).ok(); // first writer wins
+                        reason.set(TerminationReason::Cpu); // first writer wins
                         handle.terminate_execution();
                         break;
                     }
@@ -3947,7 +4424,6 @@ mod tests {
         run_module(
             Some(code),
             filename,
-            None,
             limits,
             &[],
             &[],
@@ -3988,7 +4464,6 @@ mod tests {
         run_module(
             Some(code),
             "<iso4>",
-            None,
             Limits::default(),
             &[],
             imports,
@@ -8239,7 +8714,6 @@ mod tests {
         run_module(
             Some(code),
             "<iso4>",
-            None,
             Limits::default(),
             &[],
             &[],
@@ -8535,7 +9009,6 @@ mod tests {
         let failure = run_module(
             Some("export function f() { return 'x'.repeat(1024 * 1024) }"),
             "<iso4>",
-            None,
             Limits {
                 max_export_bytes: 1024,
                 ..Default::default()
@@ -8610,7 +9083,6 @@ mod tests {
         let failure = run_module(
             Some("export function f() { for (;;) {} }"),
             "<iso4>",
-            None,
             Limits {
                 cpu_time_ms: 100,
                 wall_time_ms: 10_000,
@@ -8624,5 +9096,216 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::CpuTimeout));
+    }
+
+    // ── Warm instances (#64): create/call split, taint, warm-up budget ──────
+
+    /// A counting prefix: module-scope state observable through a call.
+    const COUNTER_PREFIX: &str = "let n = 0\nexport function bump() { return ++n }";
+
+    fn counter_core() -> InstanceCore {
+        init_platform();
+        create_instance_core(
+            Some(PrefixSpec {
+                code: COUNTER_PREFIX,
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("counter prefix warms up")
+    }
+
+    /// One `bump()` call on a warm core with the given limits.
+    fn bump(core: &mut InstanceCore, limits: Limits) -> CallOutcome {
+        let call = call_spec("bump", &[]);
+        run_call_on_core(
+            core,
+            None,
+            "<iso4>",
+            &[],
+            limits,
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        )
+    }
+
+    #[test]
+    fn warm_core_keeps_module_state_across_calls() {
+        let mut core = counter_core();
+        for expected in 1..=3 {
+            let outcome = bump(&mut core, Limits::default());
+            assert!(!outcome.tainted);
+            let out = outcome.result.expect("bump succeeds");
+            assert_eq!(value_of(&out), WireValue::Number(f64::from(expected)));
+        }
+    }
+
+    #[test]
+    fn warm_core_reports_heap_usage() {
+        let mut core = counter_core();
+        let outcome = bump(&mut core, Limits::default());
+        assert!(outcome.result.is_ok());
+        assert!(
+            outcome.heap_used_bytes > 0,
+            "a live isolate has a non-empty heap"
+        );
+    }
+
+    #[test]
+    fn fired_guard_taints_the_core() {
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "export function spin() { for (;;) {} }",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("spin prefix warms up");
+        let call = call_spec("spin", &[]);
+        let outcome = run_call_on_core(
+            &mut core,
+            None,
+            "<iso4>",
+            &[],
+            Limits {
+                cpu_time_ms: 50,
+                wall_time_ms: 5_000,
+                ..Default::default()
+            },
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        );
+        assert!(outcome.tainted, "a fired guard must taint the instance");
+        let failure = outcome.result.unwrap_err();
+        assert!(matches!(
+            failure.error,
+            RunError::CpuTimeout | RunError::WallTimeout
+        ));
+    }
+
+    #[test]
+    fn clean_exception_does_not_taint_and_state_survives() {
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "let n = 0\n\
+                       export function bump() { return ++n }\n\
+                       export function boom() { throw new Error('x') }",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up");
+        assert!(bump(&mut core, Limits::default()).result.is_ok());
+
+        let call = call_spec("boom", &[]);
+        let outcome = run_call_on_core(
+            &mut core,
+            None,
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        );
+        assert!(
+            !outcome.tainted,
+            "an ordinary uncaught exception is a clean completion"
+        );
+        assert!(matches!(
+            outcome.result.unwrap_err().error,
+            RunError::RuntimeError(_)
+        ));
+
+        // The instance stays reusable and its state is intact: n continues.
+        let out = bump(&mut core, Limits::default()).result.expect("bump");
+        assert_eq!(value_of(&out), WireValue::Number(2.0));
+    }
+
+    #[test]
+    fn warmup_budget_rejects_a_looping_prefix() {
+        init_platform();
+        let result = create_instance_core(
+            Some(PrefixSpec {
+                code: "for (;;) {}",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        );
+        let Err(failure) = result else {
+            panic!("a looping prefix cannot warm up");
+        };
+        assert!(matches!(failure.error, RunError::WarmupLimit));
+    }
+
+    #[test]
+    fn prepare_validation_rejects_a_looping_prefix() {
+        // Same budget at prepare() (validate_prefix_module), so an
+        // un-warmable prefix fails at deploy time, not on the first call.
+        // Pre-#64 this hung prepare() forever.
+        let failure =
+            validate_prefix_module("for (;;) {}", "<prefix>", &[], &[]).expect_err("must reject");
+        assert!(matches!(failure.error, RunError::WarmupLimit));
+    }
+
+    #[test]
+    fn postfix_runs_on_a_warm_core_share_prefix_state() {
+        // prefix.execute() on a warm instance: each postfix is a fresh module
+        // but evaluates in the retained context.
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "globalThis.counter = (globalThis.counter ?? 0)",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up");
+        for expected in 1..=2 {
+            let outcome = run_call_on_core(
+                &mut core,
+                Some("globalThis.counter += 1\nexport default globalThis.counter"),
+                "<iso4>",
+                &[],
+                Limits::default(),
+                &[],
+                &[],
+                None,
+                Arc::new(AtomicU32::new(0)),
+                None,
+            );
+            assert!(!outcome.tainted);
+            let out = outcome.result.expect("postfix run succeeds");
+            let WireValue::Object(entries) = testval::from_blob(&out.exports) else {
+                panic!("exports must decode to an object");
+            };
+            assert_eq!(
+                entries,
+                vec![(
+                    "default".to_string(),
+                    WireValue::Number(f64::from(expected))
+                )]
+            );
+        }
     }
 }
