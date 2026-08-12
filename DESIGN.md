@@ -15,9 +15,9 @@ The execution model is always the same:
 precompile prefix once  →  call a function with some input  →  get a value back
 ```
 
-The prefix is a V8 startup snapshot that captures compiled libraries, tool
-bindings, and helper code. Every execution restores from that snapshot (or
-reuses a live isolate from it) and runs a function, then returns its result.
+The prefix is validated once at `prepare()` and cached (source + declared
+shape); every execution evaluates it into a fresh isolate and then runs a
+function, returning its result.
 The function body and the input differ between deployments; the machinery
 is identical.
 
@@ -43,9 +43,9 @@ export default await (async () => {
 })()
 ```
 
-`prefix.run({ code })` handles this. A fresh isolate is created from the
-snapshot per call so each caller starts from a clean state regardless of
-what previous callers did. Multiple callers running simultaneously each get
+`prefix.run({ code })` handles this. A fresh isolate is created per call
+and the prefix is re-evaluated into it, so each caller starts from a clean
+state regardless of what previous callers did. Multiple callers running simultaneously each get
 their own pool slot and run in parallel.
 
 **Static code** — the function is compiled into the prefix and does not
@@ -53,7 +53,7 @@ change between calls. Only the input data varies. The prefix exports the
 function by name; the host calls it with each new input:
 
 ```js
-// Prefix code (compiled once into the snapshot)
+// Prefix code (validated once at prepare())
 export async function transform(row) {
   return { revenue: row.price * row.qty }
 }
@@ -61,7 +61,7 @@ export async function transform(row) {
 
 The static-code shape above is achievable in `@iso4/sandbox` via
 `prefix.run()` with a per-run host import that provides the input data —
-at the cost of a snapshot restore per call. A persistent-session API
+at the cost of a fresh isolate + prefix evaluation per call. A persistent-session API
 (`session.call('transform', row)`) that reuses the isolate across calls
 is **not** part of `@iso4/sandbox`; it belongs to the future analytics
 product (see §9.1 and §13.1).
@@ -105,8 +105,10 @@ analytics use case is served by a separate package, not a backend swap.
    as a V8 serialization blob, which restricts results to data
    (no functions, no methods — see §5.1).
 8. **Captured stdout/stderr** via a runtime-owned `console`.
-9. **Pre-compilable prefix code** via V8 startup snapshots. Snapshotting
-   the prefix once cuts cold start from ~30–80 ms to ~2–5 ms steady-state.
+9. **Pre-validated prefix code**: `prepare()` validates the prefix once;
+   each run re-evaluates the cached source (sub-ms for typical prefixes;
+   grows with prefix size). Runtime startup snapshots were removed — see
+   §11.6.
 10. **Composable monorepo structure**: the runtime is one package (`iso4`);
     fetch hardening (`@iso4/fetch`), stdlib stubs (`@iso4/fs`,
     `@iso4/crypto`, …), and future extensions are siblings. Each one is a
@@ -125,7 +127,7 @@ Explicitly **out of scope**:
 - Streaming `Response` / `ReadableStream`. v1 buffers full bodies host-side
   with a configurable cap.
 - Sharing live state between runs. Each `prefix.run()` is a fresh isolate
-  booted from the prefix snapshot — the _prefix's heap shape_ is shared,
+  the prefix is re-evaluated into — the _prefix's declared shape_ is shared,
   not live mutable state.
 - TypeScript / JSX compilation. Host's responsibility to ship pre-compiled JS.
 - POSIX surface (sockets, FDs, pipes, PTY, process tables). None of it.
@@ -166,7 +168,7 @@ host hands it over by name.
   │      │     v8::Context with curated globals             │    
   │      │     timeout guard thread (terminate_execution)   │    
   │      │     CPU budget tracker (enter/leave bracketing)  │    
-  │      └─ V8 startup snapshot for sub-ms isolate boot     │    
+  │      └─ stock V8 snapshot for sub-ms isolate boot       │    
   └─────────────────────────────────────────────────────────┘    
 ```
 
@@ -355,13 +357,7 @@ internal field. The field is what makes serialization work: V8 routes objects
 with internal fields to `WriteHostObject` off a map field read, leaving
 `HasCustomHostObject()` `false` so no embedder callback fires for ordinary
 objects. workerd depends on the same property. Behaviour above the shell is JS,
-evaluated into the context once and captured in the prefix snapshot, so it costs
-nothing per run.
-
-Because the shells are native callbacks, they only survive the snapshot via an
-`ExternalReferences` table that must be supplied at **both** snapshot creation
-and restore. Omitting it at restore does not fail cleanly — the process aborts
-on the first `new Response()`.
+evaluated into every run's context at creation (~0.5 ms, measured).
 
 **Deliberate deviations from spec**, in scope terms rather than bugs:
 
@@ -506,8 +502,9 @@ The shipping design keeps the best of both: the shape crosses the wire as
 (`export const <name> = import.meta.__iso4[<i>];` — identifier-validated
 names, integer indices) while building every value natively and handing
 the values array to the module through V8's import-meta callback. The
-module is an ordinary source-text module, so prefix snapshots capture
-host-module bindings as plain JS with no external references; and the
+module is an ordinary source-text module, so the prefix's host-module
+bindings are plain JS with no native pointers — they re-evaluate cleanly
+in every run; and the
 runtime owns the handle table, so bridge frames and records carry fully
 resolved names.
 
@@ -890,11 +887,11 @@ feature most users will rely on and shapes the IPC protocol.
 | ------ | ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | 0 ✅   | This doc + `packages/iso4-sandbox/src/types.ts` + `packages/iso4-sandbox/src/types.ts` + workspace scaffolding                            | API committed before code                                                  |
 | 1 ✅   | Rust binary: spawn, UDS, single run, heap limit, CPU timeout (wall-clock), ESM compile + evaluate, captured console, export serialization | `runtime.run({ code, limits })` works end-to-end with no imports, no fetch |
-| 2 ✅   | Precompile + `PrecompiledPrefix.run()` via V8 startup snapshots                                                                           | The canonical AI-agent prefix/postfix loop works                           |
+| 2 ✅   | Precompile + `PrecompiledPrefix.run()` (originally via V8 startup snapshots; mechanism replaced by per-run prefix evaluation — §11.6)                                                                           | The canonical AI-agent prefix/postfix loop works                           |
 | 3 ✅   | CPU budget enter/leave bracketing (async time exclusion)                                                                                  | Tight loops killed quickly; `await fetch` doesn't burn budget              |
 | 4 ✅   | Generic host-bridge dispatch for globals (string / function / shimmed); `fetch` is just one allowed name on this path                     | Hosts can expose any allowlisted global; `fetch` works as a regular global |
 | 5 ✅   | `@iso4/fetch` package: `createSafeFetch` with allowlist, DNS pin, private-IP blocking, no-auto-redirect                                   | Hardened default users can opt into in two lines                           |
-| 6 ✅   | Imports: source modules (Flavor B); host-supplied ESM strings compiled per-isolate. No separate code-cache LRU — the precompile snapshot is the cache.   | `import { add } from "lib:math"` works when the host declares the source     |
+| 6 ✅   | Imports: source modules (Flavor B); host-supplied ESM strings compiled per-isolate. No separate code-cache LRU — the stored prefix is the cache.   | `import { add } from "lib:math"` works when the host declares the source     |
 | 7 ✅   | Imports: host modules — host provides a JS object; the shape crosses the wire as plain data and the Rust runtime builds the module natively (data leaves via the value codec, function leaves as trampolines dispatching `BridgeCall { targetKind: 1 }` with runtime-resolved names). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for arbitrarily-nested mixed data/function shapes; bridge records report `host:tools.search` with no client-side name resolution |
 | 8     | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
 | 9     | Pre-warmed isolate pool (optional, behind a runtime option)                                                                               | Sub-2ms cold start for high-throughput workloads                           |
@@ -997,8 +994,9 @@ To be resolved as we build, not blocking the start:
   with a 1 MB cap per stream, but this still needs an explicit implementation
   decision.
 
-- **Snapshot cache LRU cap.** Snapshots live in the Rust process's memory.
-  Each is tens-to-hundreds of KB. Default cap: 100 snapshots, LRU evicted.
+- **Prefix store LRU cap.** Prepared prefixes (source + declared shape)
+  live in the Rust process's memory, typically a few KB each. Default cap:
+  100 prefixes, LRU evicted.
   Configurable via `SandboxOptions.maxPrecompiledPrefixes`. Evicted handles
   fail `.run()` with `ERR_PREFIX_DISPOSED`; the host re-precompiles.
 
@@ -1040,66 +1038,72 @@ For an interactive agent doing N tool calls per turn, that compounds badly.
 
 ### 11.2 What we do about it
 
-V8 startup snapshots let us serialize a fully-initialized isolate state to
-a `v8::StartupData` blob and restore it on demand. The `Runtime.precompile()`
-entry point creates a snapshot of a user-supplied prefix; `prefix.run()`
-restores it and runs the postfix.
+`Runtime.precompile()` validates the prefix once (compile + instantiate +
+evaluate in a throwaway isolate) and stores its source and declared shape in
+the Rust process. `prefix.run()` boots a fresh isolate from V8's stock
+snapshot, re-evaluates the prefix, then runs the postfix. The expensive,
+error-prone part of the loop — authoring and validating the setup — is paid
+once; runs pay only the evaluation.
 
 Flow:
 
 ```
-  precompile(prefix)            run(postfix)         run(postfix)
-       │                            │                     │
-       ▼                            ▼                     ▼
-  one-time:                    fast path:            fast path:
-  - boot isolate               - isolate from        - same
-  - install globals stubs        snapshot (~1ms)
-  - run prefix code            - rebind per-run
-  - create_blob() → snapshot     globals & imports
-  - cache snapshot             - compile postfix
-                               - run
+  precompile(prefix)            run(postfix)          run(postfix)
+       │                            │                      │
+       ▼                            ▼                      ▼
+  one-time:                    per run:               per run:
+  - validate in throwaway      - fresh isolate        - same
+    isolate (compile +           (stock snapshot,
+    instantiate + evaluate)      ~0.3 ms)
+  - cache source +             - web runtime install
+    declared shape             - evaluate prefix
+                               - bind per-run globals
+                                 & imports
+                               - compile + run postfix
 ```
 
 Steady-state cold start target (after the first call): **<5 ms** from
-`prefix.run()` to user code executing.
+`prefix.run()` to user code executing, for typical (small) prefixes. Run
+cost grows with prefix size — a prefix that takes 20 ms to evaluate costs
+every run 20 ms. Heavy prefixes are the domain of the resident-isolate
+model (§11.6, epic #61).
 
-### 11.3 What the snapshot captures vs doesn't
+### 11.3 The prefix contract
 
-The snapshot captures the V8 heap state at the moment the prefix module
-finishes evaluating. That means:
+Each run re-evaluates the prefix into a fresh context, so what a postfix
+sees is exactly what the prefix produces deterministically:
 
-- **Captured (baked in, identical across runs):**
-  - All top-level `const`/`let`/`var` bindings.
-  - All compiled `v8::Module`s the prefix imported.
-  - Closures, function objects, frozen built-in shapes.
-  - The results of any I/O the prefix did (because the resolved values
-    are now in memory).
-- **Not captured (rebound per run):**
-  - The backing C++ pointers for bridge function stubs. These point at the
-    precompile-time session, which is gone after snapshotting. On restore,
-    the Rust runtime walks the snapshot's global object and replaces every
-    bridge stub with a session-local one bound to the new run's handlers.
-    Same trick secure-exec uses.
-- **Forbidden:**
-  - You cannot snapshot an isolate with pending Promises, in-flight bridge
-    calls, or any external resource state. The prefix module must complete
-    evaluation before the snapshot is taken. Top-level `await` is fine as
-    long as it settles without host I/O: the runtime drains the microtask
-    queue after evaluation, which settles any await chain that doesn't wait
-    on an external event (`await 1`, `await Promise.resolve(x)`,
-    `await new Response(body).text()`, chained awaits).
-  - Prefix code cannot *call* the bridge. No host session exists at
-    `prepare()` time, so every declared bridge callable — bridge globals,
-    shim globals, host-import functions — is installed as a throwing
-    placeholder during precompile: it exists (`typeof fetch` matches what
-    run() code sees) and may be referenced, stashed, or closed over, but
-    calling it fails `prepare()` with `ERR_PREFIX_BRIDGE_CALL`. Whether
-    bridge calls at prepare() time ever become supported is a deliberate
-    future decision; the error code is the gate.
-  - A prefix whose evaluation promise can never settle (e.g.
-    `await new Promise(() => {})`) fails `prepare()` with
-    `ERR_PREFIX_DID_NOT_SETTLE`; the checkpoint loop is bounded, so it
-    cannot hang.
+- **Provided by prefix evaluation (identical across runs, assuming the
+  prefix is deterministic):**
+  - All `globalThis` state the prefix sets up.
+  - Declared value globals (string/data kinds) and shim wrappers, replayed
+    from the stored defs before the prefix evaluates.
+  - Source-module and host-module imports, rebuilt from the declared shape.
+- **Bound per run:**
+  - Bridge function stubs. While the prefix evaluates they are throwing
+    placeholders; before the postfix runs the runtime overwrites the same
+    names with live stubs bound to the run's socket and handlers.
+- **Constraints (identical to the snapshot era, by design):**
+  - The prefix's evaluation promise must settle without host I/O. Top-level
+    `await` is fine as long as nothing external is awaited: the runtime
+    drains the microtask queue after evaluation (`await 1`,
+    `await Promise.resolve(x)`, `await new Response(body).text()`, chained
+    awaits all settle). A prefix that can never settle (e.g.
+    `await new Promise(() => {})`) fails with `ERR_PREFIX_DID_NOT_SETTLE`;
+    the checkpoint loop is bounded, so nothing hangs.
+  - Prefix code cannot *call* the bridge. The bridge does not exist while a
+    prefix evaluates; every declared bridge callable — bridge globals, shim
+    globals, host-import functions — is a throwing placeholder at that
+    stage: it exists (`typeof fetch` matches what run() code sees) and may
+    be referenced, stashed, or closed over, but calling it fails with
+    `ERR_PREFIX_BRIDGE_CALL`. Whether prefix-stage bridge calls ever become
+    supported is a deliberate future decision; the error code is the gate.
+  - A nondeterministic prefix (`Math.random()`, `Date.now()`) produces
+    per-run state that differs between runs — validated once, evaluated
+    many times. This was impossible in the snapshot era and is permitted
+    but not encouraged; determinism keeps runs reproducible.
+  - Prefix evaluation runs under the run's wall/CPU limits. A prefix that
+    loops costs the run its budget instead of hanging `prepare()`.
 
 ### 11.4 Rebinding rules
 
@@ -1108,14 +1112,14 @@ handlers stay on the TS side — bridge dispatch is name-addressed, so a
 rebind just re-points the per-run dispatch entry (global name, or
 host-import `specifier` + leaf path). The Rust runtime validates every
 rebound name/location against the shape stored with the prefix. Source
-modules cannot be rebound — their code is frozen in the snapshot.
+modules cannot be rebound — their code is frozen at declaration.
 
 If `prefix.run()` passes a name that wasn't declared at `precompile()`
 time, the run fails fast with `ERR_UNDECLARED_BINDING`. This is intentional:
-we could silently install new globals into the restored context, but that
-breaks the invariant that the prefix snapshot represents the full shape of
-the sandbox surface. Better to be strict and force the user to declare
-their surface up front.
+we could silently install new globals into the run's context, but that
+breaks the invariant that the declared prefix shape represents the full
+sandbox surface the prefix was validated against. Better to be strict and
+force the user to declare their surface up front.
 
 If the prefix declared a global the run doesn't supply, the precompile-time
 implementation is reused. This makes it easy to provide a default at
@@ -1123,13 +1127,62 @@ precompile time and override only when needed per run.
 
 ### 11.5 Pool of pre-warmed isolates (phase 9)
 
-Even with snapshots, `v8::Isolate::new` + snapshot restore costs ~1–2 ms.
-For high-throughput workloads we keep a pool of N already-restored isolates
-per precompiled prefix, sitting idle until a run grabs one. Pool size,
-eviction policy, and warmup-on-precompile are all `SandboxOptions`.
+Isolate boot + prefix evaluation costs low single-digit ms for typical
+prefixes. For high-throughput workloads we keep a pool of N already-warm
+isolates per prepared prefix, sitting idle until a run grabs one. Pool
+size, eviction policy, and warmup-on-prepare are all `SandboxOptions`.
 
-Not in v1. Snapshots alone get steady-state cold start under 5 ms which is
-plenty for interactive agents. The pool is for sub-millisecond requirements.
+Not in v1. Per-run evaluation keeps steady-state cold start under 5 ms for
+typical prefixes, which is plenty for interactive agents. Warm isolates are
+the answer for sub-millisecond requirements and heavy prefixes — tracked as
+epic #61 (registry + taint-and-evict + capacity manager + eviction scoring).
+
+### 11.6 Decision record: why there is no runtime snapshotting
+
+Until 2026-08 the prefix mechanism was a **V8 startup snapshot** created at
+`prepare()` time (`SnapshotCreator` + `create_blob`) and restored per run.
+It was removed deliberately (#60 → #61/#62); do not reintroduce it without
+reading this.
+
+**What broke.** V8 14.x made two changes that are fatal to runtime snapshot
+creation in a live multi-isolate process:
+
+1. `create_blob` runs *read-only promotion*: it mutates and re-seals the
+   read-only heap that is **shared process-wide across all isolates**. Two
+   concurrent `prepare()` calls race on it and segfault the child
+   (SIGSEGV/SIGBUS inside `ReadOnlyPromotion`/`ReadOnlySpace`).
+2. `IsolateGroup::RemoveIsolate` **frees the shared read-only artifacts when
+   the last live isolate dies** and rebuilds them on the next boot.
+   Snapshots created before such a reset reference read-only pages that no
+   longer exist afterwards (`Deserializer::ReadReadOnlyHeapRef` indexes out
+   of bounds). iso4 constantly crosses the zero-live-isolates boundary
+   between runs, and **no locking can fix this one** — it is state loss,
+   not a race. Verified empirically: fully serializing every isolate boot
+   and `create_blob` still crashed 9/10 test runs.
+
+A working mitigation existed (a global mutex for (1) plus an immortal
+"keeper" isolate pinning the artifacts for (2) — 10/10 green under stress),
+but it papered over an unsupported usage rather than fixing a bug on a
+supported path.
+
+**Upstream position.** V8's snapshot owner describes the supported workflow
+as mksnapshot's: "a single snapshot of a well-known, simple heap state,
+then throw the Isolate away" — anything beyond it will "soon run into
+trouble", and multiple custom snapshots "have divergent read-only heaps,
+violating an invariant" (v8-dev, threads on custom-snapshot checksum
+failures and SnapshotCreator teardown). The field agrees: workerd and Deno
+snapshot only at build time; Node's `--build-snapshot` is a one-shot
+single-isolate process; isolated-vm shipped runtime snapshots and now warns
+"you should not use this feature … increasingly unstable due to changes in
+v8".
+
+**Re-entry path.** V8 14.x introduced `IsolateGroup` internally — separate
+groups own separate read-only heaps, which would legitimize per-snapshot
+groups. If that (or an equivalent) becomes public embedder API and rusty_v8
+exposes it, snapshots can return behind the unchanged `prepare()` API as a
+pure optimization. Until then: prefix = validated source, re-evaluated per
+run; heavy prefixes and sub-ms calls belong to the warm-isolate model
+(epic #61).
 
 ## 12. Security model — fetch hardening
 
@@ -1246,7 +1299,7 @@ want. A host author who isn't an HTTP-security expert should reach for
 prefix.run({ code }) → RunResult
 ```
 
-The isolate is created from the snapshot, executes a code string, returns
+The isolate is created fresh (prefix re-evaluated), executes a code string, returns
 named exports, and is torn down. Every run is independent. IPC cost: one
 round trip (Run → … → Result). Suitable when the work per run is
 non-trivial and async (fetch, host imports). This is the AI-agent
@@ -1301,10 +1354,10 @@ const result  = await session.call('transformRow', input)   // many times
 await session.close()
 ```
 
-The isolate is created from the snapshot once and kept alive for the
+The isolate is created once (prefix evaluated once) and kept alive for the
 lifetime of the session. The prefix exports a function (`transformRow` above)
 that the host calls repeatedly with different inputs. No new isolate cost
-per call; no snapshot restore per call.
+per call; no prefix re-evaluation per call.
 
 **What the prefix must export for this to work:**
 
@@ -1344,7 +1397,7 @@ Lifecycle on a single connection:
 TS (one pool slot)                   Rust (one isolate thread)
 │                                       │
 │──── Authenticate ────────────────────▶│
-│──── OpenSession ─────────────────────▶│  boot isolate from snapshot
+│──── OpenSession ─────────────────────▶│  boot isolate, evaluate prefix
 │◀─── SessionOpened ───────────────────│
 │                                       │
 │──── Call(fn="transformRow", row_a) ────▶│  invoke exported fn, return result
@@ -1365,10 +1418,11 @@ work for MCP agents.
 
 ### 13.4 Session pool — pre-warmed isolates for instant open
 
-Opening a session cold (snapshot restore + thread spawn) costs ~1–2 ms.
+Opening a session cold (isolate boot + prefix evaluation + thread spawn)
+costs low single-digit ms.
 For a workload that receives bursts of parallel requests, that latency
 stacks. The session pool solves this: the runtime pre-warms N isolates
-from the prefix snapshot and holds them idle. `prefix.openSession()`
+from the prepared prefix and holds them idle. `prefix.openSession()`
 picks one off the pool instantly.
 
 ```ts
@@ -1393,8 +1447,9 @@ Pool semantics:
 - `openSession()` when the pool is empty either cold-starts a new isolate
   (default) or waits for one to become free if `sessionPool.maxSize` is
   set.
-- `session.close()` returns the isolate to the pool (snapshot-restores it
-  in place) rather than destroying it, so it's ready for the next request.
+- `session.close()` returns the isolate to the pool (reset to a fresh
+  prefix state) rather than destroying it, so it's ready for the next
+  request.
 - Pool size, max size, and idle eviction timeout are all
   `PrecompileOptions.sessionPool` fields. Decided at Phase 11.
 
@@ -1427,6 +1482,58 @@ unconfigured host global/function such as `fetch`, it fails like ordinary
 user code (for example, a missing binding), not with a fetch-specific runtime
 error. The session API is intentionally narrow: pure data in, pure data out,
 no async I/O.
+
+### 13.2.1 Warm-mode capacity & eviction sketch (feeds epic #61)
+
+Design notes for the resident-isolate ("warm") mode, recorded when runtime
+snapshotting was removed (§11.6) so the later design pass starts here
+instead of re-deriving:
+
+- **Contract: warmth is a cache, never a guarantee.** State carryover
+  between calls is permitted but undocumented behavior may vanish at any
+  moment — the workerd stance. Relying on it is an antipattern; the docs
+  say so explicitly.
+- **Taint-and-evict.** Any limit violation (CPU, wall, heap) terminates the
+  call AND discards the isolate — a terminated isolate's heap is untrusted
+  by definition. The next call pays a cold start; the misbehaving tenant
+  pays, everyone else is unaffected. Never reuse a tainted isolate; never
+  evict a running one.
+- **Uniform heap cap.** Default 128 MB per isolate (workerd's number),
+  overridable per Runtime instance only — never per prefix — so capacity
+  math stays `slots × cap`.
+- **Two capacity knobs, two resources.** Max concurrent runs (threads/CPU;
+  default from `os.availableParallelism()`, queue beyond it with
+  wait-vs-fail-fast policy per call) and warm-memory budget (RAM; default
+  from `process.constrainedMemory()` — cgroup-aware, `os.freemem()` lies in
+  containers; maxWarm = budget ÷ cap). Idle warm isolates hold memory, not
+  threads.
+- **Eviction scoring.** `score = heapUsed × idleTime`, evict highest: an
+  old 3 MB idler outlives a young 90 MB hoarder; ties evict oldest. Heap
+  usage is reported per Result frame (no polling). Soft watermark: evict by
+  score until under budget. Hard watermark: additionally refuse new warm
+  admissions and degrade to one-off (cold per call) — correctness never
+  depends on warmth.
+- **Instance pools, not singletons.** The registry maps prefix →
+  **pool of instances**, because the same trigger (workflow event, web
+  request) fires concurrently: a call takes a free instance, cold-starts
+  another up to `maxInstancesPerPrefix` (fairness guard — one hot tenant
+  must not convert the whole warm budget into copies of itself), then
+  queues. Instances of the same prefix share **no state** with each other
+  (intended — same contract as workerd instances across machines); durable
+  state belongs in the DB (SQLite direction), instance memory is only ever
+  an optimization. Eviction scoring applies per instance.
+- **v1 concurrency: one call at a time per instance.** Parallelism for one
+  prefix = more instances. Async interleaving of multiple in-flight calls
+  inside one isolate (the full workerd model) is explicitly deferred: it
+  requires multiplexed bridge calls (today the bridge is sequential within
+  a run) and per-request context separation — only worth it for I/O-heavy
+  handlers under tight memory budgets.
+- **One-off runs are untouched** — agent code always gets a fresh isolate
+  and never touches the registry; warm calls and one-off runs share the
+  same run-slot budget, arbitrated by the queue.
+- **Open decision:** warm mode as a flag on `prepare()` vs a separate entry
+  point / product (this section's parent, §13, currently says separate
+  product). To be settled in the #64 design pass.
 
 ### 13.3 In-process backend (Phase 12)
 
@@ -1528,9 +1635,9 @@ Callable return values are planned in Phase 13 (callable handles). See §15.
 `ERR_UNDECLARED_BINDING` at runtime and a TypeScript compile-time error (when
 the `Prefix<G>` type parameter is specific).
 
-Rationale: the snapshot captures the prefix’s heap shape. Silently installing
-an undeclared global into a restored snapshot context would mutate that shape
-in a way the snapshot doesn’t know about.
+Rationale: the declared shape is what the prefix was validated against.
+Silently installing an undeclared global into a run's context would widen
+that surface in a way the prefix never saw.
 
 Omitting a declared global at run time is allowed — the precompile-time
 default implementation is reused.
@@ -1835,23 +1942,22 @@ per-`await` cost of using it is small in-sandbox JS time, billed to
 - **Only `await`-based async is covered.** CPED propagates across promise
   continuations, not timers/callbacks — and the sandbox has neither
   (limitations §7.2, §7.8), so this covers the entire async surface.
-- **Not available in prefix/precompile code.** The native bindings cannot be
-  captured in a V8 startup snapshot, so `node:async_hooks` does not resolve
-  during `precompile()`; it fails cleanly with `ERR_MODULE_NOT_FOUND`. Setup
+- **Not available in prefix/precompile code.** `node:async_hooks` does not
+  resolve while a prefix evaluates (at `precompile()` validation or at a
+  run's prefix stage); it fails cleanly with `ERR_MODULE_NOT_FOUND` — a
+  contract kept from the snapshot era so prefixes behave identically. Setup
   code is the prefix; async context is for the postfix (agent/workflow code).
   The durable-workflow pattern is to keep the `step`/`AsyncLocalStorage` shim
   in a **run-time import** the postfix pulls in (resolved per run, where
   `node:async_hooks` is available), while the expensive tool/data setup lives
-  in the prefix and is pre-warmed into the snapshot. See §7.1.
+  in the prefix. See §7.1.
 
-### 16.4 Precompile validates before it snapshots
+### 16.4 Precompile validates ahead of runs
 
-`precompile()` runs the prefix in two passes: it first compiles, instantiates,
-and evaluates the prefix in a throwaway regular isolate, and only builds the
-snapshot if that succeeds. This exists because a V8 snapshot creator *must*
-serialize its blob before being dropped, yet doing so after a failed module
-instantiation segfaults — so the creator must only ever see code already known
-to be valid. The upshot: any bad prefix (syntax error, unresolved import such
-as `node:async_hooks`, throwing top-level code) returns a clean error instead
-of crashing the process. Prefix code is host-authored setup with no
-bridge/network side effects, so evaluating it twice is safe.
+`precompile()` compiles, instantiates, and evaluates the prefix in a
+throwaway regular isolate, in exactly the environment a run's prefix stage
+provides. Any bad prefix (syntax error, unresolved import such as
+`node:async_hooks`, throwing top-level code) returns a clean error at
+`prepare()` time instead of failing every subsequent run. Prefix code is
+host-authored setup with no bridge/network side effects, so evaluating it at
+validation and again on every run is safe.

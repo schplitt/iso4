@@ -807,7 +807,7 @@ export interface PrefixRunPayloadOptions {
   globals?: readonly GlobalDefPayload[]
   /**
    * Host-import function-leaf rebindings. The declared module shapes are
-   * frozen with the snapshot on the Rust side; only rebind locations cross.
+   * frozen with the stored prefix on the Rust side; only rebind locations cross.
    */
   importRebinds?: readonly ImportRebindPayload[]
 }

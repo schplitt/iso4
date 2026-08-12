@@ -45,17 +45,13 @@
 //! once into the context. A JS subclass of a shell keeps the internal field,
 //! which is what makes this split possible.
 //!
-//! # Snapshot coupling — read this before touching either call site
-//!
-//! Native callbacks cannot be serialized into a V8 startup snapshot unless the
-//! embedder supplies an external-references table, and the **same** table must
-//! be supplied again when the snapshot is restored. The two call sites are
-//! `Isolate::snapshot_creator(...)` in `precompile_module` and
-//! `CreateParams::external_references(...)` in `run_module`. They move
-//! together. Supplying it at snapshot time but not at restore time does not
-//! fail cleanly: `typeof Response` still reports `"function"`, and the process
-//! then dies with `V8_Fatal: No external references provided via API` on the
-//! first `new Response()`.
+//! There is no startup-snapshot coupling anymore: runtime snapshot creation
+//! was removed (#60/#61 — V8 14.x cannot create snapshots safely in a live
+//! multi-isolate process), so the classes are installed fresh into every
+//! context and no external-references table exists. If snapshots ever return
+//! (e.g. via a public `IsolateGroup` API), the table must come back with
+//! them: native callbacks cannot cross a snapshot without it being supplied
+//! at **both** creation and restore.
 
 use v8::MapFnTo;
 
@@ -129,38 +125,12 @@ fn response_shell_ctor(
     zero_internal_field(&args);
 }
 
-/// The external-reference table for every native callback that can end up in a
-/// snapshot. Must be passed to **both** `Isolate::snapshot_creator` and
-/// `CreateParams::external_references` — see the module docs.
-///
-/// The `ExternalReferences` wrapper type is gone; both call sites now take a
-/// `Cow<'static, [ExternalReference]>` and append the null terminator
-/// themselves, so a plain vec is the whole table. It is rebuilt per call rather
-/// than cached in a `OnceLock`, because `ExternalReference` is a union of raw
-/// pointers and so is neither `Send` nor `Sync`. Three function pointers; both
-/// call sites are once-per-isolate.
-pub fn external_references() -> Vec<v8::ExternalReference> {
-    vec![
-        v8::ExternalReference {
-            function: headers_shell_ctor.map_fn_to(),
-        },
-        v8::ExternalReference {
-            function: request_shell_ctor.map_fn_to(),
-        },
-        v8::ExternalReference {
-            function: response_shell_ctor.map_fn_to(),
-        },
-    ]
-}
-
 // ── Installation ─────────────────────────────────────────────────────────────
 
 /// Install the web globals into the current context.
 ///
-/// Called at context creation on every path — both precompile passes and the
-/// no-prefix run path — so prefix and postfix code see the same environment.
-/// When a prefix snapshot is restored the classes come back with it and this is
-/// not called again.
+/// Called at context creation on every path — prefix validation and every
+/// run — so prefix and postfix code see the same environment.
 pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
     let mut shells = Vec::with_capacity(3);
     for (name, ctor) in [

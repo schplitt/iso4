@@ -18,7 +18,7 @@ executes the postfix and gets a result. The host wants:
 
 - Hard limits on memory and active execution time per run.
 - Fine control over which URLs and which modules the sandbox can reach.
-- Sub-5 ms cold start once the prefix is compiled (snapshot-based).
+- Sub-5 ms cold start for typical prefixes (validated once, evaluated per run).
 - A small, auditable runtime — no Node-stdlib emulation, no kernel, no virtual POSIX.
 
 ## Quick example
@@ -64,7 +64,7 @@ await sandbox.dispose()
 
 | Package                                    | Status  | Description                                                                                                               |
 | ------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------- |
-| [`@iso4/sandbox`](./packages/iso4-sandbox) | working | Subprocess V8 sandbox — crash-isolated, host bridge, snapshot-based prefixes                                              |
+| [`@iso4/sandbox`](./packages/iso4-sandbox) | working | Subprocess V8 sandbox — crash-isolated, host bridge, prepared prefixes                                                    |
 | [`@iso4/fetch`](./packages/iso4-fetch)     | working | Hardened `fetch` for sandbox globals: DNS pinning, SSRF blocking, route-based allowlist, middleware, redirect re-checking |
 | `@iso4/embed`                              | future  | In-process V8 sandbox for high-throughput trusted code (NAPI, no crash isolation)                                         |
 | `@iso4/fs`                                 | future  | `node:fs` stub factory with configurable root + permissions                                                               |
@@ -89,7 +89,7 @@ pnpm changeset          # record a per-package version bump
 ## Current status
 
 - `sandbox.run({ code, limits })` — direct sandboxed execution ✅
-- `sandbox.precompile()` + `prefix.run()` — snapshot-based prefix/postfix ✅
+- `sandbox.precompile()` + `prefix.run()` — prefix/postfix pattern ✅
 - CPU and wall-clock limits enforced, async wait excluded from CPU budget ✅
 - Host-declared globals bridged into V8 (`fetch`, `myTool`, any name) ✅
 - `ERR_UNDECLARED_BINDING` enforced on `prefix.run()` globals ✅

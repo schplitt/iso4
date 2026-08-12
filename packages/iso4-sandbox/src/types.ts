@@ -2,9 +2,11 @@
 /**
  * \@iso4/sandbox — public API types.
  *
- * Execution model: precompile a prefix once into a V8 startup snapshot,
+ * Execution model: prepare a prefix once (validated and cached by the
  * then call prefix.run({ code }) for each piece of dynamic code (e.g.
- * agent-generated). A fresh isolate is created from the snapshot per call.
+ * runtime), then run many dynamic postfixes against it (typically
+ * agent-generated). Each call gets a fresh isolate; the prefix is
+ * re-evaluated into it before the postfix runs.
  * Multiple concurrent callers each get their own pool slot and run in
  * parallel. See DESIGN.md §1 and §13.
  */
@@ -150,7 +152,7 @@ export type HostGlobals = Record<string, HostGlobalValue>
  * - `DataGlobal` — a plain constant carried as data and installed natively;
  *   no code text, no host involvement.
  * - `BridgeWithShim` — bridge call + in-sandbox result wrapper. The handler
- *   can be rebound per `prefix.run()`; the shim is compiled into the snapshot.
+ *   can be rebound per `prefix.run()`; the shim is part of the prefix state.
  */
 
 export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> | DataGlobal
@@ -198,13 +200,13 @@ export interface DataGlobal {
  * The shim is a JS function expression `(result) => transformedResult` (sync
  * or async). Sandbox built-ins (TextDecoder, JSON, …) are available in scope.
  * The private stub `__iso4_<name>_h` stays on globalThis so the handler can
- * be rebound per `prefix.run()` while the shim stays fixed in the snapshot.
+ * be rebound per `prefix.run()` while the shim itself stays fixed.
  */
 /**
  * `H` is the specific handler function type. Carried through the type system
  * so `RebindGlobals` can enforce that any per-run replacement has the same
  * return type, keeping it compatible with the shim that is already compiled
- * into the prefix snapshot.
+ * into the prefix state.
  */
 export interface BridgeWithShim<
   H extends (...args: unknown[]) => unknown = (...args: unknown[]) => unknown,
@@ -236,10 +238,10 @@ export interface BridgeWithShim<
  * precompile time:
  *
  * - `BridgeWithShim<H>` global — only the handler `H` itself. The shim is
- *   fixed in the snapshot; rebinding must preserve the return type so the
+ *   fixed with the prefix; rebinding must preserve the return type so the
  *   shim keeps working.
  * - `HostExportFunction` global — any compatible `HostExportFunction`.
- * - `string` global — cannot be rebound (compiled into the snapshot).
+ * - `string` global — cannot be rebound (fixed at prepare() time).
  */
 export type RebindValue<V extends HostGlobalValue>
   = V extends BridgeWithShim<infer H> ? H
@@ -251,7 +253,7 @@ export type RebindValue<V extends HostGlobalValue>
  *
  * String-valued and `DataGlobal` (constant) globals are filtered out entirely
  * (key remapping to `never`) rather than mapped to `?: never` — they cannot be
- * rebound because their value is compiled into the snapshot, and they should
+ * rebound because their value is fixed at prepare() time, and they should
  * not appear as valid keys at all.
  *
  * Each remaining key is optional and typed as `RebindValue<G[K]>`, which
@@ -388,7 +390,7 @@ export type HostExportFunction = (...args: unknown[]) => unknown
  *
  * Mirrors `RebindGlobals<G>` over the recursive host-module shape:
  *
- * - **Source imports** (string values) are compiled into the snapshot and
+ * - **Source imports** (string values) are fixed at prepare() time and
  *   cannot be rebound — their keys are excluded from the result.
  * - **Host imports** (object values) are walked recursively. Only function
  *   leaves survive; data leaves are excluded because their values are
@@ -465,7 +467,7 @@ export interface Sandbox {
   run: (options: RunOptions) => Promise<RunResult>
 
   /**
-   * Pre-compile a prefix of code into a V8 startup snapshot.
+   * Validate and prepare a prefix of code for repeated runs.
    *
    * The type parameter `G` is inferred from the `globals` you pass and flows
    * into the returned `Prefix<G>`. This lets TypeScript enforce at the call
@@ -537,7 +539,7 @@ export interface PrecompileOptions<
   M extends Imports,
 > {
   /**
-   * ESM source code to evaluate before snapshotting. Top-level await works.
+   * ESM prefix source, evaluated at the start of every run. Top-level await works.
    *
    * @example
    *   import { search } from 'tools:search';
@@ -601,7 +603,7 @@ export interface Prefix<
   readonly id: string
 
   /**
-   * Execute dynamic code against this prefix's snapshot state.
+   * Execute dynamic code against this prefix's declared state.
    *
    * Globals declared at precompile time are active. You may rebind any subset
    * of them via `options.globals`; the precompile-time handler is used for
@@ -622,7 +624,7 @@ export interface Prefix<
   run: (options: PrefixRunOptions<G, M>) => Promise<RunResult>
 
   /**
-   * Release the snapshot. Subsequent run() calls reject. Idempotent.
+   * Release the prepared prefix. Subsequent run() calls reject. Idempotent.
    */
   dispose: () => Promise<void>
 
@@ -662,7 +664,7 @@ export interface PrefixRunOptions<
 
   /**
    * Rebind host-module function exports declared at precompile time.
-   * Source module imports are frozen in the snapshot and cannot be rebound;
+   * Source module imports are frozen at prepare() time and cannot be rebound;
    * data exports are baked into the synthetic module. TypeScript enforces
    * this at the type level via `RebindImports<M>`; the runtime rejects
    * anything that slips through with `ERR_UNDECLARED_BINDING`.
@@ -876,16 +878,16 @@ export type RunErrorCode
     | 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED'
     | 'ERR_UNDECLARED_BINDING'
     /**
-     * Prefix top-level evaluation never settled at `prepare()` time —
-     * nothing in the isolate can resolve the awaited promise while the
-     * snapshot is built.
+     * Prefix top-level evaluation never settled — nothing in the isolate
+     * can resolve the awaited promise while a prefix evaluates (at
+     * `prepare()` validation or at a run's prefix stage).
      */
     | 'ERR_PREFIX_DID_NOT_SETTLE'
     /**
      * Prefix code called a bridge callable (bridge global, shim global, or
-     * host-import function) at `prepare()` time. No host session exists
-     * while the snapshot is built, so bridge calls in a prefix are not
-     * supported (yet) — do the call in `run()` code instead.
+     * host-import function). The bridge does not exist while a prefix
+     * evaluates, so bridge calls in a prefix are not supported (yet) — do
+     * the call in `run()` code instead.
      */
     | 'ERR_PREFIX_BRIDGE_CALL'
     | 'ERR_PREFIX_DISPOSED'

@@ -21,9 +21,9 @@
  *   path, and the handle IDs never leave the runtime.
  *
  * Rebinding rules (mirroring globals):
- *   - Source modules cannot be rebound at `prefix.run()` (frozen in snapshot).
+ *   - Source modules cannot be rebound at `prefix.run()` (frozen at declaration).
  *   - Host-module function leaves can be rebound by passing a new function at
- *     the same path; data leaves cannot (frozen with the snapshot).
+ *     the same path; data leaves cannot (frozen at declaration).
  *   - Declared-shape enforcement lives in the Rust runtime: `prefix.run()`
  *     sends the rebind locations and the runtime rejects anything that was
  *     not declared as a function leaf with `ERR_UNDECLARED_BINDING`, the same
@@ -229,7 +229,7 @@ export function mergeRebindImports(
     if (typeof value === 'string') {
       throw new UndeclaredImportBindingError(
         `import '${specifier}' is a source module — source imports are frozen `
-        + `in the snapshot and cannot be rebound at prefix.run() time`,
+        + `with the prefix and cannot be rebound at prefix.run() time`,
       )
     }
     if (!isPlainObject(value)) {

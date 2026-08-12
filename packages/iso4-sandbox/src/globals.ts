@@ -102,8 +102,9 @@ export function processGlobals(globals: HostGlobals): ProcessedGlobals {
  * Resolve bridge globals for a `prefix.run()` call.
  *
  * String/data globals and shim *wrappers* are already compiled into the
- * snapshot — only the bridge *stubs* they call need re-installing per run
- * (bridge stubs are bound to the run's socket and are never snapshotted). So
+ * declared prefix state, replayed by the runtime when the prefix evaluates —
+ * only the bridge *stubs* they call need re-installing per run (bridge stubs
+ * are bound to the run's socket). So
  * every returned def is `kind: 'bridge'`, and shimmed globals are routed to
  * their private `__iso4_<name>_h` key so rebinding updates the handler the
  * shim calls, without touching the shim itself.
@@ -119,7 +120,7 @@ export function extractBridgeGlobals(
 
   for (const [name, value] of Object.entries(precompileGlobals)) {
     if (typeof value === 'string' || isDataGlobal(value))
-      continue // constants compiled into the snapshot; no bridge stub
+      continue // constants replayed from the declared prefix defs; no bridge stub
 
     if (isBridgeWithShim(value)) {
       // RebindValue<BridgeWithShim<H>> = H — override is always a function, never a new shim.

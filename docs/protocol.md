@@ -416,11 +416,9 @@ fields, so V8 routes them to `WriteHostObject` off a map field read, with
 objects. Enabling it would make V8 call back into the embedder for _every_ plain
 object serialized.
 
-The internal field is deliberately left **empty**. `rusty_v8`'s snapshot callback
-reads every embedder field as an aligned pointer and `memcpy`s out of it, so
-storing anything there — a `v8::Integer` included — segfaults any snapshot that
-contains a live instance. The type tag comes from an `instanceof` check inside
-`write_host_object`, which only runs for objects V8 already routed there.
+The internal field is deliberately left **empty** (zeroed at construction).
+The type tag comes from an `instanceof` check inside `write_host_object`,
+which only runs for objects V8 already routed there.
 
 Node has no write-side equivalent. `v8.Serializer` exposes no delegate to
 JavaScript and `_writeHostObject` never fires for a class instance — the object
@@ -519,25 +517,25 @@ time. Never per run, never per value.
 
 `PrefixRunPayload`:
 
-| Field      | Encoding             | Notes                                                                                             |
-| ---------- | -------------------- | ------------------------------------------------------------------------------------------------- |
-| `runId`    | `u32`                | Unique on this connection.                                                                        |
-| `prefixId` | `PrefixId`           | Snapshot handle returned by `Precompile`.                                                         |
-| `code`     | `String`             | ESM postfix source.                                                                               |
-| `filename` | `Optional<String>`   | Used in stack traces.                                                                             |
-| `limits`   | `ResourceLimits`     | Fully normalized by TS before sending.                                                            |
-| `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are snapshotted). |
-| `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                 |
+| Field      | Encoding             | Notes                                                                                                                      |
+| ---------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `runId`    | `u32`                | Unique on this connection.                                                                                                 |
+| `prefixId` | `PrefixId`           | Prefix handle returned by `Precompile`.                                                                                    |
+| `code`     | `String`             | ESM postfix source.                                                                                                        |
+| `filename` | `Optional<String>`   | Used in stack traces.                                                                                                      |
+| `limits`   | `ResourceLimits`     | Fully normalized by TS before sending.                                                                                     |
+| `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs). |
+| `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                          |
 
 `PrecompilePayload`:
 
-| Field      | Encoding              | Notes                                                               |
-| ---------- | --------------------- | ------------------------------------------------------------------- |
-| `code`     | `String`              | ESM prefix source.                                                  |
-| `filename` | `Optional<String>`    | Used in stack traces.                                               |
-| `limits`   | `ResourceLimits`      | Limits used during precompile.                                      |
-| `globals`  | `List<GlobalDef>`     | Declares the global shape; value kinds are baked into the snapshot. |
-| `imports`  | `List<ImportBinding>` | Source imports are snapshotted; host imports declare bridge shape.  |
+| Field      | Encoding              | Notes                                                          |
+| ---------- | --------------------- | -------------------------------------------------------------- |
+| `code`     | `String`              | ESM prefix source.                                             |
+| `filename` | `Optional<String>`    | Used in stack traces.                                          |
+| `limits`   | `ResourceLimits`      | Currently unused at precompile (validation is unlimited).      |
+| `globals`  | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run. |
+| `imports`  | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.     |
 
 `ResourceLimits`:
 
@@ -576,9 +574,9 @@ and a global's name reaches the sandbox global object through the V8 API
 
 Only `bridge` and `shim` install a bridge stub (and so require the session
 socket); `string`/`data` are pure in-isolate installs. On `PrefixRun` every
-entry is `bridge` kind — string/data globals and shim wrappers are baked into
-the snapshot at `Precompile` time, so only their bridge stubs are re-installed
-per run.
+entry is `bridge` kind — string/data globals and shim wrappers were declared
+at `Precompile` time and are replayed from the stored prefix defs when the
+prefix evaluates, so only their bridge stubs are re-installed per run.
 
 `ImportBinding` (`Run` / `Precompile`):
 
@@ -612,7 +610,7 @@ them back to `(specifier, path)` before a `BridgeCall` frame is written.
 
 `ImportRebind` (`PrefixRun` only):
 
-The declared module shapes are frozen with the snapshot and stored with the
+The declared module shapes are frozen at declaration and stored with the
 prefix; a `PrefixRun` sends only the **locations** of host function leaves
 whose TS handler was replaced for this run. The runtime validates each
 location against the declared shape and fails the run with
@@ -828,35 +826,39 @@ TS (one connection slot)              Rust (one isolate thread)
 ```
 
 `Precompile` uses the same authenticated connection but is not a run. It
-returns `PrecompileResult` and stores the snapshot in the Rust process under a
-`PrefixId`.
+validates the prefix (compile + instantiate + evaluate in a throwaway
+isolate) and stores the **source and declared shape** in the Rust process
+under a `PrefixId`. Every `PrefixRun` re-evaluates that source into its fresh
+context before the postfix runs — there is no runtime snapshot (V8 14.x
+cannot create startup snapshots safely in a live multi-isolate process; see
+DESIGN.md on the removal).
 
 ---
 
 ## 7. Error codes
 
-| Code                                  | Cause                                                                                                                                                                                        |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                                                                                                                                            |
-| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                             |
-| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                  |
-| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                       |
-| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                             |
-| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                 |
-| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                        |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.                                                                                                                         |
-| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                              |
-| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                           |
-| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                      |
-| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                    |
-| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                             |
-| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5. |
-| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                  |
-| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                  |
-| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function) at `Precompile` time. No host session exists while the snapshot is built.                         |
-| `ERR_PREFIX_DISPOSED`                 | Prefix snapshot was disposed or evicted.                                                                                                                                                     |
-| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                              |
+| Code                                  | Cause                                                                                                                                                                                                   |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                           |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded `limits.memoryMb`.                                                                                                                                                       |
+| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                        |
+| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                             |
+| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                  |
+| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                        |
+| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                            |
+| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                   |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.                                                                                                                                    |
+| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                         |
+| `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                                      |
+| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                 |
+| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                               |
+| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                                        |
+| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5.            |
+| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                             |
+| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                             |
+| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage. |
+| `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                         |
+| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                         |
 
 ---
 

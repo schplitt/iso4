@@ -5,8 +5,8 @@ code in a separate Rust process for full crash isolation — an OOM or panic in
 the sandbox kills only the subprocess, not your host application.
 
 Built for the AI-agent prefix/postfix pattern: precompile host setup (globals,
-libraries, tool bindings) once into a V8 startup snapshot, then run many
-agent-generated code strings against the snapshot in parallel.
+libraries, tool bindings) once, then run many agent-generated code strings
+against it in parallel — each run in a fresh, clean isolate.
 
 > **Status:** core execution works end-to-end. Not yet at 1.0.
 
@@ -26,7 +26,7 @@ import { createSafeFetch } from '@iso4/fetch'
 
 const sandbox = await createSandbox()
 
-// Compile host setup once into a V8 snapshot
+// Validate and prepare host setup once
 const prefix = await sandbox.prepare({
   code: `
     const config = { apiBase: 'https://api.example.com' }
@@ -37,7 +37,7 @@ const prefix = await sandbox.prepare({
   },
 })
 
-// Run agent-generated code against the snapshot — as many times as needed
+// Run agent-generated code against the prefix — as many times as needed
 const result = await prefix.execute({
   code: `
     const res = await fetch(config.apiBase + '/users')
