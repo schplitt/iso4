@@ -1,4 +1,5 @@
 import { defineConfig } from 'tsdown'
+import ApiSnapshot from 'tsnapi/rolldown'
 
 export default defineConfig({
   entry: {
@@ -9,4 +10,7 @@ export default defineConfig({
   clean: true,
   dts: true,
   outDir: './dist',
+  plugins: [
+    ApiSnapshot(),
+  ],
 })
