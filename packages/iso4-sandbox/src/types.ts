@@ -1105,7 +1105,7 @@ export type RunErrorCode
      */
     | 'ERR_PREFIX_BRIDGE_CALL'
     /**
-     * Warm-up (isolate boot + prefix evaluation) exceeded its fixed budget
+     * Warm-up (prefix evaluation + per-instance runtime installs) exceeded its fixed budget
      * (1 s wall / 1 s CPU — not configurable; Cloudflare's script-startup
      * model, #64). Enforced at `prepare()` and again at every instance
      * cold-start. Move expensive setup into the handler: lazy init on first

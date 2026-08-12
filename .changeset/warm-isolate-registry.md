@@ -28,12 +28,19 @@ Reliability semantics:
   fatal bridge violation discards the instance — the next run cold-starts
   clean. Ordinary uncaught exceptions do not taint.
 - **Fixed warm-up budget** (1 s wall / 1 s CPU, not configurable —
-  Cloudflare's script-startup model): isolate boot + prefix evaluation runs
-  under it, never billed to the triggering request. Blowing it reports the
-  new **`ERR_WARMUP_LIMIT`**, and `prepare()` enforces the same budget, so
-  an un-warmable prefix fails at deploy time. (This also fixes a hang: a
-  prefix with a synchronous infinite loop used to hang `prepare()`
-  forever.)
+  Cloudflare's script-startup model): prefix evaluation (and the
+  per-instance runtime installs) runs under it, never billed to the
+  triggering request. Isolate boot itself precedes the budget. Blowing the
+  time budget reports the new **`ERR_WARMUP_LIMIT`**; blowing the heap cap
+  during warm-up keeps `ERR_MEMORY_LIMIT`. `prepare()` enforces the same
+  budget and heap cap, so an un-warmable prefix fails at deploy time — this
+  also fixes a hang (a prefix with a synchronous infinite loop used to hang
+  `prepare()` forever) and prevents a memory-heavy prefix from OOMing the
+  runtime at `prepare()` time.
+- **Prefix `console.log` output** now surfaces on the **first** run's result
+  (the cold-start run that paid for warm-up), then is cleared. Previously
+  prefix output appeared on every run (per-run re-evaluation); it must not
+  now, since the prefix evaluates once per instance.
 - **Capacity (v1)**: one cap — `maxIsolates` — covering running isolates
   plus idle warm instances; taking a slot at the cap evicts the
   least-recently-used idle instance (scored eviction lands with #66, the

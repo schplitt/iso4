@@ -1600,8 +1600,9 @@ response, so the session socket keeps exactly one user at a time (the
 instance thread does bridge I/O during a call). Idle instances hold memory,
 not threads-in-use, and no clocks are armed while idle.
 
-**Warm-up budget.** Isolate boot + prefix evaluation runs under a fixed
-1 s wall / 1 s CPU budget — never the triggering request's limits
+**Warm-up budget.** Prefix evaluation (plus the per-instance runtime
+installs) runs under a fixed 1 s wall / 1 s CPU budget — isolate boot itself
+(~0.2 ms, not sandbox-controllable) precedes it — never the triggering request's limits
 (Cloudflare's separate script-startup limit is the model; theirs is 1 s
 since 2025-10 and likewise not configurable). Blowing it reports
 `ERR_WARMUP_LIMIT`. `prepare()` enforces the same budget, so an un-warmable

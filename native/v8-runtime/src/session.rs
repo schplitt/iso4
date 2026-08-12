@@ -436,6 +436,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     payload.filename.as_deref(),
                     &payload.globals,
                     &payload.imports,
+                    payload.limits.memory_mb,
                 ) {
                     Ok(()) => {
                         let prefix_id = shared
@@ -660,19 +661,28 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 call: payload.call,
                             });
                             // An instance of a since-disposed prefix must not
-                            // return to the pool.
-                            let prefix_alive = shared
-                                .prefix_store
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .contains_key(&payload.prefix_id);
-                            shared.warm.release(
-                                &payload.prefix_id,
-                                handle,
-                                outcome.tainted,
-                                outcome.heap_used_bytes,
-                                prefix_alive,
-                            );
+                            // return to the pool. The aliveness check and the
+                            // release must be atomic w.r.t. DisposePrefix, or
+                            // a dispose landing between them leaks the busy
+                            // instance into the idle pool (dispose_prefix only
+                            // sees idle instances, and this one is still busy).
+                            // Both paths hold the prefix_store lock across the
+                            // warm-registry call; the lock order is always
+                            // prefix_store → warm, so no deadlock.
+                            {
+                                let store = shared
+                                    .prefix_store
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner());
+                                let prefix_alive = store.contains_key(&payload.prefix_id);
+                                shared.warm.release(
+                                    &payload.prefix_id,
+                                    handle,
+                                    outcome.tainted,
+                                    outcome.heap_used_bytes,
+                                    prefix_alive,
+                                );
+                            }
                             match outcome.result {
                                 Ok(output) => {
                                     trace!(
@@ -731,16 +741,21 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
             ipc::TsToRustMessageType::DisposePrefix => {
                 match ipc::parse_dispose_prefix_payload(&frame.payload) {
                     Ok(prefix_id) => {
-                        let existed = shared
-                            .prefix_store
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .remove(&prefix_id)
-                            .is_some();
-                        // Idle warm instances of this prefix die now; busy
-                        // ones are dropped at release time (the store lookup
-                        // there sees the prefix gone).
-                        shared.warm.dispose_prefix(&prefix_id);
+                        // Hold the prefix_store lock across dispose_prefix so
+                        // the remove and the idle-pool drop are atomic w.r.t.
+                        // a concurrent release (see the release site). Busy
+                        // instances are not in the idle pool yet; their
+                        // release then observes the prefix gone and drops
+                        // them instead of pooling them.
+                        let existed = {
+                            let mut store = shared
+                                .prefix_store
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner());
+                            let existed = store.remove(&prefix_id).is_some();
+                            shared.warm.dispose_prefix(&prefix_id);
+                            existed
+                        };
                         eprintln!(
                             "[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})"
                         );

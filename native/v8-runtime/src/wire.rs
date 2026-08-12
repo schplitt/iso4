@@ -504,9 +504,9 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             code: "ERR_WARMUP_LIMIT".to_string(),
             name: "Error".to_string(),
             message: format!(
-                "prefix warm-up (isolate boot + prefix evaluation) exceeded its fixed \
-                 budget ({}ms wall / {}ms CPU); move expensive setup into the handler \
-                 (lazy init on first call)",
+                "prefix evaluation exceeded its fixed warm-up budget ({}ms wall / \
+                 {}ms CPU); move expensive setup into the handler (lazy init on \
+                 first call)",
                 crate::v8::WARMUP_WALL_MS,
                 crate::v8::WARMUP_CPU_MS,
             ),
