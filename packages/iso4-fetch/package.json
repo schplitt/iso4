@@ -51,6 +51,7 @@
     "@schplitt/eslint-config": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
+    "tsnapi": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },

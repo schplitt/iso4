@@ -1,4 +1,5 @@
 import { defineConfig } from 'tsdown'
+import ApiSnapshot from 'tsnapi/rolldown'
 
 export default defineConfig({
   entry: {
@@ -11,4 +12,7 @@ export default defineConfig({
   outDir: './dist',
   // `iso4` is a peer dep; do not bundle its types in.
   external: ['iso4'],
+  plugins: [
+    ApiSnapshot(),
+  ],
 })
