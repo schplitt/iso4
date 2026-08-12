@@ -47,7 +47,9 @@ Frame readers MUST reject:
 | EOF before all `length` bytes arrive           | connection error |
 | unknown message type for the current direction | protocol error   |
 
-Current protocol version: **`2`**.
+Current protocol version: **`2`** (still in development; v2 now includes the
+optional host → sandbox `call` on `Run`/`PrefixRun`, an optional
+`PrefixRun.code`, and `skippedExports` on the success payload — #58).
 
 ---
 
@@ -506,14 +508,15 @@ time. Never per run, never per value.
 
 `RunPayload`:
 
-| Field      | Encoding              | Notes                                                |
-| ---------- | --------------------- | ---------------------------------------------------- |
-| `runId`    | `u32`                 | Unique on this connection.                           |
-| `code`     | `String`              | ESM source.                                          |
-| `filename` | `Optional<String>`    | Used in stack traces.                                |
-| `limits`   | `ResourceLimits`      | Only caller-set fields sent; runtime fills defaults. |
-| `globals`  | `List<GlobalDef>`     | Host globals + how the runtime installs each one.    |
-| `imports`  | `List<ImportBinding>` | Source or host import declarations.                  |
+| Field      | Encoding              | Notes                                                                    |
+| ---------- | --------------------- | ------------------------------------------------------------------------ |
+| `runId`    | `u32`                 | Unique on this connection.                                               |
+| `code`     | `String`              | ESM source.                                                              |
+| `filename` | `Optional<String>`    | Used in stack traces.                                                    |
+| `limits`   | `ResourceLimits`      | Only caller-set fields sent; runtime fills defaults.                     |
+| `globals`  | `List<GlobalDef>`     | Host globals + how the runtime installs each one.                        |
+| `imports`  | `List<ImportBinding>` | Source or host import declarations.                                      |
+| `call`     | `Optional<CallSpec>`  | Host → sandbox call resolved against the freshly evaluated module (#58). |
 
 `PrefixRunPayload`:
 
@@ -521,11 +524,41 @@ time. Never per run, never per value.
 | ---------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | `runId`    | `u32`                | Unique on this connection.                                                                                                 |
 | `prefixId` | `PrefixId`           | Prefix handle returned by `Precompile`.                                                                                    |
-| `code`     | `String`             | ESM postfix source.                                                                                                        |
+| `code`     | `Optional<String>`   | ESM postfix source. A frame carries a postfix **or** a call — exactly one; both parser and encoder enforce this.           |
 | `filename` | `Optional<String>`   | Used in stack traces.                                                                                                      |
 | `limits`   | `ResourceLimits`     | Fully normalized by TS before sending.                                                                                     |
 | `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs). |
 | `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                          |
+| `call`     | `Optional<CallSpec>` | Host → sandbox call resolved against the prefix module's exports (#58).                                                    |
+
+`CallSpec` (#58):
+
+A host → sandbox function call. `exportPath` addresses a callable **relative
+to the module's exports** — a top-level exported function (`"handler"`) or a
+method on an exported object (`"default.fetch"`) — never `globalThis`. The
+receiver is the object the final path segment was read from (plain `a.b.c()`
+semantics; the namespace itself for a single segment), and property reads
+follow the prototype chain so `export default new Worker()` resolves
+prototype methods. Resolution happens after the module settles, inside the
+run's CPU budget (a segment may be an accessor). A path that does not resolve
+— or resolves to something not callable — fails the run with
+`ERR_CALL_TARGET_NOT_FOUND`. Segment count is capped at 16.
+
+When `call` is present the run's **result value is the called function's
+return value** (awaited first when it is a Promise) instead of the exports —
+never both. The completion payload is unchanged: it carries exactly one value
+blob either way, and the host knows which it asked for. `maxExportBytes`
+applies to the value blob; a sync return value skips the poll loop entirely,
+while an async one re-enters the same settle machinery as the module promise
+(bridge calls included).
+
+| Field        | Encoding    | Notes                                                                                                                                               |
+| ------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `exportPath` | `String`    | Dot-separated path relative to the module's exports.                                                                                                |
+| `argsBlob`   | `ValueBlob` | **One** blob holding the whole argument array — same convention as `BridgeCall` args (§5.4); host types (`Request`, …) rehydrate to real instances. |
+
+Call args are host-authored (the trusted direction), so no dedicated size
+limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 
 `PrecompilePayload`:
 
@@ -751,14 +784,15 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 
 `RunSuccessPayload`:
 
-| Field         | Encoding                 | Notes                                                                              |
-| ------------- | ------------------------ | ---------------------------------------------------------------------------------- |
-| `exports`     | `ValueBlob`              | One blob holding a flat object: `default` plus named exports as direct properties. |
-| `stdout`      | `List<String>`           | Captured stdout log lines.                                                         |
-| `stderr`      | `List<String>`           | Captured stderr log lines.                                                         |
-| `durationMs`  | `f64`                    | Wall-clock runtime duration.                                                       |
-| `cpuTimeMs`   | `f64`                    | Active V8 execution time; bridge waits excluded.                                   |
-| `bridgeCalls` | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.                              |
+| Field            | Encoding                 | Notes                                                                                                                                                                                                                                       |
+| ---------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `exports`        | `ValueBlob`              | One blob holding a flat object: `default` plus named exports as direct properties. For a run that carried a `call` (§5.2) this is the called function's return value instead — the host knows which it asked for, so the slot needs no tag. |
+| `skippedExports` | `List<String>`           | Export names absent from `exports` because their value cannot cross (a function, an unresolved Promise, a failed serialization). Skipping is never fatal (#58). Always empty for a call run.                                                |
+| `stdout`         | `List<String>`           | Captured stdout log lines.                                                                                                                                                                                                                  |
+| `stderr`         | `List<String>`           | Captured stderr log lines.                                                                                                                                                                                                                  |
+| `durationMs`     | `f64`                    | Wall-clock runtime duration.                                                                                                                                                                                                                |
+| `cpuTimeMs`      | `f64`                    | Active V8 execution time; bridge waits excluded.                                                                                                                                                                                            |
+| `bridgeCalls`    | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.                                                                                                                                                                                       |
 
 `RunFailurePayload`:
 
@@ -847,7 +881,8 @@ DESIGN.md on the removal).
 | `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                        |
 | `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                            |
 | `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                   |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | Export (or bridge value) holds something V8 cannot clone — see §4.2.                                                                                                                                    |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.6).           |
+| `ERR_CALL_TARGET_NOT_FOUND`           | A `call.exportPath` (§5.2) does not resolve against the module's exports, or resolves to a value that is not callable. The message says which and names the path.                                       |
 | `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                         |
 | `ERR_EXPORT_UNRESOLVED_PROMISE`       | Export value is a pending Promise.                                                                                                                                                                      |
 | `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                 |

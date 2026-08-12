@@ -96,6 +96,7 @@ function bridgeRecords(records: readonly TestBridgeRecord[]): Buffer {
 interface SuccessSpec {
   ok: true
   exports: unknown
+  skippedExports?: readonly string[]
   stdout?: readonly string[]
   stderr?: readonly string[]
   durationMs?: number
@@ -131,6 +132,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
       u32(runId),
       Buffer.from([1, 1]), // ok = true, successPresent = 1
       valueSlot(spec.exports),
+      strList(spec.skippedExports ?? []),
       tail,
       Buffer.from([0]), // failurePresent = 0
     ])
@@ -235,6 +237,61 @@ describe('decodeRunCompletionPayload — success', () => {
     )
     expect(result.stdout).toEqual(['one', 'two'])
     expect(result.stderr).toEqual(['warn'])
+  })
+
+  test('skipped export names decode alongside the exports', () => {
+    const { result } = decodeRunCompletionPayload(
+      encodeCompletionPayload(0, {
+        ok: true,
+        exports: { limits: { memoryMb: 64 } },
+        skippedExports: ['default', 'helper'],
+      }),
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.skippedExports).toEqual(['default', 'helper'])
+    expect(result.exports).toEqual({ limits: { memoryMb: 64 } })
+  })
+
+  test('no skipped exports decodes to an empty list', () => {
+    const { result } = decodeRunCompletionPayload(
+      encodeCompletionPayload(0, { ok: true, exports: {} }),
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.skippedExports).toEqual([])
+  })
+
+  test('call mode decodes the value slot as the return value, not exports', () => {
+    // The wire slot is identical — the host asked for a call, so the blob is
+    // the function's return value, of any shape (here: not an object).
+    const { result } = decodeRunCompletionPayload(
+      encodeCompletionPayload(0, { ok: true, exports: 'hello from fetch' }),
+      'call',
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.value).toBe('hello from fetch')
+    expect('exports' in result).toBe(false)
+  })
+
+  test('call mode failures decode identically to run failures', () => {
+    const { result } = decodeRunCompletionPayload(
+      encodeCompletionPayload(0, {
+        ok: false,
+        code: 'ERR_CALL_TARGET_NOT_FOUND',
+        name: 'Error',
+        message: 'call export path "default.missing" does not resolve',
+      }),
+      'call',
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_CALL_TARGET_NOT_FOUND')
   })
 
   test('runId is echoed and durationMs preserved exactly', () => {

@@ -467,7 +467,17 @@ pub struct Output {
     /// `{ name: value }` object. The `default` export (if any) appears as the
     /// `"default"` key alongside named exports. An empty module produces a
     /// blob holding `{}`.
+    ///
+    /// When the run carried a `call` (#58), this is the called function's
+    /// return value instead — still exactly one blob; the host knows which it
+    /// asked for.
     pub exports: Vec<u8>,
+
+    /// Export names absent from `exports` because their value cannot cross
+    /// the boundary (a function, an unresolved Promise, or a value whose
+    /// serialization failed). Never fatal (#58); reported so nothing is
+    /// silently hidden. Always empty for a call run.
+    pub skipped_exports: Vec<String>,
 
     /// Lines written to console.log / console.debug / console.info.
     pub stdout: Vec<String>,
@@ -573,6 +583,10 @@ pub enum RunError {
     /// host-import function) at precompile time. No host session exists while
     /// the snapshot is built, so the call can never be served.
     PrefixBridgeCall(String),
+    /// A requested host → sandbox call's export path does not resolve against
+    /// the module's exports, or resolves to something that is not callable
+    /// (#58). The message says which, and names the path.
+    CallTargetNotFound(String),
     /// A function value was passed as a bridge argument.
     FunctionArgumentNotSupported,
     /// A bridge call payload (sandbox → host args) exceeded `limits.maxBridgeCallBytes`.
@@ -607,10 +621,11 @@ pub fn execute(
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
+    call: Option<&ipc::CallSpec>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
-        code,
+        Some(code),
         filename.unwrap_or("<iso4>"),
         None,
         limits,
@@ -618,6 +633,7 @@ pub fn execute(
         imports,
         stream_fd,
         call_id_counter,
+        call,
     )
 }
 
@@ -648,13 +664,14 @@ pub struct PrefixSpec<'a> {
 /// `prefix.globals` and are not re-sent per run.
 pub fn execute_with_prefix(
     prefix: PrefixSpec<'_>,
-    code: &str,
+    code: Option<&str>,
     filename: Option<&str>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
+    call: Option<&ipc::CallSpec>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
@@ -666,6 +683,7 @@ pub fn execute_with_prefix(
         imports,
         stream_fd,
         call_id_counter,
+        call,
     )
 }
 
@@ -695,8 +713,13 @@ pub fn precompile(
 /// each name, overwriting any same-named prefix placeholder.
 /// `stream_fd` is the raw file-descriptor of the session socket; it is used
 /// only during bridge calls and is never closed by this function.
+///
+/// When `call` is `Some`, the run's value is the called function's return
+/// value instead of the exports (#58): the export path resolves against the
+/// postfix module when `code` is `Some`, or against the prefix module for a
+/// call-only prefix run (`code` = `None`, only valid with a prefix).
 fn run_module(
-    code: &str,
+    code: Option<&str>,
     filename: &str,
     prefix: Option<PrefixSpec<'_>>,
     limits: Limits,
@@ -704,6 +727,7 @@ fn run_module(
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
+    call: Option<&ipc::CallSpec>,
 ) -> Result<Output, FailureOutput> {
     // The run clock, CPU budget, and bridge-call log live here (not inside
     // the inner function) so the final values can be stamped onto BOTH
@@ -721,6 +745,7 @@ fn run_module(
         imports,
         stream_fd,
         call_id_counter,
+        call,
         start,
         Arc::clone(&cpu_budget),
         Arc::clone(&bridge_log),
@@ -745,7 +770,7 @@ fn run_module(
 
 #[allow(clippy::too_many_arguments)] // internal; parameters mirror run_module + shared run state
 fn run_module_inner(
-    code: &str,
+    code: Option<&str>,
     filename: &str,
     prefix: Option<PrefixSpec<'_>>,
     limits: Limits,
@@ -758,6 +783,7 @@ fn run_module_inner(
     // run's orphaned handler from being accepted as a valid response by the
     // next run's bridge_global_callback.
     call_id_counter: Arc<AtomicU32>,
+    call: Option<&ipc::CallSpec>,
     start: std::time::Instant,
     cpu_budget: Arc<CpuBudget>,
     bridge_log: Arc<Mutex<BridgeCallLog>>,
@@ -910,16 +936,22 @@ fn run_module_inner(
     v8::scope!(let scope, &mut isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
+    // Every setup step below runs with the guards already armed, so each
+    // failure classifies through `termination_or` — a guard firing mid-setup
+    // (a very tight wall limit on a slow machine) must report the timeout,
+    // not the operation it happened to interrupt.
     install_console(scope, &mut logs as *mut LogBuffers)
-        .map_err(|error| failure(error, &logs, start))?;
+        .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
 
     // Web globals (Headers/Request/Response/URL/TextEncoder/…).
-    crate::webtypes::install(scope).map_err(|e| failure(RunError::Internal(e), &logs, start))?;
+    crate::webtypes::install(scope)
+        .map_err(|e| failure(termination_or(&reason, RunError::Internal(e)), &logs, start))?;
 
     // Install AsyncLocalStorage (importable via `node:async_hooks`) for this
     // run. Always installed: it registers no promise hooks, so runs that never
     // use it pay only for the class setup, not per-promise overhead.
-    install_async_context(scope).map_err(|error| failure(error, &logs, start))?;
+    install_async_context(scope)
+        .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
 
     // ── Prefix evaluation ────────────────────────────────────────────────────
     //
@@ -930,10 +962,15 @@ fn run_module_inner(
     // live stubs installed below overwrite the placeholder names for the
     // postfix. Runs under the run's wall/CPU guards — a prefix that loops
     // now costs the run its budget instead of hanging prepare().
+    // For a call-only prefix run (`code` = None) the prefix module is the
+    // call target, so its handle is kept; postfix runs drop it.
+    let mut prefix_module: Option<v8::Global<v8::Module>> = None;
     if let Some(prefix) = &prefix {
         v8::tc_scope!(let tc, scope);
-        evaluate_prefix_module(tc, prefix.code, prefix.filename, prefix.globals, imports)
-            .map_err(|error| failure(error, &logs, start))?;
+        let module =
+            evaluate_prefix_module(tc, prefix.code, prefix.filename, prefix.globals, imports)
+                .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
+        prefix_module = Some(module);
     }
 
     // ── Bridge globals setup ─────────────────────────────────────────────────
@@ -1002,183 +1039,552 @@ fn run_module_inner(
             Arc::clone(&bridge_log),
             &mut callback_data_boxes,
         )
-        .map_err(|e| failure(e, &logs, start))?;
+        .map_err(|e| failure(termination_or(&reason, e), &logs, start))?;
     }
 
     // Install the value globals (string exprs, constants, shim wrappers)
     // natively. For a direct run these arrive here; for a PrefixRun they were
     // replayed from the prefix defs during prefix evaluation above, so
     // `globals` carries only bridge stubs and this is a no-op.
-    install_value_globals(scope, globals).map_err(|e| failure(e, &logs, start))?;
+    install_value_globals(scope, globals)
+        .map_err(|e| failure(termination_or(&reason, e), &logs, start))?;
 
     v8::tc_scope!(let scope, scope);
 
-    let source_string = v8::String::new(scope, code).ok_or_else(|| {
-        failure(
-            RunError::Internal("failed to intern module source".to_string()),
-            &logs,
-            start,
-        )
-    })?;
-    let filename = v8::String::new(scope, filename).ok_or_else(|| {
-        failure(
-            RunError::Internal("failed to intern filename".to_string()),
-            &logs,
-            start,
-        )
-    })?;
-    let origin = v8::ScriptOrigin::new(
-        scope,
-        filename.into(),
-        0,
-        0,
-        false,
-        0,
-        None,
-        false,
-        false,
-        true,
-        None,
-    );
-    let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
+    // Shared settle machinery — the module evaluation promise and a requested
+    // call's return promise (#58) drive the same poll loop.
+    let settle_ctx = SettleCtx {
+        stream_fd,
+        limits: &limits,
+        start,
+        reason: &reason,
+        cpu_budget: &cpu_budget,
+        bridge_log: &bridge_log,
+        bridge_error: &bridge_error,
+        pending_resolvers: &pending_resolvers,
+        cancel_handle: &cancel_handle,
+    };
 
-    let module = match v8::script_compiler::compile_module(scope, &mut source) {
-        Some(m) => m,
-        None => {
-            return Err(failure(
-                RunError::CompileError(exception_message(scope)),
+    // Compile, instantiate, evaluate, and settle the postfix module when the
+    // frame carries one. A call-only prefix run (`code` = None) has no postfix
+    // — the prefix module evaluated above is the call target.
+    let evaluated_module: v8::Local<v8::Module> = if let Some(code) = code {
+        let source_string = v8::String::new(scope, code).ok_or_else(|| {
+            failure(
+                RunError::Internal("failed to intern module source".to_string()),
                 &logs,
                 start,
-            ))
+            )
+        })?;
+        let filename = v8::String::new(scope, filename).ok_or_else(|| {
+            failure(
+                RunError::Internal("failed to intern filename".to_string()),
+                &logs,
+                start,
+            )
+        })?;
+        let origin = v8::ScriptOrigin::new(
+            scope,
+            filename.into(),
+            0,
+            0,
+            false,
+            0,
+            None,
+            false,
+            false,
+            true,
+            None,
+        );
+        let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
+
+        let module = match v8::script_compiler::compile_module(scope, &mut source) {
+            Some(m) => m,
+            None => {
+                return Err(failure(
+                    termination_or(&reason, RunError::CompileError(exception_message(scope))),
+                    &logs,
+                    start,
+                ))
+            }
+        };
+
+        // ── Install module resolver for this run (Phase 6) ──────────────────────
+        // After `instantiate_module` returns we inspect `resolve_error` for any
+        // non-V8-throwable error recorded inside the resolver (e.g. a source
+        // module that failed to compile).
+        let _resolver_guard = install_resolver(ResolverContext {
+            bindings: imports.to_vec(),
+            module_cache: HashMap::new(),
+            pending_meta: Vec::new(),
+            resolve_error: None,
+            async_context_builtin: true,
+        });
+
+        if module
+            .instantiate_module(scope, module_resolver_callback)
+            .is_none()
+        {
+            let err = take_resolver()
+                .and_then(|ctx| ctx.resolve_error)
+                .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
+            return Err(failure(termination_or(&reason, err), &logs, start));
         }
+
+        cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
+        let evaluation = match module.evaluate(scope) {
+            Some(value) => value,
+            None => {
+                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+                if let Some(err) = bridge_error.get() {
+                    let owned = match err {
+                        RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
+                        RunError::FunctionArgumentNotSupported => {
+                            RunError::FunctionArgumentNotSupported
+                        }
+                        RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
+                        RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
+                        RunError::Internal(m) => RunError::Internal(m.clone()),
+                        other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
+                    };
+                    return Err(failure(owned, &logs, start));
+                }
+                let error = match reason.get().copied() {
+                    Some(TerminationReason::Wall) => RunError::WallTimeout,
+                    Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                    Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                    None => RunError::RuntimeError(Box::new(RuntimeErrorData {
+                        name: exception_name(scope),
+                        message: exception_message(scope),
+                        stack: exception_stack(scope),
+                        fields: exception_fields(scope),
+                    })),
+                };
+                return Err(failure(error, &logs, start));
+            }
+        };
+
+        // ── Poll loop: drive microtasks until the module promise settles ──────────
+        //
+        // With MicrotasksPolicy::Explicit, microtasks do not run automatically.
+        // After each BridgeResponse is resolved we call perform_microtask_checkpoint()
+        // to advance the await chains.  When the module's top-level promise finally
+        // fulfils or rejects we exit the loop.
+        //
+        // This handles both:
+        //   • Sequential bridge calls  - Promise.all([a]) etc.
+        //   • Concurrent bridge calls  - Promise.all([a, b]) sends both BridgeCall
+        //     frames before yielding; both responses route by callId.
+        //   • No bridge calls          - pure `await Promise.resolve(42)` still
+        //     needs one checkpoint to propagate the already-resolved microtask.
+        // One checkpoint immediately after evaluate() so that:
+        //   • purely synchronous results (await Promise.resolve(42)) settle now,
+        //   • synchronous bridge errors (throw from callback) propagate to the
+        //     module's top-level Promise now,
+        //   • termination exceptions propagate now.
+        // For pending bridge calls nothing changes — resolvers aren't set yet.
+        scope.perform_microtask_checkpoint();
+
+        // ESM Module::Evaluate() always returns a Promise.  The try_from is a
+        // belt-and-suspenders guard; failure would be an internal V8 bug.
+        let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
+            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+            failure(
+                RunError::Internal("module evaluation did not return a Promise".into()),
+                &logs,
+                start,
+            )
+        })?;
+
+        match settle_promise(scope, promise, &settle_ctx).map_err(|e| failure(e, &logs, start))? {
+            v8::PromiseState::Fulfilled => {}
+            _ => {
+                // Pending with no socket to wait on — an un-awaited Promise that
+                // nothing in the isolate can ever resolve.
+                let error = match reason.get().copied() {
+                    Some(TerminationReason::Wall) => RunError::WallTimeout,
+                    Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                    Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                    None => RunError::ExportNotSerializable(
+                        "module evaluation promise is still pending after poll loop".to_string(),
+                    ),
+                };
+                return Err(failure(error, &logs, start));
+            }
+        }
+
+        module
+    } else {
+        // Call-only prefix run (#58): the prefix module evaluated above is the
+        // call target. Enter the CPU budget here — the postfix path enters it
+        // right before evaluate() — so path resolution and the call itself are
+        // measured (a path segment can be an accessor).
+        cpu_budget.enter();
+        v8::Local::new(
+            scope,
+            prefix_module
+                .as_ref()
+                .expect("call-only run without a prefix module"),
+        )
     };
 
-    // ── Install module resolver for this run (Phase 6) ──────────────────────
-    // After `instantiate_module` returns we inspect `resolve_error` for any
-    // non-V8-throwable error recorded inside the resolver (e.g. a source
-    // module that failed to compile).
-    let _resolver_guard = install_resolver(ResolverContext {
-        bindings: imports.to_vec(),
-        module_cache: HashMap::new(),
-        pending_meta: Vec::new(),
-        resolve_error: None,
-        async_context_builtin: true,
-    });
-
-    if module
-        .instantiate_module(scope, module_resolver_callback)
-        .is_none()
-    {
-        let err = take_resolver()
-            .and_then(|ctx| ctx.resolve_error)
-            .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
-        return Err(failure(err, &logs, start));
+    if call.is_none() {
+        // The run's JS is done — stop the guards before extraction and
+        // serialization, exactly where the old poll loop cancelled them on
+        // fulfilment. When a call follows, the guards stay armed until the
+        // call settles.
+        cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
+        cancel_handle.cancel_terminate_execution();
     }
 
-    cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
-    let evaluation = match module.evaluate(scope) {
-        Some(value) => value,
-        None => {
-            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-            if let Some(err) = bridge_error.get() {
-                let owned = match err {
-                    RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
-                    RunError::FunctionArgumentNotSupported => {
-                        RunError::FunctionArgumentNotSupported
-                    }
-                    RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
-                    RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
-                    RunError::Internal(m) => RunError::Internal(m.clone()),
-                    other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
+    let namespace = evaluated_module
+        .get_module_namespace()
+        .to_object(scope)
+        .ok_or_else(|| {
+            failure(
+                RunError::Internal("module namespace is not an object".to_string()),
+                &logs,
+                start,
+            )
+        })?;
+
+    let mut skipped_exports: Vec<String> = Vec::new();
+
+    let exports = if let Some(call) = call {
+        // ── Host → sandbox call (#58) ────────────────────────────────────────
+        // Resolve the export path against the namespace and invoke. Runs
+        // inside the CPU budget — a path segment can be an accessor, so
+        // resolution itself is sandbox code.
+        let (target, receiver) = resolve_call_target(scope, namespace, &call.export_path)
+            .map_err(|e| failure(e, &logs, start))?;
+
+        // The argument list crosses as one blob holding an array (identity
+        // between arguments preserved, same convention as BridgeCall args);
+        // host types (Request/…) rehydrate to real instances.
+        let args_value = blob::deserialize_value_with_web_types(scope, &call.args_blob)
+            .ok_or_else(|| {
+                let error = match blob::take_codec_error() {
+                    Some(e) => codec_error_to_run_error(e),
+                    None => RunError::Internal("failed to deserialize call arguments".to_string()),
                 };
-                return Err(failure(owned, &logs, start));
-            }
-            let error = match reason.get().copied() {
-                Some(TerminationReason::Wall) => RunError::WallTimeout,
-                Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-                Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                None => RunError::RuntimeError(Box::new(RuntimeErrorData {
-                    name: exception_name(scope),
-                    message: exception_message(scope),
-                    stack: exception_stack(scope),
-                    fields: exception_fields(scope),
-                })),
-            };
-            return Err(failure(error, &logs, start));
+                failure(error, &logs, start)
+            })?;
+        let args_array = v8::Local::<v8::Array>::try_from(args_value).map_err(|_| {
+            failure(
+                RunError::Internal("call arguments blob did not hold an array".to_string()),
+                &logs,
+                start,
+            )
+        })?;
+        let mut args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(args_array.length() as usize);
+        for i in 0..args_array.length() {
+            let arg = args_array.get_index(scope, i).ok_or_else(|| {
+                failure(
+                    RunError::Internal(format!("failed to read call argument {i}")),
+                    &logs,
+                    start,
+                )
+            })?;
+            args.push(arg);
         }
-    };
 
-    // ── Poll loop: drive microtasks until the module promise settles ──────────
-    //
-    // With MicrotasksPolicy::Explicit, microtasks do not run automatically.
-    // After each BridgeResponse is resolved we call perform_microtask_checkpoint()
-    // to advance the await chains.  When the module's top-level promise finally
-    // fulfils or rejects we exit the loop.
-    //
-    // This handles both:
-    //   • Sequential bridge calls  - Promise.all([a]) etc.
-    //   • Concurrent bridge calls  - Promise.all([a, b]) sends both BridgeCall
-    //     frames before yielding; both responses route by callId.
-    //   • No bridge calls          - pure `await Promise.resolve(42)` still
-    //     needs one checkpoint to propagate the already-resolved microtask.
-    // One checkpoint immediately after evaluate() so that:
-    //   • purely synchronous results (await Promise.resolve(42)) settle now,
-    //   • synchronous bridge errors (throw from callback) propagate to the
-    //     module's top-level Promise now,
-    //   • termination exceptions propagate now.
-    // For pending bridge calls nothing changes — resolvers aren't set yet.
-    scope.perform_microtask_checkpoint();
+        let result = match target.call(scope, receiver, &args) {
+            Some(v) => v,
+            None => {
+                // Threw synchronously — classify like a rejected handler
+                // promise, so sync and async throws report the same
+                // name/message/stack/fields shape.
+                if let Some(err) = bridge_error.get() {
+                    return Err(failure(owned_bridge_error(err), &logs, start));
+                }
+                let error = match reason.get().copied() {
+                    Some(TerminationReason::Wall) => RunError::WallTimeout,
+                    Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                    Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                    None => match scope.exception() {
+                        Some(exception) => runtime_error_from_value(scope, exception),
+                        None => RunError::RuntimeError(Box::new(RuntimeErrorData {
+                            name: exception_name(scope),
+                            message: exception_message(scope),
+                            stack: exception_stack(scope),
+                            fields: exception_fields(scope),
+                        })),
+                    },
+                };
+                return Err(failure(error, &logs, start));
+            }
+        };
 
-    // ESM Module::Evaluate() always returns a Promise.  The try_from is a
-    // belt-and-suspenders guard; failure would be an internal V8 bug.
-    let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
+        // A sync return value needs no poll loop at all. An async handler gets
+        // the same settle machinery as the module promise — one checkpoint
+        // first, so a promise that waits on no host I/O settles without
+        // touching the socket (rounds track bridge round trips, not awaits).
+        let value: v8::Local<v8::Value> = if result.is_promise() {
+            let promise = v8::Local::<v8::Promise>::try_from(result).map_err(|_| {
+                failure(
+                    RunError::Internal("call result claimed to be a promise but is not".into()),
+                    &logs,
+                    start,
+                )
+            })?;
+            scope.perform_microtask_checkpoint();
+            if let Some(err) = bridge_error.get() {
+                return Err(failure(owned_bridge_error(err), &logs, start));
+            }
+            match settle_promise(scope, promise, &settle_ctx)
+                .map_err(|e| failure(e, &logs, start))?
+            {
+                v8::PromiseState::Fulfilled => promise.result(scope),
+                _ => {
+                    let error = match reason.get().copied() {
+                        Some(TerminationReason::Wall) => RunError::WallTimeout,
+                        Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                        Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                        None => RunError::ExportNotSerializable(format!(
+                            "call \"{}\" returned a promise that is still pending after the \
+                             poll loop: nothing in the isolate can resolve it",
+                            call.export_path
+                        )),
+                    };
+                    return Err(failure(error, &logs, start));
+                }
+            }
+        } else {
+            result
+        };
+
+        // The call settled — now the guards can go, before serialization,
+        // mirroring the exports path.
         cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-        failure(
-            RunError::Internal("module evaluation did not return a Promise".into()),
-            &logs,
-            start,
-        )
-    })?;
+        cancel_handle.cancel_terminate_execution();
 
-    // Helper: clones the bridge_error OnceLock into an owned RunError.
-    let owned_bridge_error = |err: &RunError| -> RunError {
-        match err {
-            RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
-            RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
-            RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
-            RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
-            RunError::Internal(m) => RunError::Internal(m.clone()),
-            other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
+        blob::serialize_value(scope, value).map_err(|message| {
+            let error = match blob::take_codec_error() {
+                Some(e) => codec_error_to_run_error(e),
+                None => RunError::ExportNotSerializable(format!(
+                    "call \"{}\" result could not be serialized: {message}",
+                    call.export_path
+                )),
+            };
+            failure(error, &logs, start)
+        })?
+    } else {
+        // ── Exports extraction ───────────────────────────────────────────────
+        let names = namespace
+            .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+            .ok_or_else(|| {
+                failure(
+                    RunError::Internal("failed to read module export names".to_string()),
+                    &logs,
+                    start,
+                )
+            })?;
+
+        // Copy the exports into a fresh plain object and serialize that **once**.
+        // The module namespace is an exotic object the V8 serializer refuses, and
+        // a single blob for all exports beats one blob per export (measured).
+        //
+        // Non-serializable exports are skipped, never fatal (#58): a value the
+        // pre-check refuses (function, unresolved Promise) is simply absent
+        // from the result, its name reported in `skipped_exports` — this is
+        // what lets `export default { fetch }` coexist with reading the
+        // module's declaration exports.
+        let exports_object = v8::Object::new(scope);
+        let mut staged: Vec<(String, v8::Local<v8::Value>)> = Vec::new();
+
+        for i in 0..names.length() {
+            let name_value = names.get_index(scope, i).ok_or_else(|| {
+                failure(
+                    RunError::Internal("failed to read export name".to_string()),
+                    &logs,
+                    start,
+                )
+            })?;
+            let name = name_value
+                .to_string(scope)
+                .map(|s| s.to_rust_string_lossy(scope))
+                .ok_or_else(|| {
+                    failure(
+                        RunError::Internal("failed to stringify export name".to_string()),
+                        &logs,
+                        start,
+                    )
+                })?;
+
+            let value = namespace.get(scope, name_value).ok_or_else(|| {
+                failure(
+                    RunError::Internal(format!("failed to read export {name}")),
+                    &logs,
+                    start,
+                )
+            })?;
+
+            // Pre-check catches the common cases cheaply (a function or
+            // Promise directly under the export name) without a trial
+            // serialization.
+            if check_export_serializable(&name, value).is_err() {
+                skipped_exports.push(name);
+                continue;
+            }
+
+            let export_key = v8::Local::<v8::Name>::try_from(name_value).map_err(|_| {
+                failure(
+                    RunError::Internal(format!("export name {name} is not a property key")),
+                    &logs,
+                    start,
+                )
+            })?;
+            exports_object
+                .create_data_property(scope, export_key, value)
+                .ok_or_else(|| {
+                    failure(
+                        RunError::Internal(format!("failed to stage export {name}")),
+                        &logs,
+                        start,
+                    )
+                })?;
+            staged.push((name, value));
+        }
+
+        match blob::serialize_value(scope, exports_object.into()) {
+            Ok(blob) => blob,
+            Err(_first_message) => {
+                // A registered host type that cannot cross keeps its dedicated
+                // loud diagnostic (stream bodies etc. must not vanish
+                // silently); only generic clone refusals are skippable.
+                if let Some(e) = blob::take_codec_error() {
+                    return Err(failure(codec_error_to_run_error(e), &logs, start));
+                }
+                // Something nested inside an export refuses to clone (e.g. the
+                // function in `export default { fetch }`). Trial-serialize
+                // each export and drop the offenders into `skipped_exports`.
+                let retry_object = v8::Object::new(scope);
+                for (name, value) in &staged {
+                    match blob::serialize_value(scope, *value) {
+                        Ok(_) => {
+                            let key = v8::String::new(scope, name).ok_or_else(|| {
+                                failure(
+                                    RunError::Internal("failed to intern export name".to_string()),
+                                    &logs,
+                                    start,
+                                )
+                            })?;
+                            retry_object
+                                .create_data_property(scope, key.into(), *value)
+                                .ok_or_else(|| {
+                                    failure(
+                                        RunError::Internal(format!(
+                                            "failed to stage export {name}"
+                                        )),
+                                        &logs,
+                                        start,
+                                    )
+                                })?;
+                        }
+                        Err(_) => {
+                            if let Some(e) = blob::take_codec_error() {
+                                return Err(failure(codec_error_to_run_error(e), &logs, start));
+                            }
+                            skipped_exports.push(name.clone());
+                        }
+                    }
+                }
+                blob::serialize_value(scope, retry_object.into()).map_err(|retry_message| {
+                    failure(
+                        RunError::ExportNotSerializable(format!(
+                            "exports could not be serialized: {retry_message}"
+                        )),
+                        &logs,
+                        start,
+                    )
+                })?
+            }
         }
     };
 
-    // Socket for BridgeResponse reads in the poll loop.
-    // Only used when stream_fd is Some (i.e. there are globals).
-    let poll_stream_fd = stream_fd;
+    // ── Export size limit ────────────────────────────────────────────────────
+    // Measured on the blob itself — the payload that actually crosses the
+    // socket, so the limit is now free (no probe encode). A call's return
+    // value is capped by the same limit.
+    if limits.max_export_bytes > 0 && exports.len() > limits.max_export_bytes as usize {
+        return Err(failure(RunError::ExportTooLarge, &logs, start));
+    }
 
-    'poll: loop {
+    Ok(Output {
+        exports,
+        skipped_exports,
+        stdout: logs.stdout.clone(),
+        stderr: logs.stderr.clone(),
+        duration_ms: elapsed_ms(start),
+        // Stamped by run_module from the shared run state.
+        cpu_time_ms: 0.0,
+        bridge_calls: Vec::new(),
+    })
+}
+
+/// Clone the shared `bridge_error` OnceLock's content into an owned RunError.
+fn owned_bridge_error(err: &RunError) -> RunError {
+    match err {
+        RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
+        RunError::FunctionArgumentNotSupported => RunError::FunctionArgumentNotSupported,
+        RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
+        RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
+        RunError::Internal(m) => RunError::Internal(m.clone()),
+        other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
+    }
+}
+
+/// Everything the poll loop needs besides the promise it settles. One run
+/// builds this once; both settle points — the module evaluation promise and a
+/// requested call's return promise (#58) — share it.
+struct SettleCtx<'a> {
+    /// Socket for BridgeResponse reads. `None` when no bridge stub exists.
+    stream_fd: Option<RawFd>,
+    limits: &'a Limits,
+    start: std::time::Instant,
+    reason: &'a Arc<OnceLock<TerminationReason>>,
+    cpu_budget: &'a Arc<CpuBudget>,
+    bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
+    bridge_error: &'a Arc<OnceLock<RunError>>,
+    pending_resolvers: &'a PendingResolvers,
+    cancel_handle: &'a v8::IsolateHandle,
+}
+
+/// Drive microtasks until `promise` settles, draining `BridgeResponse` frames
+/// and honouring `Terminate` in between — the poll loop.
+///
+/// With MicrotasksPolicy::Explicit, microtasks do not run automatically.
+/// After each BridgeResponse is resolved we call perform_microtask_checkpoint()
+/// to advance the await chains, handling sequential bridge calls, concurrent
+/// bridge calls (both frames sent before yielding; responses route by callId),
+/// and no bridge calls at all (the caller performs one checkpoint before this
+/// so already-resolvable promises settle without touching the socket).
+///
+/// Returns `Fulfilled`, or `Pending` when there is no session socket to wait
+/// on (an await that nothing in the isolate can ever resolve); every other
+/// outcome is the run's failure, returned as the `RunError` the caller wraps
+/// with `failure()`. Guards are NOT cancelled here — the caller decides when
+/// the run's JS is really over (a call may still follow the module promise);
+/// error paths rely on the `GuardCanceller` drop guard.
+fn settle_promise(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    promise: v8::Local<v8::Promise>,
+    ctx: &SettleCtx<'_>,
+) -> Result<v8::PromiseState, RunError> {
+    loop {
         match promise.state() {
-            v8::PromiseState::Fulfilled => {
-                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-                cancel_handle.cancel_terminate_execution();
-                break 'poll;
-            }
+            v8::PromiseState::Fulfilled => return Ok(v8::PromiseState::Fulfilled),
             v8::PromiseState::Rejected => {
-                cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
                 let rejection = promise.result(scope);
                 // A rejection tagged as a host bridge error surfaces as
                 // ERR_HOST_BRIDGE with the handler's name/message/fields intact.
                 if let Some(err) = host_bridge_error_from_rejection(scope, rejection) {
-                    return Err(failure(err, &logs, start));
+                    return Err(err);
                 }
-                if let Some(err) = bridge_error.get() {
-                    return Err(failure(owned_bridge_error(err), &logs, start));
+                if let Some(err) = ctx.bridge_error.get() {
+                    return Err(owned_bridge_error(err));
                 }
-                return Err(failure(
-                    runtime_error_from_value(scope, rejection),
-                    &logs,
-                    start,
-                ));
+                return Err(runtime_error_from_value(scope, rejection));
             }
             v8::PromiseState::Pending => {}
         }
@@ -1188,9 +1594,8 @@ fn run_module_inner(
         // further BridgeResponse will ever arrive, so bail out before
         // blocking on the socket — otherwise this run would sit until the
         // wall timeout and report the wrong error.
-        if let Some(err) = bridge_error.get() {
-            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-            return Err(failure(owned_bridge_error(err), &logs, start));
+        if let Some(err) = ctx.bridge_error.get() {
+            return Err(owned_bridge_error(err));
         }
 
         // ── Drain one BridgeResponse frame ──────────────────────────────────
@@ -1198,23 +1603,23 @@ fn run_module_inner(
         // Peek at the socket: if a byte is available a full frame is likely
         // ready (TS handlers write frames atomically).  If nothing is there
         // yet we do a blocking wait respecting the remaining wall budget.
-        let frame_result: Result<ipc::TsToRustFrame, io::Error> = if let Some(fd) = poll_stream_fd {
+        let frame_result: Result<ipc::TsToRustFrame, io::Error> = if let Some(fd) = ctx.stream_fd {
             // SAFETY: same ManuallyDrop pattern as bridge_global_callback.
             let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
 
             // Blocking read — pause CPU budget so host-handler latency is not
             // charged against the sandbox.  Set a read timeout equal to the
             // remaining wall budget so a stalled handler is caught here.
-            let timeout = if limits.wall_time_ms > 0 {
-                let budget = Duration::from_millis(limits.wall_time_ms as u64);
+            let timeout = if ctx.limits.wall_time_ms > 0 {
+                let budget = Duration::from_millis(ctx.limits.wall_time_ms as u64);
                 let remaining = budget
-                    .saturating_sub(start.elapsed())
+                    .saturating_sub(ctx.start.elapsed())
                     .max(Duration::from_millis(1));
                 Some(remaining)
             } else {
                 None
             };
-            cpu_budget.leave();
+            ctx.cpu_budget.leave();
             if let Some(t) = timeout {
                 sock.set_read_timeout(Some(t)).ok();
             }
@@ -1223,21 +1628,21 @@ fn run_module_inner(
             // cap (an explicit 0 on the wire; absent would have resolved to the
             // default); fall back to the global framing cap as a parsing safety
             // limit only in that case.
-            let bridge_frame_limit: u32 = if limits.memory_mb > 0 {
-                limits.memory_mb.saturating_mul(1024 * 1024)
+            let bridge_frame_limit: u32 = if ctx.limits.memory_mb > 0 {
+                ctx.limits.memory_mb.saturating_mul(1024 * 1024)
             } else {
                 ipc::DEFAULT_MAX_FRAME_LENGTH
             };
             let result = ipc::read_ts_to_rust_frame_with_limit(&mut *sock, bridge_frame_limit);
-            if limits.wall_time_ms > 0 {
+            if ctx.limits.wall_time_ms > 0 {
                 sock.set_read_timeout(None).ok();
             }
-            cpu_budget.enter();
+            ctx.cpu_budget.enter();
             result
         } else {
-            // No bridge globals — module is Pending with no socket means an
-            // un-awaited Promise was exported; break and surface the error.
-            break 'poll;
+            // No bridge globals — Pending with no socket means an await that
+            // nothing can ever resolve; the caller surfaces the error.
+            return Ok(v8::PromiseState::Pending);
         };
 
         match frame_result {
@@ -1245,15 +1650,11 @@ fn run_module_inner(
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
                 // Wall budget exhausted during blocking wait.
-                reason.set(TerminationReason::Wall).ok();
-                return Err(failure(RunError::WallTimeout, &logs, start));
+                ctx.reason.set(TerminationReason::Wall).ok();
+                return Err(RunError::WallTimeout);
             }
             Err(e) => {
-                return Err(failure(
-                    RunError::Internal(format!("poll loop socket read: {e}")),
-                    &logs,
-                    start,
-                ));
+                return Err(RunError::Internal(format!("poll loop socket read: {e}")));
             }
             Ok(frame) => {
                 // ── Validate and decode the frame ────────────────────────
@@ -1294,18 +1695,13 @@ fn run_module_inner(
                                 "[iso4-v8] Terminate received with malformed payload ({e}) — aborting"
                             ),
                         }
-                        cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-                        cancel_handle.terminate_execution();
-                        return Err(failure(RunError::Aborted, &logs, start));
+                        ctx.cancel_handle.terminate_execution();
+                        return Err(RunError::Aborted);
                     }
                     other => {
-                        return Err(failure(
-                            RunError::Internal(format!(
-                                "poll loop: expected BridgeResponse or Terminate, got {other:?}"
-                            )),
-                            &logs,
-                            start,
-                        ));
+                        return Err(RunError::Internal(format!(
+                            "poll loop: expected BridgeResponse or Terminate, got {other:?}"
+                        )));
                     }
                 }
                 // Frame size is already bounded by bridge_frame_limit (= memoryMb
@@ -1313,11 +1709,9 @@ fn run_module_inner(
                 // above, so no secondary payload length check is needed here.
                 match wire::parse_bridge_response_payload(&frame.payload) {
                     Err(e) => {
-                        return Err(failure(
-                            RunError::Internal(format!("poll loop: response decode: {e}")),
-                            &logs,
-                            start,
-                        ));
+                        return Err(RunError::Internal(format!(
+                            "poll loop: response decode: {e}"
+                        )));
                     }
                     Ok((call_id, result)) => {
                         // Settle the call's bridge record: round-trip time on
@@ -1329,15 +1723,19 @@ fn run_module_inner(
                         } else {
                             0
                         };
-                        bridge_log.lock().unwrap_or_else(|p| p.into_inner()).settle(
-                            call_id,
-                            elapsed_ms(start),
-                            result.is_ok(),
-                            response_value_bytes,
-                        );
+                        ctx.bridge_log
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .settle(
+                                call_id,
+                                elapsed_ms(ctx.start),
+                                result.is_ok(),
+                                response_value_bytes,
+                            );
                         // Route to the matching resolver.  An unknown callId
                         // means a stale frame from a previous run — discard.
-                        let entry = pending_resolvers
+                        let entry = ctx
+                            .pending_resolvers
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .remove(&call_id);
@@ -1392,149 +1790,91 @@ fn run_module_inner(
         // ── Advance all pending await chains ─────────────────────────────────
         // This is the only place microtasks run (Explicit policy).  After
         // resolving the Promise above, the microtask queued by the `await`
-        // resumes execution until the module hits its next `await` (sending
+        // resumes execution until the code hits its next `await` (sending
         // another BridgeCall) or completes.
         scope.perform_microtask_checkpoint();
 
         // Check for errors set during the checkpoint (inside bridge callbacks).
-        if let Some(err) = bridge_error.get() {
-            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-            return Err(failure(owned_bridge_error(err), &logs, start));
+        if let Some(err) = ctx.bridge_error.get() {
+            return Err(owned_bridge_error(err));
         }
         // Check if a guard thread fired termination during the checkpoint.
-        if let Some(r) = reason.get().copied() {
-            cancel_guards(&cancel_wall, &cancel_cpu, &cpu_budget);
-            let error = match r {
+        if let Some(r) = ctx.reason.get().copied() {
+            return Err(match r {
                 TerminationReason::Wall => RunError::WallTimeout,
                 TerminationReason::Cpu => RunError::CpuTimeout,
                 TerminationReason::Memory => RunError::MemoryLimit,
-            };
-            return Err(failure(error, &logs, start));
+            });
         }
-    } // end 'poll
+    }
+}
 
-    // Verify the promise is truly Fulfilled after the poll loop.
-    // (It should be — Rejected and Pending break out differently above.)
-    if promise.state() != v8::PromiseState::Fulfilled {
-        if let Some(err) = bridge_error.get() {
-            return Err(failure(owned_bridge_error(err), &logs, start));
-        }
-        let error = match reason.get().copied() {
-            Some(TerminationReason::Wall) => RunError::WallTimeout,
-            Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-            Some(TerminationReason::Memory) => RunError::MemoryLimit,
-            None => RunError::ExportNotSerializable(
-                "module evaluation promise is still pending after poll loop".to_string(),
-            ),
+/// Cap on dot-separated segments in a call's export path. Real paths are one
+/// or two segments (`"named"`, `"default.fetch"`); the cap only bounds
+/// pathological input, since every segment is a property read that may run
+/// sandbox code (an accessor).
+const MAX_CALL_PATH_SEGMENTS: usize = 16;
+
+/// Resolve a call's export path (#58) against the module namespace: the
+/// callable, plus the receiver its `this` is bound to — the object the final
+/// segment was read from, i.e. plain `a.b.c()` semantics (the namespace itself
+/// for a single-segment path), so `export default { fetch() { this.… } }`
+/// works. Reads follow the prototype chain, so `export default new Worker()`
+/// resolves prototype methods (workerd reached the same design). Both "does
+/// not resolve" and "not callable" report `ERR_CALL_TARGET_NOT_FOUND`; the
+/// message says which.
+fn resolve_call_target<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    namespace: v8::Local<'s, v8::Object>,
+    export_path: &str,
+) -> Result<(v8::Local<'s, v8::Function>, v8::Local<'s, v8::Value>), RunError> {
+    let segments: Vec<&str> = export_path.split('.').collect();
+    if export_path.is_empty() || segments.iter().any(|s| s.is_empty()) {
+        return Err(RunError::CallTargetNotFound(format!(
+            "call export path \"{export_path}\" is not a dot-separated path of non-empty segments"
+        )));
+    }
+    if segments.len() > MAX_CALL_PATH_SEGMENTS {
+        return Err(RunError::CallTargetNotFound(format!(
+            "call export path \"{export_path}\" exceeds {MAX_CALL_PATH_SEGMENTS} segments"
+        )));
+    }
+
+    let mut receiver: v8::Local<v8::Value> = namespace.into();
+    let mut current: v8::Local<v8::Value> = namespace.into();
+    for (i, segment) in segments.iter().enumerate() {
+        let Some(object) = current.to_object(scope) else {
+            return Err(RunError::CallTargetNotFound(format!(
+                "call export path \"{export_path}\" does not resolve: \"{}\" is not an object",
+                segments[..i].join(".")
+            )));
         };
-        return Err(failure(error, &logs, start));
-    }
-
-    let namespace = module
-        .get_module_namespace()
-        .to_object(scope)
-        .ok_or_else(|| {
-            failure(
-                RunError::Internal("module namespace is not an object".to_string()),
-                &logs,
-                start,
-            )
-        })?;
-
-    let names = namespace
-        .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
-        .ok_or_else(|| {
-            failure(
-                RunError::Internal("failed to read module export names".to_string()),
-                &logs,
-                start,
-            )
-        })?;
-
-    // Copy the exports into a fresh plain object and serialize that **once**.
-    // The module namespace is an exotic object the V8 serializer refuses, and
-    // a single blob for all exports beats one blob per export (measured).
-    let exports_object = v8::Object::new(scope);
-
-    for i in 0..names.length() {
-        let name_value = names.get_index(scope, i).ok_or_else(|| {
-            failure(
-                RunError::Internal("failed to read export name".to_string()),
-                &logs,
-                start,
-            )
-        })?;
-        let name = name_value
-            .to_string(scope)
-            .map(|s| s.to_rust_string_lossy(scope))
-            .ok_or_else(|| {
-                failure(
-                    RunError::Internal("failed to stringify export name".to_string()),
-                    &logs,
-                    start,
-                )
-            })?;
-
-        let value = namespace.get(scope, name_value).ok_or_else(|| {
-            failure(
-                RunError::Internal(format!("failed to read export {name}")),
-                &logs,
-                start,
-            )
-        })?;
-
-        // Pre-check the two cases whose error message names the export. The
-        // serializer would reject them too, but only with a generic
-        // "could not be cloned" message, and the export name is the useful
-        // half of that diagnostic.
-        check_export_serializable(&name, value).map_err(|error| failure(error, &logs, start))?;
-
-        let export_key = v8::Local::<v8::Name>::try_from(name_value).map_err(|_| {
-            failure(
-                RunError::Internal(format!("export name {name} is not a property key")),
-                &logs,
-                start,
-            )
-        })?;
-        exports_object
-            .create_data_property(scope, export_key, value)
-            .ok_or_else(|| {
-                failure(
-                    RunError::Internal(format!("failed to stage export {name}")),
-                    &logs,
-                    start,
-                )
-            })?;
-    }
-
-    let exports = blob::serialize_value(scope, exports_object.into()).map_err(|message| {
-        // A registered host type that cannot cross reports its own code; the
-        // generic path stays ERR_EXPORT_NOT_SERIALIZABLE.
-        let error = match blob::take_codec_error() {
-            Some(e) => codec_error_to_run_error(e),
-            None => RunError::ExportNotSerializable(format!(
-                "exports could not be serialized: {message}"
-            )),
+        let key = v8::String::new(scope, segment)
+            .ok_or_else(|| RunError::Internal("failed to intern call path segment".to_string()))?;
+        let Some(value) = object.get(scope, key.into()) else {
+            // The property read itself threw (an accessor).
+            return Err(RunError::CallTargetNotFound(format!(
+                "call export path \"{export_path}\" does not resolve: reading \"{segment}\" threw"
+            )));
         };
-        failure(error, &logs, start)
-    })?;
-
-    // ── Export size limit ────────────────────────────────────────────────────
-    // Measured on the blob itself — the payload that actually crosses the
-    // socket, so the limit is now free (no probe encode).
-    if limits.max_export_bytes > 0 && exports.len() > limits.max_export_bytes as usize {
-        return Err(failure(RunError::ExportTooLarge, &logs, start));
+        receiver = object.into();
+        current = value;
     }
 
-    Ok(Output {
-        exports,
-        stdout: logs.stdout.clone(),
-        stderr: logs.stderr.clone(),
-        duration_ms: elapsed_ms(start),
-        // Stamped by run_module from the shared run state.
-        cpu_time_ms: 0.0,
-        bridge_calls: Vec::new(),
-    })
+    v8::Local::<v8::Function>::try_from(current)
+        .map(|f| (f, receiver))
+        .map_err(|_| {
+            if current.is_undefined() || current.is_null() {
+                RunError::CallTargetNotFound(format!(
+                    "call export path \"{export_path}\" does not resolve against the module's \
+                     exports"
+                ))
+            } else {
+                RunError::CallTargetNotFound(format!(
+                    "call export path \"{export_path}\" resolved to a value that is not callable"
+                ))
+            }
+        })
 }
 
 /// Checkpoint bound for settling a prefix's top-level await. Every realistic
@@ -1545,20 +1885,21 @@ fn run_module_inner(
 const PREFIX_SETTLE_MAX_CHECKPOINTS: usize = 1000;
 
 /// Compile, instantiate, and evaluate prefix `code` as an ESM module in the
-/// current context, returning `Ok(())` once it settles successfully.
+/// current context, returning the settled module once evaluation succeeds.
 ///
-/// Shared by both precompile passes (the validation isolate and the snapshot
-/// creator) so their behavior — crucially, *which imports resolve* — is
-/// identical. Bridge globals are not installed here (bridge stubs are recreated
-/// per `execute_with_prefix`), and `node:async_hooks` is not resolvable because
-/// the native async-context bindings cannot be captured in a snapshot.
+/// Shared by `prepare()` validation and every run's prefix stage so their
+/// behavior — crucially, *which imports resolve* — is identical. Bridge
+/// globals are not installed here (bridge stubs are recreated per
+/// `execute_with_prefix`), and `node:async_hooks` is not resolvable while a
+/// prefix evaluates. The returned handle is what a `prefix.call()` resolves
+/// its export path against (#58); validation callers drop it.
 fn evaluate_prefix_module(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     code: &str,
     filename: &str,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-) -> Result<(), RunError> {
+) -> Result<v8::Global<v8::Module>, RunError> {
     // Install the value globals (string exprs, constants, shim wrappers)
     // before evaluating the prefix, so prefix code sees them. Bridge stubs
     // are NOT installed here — they are created against a live socket only
@@ -1663,7 +2004,7 @@ fn evaluate_prefix_module(
         }
     }
 
-    Ok(())
+    Ok(v8::Global::new(scope, module))
 }
 
 /// Validate prefix code in a throwaway regular isolate: compile + instantiate
@@ -1701,6 +2042,7 @@ fn validate_prefix_module(
     crate::webtypes::install(scope).map_err(|e| failure(RunError::Internal(e), &logs, start))?;
     v8::tc_scope!(let scope, scope);
     evaluate_prefix_module(scope, code, filename, globals, imports)
+        .map(|_| ())
         .map_err(|error| failure(error, &logs, start))
 }
 
@@ -1709,6 +2051,22 @@ fn validate_prefix_module(
 /// durations as f64, so sub-millisecond runs stay visible.
 fn elapsed_ms(start: std::time::Instant) -> f64 {
     (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1_000.0
+}
+
+/// A guard can fire while the run is still in setup — installing globals or
+/// the web runtime, evaluating the prefix, compiling the postfix. V8 then
+/// fails the interrupted operation, and classifying that failure would
+/// misreport the timeout as `ERR_INTERNAL` ("evaluate web runtime: null") or
+/// `ERR_COMPILE`. The guard stores its reason *before* it calls
+/// `terminate_execution`, so a set reason here is always the real cause;
+/// otherwise the fallback stands.
+fn termination_or(reason: &OnceLock<TerminationReason>, fallback: RunError) -> RunError {
+    match reason.get().copied() {
+        Some(TerminationReason::Wall) => RunError::WallTimeout,
+        Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+        Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        None => fallback,
+    }
 }
 
 fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> FailureOutput {
@@ -2896,7 +3254,9 @@ fn install_prefix_bridge_placeholders(
     let receiver: v8::Local<v8::Value> = v8::undefined(scope).into();
     for (install_name, display_name, kind) in targets {
         let name_arg = v8::String::new(scope, &display_name).ok_or_else(|| {
-            RunError::Internal(format!("failed to intern placeholder name '{display_name}'"))
+            RunError::Internal(format!(
+                "failed to intern placeholder name '{display_name}'"
+            ))
         })?;
         let kind_arg = v8::Integer::new(scope, kind);
         let placeholder = factory
@@ -3585,7 +3945,7 @@ mod tests {
     fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
         init_platform();
         run_module(
-            code,
+            Some(code),
             filename,
             None,
             limits,
@@ -3593,6 +3953,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
     }
 
@@ -3625,7 +3986,7 @@ mod tests {
     fn run_with_source_imports(code: &str, imports: &[ImportBinding]) -> Result<Output, RunError> {
         init_platform();
         run_module(
-            code,
+            Some(code),
             "<iso4>",
             None,
             Limits::default(),
@@ -3633,6 +3994,7 @@ mod tests {
             imports,
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .map_err(|failure| failure.error)
     }
@@ -4027,24 +4389,49 @@ mod tests {
     }
 
     // ── Export validation ─────────────────────────────────────────────────
+    //
+    // Non-serializable exports are skipped, never fatal (#58): the value is
+    // absent from the exports and its name is reported in `skipped_exports`.
 
     #[test]
-    fn exporting_a_function_is_an_error() {
-        let err = run_err("export default function() {}");
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    fn exporting_a_function_is_skipped_and_reported() {
+        let out = run_ok("export default function() {}\nexport const kept = 1");
+        assert_eq!(out.skipped_exports, vec!["default".to_string()]);
+        assert!(get_field(&out, "default").is_none());
+        assert_eq!(get_named(&out, "kept").as_deref(), Some("1"));
     }
 
     #[test]
-    fn exporting_a_class_is_an_error() {
-        let err = run_err("export default class Foo {}");
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    fn exporting_a_class_is_skipped_and_reported() {
+        let out = run_ok("export default class Foo {}");
+        assert_eq!(out.skipped_exports, vec!["default".to_string()]);
+        assert!(get_field(&out, "default").is_none());
     }
 
     #[test]
-    fn exporting_an_unresolved_promise_is_an_error() {
-        // A Promise that is never awaited should be rejected at the boundary.
-        let err = run_err("export default new Promise(() => {})");
-        assert!(matches!(err, RunError::ExportNotSerializable(_)));
+    fn exporting_an_unresolved_promise_is_skipped_and_reported() {
+        // A Promise that is never awaited cannot cross the boundary; it is
+        // absent from the exports rather than failing the run.
+        let out = run_ok("export default new Promise(() => {})");
+        assert_eq!(out.skipped_exports, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn nested_function_in_export_is_skipped_via_trial_serialization() {
+        // The pre-check only sees the object; the nested function surfaces in
+        // the combined serialize, which falls back to per-export trials.
+        let out = run_ok(
+            "export default { fetch() { return 1 } }\nexport const limits = { memoryMb: 64 }",
+        );
+        assert_eq!(out.skipped_exports, vec!["default".to_string()]);
+        assert!(get_field(&out, "default").is_none());
+        assert!(get_field(&out, "limits").is_some());
+    }
+
+    #[test]
+    fn serializable_runs_report_no_skipped_exports() {
+        let out = run_ok("export default 42");
+        assert!(out.skipped_exports.is_empty());
     }
 
     #[test]
@@ -4630,7 +5017,7 @@ mod tests {
         let prefix = prepared("globalThis.base = 10", &[], &[]);
         let err = execute_with_prefix(
             prefix,
-            "while (true) {}",
+            Some("while (true) {}"),
             None,
             Limits {
                 cpu_time_ms: 200,
@@ -4641,6 +5028,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -5046,13 +5434,14 @@ mod tests {
         );
         let out = execute_with_prefix(
             prefix,
-            "export default [globalThis.a + 1, globalThis.b].join('|')",
+            Some("export default [globalThis.a + 1, globalThis.b].join('|')"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("41|x"));
@@ -5097,13 +5486,14 @@ mod tests {
         );
         let out = execute_with_prefix(
             prefix,
-            "export default globalThis.level",
+            Some("export default globalThis.level"),
             None,
             Limits::default(),
             &[],
             &imports,
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("3"));
@@ -5121,13 +5511,14 @@ mod tests {
         );
         let out = execute_with_prefix(
             prefix,
-            "export default globalThis.n",
+            Some("export default globalThis.n"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("10"));
@@ -5180,8 +5571,8 @@ mod tests {
             shim: "(raw) => raw".to_string(),
             handler_name: "__iso4_fetch_h".to_string(),
         }];
-        let err = precompile("await fetch('https://example.com')", None, &globals, &[])
-            .unwrap_err();
+        let err =
+            precompile("await fetch('https://example.com')", None, &globals, &[]).unwrap_err();
         match err.error {
             // The placeholder sits under the handler name but reports the
             // public name — the user called `fetch`, not `__iso4_fetch_h`.
@@ -5216,13 +5607,14 @@ mod tests {
         let prefix = prepared("globalThis.kind = typeof fetch", &globals, &[]);
         let out = execute_with_prefix(
             prefix,
-            "export default globalThis.kind",
+            Some("export default globalThis.kind"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("function"));
@@ -5235,13 +5627,14 @@ mod tests {
         let prefix = prepared("globalThis.base = 100", &[], &[]);
         let out = execute_with_prefix(
             prefix,
-            "export default globalThis.base + 1",
+            Some("export default globalThis.base + 1"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("101"));
@@ -5258,15 +5651,15 @@ mod tests {
             &[],
         );
         let out = execute_with_prefix(
-            prefix,
-            "const r = globalThis.mk(); \
-             export default [r instanceof Response, r.status, r.headers.get('content-type')].join('|')",
+            prefix, Some("const r = globalThis.mk(); \
+             export default [r instanceof Response, r.status, r.headers.get('content-type')].join('|')"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -5293,13 +5686,14 @@ mod tests {
                     filename: "<prefix>",
                     globals: &[],
                 },
-                "export default typeof globalThis.v",
+                Some("export default typeof globalThis.v"),
                 None,
                 Limits::default(),
                 &[],
                 &[],
                 None,
                 Arc::new(AtomicU32::new(0)),
+                None,
             )
             .unwrap_or_else(|_| panic!("run with a prefix holding {expr} must not fail"));
             assert_eq!(get_default(&out).as_deref(), Some("object"), "{expr}");
@@ -5313,13 +5707,14 @@ mod tests {
         let prefix = prepared("", &[], &[]);
         let out = execute_with_prefix(
             prefix,
-            "export default new Response('body', { status: 418, headers: { 'x-a': 'b' } })",
+            Some("export default new Response('body', { status: 418, headers: { 'x-a': 'b' } })"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         // The export blob carries a host object; the host decodes it. Here we
@@ -5333,13 +5728,14 @@ mod tests {
         let prefix = prepared("globalThis.answer = 42", &[], &[]);
         let out = execute_with_prefix(
             prefix,
-            "export default globalThis.answer",
+            Some("export default globalThis.answer"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42"));
@@ -5351,35 +5747,38 @@ mod tests {
         let b = "globalThis.base";
         let out1 = execute_with_prefix(
             prefix,
-            &format!("export default {b} * 2"),
+            Some(&format!("export default {b} * 2")),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         let out2 = execute_with_prefix(
             prefix,
-            &format!("export default {b} * 3"),
+            Some(&format!("export default {b} * 3")),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         let out3 = execute_with_prefix(
             prefix,
-            &format!("export default {b} * 4"),
+            Some(&format!("export default {b} * 4")),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out1).as_deref(), Some("20"));
@@ -5392,24 +5791,26 @@ mod tests {
         let prefix = prepared("globalThis.counter = 0", &[], &[]);
         execute_with_prefix(
             prefix,
-            "globalThis.counter = 99; export default 1",
+            Some("globalThis.counter = 99; export default 1"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         let out = execute_with_prefix(
             prefix,
-            "export default globalThis.counter",
+            Some("export default globalThis.counter"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("0"));
@@ -5424,13 +5825,14 @@ mod tests {
         );
         let out = execute_with_prefix(
             prefix,
-            "export default globalThis.sq[7]",
+            Some("export default globalThis.sq[7]"),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("49"));
@@ -5441,13 +5843,14 @@ mod tests {
         let prefix = prepared("const x = 1", &[], &[]);
         let out = execute_with_prefix(
             prefix,
-            r#"console.log("hello from postfix"); export default 1"#,
+            Some(r#"console.log("hello from postfix"); export default 1"#),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         assert!(out.stdout.iter().any(|l| l.contains("hello from postfix")));
@@ -5458,13 +5861,14 @@ mod tests {
         let prefix = prepared("", &[], &[]);
         let err = execute_with_prefix(
             prefix,
-            r#"throw new Error("postfix failed")"#,
+            Some(r#"throw new Error("postfix failed")"#),
             None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
@@ -5665,6 +6069,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         );
         responder.join().unwrap();
         assert!(
@@ -5781,6 +6186,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         );
         (result, handle)
     }
@@ -5910,6 +6316,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         responder.join().unwrap();
@@ -6161,6 +6568,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6204,6 +6612,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6329,6 +6738,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6391,6 +6801,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6547,6 +6958,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6595,6 +7007,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
 
@@ -6631,6 +7044,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
 
@@ -6670,6 +7084,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6711,6 +7126,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
 
@@ -6759,6 +7175,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err();
 
@@ -6805,6 +7222,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6847,6 +7265,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6885,6 +7304,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6939,6 +7359,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap_err()
         .error;
@@ -6990,6 +7411,7 @@ mod tests {
             &[],
             Some(fd1),
             Arc::clone(&counter),
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("1"));
@@ -7027,6 +7449,7 @@ mod tests {
             &[],
             Some(fd2),
             Arc::clone(&counter),
+            None,
         )
         .unwrap_err()
         .error;
@@ -7097,6 +7520,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
 
@@ -7141,6 +7565,7 @@ mod tests {
             &[HostGlobalDef::bridge("tool")],
             &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         ).unwrap();
 
         handle.join().unwrap();
@@ -7402,6 +7827,7 @@ mod tests {
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         );
         (result, handle)
     }
@@ -7692,13 +8118,14 @@ mod tests {
                 filename: "<prefix>",
                 globals: &[],
             },
-            "export default (await globalThis.search('dogs')) + globalThis.maxResults",
+            Some("export default (await globalThis.search('dogs')) + globalThis.maxResults"),
             None,
             Limits::default(),
             &[],
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         handle.join().unwrap();
@@ -7742,13 +8169,14 @@ mod tests {
                 filename: "<prefix>",
                 globals: &[],
             },
-            r#"import { f } from "tools:t"; export default await f()"#,
+            Some(r#"import { f } from "tools:t"; export default await f()"#),
             None,
             Limits::default(),
             &[],
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
         )
         .unwrap();
         handle.join().unwrap();
@@ -7792,5 +8220,409 @@ mod tests {
         );
         assert_eq!(host_module_base_id(&imports, "a"), 0);
         assert_eq!(host_module_base_id(&imports, "b"), 3);
+    }
+
+    // ── Host → sandbox calls (#58) ───────────────────────────────────────────
+
+    /// Build a `CallSpec` with the args encoded as one blob holding an array.
+    fn call_spec(path: &str, args: &[WireValue]) -> ipc::CallSpec {
+        ipc::CallSpec {
+            export_path: path.to_string(),
+            args_blob: testval::to_blob(&WireValue::Array(args.to_vec())),
+        }
+    }
+
+    /// Shorthand: `run({ code, call })` with no globals and no socket.
+    fn run_call(code: &str, path: &str, args: &[WireValue]) -> Result<Output, RunError> {
+        init_platform();
+        let call = call_spec(path, args);
+        run_module(
+            Some(code),
+            "<iso4>",
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        )
+        .map_err(|failure| failure.error)
+    }
+
+    /// Decode a call run's value blob.
+    fn value_of(out: &Output) -> WireValue {
+        testval::from_blob(&out.exports)
+    }
+
+    #[test]
+    fn call_named_export_returns_value() {
+        let out = run_call(
+            "export function add(a, b) { return a + b }",
+            "add",
+            &[WireValue::Number(2.0), WireValue::Number(40.0)],
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::Number(42.0));
+        assert!(out.skipped_exports.is_empty());
+    }
+
+    #[test]
+    fn call_default_fetch_receiver_is_the_exported_object() {
+        // `export default { fetch }` — the receiver must be the object the
+        // final segment was read from, so `this` works (a `globalThis`
+        // receiver would silently produce "undefined:POST").
+        let out = run_call(
+            "export default { tag: 'worker-a', fetch(method) { return `${this.tag}:${method}` } }",
+            "default.fetch",
+            &[WireValue::String("POST".to_string())],
+        )
+        .unwrap();
+        assert_eq!(
+            value_of(&out),
+            WireValue::String("worker-a:POST".to_string())
+        );
+    }
+
+    #[test]
+    fn call_default_prototype_method_resolves() {
+        // `export default new Worker()` — the method lives on the prototype,
+        // so resolution must follow the prototype chain (own-property-only
+        // lookups would break this shape; workerd walks the chain too).
+        let out = run_call(
+            "class Worker { constructor() { this.tag = 'w' } fetch(m) { return this.tag + m } }\n\
+             export default new Worker()",
+            "default.fetch",
+            &[WireValue::String("!".to_string())],
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::String("w!".to_string()));
+    }
+
+    #[test]
+    fn call_single_segment_receiver_is_the_namespace() {
+        // Plain `a.b()` semantics with the namespace as the root object:
+        // a single-segment call is `ns.fn()`, so `this` is the namespace and
+        // sibling exports are reachable through it.
+        let out = run_call(
+            "export const tag = 'ns'\nexport function whoami() { return this.tag }",
+            "whoami",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::String("ns".to_string()));
+    }
+
+    #[test]
+    fn call_sync_handler_needs_no_socket() {
+        // A sync return value must not enter the poll loop — with no socket a
+        // poll would surface a bogus pending error.
+        let out = run_call("export function f() { return 1 }", "f", &[]).unwrap();
+        assert_eq!(value_of(&out), WireValue::Number(1.0));
+    }
+
+    #[test]
+    fn call_async_handler_without_bridge_settles() {
+        // Awaits that need no host I/O settle in the pre-poll checkpoint;
+        // there is no socket here, so this also proves the loop is not
+        // entered for them.
+        let out = run_call(
+            "export async function f() { const a = await 1; const b = await 2; return a + b }",
+            "f",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::Number(3.0));
+    }
+
+    #[test]
+    fn call_async_handler_with_bridge_call_settles() {
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+        let handle = spawn_responder(server, |s| {
+            ipc::write_ts_to_rust_frame(
+                s,
+                ipc::TsToRustMessageType::BridgeResponse,
+                &bridge_resp_ok(0, &WireValue::Number(41.0)),
+            )
+            .unwrap();
+        });
+        let call = call_spec("f", &[WireValue::Number(1.0)]);
+        let out = execute(
+            "export async function f(n) { return (await myTool()) + n }",
+            None,
+            Limits::default(),
+            &[HostGlobalDef::bridge("myTool")],
+            &[],
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(value_of(&out), WireValue::Number(42.0));
+        assert_eq!(out.bridge_calls.len(), 1);
+    }
+
+    #[test]
+    fn call_against_prefix_exports() {
+        // prefix.call(): no postfix at all — the export path resolves against
+        // the prefix module's live namespace, module-scope closure state
+        // included.
+        let prefix = prepared(
+            "let hits = 0\n\
+             export default { tag: 'worker-a', fetch(m) { hits += 1; return `${this.tag}|${hits}|${m}` } }\n\
+             export function named(x) { return `named|${x}` }",
+            &[],
+            &[],
+        );
+        let call = call_spec("default.fetch", &[WireValue::String("POST".to_string())]);
+        let out = execute_with_prefix(
+            prefix,
+            None,
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        )
+        .unwrap();
+        assert_eq!(
+            value_of(&out),
+            WireValue::String("worker-a|1|POST".to_string())
+        );
+    }
+
+    #[test]
+    fn call_named_export_on_prefix() {
+        let prefix = prepared("export function named(x) { return `named|${x}` }", &[], &[]);
+        let call = call_spec("named", &[WireValue::String("X".to_string())]);
+        let out = execute_with_prefix(
+            prefix,
+            None,
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::String("named|X".to_string()));
+    }
+
+    #[test]
+    fn call_unknown_path_is_call_target_not_found() {
+        let err = run_call("export default { fetch() {} }", "default.missing", &[]).unwrap_err();
+        assert!(
+            matches!(&err, RunError::CallTargetNotFound(m) if m.contains("default.missing")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_non_callable_target_is_call_target_not_found() {
+        let err = run_call("export const n = 42", "n", &[]).unwrap_err();
+        assert!(
+            matches!(&err, RunError::CallTargetNotFound(m) if m.contains("not callable")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_default_exported_class_method_is_a_clean_error() {
+        // `export default class` puts `fetch` on the prototype, not on the
+        // class object, so `default.fetch` must fail cleanly — the supported
+        // shapes are `export default { fetch }` and `export default new W()`.
+        let err = run_call(
+            "export default class { fetch() { return 1 } }",
+            "default.fetch",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CallTargetNotFound(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_path_through_non_object_is_call_target_not_found() {
+        let err = run_call("export const n = 1", "n.f.g", &[]).unwrap_err();
+        assert!(
+            matches!(err, RunError::CallTargetNotFound(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_empty_and_oversized_paths_are_rejected() {
+        for path in ["", "a..b", ".a"] {
+            let err = run_call("export const a = 1", path, &[]).unwrap_err();
+            assert!(
+                matches!(err, RunError::CallTargetNotFound(_)),
+                "path {path:?} got {err:?}"
+            );
+        }
+        let deep = vec!["a"; MAX_CALL_PATH_SEGMENTS + 1].join(".");
+        let err = run_call("export const a = 1", &deep, &[]).unwrap_err();
+        assert!(
+            matches!(err, RunError::CallTargetNotFound(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_throwing_handler_is_user_code_error() {
+        let err = run_call(
+            r#"export function f() { throw new Error("boom") }"#,
+            "f",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, RunError::RuntimeError(inner) if inner.message == "boom"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_async_rejection_is_user_code_error() {
+        let err = run_call(
+            r#"export async function f() { throw new Error("late boom") }"#,
+            "f",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, RunError::RuntimeError(inner) if inner.message == "late boom"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_args_preserve_rich_types_and_identity() {
+        // Two references to the same object arrive as the same object; a
+        // bigint arrives as a bigint — the args cross as one V8 blob.
+        let shared = WireValue::Object(vec![("k".to_string(), WireValue::Number(1.0))]);
+        let out = run_call(
+            "export function f(a, b, big) { return [a === b, typeof big] }",
+            "f",
+            &[shared.clone(), shared, WireValue::BigInt(false, vec![7u64])],
+        )
+        .unwrap();
+        // NOTE: the two `shared` values above are equal but *separate* trees,
+        // so identity is NOT preserved between them — this asserts the
+        // mechanism (blob crossing) rather than test-fixture identity.
+        assert_eq!(
+            value_of(&out),
+            WireValue::Array(vec![
+                WireValue::Bool(false),
+                WireValue::String("bigint".to_string())
+            ])
+        );
+    }
+
+    #[test]
+    fn call_result_respects_max_export_bytes() {
+        let call = call_spec("f", &[]);
+        let failure = run_module(
+            Some("export function f() { return 'x'.repeat(1024 * 1024) }"),
+            "<iso4>",
+            None,
+            Limits {
+                max_export_bytes: 1024,
+                ..Default::default()
+            },
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        )
+        .unwrap_err();
+        assert!(matches!(failure.error, RunError::ExportTooLarge));
+    }
+
+    #[test]
+    fn call_result_that_cannot_serialize_is_an_error_not_a_skip() {
+        // Skipping is an exports-path affordance; a call's return value is
+        // the whole result, so a non-serializable one must fail loudly.
+        let err = run_call("export function f() { return () => 1 }", "f", &[]).unwrap_err();
+        assert!(
+            matches!(err, RunError::ExportNotSerializable(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_run_reports_no_exports_and_no_skips() {
+        // `call` present ⇒ value, never exports — even when the module also
+        // has non-serializable exports that a plain run would skip.
+        let out = run_call(
+            "export default { fetch() { return 'ok' } }\nexport const extra = 1",
+            "default.fetch",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::String("ok".to_string()));
+        assert!(out.skipped_exports.is_empty());
+    }
+
+    #[test]
+    fn call_getter_along_the_path_runs_and_resolves() {
+        // A path segment may be an accessor — it runs inside the CPU budget
+        // and its result participates in resolution.
+        let out = run_call(
+            "export default { get inner() { return { f: () => 'via-getter' } } }",
+            "default.inner.f",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::String("via-getter".to_string()));
+    }
+
+    #[test]
+    fn call_throwing_getter_is_call_target_not_found() {
+        let err = run_call(
+            "export default { get inner() { throw new Error('no') } }",
+            "default.inner.f",
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CallTargetNotFound(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn call_cpu_guard_applies_to_the_called_function() {
+        // The guards must stay armed across the call — a handler that spins
+        // forever is stopped by the CPU budget, not the wall clock.
+        let call = call_spec("f", &[]);
+        let failure = run_module(
+            Some("export function f() { for (;;) {} }"),
+            "<iso4>",
+            None,
+            Limits {
+                cpu_time_ms: 100,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        )
+        .unwrap_err();
+        assert!(matches!(failure.error, RunError::CpuTimeout));
     }
 }

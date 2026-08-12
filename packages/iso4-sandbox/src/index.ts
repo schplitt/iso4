@@ -21,12 +21,20 @@ import {
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
 } from './ipc'
+import type { CallPayload } from './ipc'
 import type {
+  CallResult,
   HostGlobals,
   PrecompileOptions,
+  PrefixCallOptions,
   PrefixRunOptions,
   RebindGlobals,
+  RebindImports,
   Prefix,
+  ReadExportsOptions,
+  ReadExportsResult,
+  ResourceLimits,
+  RunCallOptions,
   RunOptions,
   RunResult,
   Sandbox,
@@ -43,7 +51,7 @@ import {
   processImports,
 } from './imports.js'
 import type { ImportHandlerMap } from './imports.js'
-import { materializeHostTypesInGlobals } from './v8-codec.js'
+import { materializeHostTypesInGlobals, serializeHostValue } from './v8-codec.js'
 
 export type {
   ResourceLimits,
@@ -62,12 +70,19 @@ export type {
   HostExportFunction,
   RebindImports,
   RebindHostModule,
+  CallResult,
+  CallSuccess,
+  CallTarget,
   CreateSandbox,
   Sandbox,
   SandboxOptions,
   PrecompileOptions,
   Prefix,
+  PrefixCallOptions,
   PrefixRunOptions,
+  ReadExportsOptions,
+  ReadExportsResult,
+  RunCallOptions,
   RunOptions,
   RunResult,
   RunSuccess,
@@ -191,7 +206,9 @@ class SandboxImpl implements Sandbox {
     return this._alive
   }
 
-  async run(options: RunOptions): Promise<RunResult> {
+  async run(options: RunCallOptions): Promise<CallResult>
+  async run(options: RunOptions): Promise<RunResult>
+  async run(options: RunOptions & Partial<RunCallOptions>): Promise<RunResult | CallResult> {
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
     }
@@ -203,6 +220,15 @@ class SandboxImpl implements Sandbox {
     // natively and dispatches function-leaf calls back here by
     // (specifier, path) through `handlers`.
     const { bindings, handlers } = processImports(options.imports)
+    // Call args cross as one blob holding the argument array — the same
+    // host-type-aware leg as bridge responses, so a real `Request` (whose
+    // body drain is async) works at any depth.
+    const call = options.call === undefined
+      ? undefined
+      : {
+          exportPath: options.call.export,
+          argsBlob: await serializeHostValue(options.call.args ?? []),
+        }
     try {
       return await this.pool.withClient(async (client) => {
         // Every global is installed natively by the runtime, so user code
@@ -215,8 +241,13 @@ class SandboxImpl implements Sandbox {
           imports: bindings,
           importDispatch: handlers,
           signal: options.signal,
+          call,
         })
-        const decoded = decodeRunCompletionPayload(raw.result).result
+        // `call` present ⇒ the value blob is the function's return value;
+        // absent ⇒ the exports object. Never both.
+        const decoded = call === undefined
+          ? decodeRunCompletionPayload(raw.result).result
+          : decodeRunCompletionPayload(raw.result, 'call').result
         // Graceful terminate (#36): a run whose signal aborted and whose Rust
         // Result carries ERR_ABORTED is a deliberate abort, not a failure —
         // remap to `status: 'aborted'` with the abort reason, keeping the real
@@ -230,6 +261,33 @@ class SandboxImpl implements Sandbox {
         return abortedResult(error.reason)
       throw error
     }
+  }
+
+  /**
+   * Load a module once and read its serializable exports — the deploy path.
+   * Function exports are skipped and reported; failures reject, like
+   * `prepare()`. See {@link Sandbox.readExports}.
+   * @param options
+   */
+  async readExports(options: ReadExportsOptions): Promise<ReadExportsResult> {
+    const result = await this.run({
+      code: options.code,
+      filename: options.filename,
+      limits: options.limits,
+    })
+    if (result.status !== 'completed') {
+      const err = new Error(result.error.message) as Error & {
+        code: string
+        name: string
+        stack?: string
+      }
+      err.name = result.error.name
+      err.code = result.error.code
+      if (result.error.stack)
+        err.stack = result.error.stack
+      throw err
+    }
+    return { exports: result.exports, skippedExports: result.skippedExports }
   }
 
   /**
@@ -371,6 +429,49 @@ implements Prefix<G, M> {
    * @deprecated Renamed to {@link PrefixImpl.execute}; kept as an alias.
    */
   async run(options: PrefixRunOptions<G, M>): Promise<RunResult> {
+    const result = await this.dispatch(options, { code: options.code })
+    return result as RunResult
+  }
+
+  /**
+   * Call a function exported by this prefix's module — no postfix compiled.
+   * See {@link Prefix.call}.
+   * @param options
+   */
+  async call(options: PrefixCallOptions<G, M>): Promise<CallResult> {
+    // Same host-type-aware args leg as SandboxImpl.run — a real `Request`
+    // (async body drain) works at any depth, as one blob holding the array.
+    const call = {
+      exportPath: options.export,
+      argsBlob: await serializeHostValue(options.args ?? []),
+    }
+    const result = await this.dispatch(options, { call })
+    return result as CallResult
+  }
+
+  /**
+   * Shared body of {@link run} and {@link call}: disposal/abort guards,
+   * bridge-global extraction, import-rebind merging, and the PrefixRun round
+   * trip. `payload` carries the postfix source or the call — exactly one, as
+   * the wire demands; it also selects how the result blob decodes.
+   * @param options
+   * @param options.globals
+   * @param options.imports
+   * @param options.limits
+   * @param options.signal
+   * @param options.filename
+   * @param payload
+   */
+  private async dispatch(
+    options: {
+      globals?: RebindGlobals<G>
+      imports?: RebindImports<M>
+      limits?: ResourceLimits
+      signal?: AbortSignal
+      filename?: string
+    },
+    payload: { code: string, call?: undefined } | { code?: undefined, call: CallPayload },
+  ): Promise<RunResult | CallResult> {
     if (!this._alive) {
       return {
         status: 'failed',
@@ -430,7 +531,7 @@ implements Prefix<G, M> {
       return await this.pool.withClient(async (client) => {
         const raw = await client.prefixRun({
           prefixId: this.id,
-          code: options.code,
+          code: payload.code,
           filename: options.filename,
           limits: options.limits,
           globals: defs,
@@ -438,8 +539,13 @@ implements Prefix<G, M> {
           importRebinds: merged.rebinds,
           importDispatch: merged.handlers,
           signal: options.signal,
+          call: payload.call,
         })
-        const decoded = decodeRunCompletionPayload(raw.result).result
+        // `call` present ⇒ the value blob is the function's return value;
+        // absent ⇒ the exports object. Never both.
+        const decoded = payload.call === undefined
+          ? decodeRunCompletionPayload(raw.result).result
+          : decodeRunCompletionPayload(raw.result, 'call').result
         // See the note in SandboxImpl.run — remap a graceful ERR_ABORTED Result
         // to `status: 'aborted'`, preserving the runtime's telemetry.
         if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')

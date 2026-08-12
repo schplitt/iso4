@@ -2,6 +2,7 @@ import { Buffer } from 'node:buffer'
 import { deserializeValue, serializeValue } from './v8-codec.js'
 import type {
   BridgeCallEntry,
+  CallResult,
   ResourceLimits,
   RunErrorCode,
   RunResult,
@@ -566,6 +567,19 @@ class PayloadWriter {
     return this
   }
 
+  writeOptionalCall(call: CallPayload | undefined): this {
+    // Optional<CallSpec>: presence byte, then `String exportPath` + a value
+    // slot holding the pre-serialized argument-array blob.
+    if (call === undefined) {
+      this.writeU8(0)
+    } else {
+      this.writeU8(1)
+      this.writeString(call.exportPath)
+      this.writeLengthPrefixedBytes(call.argsBlob)
+    }
+    return this
+  }
+
   writeResourceLimits(limits: ResourceLimits): this {
     // Each field is `Optional<u32>`: the client sends only the limits the
     // caller explicitly set. Absent fields are filled in by the runtime, which
@@ -746,6 +760,23 @@ export interface ImportRebindPayload {
   path: string
 }
 
+// ── CallPayload ─────────────────────────────────────────────────────────────
+
+/**
+ * A host → sandbox function call carried by a `Run`/`PrefixRun` payload (#58).
+ *
+ * `exportPath` addresses a callable relative to the module's exports
+ * (`"named"`, `"default.fetch"`), never `globalThis`. `argsBlob` is **one**
+ * pre-serialized V8 blob holding the argument array — the same convention as
+ * `BridgeCall` args (identity between arguments preserved). It is produced by
+ * `serializeHostValue` in `index.ts`, because draining a `Request` body is
+ * async and this encoder is not.
+ */
+export interface CallPayload {
+  exportPath: string
+  argsBlob: Uint8Array
+}
+
 // ── RunPayload ──────────────────────────────────────────────────────────────
 
 export interface RunPayloadOptions {
@@ -755,6 +786,11 @@ export interface RunPayloadOptions {
   limits?: ResourceLimits
   globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
+  /**
+   * When present, the run's result is the called function's return value
+   * instead of the exports, resolved against the freshly evaluated module.
+   */
+  call?: CallPayload
 }
 
 /**
@@ -769,6 +805,7 @@ export function encodeRunPayload(options: RunPayloadOptions): Buffer {
     .writeResourceLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImports(options.imports ?? [])
+    .writeOptionalCall(options.call)
     .toBuffer()
 }
 
@@ -801,7 +838,12 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buff
 
 export interface PrefixRunPayloadOptions {
   prefixId: string
-  code: string
+  /**
+   * Postfix module source. A `PrefixRun` frame carries a postfix *or* a call
+   * (#58) — exactly one; the encoder enforces this before any bytes are
+   * written, mirroring the Rust parser.
+   */
+  code?: string
   filename?: string
   limits?: ResourceLimits
   globals?: readonly GlobalDefPayload[]
@@ -810,6 +852,11 @@ export interface PrefixRunPayloadOptions {
    * frozen with the stored prefix on the Rust side; only rebind locations cross.
    */
   importRebinds?: readonly ImportRebindPayload[]
+  /**
+   * When present, the run calls into the prefix module's exports instead of
+   * evaluating a postfix; the result is the function's return value.
+   */
+  call?: CallPayload
 }
 
 /**
@@ -821,14 +868,20 @@ export interface PrefixRunPayloadOptions {
 export function encodePrefixRunPayload(
   options: PrefixRunPayloadOptions & { runId: number },
 ): Buffer {
+  if ((options.code === undefined) === (options.call === undefined)) {
+    throw new Error(
+      '[iso4] PrefixRun must carry exactly one of code or call',
+    )
+  }
   return new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.prefixId)
-    .writeString(options.code)
+    .writeOptionalString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImportRebinds(options.importRebinds ?? [])
+    .writeOptionalCall(options.call)
     .toBuffer()
 }
 
@@ -1014,14 +1067,30 @@ export interface DecodedRunCompletion {
 }
 
 /**
+ * `decodeRunCompletionPayload` result for a run that carried a call (#58):
+ * the value blob holds the called function's return value, not an exports
+ * object.
+ */
+export interface DecodedCallCompletion {
+  runId: number
+  result: CallResult
+}
+
+/**
  * Decode a `RunCompletionPayload` from a `Result` frame payload.
+ *
+ * The value blob is one slot either way: pass `resultKind: 'call'` when the
+ * run carried a call, so the blob decodes as the return `value` instead of
+ * the exports object — the wire does not tag it; the host knows what it
+ * asked for.
  *
  * Wire layout per `docs/protocol.md` §5.6:
  * ```
  * u32   runId
  * u8    ok
  * u8    successPresent   (1 when ok = 1)
- *   ValueBlob  exports
+ *   ValueBlob  exports (or the call's return value)
+ *   List<String>  skippedExports
  *   List<String>  stdout
  *   List<String>  stderr
  *   f64  durationMs
@@ -1040,10 +1109,14 @@ export interface DecodedRunCompletion {
  *   List<BridgeCallRecord>  bridgeCalls
  * ```
  * @param buf
+ * @param resultKind
  */
+export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletion
+export function decodeRunCompletionPayload(buf: Uint8Array, resultKind: 'call'): DecodedCallCompletion
 export function decodeRunCompletionPayload(
   buf: Uint8Array,
-): DecodedRunCompletion {
+  resultKind?: 'call',
+): DecodedRunCompletion | DecodedCallCompletion {
   const reader = new PayloadReader(buf)
   const runId = reader.readU32()
   const ok = reader.readBool()
@@ -1055,7 +1128,8 @@ export function decodeRunCompletionPayload(
         'expected success present byte = 1 when ok = true',
       )
     }
-    const exportsRaw = reader.readValueBlob()
+    const valueRaw = reader.readValueBlob()
+    const skippedExports = reader.readStringList()
     const stdout = reader.readStringList()
     const stderr = reader.readStringList()
     const durationMs = reader.readF64()
@@ -1064,12 +1138,28 @@ export function decodeRunCompletionPayload(
     reader.readU8() // failurePresent = 0; consumed for forward-compat
 
     reader.assertDone()
+    if (resultKind === 'call') {
+      return {
+        runId,
+        result: {
+          status: 'completed',
+          ok: true,
+          value: valueRaw,
+          stdout,
+          stderr,
+          durationMs,
+          cpuTimeMs,
+          bridgeCalls,
+        },
+      }
+    }
     return {
       runId,
       result: {
         status: 'completed',
         ok: true,
-        exports: exportsBlobToExports(exportsRaw),
+        exports: exportsBlobToExports(valueRaw),
+        skippedExports,
         stdout,
         stderr,
         durationMs,

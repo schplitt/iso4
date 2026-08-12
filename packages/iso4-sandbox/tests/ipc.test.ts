@@ -256,8 +256,8 @@ describe('payload encoders', () => {
   test('encodePrecompilePayload has no runId prefix', () => {
     const runBuf = encodeRunPayload({ runId: 0, code: 'x' })
     const preBuf = encodePrecompilePayload({ code: 'x' })
-    // PrecompilePayload is 4 bytes shorter (no runId)
-    expect(preBuf.byteLength).toBe(runBuf.byteLength - 4)
+    // PrecompilePayload is 5 bytes shorter (no runId, no optional-call byte)
+    expect(preBuf.byteLength).toBe(runBuf.byteLength - 5)
     const { value: code } = readString(preBuf, 0)
     expect(code).toBe('x')
   })
@@ -267,8 +267,58 @@ describe('payload encoders', () => {
     expect(readU32BE(buf, 0)).toBe(3) // runId
     const { value: prefixId, end } = readString(buf, 4)
     expect(prefixId).toBe('42')
-    const { value: code } = readString(buf, end)
+    expect(buf[end]).toBe(1) // code: present (Optional<String> since #58)
+    const { value: code } = readString(buf, end + 1)
     expect(code).toBe('y')
+    expect(buf[buf.byteLength - 1]).toBe(0) // call: absent
+  })
+
+  test('encodeRunPayload without a call ends with an absent-call byte', () => {
+    const buf = encodeRunPayload({ runId: 1, code: 'x' })
+    expect(buf[buf.byteLength - 1]).toBe(0)
+  })
+
+  test('encodeRunPayload lays out the call as exportPath + args value slot', () => {
+    const argsBlob = serializeValue([1, 'a'])
+    const buf = encodeRunPayload({
+      runId: 1,
+      code: 'x',
+      call: { exportPath: 'default.fetch', argsBlob },
+    })
+    // Skip runId(4) + code(4+1) + filename absent(1) + limits(8) +
+    // globals count(4) + imports count(4)
+    let off = 4 + 4 + 1 + 1 + 8 + 4 + 4
+    expect(buf[off]).toBe(1) // call: present
+    off += 1
+    const { value: path, end } = readString(buf, off)
+    expect(path).toBe('default.fetch')
+    const argsLength = readU32BE(buf, end)
+    expect(deserializeValue(buf.subarray(end + 4, end + 4 + argsLength))).toEqual([1, 'a'])
+    expect(end + 4 + argsLength).toBe(buf.byteLength)
+  })
+
+  test('encodePrefixRunPayload with a call carries no code', () => {
+    const argsBlob = serializeValue([])
+    const buf = encodePrefixRunPayload({
+      runId: 2,
+      prefixId: 'p',
+      call: { exportPath: 'handler', argsBlob },
+    })
+    const { end } = readString(buf, 4) // prefixId
+    expect(buf[end]).toBe(0) // code: absent
+  })
+
+  test('encodePrefixRunPayload rejects code and call together, and neither', () => {
+    const argsBlob = serializeValue([])
+    expect(() => encodePrefixRunPayload({
+      runId: 1,
+      prefixId: 'p',
+      code: 'x',
+      call: { exportPath: 'f', argsBlob },
+    })).toThrow(/exactly one of code or call/)
+    expect(() => encodePrefixRunPayload({ runId: 1, prefixId: 'p' })).toThrow(
+      /exactly one of code or call/,
+    )
   })
 
   test('encodeDisposePrefixPayload encodes just the prefixId string', () => {
@@ -301,7 +351,8 @@ describe('payload encoders', () => {
     expect(buf[e1]).toBe(0) // kind: source
     const { value: source, end: e2 } = readString(buf, e1 + 1)
     expect(source).toBe('export const add = (a, b) => a + b')
-    expect(e2).toBe(buf.byteLength)
+    expect(buf[e2]).toBe(0) // call: absent
+    expect(e2 + 1).toBe(buf.byteLength)
   })
 
   test('encodeRunPayload lays out a host-module tree as tagged nodes', () => {
@@ -347,7 +398,8 @@ describe('payload encoders', () => {
     const { value: c1, end: e5 } = readString(buf, e4 + 5)
     expect(c1).toBe('inner')
     expect(buf[e5]).toBe(0) // node tag: function
-    expect(e5 + 1).toBe(buf.byteLength)
+    expect(buf[e5 + 1]).toBe(0) // call: absent
+    expect(e5 + 2).toBe(buf.byteLength)
   })
 
   test('encodeRunPayload with multiple imports preserves order', () => {
@@ -372,7 +424,8 @@ describe('payload encoders', () => {
     expect(buf[e3]).toBe(0) // kind: source
     const { value: src2, end: e4 } = readString(buf, e3 + 1)
     expect(src2).toBe('export const b = 2')
-    expect(e4).toBe(buf.byteLength)
+    expect(buf[e4]).toBe(0) // call: absent
+    expect(e4 + 1).toBe(buf.byteLength)
   })
 
   test('encodePrecompilePayload carries import declarations; encodePrefixRunPayload carries rebind locations', () => {

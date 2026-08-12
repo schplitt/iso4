@@ -21,7 +21,7 @@ import {
   encodeTsToRustFrame,
 } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
-import type { GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
+import type { CallPayload, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
@@ -264,6 +264,7 @@ export class RuntimeIpcClient {
       imports?: readonly ImportBindingPayload[]
       importDispatch?: ImportHandlerMap
       signal?: AbortSignal
+      call?: CallPayload
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -280,6 +281,7 @@ export class RuntimeIpcClient {
           limits: options?.limits,
           globals: options?.globals,
           imports: options?.imports,
+          call: options?.call,
         }),
       ),
     )
@@ -330,7 +332,11 @@ export class RuntimeIpcClient {
   async prefixRun(
     options: {
       prefixId: string
-      code: string
+      /**
+       * Postfix source, or absent for a call-only run — exactly one of
+       * `code` / `call` must be present.
+       */
+      code?: string
       filename?: string
       limits?: ResourceLimits
       globals?: readonly GlobalDefPayload[]
@@ -338,6 +344,7 @@ export class RuntimeIpcClient {
       importRebinds?: readonly ImportRebindPayload[]
       importDispatch?: ImportHandlerMap
       signal?: AbortSignal
+      call?: CallPayload
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -354,6 +361,7 @@ export class RuntimeIpcClient {
           limits: options.limits,
           globals: options.globals,
           importRebinds: options.importRebinds,
+          call: options.call,
           runId,
         }),
       ),

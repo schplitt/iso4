@@ -603,17 +603,32 @@ represent crosses as a **real instance**:
 - Arrays (including sparse ones) and plain objects
 - Cyclic and shared references — object identity survives the round trip
 
-Behavior does not cross. These are rejected loudly with
-`ERR_EXPORT_NOT_SERIALIZABLE` (sandbox → host) or a `TypeError` in the host
-encoder / `ERR_HOST_BRIDGE` (host → sandbox):
+Behavior does not cross. These cannot be carried:
 
 - Functions and classes
 - Promises (must be `await`ed before exporting)
 - Symbols
 - `WeakMap` / `WeakSet` / `Proxy`
 
-The same contract applies in both directions — bridge call arguments, bridge
-return values, host-module data leaves, and exports.
+How a refusal surfaces depends on the position (#58):
+
+- **Exports are skipped, never fatal.** An export whose value cannot cross —
+  directly (`export default () => {}`) or nested
+  (`export default { fetch }`) — is simply **absent** from `exports`, with
+  its name reported in `skippedExports` so nothing is silently hidden. The
+  whole offending export is dropped (whole-export skip, no partial pruning);
+  sibling exports keep crossing. This is what makes
+  `export default { fetch }` a first-class module shape: a plain `run()` on
+  it reads the module's declaration exports instead of failing.
+- **Everything else stays loud**: a call's return value (§5.3) and bridge
+  values report `ERR_EXPORT_NOT_SERIALIZABLE` (sandbox → host) or a
+  `TypeError` in the host encoder / `ERR_HOST_BRIDGE` (host → sandbox),
+  since there the value *is* the result and skipping would mean silently
+  returning nothing.
+
+The same value contract applies in both directions — bridge call arguments,
+bridge return values, host-module data leaves, call arguments/results, and
+exports.
 
 Two behaviours worth knowing:
 
@@ -708,6 +723,77 @@ to `AbortController.abort(reason)`:
 The result is _always_ an object; `status` (or the `ok` alias) discriminates.
 `run()` does not throw for sandboxed failures — only for infrastructure failures
 (e.g., the Rust process crashed).
+
+### 5.3 Host → sandbox calls (#58)
+
+Bridge calls run sandbox → host. The call API is the other direction: invoke a
+function that already lives inside the sandbox, with real typed arguments, and
+get its return value back — what `export default { fetch(request) }` needs to
+be a first-class shape.
+
+```ts
+// direct run — the module just evaluated, so its namespace is right there
+await sandbox.run({
+  code: `export default { async fetch(request) { return new Response('hi') } }`,
+  call: { export: 'default.fetch', args: [request] },
+})
+
+// prepared prefix — the common case, nothing compiled per request
+const prefix = await sandbox.prepare({ code: bundle })
+await prefix.call({ export: 'default.fetch', args: [request] })
+
+// rebinding globals per call — orthogonal, comes free
+await prefix.call({ export: 'default.fetch', args: [request],
+                    globals: { fetch: perRequestFetch } })
+```
+
+The decided semantics (issue #58):
+
+- **Addressing is always relative to the module's exports**, never
+  `globalThis`: a top-level exported function (`"handler"`) or a method on an
+  exported object (`"default.fetch"`). For `run({ code, call })` the path
+  resolves against the freshly evaluated module; for `prefix.call()` against
+  the prefix module — live per run since prefixes re-evaluate (§11.6), so
+  module-scope closure state is reachable.
+- **`call` present ⇒ the result carries `value`** (the function's return
+  value, awaited first when it is a Promise); **absent ⇒ `exports`. Never
+  both.** Logs, `durationMs`, `cpuTimeMs`, and `bridgeCalls` are unchanged in
+  either case; the wire's completion payload carries exactly one value blob
+  either way.
+- **The receiver is the object the final path segment was read from** —
+  plain `a.b.c()` semantics (the namespace itself for a single segment), so
+  handlers reading `this` work. A `globalThis` receiver would fail *silently*
+  (`this.tag` → `undefined` in a 200 response); only the correct receiver or
+  a loud error are acceptable, the same conclusion workerd reached
+  (`ExportedHandler::self`). Path reads follow the prototype chain, so
+  `export default new Worker()` resolves prototype methods. `export default
+  class` does **not** work (its methods live on the prototype of *instances*)
+  and fails cleanly with `ERR_CALL_TARGET_NOT_FOUND` — the code covering both
+  "does not resolve" and "not callable".
+- **Arguments cross as one V8 blob holding the array** (identity between
+  arguments preserved — the `BridgeCall` convention), through the
+  host-type-aware leg, so a real `Request` crosses in and a real `Response`
+  crosses back. Args are host-authored (the trusted direction): no dedicated
+  size limit, the frame read is capped by `memoryMb` exactly like bridge
+  responses. The return value respects `maxExportBytes`.
+- **A sync return value skips the poll loop entirely**; an async handler
+  re-enters the same settle machinery as the module evaluation promise, so
+  mid-request bridge calls work for free and poll rounds track bridge round
+  trips, not `await`s. Path resolution and the call run inside the CPU
+  budget, under the run's wall/CPU guards.
+- A throw inside the handler is `ERR_USER_CODE`, exactly like postfix code.
+
+This is a **capability, not a perf win** (recorded so it is not re-argued):
+against the pull-over-the-bridge baseline a call frame saves ~2 % of a
+request at every handler size measured. The warm-isolate roadmap (§13.2.1,
+#64–#67) later makes the same API fast without changing its shape.
+
+`sandbox.readExports({ code })` rounds out the deploy path: load a module
+once and read its declaration exports (IaC-style limits/connections), with
+handler exports skipped and reported. It is API surface, not protocol —
+internally it is a plain run, which the export-skip rule (§5.1) already turns
+into a declaration reader; a warm-isolate implementation can slot in behind
+the same signature later.
 
 ---
 

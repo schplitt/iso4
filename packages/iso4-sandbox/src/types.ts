@@ -462,9 +462,32 @@ export interface SandboxOptions {
 export interface Sandbox {
   /**
    * Execute a piece of JavaScript in a fresh V8 isolate.
-   * For repeated use with a shared context, prefer precompile() + prefix.run().
+   * For repeated use with a shared context, prefer prepare() + prefix.execute().
+   *
+   * With `call`, the freshly evaluated module's export at `call.export` is
+   * invoked and the result carries its return `value` instead of `exports`:
+   *
+   * ```ts
+   * await sandbox.run({
+   *   code: `export default { async fetch(request) { return new Response('hi') } }`,
+   *   call: { export: 'default.fetch', args: [request] },
+   * })
+   * ```
    */
-  run: (options: RunOptions) => Promise<RunResult>
+  run: {
+    (options: RunCallOptions): Promise<CallResult>
+    (options: RunOptions): Promise<RunResult>
+  }
+
+  /**
+   * Load a module once and read its serializable exports — the
+   * deploy/registration path (IaC-style declaration exports read when a
+   * function is created, never per request). Builds no prefix and retains
+   * nothing. Function exports are skipped and reported, so a module that
+   * also exports handlers reads cleanly. Rejects on compile/runtime errors,
+   * like `prepare()`.
+   */
+  readExports: (options: ReadExportsOptions) => Promise<ReadExportsResult>
 
   /**
    * Validate and prepare a prefix of code for repeated runs.
@@ -624,6 +647,22 @@ export interface Prefix<
   run: (options: PrefixRunOptions<G, M>) => Promise<RunResult>
 
   /**
+   * Call a function exported by this prefix's module — nothing is compiled
+   * per request. The prefix is evaluated into a fresh isolate, `export` is
+   * resolved against its exports, and the result carries the function's
+   * return value:
+   *
+   * ```ts
+   * const prefix = await sandbox.prepare({ code: bundle })
+   * const result = await prefix.call({ export: 'default.fetch', args: [request] })
+   * ```
+   *
+   * `globals` / `imports` rebind per call exactly as they do for
+   * {@link Prefix.execute}.
+   */
+  call: (options: PrefixCallOptions<G, M>) => Promise<CallResult>
+
+  /**
    * Release the prepared prefix. Subsequent run() calls reject. Idempotent.
    */
   dispose: () => Promise<void>
@@ -676,6 +715,60 @@ export interface PrefixRunOptions<
   filename?: string
 }
 
+/**
+ * Options for `prefix.call()` — a {@link CallTarget} plus the same per-call
+ * rebinding surface as {@link PrefixRunOptions}, minus `code`: a call frame
+ * carries a postfix *or* a call, never both.
+ */
+export interface PrefixCallOptions<
+  G extends HostGlobals,
+  M extends Imports,
+> extends CallTarget {
+  /**
+   * Override implementations for a subset of globals declared at
+   * prepare() time — same rules as {@link PrefixRunOptions.globals}.
+   */
+  globals?: RebindGlobals<G>
+  /**
+   * Rebind host-module function exports declared at prepare() time — same
+   * rules as {@link PrefixRunOptions.imports}.
+   */
+  imports?: RebindImports<M>
+  limits?: ResourceLimits
+  signal?: AbortSignal
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Host → sandbox calls (#58)
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Addresses a function that lives inside the sandbox, **relative to the
+ * module's exports** — never `globalThis`. Either a top-level exported
+ * function (`"handler"`) or a method on an exported object
+ * (`"default.fetch"`).
+ *
+ * The receiver (`this`) is the object the final path segment was read from —
+ * plain `a.b.c()` semantics — so `export default { fetch() { this.… } }` and
+ * `export default new Worker()` (prototype methods included) both work.
+ * A path that does not resolve, or resolves to something that is not
+ * callable, fails the run with `ERR_CALL_TARGET_NOT_FOUND`.
+ */
+export interface CallTarget {
+  /**
+   * Dot-separated export path, e.g. `"default.fetch"` or `"handler"`.
+   */
+  export: string
+  /**
+   * Arguments for the call. They cross the boundary as **one** V8
+   * serialization blob holding the array (identity between arguments
+   * preserved), so anything in {@link HostExportData} is accepted — plus
+   * `Request` / `Response` / `Headers` at any depth, which arrive in the
+   * sandbox as real instances. Defaults to `[]`.
+   */
+  args?: unknown[]
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Direct run (no prefix)
 // ─────────────────────────────────────────────────────────────────────────
@@ -687,6 +780,43 @@ export interface RunOptions {
   imports?: Imports
   signal?: AbortSignal
   filename?: string
+}
+
+/**
+ * `run()` options with a call: the module is evaluated, then
+ * `call.export` is resolved against its freshly evaluated exports and
+ * invoked. The result carries the function's return {@link CallSuccess.value}
+ * instead of `exports` — never both.
+ */
+export interface RunCallOptions extends RunOptions {
+  call: CallTarget
+}
+
+/**
+ * Options for `sandbox.readExports()` — the deploy/registration path: load a
+ * module once and read its declaration exports (IaC-style limits, connection
+ * requirements, …). Function-valued exports are absent and reported in
+ * {@link ReadExportsResult.skippedExports}, so reading the declarations of a
+ * module that also exports handlers is not an error.
+ */
+export interface ReadExportsOptions {
+  code: string
+  limits?: ResourceLimits
+  filename?: string
+}
+
+/**
+ * What `sandbox.readExports()` resolves to. Unlike `run()`, failures reject
+ * the returned promise (like `prepare()`), since the deploy path treats a
+ * broken module as exceptional rather than as a result variant.
+ */
+export interface ReadExportsResult {
+  exports: SandboxExports
+  /**
+   * Export names absent from `exports` because their value cannot cross the
+   * boundary — see {@link RunSuccess.skippedExports}.
+   */
+  skippedExports: string[]
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -702,6 +832,33 @@ export interface RunOptions {
 export type AbortReason = unknown
 
 export type RunResult = RunSuccess | RunFailure | RunAborted
+
+/**
+ * Result of a run that carried a {@link CallTarget}: on success the called
+ * function's return value replaces `exports` — never both. Failures and
+ * aborts are shared with {@link RunResult}.
+ */
+export type CallResult = CallSuccess | RunFailure | RunAborted
+
+/**
+ * The success arm of a {@link CallResult}. Logs, timings, and bridge records
+ * are identical to {@link RunSuccess}; only the value slot differs.
+ */
+export interface CallSuccess {
+  status: 'completed'
+  ok: true
+  /**
+   * The called function's return value — awaited first when the function
+   * returned a Promise. Anything V8's serialization format carries arrives
+   * as a real instance, including a `Response`.
+   */
+  value: unknown
+  stdout: string[]
+  stderr: string[]
+  durationMs: number
+  cpuTimeMs: number
+  bridgeCalls: BridgeCallEntry[]
+}
 
 /**
  * Metadata for a single bridge call attempt, recorded by the Rust runtime on
@@ -764,6 +921,13 @@ export interface RunSuccess {
   status: 'completed'
   ok: true
   exports: SandboxExports
+  /**
+   * Export names absent from `exports` because their value cannot cross the
+   * boundary — a function (`export default { fetch }`), an unresolved
+   * Promise, or a value whose serialization failed. Skipping is never fatal
+   * (#58); the names are reported here so nothing is silently hidden.
+   */
+  skippedExports: string[]
   stdout: string[]
   stderr: string[]
   /**
@@ -873,6 +1037,12 @@ export type RunErrorCode
     | 'ERR_TYPE_NOT_SERIALIZABLE'
     | 'ERR_EXPORT_TOO_LARGE'
     | 'ERR_EXPORT_UNRESOLVED_PROMISE'
+    /**
+     * A `call.export` path did not resolve against the module's exports, or
+     * resolved to a value that is not callable. The message says which and
+     * names the path.
+     */
+    | 'ERR_CALL_TARGET_NOT_FOUND'
     | 'ERR_HOST_BRIDGE'
     | 'ERR_BRIDGE_PAYLOAD_TOO_LARGE'
     | 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED'

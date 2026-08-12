@@ -16,6 +16,20 @@ export interface BridgeWithShim<H extends (...args: unknown[]) => unknown = (...
   handler: H;
   shim: string;
 }
+export interface CallSuccess {
+  status: "completed";
+  ok: true;
+  value: unknown;
+  stdout: string[];
+  stderr: string[];
+  durationMs: number;
+  cpuTimeMs: number;
+  bridgeCalls: BridgeCallEntry[];
+}
+export interface CallTarget {
+  export: string;
+  args?: unknown[];
+}
 export interface DataGlobal {
   kind: "data";
   value: HostExportData | Request | Response | Headers;
@@ -34,9 +48,16 @@ export interface Prefix<G extends HostGlobals = {}, M extends Imports = {}> {
   readonly id: string;
   execute: (_: PrefixRunOptions<G, M>) => Promise<RunResult>;
   run: (_: PrefixRunOptions<G, M>) => Promise<RunResult>;
+  call: (_: PrefixCallOptions<G, M>) => Promise<CallResult>;
   dispose: () => Promise<void>;
   [Symbol.asyncDispose]: () => Promise<void>;
   readonly alive: boolean;
+}
+export interface PrefixCallOptions<G extends HostGlobals, M extends Imports> extends CallTarget {
+  globals?: RebindGlobals<G>;
+  imports?: RebindImports<M>;
+  limits?: ResourceLimits;
+  signal?: AbortSignal;
 }
 export interface PrefixRunOptions<G extends HostGlobals, M extends Imports> {
   code: string;
@@ -45,6 +66,15 @@ export interface PrefixRunOptions<G extends HostGlobals, M extends Imports> {
   limits?: ResourceLimits;
   signal?: AbortSignal;
   filename?: string;
+}
+export interface ReadExportsOptions {
+  code: string;
+  limits?: ResourceLimits;
+  filename?: string;
+}
+export interface ReadExportsResult {
+  exports: SandboxExports;
+  skippedExports: string[];
 }
 export interface ResourceLimits {
   memoryMb?: number;
@@ -55,6 +85,9 @@ export interface ResourceLimits {
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
   maxBridgeCalls?: number;
+}
+export interface RunCallOptions extends RunOptions {
+  call: CallTarget;
 }
 export interface RunError {
   code: RunErrorCode;
@@ -85,6 +118,7 @@ export interface RunSuccess {
   status: "completed";
   ok: true;
   exports: SandboxExports;
+  skippedExports: string[];
   stdout: string[];
   stderr: string[];
   durationMs: number;
@@ -92,7 +126,11 @@ export interface RunSuccess {
   bridgeCalls: BridgeCallEntry[];
 }
 export interface Sandbox {
-  run: (_: RunOptions) => Promise<RunResult>;
+  run: {
+    (_: RunCallOptions): Promise<CallResult>;
+    (_: RunOptions): Promise<RunResult>;
+  };
+  readExports: (_: ReadExportsOptions) => Promise<ReadExportsResult>;
   prepare: <G extends HostGlobals = {}, M extends Imports = {}>(_: PrecompileOptions<G, M>) => Promise<Prefix<G, M>>;
   precompile: <G extends HostGlobals = {}, M extends Imports = {}>(_: PrecompileOptions<G, M>) => Promise<Prefix<G, M>>;
   dispose: () => Promise<void>;
@@ -106,6 +144,7 @@ export interface SandboxOptions {
 // #endregion
 
 // #region Types
+export type CallResult = CallSuccess | RunFailure | RunAborted;
 export type CreateSandbox = (_?: SandboxOptions) => Promise<Sandbox>;
 export type HostExportData = null | undefined | boolean | number | bigint | string | Date | RegExp | Error | Map<HostExportData, HostExportData> | Set<HostExportData> | ArrayBuffer | DataView | Int8Array | Uint8Array | Uint8ClampedArray | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array | BigInt64Array | BigUint64Array | HostExportData[] | {
   [key: string]: HostExportData;
@@ -120,7 +159,7 @@ export type RebindGlobals<G extends HostGlobals> = { [K in keyof G as G[K] exten
 export type RebindHostModule<T> = T extends HostExportFunction ? T : T extends HostModuleObject ? { [K in keyof T as T[K] extends HostExportFunction ? K : T[K] extends HostModuleObject ? K : never]?: T[K] extends HostExportFunction ? T[K] : T[K] extends HostModuleObject ? RebindHostModule<T[K]> : never } : never;
 export type RebindImports<M extends Record<string, ImportValue>> = Record<string, ImportValue> extends M ? Record<string, never> : { [K in keyof M as M[K] extends string ? never : K]?: M[K] extends HostModuleObject ? RebindHostModule<M[K]> : never };
 export type RebindValue<V extends HostGlobalValue> = V extends BridgeWithShim<infer H> ? H : V extends HostExportFunction ? V : never;
-export type RunErrorCode = "ERR_USER_CODE" | "ERR_MEMORY_LIMIT" | "ERR_CPU_TIMEOUT" | "ERR_WALL_TIMEOUT" | "ERR_ABORTED" | "ERR_MODULE_NOT_FOUND" | "ERR_COMPILE" | "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED" | "ERR_EXPORT_NOT_SERIALIZABLE" | "ERR_TYPE_NOT_SERIALIZABLE" | "ERR_EXPORT_TOO_LARGE" | "ERR_EXPORT_UNRESOLVED_PROMISE" | "ERR_HOST_BRIDGE" | "ERR_BRIDGE_PAYLOAD_TOO_LARGE" | "ERR_BRIDGE_CALL_LIMIT_EXCEEDED" | "ERR_UNDECLARED_BINDING" | "ERR_PREFIX_DID_NOT_SETTLE" | "ERR_PREFIX_BRIDGE_CALL" | "ERR_PREFIX_DISPOSED" | "ERR_INTERNAL";
+export type RunErrorCode = "ERR_USER_CODE" | "ERR_MEMORY_LIMIT" | "ERR_CPU_TIMEOUT" | "ERR_WALL_TIMEOUT" | "ERR_ABORTED" | "ERR_MODULE_NOT_FOUND" | "ERR_COMPILE" | "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED" | "ERR_EXPORT_NOT_SERIALIZABLE" | "ERR_TYPE_NOT_SERIALIZABLE" | "ERR_EXPORT_TOO_LARGE" | "ERR_EXPORT_UNRESOLVED_PROMISE" | "ERR_CALL_TARGET_NOT_FOUND" | "ERR_HOST_BRIDGE" | "ERR_BRIDGE_PAYLOAD_TOO_LARGE" | "ERR_BRIDGE_CALL_LIMIT_EXCEEDED" | "ERR_UNDECLARED_BINDING" | "ERR_PREFIX_DID_NOT_SETTLE" | "ERR_PREFIX_BRIDGE_CALL" | "ERR_PREFIX_DISPOSED" | "ERR_INTERNAL";
 export type RunResult = RunSuccess | RunFailure | RunAborted;
 export type SandboxExports = {
   default: unknown;

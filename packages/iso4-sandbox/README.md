@@ -132,12 +132,48 @@ V8's continuation-preserved embedder data; no promise hooks, so it's free
 unless used. Not available in `prepare()` (prefix) code — it's for the
 postfix. See DESIGN.md §16.
 
+## Calling into the sandbox
+
+Invoke a function the module exports — `export default { fetch }` or any
+named export — with real typed arguments. On a prepared prefix nothing is
+compiled per request:
+
+```ts
+const prefix = await sandbox.prepare({ code: workerBundle })
+
+const result = await prefix.call({
+  export: 'default.fetch',
+  args: [new Request('https://example.com/', { method: 'POST', body: 'hi' })],
+})
+if (result.ok) {
+  const response = result.value as Response // a real Response instance
+}
+```
+
+`sandbox.run({ code, call })` does the same against a freshly evaluated
+module. With `call` the success result carries the function's return `value`
+instead of `exports` — never both. The receiver is the exported object
+(`this` works); prototype methods resolve (`export default new Worker()`),
+and a path that does not reach a callable fails with
+`ERR_CALL_TARGET_NOT_FOUND`. `prefix.call()` accepts the same per-call
+`globals` / `imports` rebinds as `prefix.execute()`.
+
+Non-serializable **exports** no longer fail a plain run: they are absent from
+`exports` and reported in `skippedExports`, so a module that exports handlers
+still reads cleanly. `sandbox.readExports({ code })` wraps that for the
+deploy path — load once, read the declaration exports, and get the skipped
+handler names back.
+
 ## Result shape
 
 ```ts
 type RunResult
-  = | { ok: true, exports: SandboxExports, stdout: string[], stderr: string[], durationMs: number, cpuTimeMs: number, bridgeCalls: BridgeCallEntry[] }
+  = | { ok: true, exports: SandboxExports, skippedExports: string[], stdout: string[], stderr: string[], durationMs: number, cpuTimeMs: number, bridgeCalls: BridgeCallEntry[] }
     | { ok: false, error: RunError, stdout: string[], stderr: string[], durationMs: number, cpuTimeMs: number, bridgeCalls: BridgeCallEntry[] }
+
+// prefix.call() / run({ code, call }) resolve to a CallResult instead:
+// the success arm carries `value` (the function's return value) in place of
+// `exports` + `skippedExports`; failure/aborted arms are shared.
 
 // durationMs — wall-clock time of the run; cpuTimeMs — active V8 execution
 // time (bridge waits excluded). Both measured in the runtime, µs resolution.

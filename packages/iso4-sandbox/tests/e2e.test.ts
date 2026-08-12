@@ -957,14 +957,16 @@ describe('error handling', () => {
     expect(result.error.stack).toContain('inner')
   })
 
-  test('exporting a function → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  test('exporting a function is skipped and reported, not fatal (#58)', async () => {
     const result = await runtime.run({
-      code: 'export default function() {}',
+      code: 'export default function() {}\nexport const kept = 1',
     })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    expect(result.skippedExports).toEqual(['default'])
+    expect('default' in result.exports).toBe(false)
+    expect(result.exports['kept']).toBe(1)
   })
 
   test('error in one run does not affect the next run', async () => {
@@ -1521,20 +1523,27 @@ describe('value boundary contract', () => {
       c.assertHost(received[i])
   })
 
-  test('exporting a function still fails loudly', async () => {
+  test('exporting a function is absent from the exports, reported in skippedExports', async () => {
     const result = await runtime.run({ code: 'export default () => 1' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    expect(result.skippedExports).toEqual(['default'])
+    expect(result.exports).toEqual({})
   })
 
-  test('a function nested inside a plain object still fails loudly', async () => {
-    const result = await runtime.run({ code: 'export default { fn: () => 1 }' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+  test('a function nested inside a plain object skips that export only', async () => {
+    // The whole offending export is dropped (whole-export skip); sibling
+    // exports keep crossing. This is what makes `export default { fetch }` a
+    // readable module shape (#58).
+    const result = await runtime.run({
+      code: 'export default { fn: () => 1 }\nexport const limits = { memoryMb: 64 }',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    expect(result.skippedExports).toEqual(['default'])
+    expect(result.exports['limits']).toEqual({ memoryMb: 64 })
   })
 
   test('host handler returning a function → ERR_HOST_BRIDGE', async () => {
@@ -3575,5 +3584,246 @@ describe('bridge report', () => {
     expect(result.bridgeCalls[0].name).toBe('tool')
     expect(result.cpuTimeMs).toBeGreaterThan(0)
     await prefix.dispose()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host → sandbox calls (#58): run({ code, call }) and prefix.call()
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('host → sandbox calls', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('run({ code, call }) resolves a named export and returns its value', async () => {
+    const result = await runtime.run({
+      code: 'export function add(a, b) { return a + b }',
+      call: { export: 'add', args: [2, 40] },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.value).toBe(42)
+    expect('exports' in result).toBe(false)
+  })
+
+  test('default.fetch receives args and the exported object as `this`', async () => {
+    const result = await runtime.run({
+      code: `export default { tag: 'worker-a', fetch(method) { return this.tag + ':' + method } }`,
+      call: { export: 'default.fetch', args: ['POST'] },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.value).toBe('worker-a:POST')
+  })
+
+  test('args default to an empty list', async () => {
+    const result = await runtime.run({
+      code: 'export function count(...args) { return args.length }',
+      call: { export: 'count' },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.value).toBe(0)
+  })
+
+  test('async handlers settle; sync handlers work too', async () => {
+    const asyncResult = await runtime.run({
+      code: 'export async function f() { return (await 1) + (await 2) }',
+      call: { export: 'f' },
+    })
+    expect(asyncResult.ok && asyncResult.value === 3).toBe(true)
+    const syncResult = await runtime.run({
+      code: 'export function f() { return "sync" }',
+      call: { export: 'f' },
+    })
+    expect(syncResult.ok && syncResult.value === 'sync').toBe(true)
+  })
+
+  test('a real Request crosses in and a real Response crosses back', async () => {
+    const prefix = await runtime.prepare({
+      code: `export default {
+        async fetch(request) {
+          const body = await request.text()
+          return new Response('echo:' + request.method + ':' + body, { status: 201 })
+        },
+      }`,
+    })
+    const result = await prefix.call({
+      export: 'default.fetch',
+      args: [new Request('https://example.com/in', { method: 'POST', body: 'hi' })],
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const response = result.value as Response
+    expect(response).toBeInstanceOf(Response)
+    expect(response.status).toBe(201)
+    expect(await response.text()).toBe('echo:POST:hi')
+    await prefix.dispose()
+  })
+
+  test('prefix.call() reaches module-scope closure state', async () => {
+    const prefix = await runtime.prepare({
+      code: `let calls = 0
+             export function bump() { calls += 1; return calls }`,
+    })
+    // Each call gets a fresh isolate (one-shot model), so the closure state
+    // is per-call — the point is that module scope is reachable at all.
+    const result = await prefix.call({ export: 'bump' })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.value).toBe(1)
+    await prefix.dispose()
+  })
+
+  test('prefix.call() rebinds declared bridge globals per call', async () => {
+    const prefix = await runtime.prepare({
+      code: 'export async function handler() { return await db() }',
+      globals: { db: async () => 'default-db' },
+    })
+    const withDefault = await prefix.call({ export: 'handler' })
+    expect(withDefault.ok && withDefault.value === 'default-db').toBe(true)
+    const rebound = await prefix.call({
+      export: 'handler',
+      globals: { db: async () => 'tenant-db' },
+    })
+    expect(rebound.ok && rebound.value === 'tenant-db').toBe(true)
+    await prefix.dispose()
+  })
+
+  test('an async handler makes multiple bridge calls mid-request', async () => {
+    const seen: string[] = []
+    const result = await runtime.run({
+      code: `export default {
+        async fetch(id) {
+          const a = await lookup(id)
+          const b = await lookup(a)
+          return 'final:' + b
+        },
+      }`,
+      globals: {
+        lookup: async (v: unknown) => {
+          seen.push(String(v))
+          return `${String(v)}+`
+        },
+      },
+      call: { export: 'default.fetch', args: ['x'] },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.value).toBe('final:x++')
+    expect(seen).toEqual(['x', 'x+'])
+    expect(result.bridgeCalls).toHaveLength(2)
+  })
+
+  test('unknown export path → ERR_CALL_TARGET_NOT_FOUND', async () => {
+    const result = await runtime.run({
+      code: 'export default { fetch() {} }',
+      call: { export: 'default.missing' },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_CALL_TARGET_NOT_FOUND')
+    expect(result.error.message).toContain('default.missing')
+  })
+
+  test('non-callable target → ERR_CALL_TARGET_NOT_FOUND', async () => {
+    const result = await runtime.run({
+      code: 'export const n = 42',
+      call: { export: 'n' },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_CALL_TARGET_NOT_FOUND')
+    expect(result.error.message).toContain('not callable')
+  })
+
+  test('a throw inside the handler → ERR_USER_CODE', async () => {
+    const result = await runtime.run({
+      code: 'export function f() { throw new Error("boom") }',
+      call: { export: 'f' },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.message).toBe('boom')
+  })
+
+  test('a pre-aborted signal resolves to an aborted result', async () => {
+    const prefix = await runtime.prepare({ code: 'export function f() { return 1 }' })
+    const controller = new AbortController()
+    controller.abort('why')
+    const result = await prefix.call({ export: 'f', signal: controller.signal })
+    expect(result.status).toBe('aborted')
+    if (result.status === 'aborted')
+      expect(result.reason).toBe('why')
+    await prefix.dispose()
+  })
+
+  test('logs and telemetry ride along with a call result', async () => {
+    const result = await runtime.run({
+      code: 'export function f() { console.log("from handler"); return 1 }',
+      call: { export: 'f' },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.stdout).toEqual(['from handler'])
+    expect(result.durationMs).toBeGreaterThan(0)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// readExports (#58): the deploy-path declaration reader
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('readExports', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('reads declaration exports; handlers are skipped and reported', async () => {
+    const { exports, skippedExports } = await runtime.readExports({
+      code: `export const limits = { memoryMb: 128, cpuTimeMs: 500 }
+             export const connections = ['db-main']
+             export default { async fetch() { return new Response('nope') } }`,
+    })
+    expect(exports['limits']).toEqual({ memoryMb: 128, cpuTimeMs: 500 })
+    expect(exports['connections']).toEqual(['db-main'])
+    expect('default' in exports).toBe(false)
+    expect(skippedExports).toEqual(['default'])
+  })
+
+  test('rejects on a broken module, like prepare()', async () => {
+    await expect(runtime.readExports({ code: 'export default (((' }))
+      .rejects
+      .toMatchObject({ code: 'ERR_COMPILE' })
+  })
+
+  test('rejects when the module top level throws', async () => {
+    await expect(runtime.readExports({ code: 'throw new Error("deploy-time boom")' }))
+      .rejects
+      .toMatchObject({ code: 'ERR_USER_CODE', message: 'deploy-time boom' })
   })
 })
