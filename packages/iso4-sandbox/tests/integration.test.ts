@@ -278,12 +278,13 @@ describe('error handling', () => {
     expect(result.error.stack).toContain('outer')
   })
 
-  test('export function → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  test('export function is skipped and reported (#58)', async () => {
     const result = await runtime.run({ code: 'export default function() {}' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    expect(result.skippedExports).toEqual(['default'])
+    expect(result.exports).toEqual({})
   })
 
   test('error in one run does not affect the next', async () => {
@@ -1582,28 +1583,30 @@ describe('export types — full coverage', () => {
     expect(result.exports['default']).toBeUndefined()
   })
 
-  test('Symbol → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  // Non-serializable exports are skipped and reported, never fatal (#58).
+
+  test('Symbol export is skipped and reported', async () => {
     const result = await runtime.run({ code: 'export default Symbol("s")' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    expect(result.skippedExports).toEqual(['default'])
   })
 
-  test('unresolved Promise → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  test('unresolved Promise export is skipped and reported', async () => {
     const result = await runtime.run({ code: 'export default new Promise(() => {})' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    expect(result.skippedExports).toEqual(['default'])
   })
 
-  test('class export → ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+  test('class export is skipped and reported', async () => {
     const result = await runtime.run({ code: 'export default class Foo {}' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
       return
-    expect(result.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+    expect(result.skippedExports).toEqual(['default'])
   })
 
   // Cycles used to be rejected by the hand-written codec. The V8

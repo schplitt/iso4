@@ -60,6 +60,42 @@ if (result.ok) {
 await sandbox.dispose()
 ```
 
+## Calling into the sandbox
+
+`export default { fetch(request) }` is a first-class shape: prepare the
+module once, then call its exported handler per request with real typed
+arguments — a `Request` crosses in, a `Response` crosses back, and the result
+carries the handler's return `value` instead of `exports`:
+
+```ts
+const prefix = await sandbox.prepare({ code: workerBundle })
+
+const result = await prefix.call({
+  export: 'default.fetch', // or any named export, e.g. 'handleEvent'
+  args: [new Request('https://example.com/in', { method: 'POST', body: 'hi' })],
+})
+
+if (result.ok) {
+  const response = result.value as Response
+  console.log(response.status, await response.text())
+}
+```
+
+The same works on a direct run (`sandbox.run({ code, call })`), resolved
+against the freshly evaluated module. The receiver is the exported object
+itself, so handlers reading `this` behave normally; a path that does not
+resolve to a callable fails with `ERR_CALL_TARGET_NOT_FOUND`.
+
+For the deploy path, `sandbox.readExports({ code })` loads a module once and
+returns its serializable exports (IaC-style declarations); function-valued
+exports are absent and reported in `skippedExports` — never an error:
+
+```ts
+const { exports, skippedExports } = await sandbox.readExports({ code: workerBundle })
+console.log(exports.limits) // { memoryMb: 128 }  — declaration exports
+console.log(skippedExports) // ['default']        — the handler object, skipped
+```
+
 ## Packages
 
 | Package                                    | Status  | Description                                                                                                               |
@@ -97,6 +133,8 @@ pnpm changeset          # record a per-package version bump
 - `AbortSignal` support — cancel in-flight runs; `RunResult.status` discriminates `'completed'` | `'failed'` | `'aborted'`, with `reason` on abort ✅
 - Error propagation — thrown error `name`, `stack`, and extra enumerable properties (`error.fields`) survive the bridge in both directions ✅
 - Bridge call limits — `maxBridgeCalls`, `maxBridgeCallBytes`, `maxExportBytes` per run ✅
+- Host → sandbox calls — `prefix.call({ export, args })` / `run({ code, call })` invoke exported handlers (`default.fetch`, named) with real typed arguments ✅
+- `sandbox.readExports()` — deploy-path declaration reader; non-serializable exports skipped and reported via `skippedExports` ✅
 - `@iso4/fetch` — rules-based origin + route allowlist, three-level middleware, DNS pinning, SSRF/redirect protection ✅
 
 ## How globals work

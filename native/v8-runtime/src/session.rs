@@ -327,10 +327,15 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 };
 
                 trace!(
-                    "[iso4-v8] Run {} received ({} code bytes, {} globals)",
+                    "[iso4-v8] Run {} received ({} code bytes, {} globals, call={})",
                     payload.run_id,
                     payload.code.len(),
                     payload.globals.len(),
+                    payload
+                        .call
+                        .as_ref()
+                        .map(|c| c.export_path.as_str())
+                        .unwrap_or("-"),
                 );
 
                 // A socket is needed only when some global installs a bridge
@@ -358,6 +363,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     &payload.imports,
                     stream_fd,
                     Arc::clone(&call_id_counter),
+                    payload.call.as_ref(),
                 ) {
                     Ok(output) => {
                         trace!("[iso4-v8] run succeeded in {:.3}ms", output.duration_ms);
@@ -365,6 +371,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             payload.run_id,
                             wire::RunCompletion::Success(wire::RunSuccessPayload {
                                 exports: output.exports,
+                                skipped_exports: output.skipped_exports,
                                 stdout: output.stdout,
                                 stderr: output.stderr,
                                 duration_ms: output.duration_ms,
@@ -539,8 +546,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         // bridge surface. The same rule covers host-import rebinds:
                         // only function leaves declared at precompile time may be
                         // re-pointed.
-                        let declared_set: std::collections::HashSet<&str> =
-                            prefix_data.declared_globals.iter().map(String::as_str).collect();
+                        let declared_set: std::collections::HashSet<&str> = prefix_data
+                            .declared_globals
+                            .iter()
+                            .map(String::as_str)
+                            .collect();
                         let violation: Option<String> = payload
                             .globals
                             .iter()
@@ -596,9 +606,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 None
                             };
                             trace!(
-                            "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports)",
-                            payload.run_id, payload.prefix_id, payload.code.len(),
+                            "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports, call={})",
+                            payload.run_id, payload.prefix_id,
+                            payload.code.as_deref().map(str::len).unwrap_or(0),
                             payload.globals.len(), prefix_data.declared_imports.len(),
+                            payload.call.as_ref().map(|c| c.export_path.as_str()).unwrap_or("-"),
                         );
                             match sandbox::execute_with_prefix(
                                 sandbox::PrefixSpec {
@@ -606,7 +618,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     filename: prefix_data.filename.as_deref().unwrap_or("<prefix>"),
                                     globals: &prefix_data.globals,
                                 },
-                                &payload.code,
+                                payload.code.as_deref(),
                                 payload.filename.as_deref(),
                                 sandbox::Limits {
                                     wall_time_ms: payload.limits.wall_time_ms,
@@ -622,6 +634,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                 &prefix_data.declared_imports,
                                 stream_fd,
                                 Arc::clone(&call_id_counter),
+                                payload.call.as_ref(),
                             ) {
                                 Ok(output) => {
                                     trace!(
@@ -633,6 +646,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                         payload.run_id,
                                         wire::RunCompletion::Success(wire::RunSuccessPayload {
                                             exports: output.exports,
+                                            skipped_exports: output.skipped_exports,
                                             stdout: output.stdout,
                                             stderr: output.stderr,
                                             duration_ms: output.duration_ms,

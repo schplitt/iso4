@@ -168,8 +168,13 @@ pub struct RunSuccessPayload {
     /// All exports as **one** V8 serialization blob holding a plain
     /// `{ name: value }` object. The `default` export (if present) is the
     /// `"default"` key alongside named exports; an empty module produces a
-    /// blob holding `{}`.
+    /// blob holding `{}`. For a run that carried a `call` (#58) this is the
+    /// called function's return value instead — the host knows which it asked
+    /// for, so the slot needs no tag.
     pub exports: Vec<u8>,
+    /// Export names absent from `exports` because their value cannot cross
+    /// the boundary (#58). Always empty for a call run.
+    pub skipped_exports: Vec<String>,
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub duration_ms: f64,
@@ -207,6 +212,7 @@ pub enum RunCompletion {
 /// u8    ok  (1 = success, 0 = failure)
 /// u8    successPresent  (1 when ok = 1)
 ///   ValueBlob  exports
+///   List<String>  skippedExports
 ///   List<String>  stdout
 ///   List<String>  stderr
 ///   f64  durationMs
@@ -229,6 +235,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_bool(true, &mut out);
             out.push(1); // Optional<RunSuccessPayload> present
             encode_value_blob(&s.exports, &mut out);
+            encode_string_list(&s.skipped_exports, &mut out);
             encode_string_list(&s.stdout, &mut out);
             encode_string_list(&s.stderr, &mut out);
             encode_f64(s.duration_ms, &mut out);
@@ -420,6 +427,13 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
         },
         RunError::PrefixBridgeCall(msg) => RunErrorPayload {
             code: "ERR_PREFIX_BRIDGE_CALL".to_string(),
+            name: "Error".to_string(),
+            message: msg.clone(),
+            stack: None,
+            fields: None,
+        },
+        RunError::CallTargetNotFound(msg) => RunErrorPayload {
+            code: "ERR_CALL_TARGET_NOT_FOUND".to_string(),
             name: "Error".to_string(),
             message: msg.clone(),
             stack: None,

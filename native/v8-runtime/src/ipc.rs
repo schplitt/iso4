@@ -446,6 +446,17 @@ pub struct ImportRebind {
     pub path: String,
 }
 
+/// A host → sandbox function call requested by a `Run` / `PrefixRun` frame
+/// (#58). `export_path` addresses a callable relative to the module's exports
+/// (`"named"`, `"default.fetch"`); `args_blob` is **one** V8 serialization
+/// blob holding an array of arguments — the same convention as `BridgeCall`
+/// args, identity between arguments preserved.
+#[derive(Debug)]
+pub struct CallSpec {
+    pub export_path: String,
+    pub args_blob: Vec<u8>,
+}
+
 /// Fully parsed `Run` frame payload per `docs/protocol.md` §5.2.
 #[derive(Debug)]
 pub struct RunPayload {
@@ -455,6 +466,9 @@ pub struct RunPayload {
     pub limits: ResourceLimits,
     pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
+    /// When present, the result is the called function's return value instead
+    /// of the exports. Resolved against the freshly evaluated module.
+    pub call: Option<CallSpec>,
 }
 
 // ── Payload reader ────────────────────────────────────────────────────────────
@@ -689,6 +703,22 @@ impl<'a> PayloadReader<'a> {
         Ok(rebinds)
     }
 
+    /// Read an `Optional<CallSpec>` slot: a presence byte, then
+    /// `String exportPath` + a value blob holding the argument array.
+    fn read_optional_call(&mut self) -> io::Result<Option<CallSpec>> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(CallSpec {
+                export_path: self.read_string()?,
+                args_blob: self.read_value_blob()?,
+            })),
+            b => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid optional presence byte: {b:#04x}"),
+            )),
+        }
+    }
+
     fn assert_done(&self) -> io::Result<()> {
         if self.remaining() != 0 {
             return Err(io::Error::new(
@@ -723,6 +753,7 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
     let run_id = r.read_u32()?;
     let (code, filename, limits, globals) = parse_code_fields(&mut r)?;
     let imports = r.read_import_bindings()?;
+    let call = r.read_optional_call()?;
     r.assert_done()?;
     Ok(RunPayload {
         run_id,
@@ -731,6 +762,7 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
         limits,
         globals,
         imports,
+        call,
     })
 }
 
@@ -770,11 +802,16 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
 pub struct PrefixRunPayload {
     pub run_id: u32,
     pub prefix_id: String,
-    pub code: String,
+    /// The postfix module source. A frame carries a postfix *or* a call —
+    /// exactly one; the parser enforces this.
+    pub code: Option<String>,
     pub filename: Option<String>,
     pub limits: ResourceLimits,
     pub globals: Vec<HostGlobalDef>,
     pub import_rebinds: Vec<ImportRebind>,
+    /// When present, the run calls into the prefix module's exports instead of
+    /// evaluating a postfix; the result is the function's return value.
+    pub call: Option<CallSpec>,
 }
 
 /// Parse the payload bytes of a `PrefixRun` frame per `docs/protocol.md` §5.2.
@@ -782,9 +819,19 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
     let prefix_id = r.read_string()?;
-    let (code, filename, limits, globals) = parse_code_fields(&mut r)?;
+    let code = r.read_optional_string()?;
+    let filename = r.read_optional_string()?;
+    let limits = r.read_resource_limits()?;
+    let globals = r.read_global_defs()?;
     let import_rebinds = r.read_import_rebinds()?;
+    let call = r.read_optional_call()?;
     r.assert_done()?;
+    if code.is_some() == call.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PrefixRun must carry exactly one of code or call",
+        ));
+    }
     Ok(PrefixRunPayload {
         run_id,
         prefix_id,
@@ -793,6 +840,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
         limits,
         globals,
         import_rebinds,
+        call,
     })
 }
 
@@ -1059,6 +1107,7 @@ mod tests {
         push_absent_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
+        v.push(0); // call: absent
         v
     }
 
@@ -1122,6 +1171,7 @@ mod tests {
         push_optional_u32(&mut v, Some(1_000)); // max_bridge_calls
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
+        v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.run_id, 42);
@@ -1169,6 +1219,7 @@ mod tests {
         push_optional_u32(&mut v, Some(0)); // max_bridge_calls: explicitly unlimited
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
+        v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.limits.memory_mb, 0);
@@ -1190,6 +1241,7 @@ mod tests {
         v.push(0); // kind: bridge
         push_string(&mut v, "myTool");
         push_u32(&mut v, 0); // 0 imports
+        v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.globals.len(), 2);
@@ -1224,6 +1276,7 @@ mod tests {
         push_string(&mut v, "(r) => r");
         push_string(&mut v, "__iso4_wrapped_h");
         push_u32(&mut v, 0); // 0 imports
+        v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.globals.len(), 4);
@@ -1258,6 +1311,7 @@ mod tests {
         push_string(&mut v, "lib:math"); // specifier
         v.push(0); // kind: source
         push_string(&mut v, "export const add = (a, b) => a + b");
+        v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 1);
@@ -1283,6 +1337,7 @@ mod tests {
         push_string(&mut v, "lib:b");
         v.push(0); // kind: source
         push_string(&mut v, "export const b = 2");
+        v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 2);
@@ -1324,6 +1379,7 @@ mod tests {
         push_u32(&mut v, 1);
         push_string(&mut v, "inner");
         v.push(0);
+        v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 1);
@@ -1368,6 +1424,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 3); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
+        v.push(1); // code: present
         push_string(&mut v, "code");
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -1377,12 +1434,86 @@ mod tests {
         push_string(&mut v, "query");
         push_string(&mut v, "tools:search");
         push_string(&mut v, "nested.inner");
+        v.push(0); // call: absent
 
         let p = parse_prefix_run_payload(&v).unwrap();
+        assert_eq!(p.code.as_deref(), Some("code"));
         assert_eq!(p.import_rebinds.len(), 2);
         assert_eq!(p.import_rebinds[0].specifier, "tools:search");
         assert_eq!(p.import_rebinds[0].path, "query");
         assert_eq!(p.import_rebinds[1].path, "nested.inner");
+    }
+
+    #[test]
+    fn parse_run_payload_with_call() {
+        let mut v = encode_run_payload(9, "export default { fetch() {} }", None);
+        v.pop(); // replace the absent-call byte
+        v.push(1); // call: present
+        push_string(&mut v, "default.fetch"); // exportPath
+        push_u32(&mut v, 3); // argsBlob: value slot
+        v.extend_from_slice(&[0xff, 0x0f, 0x41]);
+
+        let p = parse_run_payload(&v).unwrap();
+        let call = p.call.expect("call spec");
+        assert_eq!(call.export_path, "default.fetch");
+        assert_eq!(call.args_blob, vec![0xff, 0x0f, 0x41]);
+    }
+
+    /// Build a PrefixRun payload with the given code / call presence.
+    fn encode_prefix_run_payload(code: Option<&str>, call: Option<&str>) -> Vec<u8> {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "prefix-0"); // prefix_id
+        match code {
+            Some(c) => {
+                v.push(1);
+                push_string(&mut v, c);
+            }
+            None => v.push(0),
+        }
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 0); // rebinds count
+        match call {
+            Some(path) => {
+                v.push(1);
+                push_string(&mut v, path);
+                push_u32(&mut v, 3); // argsBlob: value slot
+                v.extend_from_slice(&[0xff, 0x0f, 0x41]);
+            }
+            None => v.push(0),
+        }
+        v
+    }
+
+    #[test]
+    fn parse_prefix_run_payload_with_call_only() {
+        let p = parse_prefix_run_payload(&encode_prefix_run_payload(None, Some("named"))).unwrap();
+        assert!(p.code.is_none());
+        let call = p.call.expect("call spec");
+        assert_eq!(call.export_path, "named");
+        assert_eq!(call.args_blob, vec![0xff, 0x0f, 0x41]);
+    }
+
+    #[test]
+    fn parse_prefix_run_payload_rejects_code_and_call_together() {
+        assert_eq!(
+            parse_prefix_run_payload(&encode_prefix_run_payload(Some("code"), Some("named")))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn parse_prefix_run_payload_rejects_neither_code_nor_call() {
+        assert_eq!(
+            parse_prefix_run_payload(&encode_prefix_run_payload(None, None))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
     }
 
     #[test]
