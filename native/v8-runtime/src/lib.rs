@@ -11,6 +11,7 @@ pub mod session;
 #[cfg(test)]
 pub mod testval;
 pub mod v8;
+pub mod warm;
 pub mod webcodec;
 pub mod webtypes;
 pub mod wire;

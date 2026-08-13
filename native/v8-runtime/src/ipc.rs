@@ -308,7 +308,7 @@ pub fn encode_hello_payload(status: HelloStatus, probe: &[u8], message: &str) ->
 ///
 /// The public `ResourceLimits` jsdoc in `packages/iso4-sandbox/src/types.ts`
 /// documents these same numbers, pointing here as the source of truth.
-pub const DEFAULT_MEMORY_MB: u32 = 64;
+pub const DEFAULT_MEMORY_MB: u32 = 128;
 pub const DEFAULT_CPU_TIME_MS: u32 = 5_000;
 pub const DEFAULT_WALL_TIME_MS: u32 = 30_000;
 pub const DEFAULT_MAX_EXPORT_BYTES: u32 = 16 * 1024 * 1024;

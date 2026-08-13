@@ -27,7 +27,7 @@ executes the postfix and gets a result. The host wants:
 import { createSandbox } from '@iso4/sandbox'
 import { createSafeFetch } from '@iso4/fetch'
 
-const sandbox = await createSandbox()
+const sandbox = await createSandbox({ memoryMb: 128 }) // uniform heap cap per isolate
 
 const prefix = await sandbox.precompile({
   code: `
@@ -50,7 +50,7 @@ const result = await prefix.run({
     const users = res.json()
     export default { count: users.length }
   `,
-  limits: { cpuTimeMs: 200, memoryMb: 64 },
+  limits: { cpuTimeMs: 200 }, // memoryMb is set on createSandbox, not per run
 })
 
 if (result.ok) {

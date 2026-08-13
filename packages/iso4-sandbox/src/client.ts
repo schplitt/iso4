@@ -2,6 +2,7 @@ import type { Buffer } from 'node:buffer'
 import { createConnection } from 'node:net'
 import type { Socket } from 'node:net'
 import {
+
   FrameReader,
   HelloStatus,
   PROTOCOL_VERSION,
@@ -20,8 +21,8 @@ import {
   encodeTerminatePayload,
   encodeTsToRustFrame,
 } from './ipc'
+import type { WireResourceLimits, CallPayload, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
-import type { CallPayload, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
@@ -258,7 +259,7 @@ export class RuntimeIpcClient {
     code: string,
     options?: {
       filename?: string
-      limits?: ResourceLimits
+      limits?: WireResourceLimits
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
       imports?: readonly ImportBindingPayload[]
@@ -297,7 +298,7 @@ export class RuntimeIpcClient {
     options: {
       code: string
       filename?: string
-      limits?: ResourceLimits
+      limits?: WireResourceLimits
       globals?: readonly GlobalDefPayload[]
       imports?: readonly ImportBindingPayload[]
     },
@@ -338,7 +339,7 @@ export class RuntimeIpcClient {
        */
       code?: string
       filename?: string
-      limits?: ResourceLimits
+      limits?: WireResourceLimits
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
       importRebinds?: readonly ImportRebindPayload[]

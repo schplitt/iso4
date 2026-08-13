@@ -9,6 +9,15 @@ import type {
   SandboxExports,
 } from './types.js'
 
+/**
+ * The limits shape the wire carries. `memoryMb` left `ResourceLimits` when it
+ * became a Runtime-level setting (#64: uniform heap cap, set at isolate
+ * creation, impossible to renegotiate per run) — but the frame layout is
+ * unchanged, so the encoder takes the public limits plus the sandbox-level
+ * `memoryMb` injected by the `Sandbox`/`Prefix` implementations.
+ */
+export type WireResourceLimits = ResourceLimits & { memoryMb?: number }
+
 export const PROTOCOL_VERSION: 2 = 2
 
 export const DEFAULT_MAX_FRAME_LENGTH: number = 64 * 1024 * 1024
@@ -580,7 +589,7 @@ class PayloadWriter {
     return this
   }
 
-  writeResourceLimits(limits: ResourceLimits): this {
+  writeResourceLimits(limits: WireResourceLimits): this {
     // Each field is `Optional<u32>`: the client sends only the limits the
     // caller explicitly set. Absent fields are filled in by the runtime, which
     // owns the default safety posture (see `ResourceLimits` jsdoc). An explicit
@@ -650,6 +659,22 @@ class PayloadReader {
     const n = this.view.getFloat64(this.offset, false) // big-endian
     this.offset += 8
     return n
+  }
+
+  /**
+   * Read an `Optional<u64>`: a presence byte, then 8 big-endian bytes.
+   * Returned as a JS number — the only u64 on the wire is a heap byte count,
+   * far below 2^53.
+   */
+  readOptionalU64(): number | undefined {
+    const present = this.readU8()
+    if (present === 0)
+      return undefined
+    if (this.remaining < 8)
+      throw new PayloadDecodeError('unexpected end of payload reading u64')
+    const n = this.view.getBigUint64(this.offset, false) // big-endian
+    this.offset += 8
+    return Number(n)
   }
 
   readBool(): boolean {
@@ -1096,6 +1121,7 @@ export interface DecodedCallCompletion {
  *   f64  durationMs
  *   f64  cpuTimeMs
  *   List<BridgeCallRecord>  bridgeCalls
+ *   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
  * u8    failurePresent   (1 when ok = 0)
  *   String  code
  *   String  name
@@ -1107,6 +1133,7 @@ export interface DecodedCallCompletion {
  *   f64  durationMs
  *   f64  cpuTimeMs
  *   List<BridgeCallRecord>  bridgeCalls
+ *   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
  * ```
  * @param buf
  * @param resultKind
@@ -1135,6 +1162,7 @@ export function decodeRunCompletionPayload(
     const durationMs = reader.readF64()
     const cpuTimeMs = reader.readF64()
     const bridgeCalls = readBridgeCallRecords(reader)
+    const heapUsedBytes = reader.readOptionalU64()
     reader.readU8() // failurePresent = 0; consumed for forward-compat
 
     reader.assertDone()
@@ -1150,6 +1178,7 @@ export function decodeRunCompletionPayload(
           durationMs,
           cpuTimeMs,
           bridgeCalls,
+          heapUsedBytes,
         },
       }
     }
@@ -1165,6 +1194,7 @@ export function decodeRunCompletionPayload(
         durationMs,
         cpuTimeMs,
         bridgeCalls,
+        heapUsedBytes,
       },
     }
   }
@@ -1187,6 +1217,7 @@ export function decodeRunCompletionPayload(
   const durationMs = reader.readF64()
   const cpuTimeMs = reader.readF64()
   const bridgeCalls = readBridgeCallRecords(reader)
+  const heapUsedBytes = reader.readOptionalU64()
 
   reader.assertDone()
   return {
@@ -1200,6 +1231,7 @@ export function decodeRunCompletionPayload(
       durationMs,
       cpuTimeMs,
       bridgeCalls,
+      heapUsedBytes,
     },
   }
 }

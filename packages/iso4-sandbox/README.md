@@ -24,7 +24,7 @@ npm i @iso4/fetch
 import { createSandbox } from '@iso4/sandbox'
 import { createSafeFetch } from '@iso4/fetch'
 
-const sandbox = await createSandbox()
+const sandbox = await createSandbox({ memoryMb: 128 }) // uniform heap cap per isolate
 
 // Validate and prepare host setup once
 const prefix = await sandbox.prepare({
@@ -43,7 +43,7 @@ const result = await prefix.execute({
     const res = await fetch(config.apiBase + '/users')
     export default { count: res.length }
   `,
-  limits: { cpuTimeMs: 200, wallTimeMs: 5_000, memoryMb: 64 },
+  limits: { cpuTimeMs: 200, wallTimeMs: 5_000 }, // memoryMb is a createSandbox option
 })
 
 if (result.ok) {
@@ -101,7 +101,8 @@ prefix.execute({
   limits: {
     cpuTimeMs: 200, // active JS execution only (await time excluded)
     wallTimeMs: 5_000, // hard cap including async waits
-    memoryMb: 64, // V8 heap + ArrayBuffer budget
+    // memoryMb is uniform per isolate and set on createSandbox({ memoryMb }),
+    // not per run (#64) — the heap cap is baked into the isolate at creation.
     maxBridgeCalls: 10, // max host-bridge calls per run (0 = unlimited)
     maxBridgePayloadBytes: 0, // max bytes per bridge call (0 = 64 MiB framing cap)
   },
