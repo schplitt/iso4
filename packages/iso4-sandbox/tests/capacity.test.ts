@@ -9,6 +9,7 @@
  * dedicated control connection that never queues behind runs.
  */
 
+import { totalmem } from 'node:os'
 import process from 'node:process'
 import { describe, expect, test, vi } from 'vitest'
 import { createSandbox } from '../src/index.js'
@@ -91,6 +92,25 @@ describe('memory budget → live-isolate cap (#65)', () => {
     await expect(
       createSandbox({ memoryBudgetMb: Number.NaN }),
     ).rejects.toThrow(/memoryBudgetMb must be a finite number/)
+  })
+
+  test('the cgroup-v1 "unlimited" sentinel falls back to host memory', async () => {
+    // On cgroup v1 (GitHub Actions runners), constrainedMemory() reports
+    // "no limit" as a sentinel near 2^63 instead of 0. Trusting it produced
+    // a live cap that was a multiple of 2^32 — which the wire's u32
+    // truncated to exactly 0. The default must clamp to os.totalmem().
+    const constrained = vi
+      .spyOn(process, 'constrainedMemory')
+      .mockReturnValue(2 ** 63)
+    try {
+      await using sandbox = await createSandbox({ maxIsolates: 2 })
+      const stats = await sandbox.stats()
+      const totalMb = totalmem() / (1024 * 1024)
+      const expected = Math.max(2, Math.floor((totalMb - Math.max(512, totalMb * 0.25)) / 128))
+      expect(stats.maxLiveIsolates).toBe(expected)
+    } finally {
+      constrained.mockRestore()
+    }
   })
 
   test('the default budget respects a container memory constraint', async () => {

@@ -201,7 +201,12 @@ function resolveMaxLiveIsolates(
     return maxIsolates
   }
   const budgetMb = memoryBudgetMb ?? defaultMemoryBudgetMb()
-  return Math.max(maxIsolates, Math.floor(budgetMb / memoryMb))
+  // The cap crosses the wire as a u32; saturate instead of letting an
+  // absurd budget wrap (a multiple of 2^32 would truncate to 0).
+  return Math.min(
+    Math.max(maxIsolates, Math.floor(budgetMb / memoryMb)),
+    0xFF_FF_FF_FF,
+  )
 }
 
 /**
@@ -212,7 +217,13 @@ function resolveMaxLiveIsolates(
  * the embedding service's own per-isolate state.
  */
 function defaultMemoryBudgetMb(): number {
-  const totalBytes = process.constrainedMemory?.() || totalmem()
+  // constrainedMemory() reports 0/undefined when there is no cgroup limit —
+  // except on cgroup v1, where "unlimited" is a sentinel near 2^63 (seen on
+  // GitHub Actions runners). Take the smaller of it and the host total
+  // instead of trusting either alone: a real container limit is below the
+  // host total, and the sentinel is above it.
+  const constrained = process.constrainedMemory?.() || Number.POSITIVE_INFINITY
+  const totalBytes = Math.min(constrained, totalmem())
   const totalMb = totalBytes / (1024 * 1024)
   return Math.floor(totalMb - Math.max(512, totalMb * 0.25))
 }

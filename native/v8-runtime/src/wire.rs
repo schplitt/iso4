@@ -541,17 +541,23 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
 ///   u32     busy
 /// ```
 pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
+    // Counts saturate at u32::MAX instead of wrapping: a live cap that is a
+    // multiple of 2^32 (seen with cgroup v1's "unlimited" memory sentinel
+    // before the host clamped its budget) would otherwise truncate to 0.
+    fn encode_count(n: usize, out: &mut Vec<u8>) {
+        encode_u32(u32::try_from(n).unwrap_or(u32::MAX), out);
+    }
     let mut out = Vec::new();
-    encode_u32(stats.oneoff_running as u32, &mut out);
-    encode_u32(stats.warm_busy as u32, &mut out);
-    encode_u32(stats.warm_idle as u32, &mut out);
+    encode_count(stats.oneoff_running, &mut out);
+    encode_count(stats.warm_busy, &mut out);
+    encode_count(stats.warm_idle, &mut out);
     encode_u64(stats.idle_heap_bytes, &mut out);
-    encode_u32(stats.max_live as u32, &mut out);
-    encode_u32(stats.per_prefix.len() as u32, &mut out);
+    encode_count(stats.max_live, &mut out);
+    encode_count(stats.per_prefix.len(), &mut out);
     for (prefix_id, idle, busy) in &stats.per_prefix {
         encode_string(prefix_id, &mut out);
-        encode_u32(*idle as u32, &mut out);
-        encode_u32(*busy as u32, &mut out);
+        encode_count(*idle, &mut out);
+        encode_count(*busy, &mut out);
     }
     out
 }
