@@ -158,8 +158,9 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   try {
     statsClient = await connect()
   } catch (error) {
-    // Don't leak the child process (and its pool connections) when the
+    // Don't leak the child process or its pool connections when the
     // control connection cannot open.
+    await pool.dispose().catch(() => {})
     proc.kill()
     throw error
   }
