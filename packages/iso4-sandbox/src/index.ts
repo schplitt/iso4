@@ -154,7 +154,15 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   // Dedicated control connection for `stats()` (#65): it never enters the
   // pool, so a capacity snapshot answers even while every run slot is busy —
   // exactly when it is most wanted.
-  const statsClient = await connect()
+  let statsClient: RuntimeIpcClient
+  try {
+    statsClient = await connect()
+  } catch (error) {
+    // Don't leak the child process (and its pool connections) when the
+    // control connection cannot open.
+    proc.kill()
+    throw error
+  }
 
   return new SandboxImpl(proc, pool, statsClient, socketPath, options?.memoryMb)
 }
@@ -174,6 +182,13 @@ function resolveMaxLiveIsolates(
   memoryMb: number,
   memoryBudgetMb: number | undefined,
 ): number {
+  if (memoryBudgetMb !== undefined && !Number.isFinite(memoryBudgetMb)) {
+    // Infinity/NaN would reach the child as `--max-live-isolates Infinity`,
+    // kill it at arg parsing, and surface as an unrelated socket timeout.
+    throw new TypeError(
+      '[@iso4/sandbox] memoryBudgetMb must be a finite number of megabytes',
+    )
+  }
   if (memoryMb === 0) {
     if (memoryBudgetMb !== undefined) {
       throw new TypeError(

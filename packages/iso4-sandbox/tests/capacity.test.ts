@@ -82,6 +82,17 @@ describe('memory budget → live-isolate cap (#65)', () => {
     ).rejects.toThrow(/memoryBudgetMb requires a nonzero memoryMb/)
   })
 
+  test('a non-finite memoryBudgetMb is rejected instead of killing the child', async () => {
+    // Infinity ("unlimited") would otherwise reach the child as
+    // `--max-live-isolates Infinity` and surface as a socket timeout.
+    await expect(
+      createSandbox({ memoryBudgetMb: Number.POSITIVE_INFINITY }),
+    ).rejects.toThrow(/memoryBudgetMb must be a finite number/)
+    await expect(
+      createSandbox({ memoryBudgetMb: Number.NaN }),
+    ).rejects.toThrow(/memoryBudgetMb must be a finite number/)
+  })
+
   test('the default budget respects a container memory constraint', async () => {
     // Pretend the process runs in a 2 GB container: constrainedMemory()
     // reports the cgroup limit os.totalmem() cannot see. Budget = 2048 minus

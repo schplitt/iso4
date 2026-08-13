@@ -872,8 +872,13 @@ snapshot answers even while every run slot is busy.
 ## 6. Session lifecycle
 
 Each connection handles one active run at a time. The TypeScript `Runtime`
-maintains a pool of connections, one per `maxIsolates` slot. Concurrency comes
-from multiple connections, not message-level multiplexing.
+maintains a pool of connections, one per `maxIsolates` slot, plus one
+dedicated control connection used only for `Stats` (#65) — kept outside the
+pool so a snapshot answers even while every run slot is busy. `Stats` is
+legal on any authenticated connection (the runtime serves it in the
+top-level message loop), but the host never sends it on a pooled connection.
+Concurrency comes from multiple connections, not message-level
+multiplexing.
 
 ```txt
 TS (one connection slot)              Rust (one isolate thread)

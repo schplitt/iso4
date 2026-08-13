@@ -492,8 +492,10 @@ export interface SandboxOptions {
 
 /**
  * A point-in-time capacity/usage snapshot from `sandbox.stats()` (#65).
- * Numbers are mutually consistent (one registry lock, one pool read) but
- * stale the moment they return — diagnostics, not synchronization.
+ * The runtime-side numbers are mutually consistent (taken under one
+ * registry lock); `queueDepth` is a separate host-side read taken after
+ * the round trip. All of it is stale the moment it returns —
+ * diagnostics, not synchronization.
  */
 export interface SandboxStats {
   /**

@@ -581,6 +581,28 @@ mod tests {
     }
 
     #[test]
+    fn stats_stay_consistent_after_an_eviction() {
+        let registry = WarmRegistry::new(1);
+        assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
+        registry.release("a", spawn_instance(counter_prefix(), 0), false, 500, true);
+
+        // Cap 1: acquiring "b" evicts a's idle instance — every count and
+        // the summed idle heap must reflect that immediately.
+        assert!(matches!(registry.acquire("b"), Acquired::CreateNew));
+        let stats = registry.stats();
+        assert_eq!(stats.warm_idle, 0);
+        assert_eq!(stats.idle_heap_bytes, 0);
+        assert_eq!(stats.warm_busy, 1);
+        assert_eq!(stats.per_prefix, vec![("b".to_string(), 0, 1)]);
+
+        registry.release("b", spawn_instance(counter_prefix(), 0), false, 300, true);
+        let stats = registry.stats();
+        assert_eq!(stats.warm_idle, 1);
+        assert_eq!(stats.warm_busy, 0);
+        assert_eq!(stats.idle_heap_bytes, 300);
+    }
+
+    #[test]
     fn dispose_prefix_with_a_busy_instance_keeps_its_accounting() {
         let registry = WarmRegistry::new(4);
         assert!(matches!(registry.acquire("p0"), Acquired::CreateNew));
