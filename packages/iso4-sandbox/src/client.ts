@@ -326,6 +326,13 @@ export class RuntimeIpcClient {
       }
       if (frame.messageType === RustToTsMessageTypes.Log)
         continue
+      // Precompile is bridge-less, so only PrecompileResult and Log are
+      // legal here — anything else means the two sides desynced. Fail
+      // loudly instead of skipping (same contract as stats()).
+      throw new Error(
+        `unexpected frame type 0x${frame.messageType.toString(16).padStart(2, '0')} `
+        + 'while awaiting a PrecompileResult',
+      )
     }
 
     throw new Error('connection closed before receiving a PrecompileResult frame')

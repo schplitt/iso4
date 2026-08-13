@@ -148,6 +148,25 @@ describe('RuntimeIpcClient', () => {
     await client.dispose()
   })
 
+  test('precompile() rejects unexpected frame types (aligned with stats())', async () => {
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+
+      // Precompile is bridge-less: a Result frame here is protocol desync.
+      await reader.readFrame()
+      socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('nonsense')))
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    await expect(client.precompile({ code: 'export const x = 1' }))
+      .rejects
+      .toThrow(/unexpected frame type 0x02/)
+    await client.dispose()
+  })
+
   test('rejects when the runtime reports a handshake error status', async () => {
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
