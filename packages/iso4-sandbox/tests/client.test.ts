@@ -117,6 +117,37 @@ describe('RuntimeIpcClient', () => {
     await client.dispose()
   })
 
+  test('stats() decodes a StatsResult and rejects unexpected frame types', async () => {
+    // StatsPayload: all-zero counters, live cap 4, no prefixes (§5.7).
+    const statsPayload = Buffer.alloc(4 * 4 + 8 + 4)
+    statsPayload.writeUInt32BE(4, 4 + 4 + 4 + 8)
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+
+      // First Stats request: answered correctly, with a Log frame in front
+      // (legal on any connection, must be skipped).
+      await reader.readFrame()
+      socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Log, Buffer.from([0, 0, 0, 0, 0])))
+      socket.write(encodeRustToTsFrame(RustToTsMessageTypes.StatsResult, statsPayload))
+
+      // Second Stats request: answered with a frame that is illegal on the
+      // control connection — the client must fail loudly, not wait forever.
+      await reader.readFrame()
+      socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('nonsense')))
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const stats = await client.stats()
+    expect(stats.maxLiveIsolates).toBe(4)
+    expect(stats.prefixes).toEqual([])
+
+    await expect(client.stats()).rejects.toThrow(/unexpected frame type 0x02/)
+    await client.dispose()
+  })
+
   test('rejects when the runtime reports a handshake error status', async () => {
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()

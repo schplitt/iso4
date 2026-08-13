@@ -394,6 +394,13 @@ export class RuntimeIpcClient {
         return decodeStatsPayload(frame.payload)
       if (frame.messageType === RustToTsMessageTypes.Log)
         continue
+      // Only StatsResult and Log are legal on the control connection —
+      // anything else means the two sides desynced. Fail loudly instead of
+      // skipping: silently waiting on would look like a hang.
+      throw new Error(
+        `unexpected frame type 0x${frame.messageType.toString(16).padStart(2, '0')} `
+        + 'while awaiting a StatsResult on the control connection',
+      )
     }
 
     throw new Error('connection closed before receiving a StatsResult frame')
