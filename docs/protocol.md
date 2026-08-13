@@ -66,6 +66,7 @@ optional host → sandbox `call` on `Run`/`PrefixRun`, an optional
 | `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                             |
 | `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                          |
 | `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown |
+| `0x08` | `Stats`          | empty                   | exactly one `StatsResult` (#65)                                                                                                  |
 
 ### 2.2 Rust → TS
 
@@ -76,6 +77,7 @@ optional host → sandbox `call` on `Run`/`PrefixRun`, an optional
 | `0x03` | `PrecompileResult` | `PrecompileResultPayload` | Result of `Precompile`.                                                                               |
 | `0x04` | `Log`              | `DiagnosticLogPayload`    | Internal runtime diagnostic; not sandbox stdout/stderr.                                               |
 | `0x05` | `Hello`            | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.               |
+| `0x06` | `StatsResult`      | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request (#65).                                            |
 
 ---
 
@@ -837,6 +839,34 @@ Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 | `prefixId` | `Optional<PrefixId>`        | Present when `ok = true`.  |
 | `error`    | `Optional<RunErrorPayload>` | Present when `ok = false`. |
 
+### 5.7 Stats payloads
+
+A `Stats` request has an **empty payload** and is answered with exactly one
+`StatsResult` frame — a point-in-time snapshot of the warm registry (#65).
+Counts are mutually consistent (taken under one registry lock) but stale the
+moment they are sent: diagnostics, not synchronization. The host sends
+`Stats` on a dedicated control connection outside its run pool, so a
+snapshot answers even while every run slot is busy.
+
+`StatsPayload`:
+
+| Field             | Encoding            | Notes                                                                             |
+| ----------------- | ------------------- | --------------------------------------------------------------------------------- |
+| `oneoffRunning`   | `u32`               | Running one-off isolates (`Run` frames in flight).                                |
+| `warmBusy`        | `u32`               | Warm instances currently serving a call.                                          |
+| `warmIdle`        | `u32`               | Idle warm instances ready for reuse.                                              |
+| `idleHeapBytes`   | `u64`               | Summed `used_heap_size` of the idle instances, each measured after its last call. |
+| `maxLiveIsolates` | `u32`               | The registry's live-isolate cap (`--max-live-isolates`).                          |
+| `prefixes`        | `List<PrefixStats>` | Per-prefix instance counts, sorted by prefix id.                                  |
+
+`PrefixStats`:
+
+| Field      | Encoding   | Notes                                    |
+| ---------- | ---------- | ---------------------------------------- |
+| `prefixId` | `PrefixId` |                                          |
+| `idle`     | `u32`      | Idle instances of this prefix.           |
+| `busy`     | `u32`      | Instances of this prefix serving a call. |
+
 ---
 
 ## 6. Session lifecycle
@@ -876,10 +906,12 @@ skip isolate boot and prefix evaluation entirely. This is invisible on the
 wire — the frames are identical warm or cold; only `heapUsedBytes` on the
 Result reports it. Instances are discarded on taint (any fired guard, abort
 mid-call, fatal bridge error), on `DisposePrefix`, and by LRU eviction when
-the slot cap (`--max-isolates`, the host pool size) is reached. State inside
-one instance survives between its calls as a cache, never a guarantee;
-instances of one prefix share no state with each other. One-off `Run` frames
-always get a fresh isolate.
+the live-isolate cap is reached — `--max-live-isolates`, derived by the host
+from its memory budget (#65) and never below the pool size
+(`--max-isolates`), so idle instances can outnumber concurrent runs. State
+inside one instance survives between its calls as a cache, never a
+guarantee; instances of one prefix share no state with each other. One-off
+`Run` frames always get a fresh isolate.
 
 ---
 

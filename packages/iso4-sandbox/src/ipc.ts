@@ -30,6 +30,11 @@ export const TsToRustMessageTypes = {
   DisposePrefix: 0x05,
   BridgeResponse: 0x06,
   Terminate: 0x07,
+  /**
+   * Request a capacity/usage snapshot (#65). Empty payload; answered with a
+   * `StatsResult` frame.
+   */
+  Stats: 0x08,
 } as const
 
 export type TsToRustMessageType
@@ -45,6 +50,10 @@ export const RustToTsMessageTypes = {
    * connection, answering `Authenticate` (protocol v2).
    */
   Hello: 0x05,
+  /**
+   * Capacity/usage snapshot answering a `Stats` request (#65).
+   */
+  StatsResult: 0x06,
 } as const
 
 export type RustToTsMessageType
@@ -659,6 +668,18 @@ class PayloadReader {
     const n = this.view.getFloat64(this.offset, false) // big-endian
     this.offset += 8
     return n
+  }
+
+  /**
+   * Read a `u64` (8 big-endian bytes) as a JS number — the only u64s on the
+   * wire are heap byte counts, far below 2^53.
+   */
+  readU64(): number {
+    if (this.remaining < 8)
+      throw new PayloadDecodeError('unexpected end of payload reading u64')
+    const n = this.view.getBigUint64(this.offset, false) // big-endian
+    this.offset += 8
+    return Number(n)
   }
 
   /**
@@ -1324,6 +1345,74 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   return { ok: false, error: { code, name, message, stack } }
 }
 
+/**
+ * The runtime's capacity/usage snapshot as decoded off a `StatsResult`
+ * frame (#65). Raw registry numbers; `sandbox.stats()` merges them with
+ * host-side pool counters into the public `SandboxStats` shape.
+ */
+export interface RuntimeStatsPayload {
+  /**
+   * Running one-off isolates (`sandbox.run()`).
+   */
+  oneoffRunning: number
+  /**
+   * Warm instances currently serving a call.
+   */
+  warmBusy: number
+  /**
+   * Idle warm instances ready for reuse.
+   */
+  warmIdle: number
+  /**
+   * Summed last-call heap of the idle instances, in bytes.
+   */
+  idleHeapBytes: number
+  /**
+   * The registry's live-isolate cap (`--max-live-isolates`).
+   */
+  maxLiveIsolates: number
+  /**
+   * Per-prefix instance counts, sorted by prefix id.
+   */
+  prefixes: { prefixId: string, idle: number, busy: number }[]
+}
+
+/**
+ * Decode a `StatsPayload` from a `StatsResult` frame.
+ *
+ * Wire layout per `docs/protocol.md` §5.7:
+ * ```
+ * u32   oneoffRunning
+ * u32   warmBusy
+ * u32   warmIdle
+ * u64   idleHeapBytes
+ * u32   maxLiveIsolates
+ * u32   prefixCount, then per prefix:
+ *   String  prefixId
+ *   u32     idle
+ *   u32     busy
+ * ```
+ * @param buf the `StatsResult` frame payload
+ */
+export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
+  const reader = new PayloadReader(buf)
+  const oneoffRunning = reader.readU32()
+  const warmBusy = reader.readU32()
+  const warmIdle = reader.readU32()
+  const idleHeapBytes = reader.readU64()
+  const maxLiveIsolates = reader.readU32()
+  const prefixCount = reader.readU32()
+  const prefixes: RuntimeStatsPayload['prefixes'] = []
+  for (let i = 0; i < prefixCount; i++) {
+    const prefixId = reader.readString()
+    const idle = reader.readU32()
+    const busy = reader.readU32()
+    prefixes.push({ prefixId, idle, busy })
+  }
+  reader.assertDone()
+  return { oneoffRunning, warmBusy, warmIdle, idleHeapBytes, maxLiveIsolates, prefixes }
+}
+
 export function parseTsToRustMessageType(
   byte: number,
 ): TsToRustMessageType {
@@ -1335,6 +1424,7 @@ export function parseTsToRustMessageType(
     case TsToRustMessageTypes.DisposePrefix:
     case TsToRustMessageTypes.BridgeResponse:
     case TsToRustMessageTypes.Terminate:
+    case TsToRustMessageTypes.Stats:
       return byte
     default:
       throw new Error(`unknown TS->Rust message type: ${formatByte(byte)}`)
@@ -1350,6 +1440,7 @@ export function parseRustToTsMessageType(
     case RustToTsMessageTypes.PrecompileResult:
     case RustToTsMessageTypes.Log:
     case RustToTsMessageTypes.Hello:
+    case RustToTsMessageTypes.StatsResult:
       return byte
     default:
       throw new Error(`unknown Rust->TS message type: ${formatByte(byte)}`)

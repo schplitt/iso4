@@ -184,14 +184,16 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// `max_isolates` is the host pool size (`--max-isolates`) — the global
-    /// cap on live isolates (running + idle warm).
-    pub fn new(token: String, max_isolates: usize) -> Self {
+    /// `max_live` is the global cap on live isolates (running + idle warm) —
+    /// the host derives it from its memory budget (`--max-live-isolates`,
+    /// #65) and it is never below the pool size, so the pool can always run
+    /// `maxIsolates` concurrent isolates.
+    pub fn new(token: String, max_live: usize) -> Self {
         Self {
             prefix_store: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),
             token,
-            warm: crate::warm::WarmRegistry::new(max_isolates),
+            warm: crate::warm::WarmRegistry::new(max_live),
         }
     }
 }
@@ -773,6 +775,20 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 // Rust side. The connection is reused for future runs, so we
                 // simply discard the late frame rather than closing.
                 eprintln!("[iso4-v8] ignoring late BridgeResponse (run already completed)");
+            }
+            ipc::TsToRustMessageType::Stats => {
+                // Capacity/usage snapshot (#65). Sent by the host's dedicated
+                // control connection, so it never queues behind runs; the
+                // payload is empty and the reply is one StatsResult frame.
+                let stats = shared.warm.stats();
+                if let Err(e) = ipc::write_rust_to_ts_frame(
+                    &mut stream,
+                    ipc::RustToTsMessageType::StatsResult,
+                    &wire::encode_stats_payload(&stats),
+                ) {
+                    eprintln!("[iso4-v8] failed to write StatsResult frame: {e}");
+                    break;
+                }
             }
             ipc::TsToRustMessageType::Terminate => {
                 // A Terminate reaching the top-level session loop targets a run

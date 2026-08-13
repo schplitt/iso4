@@ -1632,18 +1632,37 @@ impossible, and a uniform cap keeps capacity math `slots × cap`. Heap and
 ArrayBuffer usage accumulate across calls on an instance — hitting the cap
 taints it. Passing the old per-run field throws.
 
-**Capacity (v1) and eviction.** One global cap: `maxIsolates` (the host
-pool size, passed as `--max-isolates`), counting running isolates + idle
-warm instances. A run needing a slot when all are held evicts the
-least-recently-used **idle** instance — the host pool admits at most
-`maxIsolates` concurrent runs, so a full cap always contains an idle
-victim. One-off runs never touch the registry but share the slot budget
-(they may evict an idle instance to take a slot). `used_heap_size` is
-reported on every `PrefixRun` Result frame (`heapUsedBytes`), so the
+**Capacity (v2, #65) and eviction.** Two independent resources, two knobs.
+`maxIsolates` (the connection pool size) caps **concurrent runs**; the
+**memory budget** (`memoryBudgetMb` on `createSandbox`) caps **live
+isolates** — running plus kept-warm — at `budget ÷ memoryMb`, floored at
+`maxIsolates` so the pool can always run its full complement. The host
+passes the derived cap as `--max-live-isolates`; the registry keeps one
+ledger (idle warm + busy warm + running one-off) against it and evicts the
+least-recently-used **idle** instance beyond it, so idle warm instances can
+outnumber run slots — memory, not slot count, decides how much stays warm.
+Running instances are never evicted; a full ledger always contains an idle
+victim because the cap is never below the pool size. The budget default is
+container-aware: `process.constrainedMemory()` (falling back to
+`os.totalmem()`, which lies in containers) minus a safety net of
+max(512 MB, 25 %) for the Node host, the Rust runtime, and the embedding
+service's own per-isolate state. One-off runs never touch the warm pools
+but share the same ledger (they may evict an idle instance to take a slot).
+
+**Saturation and stats (#65).** Saturated run slots always queue FIFO —
+deliberately no per-call policy knobs (fail-fast / max-wait were built and
+removed: every run has wall/CPU limits, so the wait is bounded by the
+running calls themselves, and the knobs only complicated the API). Smarter
+admission is #77's cost model. `sandbox.stats()` returns a point-in-time
+snapshot (active runs,
+queue depth, warm/idle instance counts, summed idle heap, the live cap,
+per-prefix counts) over a **dedicated control connection** outside the run
+pool, so it answers precisely when everything is saturated. `used_heap_size`
+is reported on every `PrefixRun` Result frame (`heapUsedBytes`), so the
 `heapUsed × idleTime` scoring (#66) can replace oldest-first without new
-wire plumbing. The capacity manager (#65) adds the memory budget
-(`process.constrainedMemory()`-derived), per-prefix fairness caps, and
-queue policy; none of that is in #64.
+wire plumbing. Per-prefix fairness caps and the wait-vs-cold-start acquire
+policy are deliberately not here: they are #77's cost model, built on the
+per-prefix busy/idle state the registry now tracks.
 
 **Instance pools, not singletons.** The registry maps prefix → pool of
 instances, because the same trigger fires concurrently: a call takes an

@@ -65,9 +65,12 @@ describe('warm instances (#64)', () => {
   })
 
   test('LRU eviction: another prefix displaces the idle instance', async () => {
-    // One slot: warming B while A idles must evict A's instance.
-    await using prefixA = await single.prepare({ code: COUNTER })
-    await using prefixB = await single.prepare({ code: COUNTER })
+    // The live-isolate cap is budget-derived since #65; pin it to exactly
+    // one instance (128 MB budget ÷ 128 MB cap) so warming B while A idles
+    // must evict A's instance.
+    await using tiny = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 128 })
+    await using prefixA = await tiny.prepare({ code: COUNTER })
+    await using prefixB = await tiny.prepare({ code: COUNTER })
 
     const a1 = await prefixA.call({ export: 'bump' })
     expect(a1.ok && a1.value === 1).toBe(true)

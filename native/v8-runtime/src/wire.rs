@@ -523,6 +523,39 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
     }
 }
 
+// ── StatsPayload encoder ─────────────────────────────────────────────────────
+
+/// Encode a `StatsPayload` per `docs/protocol.md` §5.7 — the reply to a
+/// `Stats` request (#65).
+///
+/// Wire layout:
+/// ```text
+/// u32   oneoffRunning
+/// u32   warmBusy
+/// u32   warmIdle
+/// u64   idleHeapBytes
+/// u32   maxLiveIsolates
+/// u32   prefixCount, then per prefix:
+///   String  prefixId
+///   u32     idle
+///   u32     busy
+/// ```
+pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_u32(stats.oneoff_running as u32, &mut out);
+    encode_u32(stats.warm_busy as u32, &mut out);
+    encode_u32(stats.warm_idle as u32, &mut out);
+    encode_u64(stats.idle_heap_bytes, &mut out);
+    encode_u32(stats.max_live as u32, &mut out);
+    encode_u32(stats.per_prefix.len() as u32, &mut out);
+    for (prefix_id, idle, busy) in &stats.per_prefix {
+        encode_string(prefix_id, &mut out);
+        encode_u32(*idle as u32, &mut out);
+        encode_u32(*busy as u32, &mut out);
+    }
+    out
+}
+
 // ── BridgeCall payload encoder ────────────────────────────────────────────────────
 
 /// Encode a `BridgeCallPayload` per `docs/protocol.md` §5.4.

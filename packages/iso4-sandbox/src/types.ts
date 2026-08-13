@@ -431,16 +431,18 @@ export interface SandboxOptions {
   /**
    * Maximum number of isolates (UDS connection slots) running concurrently.
    * The Sandbox maintains a pool of this many connections to the Rust process;
-   * each executes one run() at a time. Additional callers queue.
+   * each executes one run() at a time. Additional callers queue FIFO until a
+   * slot frees — a bounded wait in practice, since every run has wall/CPU
+   * limits.
    *
    * Multiple MCP agents / concurrent callers each get their own slot and
    * run in parallel up to this limit.
    *
-   * Also the warm-instance cap (#64): running isolates plus idle warm
-   * instances never exceed this number — taking a slot at the cap evicts
-   * the least-recently-used idle instance.
+   * This caps *concurrent runs* only. How many isolates stay resident
+   * (warm instances included) is the memory budget's job — see
+   * `memoryBudgetMb` (#65) — and is never below this number.
    *
-   * Defaults to the number of logical CPUs on the host machine.
+   * Defaults to `os.availableParallelism()`.
    */
   maxIsolates?: number
 
@@ -463,10 +465,71 @@ export interface SandboxOptions {
   memoryMb?: number
 
   /**
+   * Memory budget for all live isolates of this Sandbox, in megabytes (#65):
+   * running isolates plus the warm instances kept resident between prefix
+   * runs. The runtime keeps at most `memoryBudgetMb ÷ memoryMb` isolates
+   * alive, evicting the least-recently-used idle instance beyond that.
+   *
+   * The floor is `maxIsolates` — the pool must always be able to run that
+   * many isolates concurrently, so a smaller budget is raised to
+   * `maxIsolates × memoryMb`. Requires a nonzero `memoryMb` (capacity math
+   * needs a per-isolate cap).
+   *
+   * Default: the memory available to this process — container/cgroup-aware
+   * via `process.constrainedMemory()`, falling back to `os.totalmem()` —
+   * minus a safety net of max(512 MB, 25 %) for the Node host, the Rust
+   * runtime, and whatever the embedding service keeps in memory per isolate.
+   * Services with a large per-isolate host cache should set this lower.
+   */
+  memoryBudgetMb?: number
+
+  /**
    * Override the path to the Rust V8 binary.
    * Default: auto-detect from \@iso4/v8-* platform packages.
    */
   binaryPath?: string
+}
+
+/**
+ * A point-in-time capacity/usage snapshot from `sandbox.stats()` (#65).
+ * Numbers are mutually consistent (one registry lock, one pool read) but
+ * stale the moment they return — diagnostics, not synchronization.
+ */
+export interface SandboxStats {
+  /**
+   * Isolates executing right now: one-off `run()`s plus prefix runs on warm
+   * instances.
+   */
+  activeRuns: number
+  /**
+   * Callers queued for a free run slot (the `maxIsolates` pool is
+   * saturated).
+   */
+  queueDepth: number
+  /**
+   * Resident warm instances — busy plus idle. Bounded by
+   * `maxLiveIsolates`.
+   */
+  warmInstances: number
+  /**
+   * Idle warm instances ready to serve their prefix without a cold start.
+   */
+  idleInstances: number
+  /**
+   * Summed heap of the idle instances in bytes, each measured after its
+   * last call (a busy instance's current heap is unknown mid-call).
+   */
+  idleHeapBytes: number
+  /**
+   * The live-isolate cap the runtime enforces:
+   * `max(maxIsolates, memoryBudgetMb ÷ memoryMb)`.
+   */
+  maxLiveIsolates: number
+  /**
+   * Per-prefix instance counts, keyed by prefix id — saturation of a single
+   * hot prefix is diagnosable here.
+   */
+  prefixes: Record<string, { idle: number, busy: number }>
 }
 
 export interface Sandbox {
@@ -540,6 +603,14 @@ export interface Sandbox {
   >(
     options: PrecompileOptions<G, M>,
   ) => Promise<Prefix<G, M>>
+
+  /**
+   * A point-in-time capacity/usage snapshot (#65): active runs, queue
+   * depth, warm-instance counts and their measured memory. Served over a
+   * dedicated control connection, so it answers even while every run slot
+   * is busy. See {@link SandboxStats}.
+   */
+  stats: () => Promise<SandboxStats>
 
   /**
    * Tear down the Rust process. Outstanding prefixes are invalidated.

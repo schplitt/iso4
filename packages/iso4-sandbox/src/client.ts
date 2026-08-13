@@ -11,6 +11,7 @@ import {
   TsToRustMessageTypes,
   decodeBridgeCallPayload,
   decodeHelloPayload,
+  decodeStatsPayload,
   bridgeErrorPayloadFromUnknown,
   encodeBridgeResponsePayload,
   encodeAuthenticatePayload,
@@ -21,7 +22,7 @@ import {
   encodeTerminatePayload,
   encodeTsToRustFrame,
 } from './ipc'
-import type { WireResourceLimits, CallPayload, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload } from './ipc'
+import type { WireResourceLimits, CallPayload, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
@@ -373,6 +374,29 @@ export class RuntimeIpcClient {
       runId,
       options.signal,
     )
+  }
+
+  /**
+   * Request the runtime's capacity/usage snapshot (#65). Empty request
+   * payload; the reply is one `StatsResult` frame. Sent on the sandbox's
+   * dedicated control connection so it never queues behind runs.
+   */
+  async stats(): Promise<RuntimeStatsPayload> {
+    if (this.disposed)
+      throw new Error('runtime IPC client is disposed')
+
+    await this.write(
+      encodeTsToRustFrame(TsToRustMessageTypes.Stats, new Uint8Array(0)),
+    )
+
+    for await (const frame of this.reader) {
+      if (frame.messageType === RustToTsMessageTypes.StatsResult)
+        return decodeStatsPayload(frame.payload)
+      if (frame.messageType === RustToTsMessageTypes.Log)
+        continue
+    }
+
+    throw new Error('connection closed before receiving a StatsResult frame')
   }
 
   async disposePrefix(prefixId: string): Promise<void> {
