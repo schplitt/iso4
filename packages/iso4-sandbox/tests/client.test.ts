@@ -118,9 +118,10 @@ describe('RuntimeIpcClient', () => {
   })
 
   test('stats() decodes a StatsResult and rejects unexpected frame types', async () => {
-    // StatsPayload: all-zero counters, live cap 4, no prefixes (§5.7).
-    const statsPayload = Buffer.alloc(4 * 4 + 8 + 4)
-    statsPayload.writeUInt32BE(4, 4 + 4 + 4 + 8)
+    // StatsPayload: all-zero counters, a 7-byte budget mark, zero RSS,
+    // latch off, no prefixes (§5.7 layout as of #66).
+    const statsPayload = Buffer.alloc(4 * 3 + 8 + 8 + 8 + 1 + 4)
+    statsPayload.writeBigUInt64BE(7n, 4 + 4 + 4 + 8)
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
       socket.on('data', (chunk) => reader.push(chunk))
@@ -141,7 +142,7 @@ describe('RuntimeIpcClient', () => {
 
     const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
     const stats = await client.stats()
-    expect(stats.maxLiveIsolates).toBe(4)
+    expect(stats.warmBudgetBytes).toBe(7)
     expect(stats.prefixes).toEqual([])
 
     await expect(client.stats()).rejects.toThrow(/unexpected frame type 0x02/)

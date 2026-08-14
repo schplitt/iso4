@@ -465,15 +465,20 @@ export interface SandboxOptions {
   memoryMb?: number
 
   /**
-   * Memory budget for all live isolates of this Sandbox, in megabytes (#65):
-   * running isolates plus the warm instances kept resident between prefix
-   * runs. The runtime keeps at most `memoryBudgetMb ÷ memoryMb` isolates
-   * alive, evicting the least-recently-used idle instance beyond that.
+   * The runtime's memory mark, in megabytes (#66 — celld's model, one
+   * mark). The runtime watches its own process RSS against it: at/above
+   * the mark it evicts idle warm instances by `heapUsed × idleTime` score
+   * (highest first) AND stops pooling new instances — prefix runs without
+   * an idle instance execute on cold one-off isolates — until RSS falls
+   * back to 80 % of the mark (hysteresis, so eviction doesn't flap).
+   * Reusing an already-warm instance stays allowed under pressure; it adds
+   * no memory. Correctness never depends on warmth; the only observable
+   * cost of eviction is cold-start latency. There is no instance-count
+   * cap — concurrency is bounded by `maxIsolates`, memory by this mark.
    *
-   * The floor is `maxIsolates` — the pool must always be able to run that
-   * many isolates concurrently, so a smaller budget is raised to
-   * `maxIsolates × memoryMb`. Requires a nonzero `memoryMb` (capacity math
-   * needs a per-isolate cap).
+   * `0` disables the mark entirely (nothing bounds warmth then except
+   * `dispose()`). Independent of `memoryMb`: RSS is measured, not derived
+   * from per-isolate caps.
    *
    * Default: the memory available to this process — container/cgroup-aware
    * via `process.constrainedMemory()`, falling back to `os.totalmem()` —
@@ -509,8 +514,8 @@ export interface SandboxStats {
    */
   queueDepth: number
   /**
-   * Resident warm instances — busy plus idle. Bounded by
-   * `maxLiveIsolates`.
+   * Resident warm instances — busy plus idle. Bounded by memory (the RSS
+   * mark), not by a count.
    */
   warmInstances: number
   /**
@@ -523,10 +528,23 @@ export interface SandboxStats {
    */
   idleHeapBytes: number
   /**
-   * The live-isolate cap the runtime enforces:
-   * `max(maxIsolates, memoryBudgetMb ÷ memoryMb)`.
+   * The memory mark the runtime sheds against, in bytes —
+   * `memoryBudgetMb` as the runtime received it. 0 = watermarks disabled.
+   * Utilization is `rssBytes / budgetBytes`.
    */
-  maxLiveIsolates: number
+  budgetBytes: number
+  /**
+   * The runtime process's resident set size in bytes at snapshot time —
+   * the signal the mark acts on. 0 when the platform offers no reader.
+   */
+  rssBytes: number
+  /**
+   * True while the runtime is shedding (#66): RSS reached the budget and
+   * has not yet fallen back to 80 % of it. While shedding, idle instances
+   * are evicted by score and new warm admissions stop (prefix runs without
+   * an idle instance degrade to cold one-off isolates).
+   */
+  underPressure: boolean
   /**
    * Per-prefix instance counts, keyed by prefix id — saturation of a single
    * hot prefix is diagnosable here.

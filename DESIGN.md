@@ -1582,8 +1582,8 @@ automatic — no flag, no separate API, no wire change. The host decides
 nothing; the runtime reuses or cold-starts transparently per `PrefixRun`.
 
 **Contract: warmth is a cache, never a guarantee.** State carryover between
-calls on one instance is permitted but may vanish at any moment (taint, LRU
-eviction, dispose) — the workerd stance. Relying on carryover is an
+calls on one instance is permitted but may vanish at any moment (taint,
+scored eviction, dispose) — the workerd stance. Relying on carryover is an
 antipattern; relying on per-run isolation within one prefix is simply wrong.
 Durable state belongs in the DB; instance memory is only an optimization.
 The supported pattern for expensive setup is **lazy init inside the
@@ -1632,37 +1632,68 @@ impossible, and a uniform cap keeps capacity math `slots × cap`. Heap and
 ArrayBuffer usage accumulate across calls on an instance — hitting the cap
 taints it. Passing the old per-run field throws.
 
-**Capacity (v2, #65) and eviction.** Two independent resources, two knobs.
-`maxIsolates` (the connection pool size) caps **concurrent runs**; the
-**memory budget** (`memoryBudgetMb` on `createSandbox`) caps **live
-isolates** — running plus kept-warm — at `budget ÷ memoryMb`, floored at
-`maxIsolates` so the pool can always run its full complement. The host
-passes the derived cap as `--max-live-isolates`; the registry keeps one
-ledger (idle warm + busy warm + running one-off) against it and evicts the
-least-recently-used **idle** instance beyond it, so idle warm instances can
-outnumber run slots — memory, not slot count, decides how much stays warm.
-Running instances are never evicted; a full ledger always contains an idle
-victim because the cap is never below the pool size. The budget default is
-container-aware: `process.constrainedMemory()` (falling back to
-`os.totalmem()`, which lies in containers) minus a safety net of
-max(512 MB, 25 %) for the Node host, the Rust runtime, and the embedding
-service's own per-isolate state. One-off runs never touch the warm pools
-but share the same ledger (they may evict an idle instance to take a slot).
+**Capacity (v3, #66): one RSS mark, scored eviction — celld's model,
+whole.** Two independent resources, two knobs. `maxIsolates` (the
+connection pool size) caps **concurrent runs**; the **memory budget**
+(`memoryBudgetMb` on `createSandbox`, passed as `--warm-budget-bytes`,
+`0` = disabled) is the ONE memory mark, enforced by the runtime watching
+its **own process RSS** — ground truth, where summed heap numbers
+undercount (external ArrayBuffers, V8 overhead, allocator fragmentation,
+later SQLite), and the number the container OOM killer actually acts on.
+Sampled per registry event (~0.4 µs `task_info` / `statm` read — no
+polling timers), folded through pure decision functions (`policy.rs`, the
+same replaceable-rule style #77 will use):
+
+- **RSS at/above the budget latches shedding**: evict idle instances by
+  `heapUsed × idleTime` score — highest first, ties to the longest-idle —
+  a tenth of the idle population per pass, AND stop pooling NEW instances:
+  a `PrefixRun` without an idle instance runs on a cold one-off isolate
+  (fresh per call, never pooled, one-off accounting); reuse of
+  already-warm instances stays allowed since it adds no memory (celld: a
+  pressured node "may keep serving on the isolates it already has, but
+  must not build another"). Correctness never depends on warmth; no
+  error, no new error code. **No grace period** after last use: the
+  idleTime factor already sends a just-used instance to the back of every
+  pass (celld sheds in plain LRU order for the same reason; recorded
+  on #66).
+- **The latch releases at 4/5 of the budget** — the hysteresis gap that
+  stops evict/admit flapping (celld's ratio).
+- **Futility check**: freed heap returns to the OS lazily, so a pass that
+  left RSS flat (within 5 %) stops the walk instead of evicting the world;
+  the latch holds, and a sample that moves either way re-arms it.
+
+There is deliberately **no instance-count cap** (the #65
+`--max-live-isolates` is gone): celld defaults its resident ceiling to
+unlimited after a default count cap caused eviction churn, and a count
+answers a question ("how many?") that memory pressure — the thing that
+actually kills the process — cannot be read from. Concurrency is bounded
+by the host pool, memory by the mark; running instances are never
+evicted. The budget default is container-aware:
+`process.constrainedMemory()` (falling back to `os.totalmem()`, which lies
+in containers) minus a safety net of max(512 MB, 25 %) for the Node host,
+the Rust runtime, and the embedding service's own per-isolate state — the
+mark then compares the Rust process's own RSS against its own budget, so
+no extra leniency is needed (celld's default ceiling of 80 % of total
+plays the same headroom role). Independent of `memoryMb`: RSS is
+measured, not derived from per-isolate caps. One-off runs never touch the
+warm pools but share the same ledger and pressure checks; they are never
+refused — transient work gives its memory back on its own.
 
 **Saturation and stats (#65).** Saturated run slots always queue FIFO —
 deliberately no per-call policy knobs (fail-fast / max-wait were built and
 removed: every run has wall/CPU limits, so the wait is bounded by the
 running calls themselves, and the knobs only complicated the API). Smarter
 admission is #77's cost model. `sandbox.stats()` returns a point-in-time
-snapshot (active runs,
-queue depth, warm/idle instance counts, summed idle heap, the live cap,
-per-prefix counts) over a **dedicated control connection** outside the run
-pool, so it answers precisely when everything is saturated. `used_heap_size`
-is reported on every `PrefixRun` Result frame (`heapUsedBytes`), so the
-`heapUsed × idleTime` scoring (#66) can replace oldest-first without new
-wire plumbing. Per-prefix fairness caps and the wait-vs-cold-start acquire
-policy are deliberately not here: they are #77's cost model, built on the
-per-prefix busy/idle state the registry now tracks.
+snapshot (active runs, queue depth, warm/idle instance counts, summed idle
+heap, the mark and the signal it acts on (`budgetBytes`/`rssBytes`) and
+the shedding latch (`underPressure`, #66), per-prefix counts) over a
+**dedicated control connection** outside the run pool, so it answers
+precisely when everything is saturated. `used_heap_size` is reported on
+every `PrefixRun` Result frame (`heapUsedBytes`) and feeds the
+`heapUsed × idleTime` victim scoring. Per-prefix fairness caps and the
+wait-vs-cold-start acquire policy are deliberately not here: they are
+#77's cost model, built on the per-prefix busy/idle state the registry
+now tracks.
 
 **Instance pools, not singletons.** The registry maps prefix → pool of
 instances, because the same trigger fires concurrently: a call takes an

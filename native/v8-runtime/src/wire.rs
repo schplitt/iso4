@@ -534,7 +534,9 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
 /// u32   warmBusy
 /// u32   warmIdle
 /// u64   idleHeapBytes
-/// u32   maxLiveIsolates
+/// u64   warmBudgetBytes (the RSS mark; 0 = watermarks disabled, #66)
+/// u64   rssBytes        (0 = unreadable)
+/// u8    underPressure   (1 = shedding latch is held, #66)
 /// u32   prefixCount, then per prefix:
 ///   String  prefixId
 ///   u32     idle
@@ -552,7 +554,9 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
     encode_count(stats.warm_busy, &mut out);
     encode_count(stats.warm_idle, &mut out);
     encode_u64(stats.idle_heap_bytes, &mut out);
-    encode_count(stats.max_live, &mut out);
+    encode_u64(stats.warm_budget_bytes, &mut out);
+    encode_u64(stats.rss_bytes, &mut out);
+    out.push(u8::from(stats.under_pressure));
     encode_count(stats.per_prefix.len(), &mut out);
     for (prefix_id, idle, busy) in &stats.per_prefix {
         encode_string(prefix_id, &mut out);

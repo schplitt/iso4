@@ -671,14 +671,19 @@ class PayloadReader {
   }
 
   /**
-   * Read a `u64` (8 big-endian bytes) as a JS number — the only u64s on the
-   * wire are heap byte counts, far below 2^53.
+   * Read a `u64` (8 big-endian bytes) as a JS number — the u64s on the
+   * wire are byte counts (heap, budget, RSS), far below 2^53. A value
+   * above that is not a real byte count but frame corruption or
+   * misalignment; failing loudly beats returning a silently rounded
+   * number.
    */
   readU64(): number {
     if (this.remaining < 8)
       throw new PayloadDecodeError('unexpected end of payload reading u64')
     const n = this.view.getBigUint64(this.offset, false) // big-endian
     this.offset += 8
+    if (n > BigInt(Number.MAX_SAFE_INTEGER))
+      throw new PayloadDecodeError(`u64 exceeds the JS safe-integer range: ${n}`)
     return Number(n)
   }
 
@@ -691,11 +696,7 @@ class PayloadReader {
     const present = this.readU8()
     if (present === 0)
       return undefined
-    if (this.remaining < 8)
-      throw new PayloadDecodeError('unexpected end of payload reading u64')
-    const n = this.view.getBigUint64(this.offset, false) // big-endian
-    this.offset += 8
-    return Number(n)
+    return this.readU64()
   }
 
   readBool(): boolean {
@@ -1368,9 +1369,20 @@ export interface RuntimeStatsPayload {
    */
   idleHeapBytes: number
   /**
-   * The registry's live-isolate cap (`--max-live-isolates`).
+   * The warm budget in bytes the runtime sheds against (#66);
+   * 0 = watermarks disabled.
    */
-  maxLiveIsolates: number
+  warmBudgetBytes: number
+  /**
+   * The runtime process's resident set size in bytes at snapshot time
+   * (0 when unreadable) — the signal the RSS mark acts on (#66).
+   */
+  rssBytes: number
+  /**
+   * True while the shedding latch is held: RSS reached the budget and has
+   * not yet fallen back to 4/5 of it (#66).
+   */
+  underPressure: boolean
   /**
    * Per-prefix instance counts, sorted by prefix id.
    */
@@ -1386,7 +1398,9 @@ export interface RuntimeStatsPayload {
  * u32   warmBusy
  * u32   warmIdle
  * u64   idleHeapBytes
- * u32   maxLiveIsolates
+ * u64   warmBudgetBytes
+ * u64   rssBytes
+ * u8    underPressure
  * u32   prefixCount, then per prefix:
  *   String  prefixId
  *   u32     idle
@@ -1400,7 +1414,11 @@ export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
   const warmBusy = reader.readU32()
   const warmIdle = reader.readU32()
   const idleHeapBytes = reader.readU64()
-  const maxLiveIsolates = reader.readU32()
+  const warmBudgetBytes = reader.readU64()
+  const rssBytes = reader.readU64()
+  // readBool, not readU8: any byte other than 0/1 here means the frame is
+  // misaligned — fail loudly (strict frame handling on the control path).
+  const underPressure = reader.readBool()
   const prefixCount = reader.readU32()
   const prefixes: RuntimeStatsPayload['prefixes'] = []
   for (let i = 0; i < prefixCount; i++) {
@@ -1410,7 +1428,7 @@ export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
     prefixes.push({ prefixId, idle, busy })
   }
   reader.assertDone()
-  return { oneoffRunning, warmBusy, warmIdle, idleHeapBytes, maxLiveIsolates, prefixes }
+  return { oneoffRunning, warmBusy, warmIdle, idleHeapBytes, warmBudgetBytes, rssBytes, underPressure, prefixes }
 }
 
 export function parseTsToRustMessageType(

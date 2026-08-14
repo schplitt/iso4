@@ -631,7 +631,9 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     warmBusy: number
     warmIdle: number
     idleHeapBytes: number
-    maxLiveIsolates: number
+    warmBudgetBytes: number
+    rssBytes: number
+    underPressure: boolean
     prefixes: { prefixId: string, idle: number, busy: number }[]
   }): Buffer {
     return Buffer.concat([
@@ -639,7 +641,9 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       u32(stats.warmBusy),
       u32(stats.warmIdle),
       u64(stats.idleHeapBytes),
-      u32(stats.maxLiveIsolates),
+      u64(stats.warmBudgetBytes),
+      u64(stats.rssBytes),
+      Buffer.from([stats.underPressure ? 1 : 0]),
       u32(stats.prefixes.length),
       ...stats.prefixes.map((p) => Buffer.concat([str(p.prefixId), u32(p.idle), u32(p.busy)])),
     ])
@@ -651,7 +655,9 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       warmBusy: 2,
       warmIdle: 3,
       idleHeapBytes: 5_000_000_000, // above u32 — exercises the u64 read
-      maxLiveIsolates: 12,
+      warmBudgetBytes: 7_000_000_000, // also above u32 (#66)
+      rssBytes: 6_000_000_000, // also above u32 (#66)
+      underPressure: true,
       prefixes: [
         { prefixId: '0', idle: 2, busy: 1 },
         { prefixId: '1', idle: 1, busy: 1 },
@@ -666,7 +672,9 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       warmBusy: 0,
       warmIdle: 0,
       idleHeapBytes: 0,
-      maxLiveIsolates: 4,
+      warmBudgetBytes: 0,
+      rssBytes: 0,
+      underPressure: false,
       prefixes: [],
     }
     expect(decodeStatsPayload(encodeStatsPayload(snapshot))).toEqual(snapshot)
@@ -678,12 +686,39 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       warmBusy: 0,
       warmIdle: 1,
       idleHeapBytes: 42,
-      maxLiveIsolates: 4,
+      warmBudgetBytes: 42,
+      rssBytes: 42,
+      underPressure: false,
       prefixes: [{ prefixId: '0', idle: 1, busy: 0 }],
     })
     expect(() => decodeStatsPayload(good.subarray(0, good.byteLength - 2)))
       .toThrow(PayloadDecodeError)
     expect(() => decodeStatsPayload(Buffer.concat([good, Buffer.from([0])])))
       .toThrow(PayloadDecodeError)
+  })
+
+  test('rejects an invalid latch byte and an unsafe u64', () => {
+    const good = encodeStatsPayload({
+      oneoffRunning: 0,
+      warmBusy: 0,
+      warmIdle: 0,
+      idleHeapBytes: 0,
+      warmBudgetBytes: 0,
+      rssBytes: 0,
+      underPressure: false,
+      prefixes: [],
+    })
+    // underPressure sits after 3×u32 + 3×u64 = offset 36. Any byte other
+    // than 0/1 there means the frame is misaligned — must fail loudly, not
+    // decode as `false`.
+    const badLatch = Buffer.from(good)
+    badLatch[3 * 4 + 3 * 8] = 2
+    expect(() => decodeStatsPayload(badLatch)).toThrow(PayloadDecodeError)
+
+    // A u64 above 2^53-1 is no real byte count; Number() would silently
+    // round it. rssBytes sits at offset 28.
+    const badU64 = Buffer.from(good)
+    badU64.writeBigUInt64BE(2n ** 60n, 3 * 4 + 2 * 8)
+    expect(() => decodeStatsPayload(badU64)).toThrow(PayloadDecodeError)
   })
 })

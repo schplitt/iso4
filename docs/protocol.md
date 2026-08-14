@@ -850,14 +850,16 @@ snapshot answers even while every run slot is busy.
 
 `StatsPayload`:
 
-| Field             | Encoding            | Notes                                                                             |
-| ----------------- | ------------------- | --------------------------------------------------------------------------------- |
-| `oneoffRunning`   | `u32`               | Running one-off isolates (`Run` frames in flight).                                |
-| `warmBusy`        | `u32`               | Warm instances currently serving a call.                                          |
-| `warmIdle`        | `u32`               | Idle warm instances ready for reuse.                                              |
-| `idleHeapBytes`   | `u64`               | Summed `used_heap_size` of the idle instances, each measured after its last call. |
-| `maxLiveIsolates` | `u32`               | The registry's live-isolate cap (`--max-live-isolates`).                          |
-| `prefixes`        | `List<PrefixStats>` | Per-prefix instance counts, sorted by prefix id.                                  |
+| Field             | Encoding            | Notes                                                                                                  |
+| ----------------- | ------------------- | ------------------------------------------------------------------------------------------------------ |
+| `oneoffRunning`   | `u32`               | Running one-off isolates (`Run` frames in flight).                                                     |
+| `warmBusy`        | `u32`               | Warm instances currently serving a call.                                                               |
+| `warmIdle`        | `u32`               | Idle warm instances ready for reuse.                                                                   |
+| `idleHeapBytes`   | `u64`               | Summed `used_heap_size` of the idle instances, each measured after its last call.                      |
+| `warmBudgetBytes` | `u64`               | The RSS mark the registry sheds against (`--warm-budget-bytes`, #66). 0 = watermarks disabled.         |
+| `rssBytes`        | `u64`               | The runtime process's resident set size at snapshot time; the signal the mark acts on. 0 = unreadable. |
+| `underPressure`   | `u8`                | 1 while the shedding latch is held: RSS reached the budget, not yet back at 4/5 of it (#66).           |
+| `prefixes`        | `List<PrefixStats>` | Per-prefix instance counts, sorted by prefix id.                                                       |
 
 `PrefixStats`:
 
