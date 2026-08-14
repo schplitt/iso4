@@ -1,12 +1,16 @@
 /**
- * Capacity manager acceptance tests (#65).
+ * Capacity manager acceptance tests (#65/#66).
  *
  * Two independent resources, two knobs: `maxIsolates` caps concurrent runs
- * (the connection pool, unchanged), `memoryBudgetMb` caps live isolates —
- * running plus kept-warm — at `budget ÷ memoryMb`, floored at the pool size.
- * Saturation always queues FIFO (no policy knobs — the wait is bounded by
- * the running calls' own limits), and `stats()` reports the registry over a
- * dedicated control connection that never queues behind runs.
+ * (the connection pool, unchanged), `memoryBudgetMb` feeds the RSS
+ * watermarks — the runtime watches its own process RSS against the budget
+ * and evicts idle instances by `heapUsed × idleTime` score above the soft
+ * mark; at the hard mark prefix runs degrade to cold one-off isolates.
+ * The instance-count cap became a generous runaway guard (`budget ÷ 4 MB`,
+ * floored at the pool size). Saturation always queues FIFO (no policy
+ * knobs — the wait is bounded by the running calls' own limits), and
+ * `stats()` reports the registry over a dedicated control connection that
+ * never queues behind runs.
  */
 
 import { totalmem } from 'node:os'
@@ -53,10 +57,12 @@ describe('memory budget → live-isolate cap (#65)', () => {
     expect(a2.value).toBe(2)
   })
 
-  test('an explicit memoryBudgetMb bounds resident instances', async () => {
-    // 256 MB budget ÷ 128 MB cap = 2 live isolates: warming a third prefix
-    // evicts the least-recently-used idle one.
-    await using sandbox = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 256 })
+  test('a healthy explicit budget keeps every prefix resident (#66)', async () => {
+    // Memory, not instance count, decides how much stays warm: with RSS
+    // far below the soft mark of a generous budget, warming a third prefix
+    // evicts nothing — under #65's count model (256 ÷ 128 = 2 slots) prefix
+    // C would have displaced A here.
+    await using sandbox = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 4096 })
     await using prefixA = await sandbox.prepare({ code: COUNTER })
     await using prefixB = await sandbox.prepare({ code: COUNTER })
     await using prefixC = await sandbox.prepare({ code: COUNTER })
@@ -66,21 +72,53 @@ describe('memory budget → live-isolate cap (#65)', () => {
       expect(first.ok && first.value === 1).toBe(true)
     }
 
-    // C displaced A (LRU); B survived within the budget.
-    const b2 = await prefixB.call({ export: 'bump' })
-    expect(b2.ok).toBe(true)
-    if (b2.ok)
-      expect(b2.value).toBe(2)
-    const a2 = await prefixA.call({ export: 'bump' })
-    expect(a2.ok).toBe(true)
-    if (a2.ok)
-      expect(a2.value).toBe(1)
+    // All three counters advance — nothing was evicted.
+    for (const prefix of [prefixA, prefixB, prefixC]) {
+      const second = await prefix.call({ export: 'bump' })
+      expect(second.ok).toBe(true)
+      if (second.ok)
+        expect(second.value).toBe(2)
+    }
+
+    const stats = await sandbox.stats()
+    expect(stats.underPressure).toBe(false)
   })
 
-  test('memoryBudgetMb with uncapped isolates is rejected', async () => {
-    await expect(
-      createSandbox({ memoryMb: 0, memoryBudgetMb: 1024 }),
-    ).rejects.toThrow(/memoryBudgetMb requires a nonzero memoryMb/)
+  test('hard memory pressure degrades prefix runs to cold isolates (#66)', async () => {
+    // A budget far below the process's real footprint pins RSS over the
+    // hard mark from the first sample: nothing may be pooled, every prefix
+    // run gets a fresh cold isolate — calls still succeed, state resets
+    // between calls, and nothing sits idle. Correctness never depends on
+    // warmth. (Do NOT assert RSS drops — freed heap returns to the OS
+    // lazily; that is what the futility check is for.)
+    await using pressured = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 8 })
+    await using prefix = await pressured.prepare({ code: COUNTER })
+
+    const first = await prefix.call({ export: 'bump' })
+    expect(first.ok).toBe(true)
+    if (first.ok)
+      expect(first.value).toBe(1)
+
+    // A warm instance would answer 2 here; a cold one answers 1 again.
+    const second = await prefix.call({ export: 'bump' })
+    expect(second.ok).toBe(true)
+    if (second.ok)
+      expect(second.value).toBe(1)
+
+    const stats = await pressured.stats()
+    expect(stats.underPressure).toBe(true)
+    expect(stats.idleInstances).toBe(0)
+    expect(stats.warmInstances).toBe(0)
+    expect(stats.rssBytes).toBeGreaterThan(8 * 1024 * 1024)
+  })
+
+  test('memoryBudgetMb works with uncapped isolates (#66)', async () => {
+    // Under the count model this combination threw (no per-isolate cap to
+    // divide by). RSS is measured, not derived, so the budget now applies
+    // regardless of memoryMb.
+    await using sandbox = await createSandbox({ memoryMb: 0, memoryBudgetMb: 4096 })
+    const stats = await sandbox.stats()
+    expect(stats.budgetBytes).toBe(4096 * 1024 * 1024)
   })
 
   test('a non-finite memoryBudgetMb is rejected instead of killing the child', async () => {
@@ -106,8 +144,10 @@ describe('memory budget → live-isolate cap (#65)', () => {
       await using sandbox = await createSandbox({ maxIsolates: 2 })
       const stats = await sandbox.stats()
       const totalMb = totalmem() / (1024 * 1024)
-      const expected = Math.max(2, Math.floor((totalMb - Math.max(512, totalMb * 0.25)) / 128))
-      expect(stats.maxLiveIsolates).toBe(expected)
+      // The default budget must be clamped to the host total, not the
+      // sentinel; stats reports it in bytes since #66.
+      const expected = Math.floor(totalMb - Math.max(512, totalMb * 0.25)) * 1024 * 1024
+      expect(stats.budgetBytes).toBe(expected)
     } finally {
       constrained.mockRestore()
     }
@@ -116,15 +156,15 @@ describe('memory budget → live-isolate cap (#65)', () => {
   test('the default budget respects a container memory constraint', async () => {
     // Pretend the process runs in a 2 GB container: constrainedMemory()
     // reports the cgroup limit os.totalmem() cannot see. Budget = 2048 minus
-    // the max(512 MB, 25 %) safety net = 1536 MB → 12 live isolates at the
-    // 128 MB default cap.
+    // the max(512 MB, 25 %) safety net = 1536 MB — the RSS mark the runtime
+    // sheds against (#66).
     const constrained = vi
       .spyOn(process, 'constrainedMemory')
       .mockReturnValue(2 * 1024 * 1024 * 1024)
     try {
       await using sandbox = await createSandbox({ maxIsolates: 2 })
       const stats = await sandbox.stats()
-      expect(stats.maxLiveIsolates).toBe(12)
+      expect(stats.budgetBytes).toBe(1536 * 1024 * 1024)
     } finally {
       constrained.mockRestore()
     }
@@ -167,7 +207,11 @@ describe('stats() (#65)', () => {
     expect(stats.warmInstances).toBe(1)
     expect(stats.idleInstances).toBe(1)
     expect(stats.idleHeapBytes).toBeGreaterThan(0)
-    expect(stats.maxLiveIsolates).toBeGreaterThanOrEqual(2)
+    // #66: the watermark signal is visible — the mark, a real RSS reading,
+    // and no pressure with a healthy default budget on an idle sandbox.
+    expect(stats.budgetBytes).toBeGreaterThan(0)
+    expect(stats.rssBytes).toBeGreaterThan(1024 * 1024)
+    expect(stats.underPressure).toBe(false)
     expect(stats.prefixes[prefix.id]).toEqual({ idle: 1, busy: 0 })
   })
 

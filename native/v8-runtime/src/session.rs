@@ -184,16 +184,15 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// `max_live` is the global cap on live isolates (running + idle warm) —
-    /// the host derives it from its memory budget (`--max-live-isolates`,
-    /// #65) and it is never below the pool size, so the pool can always run
-    /// `maxIsolates` concurrent isolates.
-    pub fn new(token: String, max_live: usize) -> Self {
+    /// `warm_budget_bytes` is the RSS mark the registry sheds against
+    /// (#66) — the memory control; 0 disables it. Concurrency is bounded
+    /// by the host pool; there is no instance-count cap.
+    pub fn new(token: String, warm_budget_bytes: u64) -> Self {
         Self {
             prefix_store: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),
             token,
-            warm: crate::warm::WarmRegistry::new(max_live),
+            warm: crate::warm::WarmRegistry::new(warm_budget_bytes),
         }
     }
 }
@@ -630,18 +629,32 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             payload.globals.len(), prefix_data.declared_imports.len(),
                             payload.call.as_ref().map(|c| c.export_path.as_str()).unwrap_or("-"),
                         );
-                            // ── Warm instance flow (#64) ─────────────────────
+                            // ── Warm instance flow (#64/#66) ─────────────────
                             // Reuse the warmest idle instance of this prefix,
-                            // or take a slot (evicting an idle LRU victim if
-                            // the cap is full) and cold-start a fresh one on
-                            // its own owner thread. The session thread parks
-                            // on the response channel for the duration, so
-                            // the socket has one user at a time.
-                            let handle = match shared.warm.acquire(&payload.prefix_id) {
-                                crate::warm::Acquired::Reused(h) => h,
-                                crate::warm::Acquired::CreateNew => crate::warm::spawn_instance(
-                                    Arc::clone(&prefix_data),
-                                    payload.limits.memory_mb,
+                            // or take a slot (shedding scored victims if the
+                            // RSS watermark demands it) and cold-start a
+                            // fresh one on its own owner thread. At the hard
+                            // watermark the fresh instance is CreateCold: it
+                            // serves this call and is dropped, never pooled —
+                            // correctness never depends on warmth. The
+                            // session thread parks on the response channel
+                            // for the duration, so the socket has one user
+                            // at a time.
+                            let (handle, pooled) = match shared.warm.acquire(&payload.prefix_id) {
+                                crate::warm::Acquired::Reused(h) => (h, true),
+                                crate::warm::Acquired::CreateNew => (
+                                    crate::warm::spawn_instance(
+                                        Arc::clone(&prefix_data),
+                                        payload.limits.memory_mb,
+                                    ),
+                                    true,
+                                ),
+                                crate::warm::Acquired::CreateCold => (
+                                    crate::warm::spawn_instance(
+                                        Arc::clone(&prefix_data),
+                                        payload.limits.memory_mb,
+                                    ),
+                                    false,
                                 ),
                             };
                             let outcome = handle.call(crate::warm::CallJob {
@@ -671,7 +684,12 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             // Both paths hold the prefix_store lock across the
                             // warm-registry call; the lock order is always
                             // prefix_store → warm, so no deadlock.
-                            {
+                            //
+                            // A CreateCold instance never entered a pool, so
+                            // the dispose race cannot touch it: drop the
+                            // handle (the owner thread exits and disposes the
+                            // isolate) and give back the one-off slot.
+                            if pooled {
                                 let store = shared
                                     .prefix_store
                                     .lock()
@@ -684,6 +702,9 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     outcome.heap_used_bytes,
                                     prefix_alive,
                                 );
+                            } else {
+                                drop(handle);
+                                shared.warm.release_oneoff();
                             }
                             match outcome.result {
                                 Ok(output) => {
@@ -823,7 +844,7 @@ mod tests {
     /// payload and return the first frame it writes back (if any).
     fn handshake(payload: Vec<u8>, token: &str) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(token.to_string(), 4));
+        let shared = Arc::new(SharedState::new(token.to_string(), 0));
         let server = std::thread::spawn(move || handle_client(runtime, shared));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)

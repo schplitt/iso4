@@ -152,7 +152,9 @@ export interface SandboxStats {
   warmInstances: number;
   idleInstances: number;
   idleHeapBytes: number;
-  maxLiveIsolates: number;
+  budgetBytes: number;
+  rssBytes: number;
+  underPressure: boolean;
   prefixes: Record<string, {
     idle: number;
     busy: number;

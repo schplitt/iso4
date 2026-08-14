@@ -7,6 +7,8 @@
 
 pub mod blob;
 pub mod ipc;
+pub mod policy;
+pub mod rss;
 pub mod session;
 #[cfg(test)]
 pub mod testval;

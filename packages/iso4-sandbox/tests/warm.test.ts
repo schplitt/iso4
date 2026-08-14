@@ -64,11 +64,13 @@ describe('warm instances (#64)', () => {
     expect(fresh.value).toBe(1)
   })
 
-  test('LRU eviction: another prefix displaces the idle instance', async () => {
-    // The live-isolate cap is budget-derived since #65; pin it to exactly
-    // one instance (128 MB budget ÷ 128 MB cap) so warming B while A idles
-    // must evict A's instance.
-    await using tiny = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 128 })
+  test('no count cap: warming another prefix displaces nothing (#66)', async () => {
+    // The count-based eviction of #64/#65 is gone — celld's stance (their
+    // resident ceiling defaults to unlimited after a default count cap
+    // caused eviction churn). Even with a single run slot and watermarks
+    // explicitly disabled, warming B leaves A resident; only RSS pressure
+    // (capacity.test.ts) or dispose() evicts.
+    await using tiny = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 0 })
     await using prefixA = await tiny.prepare({ code: COUNTER })
     await using prefixB = await tiny.prepare({ code: COUNTER })
 
@@ -78,12 +80,12 @@ describe('warm instances (#64)', () => {
     const b1 = await prefixB.call({ export: 'bump' })
     expect(b1.ok && b1.value === 1).toBe(true)
 
-    // A was evicted for B — its next call cold-starts from n = 0.
+    // A is still warm — its counter advances instead of resetting.
     const a2 = await prefixA.call({ export: 'bump' })
     expect(a2.ok).toBe(true)
     if (!a2.ok)
       return
-    expect(a2.value).toBe(1)
+    expect(a2.value).toBe(2)
   })
 
   test('heapUsedBytes is reported for prefix runs, absent for one-off runs', async () => {

@@ -99,11 +99,7 @@ export type {
 export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> {
   const binaryPath = resolveRuntimeBinary(options)
   const maxIsolates = options?.maxIsolates ?? availableParallelism()
-  const maxLiveIsolates = resolveMaxLiveIsolates(
-    maxIsolates,
-    options?.memoryMb ?? 128,
-    options?.memoryBudgetMb,
-  )
+  const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb)
 
   // Generate a per-process unique socket path and a cryptographically
   // random auth token. Both are passed as CLI args to the Rust binary so
@@ -111,18 +107,17 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const socketPath = join(tmpdir(), `iso4-v8-${process.pid}-${randomUUID().slice(0, 8)}.sock`)
   const token = randomUUID()
 
-  // The runtime needs the pool size (fallback live cap for old hosts) and
-  // the budget-derived live-isolate cap (#65): idle warm instances +
-  // running isolates never exceed `--max-live-isolates`.
+  // The runtime needs exactly one capacity fact: the warm budget in bytes,
+  // the RSS mark it sheds against (#66). Concurrency is bounded by this
+  // host's connection pool; there is no instance-count cap (celld's
+  // stance — their resident ceiling defaults to unlimited).
   const proc = spawn(binaryPath, [
     '--socket',
     socketPath,
     '--token',
     token,
-    '--max-isolates',
-    String(maxIsolates),
-    '--max-live-isolates',
-    String(maxLiveIsolates),
+    '--warm-budget-bytes',
+    String(warmBudgetBytes),
   ], {
     // stdin closed, stdout ignored, stderr forwarded so runtime diagnostics
     // (the [iso4-v8] lines) appear in the host process's stderr.
@@ -169,44 +164,26 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
 }
 
 /**
- * The live-isolate cap the runtime enforces (#65): how many isolates —
- * running plus kept warm — the memory budget allows, never below the pool
- * size (the pool must be able to run `maxIsolates` concurrent isolates).
- * With `memoryMb: 0` (uncapped isolates) capacity math is impossible, so
- * the cap stays at the pool size — the #64 behavior.
- * @param maxIsolates the connection-pool size (concurrent-run cap)
- * @param memoryMb the uniform per-isolate heap cap
- * @param memoryBudgetMb the explicit budget knob, or undefined for the default
+ * The warm budget in bytes — the ONE capacity fact the runtime needs
+ * (#66, celld's model): the RSS mark it sheds against, `0` = disabled.
+ * Independent of `memoryMb`: RSS is measured, not derived from per-isolate
+ * caps, so an uncapped-heap sandbox is budgeted all the same.
+ * @param memoryBudgetMb the explicit budget knob (`0` opts out of
+ * watermarks entirely, like celld's `CELLD_MAX_RSS_MB=0`), or undefined
+ * for the container-aware default
  */
-function resolveMaxLiveIsolates(
-  maxIsolates: number,
-  memoryMb: number,
-  memoryBudgetMb: number | undefined,
-): number {
+function resolveWarmBudgetBytes(memoryBudgetMb: number | undefined): number {
   if (memoryBudgetMb !== undefined && !Number.isFinite(memoryBudgetMb)) {
-    // Infinity/NaN would reach the child as `--max-live-isolates Infinity`,
+    // Infinity/NaN would reach the child as `--warm-budget-bytes Infinity`,
     // kill it at arg parsing, and surface as an unrelated socket timeout.
     throw new TypeError(
       '[@iso4/sandbox] memoryBudgetMb must be a finite number of megabytes',
     )
   }
-  if (memoryMb === 0) {
-    if (memoryBudgetMb !== undefined) {
-      throw new TypeError(
-        '[@iso4/sandbox] memoryBudgetMb requires a nonzero memoryMb: the '
-        + 'live-isolate cap is memoryBudgetMb ÷ memoryMb, so uncapped '
-        + 'isolates leave nothing to divide by',
-      )
-    }
-    return maxIsolates
-  }
   const budgetMb = memoryBudgetMb ?? defaultMemoryBudgetMb()
-  // The cap crosses the wire as a u32; saturate instead of letting an
-  // absurd budget wrap (a multiple of 2^32 would truncate to 0).
-  return Math.min(
-    Math.max(maxIsolates, Math.floor(budgetMb / memoryMb)),
-    0xFF_FF_FF_FF,
-  )
+  // The budget crosses the wire as a u64 — safe-integer range is the
+  // practical bound; clamp negatives (a nonsense budget) to 0 = disabled.
+  return Math.max(0, Math.floor(budgetMb * 1024 * 1024))
 }
 
 /**
@@ -396,7 +373,9 @@ class SandboxImpl implements Sandbox {
       warmInstances: raw.warmBusy + raw.warmIdle,
       idleInstances: raw.warmIdle,
       idleHeapBytes: raw.idleHeapBytes,
-      maxLiveIsolates: raw.maxLiveIsolates,
+      budgetBytes: raw.warmBudgetBytes,
+      rssBytes: raw.rssBytes,
+      underPressure: raw.underPressure,
       prefixes: Object.fromEntries(
         raw.prefixes.map((p) => [p.prefixId, { idle: p.idle, busy: p.busy }]),
       ),

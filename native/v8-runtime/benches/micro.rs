@@ -396,6 +396,57 @@ fn make_snapshot_blob() -> Vec<u8> {
         .to_vec()
 }
 
+// ── policy: eviction scoring + watermark verdict (#66) ─────────────────────
+//
+// These run inside the registry lock on acquire/release, so their cost is
+// hot-path cost. `watermark_action` is the per-event constant price (target
+// ~ns — it is a handful of integer compares); `pick_victim` is paid only
+// when a pass actually evicts, scaling with the idle population. CodSpeed
+// tracks both so a policy change that regresses the per-call tax or the
+// shed-pass walk shows up as a PR diff.
+
+fn bench_policy(c: &mut Criterion) {
+    use iso4_v8_runtime::policy::{
+        pick_victim, watermark_action, PassOutcome, PressureFacts, VictimFact,
+    };
+    use std::time::Instant;
+
+    let mut group = c.benchmark_group("policy");
+    let now = Instant::now();
+
+    for count in [16usize, 256, 1024] {
+        // Deterministic spread of heap sizes and ages — mulberry32, same
+        // generator as the payload fixtures.
+        let mut rand = prng(0xEC1C_7100 + count as u32);
+        let idle: Vec<VictimFact> = (0..count)
+            .map(|_| VictimFact {
+                heap_used_bytes: (rand() * 128.0 * 1024.0 * 1024.0) as u64,
+                last_used: now - Duration::from_micros((rand() * 60_000_000.0) as u64),
+            })
+            .collect();
+        group.bench_with_input(
+            BenchmarkId::new("pick_victim", count),
+            &idle,
+            |b, idle| b.iter(|| black_box(pick_victim(black_box(idle), now))),
+        );
+    }
+
+    let facts = PressureFacts {
+        rss_bytes: 900 * 1024 * 1024,
+        budget_bytes: 1024 * 1024 * 1024,
+        was_shedding: true,
+        last_pass: Some(PassOutcome {
+            rss_at_pass: 950 * 1024 * 1024,
+        }),
+        idle_count: 256,
+    };
+    group.bench_function("watermark_action", |b| {
+        b.iter(|| black_box(watermark_action(black_box(&facts))));
+    });
+
+    group.finish();
+}
+
 // ── Criterion config ───────────────────────────────────────────────────────
 
 fn configured() -> Criterion {
@@ -419,6 +470,6 @@ fn configured() -> Criterion {
 criterion_group! {
     name = benches;
     config = configured();
-    targets = bench_v8_value, bench_exec
+    targets = bench_v8_value, bench_exec, bench_policy
 }
 criterion_main!(benches);
