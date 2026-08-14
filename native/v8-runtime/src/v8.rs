@@ -738,8 +738,11 @@ pub fn execute_with_prefix(
 /// (syntax error, unresolved import, throwing top-level code) before any run
 /// pays for it.
 ///
-/// No execution-time limits are applied: prefix code is host-authored and
-/// trusted. Runs re-evaluate the prefix under their own limits.
+/// The caller's per-run limits do not apply — prefix code is host-authored —
+/// but validation is not unbounded: it runs under the same heap cap as a real
+/// instance and the fixed warm-up budget (`WARMUP_WALL_MS` / `WARMUP_CPU_MS`,
+/// #64), so a looping or heap-hungry prefix fails here instead of on every
+/// cold start.
 pub fn precompile(
     code: &str,
     filename: Option<&str>,

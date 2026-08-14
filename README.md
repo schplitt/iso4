@@ -18,7 +18,8 @@ executes the postfix and gets a result. The host wants:
 
 - Hard limits on memory and active execution time per run.
 - Fine control over which URLs and which modules the sandbox can reach.
-- Sub-5 ms cold start for typical prefixes (validated once, evaluated per run).
+- Sub-5 ms cold start for typical prefixes — and sub-millisecond calls once a
+  warm instance of that prefix is resident.
 - A small, auditable runtime — no Node-stdlib emulation, no kernel, no virtual POSIX.
 
 ## Quick example
@@ -135,6 +136,9 @@ pnpm changeset          # record a per-package version bump
 - Bridge call limits — `maxBridgeCalls`, `maxBridgeCallBytes`, `maxExportBytes` per run ✅
 - Host → sandbox calls — `prefix.call({ export, args })` / `run({ code, call })` invoke exported handlers (`default.fetch`, named) with real typed arguments ✅
 - `sandbox.readExports()` — deploy-path declaration reader; non-serializable exports skipped and reported via `skippedExports` ✅
+- Warm instances — prefix runs reuse resident isolates and skip boot + prefix evaluation; a transparent cache, discarded on any fired limit, abort, or dispose ✅
+- Memory-bounded residency — `memoryBudgetMb` is an RSS mark for the runtime process: idle instances are evicted by `heapUsed × idleTime` and new warmth is refused above it, with no instance-count cap ✅
+- `sandbox.stats()` — active runs, queue depth, warm/idle counts, idle heap, budget/RSS, pressure latch, per-prefix counts, answered on a dedicated connection ✅
 - `@iso4/fetch` — rules-based origin + route allowlist, three-level middleware, DNS pinning, SSRF/redirect protection ✅
 
 ## How globals work
