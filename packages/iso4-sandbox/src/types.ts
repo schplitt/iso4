@@ -3,10 +3,11 @@
  * \@iso4/sandbox — public API types.
  *
  * Execution model: prepare a prefix once (validated and cached by the
- * then call prefix.run({ code }) for each piece of dynamic code (e.g.
  * runtime), then run many dynamic postfixes against it (typically
- * agent-generated). Each call gets a fresh isolate; the prefix is
- * re-evaluated into it before the postfix runs.
+ * agent-generated) with `prefix.execute({ code })` or invoke one of its
+ * exports with `prefix.call({ export, args })`. Prefix runs are served by
+ * resident warm instances, which skip isolate boot and prefix evaluation on
+ * reuse; a one-off `sandbox.run({ code })` always gets a fresh isolate.
  * Multiple concurrent callers each get their own pool slot and run in
  * parallel. See DESIGN.md §1 and §13.
  */
@@ -440,7 +441,9 @@ export interface SandboxOptions {
    *
    * This caps *concurrent runs* only. How many isolates stay resident
    * (warm instances included) is the memory budget's job — see
-   * `memoryBudgetMb` (#65) — and is never below this number.
+   * `memoryBudgetMb`. There is no instance-count cap of any kind (#66), so
+   * idle warm instances may outnumber the slots here, or fall below them
+   * under memory pressure.
    *
    * Defaults to `os.availableParallelism()`.
    */
@@ -485,6 +488,13 @@ export interface SandboxOptions {
    * minus a safety net of max(512 MB, 25 %) for the Node host, the Rust
    * runtime, and whatever the embedding service keeps in memory per isolate.
    * Services with a large per-isolate host cache should set this lower.
+   * On a host too small for that subtraction the default floors at 64 MB
+   * (with a warning on stderr) rather than reaching 0 and disabling the
+   * mark: memory-starved hosts get aggressive eviction, never no protection.
+   * The floor applies to the default only — an explicit `0` still opts out.
+   * Explicit values are clamped to `Number.MAX_SAFE_INTEGER` bytes (above
+   * that the byte math stops being exact) and a negative value to `0`; a
+   * non-finite one throws.
    */
   memoryBudgetMb?: number
 
@@ -1049,7 +1059,16 @@ export interface RunSuccess {
    * (#58); the names are reported here so nothing is silently hidden.
    */
   skippedExports: string[]
+  /**
+   * Lines this run wrote to `console.log` / `.debug` / `.info`, capped by
+   * `limits.maxStdoutBytes`. Prefix code shares the same console: when a run
+   * cold-starts a warm instance, what the prefix logged while evaluating
+   * arrives here once, on that run's result, ahead of the run's own lines.
+   */
   stdout: string[]
+  /**
+   * Same as {@link RunSuccess.stdout}, for `console.warn` / `.error`.
+   */
   stderr: string[]
   /**
    * Wall-clock time of the run (start of execution to result), measured in

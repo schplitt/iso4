@@ -148,7 +148,7 @@ host hands it over by name.
   │   Application code                                      │    
   │      │                                                  │    
   │      ▼                                                  │    
-  │   @iso4/host (this package, TypeScript)                 │    
+  │   @iso4/sandbox (this package, TypeScript)              │    
   │      ├─ spawns the Rust V8 binary once per process       │   
   │      ├─ multiplexes runs onto isolates via UDS           │   
   │      ├─ owns the imports/globals registry per-run        │   
@@ -210,17 +210,20 @@ Every call to `runtime.run(opts)`:
    `v8::Isolate` with the configured heap limit and custom array-buffer
    allocator.
 3. Rust creates a fresh `v8::Context`. Installs only deliberate runtime-owned
-   globals. Log capture (`console.*`) is a separate design item and must not be
-   smuggled in as an ad-hoc inline prelude. Host-configured globals/functions
-   are installed through the bridge surface declared by the host.
+   globals, including the `console` shim (`log`/`debug`/`info` → stdout,
+   `warn`/`error` → stderr), which is a native V8 callback writing into
+   per-run buffers — never an inline JS prelude. Host-configured
+   globals/functions are installed through the bridge surface declared by the
+   host.
 4. Rust compiles `opts.code` as a `v8::Module` (always ESM) using a module
    resolver that:
    - Looks up each `import` specifier in the host's `imports` map.
    - For source modules: compiles and caches the `v8::Module`.
    - For host-implemented modules: builds a synthetic module whose
      exports are stubs that bridge to the host.
-5. Rust evaluates the module. Top-level `await` works. (In a prefix at
-   `prepare()` time it works as long as it settles without host I/O — see
+5. Rust evaluates the module. Top-level `await` works. (In a prefix it works
+   as long as the evaluation promise settles without host I/O — the same rule
+   at `prepare()` validation and at every prefix evaluation afterwards; see
    §11.3.)
 6. Once evaluation settles, Rust copies the module namespace into a plain
    object and serializes it **once** as a V8 blob — `default` and every named
@@ -239,7 +242,7 @@ Every call to `runtime.run(opts)`:
 | Source modules (Flavor B)           | Compiled into V8, runs in-isolate                     |
 | Host-implemented modules (Flavor A) | Stubs in V8 call across bridge → host                 |
 | `fetch`                             | Stub in V8, host implements with permission check     |
-| `console.*`                         | Captured in Rust, streamed back as stdout/stderr      |
+| `console.*`                         | Captured in Rust, returned with the run's `Result`    |
 | Result serialization                | V8 serialization blob (Rust side), data only          |
 
 ---
@@ -822,26 +825,40 @@ direction. Both tables start at `0x01`.
 
 **TS → Rust**
 
-| Byte   | Name             | Purpose                                            |
-| ------ | ---------------- | -------------------------------------------------- |
-| `0x01` | `Authenticate`   | First message on connect: protocol version + token |
-| `0x02` | `Run`            | Start a sandboxed execution                        |
-| `0x03` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                  |
-| `0x04` | `Terminate`      | Ask Rust to abort a running run and reply with an `ERR_ABORTED` result (§14.7) |
+| Byte   | Name             | Purpose                                                                |
+| ------ | ---------------- | ---------------------------------------------------------------------- |
+| `0x01` | `Authenticate`   | First message on connect: protocol version + V8 format probe + token   |
+| `0x02` | `Run`            | Start a sandboxed execution in a fresh isolate                         |
+| `0x03` | `Precompile`     | Validate prefix code and store it under a `PrefixId`                   |
+| `0x04` | `PrefixRun`      | Execute against a prepared prefix (served by a warm instance, §13.2.1) |
+| `0x05` | `DisposePrefix`  | Drop a stored prefix and its instances                                 |
+| `0x06` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                                      |
+| `0x07` | `Terminate`      | Abort a running run; Rust replies with an `ERR_ABORTED` result (§14.7) |
+| `0x08` | `Stats`          | Ask for a registry snapshot (empty payload, #65)                       |
+
+Next free TS → Rust byte: `0x09`.
 
 **Rust → TS**
 
-| Byte   | Name         | Purpose                                             |
-| ------ | ------------ | --------------------------------------------------- |
-| `0x01` | `BridgeCall` | Sandbox called `fetch` or a host-module function    |
-| `0x02` | `StdioChunk` | Eager `console.*` output (stdout or stderr)         |
-| `0x03` | `Result`     | Final result for a `Run` (always sent exactly once) |
-| `0x04` | `Log`        | Internal runtime diagnostics                        |
+| Byte   | Name               | Purpose                                                |
+| ------ | ------------------ | ------------------------------------------------------ |
+| `0x01` | `BridgeCall`       | Sandbox called `fetch` or a host-module function       |
+| `0x02` | `Result`           | Final result for a run (always sent exactly once)      |
+| `0x03` | `PrecompileResult` | Outcome of a `Precompile` (prefix id or error)         |
+| `0x04` | `Log`              | Internal runtime diagnostics                           |
+| `0x05` | `Hello`            | Handshake accepted: protocol version + V8 format probe |
+| `0x06` | `StatsResult`      | The registry snapshot answering a `Stats` request      |
+
+Next free Rust → TS byte: `0x07`.
+
+There is **no `StdioChunk` frame**: `console.*` output is buffered in the
+runtime and rides inside the `Result` frame, so a run's stdout/stderr arrive
+with its outcome rather than eagerly.
 
 ### 6.3 Payload encoding
 
 Structured data (arguments, results, exports) uses V8 serialization blobs
-(`docs/protocol.md` §4). Raw bytes for stdio chunks. Plain UTF-8 for log
+(`docs/protocol.md` §4). Plain UTF-8 for captured stdout/stderr lines and log
 strings.
 
 ### 6.4 Session lifecycle and concurrency
@@ -859,23 +876,25 @@ Runtime (TypeScript)
   ...up to maxIsolates
 ```
 
-When `prefix.run()` or `runtime.run()` is called:
+When `prefix.execute()` or `sandbox.run()` is called:
 
 1. Claim a free slot from the pool (or queue if all slots are busy).
-2. Send `Run` on that slot's connection.
-3. Receive `StdioChunk` / `BridgeCall` / `BridgeResponse` frames until
-   `Result` arrives.
+2. Send `Run` (one-off) or `PrefixRun` (prepared prefix) on that slot's
+   connection.
+3. Exchange `BridgeCall` / `BridgeResponse` frames until `Result` arrives.
 4. Resolve the caller's Promise and release the slot back to the pool.
 
-This means five agents calling `prefix.run()` simultaneously each get their
-own connection slot and run truly in parallel on separate isolate threads
-inside the Rust process — the fifth call does not wait on the first.
+This means five agents calling `prefix.execute()` simultaneously each get
+their own connection slot and run truly in parallel on separate isolate
+threads inside the Rust process — the fifth call does not wait on the first.
 
-`maxIsolates` in `SandboxOptions` controls the pool ceiling.
-Additional callers queue behind it (backpressure). The Rust process
-spawns one OS thread per active isolate and enforces the same ceiling
-server-side; connection N+1 from an overloaded client is accepted but
-queued until a thread is free.
+`maxIsolates` in `SandboxOptions` controls the pool ceiling. Additional
+callers queue behind it (backpressure). The ceiling is the host's alone: the
+Rust process takes no concurrency flag and accepts every connection it is
+given, spawning one OS thread per active isolate. The runtime bounds
+*memory*, not connection count — see §13.2.1. Outside the pool the host keeps
+one dedicated control connection for `Stats`, so a snapshot answers while
+every run slot is busy.
 
 `BridgeCall` / `BridgeResponse` pairs are sequential **within a single
 run** in v1: Rust sends one `BridgeCall`, waits for `BridgeResponse`,
@@ -912,9 +931,12 @@ Documented up front so we don't drift into rebuilding secure-exec:
 
 5. **No WebAssembly.** `set_allow_wasm_code_generation_callback(_ => false)`.
 
-6. **No shared state between runs.** Each `run()` is a fresh `v8::Context`.
-   Module compilation is cached by the runtime for perf; module _state_
-   (singletons, top-level variables) is not.
+6. **No shared state between runs — as a contract.** One-off `sandbox.run()`
+   is always a fresh `v8::Context`, and no run may *depend* on state left by
+   another. Prefix runs are served by warm instances, so state can in fact
+   survive between calls on one instance as a cache that may vanish at any
+   moment; the contract, the concurrency rule (one call at a time per
+   instance), and the supported lazy-init pattern are §13.2.1.
 
 7. **No filesystem.** No FS module is provided. If host code wants to expose
    read-only files, it does so via a custom import.
@@ -933,41 +955,41 @@ Documented up front so we don't drift into rebuilding secure-exec:
 
 ## 8. Project layout
 
-Monorepo with pnpm workspaces. The canonical breakdown lives in
-The short version:
+Monorepo with pnpm workspaces:
 
 ```
 iso4/
-  DESIGN.md                         ← this file
-
-  packages/iso4-sandbox/src/types.ts ← canonical API shapes for @iso4/sandbox
-  packages/iso4-sandbox/src/types.ts    ← shared types (@iso4/sandbox)
+  DESIGN.md                         ← this file (the design contract)
+  docs/protocol.md                  ← the canonical wire reference
   pnpm-workspace.yaml
   packages/
-    iso4/                           ← the runtime: createSandbox, run, precompile
+    iso4-sandbox/                   ← @iso4/sandbox — createSandbox, prepare, run
+      src/types.ts                  ← canonical API shapes for @iso4/sandbox
     iso4-fetch/                     ← @iso4/fetch — hardened fetch helpers
-    iso4-fs/                        ← @iso4/fs    — (future) node:fs stub factory
-    iso4-crypto/                    ← @iso4/crypto (future) node:crypto stub factory
     iso4-v8-darwin-arm64/           ← @iso4/v8-darwin-arm64 — native Rust binary
-    iso4-v8-linux-x64-gnu/          ← (additional platforms added as needed)
-    ...
+    iso4-v8-darwin-x64/             ← (one package per supported platform;
+    iso4-v8-linux-arm64-gnu/           binaries are built in CI, not committed)
+    iso4-v8-linux-x64-gnu/
+    iso4-fs/, iso4-crypto/          ← (future) node:* stub factories
   native/
     v8-runtime/                     ← Rust source for the V8 host binary
 ```
 
 Target sizes (when complete):
 
-- `iso4`: <1500 LoC TypeScript.
+- `@iso4/sandbox`: <1500 LoC TypeScript.
 - `@iso4/fetch`: <500 LoC TypeScript.
-- `@iso4/sandbox/v8-runtime`: <3000 LoC Rust.
+- `native/v8-runtime`: <3000 LoC Rust.
 - JS injected into each isolate: <300 LoC.
 
 ---
 
 ## 9. Phased build plan
 
-Reordered so the snapshot-based prefix mechanism lands early — it's the
-feature most users will rely on and shapes the IPC protocol.
+Reordered so the prefix mechanism lands early — it's the feature most users
+will rely on and shapes the IPC protocol. (It shipped as V8 startup
+snapshots and was later replaced by per-run prefix evaluation, §11.6, then by
+warm instances, §13.2.1; the phase order is unchanged.)
 
 | Phase  | Scope                                                                                                                                     | Deliverable                                                                |
 | ------ | ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
@@ -979,8 +1001,8 @@ feature most users will rely on and shapes the IPC protocol.
 | 5 ✅   | `@iso4/fetch` package: `createSafeFetch` with allowlist, DNS pin, private-IP blocking, no-auto-redirect                                   | Hardened default users can opt into in two lines                           |
 | 6 ✅   | Imports: source modules (Flavor B); host-supplied ESM strings compiled per-isolate. No separate code-cache LRU — the stored prefix is the cache.   | `import { add } from "lib:math"` works when the host declares the source     |
 | 7 ✅   | Imports: host modules — host provides a JS object; the shape crosses the wire as plain data and the Rust runtime builds the module natively (data leaves via the value codec, function leaves as trampolines dispatching `BridgeCall { targetKind: 1 }` with runtime-resolved names). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for arbitrarily-nested mixed data/function shapes; bridge records report `host:tools.search` with no client-side name resolution |
-| 8     | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
-| 9     | Pre-warmed isolate pool (optional, behind a runtime option)                                                                               | Sub-2ms cold start for high-throughput workloads                           |
+| 8 ✅   | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
+| 9 ✅   | Resident warm instances per prefix — registry, taint-and-evict, memory budget, eviction scoring (epic #61; shipped as always-on, not behind an option — §13.2.1) | Sub-ms warm calls for high-throughput workloads                            |
 | 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |
 | 11    | **Sync bridge calls.** Per-leaf sync tag on the wire shape; the runtime builds a sync trampoline (`__iso4_call_sync`, blocks the isolate on UDS read) instead of the async one. Leaf classification + the opt-in-vs-auto policy question are covered in the §4.3 "sync function leaves" note. CPU budget bracketed; wall guard preempts via `terminate_execution`. | `import { readFileSync } from "host:fs"` works without `await`. Foundational for a future node-compat layer. |
 | 12    | ~~Native host-module binding.~~ Superseded by #37: host modules already cross as data and are built natively by the runtime, which owns the handle table and emits `BridgeCall { targetKind: 1 }` with resolved names. Full synthetic modules remain deliberately unused (native evaluation-steps pointers would need external-reference bookkeeping to survive prefix snapshots). | — |
@@ -1067,24 +1089,33 @@ To be resolved as we build, not blocking the start:
   size = `maxIsolates` (default: CPU count). This is required for MCP
   multi-agent parallelism.
 
-- **How aggressive should the export validator be?** Strict-throw on
-  functions is a hard requirement. Question: do we also throw on
-  unresolved Promises, or just await them once at the top level? Current
-  lean: throw, force the user to await before exporting.
+- ~~**How aggressive should the export validator be?**~~ **Resolved and
+  shipped** (#58): neither answer won. A value that cannot cross — a
+  function, a class, a Promise still pending — is **skipped, never fatal**:
+  it is absent from `exports` and its name is listed in `skippedExports`, so
+  `export default { fetch }` alongside plain declarations reads cleanly.
+  What still fails a run: the size cap (`ERR_EXPORT_TOO_LARGE`), and a
+  non-clonable value in a slot that has no "skip" option —
+  `ERR_EXPORT_NOT_SERIALIZABLE` covers a `prefix.call()` return value or a
+  bridge value.
 
-- **How exactly should logs/stdout/stderr be captured?**
-  Log handling is deliberately deferred. Options include native V8 callbacks,
-  a small owned shim installed by the runtime, eager `StdioChunk` frames, or
-  buffered output returned with `Result`. Do not add an ad-hoc inline JS
-  prelude while this is unresolved. Current lean: eager, frame-per-write,
-  with a 1 MB cap per stream, but this still needs an explicit implementation
-  decision.
+- ~~**How exactly should logs/stdout/stderr be captured?**~~ **Resolved and
+  shipped** (Phase 1): the runtime installs a `console` object built from
+  native V8 callbacks — `log`/`debug`/`info` to stdout, `warn`/`error` to
+  stderr — that appends formatted lines to per-run buffers. No inline JS
+  prelude, and no eager `StdioChunk` frames: the buffers are **returned with
+  the `Result`** frame, capped per stream by `limits.maxStdoutBytes` /
+  `limits.maxStderrBytes`. Caps are per call, also on a warm instance.
+  `console.*` written by *prefix* code is covered in §13.2.1.
 
-- **Prefix store LRU cap.** Prepared prefixes (source + declared shape)
-  live in the Rust process's memory, typically a few KB each. Default cap:
-  100 prefixes, LRU evicted.
-  Configurable via `SandboxOptions.maxPrecompiledPrefixes`. Evicted handles
-  fail `.run()` with `ERR_PREFIX_DISPOSED`; the host re-precompiles.
+- **Prefix store LRU cap.** Still open, still unimplemented: prepared
+  prefixes (source + declared shape) live in the Rust process's memory,
+  typically a few KB each, in an unbounded map that only `prefix.dispose()`
+  removes from. A cap (sketched as 100 prefixes, LRU evicted, configurable
+  via `SandboxOptions.maxPrecompiledPrefixes`) would make evicted handles
+  fail with `ERR_PREFIX_DISPOSED` and force the host to re-prepare. Note that
+  the *instances* of a prefix are already bounded by the memory mark
+  (§13.2.1) — this question is only about the stored source.
 
 - **Mandate `createSafeFetch` or recommend it?** The core `iso4` package's
   `fetch` field accepts any `FetchHandler`. The library does mechanical
@@ -1124,12 +1155,16 @@ For an interactive agent doing N tool calls per turn, that compounds badly.
 
 ### 11.2 What we do about it
 
-`Runtime.precompile()` validates the prefix once (compile + instantiate +
+`sandbox.prepare()` validates the prefix once (compile + instantiate +
 evaluate in a throwaway isolate) and stores its source and declared shape in
-the Rust process. `prefix.run()` boots a fresh isolate from V8's stock
-snapshot, re-evaluates the prefix, then runs the postfix. The expensive,
-error-prone part of the loop — authoring and validating the setup — is paid
-once; runs pay only the evaluation.
+the Rust process. A cold `prefix.execute()` boots a fresh isolate from V8's
+stock snapshot, re-evaluates the prefix, then runs the postfix. The
+expensive, error-prone part of the loop — authoring and validating the setup
+— is paid once; runs pay only the evaluation.
+
+Since #64 that per-run evaluation is itself skipped whenever an idle warm
+instance of the prefix is available: the flow below is what a **cold start**
+costs, and §13.2.1 is what happens on reuse.
 
 Flow:
 
@@ -1149,10 +1184,11 @@ Flow:
 ```
 
 Steady-state cold start target (after the first call): **<5 ms** from
-`prefix.run()` to user code executing, for typical (small) prefixes. Run
-cost grows with prefix size — a prefix that takes 20 ms to evaluate costs
-every run 20 ms. Heavy prefixes are the domain of the resident-isolate
-model (§11.6, epic #61).
+`prefix.execute()` to user code executing, for typical (small) prefixes.
+Cold-start cost grows with prefix size — a prefix that takes 20 ms to
+evaluate costs 20 ms on every cold start. Heavy prefixes are the reason for
+the resident-isolate model (§13.2.1, epic #61), which pays that cost once per
+instance instead of once per run.
 
 ### 11.3 The prefix contract
 
@@ -1184,6 +1220,13 @@ sees is exactly what the prefix produces deterministically:
     be referenced, stashed, or closed over, but calling it fails with
     `ERR_PREFIX_BRIDGE_CALL`. Whether prefix-stage bridge calls ever become
     supported is a deliberate future decision; the error code is the gate.
+  - `console.*` in prefix code works and is captured, but *where it lands*
+    depends on the stage: at `prepare()` validation the output is discarded
+    (that isolate is a throwaway and `prepare()` returns no streams), while
+    the output of the evaluation that warms an instance is delivered once, on
+    the result of the call that paid for the cold start (§13.2.1). Whether
+    that is the right contract is GH #86; the behavior above is what ships
+    today.
   - A nondeterministic prefix (`Math.random()`, `Date.now()`) produces
     per-run state that differs between runs — validated once, evaluated
     many times. This was impossible in the snapshot era and is permitted
@@ -1211,17 +1254,22 @@ If the prefix declared a global the run doesn't supply, the precompile-time
 implementation is reused. This makes it easy to provide a default at
 precompile time and override only when needed per run.
 
-### 11.5 Pool of pre-warmed isolates (phase 9)
+### 11.5 Pool of pre-warmed isolates (phase 9 — shipped as warm instances)
 
 Isolate boot + prefix evaluation costs low single-digit ms for typical
-prefixes. For high-throughput workloads we keep a pool of N already-warm
-isolates per prepared prefix, sitting idle until a run grabs one. Pool
-size, eviction policy, and warmup-on-prepare are all `SandboxOptions`.
+prefixes, which is plenty for interactive agents but not for sub-millisecond
+or heavy-prefix workloads. Epic #61 shipped the answer: a registry of
+resident **warm instances** per prepared prefix — idle isolates with the
+prefix already evaluated, taken by the next `PrefixRun` and skipping boot and
+evaluation entirely.
 
-Not in v1. Per-run evaluation keeps steady-state cold start under 5 ms for
-typical prefixes, which is plenty for interactive agents. Warm isolates are
-the answer for sub-millisecond requirements and heavy prefixes — tracked as
-epic #61 (registry + taint-and-evict + capacity manager + eviction scoring).
+It differs from the pool sketched here in two ways, both deliberate:
+**nothing is pre-warmed** (an instance is created by the first call that
+needs one, so no isolate is paid for before it is used), and **there are no
+pool knobs** — no size, no maximum, no eviction timeout, no
+warmup-on-prepare. The only capacity knob is the memory budget, and
+residency follows memory pressure rather than a configured count. The full
+contract, threading, taint rules, and pressure model are §13.2.1.
 
 ### 11.6 Decision record: why there is no runtime snapshotting
 
@@ -1544,22 +1592,28 @@ Pool semantics:
 This is the session analogue of Phase 9's pre-warmed isolate pool for
 one-shot runs.
 
-**Wire protocol additions (two-process backend, Phase 11):**
+**Wire protocol additions (historical sketch — DEAD BYTES, do not size new
+frames from this table):** the numbers below were chosen when `0x05`–`0x07`
+were free. They are **not** allocated to these messages: `0x05`/`0x06`/`0x07`
+TS→Rust are `DisposePrefix`/`BridgeResponse`/`Terminate` and `0x05`/`0x06`
+Rust→TS are `Hello`/`StatsResult` (§6.2 has the live tables and the next free
+byte in each direction). If a session-like API is ever built, it allocates
+fresh bytes from there.
 
-TS→Rust:
+TS→Rust (never implemented):
 
-| Byte   | Name           | Payload                           |
-| ------ | -------------- | --------------------------------- |
-| `0x05` | `OpenSession`  | `u32` prefix-id                   |
-| `0x06` | `Call`         | UTF-8 fn name + V8-serialized arg |
-| `0x07` | `CloseSession` | _(empty)_                         |
+| Byte           | Name           | Payload                           |
+| -------------- | -------------- | --------------------------------- |
+| ~~`0x05`~~ n/a | `OpenSession`  | `u32` prefix-id                   |
+| ~~`0x06`~~ n/a | `Call`         | UTF-8 fn name + V8-serialized arg |
+| ~~`0x07`~~ n/a | `CloseSession` | _(empty)_                         |
 
-Rust→TS:
+Rust→TS (never implemented):
 
-| Byte   | Name            | Payload                          |
-| ------ | --------------- | -------------------------------- |
-| `0x05` | `SessionOpened` | _(empty — connection is the id)_ |
-| `0x06` | `CallResult`    | V8-serialized result or error    |
+| Byte           | Name            | Payload                          |
+| -------------- | --------------- | -------------------------------- |
+| ~~`0x05`~~ n/a | `SessionOpened` | _(empty — connection is the id)_ |
+| ~~`0x06`~~ n/a | `CallResult`    | V8-serialized result or error    |
 
 No session-id on the wire: the connection itself identifies the session,
 just as the connection identifies which `Run` is active.
@@ -1616,6 +1670,16 @@ fresh wall/CPU guards and a fresh CPU meter from dispatch to settle, bridge
 stubs re-installed per call (throwing placeholders re-armed first so a stub
 the next call does not re-bind can never dangle), per-call console caps.
 The heap cap is the exception — see below.
+
+**Warm-up console output.** The console shim is installed before the prefix
+evaluates, so `console.*` written by prefix code is captured. It is delivered
+on the result of the **cold-start call** — the call that paid for the warm-up
+— and the buffers are cleared afterwards, so later calls on that instance see
+only their own output. Pre-#64 the prefix re-evaluated per run and its output
+appeared on every result; the one-off delivery is the closest equivalent.
+Prefix output produced at `prepare()` validation is discarded (throwaway
+isolate, no result frame). Whether prefix logs should instead be dropped,
+tagged, or repeated is GH #86 — the text here records what ships today.
 
 **Taint-and-evict.** Any fired guard (CPU, wall, heap), an abort landing
 mid-call, a fatal bridge violation, or an internal failure discards the
@@ -1707,7 +1771,11 @@ it needs multiplexed bridge calls and per-request context separation.
 **One-off runs are untouched**: `sandbox.run()` always gets a fresh isolate
 with unchanged semantics.
 
-### 13.3 In-process backend (Phase 12)
+### 13.5 In-process backend (archived; Phase 12 of the original plan)
+
+Archived with the rest of the session sketch: `@iso4/sandbox` has no
+`SandboxOptions.backend` flag and will not get one (§9.1) — the paragraphs
+below are design notes for the future analytics product.
 
 The in-process backend implements the same `Session` API using a C++ NAPI
 addon rather than the Rust subprocess. `session.call()` becomes a direct
@@ -1739,7 +1807,7 @@ The one-shot `prefix.run()` also works with the in-process backend (it
 creates a session, runs the code as the session's body, returns exports,
 closes the session).
 
-### 13.4 Choosing between the models (archived)
+### 13.6 Choosing between the models (archived)
 
 No choice to make in this product — `@iso4/sandbox` ships only one
 execution model. The table below is the original comparison, kept for
@@ -1918,7 +1986,7 @@ carrying the value passed to `abort(reason)`, and retaining `error.code:
 
 ## 15. Callable handles (Phase 13)
 
-### 14.1 The problem
+### 15.1 The problem
 
 Bridge return values are plain data (a value blob). This means a host handler
 that wants to return a rich object with methods — the classic example is a
@@ -1949,7 +2017,7 @@ returns a shape the agent can work with naturally. Phase 13 lifts this
 restriction for cases where the host genuinely needs to return objects with
 methods.
 
-### 14.2 Mechanism: per-run callable handle table
+### 15.2 Mechanism: per-run callable handle table
 
 The host handler returns a value that contains functions. The TypeScript
 serialiser detects functions in the return value and replaces each one with
@@ -1970,7 +2038,7 @@ Serializer produces:
 callableHandles = { 42: originalJsonFn, 43: originalTextFn }
 ```
 
-### 14.3 V8 side: callable stubs
+### 15.3 V8 side: callable stubs
 
 The Rust side detects `{ __iso4_fn__: <id> }` objects after deserializing and
 installs a real V8 `Function` in their place. The function's External data
@@ -1993,7 +2061,7 @@ BridgeCallPayload (targetKind = 2):
 CPU budget bracketing (`leave()` / `enter()`) applies exactly as for global
 calls: host-side execution time does not count against the sandbox budget.
 
-### 14.4 TypeScript side: dispatch and cleanup
+### 15.4 TypeScript side: dispatch and cleanup
 
 The `drainUntilResult` loop in `client.ts` gains a `targetKind === 2` branch:
 
@@ -2013,7 +2081,7 @@ case 2: {  // callable ref
 The `callableHandles` map is created at the start of each run alongside the
 dispatcher, and discarded when the run's `Result` frame arrives.
 
-### 14.5 Nested callables
+### 15.5 Nested callables
 
 The result of a callable method call is itself serialized as a value blob.
 This means a callable can return another callable, and the sandbox can chain
@@ -2031,7 +2099,7 @@ Each step is one additional bridge round-trip. Deep chains add latency but
 work correctly — callables returned from callables get fresh IDs in the same
 per-run table.
 
-### 14.6 What callable handles are not
+### 15.6 What callable handles are not
 
 - **Not a general object-capability system.** Handles are one-shot
   per-run and cannot be passed to other runs or serialised into exports.

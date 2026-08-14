@@ -4,45 +4,58 @@
 
 **iso4** is a fast, sandboxed V8 isolate runtime with permission-controlled
 `fetch` and pluggable modules. Built primarily for the AI-agent prefix/postfix
-pattern: host code precompiles setup (globals, data, tool bindings) once,
-then runs many agent-generated postfixes against the resulting V8 startup
-snapshot.
+pattern: host code prepares setup (globals, data, tool bindings) once, then
+runs many agent-generated postfixes against it. The prefix is stored as
+validated source and evaluated per isolate — there is no runtime V8 snapshot
+(DESIGN.md §11.6) — and prefix runs are served by resident warm instances
+that skip that evaluation on reuse (DESIGN.md §13.2.1).
 
 The project is a pnpm monorepo. Architecture and rationale are documented
-exhaustively in three docs at the repo root:
+exhaustively in three files:
 
 - **`DESIGN.md`** — architecture, execution model, limits, security model,
-  phased build plan. Read this first for any non-trivial change.
-  distribution. Read this before adding code to a new package or moving
-  code between packages.
+  phased build plan. The design contract. Read this first for any non-trivial
+  change, and before adding code to a new package or moving code between
+  packages.
+- **`docs/protocol.md`** — the canonical wire reference: frame table, payload
+  layouts, error codes, versioning. Authoritative for anything on the socket.
 - **`packages/iso4-sandbox/src/types.ts`** — canonical public API surface for
   `@iso4/sandbox`. Changes here are API changes and must align with DESIGN.md.
-- **`packages/iso4-sandbox/src/types.ts`** — shared types used by all packages.
-  Changes here affect every package in the ecosystem.
 
 ## Architecture
 
 ```
 iso4/                              ← workspace root
-  DESIGN.md
+  DESIGN.md                        ← design contract
+  docs/protocol.md                 ← wire protocol reference
   package.json                     ← workspace root (private)
   pnpm-workspace.yaml              ← packages glob + catalog
   eslint.config.js                 ← @schplitt/eslint-config
+  scripts/build-native.ts          ← cargo build + copy binary into the platform package
   .github/workflows/               ← CI + release
   packages/
-    iso4/                          ← `iso4` package (the runtime)
+    iso4-sandbox/                  ← @iso4/sandbox (the runtime)
       src/
         index.ts                   ← public re-exports + createSandbox
         types.ts                   ← canonical API types
+        client.ts, pool.ts, ipc.ts ← IPC client, connection pool, frame codec
       tests/
+      bench/
+      __snapshots__/tsnapi/        ← public API snapshot (tsdown --update-snapshot)
       package.json
       tsconfig.json                ← standalone (no extends), copied from starter template
       tsdown.config.ts
-    iso4-fetch/                    ← @iso4/fetch (planned)
-    iso4-fs/                       ← @iso4/fs    (future)
-    iso4-v8-<platform>/            ← native Rust binaries (planned)
+    iso4-fetch/                    ← @iso4/fetch
+    iso4-v8-<platform>/            ← native Rust binaries (built in CI, not committed)
   native/
-    v8-runtime/                    ← Rust source for the V8 host binary (planned)
+    v8-runtime/                    ← Rust source for the V8 host binary
+      src/
+        main.rs                    ← arg parsing, UDS accept loop
+        session.rs                 ← per-connection message loop, prefix store
+        v8.rs                      ← isolates, contexts, prefix evaluation, limits
+        warm.rs                    ← warm-instance registry (#64)
+        policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader (#66)
+        ipc.rs, wire.rs, blob.rs   ← frames, payload codecs, V8 serialization
 ```
 
 ### `packages/iso4-sandbox`
@@ -57,8 +70,10 @@ The two-process dynamic runtime package (`@iso4/sandbox`). Owns:
 - Mechanical fetch hygiene when the host chooses to expose `fetch`:
   header/URL/method validation, body size cap, no-auto-redirect default.
   Anything that is not policy.
-- Runtime-owned sandbox shims where explicitly designed. Log handling
-  (`console.*`) is still a TODO; do not infer an inline prelude shim.
+- Runtime-owned sandbox shims where explicitly designed. `console.*` capture
+  is one of them and it ships as native V8 callbacks in `v8.rs`
+  (`install_console`), buffered per call and returned with the run's result —
+  never an inline JS prelude.
 
 Does **not** own:
 
@@ -67,11 +82,14 @@ Does **not** own:
 - Any policy. Allow/deny decisions live in handlers the host supplies.
 - Any Node-stdlib emulation. Those live in sibling `@iso4/<name>` packages.
 
-### Future packages
+### Sibling packages
 
-`@iso4/fetch`, `@iso4/fs`, `@iso4/crypto`, etc. are tiny factory packages
-that produce `FetchHandler` or `HostImport` values ready to plug into the
-rule for adding new ones.
+`@iso4/fetch` (shipped) and the planned `@iso4/fs`, `@iso4/crypto`, … are
+tiny factory packages that produce `FetchHandler` or host-import values ready
+to plug into `createSandbox({ globals, imports })`. They hold policy and
+capability surface; `@iso4/sandbox` holds none. A new one is added by the
+same rule: it may depend on `@iso4/sandbox`'s public types only, never on its
+internals.
 
 ## Development
 
@@ -143,12 +161,16 @@ When making changes to the project:
 - **`DESIGN.md`** — Update whenever architecture, the execution model,
   resource-limit semantics, the security model, or the API surface changes.
   This is the design contract. Out-of-date design docs cost more than the
-  code they describe.
-  package is added, dependency direction shifts, or versioning policy
-  changes.
+  code they describe. Also update it when a package is added, dependency
+  direction shifts, or versioning policy changes.
+- **`docs/protocol.md`** — Update whenever a frame, payload field, error
+  code, or handshake rule changes. It is authoritative for the wire; where it
+  and `DESIGN.md` disagree about frames, `DESIGN.md` is the one that is stale.
 - **`packages/iso4-sandbox/src/types.ts`** — Update whenever the `@iso4/sandbox`
-  API changes. Any deviation between this and `DESIGN.md` is a bug.
-- **`packages/iso4-sandbox/src/types.ts`** — Update whenever shared types change.
+  API changes. Any deviation between this and `DESIGN.md` is a bug. JSDoc
+  here is the published API documentation, so it must not describe removed
+  behavior; changing it updates `__snapshots__/tsnapi/` (run
+  `npx tsdown --update-snapshot` in the package and commit the result).
 - **`AGENTS.md`** (this file) — Update with technical details, architecture,
   and best practices for AI agents.
 - **`README.md`** — Update with user-facing documentation for end users:
@@ -166,6 +188,8 @@ When making changes to the project:
 When working on this project:
 
 1. **Read the design docs first.** Almost every non-trivial change touches
+   a decision already recorded in `DESIGN.md` or `docs/protocol.md`; reading
+   the relevant section is cheaper than re-deriving it.
 2. **Keep `types.ts` and `DESIGN.md` in sync.** If you change the API, both
    files change in the same commit. If you cannot match them, ask before
    committing.
@@ -215,8 +239,10 @@ When working on this project:
     tiny one-line helper/utility functions or throwaway `parse*` helpers
     for trivial one-off logic. Inline unless there is real reuse or a clear
     API boundary.
-18. **Respect package boundaries** — Before adding code, check the "What
-    row, the design needs a conversation before the code does.
+18. **Respect package boundaries** — Before adding code, check the "Owns" /
+    "Does not own" lists above and the layout in `DESIGN.md` §8. If the new
+    code does not fit an existing row, the design needs a conversation before
+    the code does.
 
 ## Project Context & Learnings
 
@@ -269,10 +295,12 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   typed arrays, cycles — not just JSON-shaped values.
 - **User code is always ESM.** Results come back via `export default` /
   named `export`s, never via globals or `console`.
-- **Globals are runtime-curated.** The host can only contribute names
-  from a small allowlist (currently `fetch`). Everything else goes
-  through `imports`. Adding a new permitted global is a deliberate
-  design decision recorded in `DESIGN.md` §4.2.
+- **Globals are runtime-curated, block-listed not allowlisted.** The host may
+  contribute any name that is not on the reserved list (JS built-ins plus the
+  runtime's own web globals and `console`); `fetch` is not special-cased.
+  Prefer `imports` for anything user code does not expect as a bare name.
+  Changing what the runtime installs or reserves is a deliberate design
+  decision recorded in `DESIGN.md` §4.2 / §4.2.1.
 - **`iso4` has no HTTP client and no network policy.** Mechanical hygiene
   (header validation, URL parsing, body cap) lives in `iso4`. Real fetch
   behavior + policy lives in `@iso4/fetch` or in host code.
@@ -280,7 +308,10 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   event listeners on host objects. Functions passed as host-import
   arguments are rejected with `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`.
 - **One execution model in this product.** `@iso4/sandbox` ships one API
-  shape: AI-agent one-shot runs (`prefix.run()`). The persistent-session
+  shape: independent runs against a prepared prefix (`prefix.execute()` /
+  `prefix.call()`, plus one-off `sandbox.run()`). Warm instances make those
+  runs cheap but are a transparent cache, not a second model — no session
+  handle, no host-visible lifecycle. The persistent-session
   / per-row-analytics use case is its own product (`@iso4/analytics` or
   similar, name TBD), not a `SandboxOptions.backend` flag. They will
   share wire-frame types, the `Imports<…>` declaration shape, and the
@@ -307,14 +338,16 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 - Do not import from a sibling package's internals. Use its public
   `package.json` exports. If something needs to be shared between sibling
   packages, that's a design discussion (not just a refactor).
-- Do not silently install new top-level globals into a precompiled
-  prefix's restored context at run time — that breaks the snapshot's
-  shape invariant. Surface with `ERR_UNDECLARED_BINDING` instead.
+- Do not silently install new top-level globals into a prepared prefix's
+  context at run time — that breaks the invariant that the declared prefix
+  shape is the full surface the prefix was validated against. Surface with
+  `ERR_UNDECLARED_BINDING` instead.
 - Do not add a default HTTP client to `iso4`. Sandbox network access
   must be deny-by-default.
 - Do not add ad-hoc inline JS preludes for `console`, `crypto`, or `fetch`.
-  Log handling is a deliberate TODO, and `fetch` is just a host-configured
-  bridge global/function rather than a special always-installed runtime stub.
+  Runtime-owned surface is installed natively (`install_console`,
+  `webtypes::install`), and `fetch` is just a host-configured bridge
+  global/function rather than a special always-installed runtime stub.
 - Do not forget to run `pnpm changeset` when a PR changes user-visible
   behavior in a published package. Internal-only changes (refactors,
   tests, docs) do not need one.

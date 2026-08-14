@@ -773,6 +773,11 @@ default; an explicit `0` disables it.
 Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
 `console.warn` and `console.error` map to stderr.
 
+Prefix code shares that console. Output written while a warm instance
+evaluates its prefix is carried on the completion of the call that
+cold-started the instance (the run that paid for the warm-up) and cleared
+afterwards, so later calls report only their own lines.
+
 ### 5.6 Completion payloads
 
 `RunCompletionPayload`:
@@ -912,13 +917,16 @@ warm-up budget, never billed to the triggering run); later runs reuse it and
 skip isolate boot and prefix evaluation entirely. This is invisible on the
 wire — the frames are identical warm or cold; only `heapUsedBytes` on the
 Result reports it. Instances are discarded on taint (any fired guard, abort
-mid-call, fatal bridge error), on `DisposePrefix`, and by LRU eviction when
-the live-isolate cap is reached — `--max-live-isolates`, derived by the host
-from its memory budget (#65) and never below the pool size
-(`--max-isolates`), so idle instances can outnumber concurrent runs. State
-inside one instance survives between its calls as a cache, never a
-guarantee; instances of one prefix share no state with each other. One-off
-`Run` frames always get a fresh isolate.
+mid-call, fatal bridge error), on `DisposePrefix`, and by scored eviction
+under memory pressure: there is no instance-count cap, only the RSS mark
+(`--warm-budget-bytes`, #66). At/above the mark the runtime evicts idle
+instances by `heapUsed × idleTime` and stops admitting new warmth until RSS
+falls back to 4/5 of the mark, so a `PrefixRun` with no idle instance
+available runs on a fresh one-off isolate instead of pooling another. Idle
+instances can therefore outnumber concurrent runs, and their number follows
+memory rather than the pool size. State inside one instance survives between
+its calls as a cache, never a guarantee; instances of one prefix share no
+state with each other. One-off `Run` frames always get a fresh isolate.
 
 ---
 

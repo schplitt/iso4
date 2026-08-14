@@ -4,9 +4,11 @@ Fast, sandboxed V8 isolate runtime for agent-generated JavaScript. Runs user
 code in a separate Rust process for full crash isolation — an OOM or panic in
 the sandbox kills only the subprocess, not your host application.
 
-Built for the AI-agent prefix/postfix pattern: precompile host setup (globals,
+Built for the AI-agent prefix/postfix pattern: prepare host setup (globals,
 libraries, tool bindings) once, then run many agent-generated code strings
-against it in parallel — each run in a fresh, clean isolate.
+against it in parallel. Every run gets its own limits, guards, and bridge
+bindings; one-off `sandbox.run()` always gets a fresh isolate, while prefix
+runs reuse resident warm instances when one is free (see below).
 
 > **Status:** core execution works end-to-end. Not yet at 1.0.
 
@@ -104,10 +106,48 @@ prefix.execute({
     // memoryMb is uniform per isolate and set on createSandbox({ memoryMb }),
     // not per run (#64) — the heap cap is baked into the isolate at creation.
     maxBridgeCalls: 10, // max host-bridge calls per run (0 = unlimited)
-    maxBridgePayloadBytes: 0, // max bytes per bridge call (0 = 64 MiB framing cap)
+    maxBridgeCallBytes: 0, // max bytes per bridge call (0 = 64 MiB framing cap)
+    maxExportBytes: 0, // max bytes of encoded exports (0 = unlimited)
+    maxStdoutBytes: 0, // per-run console capture caps (0 = unlimited)
+    maxStderrBytes: 0,
   },
 })
 ```
+
+## Warm instances and the memory budget
+
+Runs against a prepared prefix are served by **warm instances**: resident
+isolates with the prefix already evaluated, reused across calls so boot and
+prefix evaluation are paid once instead of per run. This is automatic — no
+flag, no separate API — and it is a cache, never a guarantee: an instance can
+disappear between calls (a fired limit, an abort, memory pressure, `dispose()`),
+and the next call transparently cold-starts a new one. Never depend on state
+carrying over; put durable state in a database, and do expensive setup lazily
+inside the handler (`conn ??= await connect()`), which then re-runs correctly
+after any eviction. Instances of one prefix share no state with each other and
+serve one call at a time. `console.*` written while a prefix evaluates arrives
+on the result of the call that cold-started the instance.
+
+Residency is bounded by memory, not by a count:
+
+```ts
+const sandbox = await createSandbox({
+  memoryMb: 128, // heap cap per isolate
+  memoryBudgetMb: 2048, // RSS mark for the whole runtime process (0 = off)
+})
+```
+
+The runtime watches its own process RSS. At or above `memoryBudgetMb` it
+evicts idle instances (largest heap × longest idle first) and stops adding new
+warm ones — prefix runs then execute on cold one-off isolates — until RSS falls
+back to 80 % of the mark. `maxIsolates` caps concurrent runs; this caps memory.
+The default is derived from the memory available to the process
+(container-aware), so most hosts never set it.
+
+`sandbox.stats()` reports the live picture — active runs, queue depth, warm and
+idle instance counts, summed idle heap, `budgetBytes` / `rssBytes`, whether the
+runtime is currently `underPressure`, and per-prefix counts. It answers on a
+dedicated connection, so it works even when every run slot is busy.
 
 ## Async context (`AsyncLocalStorage`)
 
