@@ -671,14 +671,19 @@ class PayloadReader {
   }
 
   /**
-   * Read a `u64` (8 big-endian bytes) as a JS number — the only u64s on the
-   * wire are heap byte counts, far below 2^53.
+   * Read a `u64` (8 big-endian bytes) as a JS number — the u64s on the
+   * wire are byte counts (heap, budget, RSS), far below 2^53. A value
+   * above that is not a real byte count but frame corruption or
+   * misalignment; failing loudly beats returning a silently rounded
+   * number.
    */
   readU64(): number {
     if (this.remaining < 8)
       throw new PayloadDecodeError('unexpected end of payload reading u64')
     const n = this.view.getBigUint64(this.offset, false) // big-endian
     this.offset += 8
+    if (n > BigInt(Number.MAX_SAFE_INTEGER))
+      throw new PayloadDecodeError(`u64 exceeds the JS safe-integer range: ${n}`)
     return Number(n)
   }
 
@@ -691,11 +696,7 @@ class PayloadReader {
     const present = this.readU8()
     if (present === 0)
       return undefined
-    if (this.remaining < 8)
-      throw new PayloadDecodeError('unexpected end of payload reading u64')
-    const n = this.view.getBigUint64(this.offset, false) // big-endian
-    this.offset += 8
-    return Number(n)
+    return this.readU64()
   }
 
   readBool(): boolean {
@@ -1415,7 +1416,9 @@ export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
   const idleHeapBytes = reader.readU64()
   const warmBudgetBytes = reader.readU64()
   const rssBytes = reader.readU64()
-  const underPressure = reader.readU8() === 1
+  // readBool, not readU8: any byte other than 0/1 here means the frame is
+  // misaligned — fail loudly (strict frame handling on the control path).
+  const underPressure = reader.readBool()
   const prefixCount = reader.readU32()
   const prefixes: RuntimeStatsPayload['prefixes'] = []
   for (let i = 0; i < prefixCount; i++) {

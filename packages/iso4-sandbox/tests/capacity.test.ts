@@ -2,15 +2,14 @@
  * Capacity manager acceptance tests (#65/#66).
  *
  * Two independent resources, two knobs: `maxIsolates` caps concurrent runs
- * (the connection pool, unchanged), `memoryBudgetMb` feeds the RSS
- * watermarks — the runtime watches its own process RSS against the budget
- * and evicts idle instances by `heapUsed × idleTime` score above the soft
- * mark; at the hard mark prefix runs degrade to cold one-off isolates.
- * The instance-count cap became a generous runaway guard (`budget ÷ 4 MB`,
- * floored at the pool size). Saturation always queues FIFO (no policy
- * knobs — the wait is bounded by the running calls' own limits), and
- * `stats()` reports the registry over a dedicated control connection that
- * never queues behind runs.
+ * (the connection pool, unchanged), `memoryBudgetMb` is the ONE memory
+ * mark — the runtime watches its own process RSS against it; at/above the
+ * mark it evicts idle instances by `heapUsed × idleTime` score AND stops
+ * pooling new ones (prefix runs degrade to cold one-off isolates) until
+ * RSS falls back to 80 % of the mark. There is no instance-count cap.
+ * Saturation always queues FIFO (no policy knobs — the wait is bounded by
+ * the running calls' own limits), and `stats()` reports the registry over
+ * a dedicated control connection that never queues behind runs.
  */
 
 import { totalmem } from 'node:os'
@@ -130,6 +129,34 @@ describe('memory budget → live-isolate cap (#65)', () => {
     await expect(
       createSandbox({ memoryBudgetMb: Number.NaN }),
     ).rejects.toThrow(/memoryBudgetMb must be a finite number/)
+  })
+
+  test('a small-memory host floors the default budget instead of disabling it', async () => {
+    // On a host at or below the 512 MB safety net the derived default goes
+    // to zero or negative — which must NOT silently disable the watermarks
+    // on exactly the machines that need them (the count cap that used to
+    // backstop this case is gone). The default floors at 64 MB; explicit
+    // memoryBudgetMb: 0 stays the only opt-out.
+    const constrained = vi
+      .spyOn(process, 'constrainedMemory')
+      .mockReturnValue(256 * 1024 * 1024)
+    try {
+      await using sandbox = await createSandbox({ maxIsolates: 1 })
+      const stats = await sandbox.stats()
+      expect(stats.budgetBytes).toBe(64 * 1024 * 1024)
+    } finally {
+      constrained.mockRestore()
+    }
+  })
+
+  test('a huge finite budget is clamped, not passed through broken', async () => {
+    // 1e15 MB in bytes exceeds 2^53 (silent rounding) and 1e21 stringifies
+    // to exponential notation, which would kill the child at arg parsing
+    // and surface as a socket timeout. The clamp keeps the spawn alive and
+    // the mark at the JS safe-integer ceiling.
+    await using sandbox = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 1e15 })
+    const stats = await sandbox.stats()
+    expect(stats.budgetBytes).toBe(Number.MAX_SAFE_INTEGER)
   })
 
   test('the cgroup-v1 "unlimited" sentinel falls back to host memory', async () => {

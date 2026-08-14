@@ -178,8 +178,8 @@ fn instance_main(
 pub enum Acquired {
     /// An idle instance of this prefix — use it, then `release` it.
     Reused(InstanceHandle),
-    /// No idle instance; a slot has been reserved (evicting an idle victim
-    /// if the cap demanded it). Spawn a fresh instance, then `release` it.
+    /// No idle instance and no pressure: spawn a fresh instance, then
+    /// `release` it into the pool.
     CreateNew,
     /// Shedding: RSS is at/over the warm budget (or still above the
     /// release line), so no new instance may be pooled. Spawn a fresh
@@ -264,10 +264,14 @@ impl RegistryInner {
     /// verdict: update the latch, shed the pass's worth of victims, record
     /// the pass for the futility check. Returns whether a NEW instance may
     /// be pooled (`false` while shedding — celld couples the admission
-    /// stop to the latch). `None` (no reading available) changes nothing
-    /// and admits — watermarks unavailable is not pressure.
+    /// stop to the latch). `None` (no reading available) releases the
+    /// latch and admits — watermarks unavailable is not pressure, and a
+    /// latch held with no signal to ever release it would report
+    /// `underPressure` forever while admission has in fact resumed.
     fn pressure_pass(&mut self, rss_sample: Option<u64>, budget_bytes: u64) -> bool {
         let Some(rss_bytes) = rss_sample else {
+            self.shedding = false;
+            self.last_pass = None;
             return true;
         };
         let verdict = policy::watermark_action(&policy::PressureFacts {
@@ -355,7 +359,10 @@ impl WarmRegistry {
                 // stays allowed while shedding — an existing instance adds
                 // no memory.
                 slots.busy += 1;
-                inner.idle_total -= 1;
+                // saturating like the other counters: a future drift bug
+                // must degrade shed targets, not wrap them to usize::MAX
+                // (stats() debug_asserts the counter against the real sum).
+                inner.idle_total = inner.idle_total.saturating_sub(1);
                 return Acquired::Reused(handle);
             }
         }
@@ -383,9 +390,11 @@ impl WarmRegistry {
         inner.oneoff_running += 1;
     }
 
-    /// A one-off run finished; its isolate is already gone. Also the
-    /// release path for `CreateCold` instances (the session drops the
-    /// handle instead of pooling it).
+    /// A one-off run finished. Also the release path for `CreateCold`
+    /// instances: the session drops the handle instead of pooling it, and
+    /// the owner thread disposes the isolate asynchronously — the ledger
+    /// decrements slightly ahead of the actual memory release, which the
+    /// next RSS sample absorbs.
     pub fn release_oneoff(&self) {
         let rss_sample = self.sample_rss();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());

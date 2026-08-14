@@ -696,4 +696,29 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     expect(() => decodeStatsPayload(Buffer.concat([good, Buffer.from([0])])))
       .toThrow(PayloadDecodeError)
   })
+
+  test('rejects an invalid latch byte and an unsafe u64', () => {
+    const good = encodeStatsPayload({
+      oneoffRunning: 0,
+      warmBusy: 0,
+      warmIdle: 0,
+      idleHeapBytes: 0,
+      warmBudgetBytes: 0,
+      rssBytes: 0,
+      underPressure: false,
+      prefixes: [],
+    })
+    // underPressure sits after 3×u32 + 3×u64 = offset 36. Any byte other
+    // than 0/1 there means the frame is misaligned — must fail loudly, not
+    // decode as `false`.
+    const badLatch = Buffer.from(good)
+    badLatch[3 * 4 + 3 * 8] = 2
+    expect(() => decodeStatsPayload(badLatch)).toThrow(PayloadDecodeError)
+
+    // A u64 above 2^53-1 is no real byte count; Number() would silently
+    // round it. rssBytes sits at offset 28.
+    const badU64 = Buffer.from(good)
+    badU64.writeBigUInt64BE(2n ** 60n, 3 * 4 + 2 * 8)
+    expect(() => decodeStatsPayload(badU64)).toThrow(PayloadDecodeError)
+  })
 })
