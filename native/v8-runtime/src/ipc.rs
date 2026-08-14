@@ -54,6 +54,9 @@ pub enum TsToRustMessageType {
     BridgeResponse = 0x06,
     /// Force-stop a running isolate.
     Terminate = 0x07,
+    /// Request a capacity/usage snapshot (#65). Empty payload; answered
+    /// with a `StatsResult` frame.
+    Stats = 0x08,
 }
 
 /// Message types sent from Rust to the TypeScript host.
@@ -75,6 +78,8 @@ pub enum RustToTsMessageType {
     /// Handshake acknowledgement — the first frame sent on a new connection,
     /// answering `Authenticate` (protocol v2).
     Hello = 0x05,
+    /// Capacity/usage snapshot answering a `Stats` request (#65).
+    StatsResult = 0x06,
 }
 
 /// Handshake status reported on a `Hello` frame.
@@ -875,6 +880,7 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
         0x05 => Ok(TsToRustMessageType::DisposePrefix),
         0x06 => Ok(TsToRustMessageType::BridgeResponse),
         0x07 => Ok(TsToRustMessageType::Terminate),
+        0x08 => Ok(TsToRustMessageType::Stats),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown TS->Rust message type: {byte:#04x}"),
@@ -892,6 +898,7 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
         0x03 => Ok(RustToTsMessageType::PrecompileResult),
         0x04 => Ok(RustToTsMessageType::Log),
         0x05 => Ok(RustToTsMessageType::Hello),
+        0x06 => Ok(RustToTsMessageType::StatsResult),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown Rust->TS message type: {byte:#04x}"),
@@ -1084,6 +1091,21 @@ mod tests {
     #[test]
     fn log_byte_matches_protocol_spec() {
         assert_eq!(RustToTsMessageType::Log as u8, 0x04);
+    }
+
+    #[test]
+    fn stats_bytes_match_protocol_spec() {
+        // docs/protocol.md §2.1: Stats = 0x08; §2.2: StatsResult = 0x06
+        assert_eq!(TsToRustMessageType::Stats as u8, 0x08);
+        assert_eq!(RustToTsMessageType::StatsResult as u8, 0x06);
+        assert!(matches!(
+            parse_ts_to_rust_message_type(0x08),
+            Ok(TsToRustMessageType::Stats)
+        ));
+        assert!(matches!(
+            parse_rust_to_ts_message_type(0x06),
+            Ok(RustToTsMessageType::StatsResult)
+        ));
     }
 
     // ── parse_run_payload ──────────────────────────────────────────────

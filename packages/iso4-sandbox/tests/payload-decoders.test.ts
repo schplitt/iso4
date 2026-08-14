@@ -17,6 +17,7 @@ import {
   decodeBridgeCallPayload,
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
+  decodeStatsPayload,
 } from '../src/ipc.js'
 import { serializeValue } from '../src/v8-codec.js'
 import type { RunErrorCode } from '../src/types.js'
@@ -614,5 +615,75 @@ describe('decodeBridgeCallPayload', () => {
   test('rejects an invalid targetKind', () => {
     const buf = Buffer.concat([u32(0), Buffer.from([9, 0]), str('f'), valueSlot([])])
     expect(() => decodeBridgeCallPayload(buf)).toThrow(/invalid bridge targetKind/)
+  })
+})
+
+describe('decodeStatsPayload (protocol.md §5.7)', () => {
+  function u64(n: number): Buffer {
+    const b = Buffer.alloc(8)
+    b.writeBigUInt64BE(BigInt(n), 0)
+    return b
+  }
+
+  // Mirror of the Rust `encode_stats_payload` in wire.rs.
+  function encodeStatsPayload(stats: {
+    oneoffRunning: number
+    warmBusy: number
+    warmIdle: number
+    idleHeapBytes: number
+    maxLiveIsolates: number
+    prefixes: { prefixId: string, idle: number, busy: number }[]
+  }): Buffer {
+    return Buffer.concat([
+      u32(stats.oneoffRunning),
+      u32(stats.warmBusy),
+      u32(stats.warmIdle),
+      u64(stats.idleHeapBytes),
+      u32(stats.maxLiveIsolates),
+      u32(stats.prefixes.length),
+      ...stats.prefixes.map((p) => Buffer.concat([str(p.prefixId), u32(p.idle), u32(p.busy)])),
+    ])
+  }
+
+  test('round-trips a snapshot with multiple prefixes', () => {
+    const snapshot = {
+      oneoffRunning: 1,
+      warmBusy: 2,
+      warmIdle: 3,
+      idleHeapBytes: 5_000_000_000, // above u32 — exercises the u64 read
+      maxLiveIsolates: 12,
+      prefixes: [
+        { prefixId: '0', idle: 2, busy: 1 },
+        { prefixId: '1', idle: 1, busy: 1 },
+      ],
+    }
+    expect(decodeStatsPayload(encodeStatsPayload(snapshot))).toEqual(snapshot)
+  })
+
+  test('round-trips an empty registry', () => {
+    const snapshot = {
+      oneoffRunning: 0,
+      warmBusy: 0,
+      warmIdle: 0,
+      idleHeapBytes: 0,
+      maxLiveIsolates: 4,
+      prefixes: [],
+    }
+    expect(decodeStatsPayload(encodeStatsPayload(snapshot))).toEqual(snapshot)
+  })
+
+  test('rejects truncated and trailing-byte payloads', () => {
+    const good = encodeStatsPayload({
+      oneoffRunning: 0,
+      warmBusy: 0,
+      warmIdle: 1,
+      idleHeapBytes: 42,
+      maxLiveIsolates: 4,
+      prefixes: [{ prefixId: '0', idle: 1, busy: 0 }],
+    })
+    expect(() => decodeStatsPayload(good.subarray(0, good.byteLength - 2)))
+      .toThrow(PayloadDecodeError)
+    expect(() => decodeStatsPayload(Buffer.concat([good, Buffer.from([0])])))
+      .toThrow(PayloadDecodeError)
   })
 })

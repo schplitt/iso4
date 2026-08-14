@@ -11,14 +11,16 @@
 //! does the bridge I/O during the call, the session thread between calls —
 //! the same discipline as before #64, just on another thread).
 //!
-//! Capacity model (v1): one global cap — `max_isolates`, the same number as
-//! the host's connection-pool size. A slot holds either a running isolate
-//! (warm call or one-off run) or an idle warm instance. Taking a slot when
-//! all are held evicts the least-recently-used *idle* instance; running
-//! instances are never evicted. The host pool admits at most `max_isolates`
-//! concurrent runs, so whenever the cap is hit at least one held slot is
-//! idle. Smarter victim selection (`heapUsed × idleTime`) is #66; per-prefix
-//! fairness caps and a memory budget are #65.
+//! Capacity model (v2, #65): one global ledger of live isolates — idle warm
+//! + busy warm + running one-off — capped at `max_live`, which the host
+//! derives from its memory budget (`budget ÷ memoryMb`, floored at the pool
+//! size so the pool can always run `maxIsolates` concurrent isolates).
+//! Taking a slot when all are held evicts the least-recently-used *idle*
+//! instance; running instances are never evicted. The host pool admits at
+//! most `maxIsolates` concurrent runs and `max_live >= maxIsolates`, so
+//! whenever the cap is hit at least one held slot is idle. Smarter victim
+//! selection (`heapUsed × idleTime`) and memory watermarks are #66; the
+//! wait-vs-cold-start acquire policy is #77.
 //!
 //! Instances of one prefix share no state with each other; state inside one
 //! instance survives between calls as a cache, never a guarantee — any
@@ -174,29 +176,82 @@ pub enum Acquired {
     CreateNew,
 }
 
+/// A point-in-time snapshot of the registry for `stats()` (#65). Counts are
+/// consistent with each other (taken under one lock), stale the moment the
+/// lock drops — diagnostics, not synchronization.
+pub struct RegistryStats {
+    /// Running one-off isolates (`sandbox.run()`).
+    pub oneoff_running: usize,
+    /// Warm instances currently serving a call.
+    pub warm_busy: usize,
+    /// Idle warm instances ready for reuse.
+    pub warm_idle: usize,
+    /// Summed `heap_used_bytes` of the idle instances (last-call
+    /// measurements; busy instances' current heap is unknown mid-call).
+    pub idle_heap_bytes: u64,
+    /// The live-isolate cap this registry enforces.
+    pub max_live: usize,
+    /// Per-prefix `(prefix_id, idle, busy)` instance counts.
+    pub per_prefix: Vec<(String, usize, usize)>,
+}
+
 pub struct WarmRegistry {
     inner: Mutex<RegistryInner>,
-    /// Global isolate cap — the host's `maxIsolates`, passed as
-    /// `--max-isolates`. Counts idle warm + busy warm + running one-off.
-    cap: usize,
+    /// Global live-isolate cap — host-derived from the memory budget
+    /// (`--max-live-isolates`, floored at the pool size). Counts idle warm
+    /// + busy warm + running one-off.
+    max_live: usize,
+}
+
+/// Instances of one prefix as the registry tracks them.
+#[derive(Default)]
+struct PrefixSlots {
+    /// Idle instances, most-recently-used at the back (reuse pops the
+    /// warmest; eviction removes the front).
+    idle: Vec<InstanceHandle>,
+    /// Instances currently serving a call — counted for `stats()` and for
+    /// the per-prefix state #77's acquire policy will need.
+    busy: usize,
 }
 
 struct RegistryInner {
-    /// Idle instances per prefix, most-recently-used at the back (reuse pops
-    /// the warmest; eviction scans for the coldest).
-    idle: HashMap<String, Vec<InstanceHandle>>,
+    /// Per-prefix instance state. An entry exists while the prefix has any
+    /// instance (idle or busy) and is removed when both drain to zero.
+    prefixes: HashMap<String, PrefixSlots>,
     /// Live isolates: idle warm + busy warm + running one-off.
     total: usize,
+    /// Running one-off isolates — stats only; they also count in `total`.
+    oneoff_running: usize,
+}
+
+impl RegistryInner {
+    /// Evict at least enough idle instances to admit one more live isolate,
+    /// or warn and give up when nothing is idle (more concurrent runs than
+    /// the cap, which the host pool is supposed to prevent — run over cap
+    /// rather than deadlock; the excess corrects itself on release).
+    fn make_room(&mut self, max_live: usize) {
+        while self.total >= max_live {
+            if !evict_lru(self) {
+                eprintln!(
+                    "[iso4-v8] warm registry over capacity with no idle victim \
+                     (total={}, max_live={}) — proceeding over cap",
+                    self.total, max_live
+                );
+                break;
+            }
+        }
+    }
 }
 
 impl WarmRegistry {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(max_live: usize) -> Self {
         Self {
             inner: Mutex::new(RegistryInner {
-                idle: HashMap::new(),
+                prefixes: HashMap::new(),
                 total: 0,
+                oneoff_running: 0,
             }),
-            cap: cap.max(1),
+            max_live: max_live.max(1),
         }
     }
 
@@ -204,28 +259,19 @@ impl WarmRegistry {
     /// of that prefix, or reserve a slot for a fresh one — evicting the
     /// least-recently-used idle instance (any prefix) when the cap is full.
     /// Running instances are never evicted: the host pool admits at most
-    /// `cap` concurrent runs, so a full cap always contains an idle victim.
+    /// `maxIsolates <= max_live` concurrent runs, so a full cap always
+    /// contains an idle victim.
     pub fn acquire(&self, prefix_id: &str) -> Acquired {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(pool) = inner.idle.get_mut(prefix_id) {
-            if let Some(handle) = pool.pop() {
+        if let Some(slots) = inner.prefixes.get_mut(prefix_id) {
+            if let Some(handle) = slots.idle.pop() {
                 // total unchanged: the slot moves from idle to busy.
+                slots.busy += 1;
                 return Acquired::Reused(handle);
             }
         }
-        while inner.total >= self.cap {
-            if !evict_lru(&mut inner) {
-                // No idle victim — more concurrent runs than the cap, which
-                // the host pool is supposed to prevent. Run over cap rather
-                // than deadlock; the excess corrects itself on release.
-                eprintln!(
-                    "[iso4-v8] warm registry over capacity with no idle victim \
-                     (total={}, cap={}) — proceeding over cap",
-                    inner.total, self.cap
-                );
-                break;
-            }
-        }
+        inner.make_room(self.max_live);
+        inner.prefixes.entry(prefix_id.to_string()).or_default().busy += 1;
         inner.total += 1;
         Acquired::CreateNew
     }
@@ -234,23 +280,16 @@ impl WarmRegistry {
     /// reserve a slot, evicting an idle instance if the cap demands it.
     pub fn reserve_oneoff(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        while inner.total >= self.cap {
-            if !evict_lru(&mut inner) {
-                eprintln!(
-                    "[iso4-v8] warm registry over capacity with no idle victim \
-                     (total={}, cap={}) — proceeding over cap",
-                    inner.total, self.cap
-                );
-                break;
-            }
-        }
+        inner.make_room(self.max_live);
         inner.total += 1;
+        inner.oneoff_running += 1;
     }
 
     /// A one-off run finished; its isolate is already gone.
     pub fn release_oneoff(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.total = inner.total.saturating_sub(1);
+        inner.oneoff_running = inner.oneoff_running.saturating_sub(1);
     }
 
     /// Return a warm instance after a call. Tainted instances and instances
@@ -266,7 +305,12 @@ impl WarmRegistry {
         prefix_alive: bool,
     ) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let slots = inner.prefixes.entry(prefix_id.to_string()).or_default();
+        slots.busy = slots.busy.saturating_sub(1);
         if outcome_tainted || !prefix_alive {
+            if slots.idle.is_empty() && slots.busy == 0 {
+                inner.prefixes.remove(prefix_id);
+            }
             inner.total = inner.total.saturating_sub(1);
             // Dropping the handle disconnects the job channel; the owner
             // thread exits and the isolate dies on its creating thread.
@@ -274,16 +318,51 @@ impl WarmRegistry {
         }
         handle.last_used = Instant::now();
         handle.heap_used_bytes = heap_used_bytes;
-        inner.idle.entry(prefix_id.to_string()).or_default().push(handle);
+        slots.idle.push(handle);
     }
 
     /// Drop every idle instance of a disposed prefix. Busy instances are
-    /// handled at `release` time via `prefix_alive: false`.
+    /// handled at `release` time via `prefix_alive: false` (the entry stays
+    /// until their release drains `busy` to zero).
     pub fn dispose_prefix(&self, prefix_id: &str) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(pool) = inner.idle.remove(prefix_id) {
-            inner.total = inner.total.saturating_sub(pool.len());
-            // Handles drop here → owner threads exit.
+        let Some(slots) = inner.prefixes.get_mut(prefix_id) else {
+            return;
+        };
+        let dropped = slots.idle.len();
+        slots.idle.clear(); // Handles drop here → owner threads exit.
+        let still_busy = slots.busy > 0;
+        inner.total = inner.total.saturating_sub(dropped);
+        if !still_busy {
+            inner.prefixes.remove(prefix_id);
+        }
+    }
+
+    /// Snapshot the registry for the `Stats` frame (#65).
+    pub fn stats(&self) -> RegistryStats {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut warm_busy = 0;
+        let mut warm_idle = 0;
+        let mut idle_heap_bytes = 0u64;
+        let mut per_prefix: Vec<(String, usize, usize)> = inner
+            .prefixes
+            .iter()
+            .map(|(id, slots)| {
+                warm_busy += slots.busy;
+                warm_idle += slots.idle.len();
+                idle_heap_bytes += slots.idle.iter().map(|h| h.heap_used_bytes).sum::<u64>();
+                (id.clone(), slots.idle.len(), slots.busy)
+            })
+            .collect();
+        // HashMap iteration order is arbitrary; stable output for tests/logs.
+        per_prefix.sort_by(|a, b| a.0.cmp(&b.0));
+        RegistryStats {
+            oneoff_running: inner.oneoff_running,
+            warm_busy,
+            warm_idle,
+            idle_heap_bytes,
+            max_live: self.max_live,
+            per_prefix,
         }
     }
 }
@@ -292,23 +371,23 @@ impl WarmRegistry {
 /// false when nothing is idle.
 fn evict_lru(inner: &mut RegistryInner) -> bool {
     let victim = inner
-        .idle
+        .prefixes
         .iter()
-        .filter(|(_, pool)| !pool.is_empty())
-        .min_by_key(|(_, pool)| pool[0].last_used)
+        .filter(|(_, slots)| !slots.idle.is_empty())
+        .min_by_key(|(_, slots)| slots.idle[0].last_used)
         .map(|(id, _)| id.clone());
     let Some(prefix_id) = victim else {
         return false;
     };
-    let pool = inner
-        .idle
+    let slots = inner
+        .prefixes
         .get_mut(&prefix_id)
         .expect("victim key came from the map");
     // Front of the Vec is the least recently used (reuse pushes/pops the
     // back), so evict index 0.
-    let _evicted = pool.remove(0);
-    if pool.is_empty() {
-        inner.idle.remove(&prefix_id);
+    let _evicted = slots.idle.remove(0);
+    if slots.idle.is_empty() && slots.busy == 0 {
+        inner.prefixes.remove(&prefix_id);
     }
     inner.total = inner.total.saturating_sub(1);
     true
@@ -450,6 +529,92 @@ mod tests {
         registry.reserve_oneoff();
         registry.release_oneoff();
         assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
+    }
+
+    #[test]
+    fn stats_snapshot_counts_idle_busy_and_oneoff() {
+        let registry = WarmRegistry::new(8);
+        // Two instances of "a": one stays busy, one is released idle with a
+        // known heap measurement. Plus one running one-off.
+        assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
+        assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
+        registry.release("a", spawn_instance(counter_prefix(), 0), false, 1_000, true);
+        registry.reserve_oneoff();
+
+        let stats = registry.stats();
+        assert_eq!(stats.oneoff_running, 1);
+        assert_eq!(stats.warm_busy, 1);
+        assert_eq!(stats.warm_idle, 1);
+        assert_eq!(stats.idle_heap_bytes, 1_000);
+        assert_eq!(stats.max_live, 8);
+        assert_eq!(stats.per_prefix, vec![("a".to_string(), 1, 1)]);
+
+        // Drain everything: counts return to zero and the entry disappears.
+        registry.release_oneoff();
+        let Acquired::Reused(_) = registry.acquire("a") else {
+            panic!("idle instance must be reused");
+        };
+        registry.release("a", spawn_instance(counter_prefix(), 0), true, 0, true);
+        registry.release("a", spawn_instance(counter_prefix(), 0), true, 0, true);
+        let stats = registry.stats();
+        assert_eq!(stats.oneoff_running, 0);
+        assert_eq!(stats.warm_busy, 0);
+        assert_eq!(stats.warm_idle, 0);
+        assert_eq!(stats.idle_heap_bytes, 0);
+        assert!(stats.per_prefix.is_empty());
+    }
+
+    #[test]
+    fn max_live_admits_more_idle_instances_than_the_pool_size() {
+        // The #65 point: the live cap comes from the memory budget, so idle
+        // warm instances can outnumber concurrent runs. Cap 3, one busy slot
+        // at a time: two prefixes stay resident with no eviction.
+        let registry = WarmRegistry::new(3);
+        assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
+        registry.release("a", spawn_instance(counter_prefix(), 0), false, 0, true);
+        assert!(matches!(registry.acquire("b"), Acquired::CreateNew));
+        registry.release("b", spawn_instance(counter_prefix(), 0), false, 0, true);
+
+        // Both survive: reuse hits for each.
+        assert!(matches!(registry.acquire("a"), Acquired::Reused(_)));
+        assert!(matches!(registry.acquire("b"), Acquired::Reused(_)));
+    }
+
+    #[test]
+    fn stats_stay_consistent_after_an_eviction() {
+        let registry = WarmRegistry::new(1);
+        assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
+        registry.release("a", spawn_instance(counter_prefix(), 0), false, 500, true);
+
+        // Cap 1: acquiring "b" evicts a's idle instance — every count and
+        // the summed idle heap must reflect that immediately.
+        assert!(matches!(registry.acquire("b"), Acquired::CreateNew));
+        let stats = registry.stats();
+        assert_eq!(stats.warm_idle, 0);
+        assert_eq!(stats.idle_heap_bytes, 0);
+        assert_eq!(stats.warm_busy, 1);
+        assert_eq!(stats.per_prefix, vec![("b".to_string(), 0, 1)]);
+
+        registry.release("b", spawn_instance(counter_prefix(), 0), false, 300, true);
+        let stats = registry.stats();
+        assert_eq!(stats.warm_idle, 1);
+        assert_eq!(stats.warm_busy, 0);
+        assert_eq!(stats.idle_heap_bytes, 300);
+    }
+
+    #[test]
+    fn dispose_prefix_with_a_busy_instance_keeps_its_accounting() {
+        let registry = WarmRegistry::new(4);
+        assert!(matches!(registry.acquire("p0"), Acquired::CreateNew));
+        // Dispose lands while the instance is busy: nothing idle to drop yet.
+        registry.dispose_prefix("p0");
+        let stats = registry.stats();
+        assert_eq!(stats.warm_busy, 1);
+        // The release then observes the prefix gone and drops the instance.
+        registry.release("p0", spawn_instance(counter_prefix(), 0), false, 0, false);
+        let stats = registry.stats();
+        assert_eq!(stats.warm_busy, 0);
+        assert!(stats.per_prefix.is_empty());
     }
 
     #[test]

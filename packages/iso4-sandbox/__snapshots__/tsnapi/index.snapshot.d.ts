@@ -135,6 +135,7 @@ export interface Sandbox {
   readExports: (_: ReadExportsOptions) => Promise<ReadExportsResult>;
   prepare: <G extends HostGlobals = {}, M extends Imports = {}>(_: PrecompileOptions<G, M>) => Promise<Prefix<G, M>>;
   precompile: <G extends HostGlobals = {}, M extends Imports = {}>(_: PrecompileOptions<G, M>) => Promise<Prefix<G, M>>;
+  stats: () => Promise<SandboxStats>;
   dispose: () => Promise<void>;
   [Symbol.asyncDispose]: () => Promise<void>;
   readonly alive: boolean;
@@ -142,7 +143,20 @@ export interface Sandbox {
 export interface SandboxOptions {
   maxIsolates?: number;
   memoryMb?: number;
+  memoryBudgetMb?: number;
   binaryPath?: string;
+}
+export interface SandboxStats {
+  activeRuns: number;
+  queueDepth: number;
+  warmInstances: number;
+  idleInstances: number;
+  idleHeapBytes: number;
+  maxLiveIsolates: number;
+  prefixes: Record<string, {
+    idle: number;
+    busy: number;
+  }>;
 }
 // #endregion
 

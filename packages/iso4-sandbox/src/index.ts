@@ -6,7 +6,7 @@
  */
 
 import { access, unlink } from 'node:fs/promises'
-import { cpus, tmpdir } from 'node:os'
+import { availableParallelism, tmpdir, totalmem } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import process from 'node:process'
@@ -39,6 +39,7 @@ import type {
   RunResult,
   Sandbox,
   SandboxOptions,
+  SandboxStats,
   Imports,
 } from './types'
 
@@ -76,6 +77,7 @@ export type {
   CreateSandbox,
   Sandbox,
   SandboxOptions,
+  SandboxStats,
   PrecompileOptions,
   Prefix,
   PrefixCallOptions,
@@ -96,7 +98,12 @@ export type {
 
 export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> {
   const binaryPath = resolveRuntimeBinary(options)
-  const maxIsolates = options?.maxIsolates ?? cpus().length
+  const maxIsolates = options?.maxIsolates ?? availableParallelism()
+  const maxLiveIsolates = resolveMaxLiveIsolates(
+    maxIsolates,
+    options?.memoryMb ?? 128,
+    options?.memoryBudgetMb,
+  )
 
   // Generate a per-process unique socket path and a cryptographically
   // random auth token. Both are passed as CLI args to the Rust binary so
@@ -104,8 +111,9 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const socketPath = join(tmpdir(), `iso4-v8-${process.pid}-${randomUUID().slice(0, 8)}.sock`)
   const token = randomUUID()
 
-  // The runtime needs the pool size for the warm registry's global isolate
-  // cap (#64): idle warm instances + running isolates never exceed it.
+  // The runtime needs the pool size (fallback live cap for old hosts) and
+  // the budget-derived live-isolate cap (#65): idle warm instances +
+  // running isolates never exceed `--max-live-isolates`.
   const proc = spawn(binaryPath, [
     '--socket',
     socketPath,
@@ -113,6 +121,8 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     token,
     '--max-isolates',
     String(maxIsolates),
+    '--max-live-isolates',
+    String(maxLiveIsolates),
   ], {
     // stdin closed, stdout ignored, stderr forwarded so runtime diagnostics
     // (the [iso4-v8] lines) appear in the host process's stderr.
@@ -140,7 +150,82 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   // The pool uses `connect` to reopen any slot torn down by an in-flight abort,
   // keeping the pool at `maxIsolates`.
   const pool = new ConnectionPool(clients, connect)
-  return new SandboxImpl(proc, pool, socketPath, options?.memoryMb)
+
+  // Dedicated control connection for `stats()` (#65): it never enters the
+  // pool, so a capacity snapshot answers even while every run slot is busy —
+  // exactly when it is most wanted.
+  let statsClient: RuntimeIpcClient
+  try {
+    statsClient = await connect()
+  } catch (error) {
+    // Don't leak the child process or its pool connections when the
+    // control connection cannot open.
+    await pool.dispose().catch(() => {})
+    proc.kill()
+    throw error
+  }
+
+  return new SandboxImpl(proc, pool, statsClient, socketPath, options?.memoryMb)
+}
+
+/**
+ * The live-isolate cap the runtime enforces (#65): how many isolates —
+ * running plus kept warm — the memory budget allows, never below the pool
+ * size (the pool must be able to run `maxIsolates` concurrent isolates).
+ * With `memoryMb: 0` (uncapped isolates) capacity math is impossible, so
+ * the cap stays at the pool size — the #64 behavior.
+ * @param maxIsolates the connection-pool size (concurrent-run cap)
+ * @param memoryMb the uniform per-isolate heap cap
+ * @param memoryBudgetMb the explicit budget knob, or undefined for the default
+ */
+function resolveMaxLiveIsolates(
+  maxIsolates: number,
+  memoryMb: number,
+  memoryBudgetMb: number | undefined,
+): number {
+  if (memoryBudgetMb !== undefined && !Number.isFinite(memoryBudgetMb)) {
+    // Infinity/NaN would reach the child as `--max-live-isolates Infinity`,
+    // kill it at arg parsing, and surface as an unrelated socket timeout.
+    throw new TypeError(
+      '[@iso4/sandbox] memoryBudgetMb must be a finite number of megabytes',
+    )
+  }
+  if (memoryMb === 0) {
+    if (memoryBudgetMb !== undefined) {
+      throw new TypeError(
+        '[@iso4/sandbox] memoryBudgetMb requires a nonzero memoryMb: the '
+        + 'live-isolate cap is memoryBudgetMb ÷ memoryMb, so uncapped '
+        + 'isolates leave nothing to divide by',
+      )
+    }
+    return maxIsolates
+  }
+  const budgetMb = memoryBudgetMb ?? defaultMemoryBudgetMb()
+  // The cap crosses the wire as a u32; saturate instead of letting an
+  // absurd budget wrap (a multiple of 2^32 would truncate to 0).
+  return Math.min(
+    Math.max(maxIsolates, Math.floor(budgetMb / memoryMb)),
+    0xFF_FF_FF_FF,
+  )
+}
+
+/**
+ * Default memory budget: what this process may use — container/cgroup-aware
+ * via `process.constrainedMemory()` (`os.totalmem()` lies inside containers;
+ * the fallback covers bare metal, where constrainedMemory reports 0) — minus
+ * a safety net of max(512 MB, 25 %) for the Node host, the Rust runtime, and
+ * the embedding service's own per-isolate state.
+ */
+function defaultMemoryBudgetMb(): number {
+  // constrainedMemory() reports 0/undefined when there is no cgroup limit —
+  // except on cgroup v1, where "unlimited" is a sentinel near 2^63 (seen on
+  // GitHub Actions runners). Take the smaller of it and the host total
+  // instead of trusting either alone: a real container limit is below the
+  // host total, and the sentinel is above it.
+  const constrained = process.constrainedMemory?.() || Number.POSITIVE_INFINITY
+  const totalBytes = Math.min(constrained, totalmem())
+  const totalMb = totalBytes / (1024 * 1024)
+  return Math.floor(totalMb - Math.max(512, totalMb * 0.25))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -199,6 +284,11 @@ function abortedResult(reason?: unknown, from?: RunResult): RunResult {
 class SandboxImpl implements Sandbox {
   private readonly proc: ChildProcess
   private readonly pool: ConnectionPool
+  /**
+   * Control connection for `stats()` — outside the pool so a snapshot
+   * answers even when every run slot is busy.
+   */
+  private readonly statsClient: RuntimeIpcClient
   private readonly socketPath: string
   /**
    * Uniform per-isolate heap cap (#64), set once at `createSandbox` and
@@ -209,9 +299,16 @@ class SandboxImpl implements Sandbox {
   private readonly memoryMb: number | undefined
   private _alive = true
 
-  constructor(proc: ChildProcess, pool: ConnectionPool, socketPath: string, memoryMb?: number) {
+  constructor(
+    proc: ChildProcess,
+    pool: ConnectionPool,
+    statsClient: RuntimeIpcClient,
+    socketPath: string,
+    memoryMb?: number,
+  ) {
     this.proc = proc
     this.pool = pool
+    this.statsClient = statsClient
     this.socketPath = socketPath
     this.memoryMb = memoryMb
     proc.once('exit', () => {
@@ -284,6 +381,25 @@ class SandboxImpl implements Sandbox {
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
       throw error
+    }
+  }
+
+  /**
+   * A capacity/usage snapshot from the runtime's registry merged with the
+   * host pool's queue counter. See {@link Sandbox.stats}.
+   */
+  async stats(): Promise<SandboxStats> {
+    const raw = await this.statsClient.stats()
+    return {
+      activeRuns: raw.oneoffRunning + raw.warmBusy,
+      queueDepth: this.pool.queueDepth,
+      warmInstances: raw.warmBusy + raw.warmIdle,
+      idleInstances: raw.warmIdle,
+      idleHeapBytes: raw.idleHeapBytes,
+      maxLiveIsolates: raw.maxLiveIsolates,
+      prefixes: Object.fromEntries(
+        raw.prefixes.map((p) => [p.prefixId, { idle: p.idle, busy: p.busy }]),
+      ),
     }
   }
 
@@ -382,6 +498,7 @@ class SandboxImpl implements Sandbox {
       return
     this._alive = false
     await this.pool.dispose()
+    await this.statsClient.dispose()
     this.proc.kill()
     // Best-effort cleanup: the Rust process leaves the socket file on disk
     // after it exits. Remove it; ignore the error if it's already gone.

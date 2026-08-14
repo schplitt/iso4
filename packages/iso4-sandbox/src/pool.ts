@@ -33,6 +33,14 @@ export class ConnectionPool {
   }
 
   /**
+   * Callers currently queued for a free slot — `stats()` reports this as
+   * `queueDepth`.
+   */
+  get queueDepth(): number {
+    return this.waiters.length
+  }
+
+  /**
    * Borrow a client, run `fn`, then unconditionally return the client.
    * If the pool is disposed while `fn` is running, the client is disposed
    * on release rather than returned to the free list.
@@ -72,7 +80,8 @@ export class ConnectionPool {
       return Promise.resolve(client)
     }
 
-    // All slots busy — queue until one is released.
+    // All slots busy — queue until one is released. A bounded wait in
+    // practice: every run has wall/CPU limits, so slots always free up.
     return new Promise((resolve, reject) => {
       this.waiters.push({ resolve, reject })
     })

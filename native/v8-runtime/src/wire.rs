@@ -523,6 +523,45 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
     }
 }
 
+// ── StatsPayload encoder ─────────────────────────────────────────────────────
+
+/// Encode a `StatsPayload` per `docs/protocol.md` §5.7 — the reply to a
+/// `Stats` request (#65).
+///
+/// Wire layout:
+/// ```text
+/// u32   oneoffRunning
+/// u32   warmBusy
+/// u32   warmIdle
+/// u64   idleHeapBytes
+/// u32   maxLiveIsolates
+/// u32   prefixCount, then per prefix:
+///   String  prefixId
+///   u32     idle
+///   u32     busy
+/// ```
+pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
+    // Counts saturate at u32::MAX instead of wrapping: a live cap that is a
+    // multiple of 2^32 (seen with cgroup v1's "unlimited" memory sentinel
+    // before the host clamped its budget) would otherwise truncate to 0.
+    fn encode_count(n: usize, out: &mut Vec<u8>) {
+        encode_u32(u32::try_from(n).unwrap_or(u32::MAX), out);
+    }
+    let mut out = Vec::new();
+    encode_count(stats.oneoff_running, &mut out);
+    encode_count(stats.warm_busy, &mut out);
+    encode_count(stats.warm_idle, &mut out);
+    encode_u64(stats.idle_heap_bytes, &mut out);
+    encode_count(stats.max_live, &mut out);
+    encode_count(stats.per_prefix.len(), &mut out);
+    for (prefix_id, idle, busy) in &stats.per_prefix {
+        encode_string(prefix_id, &mut out);
+        encode_count(*idle, &mut out);
+        encode_count(*busy, &mut out);
+    }
+    out
+}
+
 // ── BridgeCall payload encoder ────────────────────────────────────────────────────
 
 /// Encode a `BridgeCallPayload` per `docs/protocol.md` §5.4.
