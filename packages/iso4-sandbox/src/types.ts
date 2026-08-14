@@ -1054,9 +1054,16 @@ export interface RunSuccess {
   exports: SandboxExports
   /**
    * Export names absent from `exports` because their value cannot cross the
-   * boundary — a function (`export default { fetch }`), an unresolved
-   * Promise, or a value whose serialization failed. Skipping is never fatal
-   * (#58); the names are reported here so nothing is silently hidden.
+   * boundary — a function (`export default { fetch }`), a Promise, or a value
+   * whose serialization failed. Skipping is never fatal (#58); the names are
+   * reported here so nothing is silently hidden.
+   *
+   * A Promise is skipped **whatever its state**: the export path never awaits,
+   * so `export default Promise.resolve(42)` is dropped exactly like a pending
+   * one. Export the value instead — `export default await something()` — which
+   * works because the module's own evaluation settles before the runtime reads
+   * the namespace. `prefix.call()` is the opposite: it awaits a returned
+   * Promise and resolves to its value.
    */
   skippedExports: string[]
   /**
@@ -1190,7 +1197,6 @@ export type RunErrorCode
      */
     | 'ERR_TYPE_NOT_SERIALIZABLE'
     | 'ERR_EXPORT_TOO_LARGE'
-    | 'ERR_EXPORT_UNRESOLVED_PROMISE'
     /**
      * A `call.export` path did not resolve against the module's exports, or
      * resolved to a value that is not callable. The message says which and

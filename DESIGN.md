@@ -613,6 +613,16 @@ Behavior does not cross. These cannot be carried:
 - Symbols
 - `WeakMap` / `WeakSet` / `Proxy`
 
+**A Promise export is dropped whatever its state.** Nothing awaits it on the
+export path: `export default Promise.resolve(42)` is skipped exactly like
+`export default new Promise(() => {})`, because the serializer sees a Promise
+either way and V8's format cannot carry one. Write
+`export default await something()` — the module's evaluation promise settles
+before the runtime reads the namespace, so the awaited *value* is what gets
+exported. A call's return value is the exception and behaves the opposite
+way: `prefix.call()` awaits a returned Promise and gives you its value
+(§5.3).
+
 How a refusal surfaces depends on the position (#58):
 
 - **Exports are skipped, never fatal.** An export whose value cannot cross —
