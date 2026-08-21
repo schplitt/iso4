@@ -209,6 +209,59 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
     }
 }
 
+/// Write a `Result` frame, substituting a minimal one when the assembled
+/// payload is too large to frame.
+///
+/// `max_export_bytes` bounds the *success* payload, but nothing bounds a
+/// failure: the error's message, stack and own properties are cloned verbatim
+/// out of the isolate, so `throw new Error('A'.repeat(70e6))` builds a payload
+/// past the 64 MiB frame ceiling under default limits. Writing it used to fail,
+/// and the caller treated that as fatal and closed the connection with no frame
+/// sent at all — which the host then recycled, one dead pool slot per run, until
+/// the sandbox served nothing. Guest code could do that deliberately.
+///
+/// Substituting is safe because the length check in `write_frame_with_limit`
+/// runs before any byte reaches the socket, so the stream is still frame-aligned
+/// and the run can be answered properly. Only a genuine I/O failure (a
+/// different `ErrorKind`) may have written a partial frame, and that stays
+/// fatal.
+fn write_result_frame(stream: &mut UnixStream, run_id: u32, payload: &[u8]) -> std::io::Result<()> {
+    match ipc::write_rust_to_ts_frame(stream, ipc::RustToTsMessageType::Result, payload) {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            eprintln!(
+                "[iso4-v8] Result frame for run {run_id} too large to send ({e}) — \
+                 replacing it with ERR_INTERNAL"
+            );
+            let replacement = wire::encode_run_completion_payload(
+                run_id,
+                wire::RunCompletion::Failure(wire::RunFailurePayload {
+                    error: wire::RunErrorPayload {
+                        code: "ERR_INTERNAL".to_string(),
+                        name: "Error".to_string(),
+                        message: format!(
+                            "the run's result was too large to send to the host ({e}). \
+                             A thrown error's message, stack and properties are reported \
+                             verbatim, so a very large one cannot be delivered."
+                        ),
+                        stack: None,
+                        fields: None,
+                    },
+                    // Dropped deliberately: stdout/stderr are unbounded too, and
+                    // this payload has to be small by construction.
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    duration_ms: 0.0,
+                    cpu_time_ms: 0.0,
+                    bridge_calls: Vec::new(),
+                    heap_used_bytes: None,
+                }),
+            );
+            ipc::write_rust_to_ts_frame(stream, ipc::RustToTsMessageType::Result, &replacement)
+        }
+        other => other,
+    }
+}
+
 pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
@@ -414,11 +467,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 };
                 shared.warm.release_oneoff();
 
-                if let Err(e) = ipc::write_rust_to_ts_frame(
-                    &mut stream,
-                    ipc::RustToTsMessageType::Result,
-                    &result_payload,
-                ) {
+                if let Err(e) = write_result_frame(&mut stream, payload.run_id, &result_payload) {
                     eprintln!("[iso4-v8] failed to write Result frame: {e}");
                     break;
                 }
@@ -752,11 +801,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                 };
 
-                if let Err(e) = ipc::write_rust_to_ts_frame(
-                    &mut stream,
-                    ipc::RustToTsMessageType::Result,
-                    &result_payload,
-                ) {
+                if let Err(e) = write_result_frame(&mut stream, payload.run_id, &result_payload) {
                     eprintln!("[iso4-v8] failed to write Result frame: {e}");
                     break;
                 }

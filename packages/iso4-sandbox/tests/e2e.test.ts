@@ -1608,6 +1608,34 @@ describe('resource limits', () => {
     }
   }, 15_000)
 
+  test('an error too large to send does not retire the pool slot', async () => {
+    // maxExportBytes bounds the success path; nothing bounded a thrown error's
+    // message and stack, which are copied verbatim out of the isolate. This
+    // built a Result frame of ~140 MB, past the 64 MiB frame ceiling, so the
+    // runtime could not write it, treated that as fatal, and closed the socket
+    // with no frame at all. The host recycled the dead connection, so at
+    // maxIsolates: 1 the sandbox was finished — one line of guest code.
+    const small = await createRuntime({ maxIsolates: 1 })
+    try {
+      const result = await small.run({
+        code: `throw new Error('A'.repeat(70e6))`,
+        limits: { wallTimeMs: 20_000, cpuTimeMs: 20_000 },
+      })
+      expect(result.ok).toBe(false)
+      if (result.ok)
+        return
+      // The real error survives, clamped — not swapped for a generic failure.
+      expect(result.error.code).toBe('ERR_USER_CODE')
+      expect(result.error.message).toMatch(/truncated by iso4: \d+ bytes total/)
+
+      // The point of the test: the one connection is still alive.
+      const next = await small.run({ code: 'export default 1 + 1' })
+      expect(next.ok).toBe(true)
+    } finally {
+      await small.dispose()
+    }
+  }, 30_000)
+
   test('memory limit is enforced — logs emitted before OOM are preserved', async () => {
     const small = await createRuntime({ maxIsolates: 1, memoryMb: 32 })
     try {
