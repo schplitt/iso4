@@ -1,5 +1,10 @@
 name: Release
 
+# Default-deny. The changeset and publish jobs widen this for themselves;
+# build-native, which needs nothing but checkout, stays read-only.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
