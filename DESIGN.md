@@ -1981,8 +1981,10 @@ frame read, so Rust cannot consume the `Terminate`. If no result arrives within
 a short grace window (`TERMINATE_GRACE_MS`, ~100 ms), TS falls back to the
 teardown path: it closes the frame reader and destroys the socket. The `run()`
 promise resolves as aborted immediately with synthesized zeros, the connection
-is marked unusable and replaced by `ConnectionPool` (keeping the full
-`maxIsolates` complement), and the abandoned isolate is reclaimed only when its
+is marked unusable and dropped by `ConnectionPool`. `maxIsolates` is a capacity,
+not a fixed set of sockets, so dropping it frees a unit of that capacity and the
+next caller that needs a connection opens one — a connect failure fails that run
+rather than permanently shrinking the pool. The abandoned isolate is reclaimed only when its
 **CPU guard** fires — bounded by `cpuTimeMs`, not `wallTimeMs`. Promptly
 interrupting a busy isolate would require a Rust-side `terminate_execution`
 driven by an out-of-band signal (e.g. a socket-hangup watcher); this is

@@ -399,7 +399,7 @@ class SandboxImpl implements Sandbox {
         if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')
           return abortedResult(options.signal.reason, decoded)
         return decoded
-      })
+      }, options.signal)
     } catch (error) {
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
@@ -734,7 +734,7 @@ implements Prefix<G, M> {
         if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')
           return abortedResult(options.signal.reason, decoded)
         return decoded
-      })
+      }, options.signal)
     } catch (error) {
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
