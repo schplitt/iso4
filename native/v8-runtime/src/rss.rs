@@ -63,21 +63,44 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
+    use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::OnceLock;
 
     /// `/proc/self/statm`, held open for the process's life and `pread` at
     /// offset 0 per sample — procfs regenerates the content per read, and
     /// skipping open/close keeps the cost near the macOS number. `pread` is
     /// position-less per call, so concurrent samplers need no lock.
-    static STATM_FD: OnceLock<Option<i32>> = OnceLock::new();
+    ///
+    /// `-1` means "no fd yet": either never opened or the last attempt
+    /// failed. A failed open must stay retryable — caching it (the previous
+    /// `OnceLock<Option<i32>>`) turned one transient failure (e.g. fd
+    /// exhaustion at sample time) into permanently blind watermarks for the
+    /// rest of the process's life.
+    static STATM_FD: AtomicI32 = AtomicI32::new(-1);
     static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
 
+    fn statm_fd() -> Option<i32> {
+        let cached = STATM_FD.load(Ordering::Acquire);
+        if cached >= 0 {
+            return Some(cached);
+        }
+        let path = c"/proc/self/statm";
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        match STATM_FD.compare_exchange(-1, fd, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Some(fd),
+            // Another sampler won the race — keep its fd, close ours.
+            Err(winner) => {
+                unsafe { libc::close(fd) };
+                Some(winner)
+            }
+        }
+    }
+
     pub fn read() -> Option<u64> {
-        let fd = (*STATM_FD.get_or_init(|| {
-            let path = c"/proc/self/statm";
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            (fd >= 0).then_some(fd)
-        }))?;
+        let fd = statm_fd()?;
         let page_size = *PAGE_SIZE
             .get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE).max(0) as u64 });
 
