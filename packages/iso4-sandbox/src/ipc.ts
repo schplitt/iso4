@@ -126,7 +126,16 @@ export class FrameReader {
       this.buffer,
       Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength),
     ])
-    this.flushPendingReads()
+    // `push` is called straight from the socket's 'data' listener, so a throw
+    // from the drain below would land on the event loop as an uncaughtException
+    // and take the host process down. Route it through `close` instead: pending
+    // and future reads reject with it, which is how every other read failure on
+    // this connection already surfaces.
+    try {
+      this.flushPendingReads()
+    } catch (error) {
+      this.close(error instanceof Error ? error : new Error(String(error)))
+    }
   }
 
   readFrame(): Promise<Frame> {
@@ -164,7 +173,17 @@ export class FrameReader {
     }
 
     this.closedError = error
-    this.flushPendingReads()
+    // Deliver whatever whole frames are already buffered, but never let a throw
+    // from that drain escape: the bad length prefix that brought us here is
+    // still at the head of the buffer, so `tryReadFrame` throws again, and the
+    // rejection loop below would be skipped — leaving the pending read forever
+    // unsettled (the run hangs, the pool slot leaks). `close` must also stay
+    // non-throwing for its callers, which include the socket event handlers.
+    try {
+      this.flushPendingReads()
+    } catch {
+      // Nothing to do: every pending read is settled with `error` below.
+    }
 
     while (this.pendingReads.length > 0) {
       this.pendingReads.shift()?.reject(error)
