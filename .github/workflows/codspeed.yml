@@ -9,11 +9,16 @@ name: CodSpeed
 #     baseline; every PR push gets a diff comment from the CodSpeed GitHub
 #     app, with ~1-2 % regression resolution.
 #
-#   - NOT covered: the two-process end-to-end suites (matrix/runtime.bench.ts).
-#     Those spawn the iso4-v8 child process and wait on a Unix socket, so
-#     instrumenting the vitest process would measure only the host-side
-#     slice. They are wall-time only: bench both sides back-to-back on the
-#     same idle machine and compare with scripts/bench-compare.ts.
+#   - NOT covered: the two-process end-to-end suites (matrix/runtime/warm/
+#     eviction.bench.ts). Those spawn the iso4-v8 child process and wait on
+#     a Unix socket, so instrumenting the vitest process would measure only
+#     the host-side slice. They are wall-time only: bench both sides
+#     back-to-back on the same idle machine and compare with
+#     scripts/bench-compare.ts. Putting them in CI needs stable dedicated
+#     hardware — CodSpeed's walltime macro runners require a GitHub org
+#     (this repo is on a personal account) and a standing bench box wasn't
+#     worth the cost yet; decided 2026-08-21 (#67), revisit when the perf
+#     lab (Node-version matrix) becomes real.
 #
 # Auth is OIDC (id-token: write) — no long-lived token. The repo must be
 # added on https://codspeed.io for reports/comments to appear.
