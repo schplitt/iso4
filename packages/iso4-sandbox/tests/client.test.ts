@@ -319,6 +319,40 @@ describe('RuntimeIpcClient', () => {
     await client.dispose()
   })
 
+  test('runId wraps past 2³¹ as an unsigned value', async () => {
+    // `& 0xffffffff` coerces through ToInt32, so the counter used to go
+    // negative at 2³¹ and every later run died in writeU32 with
+    // ERR_OUT_OF_RANGE before a byte reached the wire. Seeded at the boundary
+    // rather than incremented 2³¹ times.
+    let sentRunId: number | undefined
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const runFrame = await reader.readFrame()
+      sentRunId = Buffer.from(
+        runFrame.payload.buffer,
+        runFrame.payload.byteOffset,
+        runFrame.payload.byteLength,
+      ).readUInt32BE(0)
+      socket.write(
+        encodeRustToTsFrame(
+          RustToTsMessageTypes.Result,
+          resultPayload(sentRunId, 'payload'),
+        ),
+      )
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    ;(client as unknown as { nextRunId: number }).nextRunId = 0x7FFFFFFF
+
+    await expect(client.runRawCode('export default 42')).resolves.toBeDefined()
+    expect(sentRunId).toBe(0x80000000)
+
+    await client.dispose()
+  })
+
   test('rejects a Result carrying another run\'s runId and tears the connection down', async () => {
     // The cross-run disclosure: a connection that went back to the pool while
     // the runtime was still mid-run answers the next run with the previous

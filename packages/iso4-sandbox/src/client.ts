@@ -278,12 +278,17 @@ export class RuntimeIpcClient {
 
   private nextRunId = 0
   private nextRunIdValue(): number {
-    // Wraps at 2³²-1 back to 0. Safe in v1 because runs are sequential per
-    // connection — no two runs share a connection simultaneously, so a
-    // rolled-over ID can never collide with a live one. When D11 (concurrent
-    // async bridge) lands, add a `do { ... } while (inFlightRuns.has(id))`
-    // guard here.
-    this.nextRunId = (this.nextRunId + 1) & 0xffffffff
+    // Wraps at 2³²-1 back to 0. `>>> 0` and not `& 0xffffffff`: `&` coerces
+    // through ToInt32, so `(0x7fffffff + 1) & 0xffffffff` is -2147483648, which
+    // `writeU32` then rejects with ERR_OUT_OF_RANGE — killing every subsequent
+    // run on the connection for the next 2³¹ increments.
+    //
+    // Safe in v1 because runs are sequential per connection — no two runs share
+    // a connection simultaneously, so a rolled-over ID can never collide with a
+    // live one, and `drainFrames` can treat the ID as proof a Result is ours.
+    // When D11 (concurrent async bridge) lands, add a
+    // `do { ... } while (inFlightRuns.has(id))` guard here.
+    this.nextRunId = (this.nextRunId + 1) >>> 0
     return this.nextRunId
   }
 
