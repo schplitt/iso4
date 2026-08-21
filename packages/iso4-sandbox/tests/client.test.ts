@@ -76,6 +76,20 @@ function writeHello(socket: Socket): void {
   )
 }
 
+/**
+ * A `Result` frame payload stub: the `runId` being answered followed by
+ * arbitrary body bytes. The runId is not decoration — the client rejects any
+ * `Result` whose runId is not the one it sent, so a fake runtime has to echo it
+ * the way `session.rs` does.
+ * @param runId
+ * @param body
+ */
+function resultPayload(runId: number, body: string): Buffer {
+  const head = Buffer.allocUnsafe(4)
+  head.writeUInt32BE(runId, 0)
+  return Buffer.concat([head, Buffer.from(body, 'utf8')])
+}
+
 describe('RuntimeIpcClient', () => {
   test('connects, authenticates, sends Run, and receives Result', async () => {
     const socketPath = await listen(async (socket) => {
@@ -100,9 +114,14 @@ describe('RuntimeIpcClient', () => {
       expect(code).toBe('export default 42')
 
       // Result frame carries the full RunCompletionPayload (no StdioChunk
-      // in the real protocol — logs are inside the Result payload).
+      // in the real protocol — logs are inside the Result payload). Its first
+      // field is the runId being answered, which the client matches against
+      // the one it sent before accepting the frame.
       socket.write(
-        encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('payload')),
+        encodeRustToTsFrame(
+          RustToTsMessageTypes.Result,
+          resultPayload(view.readUInt32BE(0), 'payload'),
+        ),
       )
     })
 
@@ -112,7 +131,7 @@ describe('RuntimeIpcClient', () => {
     })
     const result = await client.runRawCode('export default 42')
 
-    expect(Buffer.from(result.result).toString('utf8')).toBe('payload')
+    expect(Buffer.from(result.result).subarray(4).toString('utf8')).toBe('payload')
 
     await client.dispose()
   })
@@ -259,7 +278,12 @@ describe('RuntimeIpcClient', () => {
       socket.on('data', (chunk) => reader.push(chunk))
       await reader.readFrame() // Authenticate
       writeHello(socket)
-      await reader.readFrame() // Run
+      const runFrame = await reader.readFrame() // Run
+      const runId = Buffer.from(
+        runFrame.payload.buffer,
+        runFrame.payload.byteOffset,
+        runFrame.payload.byteLength,
+      ).readUInt32BE(0)
 
       socket.write(
         encodeRustToTsFrame(RustToTsMessageTypes.BridgeCall, bridgeCallPayload),
@@ -270,9 +294,12 @@ describe('RuntimeIpcClient', () => {
       // BridgeResponse is TS→Rust type byte 0x06
       expect(responseFrame.messageType).toBe(TsToRustMessageTypes.BridgeResponse)
 
-      // Send a Result frame to complete the run
+      // Send a Result frame to complete the run, echoing the runId it answers.
       socket.write(
-        encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('payload')),
+        encodeRustToTsFrame(
+          RustToTsMessageTypes.Result,
+          resultPayload(runId, 'payload'),
+        ),
       )
     })
 
@@ -287,8 +314,130 @@ describe('RuntimeIpcClient', () => {
         },
       },
     })
-    expect(Buffer.from(raw.result).toString('utf8')).toBe('payload')
+    expect(Buffer.from(raw.result).subarray(4).toString('utf8')).toBe('payload')
     expect(dispatched).toEqual(['world'])
+    await client.dispose()
+  })
+
+  test('rejects a Result carrying another run\'s runId and tears the connection down', async () => {
+    // The cross-run disclosure: a connection that went back to the pool while
+    // the runtime was still mid-run answers the next run with the previous
+    // run's Result. Simulated directly by answering with runId + 1 — the frame
+    // is otherwise perfectly well-formed, which is exactly why nothing but the
+    // runId can catch it.
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const runFrame = await reader.readFrame()
+      const sentRunId = Buffer.from(
+        runFrame.payload.buffer,
+        runFrame.payload.byteOffset,
+        runFrame.payload.byteLength,
+      ).readUInt32BE(0)
+
+      socket.write(
+        encodeRustToTsFrame(
+          RustToTsMessageTypes.Result,
+          resultPayload(sentRunId + 1, 'someone else\'s exports'),
+        ),
+      )
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+
+    await expect(client.runRawCode('export default 42')).rejects.toThrow(
+      /Result frame carries runId .* but run \d+ is in flight/,
+    )
+    // The pool must not get this connection back: the peer is answering runs
+    // that are not ours, and the stream stays offset for every future run.
+    expect(client.usable).toBe(false)
+
+    await client.dispose()
+  })
+
+  test('answers an undecodable BridgeCall with an error response and keeps the connection', async () => {
+    // Guest-controlled bytes the host cannot rebuild (the real trigger is a
+    // host type the sandbox accepted and this Node rejects). The callId sits
+    // ahead of the args blob, so the call is still answerable — the run must
+    // complete normally and the connection must survive, rather than the
+    // decode throw escaping and costing a pool slot.
+    const enc = (s: string): Buffer => {
+      const b = Buffer.from(s, 'utf8')
+      const h = Buffer.allocUnsafe(4)
+      h.writeUInt32BE(b.byteLength, 0)
+      return Buffer.concat([h, b])
+    }
+    const garbageArgs = Buffer.from([0xFF, 0xFF, 0xFF, 0xFF])
+    const argsLen = Buffer.allocUnsafe(4)
+    argsLen.writeUInt32BE(garbageArgs.byteLength, 0)
+    const undecodableCall = Buffer.concat([
+      Buffer.from([0, 0, 0, 7]), // callId = 7
+      Buffer.from([0]), // targetKind = global
+      Buffer.from([0]), // specifier absent
+      enc('greet'),
+      argsLen,
+      garbageArgs, // not a valid V8 serialization blob
+    ])
+
+    let responseOk: number | undefined
+    let responseCallId: number | undefined
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const runFrame = await reader.readFrame()
+      const runId = Buffer.from(
+        runFrame.payload.buffer,
+        runFrame.payload.byteOffset,
+        runFrame.payload.byteLength,
+      ).readUInt32BE(0)
+
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.BridgeCall, undecodableCall),
+      )
+
+      // The client must still answer, so the runtime is never left parked.
+      const responseFrame = await reader.readFrame()
+      expect(responseFrame.messageType).toBe(TsToRustMessageTypes.BridgeResponse)
+      const view = Buffer.from(
+        responseFrame.payload.buffer,
+        responseFrame.payload.byteOffset,
+        responseFrame.payload.byteLength,
+      )
+      responseCallId = view.readUInt32BE(0)
+      responseOk = view.readUInt8(4)
+
+      socket.write(
+        encodeRustToTsFrame(
+          RustToTsMessageTypes.Result,
+          resultPayload(runId, 'payload'),
+        ),
+      )
+    })
+
+    const dispatched: unknown[] = []
+    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const raw = await client.runRawCode('export default 1', {
+      globals: [{ kind: 'bridge', name: 'greet' }],
+      dispatch: {
+        greet: (...args: unknown[]) => {
+          dispatched.push(args[0])
+          return 'hello'
+        },
+      },
+    })
+
+    // Answered as a failure, against the right call, and the handler never ran.
+    expect(responseCallId).toBe(7)
+    expect(responseOk).toBe(0)
+    expect(dispatched).toEqual([])
+    // The run completed and the connection is still poolable.
+    expect(Buffer.from(raw.result).subarray(4).toString('utf8')).toBe('payload')
+    expect(client.usable).toBe(true)
+
     await client.dispose()
   })
 })

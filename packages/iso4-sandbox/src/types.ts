@@ -1229,4 +1229,16 @@ export type RunErrorCode
      */
     | 'ERR_WARMUP_LIMIT'
     | 'ERR_PREFIX_DISPOSED'
+    /**
+     * The runtime answered with a `Result` belonging to a different run, or
+     * sent a frame that has no place in the run protocol. Host-detected, never
+     * reported by the runtime: the two sides lost frame alignment on that
+     * connection, so **this run never executed** — nothing ran, nothing was
+     * observed, and the telemetry fields are zero rather than partial.
+     *
+     * The connection is destroyed and replaced before the result is returned,
+     * so a retry runs on a fresh one. Seeing this at all is a bug worth
+     * reporting; it should be unreachable.
+     */
+    | 'ERR_PROTOCOL_DESYNC'
     | 'ERR_INTERNAL'

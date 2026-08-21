@@ -14,7 +14,7 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 
 import { resolveRuntimeBinary } from './binary'
-import { RunAbortedError, RuntimeIpcClient } from './client'
+import { ProtocolDesyncError, RunAbortedError, RuntimeIpcClient } from './client'
 
 import { ConnectionPool } from './pool'
 import {
@@ -265,6 +265,29 @@ async function waitForSocket(
  * @param reason
  * @param from
  */
+/**
+ * Synthesized result for a run displaced by a connection desync. The run never
+ * reached the isolate, so unlike {@link abortedResult} there is no partial
+ * telemetry to carry over — every field is empty by construction.
+ * @param error
+ */
+function desyncResult(error: ProtocolDesyncError): RunResult {
+  return {
+    status: 'failed',
+    ok: false,
+    error: {
+      code: 'ERR_PROTOCOL_DESYNC',
+      name: error.name,
+      message: error.message,
+    },
+    stdout: [],
+    stderr: [],
+    durationMs: 0,
+    cpuTimeMs: 0,
+    bridgeCalls: [],
+  }
+}
+
 function abortedResult(reason?: unknown, from?: RunResult): RunResult {
   return {
     status: 'aborted',
@@ -380,6 +403,8 @@ class SandboxImpl implements Sandbox {
     } catch (error) {
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
+      if (error instanceof ProtocolDesyncError)
+        return desyncResult(error)
       throw error
     }
   }
@@ -713,6 +738,8 @@ implements Prefix<G, M> {
     } catch (error) {
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
+      if (error instanceof ProtocolDesyncError)
+        return desyncResult(error)
       throw error
     }
   }

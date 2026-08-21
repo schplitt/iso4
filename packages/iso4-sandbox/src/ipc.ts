@@ -976,6 +976,25 @@ export interface BridgeCallInfo {
  * preserves identity between arguments that reference the same object.
  * @param buf
  */
+/**
+ * Read just the `callId` off a `BridgeCall` frame payload.
+ *
+ * `callId` is the first field, ahead of the guest-controlled value blob, so it
+ * is still recoverable when {@link decodeBridgeCallPayload} throws on the args.
+ * That lets the client answer a call it could not decode instead of stranding
+ * the peer on a response that never comes.
+ *
+ * Returns `undefined` only when the payload is too short to carry one.
+ * @param buf
+ */
+export function peekBridgeCallId(buf: Uint8Array): number | undefined {
+  if (buf.byteLength < 4)
+    return undefined
+  return (
+    (buf[0]! << 24) | (buf[1]! << 16) | (buf[2]! << 8) | buf[3]!
+  ) >>> 0
+}
+
 export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
   const reader = new PayloadReader(buf)
 
@@ -1121,6 +1140,27 @@ export interface DecodedRunCompletion {
 export interface DecodedCallCompletion {
   runId: number
   result: CallResult
+}
+
+/**
+ * Read just the `runId` off a `Result` frame payload, without decoding the rest.
+ *
+ * The client correlates every `Result` against the `runId` it sent before it
+ * accepts the frame as its own, so this runs on a payload that may belong to a
+ * different run entirely — decoding the value blob first would be both wasted
+ * work and a chance for another run's bytes to throw. `runId` is the first
+ * field of the layout documented on {@link decodeRunCompletionPayload}.
+ *
+ * Returns `undefined` when the payload is too short to carry one, which is
+ * itself a desync rather than a run this client can claim.
+ * @param buf
+ */
+export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
+  if (buf.byteLength < 4)
+    return undefined
+  return (
+    (buf[0]! << 24) | (buf[1]! << 16) | (buf[2]! << 8) | buf[3]!
+  ) >>> 0
 }
 
 /**
