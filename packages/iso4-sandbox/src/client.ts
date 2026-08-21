@@ -276,6 +276,14 @@ export class RuntimeIpcClient {
     }
   }
 
+  /**
+   * The run currently being drained, or `undefined` between runs. Bridge
+   * response handlers are fire-and-forget and can settle after their run has
+   * finished, so anything they do to the *connection* has to check that the
+   * connection is still theirs.
+   */
+  private inFlightRunId: number | undefined
+
   private nextRunId = 0
   private nextRunIdValue(): number {
     // Wraps at 2³²-1 back to 0. `>>> 0` and not `& 0xffffffff`: `&` coerces
@@ -560,6 +568,7 @@ export class RuntimeIpcClient {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
 
+    this.inFlightRunId = runId
     try {
       return await this.drainFrames(dispatcher, runId)
     } catch (error) {
@@ -571,6 +580,7 @@ export class RuntimeIpcClient {
         throw new RunAbortedError(signal.reason)
       throw error
     } finally {
+      this.inFlightRunId = undefined
       if (graceTimer !== undefined)
         clearTimeout(graceTimer)
       signal?.removeEventListener('abort', onAbort)
@@ -744,8 +754,41 @@ export class RuntimeIpcClient {
                   ),
                 ),
               ),
-            ).catch(() => {
-              // Connection may have closed — discard silently.
+            ).catch(async (err: unknown) => {
+              // Encoding or writing the response itself failed — most reachably
+              // `encodeFrame`'s 64 MiB ceiling on a large handler return value.
+              // Nothing was written, so the sandbox's awaited bridge promise
+              // never settles and the run hangs until the wall deadline, or
+              // forever under the supported `wallTimeMs: 0` (Rust installs
+              // neither a read timeout nor a wall-guard thread in that case, and
+              // freezes the CPU accumulator while parked). Answer with the
+              // failure instead: a small payload where the original was not.
+              //
+              // Safe to send late. This handler is orphaned when the run
+              // completes without it, and Rust discards responses for callIds it
+              // no longer knows.
+              try {
+                await this.write(
+                  encodeTsToRustFrame(
+                    TsToRustMessageTypes.BridgeResponse,
+                    encodeBridgeResponsePayload(
+                      callId,
+                      false,
+                      undefined,
+                      bridgeErrorPayloadFromUnknown(err),
+                    ),
+                  ),
+                )
+              } catch {
+                // The connection cannot even carry the failure. Tear it down so
+                // the run fails fast instead of waiting out the wall clock — but
+                // only while it is still OUR run: by now the slot may have been
+                // returned to the pool and be serving someone else, and killing
+                // a healthy connection under a different caller would turn this
+                // into the very cross-run fault this branch closes.
+                if (this.inFlightRunId === runId)
+                  this.abortConnection()
+              }
             })
           }
           break

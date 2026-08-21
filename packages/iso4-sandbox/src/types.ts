@@ -50,9 +50,12 @@ export interface ResourceLimits {
    * A violation terminates the run immediately with
    * `ERR_BRIDGE_PAYLOAD_TOO_LARGE`; sandbox code cannot catch it.
    *
-   * Bridge responses (host → sandbox) are not separately capped here — the
-   * natural limit is `memoryMb`: the sandbox cannot hold a response larger than
-   * its own memory budget, and the framing layer enforces this automatically.
+   * Bridge responses (host → sandbox) are not separately capped here. The
+   * binding limit is the host framing ceiling of 64 MiB, below the runtime's own
+   * inbound allowance of `memoryMb`: a handler returning more than that cannot
+   * be encoded, and the sandbox receives `ERR_HOST_BRIDGE` for that call rather
+   * than the value. Cap large handler return values yourself if you want a
+   * cleaner failure.
    *
    * Zero disables the per-call cap.
    * @default 16 * 1024 * 1024

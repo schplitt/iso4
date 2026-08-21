@@ -319,6 +319,90 @@ describe('RuntimeIpcClient', () => {
     await client.dispose()
   })
 
+  test('a bridge response too large to encode is answered as an error, not swallowed', async () => {
+    // The success arm caught serializeHostValue but not the encode+write that
+    // follows, and the trailing .catch discarded it — so no BridgeResponse was
+    // ever written and the sandbox's awaited promise never settled. The run then
+    // hung to the wall deadline, or forever under `wallTimeMs: 0`.
+    const enc = (s: string): Buffer => {
+      const b = Buffer.from(s, 'utf8')
+      const h = Buffer.allocUnsafe(4)
+      h.writeUInt32BE(b.byteLength, 0)
+      return Buffer.concat([h, b])
+    }
+    const argsBlob = serializeValue([])
+    const argsLen = Buffer.allocUnsafe(4)
+    argsLen.writeUInt32BE(argsBlob.byteLength, 0)
+    const bridgeCallPayload = Buffer.concat([
+      Buffer.from([0, 0, 0, 3]), // callId = 3
+      Buffer.from([0]), // targetKind = global
+      Buffer.from([0]), // specifier absent
+      enc('big'),
+      argsLen,
+      argsBlob,
+    ])
+
+    let responseOk: number | undefined
+    let responseCallId: number | undefined
+    let responseMessage: string | undefined
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const runFrame = await reader.readFrame()
+      const runId = Buffer.from(
+        runFrame.payload.buffer,
+        runFrame.payload.byteOffset,
+        runFrame.payload.byteLength,
+      ).readUInt32BE(0)
+
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.BridgeCall, bridgeCallPayload),
+      )
+
+      const responseFrame = await reader.readFrame()
+      const view = Buffer.from(
+        responseFrame.payload.buffer,
+        responseFrame.payload.byteOffset,
+        responseFrame.payload.byteLength,
+      )
+      responseCallId = view.readUInt32BE(0)
+      responseOk = view.readUInt8(4)
+      // Failure layout: u32 callId, u8 ok, String code, String name,
+      // String message. Walk to the message.
+      let at = 5
+      for (let i = 0; i < 2; i++) at += 4 + view.readUInt32BE(at)
+      responseMessage = view.subarray(at + 4, at + 4 + view.readUInt32BE(at)).toString('utf8')
+
+      socket.write(
+        encodeRustToTsFrame(
+          RustToTsMessageTypes.Result,
+          resultPayload(runId, 'payload'),
+        ),
+      )
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const raw = await client.runRawCode('export default 1', {
+      globals: [{ kind: 'bridge', name: 'big' }],
+      dispatch: {
+        // Serializes fine, but the framed payload exceeds the 64 MiB ceiling.
+        big: () => new Uint8Array(65 * 1024 * 1024),
+      },
+    })
+
+    expect(responseCallId).toBe(3)
+    expect(responseOk).toBe(0)
+    // Pin the path: this must be the framing ceiling, not the
+    // serializeHostValue catch that already worked before this fix.
+    expect(responseMessage).toMatch(/exceeds max frame length/)
+    expect(Buffer.from(raw.result).subarray(4).toString('utf8')).toBe('payload')
+    expect(client.usable).toBe(true)
+
+    await client.dispose()
+  })
+
   test('runId wraps past 2³¹ as an unsigned value', async () => {
     // `& 0xffffffff` coerces through ToInt32, so the counter used to go
     // negative at 2³¹ and every later run died in writeU32 with
