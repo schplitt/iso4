@@ -10,7 +10,8 @@ against it in parallel. Every run gets its own limits, guards, and bridge
 bindings; one-off `sandbox.run()` always gets a fresh isolate, while prefix
 runs reuse resident warm instances when one is free (see below).
 
-> **Status:** core execution works end-to-end. Not yet at 1.0.
+> **Status:** core execution works end-to-end. Not yet at 1.0 — every API,
+> option, and observability surface (including `stats()`) may still change.
 
 ## Install
 
@@ -117,16 +118,23 @@ prefix.execute({
 ## Warm instances and the memory budget
 
 Runs against a prepared prefix are served by **warm instances**: resident
-isolates with the prefix already evaluated, reused across calls so boot and
-prefix evaluation are paid once instead of per run. This is automatic — no
-flag, no separate API — and it is a cache, never a guarantee: an instance can
-disappear between calls (a fired limit, an abort, memory pressure, `dispose()`),
-and the next call transparently cold-starts a new one. Never depend on state
-carrying over; put durable state in a database, and do expensive setup lazily
-inside the handler (`conn ??= await connect()`), which then re-runs correctly
-after any eviction. Instances of one prefix share no state with each other and
-serve one call at a time. `console.*` written while a prefix evaluates arrives
-on the result of the call that cold-started the instance.
+isolates with the prefix already evaluated, so boot and prefix evaluation
+are paid once instead of per run. Automatic — no flag, no separate API.
+
+Warmth is a cache, never a guarantee. An instance can vanish between any
+two calls (memory pressure, `dispose()`), and a call that fires a limit or
+aborts always costs its instance — the next call cold-starts clean. Don't
+rely on state carrying over: `globalThis` writes and patched builtins stay
+visible to later runs until eviction silently wipes them. Keep durable
+state in a database and do expensive setup lazily in the handler
+(`conn ??= await connect()`).
+
+Instances of one prefix share no state and serve one call at a time —
+concurrency means more instances. Top-level names never collide across runs
+(each run is its own module). A prefix that can't finish evaluating under
+the fixed warm-up budget is rejected by `prepare()` with
+`ERR_WARMUP_LIMIT`. `console.*` from prefix evaluation arrives on the
+cold-starting call's result.
 
 Residency is bounded by memory, not by a count:
 
