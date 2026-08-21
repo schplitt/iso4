@@ -155,6 +155,37 @@ describe('buffered frame reader', () => {
 
     await expect(pending).rejects.toThrow(/boom/)
   })
+
+  test('a bad length prefix rejects the pending read instead of throwing out of push', async () => {
+    // `push` runs inside the socket's 'data' listener, so a synchronous throw
+    // here would surface as an uncaughtException and kill the host process.
+    // It must reject the waiting read instead. Zero length and oversized length
+    // are the two prefixes `tryReadFrame` refuses.
+    for (const prefix of [
+      Buffer.from([0x00, 0x00, 0x00, 0x00]),
+      Buffer.from([0xFF, 0xFF, 0xFF, 0xFF]),
+    ]) {
+      const reader = new FrameReader()
+      const pending = reader.readFrame()
+
+      expect(() => reader.push(prefix)).not.toThrow()
+      await expect(pending).rejects.toThrow(/frame length/)
+    }
+  })
+
+  test('close settles pending reads even when the buffered prefix is unreadable', async () => {
+    // close() drains buffered frames before rejecting. That drain re-reads the
+    // same bad prefix and throws, which used to skip the rejection loop and
+    // leave the read unsettled forever (a hung run holding a pool slot).
+    const reader = new FrameReader()
+    const pending = reader.readFrame()
+
+    // Seed the bad prefix without going through push's own guard.
+    ;(reader as unknown as { buffer: Buffer }).buffer = Buffer.from([0, 0, 0, 0])
+
+    expect(() => reader.close(new Error('socket closed'))).not.toThrow()
+    await expect(pending).rejects.toThrow()
+  })
 })
 
 describe('Authenticate payload', () => {

@@ -126,7 +126,16 @@ export class FrameReader {
       this.buffer,
       Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength),
     ])
-    this.flushPendingReads()
+    // `push` is called straight from the socket's 'data' listener, so a throw
+    // from the drain below would land on the event loop as an uncaughtException
+    // and take the host process down. Route it through `close` instead: pending
+    // and future reads reject with it, which is how every other read failure on
+    // this connection already surfaces.
+    try {
+      this.flushPendingReads()
+    } catch (error) {
+      this.close(error instanceof Error ? error : new Error(String(error)))
+    }
   }
 
   readFrame(): Promise<Frame> {
@@ -164,7 +173,17 @@ export class FrameReader {
     }
 
     this.closedError = error
-    this.flushPendingReads()
+    // Deliver whatever whole frames are already buffered, but never let a throw
+    // from that drain escape: the bad length prefix that brought us here is
+    // still at the head of the buffer, so `tryReadFrame` throws again, and the
+    // rejection loop below would be skipped — leaving the pending read forever
+    // unsettled (the run hangs, the pool slot leaks). `close` must also stay
+    // non-throwing for its callers, which include the socket event handlers.
+    try {
+      this.flushPendingReads()
+    } catch {
+      // Nothing to do: every pending read is settled with `error` below.
+    }
 
     while (this.pendingReads.length > 0) {
       this.pendingReads.shift()?.reject(error)
@@ -976,6 +995,25 @@ export interface BridgeCallInfo {
  * preserves identity between arguments that reference the same object.
  * @param buf
  */
+/**
+ * Read just the `callId` off a `BridgeCall` frame payload.
+ *
+ * `callId` is the first field, ahead of the guest-controlled value blob, so it
+ * is still recoverable when {@link decodeBridgeCallPayload} throws on the args.
+ * That lets the client answer a call it could not decode instead of stranding
+ * the peer on a response that never comes.
+ *
+ * Returns `undefined` only when the payload is too short to carry one.
+ * @param buf
+ */
+export function peekBridgeCallId(buf: Uint8Array): number | undefined {
+  if (buf.byteLength < 4)
+    return undefined
+  return (
+    (buf[0]! << 24) | (buf[1]! << 16) | (buf[2]! << 8) | buf[3]!
+  ) >>> 0
+}
+
 export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
   const reader = new PayloadReader(buf)
 
@@ -1121,6 +1159,27 @@ export interface DecodedRunCompletion {
 export interface DecodedCallCompletion {
   runId: number
   result: CallResult
+}
+
+/**
+ * Read just the `runId` off a `Result` frame payload, without decoding the rest.
+ *
+ * The client correlates every `Result` against the `runId` it sent before it
+ * accepts the frame as its own, so this runs on a payload that may belong to a
+ * different run entirely — decoding the value blob first would be both wasted
+ * work and a chance for another run's bytes to throw. `runId` is the first
+ * field of the layout documented on {@link decodeRunCompletionPayload}.
+ *
+ * Returns `undefined` when the payload is too short to carry one, which is
+ * itself a desync rather than a run this client can claim.
+ * @param buf
+ */
+export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
+  if (buf.byteLength < 4)
+    return undefined
+  return (
+    (buf[0]! << 24) | (buf[1]! << 16) | (buf[2]! << 8) | buf[3]!
+  ) >>> 0
 }
 
 /**

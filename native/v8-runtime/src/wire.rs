@@ -307,18 +307,61 @@ fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
     }
 }
 
+/// Ceiling on each piece of error *text* (message, stack) the runtime reports.
+///
+/// A thrown error's message and stack are copied verbatim out of the isolate,
+/// and `max_export_bytes` bounds only the success path — so
+/// `throw new Error('A'.repeat(70e6))` used to build a Result frame past the
+/// 64 MiB frame ceiling, which could not be written and cost the connection.
+/// 64 KiB is far past any real message while keeping the payload small.
+const MAX_ERROR_TEXT_BYTES: usize = 64 * 1024;
+
+/// Ceiling on the serialized own-properties blob attached to an error. Same
+/// reasoning as [`MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
+/// cannot be truncated meaningfully, so an oversized one is dropped whole.
+const MAX_ERROR_FIELDS_BYTES: usize = 1024 * 1024;
+
+/// Clamp error text to [`MAX_ERROR_TEXT_BYTES`], on a UTF-8 boundary, and say
+/// so in the result rather than silently shortening it.
+fn clamp_error_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= MAX_ERROR_TEXT_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = MAX_ERROR_TEXT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}… [truncated by iso4: {} bytes total]",
+        &text[..end],
+        text.len()
+    ))
+}
+
 fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
     encode_string(&error.code, out);
     encode_string(&error.name, out);
-    encode_string(&error.message, out);
+    encode_string(&clamp_error_text(&error.message), out);
     match &error.stack {
         Some(s) => {
             out.push(1);
-            encode_string(s, out);
+            encode_string(&clamp_error_text(s), out);
         }
         None => out.push(0),
     }
-    encode_optional_value_blob(error.fields.as_ref(), out);
+    // The code and name always survive, so the caller still learns what kind of
+    // failure this was even when the detail cannot be carried.
+    let fields = error.fields.as_ref().filter(|f| {
+        let keep = f.len() <= MAX_ERROR_FIELDS_BYTES;
+        if !keep {
+            eprintln!(
+                "[iso4-v8] dropping {} bytes of error properties (limit {MAX_ERROR_FIELDS_BYTES})",
+                f.len()
+            );
+        }
+        keep
+    });
+    encode_optional_value_blob(fields, out);
 }
 
 // ── PrecompileResultPayload encoder ──────────────────────────────────────────
@@ -689,5 +732,71 @@ pub fn parse_bridge_response_payload(
             io::ErrorKind::InvalidData,
             format!("invalid BridgeResponse ok byte: {b:#04x}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure_payload(message: String, stack: Option<String>, fields: Option<Vec<u8>>) -> Vec<u8> {
+        encode_run_completion_payload(
+            7,
+            RunCompletion::Failure(RunFailurePayload {
+                error: RunErrorPayload {
+                    code: "ERR_USER_CODE".to_string(),
+                    name: "Error".to_string(),
+                    message,
+                    stack,
+                    fields,
+                },
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                duration_ms: 1.0,
+                cpu_time_ms: 1.0,
+                bridge_calls: Vec::new(),
+                heap_used_bytes: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn short_error_text_is_passed_through_unchanged() {
+        assert_eq!(clamp_error_text("boom"), "boom");
+    }
+
+    #[test]
+    fn oversized_error_text_is_truncated_on_a_char_boundary() {
+        // 3-byte chars, so the cut offset is deliberately NOT a char boundary
+        // and the backoff loop has to run. Slicing off-boundary would panic.
+        let text = "€".repeat(MAX_ERROR_TEXT_BYTES);
+        let clamped = clamp_error_text(&text);
+
+        assert!(clamped.len() < text.len());
+        assert!(clamped.len() <= MAX_ERROR_TEXT_BYTES + 64);
+        assert!(clamped.ends_with(&format!("[truncated by iso4: {} bytes total]", text.len())));
+    }
+
+    #[test]
+    fn a_huge_thrown_error_still_fits_in_one_frame() {
+        // `throw Object.assign(new Error('A'.repeat(70e6)), { p: <100 MB> })`:
+        // the shape that used to encode past the frame ceiling, fail to write,
+        // and take the connection down with it — one dead pool slot per run.
+        let payload = failure_payload(
+            "A".repeat(70_000_000),
+            Some("B".repeat(70_000_000)),
+            Some(vec![0u8; 100_000_000]),
+        );
+
+        assert!(
+            payload.len() < crate::ipc::DEFAULT_MAX_FRAME_LENGTH as usize,
+            "failure payload was {} bytes, over the frame ceiling",
+            payload.len()
+        );
+        // The caller must still learn what kind of failure it was.
+        assert!(
+            String::from_utf8_lossy(&payload).contains("ERR_USER_CODE"),
+            "error code did not survive clamping"
+        );
     }
 }
