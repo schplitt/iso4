@@ -19,3 +19,8 @@ internal
 .DS_Store
 *.swp
 .idea
+
+
+# other
+.deepsec
+findings
