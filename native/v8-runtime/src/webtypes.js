@@ -736,6 +736,17 @@
     // cross the boundary, and returning null would claim the body is empty.
   }
 
+  // clone() must tee into independent bodies. `_b` is only ever null, an
+  // immutable string, or a Uint8Array (the body domain enforced by `bodyInit`
+  // and the codec's check_body), so only the buffer variant can be mutated
+  // through and needs a copy — a shared string cannot observe a change, and
+  // null is nothing. Copying a string would just be a wasted allocation on
+  // the common text-body path. This is the same copy rule `bodyInit` applies
+  // at construction; clone() skipped it and aliased the buffer.
+  function cloneBody(body) {
+    return body instanceof Uint8Array ? new Uint8Array(body) : body
+  }
+
   function consume(self) {
     if (self._used)
       throw new TypeError('Body has already been consumed')
@@ -818,7 +829,7 @@
       if (this._used)
         throw new TypeError('Body has already been consumed')
       const copy = new Request(this._u, { method: this._m, headers: this._h })
-      def(copy, '_b', this._b)
+      def(copy, '_b', cloneBody(this._b))
       def(copy, '_x', this._x)
       return copy
     }
@@ -891,7 +902,7 @@
         headers: this._h,
       })
       def(copy, '_s', this._s)
-      def(copy, '_b', this._b)
+      def(copy, '_b', cloneBody(this._b))
       return copy
     }
 

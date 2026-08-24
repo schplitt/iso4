@@ -299,4 +299,30 @@ describe('platform parity — the sandbox throws where Node throws', () => {
     const after = await run(`export default new Response('ok').status`)
     expect(after).toBe(200)
   })
+
+  // clone() must produce independent bodies: a buffer body is copied, not
+  // aliased, so mutating one side's bytes cannot reach through to the other.
+  test('Response.clone gives the clone an independent body buffer', async () => {
+    const value = await run(`
+      const r = new Response(new Uint8Array([1, 2, 3]))
+      const c = r.clone()
+      const rb = await r.bytes()
+      rb[0] = 0xff
+      const cb = await c.bytes()
+      export default cb[0]
+    `)
+    expect(value).toBe(1)
+  })
+
+  test('Request.clone gives the clone an independent body buffer', async () => {
+    const value = await run(`
+      const r = new Request('https://example.com/', { method: 'POST', body: new Uint8Array([1, 2, 3]) })
+      const c = r.clone()
+      const rb = await r.bytes()
+      rb[0] = 0xff
+      const cb = await c.bytes()
+      export default cb[0]
+    `)
+    expect(value).toBe(1)
+  })
 })
