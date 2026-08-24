@@ -16,6 +16,18 @@ The interactive prompt asks which packages are affected and whether the
 bump is `patch`, `minor`, or `major`. Commit the generated file in
 `.changeset/<random-name>.md` as part of your PR.
 
+## Keep the body short
+
+A changeset becomes a `CHANGELOG.md` entry, so it is release notes, not a
+commit message. Write it as one conventional-commit line — `fix: …`,
+`feat: …`, `perf: …` — which on its own is usually enough. Add at most two
+sentences after it, and only for what a reader of the changelog needs: what
+they will notice, or what they have to do differently.
+
+Rationale, mechanism, measurements and file names belong in the commit
+message and the PR, where anyone investigating will look. Repeating them
+here makes the changelog long without making it more useful.
+
 ## Fixed version group
 
 `@iso4/sandbox` and all `@iso4/v8-*` platform packages are in a **fixed
