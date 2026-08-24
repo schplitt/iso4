@@ -287,6 +287,18 @@ that calls `isolate.terminate_execution()` when the bracketed time exceeds
 **Wall time** is a single guard timer that fires regardless. Catches
 runaway-await cases (e.g., host fetch implementation never resolves).
 
+**Result serialization is guest execution.** V8's `ValueSerializer` follows
+structured-clone semantics: a getter on an exported object (or on a `call()`
+return value) is invoked during serialization, and its computed value is what
+crosses. All three budgets therefore stay armed until the result blob exists —
+the CPU and wall guards cover export extraction and serialization, and the
+memory budget covers whatever a getter allocates. A getter that never returns
+is terminated like any other runaway guest code, and the time spent
+serializing a large result counts against `cpuTimeMs`/`wallTimeMs`. A run
+whose guard fires during serialization fails with the timeout error; it never
+returns a partial result. workerd enforces its limits across serialization
+the same way.
+
 **Bridge payload sizes** (`maxBridgeCallBytes`, `maxBridgeResponseBytes`):
 the two directions are capped independently. `maxBridgeCallBytes` limits
 what untrusted sandbox code can send to host handlers; `maxBridgeResponseBytes`

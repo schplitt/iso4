@@ -1351,21 +1351,25 @@ fn run_call_phase(
         )
     };
 
-    if call.is_none() {
-        // The run's JS is done — stop the guards before extraction and
-        // serialization, exactly where the old poll loop cancelled them on
-        // fulfilment. When a call follows, the guards stay armed until the
-        // call settles.
-        cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
-        cancel_handle.cancel_terminate_execution();
-    }
+    // The guards stay armed through extraction and serialization. V8's
+    // ValueSerializer follows structured-clone semantics and invokes guest
+    // getters on the properties it walks, so result serialization is guest
+    // execution and must stay under the run's wall/CPU/memory budgets —
+    // workerd does the same (its limit enforcer covers every entry into JS,
+    // serialization included). The caller's GuardCanceller stops the guards
+    // once this function returns; every failure below classifies through
+    // `termination_or` so a guard firing mid-serialization reports the
+    // timeout, not the operation it interrupted.
 
     let namespace = evaluated_module
         .get_module_namespace()
         .to_object(scope)
         .ok_or_else(|| {
             failure(
-                RunError::Internal("module namespace is not an object".to_string()),
+                termination_or(
+                    reason,
+                    RunError::Internal("module namespace is not an object".to_string()),
+                ),
                 unsafe { &*logs },
                 start,
             )
@@ -1476,11 +1480,8 @@ fn run_call_phase(
             result
         };
 
-        // The call settled — now the guards can go, before serialization,
-        // mirroring the exports path.
-        cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
-        cancel_handle.cancel_terminate_execution();
-
+        // The call settled; the guards stay armed through serialization of
+        // the return value (see the comment above the namespace read).
         blob::serialize_value(scope, value).map_err(|message| {
             let error = match blob::take_codec_error() {
                 Some(e) => codec_error_to_run_error(e),
@@ -1489,7 +1490,7 @@ fn run_call_phase(
                     call.export_path
                 )),
             };
-            failure(error, unsafe { &*logs }, start)
+            failure(termination_or(reason, error), unsafe { &*logs }, start)
         })?
     } else {
         // ── Exports extraction ───────────────────────────────────────────────
@@ -1497,7 +1498,10 @@ fn run_call_phase(
             .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
             .ok_or_else(|| {
                 failure(
-                    RunError::Internal("failed to read module export names".to_string()),
+                    termination_or(
+                        reason,
+                        RunError::Internal("failed to read module export names".to_string()),
+                    ),
                     unsafe { &*logs },
                     start,
                 )
@@ -1518,7 +1522,10 @@ fn run_call_phase(
         for i in 0..names.length() {
             let name_value = names.get_index(scope, i).ok_or_else(|| {
                 failure(
-                    RunError::Internal("failed to read export name".to_string()),
+                    termination_or(
+                        reason,
+                        RunError::Internal("failed to read export name".to_string()),
+                    ),
                     unsafe { &*logs },
                     start,
                 )
@@ -1528,7 +1535,10 @@ fn run_call_phase(
                 .map(|s| s.to_rust_string_lossy(scope))
                 .ok_or_else(|| {
                     failure(
-                        RunError::Internal("failed to stringify export name".to_string()),
+                        termination_or(
+                            reason,
+                            RunError::Internal("failed to stringify export name".to_string()),
+                        ),
                         unsafe { &*logs },
                         start,
                     )
@@ -1536,7 +1546,10 @@ fn run_call_phase(
 
             let value = namespace.get(scope, name_value).ok_or_else(|| {
                 failure(
-                    RunError::Internal(format!("failed to read export {name}")),
+                    termination_or(
+                        reason,
+                        RunError::Internal(format!("failed to read export {name}")),
+                    ),
                     unsafe { &*logs },
                     start,
                 )
@@ -1552,7 +1565,10 @@ fn run_call_phase(
 
             let export_key = v8::Local::<v8::Name>::try_from(name_value).map_err(|_| {
                 failure(
-                    RunError::Internal(format!("export name {name} is not a property key")),
+                    termination_or(
+                        reason,
+                        RunError::Internal(format!("export name {name} is not a property key")),
+                    ),
                     unsafe { &*logs },
                     start,
                 )
@@ -1561,7 +1577,10 @@ fn run_call_phase(
                 .create_data_property(scope, export_key, value)
                 .ok_or_else(|| {
                     failure(
-                        RunError::Internal(format!("failed to stage export {name}")),
+                        termination_or(
+                            reason,
+                            RunError::Internal(format!("failed to stage export {name}")),
+                        ),
                         unsafe { &*logs },
                         start,
                     )
@@ -1576,7 +1595,11 @@ fn run_call_phase(
                 // loud diagnostic (stream bodies etc. must not vanish
                 // silently); only generic clone refusals are skippable.
                 if let Some(e) = blob::take_codec_error() {
-                    return Err(failure(codec_error_to_run_error(e), unsafe { &*logs }, start));
+                    return Err(failure(
+                        termination_or(reason, codec_error_to_run_error(e)),
+                        unsafe { &*logs },
+                        start,
+                    ));
                 }
                 // Something nested inside an export refuses to clone (e.g. the
                 // function in `export default { fetch }`). Trial-serialize
@@ -1587,7 +1610,12 @@ fn run_call_phase(
                         Ok(_) => {
                             let key = v8::String::new(scope, name).ok_or_else(|| {
                                 failure(
-                                    RunError::Internal("failed to intern export name".to_string()),
+                                    termination_or(
+                                        reason,
+                                        RunError::Internal(
+                                            "failed to intern export name".to_string(),
+                                        ),
+                                    ),
                                     unsafe { &*logs },
                                     start,
                                 )
@@ -1596,9 +1624,12 @@ fn run_call_phase(
                                 .create_data_property(scope, key.into(), *value)
                                 .ok_or_else(|| {
                                     failure(
-                                        RunError::Internal(format!(
-                                            "failed to stage export {name}"
-                                        )),
+                                        termination_or(
+                                            reason,
+                                            RunError::Internal(format!(
+                                                "failed to stage export {name}"
+                                            )),
+                                        ),
                                         unsafe { &*logs },
                                         start,
                                     )
@@ -1606,7 +1637,11 @@ fn run_call_phase(
                         }
                         Err(_) => {
                             if let Some(e) = blob::take_codec_error() {
-                                return Err(failure(codec_error_to_run_error(e), unsafe { &*logs }, start));
+                                return Err(failure(
+                                    termination_or(reason, codec_error_to_run_error(e)),
+                                    unsafe { &*logs },
+                                    start,
+                                ));
                             }
                             skipped_exports.push(name.clone());
                         }
@@ -1614,9 +1649,12 @@ fn run_call_phase(
                 }
                 blob::serialize_value(scope, retry_object.into()).map_err(|retry_message| {
                     failure(
-                        RunError::ExportNotSerializable(format!(
-                            "exports could not be serialized: {retry_message}"
-                        )),
+                        termination_or(
+                            reason,
+                            RunError::ExportNotSerializable(format!(
+                                "exports could not be serialized: {retry_message}"
+                            )),
+                        ),
                         unsafe { &*logs },
                         start,
                     )
@@ -1624,6 +1662,21 @@ fn run_call_phase(
             }
         }
     };
+
+    // Termination only interrupts JS — the serializer's walk of plain data
+    // can still complete after a guard fires (the per-export retry loop then
+    // skips whatever export the interrupted getter sat on). A produced blob
+    // does not make the run a success: the budget was exceeded.
+    if reason.get().is_some() {
+        return Err(failure(
+            termination_or(
+                reason,
+                RunError::Internal("terminated during result serialization".to_string()),
+            ),
+            unsafe { &*logs },
+            start,
+        ));
+    }
 
     // ── Export size limit ────────────────────────────────────────────────────
     // Measured on the blob itself — the payload that actually crosses the
@@ -9302,6 +9355,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::CpuTimeout));
+    }
+
+    // ── Result serialization stays under the run's budgets ──────────────────
+    // V8's ValueSerializer runs guest getters (structured-clone semantics), so
+    // serialization is guest execution: a getter that never returns must be
+    // terminated by the still-armed guards. Each run is raced against a
+    // channel timeout so a regression fails the test instead of hanging the
+    // suite (the leaked spinner thread then dies with the test process).
+
+    fn run_code_bounded(
+        code: &'static str,
+        limits: Limits,
+        call: Option<ipc::CallSpec>,
+    ) -> Result<Output, FailureOutput> {
+        init_platform();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = run_module(
+                Some(code),
+                "<test>",
+                limits,
+                &[],
+                &[],
+                None,
+                Arc::new(AtomicU32::new(0)),
+                call.as_ref(),
+            );
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("run never returned: guards did not interrupt serialization")
+    }
+
+    #[test]
+    fn spinning_getter_in_export_is_terminated() {
+        let err = run_code_bounded(
+            "export default { get a() { for (;;) {} } }",
+            Limits {
+                cpu_time_ms: 200,
+                wall_time_ms: 5_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CpuTimeout | RunError::WallTimeout),
+            "expected timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn spinning_getter_nested_in_export_is_terminated() {
+        // The pre-check only sees the top level; the serializer walks
+        // arbitrarily deep, so the guards must cover the whole walk.
+        let err = run_code_bounded(
+            "export default { a: { get b() { for (;;) {} } } }",
+            Limits {
+                cpu_time_ms: 200,
+                wall_time_ms: 5_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CpuTimeout | RunError::WallTimeout),
+            "expected timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn spinning_getter_in_call_result_is_terminated() {
+        let err = run_code_bounded(
+            "export function f() { return { get a() { for (;;) {} } } }",
+            Limits {
+                cpu_time_ms: 200,
+                wall_time_ms: 5_000,
+                ..Default::default()
+            },
+            Some(call_spec("f", &[])),
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::CpuTimeout | RunError::WallTimeout),
+            "expected timeout, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn benign_getter_export_crosses_as_its_value() {
+        // Structured-clone semantics stay intact: a getter that returns is
+        // invoked once during serialization and its value crosses.
+        let out = run_ok("export default { get a() { return 41 + 1 } }");
+        assert_eq!(
+            get_field(&out, "default"),
+            Some(WireValue::Object(vec![(
+                "a".to_string(),
+                WireValue::Number(42.0)
+            )]))
+        );
+        assert!(out.skipped_exports.is_empty());
     }
 
     // ── Warm instances (#64): create/call split, taint, warm-up budget ──────
