@@ -746,7 +746,12 @@ execution.
 **`maxBridgeCallBytes` enforcement:** When non-zero, Rust checks the encoded
 `BridgeCallPayload` byte length before writing it to the socket. If the payload
 exceeds the limit the run terminates with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` without
-performing any I/O.
+performing any I/O. That length is computed rather than materialized: every
+field ahead of the args blob is fixed or already known, so the payload is
+measured as header + blob and the two are written in sequence. The bytes on the
+wire are exactly as laid out above; the args blob is never copied into a second
+buffer, which would otherwise double the peak memory of every bridge call and
+place that allocation before the check meant to bound it.
 
 **BridgeResponse frame cap:** `BridgeResponse` frames are read with
 `read_frame_with_limit(memoryMb × 1 MiB)`. The sandbox cannot hold a response

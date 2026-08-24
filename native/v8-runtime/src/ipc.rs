@@ -244,6 +244,42 @@ pub fn write_frame_with_limit(
     Ok(())
 }
 
+/// Write a Rust->TS frame whose payload is already in two pieces.
+///
+/// Same bytes on the wire as `write_rust_to_ts_frame(writer, ty, [head,
+/// tail].concat())`, without building that concatenation. The writer already
+/// emits the length and the type as their own calls, so this adds one more
+/// rather than changing how a frame is written. It exists for `BridgeCall`,
+/// whose payload is a small header in front of an argument blob that can be
+/// large and that nothing has copied yet.
+pub fn write_rust_to_ts_frame_parts(
+    writer: &mut impl Write,
+    message_type: RustToTsMessageType,
+    head: &[u8],
+    tail: &[u8],
+) -> io::Result<()> {
+    let payload_length = head
+        .len()
+        .checked_add(tail.len())
+        .and_then(|total| u32::try_from(total).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
+    let length = payload_length
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
+    if length > DEFAULT_MAX_FRAME_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frame length {length} exceeds max frame length {DEFAULT_MAX_FRAME_LENGTH}"),
+        ));
+    }
+
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(&[message_type as u8])?;
+    writer.write_all(head)?;
+    writer.write_all(tail)?;
+    Ok(())
+}
+
 /// Write a single TS->Rust frame using a validated message type.
 pub fn write_ts_to_rust_frame(
     writer: &mut impl Write,

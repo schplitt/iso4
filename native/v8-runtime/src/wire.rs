@@ -621,12 +621,23 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 /// String             exportName
 /// ValueBlob          args   (one blob holding the whole argument array)
 /// ```
-pub fn encode_bridge_call_payload(
+/// Everything in that layout except the argument bytes themselves, ending
+/// with the blob's `u32` length prefix.
+///
+/// The arguments are already a serialized buffer by the time this runs, and
+/// they are the only part of the payload with no bound: copying them into a
+/// second buffer just to prepend this header doubles the peak memory of every
+/// bridge call, and does it *before* `maxBridgeCallBytes` gets a chance to
+/// refuse the call — so the cap could stop the send but never the allocation
+/// it exists to prevent. The header's length plus the blob's is the exact
+/// payload length, so the caller can check the cap first and then write the
+/// two pieces in sequence.
+pub fn encode_bridge_call_header(
     call_id: u32,
     target_kind: u8, // 0 = global
     specifier: Option<&str>,
     export_name: &str,
-    args_blob: &[u8],
+    args_blob_len: u32,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     encode_u32(call_id, &mut out);
@@ -641,7 +652,7 @@ pub fn encode_bridge_call_payload(
         }
     }
     encode_string(export_name, &mut out);
-    encode_value_blob(args_blob, &mut out);
+    encode_u32(args_blob_len, &mut out);
     out
 }
 

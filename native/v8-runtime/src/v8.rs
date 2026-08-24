@@ -3550,15 +3550,37 @@ fn bridge_global_callback(
         }
     };
 
-    // ── Assign call ID and build BridgeCall payload ────────────────────────
+    // ── Assign call ID and build the BridgeCall header ────────────────────
+    //
+    // Header only: the arguments stay in the buffer the serializer produced,
+    // and are written straight after it. Copying them into a combined payload
+    // first would double the peak memory of every bridge call — that memory
+    // is outside the V8 heap, so `memoryMb` does not account for it, and it
+    // lands in the process RSS the warm-instance ceiling watches, where one
+    // run's arguments can push a shared child into shedding. It would also
+    // put the copy *before* the size check, leaving `maxBridgeCallBytes` able
+    // to refuse the send but not the allocation.
     let call_id = data.call_id.fetch_add(1, Ordering::Relaxed);
-    let bridge_call_payload =
-        wire::encode_bridge_call_payload(call_id, target_kind, specifier, export_name, &args_blob);
+    let Ok(args_blob_len) = u32::try_from(args_blob.len()) else {
+        record_blocked(u32::MAX);
+        fatal_bridge_error(
+            scope,
+            &data.bridge_error,
+            RunError::BridgeCallPayloadTooLarge,
+        );
+        return;
+    };
+    let bridge_call_header = wire::encode_bridge_call_header(
+        call_id,
+        target_kind,
+        specifier,
+        export_name,
+        args_blob_len,
+    );
+    let payload_len = bridge_call_header.len() + args_blob.len();
 
-    if data.max_bridge_call_bytes > 0
-        && bridge_call_payload.len() > data.max_bridge_call_bytes as usize
-    {
-        record_blocked(bridge_call_payload.len() as u32);
+    if data.max_bridge_call_bytes > 0 && payload_len > data.max_bridge_call_bytes as usize {
+        record_blocked(u32::try_from(payload_len).unwrap_or(u32::MAX));
         fatal_bridge_error(
             scope,
             &data.bridge_error,
@@ -3571,12 +3593,13 @@ fn bridge_global_callback(
     // SAFETY: stream_fd is the live session socket owned by handle_client.
     // ManuallyDrop prevents closing it here.
     let mut stream = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(data.stream_fd) });
-    if let Err(e) = ipc::write_rust_to_ts_frame(
+    if let Err(e) = ipc::write_rust_to_ts_frame_parts(
         &mut *stream,
         ipc::RustToTsMessageType::BridgeCall,
-        &bridge_call_payload,
+        &bridge_call_header,
+        &args_blob,
     ) {
-        record_blocked(bridge_call_payload.len() as u32);
+        record_blocked(u32::try_from(payload_len).unwrap_or(u32::MAX));
         fatal_bridge_error(
             scope,
             &data.bridge_error,
@@ -3595,7 +3618,7 @@ fn bridge_global_callback(
             call_id,
             &record_name,
             start_ms,
-            bridge_call_payload.len() as u32,
+            u32::try_from(payload_len).unwrap_or(u32::MAX),
         );
 
     // ── Create PromiseResolver, store it, return the Promise ──────────────
