@@ -102,6 +102,14 @@ All integers are big-endian.
 Strings MUST be valid UTF-8. Decoders MUST reject invalid booleans and invalid
 optional presence bytes.
 
+A `List<T>` length MUST be backed by the payload that carries it. Every entry
+costs at least one byte on the wire, so a length greater than the number of
+bytes remaining describes a payload that cannot exist and MUST be rejected as
+malformed before a decoder sizes anything from it. A decoder that does size a
+collection from a wire-supplied length MUST also be able to decline: a
+reservation it cannot satisfy is a decode error for that connection, never a
+process-level failure.
+
 ---
 
 ## 4. Value encoding

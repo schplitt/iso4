@@ -518,6 +518,51 @@ impl<'a> PayloadReader<'a> {
         Ok(n)
     }
 
+    /// Read the `u32` entry count that introduces a `List<…>` block and return
+    /// it together with a vector already sized for that many entries.
+    ///
+    /// A count is a size, and a size read off the wire is a size the sender
+    /// chose, so it gets two checks before any memory is asked for.
+    ///
+    /// First, it has to be a count this payload could actually back. Every
+    /// list entry in this format costs at least one byte — a tag byte or a
+    /// four-byte length prefix — so a count larger than `remaining()`
+    /// describes a payload that cannot exist, and the sender is either broken
+    /// or not speaking this protocol. That puts counts on the same footing as
+    /// the length checks in `read_string` and `read_bytes` below, which have
+    /// always validated before touching memory.
+    ///
+    /// Second, the reservation itself has to be allowed to fail. Sizing up
+    /// front is the right shape — these lists are read once per run and one
+    /// allocation beats growing through several — but `Vec::with_capacity`
+    /// offers no way to decline: a request the allocator cannot serve reaches
+    /// `handle_alloc_error`, which aborts, and `[profile.release]` sets
+    /// `panic = "abort"`, so there is no unwinding to contain it either. A
+    /// whole child process ending takes every run on every connection with
+    /// it. `try_reserve_exact` is the same single allocation with an error
+    /// path, so a count this machine cannot honour ends one connection with a
+    /// log line instead.
+    fn read_list<T>(&mut self, what: &str) -> io::Result<(usize, Vec<T>)> {
+        let count = self.read_u32()? as usize;
+        if count > self.remaining() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{what} count {count} exceeds the {} bytes remaining in the payload",
+                    self.remaining()
+                ),
+            ));
+        }
+        let mut items = Vec::new();
+        items.try_reserve_exact(count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                format!("cannot reserve room for {count} {what} entries"),
+            )
+        })?;
+        Ok((count, items))
+    }
+
     fn read_string(&mut self) -> io::Result<String> {
         let len = self.read_u32()? as usize;
         if self.remaining() < len {
@@ -610,8 +655,7 @@ impl<'a> PayloadReader<'a> {
     /// entry per global. Mirrors `writeGlobalDefs` in the TS codec (`ipc.ts`)
     /// and `docs/protocol.md` §5.2.
     fn read_global_defs(&mut self) -> io::Result<Vec<HostGlobalDef>> {
-        let count = self.read_u32()? as usize;
-        let mut defs = Vec::with_capacity(count);
+        let (count, mut defs) = self.read_list("global def")?;
         for _ in 0..count {
             let kind = self.read_u8()?;
             let name = self.read_string()?;
@@ -650,8 +694,7 @@ impl<'a> PayloadReader<'a> {
             0 => Ok(HostModuleNode::Function),
             1 => Ok(HostModuleNode::Data(self.read_value_blob()?)),
             2 => {
-                let count = self.read_u32()? as usize;
-                let mut entries = Vec::with_capacity(count);
+                let (count, mut entries) = self.read_list("host-module object entry")?;
                 for _ in 0..count {
                     let key = self.read_string()?;
                     let node = self.read_host_module_node()?;
@@ -668,15 +711,13 @@ impl<'a> PayloadReader<'a> {
 
     /// Read the `List<ImportBinding>` block of a `Run` / `Precompile` payload.
     fn read_import_bindings(&mut self) -> io::Result<Vec<ImportBinding>> {
-        let count = self.read_u32()? as usize;
-        let mut imports = Vec::with_capacity(count);
+        let (count, mut imports) = self.read_list("import binding")?;
         for _ in 0..count {
             let specifier = self.read_string()?;
             let module = match self.read_u8()? {
                 0 => ImportModule::Source(self.read_string()?),
                 1 => {
-                    let export_count = self.read_u32()? as usize;
-                    let mut exports = Vec::with_capacity(export_count);
+                    let (export_count, mut exports) = self.read_list("host-module export")?;
                     for _ in 0..export_count {
                         let name = self.read_string()?;
                         let node = self.read_host_module_node()?;
@@ -698,8 +739,7 @@ impl<'a> PayloadReader<'a> {
 
     /// Read the `List<ImportRebind>` block of a `PrefixRun` payload.
     fn read_import_rebinds(&mut self) -> io::Result<Vec<ImportRebind>> {
-        let count = self.read_u32()? as usize;
-        let mut rebinds = Vec::with_capacity(count);
+        let (count, mut rebinds) = self.read_list("import rebind")?;
         for _ in 0..count {
             let specifier = self.read_string()?;
             let path = self.read_string()?;
@@ -1438,6 +1478,121 @@ mod tests {
         assert_eq!(
             parse_run_payload(&v).unwrap_err().kind(),
             io::ErrorKind::InvalidData,
+        );
+    }
+
+    // ── List entry counts vs. the bytes actually present ───────────────
+    //
+    // A `List<…>` count is a size chosen by the sender, and the readers used
+    // to hand it straight to `Vec::with_capacity`, which has no error path: a
+    // request the allocator cannot serve aborts the process, and with
+    // `panic = "abort"` in the release profile nothing contains that. These
+    // cover the first of the two checks in `read_list` — a count is now
+    // compared against the bytes left in the payload, so one that no payload
+    // this size could back is rejected as malformed data before any memory is
+    // asked for. Note the assertions are on
+    // `InvalidData` specifically: an unchecked reader still fails these
+    // payloads, but with `UnexpectedEof` from the middle of the entry loop,
+    // which is the wrong answer for a length field that was wrong up front.
+
+    #[test]
+    fn parse_run_payload_rejects_global_def_count_past_payload_end() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "x"); // code
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 1000); // claims 1000 globals, supplies none
+
+        let err = parse_run_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("global def count 1000 exceeds"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_payload_rejects_import_binding_count_past_payload_end() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "x"); // code
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, u32::MAX); // claims every import there could be
+
+        let err = parse_run_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("import binding count"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_payload_rejects_host_module_export_count_past_payload_end() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "code");
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
+        push_string(&mut v, "tools:search");
+        v.push(1); // kind: host
+        push_u32(&mut v, u32::MAX); // claims every export there could be
+
+        let err = parse_run_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("host-module export count"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_run_payload_rejects_host_module_object_entry_count_past_payload_end() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "code");
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
+        push_string(&mut v, "tools:search");
+        v.push(1); // kind: host
+        push_u32(&mut v, 1); // 1 top-level export
+        push_string(&mut v, "nested");
+        v.push(2); // node: object
+        push_u32(&mut v, 1000); // claims 1000 entries, supplies none
+
+        let err = parse_run_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("host-module object entry count 1000 exceeds"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_prefix_run_payload_rejects_import_rebind_count_past_payload_end() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 3); // run_id
+        push_string(&mut v, "prefix-0"); // prefix_id
+        v.push(1); // code: present
+        push_string(&mut v, "code");
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, u32::MAX); // claims every rebind there could be
+
+        let err = parse_prefix_run_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("import rebind count"),
+            "unexpected message: {err}"
         );
     }
 
