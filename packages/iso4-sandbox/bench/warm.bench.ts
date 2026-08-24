@@ -84,25 +84,76 @@ function assertOk(result: CallResult, what: string): void {
   }
 }
 
-// ── Call latency — one call per iteration, single slot ─────────────────────
+// Throughput pool shape: one iteration fires SLOTS×BATCH calls.
+const SLOTS = 8
+const BATCH = 64
+
+// ── Runtimes, setup, teardown ──────────────────────────────────────────────
+//
+// Every step that can throw runs inside one `try`, and the `catch` disposes
+// both runtimes before rethrowing. That is what stops a failed bench run from
+// leaving two runtime processes and their socket files behind, holding warm
+// isolates for as long as the machine is up.
+//
+// `afterAll` alone is not enough, and it is worth writing down why: these
+// steps run during module evaluation, and when that throws, Vitest never runs
+// the file's hooks — the suite it would have attached them to does not exist.
+// Registering the hook earlier (which this file previously did not do either)
+// changes nothing on that path. Measured: with the hook registered first and
+// no `try`, a forced failure here still left both processes running,
+// reparented to init. The hook still earns its place for the normal path,
+// where the benches run and the file completes.
 
 const latencyRt: Sandbox = await createSandbox({ maxIsolates: 1 })
-const syncPrefix: Prefix = await latencyRt.prepare({ code: SYNC_HANDLER })
-const asyncPrefix: Prefix = await latencyRt.prepare({ code: ASYNC_HANDLER })
-const realisticPrefix: Prefix = await latencyRt.prepare({ code: REALISTIC_PREFIX })
+const throughputRt: Sandbox = await createSandbox({ maxIsolates: SLOTS })
 
-assertOk(
-  await syncPrefix.call({ export: 'default.fetch', args: [{ n: 1 }] }),
-  'call sync handler',
-)
-assertOk(
-  await asyncPrefix.call({ export: 'default.fetch', args: [{ n: 1 }] }),
-  'call async handler',
-)
-assertOk(
-  await realisticPrefix.call({ export: 'default.fetch', args: [{ n: 1 }] }),
-  'call realistic prefix',
-)
+// `allSettled` in both places: one runtime failing to dispose must not skip
+// the other.
+afterAll(async () => {
+  await Promise.allSettled([latencyRt.dispose(), throughputRt.dispose()])
+})
+
+let syncPrefix!: Prefix
+let asyncPrefix!: Prefix
+let realisticPrefix!: Prefix
+let tpPrefixA!: Prefix
+let tpPrefixB!: Prefix
+
+try {
+  // Call latency — one call per iteration, single slot.
+  syncPrefix = await latencyRt.prepare({ code: SYNC_HANDLER })
+  asyncPrefix = await latencyRt.prepare({ code: ASYNC_HANDLER })
+  realisticPrefix = await latencyRt.prepare({ code: REALISTIC_PREFIX })
+
+  assertOk(
+    await syncPrefix.call({ export: 'default.fetch', args: [{ n: 1 }] }),
+    'call sync handler',
+  )
+  assertOk(
+    await asyncPrefix.call({ export: 'default.fetch', args: [{ n: 1 }] }),
+    'call async handler',
+  )
+  assertOk(
+    await realisticPrefix.call({ export: 'default.fetch', args: [{ n: 1 }] }),
+    'call realistic prefix',
+  )
+
+  // Throughput — concurrent calls across an 8-slot pool.
+  tpPrefixA = await throughputRt.prepare({ code: REALISTIC_PREFIX })
+  tpPrefixB = await throughputRt.prepare({ code: SYNC_HANDLER })
+
+  assertOk(
+    await tpPrefixA.call({ export: 'default.fetch', args: [{ n: 1 }] }),
+    'throughput prefix A',
+  )
+  assertOk(
+    await tpPrefixB.call({ export: 'default.fetch', args: [{ n: 1 }] }),
+    'throughput prefix B',
+  )
+} catch (error) {
+  await Promise.allSettled([latencyRt.dispose(), throughputRt.dispose()])
+  throw error
+}
 
 describe('call latency', () => {
   bench('sync handler, empty prefix', async () => {
@@ -116,29 +167,6 @@ describe('call latency', () => {
   bench('sync handler, realistic prefix (~2KB)', async () => {
     await realisticPrefix.call({ export: 'default.fetch', args: [{ n: 7 }] })
   }, HEAVY_OPTS)
-})
-
-// ── Throughput — concurrent calls across an 8-slot pool ────────────────────
-
-const SLOTS = 8
-const BATCH = 64
-
-const throughputRt: Sandbox = await createSandbox({ maxIsolates: SLOTS })
-const tpPrefixA: Prefix = await throughputRt.prepare({ code: REALISTIC_PREFIX })
-const tpPrefixB: Prefix = await throughputRt.prepare({ code: SYNC_HANDLER })
-
-assertOk(
-  await tpPrefixA.call({ export: 'default.fetch', args: [{ n: 1 }] }),
-  'throughput prefix A',
-)
-assertOk(
-  await tpPrefixB.call({ export: 'default.fetch', args: [{ n: 1 }] }),
-  'throughput prefix B',
-)
-
-afterAll(async () => {
-  await latencyRt.dispose()
-  await throughputRt.dispose()
 })
 
 describe('call throughput', () => {

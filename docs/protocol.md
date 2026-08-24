@@ -102,6 +102,14 @@ All integers are big-endian.
 Strings MUST be valid UTF-8. Decoders MUST reject invalid booleans and invalid
 optional presence bytes.
 
+A `List<T>` length MUST be backed by the payload that carries it. Every entry
+costs at least one byte on the wire, so a length greater than the number of
+bytes remaining describes a payload that cannot exist and MUST be rejected as
+malformed before a decoder sizes anything from it. A decoder that does size a
+collection from a wire-supplied length MUST also be able to decline: a
+reservation it cannot satisfy is a decode error for that connection, never a
+process-level failure.
+
 ---
 
 ## 4. Value encoding
@@ -481,6 +489,17 @@ it. Additive fields go in `extras` and need no tag at all.
 | `probe`   | `u32 byteLength` + bytes | The runtime's own serialized `null`.                                 |
 | `message` | `String`                 | Actionable detail for a non-zero status; empty when `status = 0`.    |
 
+**The `Authenticate` frame is read on its own terms.** It arrives from a peer
+that has shown nothing yet, so it does not get the frame ceiling the rest of
+the connection uses (§2): the runtime caps it at **4 KiB**, which is ample for
+a `u16`, a short probe and a token, and it MUST arrive complete within **2
+seconds** of the connection being accepted. The deadline covers the frame as a
+whole rather than each read within it, so a peer that sends its bytes slowly is
+bounded by the same budget as one that sends nothing. Both are enforced only
+before authentication; once the handshake is accepted, reads have no deadline,
+because a pooled connection legitimately sits idle between runs. A peer that
+misses either is dropped without a reply.
+
 **Why the probe.** Values cross as V8 serialization blobs, so both V8s must
 agree on the serialization **format version**. V8 bumps that version over
 time and `ReadHeader` hard-rejects anything newer than the reader knows;
@@ -727,7 +746,12 @@ execution.
 **`maxBridgeCallBytes` enforcement:** When non-zero, Rust checks the encoded
 `BridgeCallPayload` byte length before writing it to the socket. If the payload
 exceeds the limit the run terminates with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` without
-performing any I/O.
+performing any I/O. That length is computed rather than materialized: every
+field ahead of the args blob is fixed or already known, so the payload is
+measured as header + blob and the two are written in sequence. The bytes on the
+wire are exactly as laid out above; the args blob is never copied into a second
+buffer, which would otherwise double the peak memory of every bridge call and
+place that allocation before the check meant to bound it.
 
 **BridgeResponse frame cap:** `BridgeResponse` frames are read with
 `read_frame_with_limit(memoryMb × 1 MiB)`. The sandbox cannot hold a response

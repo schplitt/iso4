@@ -49,6 +49,9 @@ function isReservedIp(ip: string): boolean {
     const addr = ip.toLowerCase().replace(/^\[|\]$/g, '')
     if (addr === '::1')
       return true
+    // The unspecified address. Connecting to it reaches the local host.
+    if (addr === '::')
+      return true
     const firstWord = parseInt(addr.split(':')[0] ?? '0', 16)
     if ((firstWord & 0xffc0) === 0xfe80)
       return true // fe80::/10 link-local
@@ -279,10 +282,18 @@ function makeFetchContext(
 
 function makeDnsLookupFn(): NonNullable<NonNullable<Parameters<typeof interceptors.dns>[0]>['lookup']> {
   return (hostnameOrUrl, _opts, callback) => {
-    const hostname: string
+    const rawHostname: string
       = typeof hostnameOrUrl === 'object' && hostnameOrUrl !== null
         ? (hostnameOrUrl as unknown as URL).hostname
         : hostnameOrUrl
+
+    // `URL.hostname` keeps the brackets around an IPv6 literal and
+    // `dns.lookup('[::1]')` cannot parse them, so a literal IPv6 URL failed to
+    // resolve at all. Strip them; `dns.lookup` hands a bare literal straight
+    // back.
+    const hostname = rawHostname.startsWith('[') && rawHostname.endsWith(']')
+      ? rawHostname.slice(1, -1)
+      : rawHostname
 
     nodeDnsLookupCb(hostname, { all: true, family: 0 }, (err, addresses) => {
       if (err) {
@@ -497,8 +508,20 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
   const maxBodyBytes = options.maxBodyBytes ?? 16 * 1024 * 1024
   const allowCompressed = options.allowCompressedResponses ?? false
 
+  // Both address families. Pinning used to force IPv4 (`dualStack: false,
+  // affinity: 4`), which had two consequences: a host with only AAAA records —
+  // ordinary for internal services — was unreachable, and undici's picker
+  // returned no address for it and then dereferenced that result without a
+  // guard on its first-lookup path. The resulting TypeError is raised inside a
+  // DNS completion callback with nothing above it to catch, so it reached the
+  // host as an uncaught exception and ended the host process — inverting the
+  // containment iso4 otherwise gives, since the process that dies is the host
+  // and not the sandbox child. Leaving both families enabled is undici's
+  // default, keeps the picker on its guarded path, and makes IPv6-only origins
+  // work. Every resolved address is still checked against the reserved ranges
+  // of its own family in `makeDnsLookupFn` before anything connects.
   const agent: Dispatcher = doPinDns
-    ? new Agent().compose(interceptors.dns({ lookup: makeDnsLookupFn(), maxTTL: 10_000, dualStack: false, affinity: 4 }))
+    ? new Agent().compose(interceptors.dns({ lookup: makeDnsLookupFn(), maxTTL: 10_000 }))
     : new Agent()
 
   async function buildSafeFetchRequest(parsedUrl: URL, method: string, headers: Record<string, string>, hop: number): Promise<SafeFetchRequest> {

@@ -77,7 +77,7 @@ mod imp {
     /// exhaustion at sample time) into permanently blind watermarks for the
     /// rest of the process's life.
     static STATM_FD: AtomicI32 = AtomicI32::new(-1);
-    static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+    static PAGE_SIZE: OnceLock<libc::c_long> = OnceLock::new();
 
     fn statm_fd() -> Option<i32> {
         let cached = STATM_FD.load(Ordering::Acquire);
@@ -101,8 +101,18 @@ mod imp {
 
     pub fn read() -> Option<u64> {
         let fd = statm_fd()?;
-        let page_size = *PAGE_SIZE
-            .get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE).max(0) as u64 });
+        // `sysconf` reports failure as -1, and clamping that to 0 would make
+        // every sample `Some(0)` — a reading of "no memory in use", which the
+        // watermark reads as "far below budget" and never sheds against. The
+        // module contract is that an unusable reading is `None`, so an
+        // unusable page size has to be `None` too. On glibc this resolves from
+        // auxv and cannot realistically fail; it is a contract hole, not a
+        // live failure.
+        let page_size = *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) });
+        if page_size <= 0 {
+            return None;
+        }
+        let page_size = page_size as u64;
 
         // statm: "size resident shared text lib data dt" in pages; the
         // whole line fits well under 128 bytes.

@@ -3,13 +3,32 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, session};
+use iso4_v8_runtime::{blob, rss, session};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
     let (socket_path, token, warm_budget_bytes) = parse_args();
+
+    // The warm budget is enforced by comparing this process's own resident
+    // memory against it, so a budget with no way to read that memory is not a
+    // budget at all: nothing would ever be evicted, warm instances would
+    // accumulate for as long as the process lived, and `stats()` would report
+    // a healthy idle runtime throughout. Refusing to start says so at the
+    // first call instead — the host reports this exit immediately, and the
+    // line below is on its stderr. A budget of 0 means watermarks are off by
+    // request, so nothing is read and nothing is checked.
+    if warm_budget_bytes > 0 && rss::process_rss_bytes().is_none() {
+        eprintln!(
+            "[iso4-v8] cannot read this process's resident memory, so the \
+             {warm_budget_bytes}-byte memory budget could never be enforced. \
+             This usually means /proc is not mounted or is not readable in \
+             this environment. Mount it, or pass memoryBudgetMb: 0 to run \
+             without a budget."
+        );
+        std::process::exit(1);
+    }
 
     // Compute the V8 serialization probe (and with it this binary's write
     // format version) once, in a throwaway isolate, before any connection
@@ -83,8 +102,12 @@ fn parse_args() -> (String, String, u64) {
                 i += 2;
             }
             arg => {
+                // Fatal, like every other bad input here. Continuing would
+                // leave a mistyped `--warm-budget-bytes` at its initial 0,
+                // which means watermarks off — the memory ceiling silently
+                // absent, with one stderr line to say so.
                 eprintln!("[iso4-v8] unknown argument: {arg}");
-                i += 1;
+                std::process::exit(1);
             }
         }
     }

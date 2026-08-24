@@ -351,6 +351,12 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 - Do not forget to run `pnpm changeset` when a PR changes user-visible
   behavior in a published package. Internal-only changes (refactors,
   tests, docs) do not need one.
+- Do not write a long changeset. It becomes the package's `CHANGELOG.md`
+  entry and the body of its GitHub release, so it is release notes rather
+  than a commit message: one conventional-commit line,
+  then at most two sentences covering what a reader will notice or has to
+  do differently. Rationale, mechanism, measurements and file names go in
+  the commit message and the PR. See `.changeset/README.md`.
 - Do not add Cap'n Proto, MessagePack, or similar as the IPC serialization
   format. V8 `ValueSerializer` is the only correct format for JS values
   crossing the sandbox boundary. The wire envelope (4-byte length + 1-byte

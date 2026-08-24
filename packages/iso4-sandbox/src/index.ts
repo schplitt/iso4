@@ -6,6 +6,7 @@
  */
 
 import { access, unlink } from 'node:fs/promises'
+import { unlinkSync } from 'node:fs'
 import { availableParallelism, tmpdir, totalmem } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -133,34 +134,65 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     process.stderr.write(`[@iso4/sandbox] failed to start V8 process: ${err.message}\n`)
   })
 
-  await waitForSocket(socketPath)
-
-  // Open all pool connections in parallel.
-  const connect = (): Promise<RuntimeIpcClient> =>
-    RuntimeIpcClient.connect({ socketPath, token })
-  const clients = await Promise.all(
-    Array.from({ length: maxIsolates }, () => connect()),
-  )
-
-  // The pool uses `connect` to reopen any slot torn down by an in-flight abort,
-  // keeping the pool at `maxIsolates`.
-  const pool = new ConnectionPool(clients, connect)
-
-  // Dedicated control connection for `stats()` (#65): it never enters the
-  // pool, so a capacity snapshot answers even while every run slot is busy —
-  // exactly when it is most wanted.
-  let statsClient: RuntimeIpcClient
+  // From here to the `return`, this function is the only owner of the child.
+  // A caller that gets an exception never receives a `Sandbox`, so it has
+  // nothing to call `dispose()` on — every failure has to shut the child down
+  // itself or the process outlives the call, holding its isolate heaps and its
+  // socket file until someone kills it by hand. A service that retries
+  // `createSandbox` would otherwise collect one of those per attempt.
   try {
-    statsClient = await connect()
+    await waitForSocket(socketPath, proc)
+
+    // Open all pool connections in parallel. `allSettled`, not `all`: `all`
+    // rejects on the first failure while its siblings keep running, so the
+    // connections that did open are left with no owner. Killing the child
+    // below closes them anyway, but only after they have each held a thread in
+    // it, and only if the kill lands.
+    const connect = (): Promise<RuntimeIpcClient> =>
+      RuntimeIpcClient.connect({ socketPath, token })
+    const settled = await Promise.allSettled(
+      Array.from({ length: maxIsolates }, () => connect()),
+    )
+    const clients: RuntimeIpcClient[] = []
+    let firstFailure: { reason: unknown } | undefined
+    for (const outcome of settled) {
+      if (outcome.status === 'fulfilled')
+        clients.push(outcome.value)
+      else if (firstFailure === undefined)
+        firstFailure = { reason: outcome.reason }
+    }
+    if (firstFailure !== undefined) {
+      await Promise.all(clients.map((client) => client.dispose().catch(() => {})))
+      throw firstFailure.reason
+    }
+
+    // These connections set the pool's capacity. Within it the pool reuses
+    // idle connections and opens a replacement on demand for one that died,
+    // rather than holding a fixed set of slots (see `pool.ts`).
+    const pool = new ConnectionPool(clients, connect)
+
+    // Dedicated control connection for `stats()` (#65): it never enters the
+    // pool, so a capacity snapshot answers even while every run slot is busy —
+    // exactly when it is most wanted.
+    let statsClient: RuntimeIpcClient
+    try {
+      statsClient = await connect()
+    } catch (error) {
+      // The child is dealt with by the outer handler; the pool's connections
+      // are this block's to release.
+      await pool.dispose().catch(() => {})
+      throw error
+    }
+
+    return new SandboxImpl(proc, pool, statsClient, socketPath, options?.memoryMb)
   } catch (error) {
-    // Don't leak the child process or its pool connections when the
-    // control connection cannot open.
-    await pool.dispose().catch(() => {})
     proc.kill()
+    // The runtime leaves its socket file behind, and nothing else will remove
+    // it now — `dispose()` is the only other place that does, and there is no
+    // instance to call it on.
+    await unlink(socketPath).catch(() => {})
     throw error
   }
-
-  return new SandboxImpl(proc, pool, statsClient, socketPath, options?.memoryMb)
 }
 
 /**
@@ -232,6 +264,7 @@ function defaultMemoryBudgetMb(): number {
 
 async function waitForSocket(
   socketPath: string,
+  proc: ChildProcess,
   timeoutMs = 5_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
@@ -240,6 +273,18 @@ async function waitForSocket(
       await access(socketPath)
       return
     } catch {
+      // A child that died at startup — bad argument, a socket it could not
+      // bind — will never create the file, so waiting out the timeout and then
+      // blaming the socket reports the symptom and hides the cause. Its stderr
+      // is inherited, so the real complaint is already on the host's stderr;
+      // name the exit here so the thrown error points at it.
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        throw new Error(
+          `[@iso4/sandbox] the V8 process exited before its socket appeared `
+          + `(exit code ${proc.exitCode}, signal ${proc.signalCode}). `
+          + `Its own diagnostics are on this process's stderr.`,
+        )
+      }
       await new Promise((resolve) => {
         setTimeout(resolve, 50)
       })
@@ -320,6 +365,12 @@ class SandboxImpl implements Sandbox {
    * runtime default (128 MB).
    */
   private readonly memoryMb: number | undefined
+  /**
+   * Last-resort cleanup registered on the host's `exit`, removed by
+   * `dispose()` so a program that creates and disposes many sandboxes does not
+   * accumulate listeners.
+   */
+  private readonly exitHook: () => void
   private _alive = true
 
   constructor(
@@ -337,6 +388,23 @@ class SandboxImpl implements Sandbox {
     proc.once('exit', () => {
       this._alive = false
     })
+    // Nothing but `dispose()` stops the runtime, so a host that exits without
+    // calling it leaves the process running, holding its isolate heaps and its
+    // socket file with no owner. This is the backstop for forgetting: it runs
+    // on a normal exit and on the way out of an uncaught exception, and both
+    // steps are synchronous because nothing asynchronous runs during exit.
+    //
+    // It is a backstop, not a replacement. A host killed by a signal runs no
+    // JavaScript at all, so the only complete answer is calling `dispose()`.
+    this.exitHook = () => {
+      this.proc.kill()
+      try {
+        unlinkSync(this.socketPath)
+      } catch {
+        // already gone, or never created
+      }
+    }
+    process.once('exit', this.exitHook)
   }
 
   get alive(): boolean {
@@ -524,6 +592,7 @@ class SandboxImpl implements Sandbox {
     if (!this._alive)
       return
     this._alive = false
+    process.removeListener('exit', this.exitHook)
     await this.pool.dispose()
     await this.statsClient.dispose()
     this.proc.kill()

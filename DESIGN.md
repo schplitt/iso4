@@ -1753,6 +1753,18 @@ measured, not derived from per-isolate caps. One-off runs never touch the
 warm pools but share the same ledger and pressure checks; they are never
 refused — transient work gives its memory back on its own.
 
+**A budget that cannot be measured is refused at startup.** The mark is
+enforced by reading the runtime's own RSS, so an environment where that
+read fails (a container without a readable `/proc` is the realistic case)
+would leave the budget declared but never applied: nothing evicted, warm
+instances accumulating for the life of the process, and `stats()`
+reporting `rssBytes: 0, underPressure: false` throughout, which reads
+exactly like a healthy idle runtime. The runtime therefore samples once at
+startup and exits with a diagnostic if a non-zero budget has no reading
+behind it, so the deployment fails on the first `createSandbox()` rather
+than silently running without the ceiling. `memoryBudgetMb: 0` disables
+the watermarks by request and skips the check with them.
+
 **Saturation and stats (#65).** Saturated run slots always queue FIFO —
 deliberately no per-call policy knobs (fail-fast / max-wait were built and
 removed: every run has wall/CPU limits, so the wait is bounded by the
