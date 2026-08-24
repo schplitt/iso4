@@ -18,11 +18,11 @@ bump is `patch`, `minor`, or `major`. Commit the generated file in
 
 ## Keep the body short
 
-A changeset becomes a `CHANGELOG.md` entry, so it is release notes, not a
-commit message. Write it as one conventional-commit line — `fix: …`,
-`feat: …`, `perf: …` — which on its own is usually enough. Add at most two
-sentences after it, and only for what a reader of the changelog needs: what
-they will notice, or what they have to do differently.
+A changeset becomes the package's `CHANGELOG.md` entry and the body of its
+GitHub release, so it is release notes, not a commit message. Write it as
+one conventional-commit line — `fix: …`, `feat: …`, `perf: …` — which on its
+own is usually enough. Add at most two sentences after it, and only for what
+a reader needs: what they will notice, or what they have to do differently.
 
 Rationale, mechanism, measurements and file names belong in the commit
 message and the PR, where anyone investigating will look. Repeating them
