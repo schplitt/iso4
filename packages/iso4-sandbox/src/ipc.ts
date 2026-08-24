@@ -113,7 +113,28 @@ interface PendingRead {
 }
 
 export class FrameReader {
-  private buffer: Buffer = Buffer.alloc(0)
+  /**
+   * Chunks exactly as the socket delivered them, oldest first, never merged
+   * on arrival.
+   *
+   * The obvious alternative — one accumulation buffer, each chunk appended
+   * with `Buffer.concat` — copies everything received so far on every chunk,
+   * so the total copying grows with the square of the frame size rather than
+   * linearly with it. A result at the default 16 MiB export cap arrives in
+   * roughly 250 socket reads and would cost some 2 GiB of copying to receive,
+   * all of it synchronous on the event loop, stalling the whole host and not
+   * merely the run that asked for it. The size is chosen by sandbox code, so
+   * that is untrusted input deciding how much work the host does.
+   *
+   * Held as a list instead, each byte is copied at most once, when a complete
+   * frame is handed out — and not even then when the frame sits inside a
+   * single chunk, which is every small frame.
+   */
+  private chunks: Buffer[] = []
+  /**
+   * Total bytes across {@link chunks}; kept in step rather than recomputed.
+   */
+  private buffered = 0
   private readonly pendingReads: PendingRead[] = []
   private closedError: Error | null = null
 
@@ -122,10 +143,12 @@ export class FrameReader {
       return
     }
 
-    this.buffer = Buffer.concat([
-      this.buffer,
-      Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength),
-    ])
+    if (chunk.byteLength > 0) {
+      // A view, not a copy. Keeping an empty chunk out of the list lets the
+      // readers below assume a non-empty head.
+      this.chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+      this.buffered += chunk.byteLength
+    }
     // `push` is called straight from the socket's 'data' listener, so a throw
     // from the drain below would land on the event loop as an uncaughtException
     // and take the host process down. Route it through `close` instead: pending
@@ -202,11 +225,11 @@ export class FrameReader {
   }
 
   private tryReadFrame(): Frame | null {
-    if (this.buffer.byteLength < 4) {
+    if (this.buffered < 4) {
       return null
     }
 
-    const length = this.buffer.readUInt32BE(0)
+    const length = this.peekLength()
     if (length === 0) {
       const error = new Error('frame length cannot be zero')
       this.close(error)
@@ -219,13 +242,76 @@ export class FrameReader {
       this.close(error)
       throw error
     }
-    if (this.buffer.byteLength < 4 + length) {
+    if (this.buffered < 4 + length) {
       return null
     }
 
-    const frameBytes = this.buffer.subarray(0, 4 + length)
-    this.buffer = this.buffer.subarray(4 + length)
-    return decodeFrame(frameBytes)
+    return decodeFrame(this.take(4 + length))
+  }
+
+  /**
+   * The frame's `u32` length prefix, which the socket may have split across
+   * chunks — a 4-byte field arriving in two reads is rare but perfectly legal,
+   * and reading it out of the head chunk alone would silently misread it.
+   */
+  private peekLength(): number {
+    const first = this.chunks[0]
+    if (first !== undefined && first.byteLength >= 4) {
+      return first.readUInt32BE(0)
+    }
+    let value = 0
+    let seen = 0
+    for (const chunk of this.chunks) {
+      for (let i = 0; i < chunk.byteLength && seen < 4; i++, seen++) {
+        // Multiplication rather than `<< 8`: a shift works on signed 32-bit
+        // values, so a length with the top bit set would come out negative.
+        value = value * 256 + chunk[i]!
+      }
+      if (seen === 4) {
+        break
+      }
+    }
+    return value
+  }
+
+  /**
+   * Remove and return the first `n` buffered bytes. The caller has already
+   * established that `n` bytes are there.
+   * @param n how many bytes to take, frame length prefix included
+   */
+  private take(n: number): Buffer {
+    const first = this.chunks[0]!
+    // Whole frame inside one chunk — the common case, and no copy at all.
+    if (first.byteLength === n) {
+      this.chunks.shift()
+      this.buffered -= n
+      return first
+    }
+    if (first.byteLength > n) {
+      this.chunks[0] = first.subarray(n)
+      this.buffered -= n
+      return first.subarray(0, n)
+    }
+
+    // Spans chunks: one allocation the size of the frame, each byte copied
+    // once into it.
+    const out = Buffer.allocUnsafe(n)
+    let offset = 0
+    while (offset < n) {
+      const chunk = this.chunks[0]!
+      const needed = n - offset
+      if (chunk.byteLength <= needed) {
+        chunk.copy(out, offset)
+        offset += chunk.byteLength
+        this.chunks.shift()
+      } else {
+        chunk.copy(out, offset, 0, needed)
+        this.chunks[0] = chunk.subarray(needed)
+        offset = n
+      }
+    }
+    this.buffered -= n
+    return out
   }
 }
 

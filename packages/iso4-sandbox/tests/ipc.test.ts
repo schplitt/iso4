@@ -148,6 +148,46 @@ describe('buffered frame reader', () => {
     expect(Buffer.from(b.payload).toString('utf8')).toBe('ok')
   })
 
+  test('reassembles a frame delivered one byte per chunk', async () => {
+    // Chunks are kept as a list and joined only when a whole frame is there,
+    // so this walks the reassembly path end to end: a prefix spread over four
+    // chunks, then a body spread over many more.
+    const reader = new FrameReader()
+    const payload = Buffer.from('a'.repeat(200), 'utf8')
+    const bytes = encodeRustToTsFrame(RustToTsMessageTypes.Result, payload)
+
+    const pending = reader.readRustToTsFrame()
+    for (const byte of bytes) {
+      reader.push(Buffer.from([byte]))
+    }
+
+    const frame = await pending
+    expect(frame.messageType).toBe(RustToTsMessageTypes.Result)
+    expect(Buffer.from(frame.payload).toString('utf8')).toBe(payload.toString('utf8'))
+  })
+
+  test('keeps the remainder when a chunk ends mid-frame', async () => {
+    // The second frame starts inside the first chunk and finishes in the
+    // second, so the leftover of chunk one has to survive the first read
+    // intact and line up with what follows.
+    const reader = new FrameReader()
+    const first = encodeRustToTsFrame(RustToTsMessageTypes.Log, Buffer.from('one', 'utf8'))
+    const second = encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('two', 'utf8'))
+    const stream = Buffer.concat([first, second])
+    const split = first.byteLength + 3
+
+    reader.push(stream.subarray(0, split))
+    reader.push(stream.subarray(split))
+
+    const a = await reader.readRustToTsFrame()
+    const b = await reader.readRustToTsFrame()
+
+    expect(a.messageType).toBe(RustToTsMessageTypes.Log)
+    expect(Buffer.from(a.payload).toString('utf8')).toBe('one')
+    expect(b.messageType).toBe(RustToTsMessageTypes.Result)
+    expect(Buffer.from(b.payload).toString('utf8')).toBe('two')
+  })
+
   test('rejects pending reads when closed', async () => {
     const reader = new FrameReader()
     const pending = reader.readFrame()
@@ -181,7 +221,9 @@ describe('buffered frame reader', () => {
     const pending = reader.readFrame()
 
     // Seed the bad prefix without going through push's own guard.
-    ;(reader as unknown as { buffer: Buffer }).buffer = Buffer.from([0, 0, 0, 0])
+    ;(reader as unknown as { chunks: Buffer[], buffered: number }).chunks
+      = [Buffer.from([0, 0, 0, 0])]
+    ;(reader as unknown as { chunks: Buffer[], buffered: number }).buffered = 4
 
     expect(() => reader.close(new Error('socket closed'))).not.toThrow()
     await expect(pending).rejects.toThrow()
