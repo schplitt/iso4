@@ -489,6 +489,17 @@ it. Additive fields go in `extras` and need no tag at all.
 | `probe`   | `u32 byteLength` + bytes | The runtime's own serialized `null`.                                 |
 | `message` | `String`                 | Actionable detail for a non-zero status; empty when `status = 0`.    |
 
+**The `Authenticate` frame is read on its own terms.** It arrives from a peer
+that has shown nothing yet, so it does not get the frame ceiling the rest of
+the connection uses (§2): the runtime caps it at **4 KiB**, which is ample for
+a `u16`, a short probe and a token, and it MUST arrive complete within **2
+seconds** of the connection being accepted. The deadline covers the frame as a
+whole rather than each read within it, so a peer that sends its bytes slowly is
+bounded by the same budget as one that sends nothing. Both are enforced only
+before authentication; once the handshake is accepted, reads have no deadline,
+because a pooled connection legitimately sits idle between runs. A peer that
+misses either is dropped without a reply.
+
 **Why the probe.** Values cross as V8 serialization blobs, so both V8s must
 agree on the serialization **format version**. V8 bumps that version over
 time and `ReadHeader` hard-rejects anything newer than the reader knows;

@@ -12,10 +12,12 @@
 //!   parsing lands, the `run_id` will be read from the payload.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::ipc;
 use crate::v8 as sandbox;
@@ -197,6 +199,50 @@ impl SharedState {
     }
 }
 
+/// How long a freshly accepted connection has to deliver its whole
+/// `Authenticate` frame, measured from the first byte of the length prefix.
+///
+/// The host writes that frame immediately after `connect()`, so this is orders
+/// of magnitude more time than the handshake actually takes; it exists so that
+/// a connection which never gets around to authenticating stops occupying a
+/// thread. Tests use a short deadline so the suite does not wait on it.
+#[cfg(not(test))]
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const HANDSHAKE_DEADLINE: Duration = Duration::from_millis(200);
+
+/// Reader that bounds the handshake as a whole rather than each read inside it.
+///
+/// A plain `set_read_timeout` is not enough: the socket timer restarts on every
+/// successful read, so a peer that sends one byte per interval keeps its
+/// connection, and its thread, for as long as it cares to. This computes the
+/// time left before each read instead and hands that to the socket, so the
+/// budget is spent whether the peer is silent or merely slow. `read_exact` in
+/// the frame reader loops over `read`, so a partial frame is covered too.
+///
+/// Used for the `Authenticate` frame only. The deadline is dropped once the
+/// peer is authenticated, because an idle connection is normal after that —
+/// the host's pool holds connections open between runs and they may wait
+/// indefinitely for the next one.
+struct HandshakeReader<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl Read for HandshakeReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "handshake deadline passed",
+            ));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
 /// Best-effort `Hello` write on a rejected handshake. The connection is about
 /// to close either way, so a write failure here is only worth a log line.
 fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) {
@@ -265,13 +311,31 @@ fn write_result_frame(stream: &mut UnixStream, run_id: u32, payload: &[u8]) -> s
 pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
-    let auth_frame = match ipc::read_ts_to_rust_frame(&mut stream) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[iso4-v8] failed to read first frame: {e}");
-            return;
+    // The first frame comes from a peer that has shown nothing yet, so it is
+    // read on a deadline and against a ceiling of its own (`AUTH_MAX_FRAME_LENGTH`)
+    // rather than the one sized for run payloads.
+    let auth_frame = {
+        let mut reader = HandshakeReader {
+            stream: &mut stream,
+            deadline: Instant::now() + HANDSHAKE_DEADLINE,
+        };
+        match ipc::read_ts_to_rust_frame_with_limit(&mut reader, ipc::AUTH_MAX_FRAME_LENGTH) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[iso4-v8] failed to read first frame: {e}");
+                return;
+            }
         }
     };
+
+    // Authenticated peers may idle: the host's pool keeps connections open
+    // between runs, so every read after this one blocks for as long as it
+    // takes. Failing to clear the deadline would put the handshake limit on an
+    // idle connection, so it is fatal rather than best-effort.
+    if let Err(e) = stream.set_read_timeout(None) {
+        eprintln!("[iso4-v8] failed to clear the handshake deadline: {e} — closing");
+        return;
+    }
 
     if auth_frame.message_type != ipc::TsToRustMessageType::Authenticate {
         eprintln!(
@@ -899,6 +963,58 @@ mod tests {
         drop(host);
         server.join().unwrap();
         frame
+    }
+
+    /// Spawn `handle_client` over a socket pair. Returns the host end, which
+    /// the caller keeps open, plus a receiver that fires when the session
+    /// thread finishes — so a session that never ends fails the test instead of
+    /// hanging the suite.
+    fn spawn_session(token: &str) -> (UnixStream, crossbeam_channel::Receiver<()>) {
+        let (host, runtime) = UnixStream::pair().unwrap();
+        let shared = Arc::new(SharedState::new(token.to_string(), 0));
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            handle_client(runtime, shared);
+            let _ = done_tx.send(());
+        });
+        (host, done_rx)
+    }
+
+    #[test]
+    fn a_connection_that_never_authenticates_is_dropped() {
+        // `_host` stays open for the whole test, so nothing except the deadline
+        // can end this session: no EOF, no error, just a peer that says
+        // nothing. Before the deadline existed the read blocked forever and the
+        // thread was never reclaimed.
+        let (_host, done) = spawn_session("tok");
+
+        done.recv_timeout(HANDSHAKE_DEADLINE * 20)
+            .expect("a silent peer kept its session thread");
+    }
+
+    #[test]
+    fn a_first_frame_over_the_handshake_ceiling_is_refused() {
+        // Correct token, valid probe, right protocol version — the frame is
+        // refused purely for its size, which is what the pre-auth ceiling is
+        // for: how much an unproven peer can make the runtime buffer. A real
+        // token is a UUID, so nothing legitimate comes near 4 KiB.
+        let token = "t".repeat(5_000);
+        let (mut host, done) = spawn_session(&token);
+
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::Authenticate,
+            &authenticate(crate::blob::probe().to_vec(), &token),
+        )
+        .unwrap();
+        host.flush().unwrap();
+
+        done.recv_timeout(HANDSHAKE_DEADLINE * 20)
+            .expect("an oversized first frame was not refused");
+        assert!(
+            ipc::read_rust_to_ts_frame(&mut host).is_err(),
+            "an oversized first frame must not be answered"
+        );
     }
 
     fn authenticate(probe: Vec<u8>, token: &str) -> Vec<u8> {

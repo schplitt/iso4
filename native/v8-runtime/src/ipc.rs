@@ -34,6 +34,19 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// Default maximum frame length in bytes, including the 1-byte message type.
 pub const DEFAULT_MAX_FRAME_LENGTH: u32 = 64 * 1024 * 1024;
 
+/// Maximum frame length accepted for the `Authenticate` frame — the one frame
+/// read from a peer that has not yet shown it holds the token.
+///
+/// An `AuthenticatePayload` is a `u16`, a probe of a few bytes and a token, so
+/// a few dozen bytes in practice. The default ceiling is sized for run payloads
+/// carrying prefix source and serialized values, and it is a poor fit here: a
+/// frame body is buffered to its declared length, so applying the run ceiling
+/// to the handshake lets an unproven peer name a size six orders of magnitude
+/// past anything the handshake needs. 4 KiB leaves room for a token far longer
+/// than the runtime generates while keeping that buffer to a size the peer
+/// could plausibly deliver.
+pub const AUTH_MAX_FRAME_LENGTH: u32 = 4 * 1024;
+
 /// Message types sent from the TypeScript host to Rust.
 ///
 /// Byte values match `docs/protocol.md` §2.1.
