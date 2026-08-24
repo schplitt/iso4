@@ -102,8 +102,12 @@ fn parse_args() -> (String, String, u64) {
                 i += 2;
             }
             arg => {
+                // Fatal, like every other bad input here. Continuing would
+                // leave a mistyped `--warm-budget-bytes` at its initial 0,
+                // which means watermarks off — the memory ceiling silently
+                // absent, with one stderr line to say so.
                 eprintln!("[iso4-v8] unknown argument: {arg}");
-                i += 1;
+                std::process::exit(1);
             }
         }
     }
