@@ -6,6 +6,7 @@
  */
 
 import { access, unlink } from 'node:fs/promises'
+import { unlinkSync } from 'node:fs'
 import { availableParallelism, tmpdir, totalmem } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -364,6 +365,12 @@ class SandboxImpl implements Sandbox {
    * runtime default (128 MB).
    */
   private readonly memoryMb: number | undefined
+  /**
+   * Last-resort cleanup registered on the host's `exit`, removed by
+   * `dispose()` so a program that creates and disposes many sandboxes does not
+   * accumulate listeners.
+   */
+  private readonly exitHook: () => void
   private _alive = true
 
   constructor(
@@ -381,6 +388,23 @@ class SandboxImpl implements Sandbox {
     proc.once('exit', () => {
       this._alive = false
     })
+    // Nothing but `dispose()` stops the runtime, so a host that exits without
+    // calling it leaves the process running, holding its isolate heaps and its
+    // socket file with no owner. This is the backstop for forgetting: it runs
+    // on a normal exit and on the way out of an uncaught exception, and both
+    // steps are synchronous because nothing asynchronous runs during exit.
+    //
+    // It is a backstop, not a replacement. A host killed by a signal runs no
+    // JavaScript at all, so the only complete answer is calling `dispose()`.
+    this.exitHook = () => {
+      this.proc.kill()
+      try {
+        unlinkSync(this.socketPath)
+      } catch {
+        // already gone, or never created
+      }
+    }
+    process.once('exit', this.exitHook)
   }
 
   get alive(): boolean {
@@ -568,6 +592,7 @@ class SandboxImpl implements Sandbox {
     if (!this._alive)
       return
     this._alive = false
+    process.removeListener('exit', this.exitHook)
     await this.pool.dispose()
     await this.statsClient.dispose()
     this.proc.kill()
