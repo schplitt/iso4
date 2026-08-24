@@ -12,6 +12,7 @@ pub mod rss;
 pub mod session;
 #[cfg(test)]
 pub mod testval;
+pub mod url;
 pub mod v8;
 pub mod warm;
 pub mod webcodec;

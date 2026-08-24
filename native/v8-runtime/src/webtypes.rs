@@ -132,7 +132,7 @@ fn response_shell_ctor(
 /// Called at context creation on every path — prefix validation and every
 /// run — so prefix and postfix code see the same environment.
 pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
-    let mut shells = Vec::with_capacity(3);
+    let mut factory_args = Vec::with_capacity(5);
     for (name, ctor) in [
         ("HeadersShell", headers_shell_ctor.map_fn_to()),
         ("RequestShell", request_shell_ctor.map_fn_to()),
@@ -147,12 +147,24 @@ pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
         let func = tmpl
             .get_function(scope)
             .ok_or_else(|| format!("get_function for {name} failed"))?;
-        shells.push(v8::Local::<v8::Value>::from(func));
+        factory_args.push(v8::Local::<v8::Value>::from(func));
+    }
+
+    // Native URL parsing (url.rs). Passed to the factory like the shells and
+    // never exposed on `globalThis`.
+    for (name, callback) in [
+        ("urlParse", crate::url::url_parse_callback.map_fn_to()),
+        ("urlSet", crate::url::url_set_callback.map_fn_to()),
+    ] {
+        let func = v8::Function::builder_raw(callback)
+            .build(scope)
+            .ok_or_else(|| format!("create {name} failed"))?;
+        factory_args.push(v8::Local::<v8::Value>::from(func));
     }
 
     // The runtime source is an expression evaluating to a function; calling it
-    // with the three shells installs the classes. The shells themselves are
-    // never exposed on `globalThis`.
+    // with the three shells and the two URL callbacks installs the classes.
+    // None of the five are ever exposed on `globalThis`.
     let source = v8::String::new(scope, RUNTIME_JS)
         .ok_or_else(|| "intern web runtime source failed".to_string())?;
     let origin_name = v8::String::new(scope, "iso4:web")
@@ -183,7 +195,7 @@ pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
 
     let recv = v8::undefined(tc).into();
     factory
-        .call(tc, recv, &shells)
+        .call(tc, recv, &factory_args)
         .ok_or_else(|| exception_text(tc, "install web runtime"))?;
     Ok(())
 }
@@ -218,6 +230,14 @@ fn exception_text(
 /// | Response | `_t`     | statusText string                        |
 /// | Response | `_h`     | `Headers` instance                       |
 /// | Response | `_b`     | `null` \| `Uint8Array` \| string          |
+///
+/// Startup cost: this source is compiled and evaluated into every fresh
+/// context. Deno avoids that by precompiling its JS runtime into a build-time
+/// V8 snapshot, and that stays on the table for static sources like this one
+/// (what #60/#61 removed was *runtime* snapshot creation of live prefix state
+/// in a multi-isolate process). A build-time snapshot must carry the
+/// external-references table for every native callback above (see module
+/// docs); the nearer-term step is the process-wide code cache tracked in #83.
 const RUNTIME_JS: &str = include_str!("webtypes.js");
 
 // ── Adapter ──────────────────────────────────────────────────────────────────

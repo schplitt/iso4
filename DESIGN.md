@@ -381,10 +381,15 @@ evaluated into every run's context at creation (~0.5 ms, measured).
   `arrayBuffer()`, `bytes()`.
 - No `Blob` or `FormData`, so no `blob()`/`formData()` and neither works as a
   body initializer.
-- `URL` is a pragmatic parser: correct for http(s)/ws(s)/ftp/file and relative
-  resolution, without IDNA/punycode or non-special-scheme edge cases.
 - No `crypto`, `AbortController`, `AbortSignal`, `Event`, `structuredClone`,
   `setTimeout`, `queueMicrotask`.
+
+`URL` is not on this list: parsing and every component setter run natively on
+ada (the parser Node.js uses, vendored into the runtime binary via the
+`ada-url` crate), so component semantics — IDNA, relative resolution,
+non-special schemes — match Node by construction. The class is gated end to
+end on the WPT URL corpus (`native/v8-runtime/tests/wpt/`), and the `URL.parse`
+and `URL.canParse` statics are included. `URLSearchParams` remains JS.
 
 Widening this set is additive and does not change the wire format
 (`docs/protocol.md` §4.4), which is why the tier was chosen deliberately rather
