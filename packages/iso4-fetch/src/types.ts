@@ -394,6 +394,10 @@ export interface SafeFetchOptions {
    * Pre-resolve DNS and pin the connection to the resolved IP.
    * Prevents SSRF and DNS rebinding. `SafeFetchRequest.resolvedIp` is set.
    *
+   * Both address families are used, so a host that resolves to IPv6 only is
+   * reachable; every resolved address is checked against the private and
+   * reserved ranges of its own family before anything connects.
+   *
    * @default true
    */
   pinDns?: boolean
