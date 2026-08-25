@@ -353,15 +353,9 @@ async function httpRequest(
   headers: Record<string, string>,
   body: Uint8Array | string | null,
   agent: Dispatcher,
-  timeoutMs: number,
   maxBodyBytes: number,
-  incomingSignal?: AbortSignal,
+  signal: AbortSignal,
 ): Promise<{ response: Awaited<ReturnType<typeof undiciFetch>>, bodyBytes: Uint8Array | null }> {
-  const signals: AbortSignal[] = [AbortSignal.timeout(timeoutMs)]
-  if (incomingSignal !== undefined)
-    signals.push(incomingSignal)
-  const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals)
-
   const response = await undiciFetch(url, {
     method,
     headers,
@@ -684,6 +678,13 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
       let currentHeaders: Record<string, string> = ctx.req.headers
       let hop = 0
 
+      // One deadline for the whole request, so redirects cannot extend it to
+      // (maxRedirects + 1) * timeoutMs. Built once and shared across hops.
+      const deadline = AbortSignal.timeout(timeoutMs)
+      const signal = hostRequest.signal !== undefined
+        ? AbortSignal.any([deadline, hostRequest.signal])
+        : deadline
+
       for (;;) {
         const { response, bodyBytes } = await httpRequest(
           currentUrl,
@@ -691,9 +692,8 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
           currentHeaders,
           currentBody,
           agent,
-          timeoutMs,
           maxBodyBytes,
-          hostRequest.signal,
+          signal,
         )
 
         if (!REDIRECT_STATUSES.has(response.status) || hop >= maxRedirects) {
