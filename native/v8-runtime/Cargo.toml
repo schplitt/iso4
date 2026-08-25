@@ -37,6 +37,12 @@ signal-hook = "0.3"
 # POSIX bits: fcntl, pipe, poll, FD_CLOEXEC
 libc = "0.2"
 
+# WHATWG URL parsing for the sandbox URL class (src/url.rs) — ada, the parser
+# Node.js itself uses, so component semantics match Node by construction. The
+# crate vendors the ada C++ amalgamation and compiles it via `cc` at build
+# time (C++20; every toolchain we build on qualifies).
+ada-url = "4"
+
 [dev-dependencies]
 # Wall-time microbenchmarks (benches/micro.rs). Plots and rayon disabled:
 # CI only needs `--output-format bencher` text output.

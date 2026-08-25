@@ -4,12 +4,15 @@
 //! CI runs with `-- --output-format bencher` so `scripts/bench-compare.ts`
 //! can parse the results (see .github/workflows/bench.yml).
 //!
-//! Two groups:
+//! Groups:
 //! - `v8_value` — the value plane crossing into/out of V8: `blob::serialize_value`
 //!   / `blob::deserialize_value`, i.e. V8's own `ValueSerializer` /
 //!   `ValueDeserializer` (the only value codec in the protocol).
 //! - `exec` — per-run execution costs: fresh context, snapshot restore,
 //!   unique-source compile, and direct `Function::call` per event.
+//! - `policy` — warm-registry eviction/pressure decisions (policy.rs).
+//! - `url` — the sandbox `URL` class end to end: JS call → native callback →
+//!   ada parse → component array (url.rs).
 //!
 //! The payload matrix mirrors `packages/iso4-sandbox/bench/payloads.ts`:
 //! codec cost tracks value count, not bytes, so shapes are chosen by value
@@ -28,6 +31,7 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use iso4_v8_runtime::blob;
 use iso4_v8_runtime::v8::init_platform;
+use iso4_v8_runtime::webtypes;
 
 // ── Deterministic payload fixtures ─────────────────────────────────────────
 
@@ -333,7 +337,7 @@ fn bench_exec(c: &mut Criterion) {
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        let (func, recv) = compile_transform(scope);
+        let (func, recv) = compile_fn(scope, TRANSFORM_SRC);
         let event = to_v8(scope, &small_event());
         b.iter(|| {
             v8::scope!(let scope, scope);
@@ -349,7 +353,7 @@ fn bench_exec(c: &mut Criterion) {
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        let (func, recv) = compile_transform(scope);
+        let (func, recv) = compile_fn(scope, TRANSFORM_SRC);
         let event = to_v8(scope, &small_event());
         let args_blob = blob::serialize_value(scope, event).unwrap();
         b.iter(|| {
@@ -363,12 +367,78 @@ fn bench_exec(c: &mut Criterion) {
     group.finish();
 }
 
-/// Evaluate `TRANSFORM_SRC` and hand back the function plus an `undefined`
-/// receiver for `Function::call`.
-fn compile_transform<'s>(
+// ── url ─────────────────────────────────────────────────────────────────────
+
+/// The sandbox `URL` class end to end, as guest code pays for it: JS call →
+/// native callback → ada parse → component-array build (url.rs).
+fn bench_url(c: &mut Criterion) {
+    init_platform();
+    let mut group = c.benchmark_group("url");
+
+    group.bench_function("parse", |b| {
+        let isolate = &mut v8::Isolate::new(Default::default());
+        v8::scope!(let scope, isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        webtypes::install(scope).unwrap();
+        let (func, recv) = compile_fn(scope, "s => new URL(s)");
+        let input: v8::Local<v8::Value> =
+            v8::String::new(scope, "https://user@example.com:8443/a/b/../c?x=1&y=2#frag")
+                .unwrap()
+                .into();
+        b.iter(|| {
+            v8::scope!(let scope, scope);
+            black_box(func.call(scope, recv, &[input]).unwrap());
+        });
+    });
+
+    // Relative resolution against a base — the shape `Request` construction
+    // and redirect handling produce.
+    group.bench_function("parse_relative_with_base", |b| {
+        let isolate = &mut v8::Isolate::new(Default::default());
+        v8::scope!(let scope, isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        webtypes::install(scope).unwrap();
+        let (func, recv) = compile_fn(
+            scope,
+            "s => new URL(s, 'https://example.com/base/dir/index.html')",
+        );
+        let input: v8::Local<v8::Value> =
+            v8::String::new(scope, "../other/path?q=1").unwrap().into();
+        b.iter(|| {
+            v8::scope!(let scope, scope);
+            black_box(func.call(scope, recv, &[input]).unwrap());
+        });
+    });
+
+    // One component setter: re-parse from href, apply the DOM setter
+    // natively, swap in the fresh component array.
+    group.bench_function("set_pathname", |b| {
+        let isolate = &mut v8::Isolate::new(Default::default());
+        v8::scope!(let scope, isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        webtypes::install(scope).unwrap();
+        let (make, recv) = compile_fn(scope, "() => new URL('https://example.com/a?b=1')");
+        let url = make.call(scope, recv, &[]).unwrap();
+        let (func, recv) = compile_fn(scope, "u => { u.pathname = '/new/path'; return u }");
+        b.iter(|| {
+            v8::scope!(let scope, scope);
+            black_box(func.call(scope, recv, &[url]).unwrap());
+        });
+    });
+
+    group.finish();
+}
+
+/// Evaluate a function-expression source and hand back the function plus an
+/// `undefined` receiver for `Function::call`.
+fn compile_fn<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
 ) -> (v8::Local<'s, v8::Function>, v8::Local<'s, v8::Value>) {
-    let code = v8::String::new(scope, TRANSFORM_SRC).unwrap();
+    let code = v8::String::new(scope, src).unwrap();
     let script = v8::Script::compile(scope, code, None).unwrap();
     let func: v8::Local<v8::Function> = script.run(scope).unwrap().try_into().unwrap();
     let recv: v8::Local<v8::Value> = v8::undefined(scope).into();
@@ -470,6 +540,6 @@ fn configured() -> Criterion {
 criterion_group! {
     name = benches;
     config = configured();
-    targets = bench_v8_value, bench_exec, bench_policy
+    targets = bench_v8_value, bench_exec, bench_policy, bench_url
 }
 criterion_main!(benches);

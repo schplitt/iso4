@@ -11,11 +11,12 @@
 // Deliberate deviations from spec, all documented in DESIGN.md:
 //   - no `.body` getter (that is a ReadableStream; streams cannot cross)
 //   - no Blob / FormData body variants
-//   - URL is a pragmatic parser: correct for http(s)/ws(s)/ftp/file and
-//     relative resolution, but no IDNA/punycode and no non-special-scheme
-//     edge cases.
+//
+// URL parsing is native: `urlParse`/`urlSet` are callbacks backed by the ada
+// parser (url.rs), and the URL class below is only the object surface. Like
+// the shells, they are never exposed on globalThis.
 
-(function (HeadersShell, RequestShell, ResponseShell) {
+(function (HeadersShell, RequestShell, ResponseShell, urlParse, urlSet) {
   'use strict'
 
   const def = (target, name, value) =>
@@ -341,260 +342,171 @@
 
   // ── URL ────────────────────────────────────────────────────────────────────
 
-  const DEFAULT_PORTS = {
-    'http:': '80',
-    'https:': '443',
-    'ws:': '80',
-    'wss:': '443',
-    'ftp:': '21',
-  }
-  const SPECIAL = new Set(['http:', 'https:', 'ws:', 'wss:', 'ftp:', 'file:'])
-  const SCHEME_RE = /^([A-Za-z][A-Za-z0-9+\-.]*):/
+  // Parsing and every component mutation happen natively in ada (url.rs);
+  // this class only owns the object surface. `_c` caches the component
+  // strings in the order produced by url.rs — the U_* indices below are that
+  // contract. A setter re-parses from `href`, applies the change natively and
+  // swaps in the fresh array, so instances hold no native state.
 
-  function normalisePath(path, isSpecial) {
-    if (path === '')
-      return isSpecial ? '/' : ''
-    const absolute = path.charCodeAt(0) === 47 /**
-                                                * /
-                                                */
-    const segments = path.split('/')
-    const out = []
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i]
-      if (seg === '.' || (i === 0 && seg === '' && absolute))
-        continue
-      if (seg === '..') {
-        if (out.length)
-          out.pop(); continue
-      }
-      out.push(seg)
-    }
-    // A trailing "." or ".." leaves an empty final segment, per spec.
-    const last = segments[segments.length - 1]
-    if (last === '.' || last === '..')
-      out.push('')
-    return (absolute ? '/' : '') + out.join('/')
-  }
+  const U_HREF = 0
+  const U_PROTOCOL = 1
+  const U_USERNAME = 2
+  const U_PASSWORD = 3
+  const U_HOST = 4
+  const U_HOSTNAME = 5
+  const U_PORT = 6
+  const U_PATHNAME = 7
+  const U_SEARCH = 8
+  const U_HASH = 9
+  const U_ORIGIN = 10
 
   class URL {
     constructor(input, base) {
-      def(this, '_scheme', '')
-      def(this, '_username', '')
-      def(this, '_password', '')
-      def(this, '_hostname', '')
-      def(this, '_port', '')
-      def(this, '_path', '')
-      def(this, '_query', '')
-      def(this, '_hash', '')
+      const str = String(input)
+      const c = urlParse(str, base === undefined || base === null ? undefined : String(base))
+      if (c === null)
+        throw new TypeError(`Invalid URL: "${str}"`)
+      def(this, '_c', c)
       def(this, '_sp', null)
-
-      let str = String(input).trim()
-      let baseUrl = null
-      if (base !== undefined && base !== null) {
-        baseUrl = base instanceof URL ? base : new URL(String(base))
-      }
-
-      const m = SCHEME_RE.exec(str)
-      if (m) {
-        this._scheme = `${m[1].toLowerCase()}:`
-        str = str.slice(m[0].length)
-        this._parseAfterScheme(str, true)
-      } else {
-        if (!baseUrl)
-          throw new TypeError(`Invalid URL: "${input}"`)
-        this._scheme = baseUrl._scheme
-        this._username = baseUrl._username
-        this._password = baseUrl._password
-        this._hostname = baseUrl._hostname
-        this._port = baseUrl._port
-        if (str.startsWith('//')) {
-          this._parseAfterScheme(str, true)
-        } else if (str.startsWith('/')) {
-          this._parseTail(str)
-        } else if (str === '') {
-          this._path = baseUrl._path
-          this._query = baseUrl._query
-        } else if (str.startsWith('?') || str.startsWith('#')) {
-          this._path = baseUrl._path
-          if (str.startsWith('?')) {
-            this._parseTail(str)
-          } else {
-            this._query = baseUrl._query; this._hash = str
-          }
-        } else {
-          const basePath = baseUrl._path
-          const cut = basePath.lastIndexOf('/')
-          const prefix = cut === -1 ? '/' : basePath.slice(0, cut + 1)
-          this._parseTail(prefix + str)
-        }
-      }
-
-      if (SPECIAL.has(this._scheme) && this._hostname === '' && this._scheme !== 'file:')
-        throw new TypeError(`Invalid URL: "${input}" (no host)`)
-
-      this._path = normalisePath(this._path, SPECIAL.has(this._scheme))
     }
 
-    _parseAfterScheme(rest, allowAuthority) {
-      if (allowAuthority && rest.startsWith('//')) {
-        rest = rest.slice(2)
-        let end = rest.length
-        for (let i = 0; i < rest.length; i++) {
-          const c = rest[i]
-          if (c === '/' || c === '?' || c === '#') {
-            end = i; break
-          }
-        }
-        let authority = rest.slice(0, end)
-        const tail = rest.slice(end)
-
-        const at = authority.lastIndexOf('@')
-        if (at !== -1) {
-          const creds = authority.slice(0, at)
-          authority = authority.slice(at + 1)
-          const colon = creds.indexOf(':')
-          if (colon === -1) {
-            this._username = creds
-          } else {
-            this._username = creds.slice(0, colon)
-            this._password = creds.slice(colon + 1)
-          }
-        }
-
-        if (authority.startsWith('[')) {
-          // IPv6 literal
-          const close = authority.indexOf(']')
-          this._hostname = authority.slice(0, close + 1).toLowerCase()
-          const after = authority.slice(close + 1)
-          if (after.startsWith(':'))
-            this._port = after.slice(1)
-        } else {
-          const colon = authority.indexOf(':')
-          if (colon === -1) {
-            this._hostname = authority.toLowerCase()
-          } else {
-            this._hostname = authority.slice(0, colon).toLowerCase()
-            this._port = authority.slice(colon + 1)
-          }
-        }
-        if (this._port !== '') {
-          if (!/^\d+$/.test(this._port))
-            throw new TypeError(`Invalid URL: bad port "${this._port}"`)
-          if (this._port === DEFAULT_PORTS[this._scheme])
-            this._port = ''
-        }
-        this._parseTail(tail)
-      } else {
-        this._parseTail(rest)
+    static parse(input, base) {
+      try {
+        return new URL(input, base)
+      } catch {
+        return null
       }
     }
 
-    _parseTail(tail) {
-      const hashAt = tail.indexOf('#')
-      if (hashAt !== -1) {
-        this._hash = tail.slice(hashAt); tail = tail.slice(0, hashAt)
+    static canParse(input, base) {
+      return URL.parse(input, base) !== null
+    }
+
+    // Apply one DOM setter natively. Everything except the href setter is a
+    // silent no-op on invalid input (per spec), in which case url.rs returns
+    // the components unchanged; `null` only comes back for an invalid href.
+    _apply(which, value) {
+      const c = urlSet(this._c[U_HREF], which, String(value))
+      if (c !== null)
+        this._c = c
+      return c
+    }
+
+    // The spec resets a live URLSearchParams list whenever the query is set
+    // through the URL side (href or search setter).
+    _resyncSearchParams() {
+      if (this._sp) {
+        this._sp._p.length = 0
+        this._sp._parse(this._c[U_SEARCH])
       }
-      const qAt = tail.indexOf('?')
-      if (qAt !== -1) {
-        this._query = tail.slice(qAt); tail = tail.slice(0, qAt)
-      }
-      this._path = tail
     }
 
     _onSearchChanged() {
-      const s = this._sp.toString()
-      this._query = s === '' ? '' : `?${s}`
+      this._apply(U_SEARCH, this._sp.toString())
+    }
+
+    get href() {
+      return this._c[U_HREF]
+    }
+
+    set href(v) {
+      if (this._apply(U_HREF, v) === null)
+        throw new TypeError(`Invalid URL: "${String(v)}"`)
+      this._resyncSearchParams()
     }
 
     get protocol() {
-      return this._scheme
+      return this._c[U_PROTOCOL]
+    }
+
+    set protocol(v) {
+      this._apply(U_PROTOCOL, v)
     }
 
     get username() {
-      return this._username
+      return this._c[U_USERNAME]
+    }
+
+    set username(v) {
+      this._apply(U_USERNAME, v)
     }
 
     get password() {
-      return this._password
+      return this._c[U_PASSWORD]
     }
 
-    get hostname() {
-      return this._hostname
-    }
-
-    get port() {
-      return this._port
+    set password(v) {
+      this._apply(U_PASSWORD, v)
     }
 
     get host() {
-      return this._port === '' ? this._hostname : `${this._hostname}:${this._port}`
+      return this._c[U_HOST]
+    }
+
+    set host(v) {
+      this._apply(U_HOST, v)
+    }
+
+    get hostname() {
+      return this._c[U_HOSTNAME]
+    }
+
+    set hostname(v) {
+      this._apply(U_HOSTNAME, v)
+    }
+
+    get port() {
+      return this._c[U_PORT]
+    }
+
+    set port(v) {
+      this._apply(U_PORT, v)
     }
 
     get pathname() {
-      return this._path
+      return this._c[U_PATHNAME]
     }
 
-    get hash() {
-      return this._hash
-    }
-
-    get origin() {
-      return SPECIAL.has(this._scheme) && this._scheme !== 'file:'
-        ? `${this._scheme}//${this.host}`
-        : 'null'
+    set pathname(v) {
+      this._apply(U_PATHNAME, v)
     }
 
     get search() {
-      return this._sp ? (this._sp.size ? this._query : '') : this._query
+      return this._c[U_SEARCH]
     }
 
     set search(v) {
-      const s = String(v)
-      this._query = s === '' ? '' : (s.startsWith('?') ? s : `?${s}`)
-      if (this._sp) {
-        this._sp._p.length = 0; this._sp._parse(this._query)
-      }
+      this._apply(U_SEARCH, v)
+      this._resyncSearchParams()
+    }
+
+    get hash() {
+      return this._c[U_HASH]
+    }
+
+    set hash(v) {
+      this._apply(U_HASH, v)
+    }
+
+    get origin() {
+      return this._c[U_ORIGIN]
     }
 
     get searchParams() {
       if (!this._sp) {
-        const sp = new URLSearchParams(this._query)
+        const sp = new URLSearchParams(this._c[U_SEARCH])
         def(sp, '_url', this)
         def(this, '_sp', sp)
       }
       return this._sp
     }
 
-    set pathname(v) {
-      this._path = normalisePath(String(v), SPECIAL.has(this._scheme))
-    }
-
-    set hash(v) {
-      const s = String(v)
-      this._hash = s === '' ? '' : (s.startsWith('#') ? s : `#${s}`)
-    }
-
-    get href() {
-      let out = this._scheme
-      if (this._hostname !== '' || SPECIAL.has(this._scheme)) {
-        out += '//'
-        if (this._username !== '') {
-          out += this._username
-          if (this._password !== '')
-            out += `:${this._password}`
-          out += '@'
-        }
-        out += this.host
-      }
-      return out + this._path + this.search + this._hash
-    }
-
     toString() {
-      return this.href
+      return this._c[U_HREF]
     }
 
     toJSON() {
-      return this.href
+      return this._c[U_HREF]
     }
   }
 
