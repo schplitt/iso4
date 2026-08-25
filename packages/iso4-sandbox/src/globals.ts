@@ -111,6 +111,35 @@ export function processGlobals(globals: HostGlobals): ProcessedGlobals {
  * @param runGlobals
  * @param precompileGlobals
  */
+/**
+ * Resolve a per-run override for a declared bridge global.
+ *
+ * An omitted key falls back to the precompile-time handler (the intended
+ * default). But a key that IS supplied yet is not a function — the runtime
+ * shape TypeScript cannot catch, e.g. a tenant handler that resolves to
+ * `undefined` — throws instead of silently reusing the (often broader) default,
+ * which would be a fail-open exactly where the API is used to narrow privilege.
+ * This matches the imports side, which already rejects a non-function rebind.
+ * @param runGlobals the per-run rebind map
+ * @param name the declared global's name
+ * @param fallback the precompile-time handler used when no override is supplied
+ */
+function resolveOverride(
+  runGlobals: RebindGlobals<HostGlobals>,
+  name: string,
+  fallback: HostExportFunction,
+): HostExportFunction {
+  if (!Object.hasOwn(runGlobals, name))
+    return fallback
+  const override = (runGlobals as Record<string, unknown>)[name]
+  if (typeof override !== 'function') {
+    throw new TypeError(
+      `[iso4] global override "${name}" must be a function, got ${override === null ? 'null' : typeof override}`,
+    )
+  }
+  return override as HostExportFunction
+}
+
 export function extractBridgeGlobals(
   runGlobals: RebindGlobals<HostGlobals>,
   precompileGlobals: HostGlobals,
@@ -125,15 +154,11 @@ export function extractBridgeGlobals(
     if (isBridgeWithShim(value)) {
       // RebindValue<BridgeWithShim<H>> = H — override is always a function, never a new shim.
       const handlerName = shimHandlerName(name)
-      const override = runGlobals[name]
       defs.push({ kind: 'bridge', name: handlerName })
-      dispatch[handlerName] = (typeof override === 'function'
-        ? override
-        : value.handler) as HostExportFunction
+      dispatch[handlerName] = resolveOverride(runGlobals, name, value.handler)
     } else if (typeof value === 'function') {
-      const override = runGlobals[name]
       defs.push({ kind: 'bridge', name })
-      dispatch[name] = (typeof override === 'function' ? override : value) as HostExportFunction
+      dispatch[name] = resolveOverride(runGlobals, name, value as HostExportFunction)
     }
   }
 

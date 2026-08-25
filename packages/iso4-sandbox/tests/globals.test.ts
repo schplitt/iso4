@@ -279,29 +279,37 @@ describe('bad paths — runtime', () => {
     })
   })
 
-  describe('extractBridgeGlobals — silently ignores invalid overrides', () => {
-    it('string global override at run time is silently dropped (not a bridge function)', () => {
-      // At runtime someone bypasses TypeScript with `as any`.
-      // extractBridgeGlobals skips string entries entirely — no throw, no bridge global.
+  describe('extractBridgeGlobals — rejects a supplied-but-malformed override', () => {
+    it('a supplied string override throws instead of reusing the default', () => {
+      // At runtime someone bypasses TypeScript with `as any`. A key that is
+      // present but not a function must not silently fall back to the (broader)
+      // precompile default.
       const shimGlobal: BridgeWithShim = {
         kind: 'bridge-with-shim',
         handler: () => {},
         shim: '(r) => r',
       }
-      const { dispatch } = extractBridgeGlobals(
-        { fetch: 'https://evil.com' } as unknown as RebindGlobals<HostGlobals>,
-        { fetch: shimGlobal },
-      )
-      // String override is ignored; falls back to default handler at the private key
-      expect(dispatch['__iso4_fetch_h']).toBe(shimGlobal.handler)
+      expect(() =>
+        extractBridgeGlobals(
+          { fetch: 'https://evil.com' } as unknown as RebindGlobals<HostGlobals>,
+          { fetch: shimGlobal },
+        ),
+      ).toThrow(/must be a function/)
     })
 
-    it('null/undefined override falls back to precompile default', () => {
+    it('a supplied undefined override throws (e.g. a tenant handler resolving to undefined)', () => {
       const defaultFn: HostExportFunction = () => 'default'
-      const { dispatch } = extractBridgeGlobals(
-        { myTool: undefined as unknown as HostExportFunction },
-        { myTool: defaultFn },
-      )
+      expect(() =>
+        extractBridgeGlobals(
+          { myTool: undefined as unknown as HostExportFunction },
+          { myTool: defaultFn },
+        ),
+      ).toThrow(/must be a function/)
+    })
+
+    it('an omitted override still falls back to the precompile default', () => {
+      const defaultFn: HostExportFunction = () => 'default'
+      const { dispatch } = extractBridgeGlobals({}, { myTool: defaultFn })
       expect(dispatch['myTool']).toBe(defaultFn)
     })
   })
