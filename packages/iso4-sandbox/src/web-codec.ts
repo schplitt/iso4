@@ -279,7 +279,12 @@ async function transform(
   }
 
   // A plain object, or a class instance that would flatten anyway (§4.2).
-  const out: Record<string, unknown> = {}
+  // Null-prototype so an own `__proto__` key is copied as data instead of
+  // hitting the `Object.prototype` `__proto__` setter (which would re-point the
+  // prototype and drop the key from the serialized output). `ValueSerializer`
+  // does not preserve the null prototype, so the sandbox still gets an ordinary
+  // object.
+  const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>
   seen.set(value, out)
   for (const [k, v] of Object.entries(value))
     out[k] = await transform(v, seen, depth + 1)
