@@ -777,7 +777,14 @@
         headersInit = input._h
         body = input._b
       } else {
-        url = new URL(String(input)).href
+        const parsed = new URL(String(input))
+        // Fetch spec: a Request URL may not carry credentials. The sandbox URL
+        // (ada) preserves them like any WHATWG URL, so the check lives here —
+        // and Node's Request rejects them too, so this keeps the error on the
+        // user's line instead of failing host-side reconstruction.
+        if (parsed.username !== '' || parsed.password !== '')
+          throw new TypeError('Request cannot be constructed from a URL that includes credentials')
+        url = parsed.href
       }
 
       if (init.method !== undefined) {
@@ -854,7 +861,11 @@
         throw new TypeError(`Response with status ${status} cannot have a body`)
 
       const statusText = init.statusText === undefined ? '' : String(init.statusText)
-      if (/[\0\r\n]/.test(statusText) || !BYTE_STRING_RE.test(statusText))
+      // Reject all control characters, mirroring workerd (any byte < 0x20),
+      // which is stricter than the earlier \0\r\n check and blocks header
+      // injection through the reason phrase.
+      // eslint-disable-next-line no-control-regex -- the control range is the point
+      if (/[\x00-\x1F]/.test(statusText) || !BYTE_STRING_RE.test(statusText))
         throw new TypeError(`Invalid statusText: "${statusText}"`)
 
       const headers = new Headers(init.headers)

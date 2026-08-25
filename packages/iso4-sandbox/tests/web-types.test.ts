@@ -252,6 +252,8 @@ describe('platform parity — the sandbox throws where Node throws', () => {
     ['statusText with a newline', `new Response(null, { statusText: 'a\\nb' })`],
     ['non-ByteString header value', `new Response(null, { headers: { 'x-a': '世' } })`],
     ['forbidden method', `new Request('https://ex.com/', { method: 'CONNECT' })`],
+    ['URL with credentials', `new Request('http://user:pass@ex.com/')`],
+    ['statusText with a control char', `new Response(null, { statusText: 'a\\u0001b' })`],
   ])('%s is a user-code error, not a host throw', async (_label, expr) => {
     const result = await sandbox.run({ code: `export default ${expr}` })
     expect(result.ok).toBe(false)
