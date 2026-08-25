@@ -1138,6 +1138,13 @@ export interface BridgeErrorPayload {
    * beyond `name`/`message`/`stack` (reserved keys). Absent when there are
    * none. The Rust side re-attaches these as direct own properties on the
    * Error it rejects the sandbox promise with.
+   *
+   * These are host-controlled and cross to untrusted sandbox code verbatim —
+   * whatever the handler (or a third-party SDK it re-throws) attached to the
+   * error. Sanitising is the handler's responsibility: throw a clean Error
+   * rather than forwarding one that may carry credentials or request context.
+   * The stack is withheld separately because the runtime populates it
+   * implicitly, not the host.
    */
   encodedFields?: Uint8Array
 }

@@ -271,6 +271,14 @@ Thrown errors keep their identity across the bridge, in both directions:
   the run with `ERR_HOST_BRIDGE`. The **host stack never crosses** into the
   sandbox.
 
+> Every own property you attach to a host-thrown error is visible to sandbox
+> code (the auto-populated stack is the one exception). Sandbox code is
+> untrusted, and this includes properties a third-party SDK attaches to its own
+> error objects — so if an error may carry request context or credentials
+> (an SDK's `config`/`request`/`response`), throw a clean `Error` from your
+> handler instead of re-throwing it wholesale. Sanitising is the handler's job,
+> the same as with any value you return.
+
 ## Architecture
 
 V8 runs in a separate Rust subprocess communicating over a Unix domain socket.
