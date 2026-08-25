@@ -129,6 +129,13 @@ visible to later runs until eviction silently wipes them. Keep durable
 state in a database and do expensive setup lazily in the handler
 (`conn ??= await connect()`).
 
+Carryover is not an isolation boundary. Because a warm instance is reused
+across runs of the same prefix, one run can change what a later run sees —
+including reassigning the runtime's own globals (`Response`, `fetch`, …) or
+patching prototypes, which then affects that later run. This is intended and
+matches a shared-isolate worker: run one prefix only for callers that trust
+each other, and give mutually-distrusting workloads separate prefixes.
+
 Instances of one prefix share no state and serve one call at a time —
 concurrency means more instances. Top-level names never collide across runs
 (each run is its own module). A prefix that can't finish evaluating under
