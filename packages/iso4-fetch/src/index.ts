@@ -7,8 +7,8 @@ import { createRouter, addRoute, findRoute } from 'rou3'
 import type { RouterContext } from 'rou3'
 import { fetch as undiciFetch, Agent, interceptors } from 'undici'
 import type { Dispatcher } from 'undici'
-import { lookup as nodeDnsLookup } from 'node:dns/promises'
-import { lookup as nodeDnsLookupCb } from 'node:dns'
+
+import { isReservedIp, makeDnsLookupFn } from './dns.js'
 
 import type {
   FetchContext,
@@ -39,75 +39,6 @@ export type {
   SafeFetchPolicy,
   SafeFetchRequest,
 } from './types.js'
-
-// ─────────────────────────────────────────────────────────────────────────
-// IP address utilities
-// ─────────────────────────────────────────────────────────────────────────
-
-function isReservedIp(ip: string): boolean {
-  if (ip.includes(':')) {
-    const addr = ip.toLowerCase().replace(/^\[|\]$/g, '')
-    if (addr === '::1')
-      return true
-    // The unspecified address. Connecting to it reaches the local host.
-    if (addr === '::')
-      return true
-    const firstWord = parseInt(addr.split(':')[0] ?? '0', 16)
-    if ((firstWord & 0xffc0) === 0xfe80)
-      return true // fe80::/10 link-local
-    if ((firstWord & 0xfe00) === 0xfc00)
-      return true // fc00::/7 unique-local
-    if (addr.startsWith('::ffff:'))
-      return isReservedIp(addr.slice(7))
-    return false
-  }
-
-  const parts = ip.split('.').map(Number)
-  if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255))
-    return true
-
-  const a = parts[0]!
-  const b = parts[1] ?? 0
-  const c = parts[2] ?? 0
-
-  return (
-    a === 0
-    || a === 10
-    || a === 127
-    || (a === 100 && (b & 0xc0) === 64)
-    || (a === 169 && b === 254)
-    || (a === 172 && b >= 16 && b <= 31)
-    || (a === 192 && b === 0 && (c === 0 || c === 2))
-    || (a === 192 && b === 168)
-    || (a === 198 && (b === 18 || b === 19))
-    || (a === 198 && b === 51 && c === 100)
-    || (a === 203 && b === 0 && c === 113)
-    || a >= 224
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// DNS resolution
-// ─────────────────────────────────────────────────────────────────────────
-
-async function resolveAndCheckIp(hostname: string): Promise<string> {
-  let addrs: Array<{ address: string, family: number }>
-  try {
-    addrs = await nodeDnsLookup(hostname, { all: true, family: 0 })
-  } catch (err) {
-    throw new Error(`fetch: DNS resolution failed for "${hostname}": ${(err as Error).message}`)
-  }
-
-  if (addrs.length === 0)
-    throw new Error(`fetch: DNS resolution returned no addresses for "${hostname}"`)
-
-  for (const { address } of addrs) {
-    if (isReservedIp(address))
-      throw new Error(`fetch: request blocked — "${hostname}" resolves to private/reserved IP ${address}`)
-  }
-
-  return addrs[0]!.address
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Hostname matching
@@ -279,41 +210,6 @@ function makeFetchContext(
 // ─────────────────────────────────────────────────────────────────────────
 // HTTP client
 // ─────────────────────────────────────────────────────────────────────────
-
-function makeDnsLookupFn(): NonNullable<NonNullable<Parameters<typeof interceptors.dns>[0]>['lookup']> {
-  return (hostnameOrUrl, _opts, callback) => {
-    const rawHostname: string
-      = typeof hostnameOrUrl === 'object' && hostnameOrUrl !== null
-        ? (hostnameOrUrl as unknown as URL).hostname
-        : hostnameOrUrl
-
-    // `URL.hostname` keeps the brackets around an IPv6 literal and
-    // `dns.lookup('[::1]')` cannot parse them, so a literal IPv6 URL failed to
-    // resolve at all. Strip them; `dns.lookup` hands a bare literal straight
-    // back.
-    const hostname = rawHostname.startsWith('[') && rawHostname.endsWith(']')
-      ? rawHostname.slice(1, -1)
-      : rawHostname
-
-    nodeDnsLookupCb(hostname, { all: true, family: 0 }, (err, addresses) => {
-      if (err) {
-        callback(err, [])
-        return
-      }
-      if (addresses.length === 0) {
-        callback(new Error(`fetch: no DNS addresses for "${hostname}"`), [])
-        return
-      }
-      for (const { address } of addresses) {
-        if (isReservedIp(address)) {
-          callback(new Error(`fetch: request blocked — "${hostname}" resolves to private/reserved IP ${address}`), [])
-          return
-        }
-      }
-      callback(null, addresses.map((addr) => ({ address: addr.address, family: addr.family as 4 | 6, ttl: 10_000 })))
-    })
-  }
-}
 
 async function readBody(body: ReadableStream<Uint8Array> | null, maxBytes: number): Promise<Uint8Array | null> {
   if (body === null)
@@ -518,7 +414,7 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
     ? new Agent().compose(interceptors.dns({ lookup: makeDnsLookupFn(), maxTTL: 10_000 }))
     : new Agent()
 
-  async function buildSafeFetchRequest(parsedUrl: URL, method: string, headers: Record<string, string>, hop: number): Promise<SafeFetchRequest> {
+  function buildSafeFetchRequest(parsedUrl: URL, method: string, headers: Record<string, string>, hop: number): SafeFetchRequest {
     const protocol = parsedUrl.protocol.slice(0, -1)
     if (protocol !== 'http' && protocol !== 'https')
       throw new Error(`fetch: unsupported protocol "${parsedUrl.protocol}"`)
@@ -526,17 +422,19 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
     const host = parsedUrl.hostname.toLowerCase()
     const port = parsedUrl.port !== '' ? parseInt(parsedUrl.port, 10) : protocol === 'https' ? 443 : 80
 
-    let resolvedIp: string | null = null
+    // A hostname is NOT resolved here. Resolution (and the private/reserved-IP
+    // block) happens in the connection-time DNS interceptor, which only runs
+    // once a request has been authorized — so a denied host is never looked up,
+    // and the allow-list gates DNS, not just the HTTP call. IP literals are the
+    // exception: undici's interceptor short-circuits them, so a private literal
+    // is refused synchronously here.
     if (doPinDns) {
       const isIpLiteral = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || host.startsWith('[')
-      if (!isIpLiteral) {
-        resolvedIp = await resolveAndCheckIp(host)
-      } else if (isReservedIp(host.replace(/^\[|\]$/g, ''))) {
+      if (isIpLiteral && isReservedIp(host.replace(/^\[|\]$/g, '')))
         throw new Error(`fetch: request blocked — IP literal ${host} is private/reserved`)
-      }
     }
 
-    return { url: parsedUrl.toString(), protocol: protocol as 'http' | 'https', host, port, path: parsedUrl.pathname + parsedUrl.search, method, headers, resolvedIp, hop }
+    return { url: parsedUrl.toString(), protocol: protocol as 'http' | 'https', host, port, path: parsedUrl.pathname + parsedUrl.search, method, headers, resolvedIp: null, hop }
   }
 
   async function runDeny(req: SafeFetchRequest, reason: string): Promise<never> {
@@ -645,7 +543,7 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
     const method = hostRequest.method.toUpperCase()
 
     // Allow/deny check on the initial URL
-    const req = await buildSafeFetchRequest(parsedUrl, method, baseHeaders, 0)
+    const req = buildSafeFetchRequest(parsedUrl, method, baseHeaders, 0)
     const match = await checkRequest(req)
 
     // Build mutable context — middleware sees and mutates this
@@ -740,7 +638,7 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
         // Security check for the redirect destination, with the headers that
         // will actually be sent.
         hop++
-        const redirectReq = await buildSafeFetchRequest(nextUrl, currentMethod, currentHeaders, hop)
+        const redirectReq = buildSafeFetchRequest(nextUrl, currentMethod, currentHeaders, hop)
         await checkRequest(redirectReq)
 
         if (methodChanges) {
