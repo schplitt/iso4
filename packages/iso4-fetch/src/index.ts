@@ -163,18 +163,6 @@ function compileRules(rawRules: FetchOriginRule | FetchOriginRule[]): CompiledRu
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Path normalization
-// ─────────────────────────────────────────────────────────────────────────
-
-function decodePath(rawPath: string): string {
-  const once = decodeURIComponent(rawPath)
-  const twice = decodeURIComponent(once)
-  if (once !== twice)
-    throw new Error('fetch: request denied — double-encoded path detected')
-  return once
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // Origin + route matching
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -222,14 +210,13 @@ function matchRules(req: SafeFetchRequest, compiled: CompiledRule[]): MatchResul
       if (rule.routes.length === 0)
         return { kind: 'deny-route' }
 
-      let decodedPathname: string
-      try {
-        decodedPathname = decodePath(new URL(req.url).pathname)
-      } catch {
-        return { kind: 'deny-route' }
-      }
-
-      const matched = findRoute(router, req.method, decodedPathname, { normalize: true })
+      // Match the pathname exactly as it will be sent — no percent-decoding, so
+      // the authorised string and the wire string are identical (`%2F` stays a
+      // literal, it never becomes a path separator that a decoded match would
+      // approve while the encoded bytes go out). The URL parser has already
+      // collapsed `.`/`..` (including the `%2e` forms); `normalize` is a
+      // belt-and-braces pass over any literal dot segments that remain.
+      const matched = findRoute(router, req.method, new URL(req.url).pathname, { normalize: true })
       if (matched === undefined)
         return { kind: 'deny-route' }
 
