@@ -540,6 +540,9 @@ describe('composing multiple origin rules', () => {
 // Path security edge cases
 // ─────────────────────────────────────────────────────────────────────────
 
+// Paths are matched exactly as they are sent — no percent-decoding, so the
+// authorised string and the wire string are identical. The URL parser still
+// collapses `.`/`..` (including the `%2e` forms) before matching.
 describe('path security', () => {
   const { handler } = createSafeFetch({
     rules: { host: 'api.example.com', routes: [{ path: '/public/**' }] },
@@ -547,30 +550,46 @@ describe('path security', () => {
   })
 
   it('blocks path traversal: /public/../admin', async () => {
-    // new URL normalizes this before we even see it in most clients, but
-    // the rou3 normalize:true option handles it either way
+    // The URL parser normalises `..` to `/admin`, which is not under /public/**.
     await expect(
       handler('https://api.example.com/public/../admin', { method: 'GET', headers: {}, body: null }),
     ).rejects.toThrow()
   })
 
   it('blocks percent-encoded traversal: /public/%2e%2e/admin', async () => {
+    // The parser resolves the WHATWG `%2e` dot form too → /admin.
     await expect(
       handler('https://api.example.com/public/%2e%2e/admin', { method: 'GET', headers: {}, body: null }),
     ).rejects.toThrow()
   })
 
-  it('blocks double-encoded traversal: /public/%252e%252e/admin', async () => {
+  it('treats a double-encoded path literally (no decoding), so it stays under /public', async () => {
+    // %252e is not a dot to the parser; the path is a literal segment under
+    // /public and is sent verbatim, so matched === sent. A server that does
+    // not decode %XX (the default) sees exactly this path.
     await expect(
       handler('https://api.example.com/public/%252e%252e/admin', { method: 'GET', headers: {}, body: null }),
-    ).rejects.toThrow()
+    ).resolves.toBeDefined()
   })
 
   it('allows a legitimate percent-encoded path segment', async () => {
-    // /public/hello%20world → /public/hello world — still under /public/**
+    // /public/hello%20world is matched and sent verbatim — still under /public/**.
     await expect(
       handler('https://api.example.com/public/hello%20world', { method: 'GET', headers: {}, body: null }),
     ).resolves.toBeDefined()
+  })
+
+  it('denies an encoded-slash bypass of a specific route', async () => {
+    // With only /a allowed, /b%2F..%2Fa must NOT match: %2F is a literal, so
+    // the path is one segment `b%2F..%2Fa`, not `/a`. (Decoding it, as the old
+    // code did, would have matched /a while sending /b%2F..%2Fa.)
+    const { handler: specific } = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/a' }] },
+      pinDns: false,
+    })
+    await expect(
+      specific('https://api.example.com/b%2F..%2Fa', { method: 'GET', headers: {}, body: null }),
+    ).rejects.toThrow()
   })
 })
 

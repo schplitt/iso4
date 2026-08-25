@@ -229,16 +229,34 @@ no route does the request is denied without consulting `policy`.
 
 ## Security defaults
 
-| Threat                      | Mitigation                                                                   |
-| --------------------------- | ---------------------------------------------------------------------------- |
-| SSRF / private IP           | DNS pre-resolved before every request; loopback, RFC1918, link-local blocked |
-| DNS rebinding               | undici DNS interceptor pins the connection to the resolved IP                |
-| Redirect bypass             | No auto-follow by default; allow/deny re-checked on each hop                 |
-| Credential leak on redirect | `authorization`/`cookie`/`proxy-authorization` dropped on a cross-origin hop |
-| Response amplification      | Body streamed with `maxBodyBytes` cap                                        |
-| Host auth leakage           | Isolated undici `Agent` — no shared pool, cookies, or auth with the host app |
-| Path traversal              | Paths decoded and `.`/`..`-normalised before route matching                  |
-| Double-encoded paths        | Detected and rejected at parse time                                          |
+| Threat                      | Mitigation                                                                    |
+| --------------------------- | ----------------------------------------------------------------------------- |
+| SSRF / private IP           | DNS pre-resolved before every request; loopback, RFC1918, link-local blocked  |
+| DNS rebinding               | undici DNS interceptor pins the connection to the resolved IP                 |
+| Redirect bypass             | No auto-follow by default; allow/deny re-checked on each hop                  |
+| Credential leak on redirect | `authorization`/`cookie`/`proxy-authorization` dropped on a cross-origin hop  |
+| Response amplification      | Body streamed with `maxBodyBytes` cap                                         |
+| Host auth leakage           | Isolated undici `Agent` — no shared pool, cookies, or auth with the host app  |
+| Path traversal              | `.`/`..` (and the `%2e` forms) normalised by the URL parser before matching   |
+| Path/allowlist consistency  | Paths matched literally, never decoded, so the approved path is sent verbatim |
+
+Paths are matched and forwarded **literally** — iso4 never percent-decodes
+them, so the path the allowlist approves is byte-for-byte the path that is sent.
+This is deliberate: decoding to match while sending the encoded form would let
+the two disagree. The servers iso4 usually targets (h3/Nitro, Express, nginx,
+Apache by default) treat `%2F`/`%5C` as literal too, so a literal match is also
+what they route on. If you point iso4 at a server that **does** decode `%2F` or
+`%5C` before routing (e.g. Tomcat with encoded-slash enabled), a path the
+allowlist permitted could re-resolve to a different one there — iso4 cannot see
+that. In that case, reject encoded separators in your own middleware, e.g.:
+
+```ts
+async function denyEncodedSeparators(ctx, next) {
+  if (/%2f|%5c/i.test(new URL(ctx.req.url).pathname))
+    throw new Error('encoded separator not allowed')
+  return next()
+}
+```
 
 ## License
 
