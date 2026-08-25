@@ -1279,7 +1279,12 @@ force the user to declare their surface up front.
 
 If the prefix declared a global the run doesn't supply, the precompile-time
 implementation is reused. This makes it easy to provide a default at
-precompile time and override only when needed per run.
+precompile time and override only when needed per run. A global that *is*
+supplied but is not a function (the runtime shape TypeScript cannot catch —
+e.g. a per-tenant handler that resolves to `undefined`) throws rather than
+falling back to the default, so a rebind meant to narrow privilege cannot
+silently reinstate the broader default. This matches the imports side, which
+also rejects a non-function rebind.
 
 ### 11.5 Pool of pre-warmed isolates (phase 9 — shipped as warm instances)
 
