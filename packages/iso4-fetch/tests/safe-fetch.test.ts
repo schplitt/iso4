@@ -7,6 +7,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { createSafeFetch } from '../src/index.js'
 import type { FetchOriginRule, SafeFetchPolicy } from '../src/index.js'
+import { assertPublicAddresses, isReservedIp, makeDnsLookupFn } from '../src/dns.js'
 
 // ─────────────────────────────────────────────────────────────────────────
 // Mock undici (fetch) and both dns modules so no real network calls happen.
@@ -61,9 +62,8 @@ beforeEach(() => {
   mockDnsPromiseLookup.mockReset()
   mockDnsCallbackLookup.mockReset()
   mockFetch.mockResolvedValue(okResponse())
-  // Promise-based lookup (resolveAndCheckIp)
   mockDnsPromiseLookup.mockResolvedValue([{ address: '1.2.3.4', family: 4 }])
-  // Callback-based lookup (undici DNS interceptor)
+  // Callback-based lookup (undici DNS interceptor / makeDnsLookupFn)
   mockDnsCallbackLookup.mockImplementation(
     (_host: string, _opts: unknown, cb: (err: null, addrs: Array<{ address: string, family: number }>) => void) => {
       cb(null, [{ address: '1.2.3.4', family: 4 }])
@@ -665,71 +665,102 @@ describe('header injection hardening', () => {
 // DNS pinning and private IP blocking (pinDns: true, the default)
 // ─────────────────────────────────────────────────────────────────────────
 
+// The private/reserved-IP block lives in the connection-time DNS interceptor
+// (`makeDnsLookupFn` / `assertPublicAddresses`), which undici invokes only when
+// a request actually connects — i.e. after it passed the allow/deny check. The
+// handler mocks `fetch`, so that interceptor never fires through the handler;
+// these cover it directly.
+describe('DNS interceptor — private-IP block', () => {
+  function lookup(hostname: string): Promise<{ err: Error | null, addrs: unknown }> {
+    return new Promise((resolve) => {
+      makeDnsLookupFn()(hostname, {}, (err, addrs) => resolve({ err: err ?? null, addrs }))
+    })
+  }
+
+  it('allows a hostname that resolves to a public IP', async () => {
+    mockDnsCallbackLookup.mockImplementation(
+      (_h: string, _o: unknown, cb: (e: null, a: Array<{ address: string, family: number }>) => void) =>
+        cb(null, [{ address: '1.2.3.4', family: 4 }]),
+    )
+    const { err, addrs } = await lookup('api.example.com')
+    expect(err).toBeNull()
+    expect(addrs).toEqual([{ address: '1.2.3.4', family: 4, ttl: 10_000 }])
+  })
+
+  it('blocks a hostname that resolves to a private/reserved IP', async () => {
+    mockDnsCallbackLookup.mockImplementation(
+      (_h: string, _o: unknown, cb: (e: null, a: Array<{ address: string, family: number }>) => void) =>
+        cb(null, [{ address: '127.0.0.1', family: 4 }]),
+    )
+    const { err } = await lookup('internal.example.com')
+    expect(err?.message).toMatch(/private\/reserved IP/)
+  })
+
+  it.each([
+    ['loopback', '127.0.0.1'],
+    ['AWS IMDS', '169.254.169.254'],
+    ['RFC1918 10/8', '10.0.0.1'],
+    ['RFC1918 172.16/12', '172.16.0.1'],
+    ['RFC1918 192.168/16', '192.168.1.1'],
+    ['IPv6 loopback', '::1'],
+    ['IPv6 link-local', 'fe80::1'],
+  ])('assertPublicAddresses blocks %s', (_label, ip) => {
+    expect(() => assertPublicAddresses('h', [{ address: ip }])).toThrow(/private\/reserved IP/)
+    expect(isReservedIp(ip)).toBe(true)
+  })
+
+  it('assertPublicAddresses allows a public address', () => {
+    expect(() => assertPublicAddresses('h', [{ address: '1.2.3.4' }])).not.toThrow()
+    expect(isReservedIp('1.2.3.4')).toBe(false)
+  })
+})
+
 describe('DNS pinning (pinDns: true)', () => {
-  // The handler is created once; DNS results are controlled per-test via
-  // mockDnsPromiseLookup (node:dns/promises, used by resolveAndCheckIp).
   const { handler } = createSafeFetch({
     rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
   })
 
-  it('allows when DNS resolves to a public IP', async () => {
-    mockDnsPromiseLookup.mockResolvedValue([{ address: '1.2.3.4', family: 4 }])
-    await expect(
-      handler('https://api.example.com/', { method: 'GET', headers: {}, body: null }),
-    ).resolves.toBeDefined()
-  })
-
-  it('blocks when DNS resolves to loopback 127.0.0.1', async () => {
-    mockDnsPromiseLookup.mockResolvedValue([{ address: '127.0.0.1', family: 4 }])
-    await expect(
-      handler('https://api.example.com/', { method: 'GET', headers: {}, body: null }),
-    ).rejects.toThrow(/private\/reserved IP/)
-  })
-
-  it('blocks when DNS resolves to AWS IMDS 169.254.169.254', async () => {
-    mockDnsPromiseLookup.mockResolvedValue([{ address: '169.254.169.254', family: 4 }])
-    await expect(
-      handler('https://api.example.com/', { method: 'GET', headers: {}, body: null }),
-    ).rejects.toThrow(/private\/reserved IP/)
-  })
-
-  it('blocks when DNS resolves to RFC 1918 private IP', async () => {
-    for (const ip of ['10.0.0.1', '172.16.0.1', '192.168.1.1']) {
-      mockDnsPromiseLookup.mockResolvedValue([{ address: ip, family: 4 }])
-      await expect(
-        handler('https://api.example.com/', { method: 'GET', headers: {}, body: null }),
-      ).rejects.toThrow(/private\/reserved IP/)
-    }
-  })
-
-  it('blocks IP literal requests to private addresses', async () => {
-    // IP literals bypass DNS entirely — checked inline in buildSafeFetchRequest
+  it('blocks IP literal requests to private addresses (checked synchronously)', async () => {
+    // undici's interceptor short-circuits IP literals, so a private literal is
+    // refused inline before any request is made.
     await expect(
       handler('https://192.168.1.1/', { method: 'GET', headers: {}, body: null }),
     ).rejects.toThrow(/private\/reserved/)
   })
 
-  it('skips DNS lookup for IP literals', async () => {
+  it('allows a public IP literal', async () => {
     const { handler: handlerPublicIp } = createSafeFetch({
       rules: { host: '1.2.3.4', routes: [{ path: '/**' }] },
     })
     await expect(
       handlerPublicIp('https://1.2.3.4/', { method: 'GET', headers: {}, body: null }),
     ).resolves.toBeDefined()
+  })
+
+  it('a denied host is never looked up — the allow-list gates DNS', async () => {
+    // A rules-denied request never reaches the HTTP call, so it never reaches
+    // the DNS interceptor either. Nothing is resolved for a host the allow-list
+    // rejects (the covert-lookup channel is closed).
+    await expect(
+      handler('https://not-allowed.example.com/', { method: 'GET', headers: {}, body: null }),
+    ).rejects.toThrow()
+    expect(mockFetch).not.toHaveBeenCalled()
+    expect(mockDnsCallbackLookup).not.toHaveBeenCalled()
     expect(mockDnsPromiseLookup).not.toHaveBeenCalled()
   })
 
-  it('passes resolvedIp to the policy callback', async () => {
-    mockDnsPromiseLookup.mockResolvedValue([{ address: '1.2.3.4', family: 4 }])
-    const resolvedIpSeen: string[] = []
+  it('does not resolve DNS before the policy decides', async () => {
+    const resolvedIpSeen: Array<string | null> = []
     const { handler: handlerWithPolicy } = createSafeFetch({
       policy: (req) => {
-        resolvedIpSeen.push(req.resolvedIp ?? 'null')
+        resolvedIpSeen.push(req.resolvedIp)
         return req.host === 'api.example.com'
       },
     })
     await handlerWithPolicy('https://api.example.com/', { method: 'GET', headers: {}, body: null })
-    expect(resolvedIpSeen).toEqual(['1.2.3.4'])
+    // The policy no longer receives a resolved IP: nothing is looked up until
+    // the request is authorized.
+    expect(resolvedIpSeen).toEqual([null])
   })
 })
 

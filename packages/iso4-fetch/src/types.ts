@@ -345,8 +345,10 @@ export interface SafeFetchRequest {
    */
   headers: Record<string, string>
   /**
-   * Resolved IP when `pinDns: true`. `null` when `pinDns: false` or when
-   * using policy-only mode without rules.
+   * Always `null`. DNS is resolved only at connection time — after the request
+   * is authorized — so no resolved address is available to a `policy` or
+   * `onDenied`. The private/reserved-IP block still runs at that point. Kept
+   * for backward compatibility; do not rely on it.
    */
   resolvedIp: string | null
   /**
@@ -395,8 +397,10 @@ export interface SafeFetchOptions {
   middleware?: FetchMiddleware
 
   /**
-   * Pre-resolve DNS and pin the connection to the resolved IP.
-   * Prevents SSRF and DNS rebinding. `SafeFetchRequest.resolvedIp` is set.
+   * Resolve DNS and pin the connection to the resolved IP, refusing any
+   * private/reserved address. Prevents SSRF and DNS rebinding. Resolution
+   * happens at connection time, only for a request that already passed the
+   * allow/deny check, so a denied host is never looked up.
    *
    * Both address families are used, so a host that resolves to IPv6 only is
    * reachable; every resolved address is checked against the private and
