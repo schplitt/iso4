@@ -118,7 +118,11 @@ export interface FetchContextReq {
   header: (name: string, value: string) => void
 
   /**
-   * Replace the outgoing URL.
+   * Replace the outgoing URL. Trusted host operation: the new URL is **not**
+   * re-checked against the allow/deny + SSRF rules — those run once, on the
+   * agent's original URL, which also fixes the middleware pipeline and
+   * `params` for the request. Validate a URL derived from agent-influenced
+   * data before setting it. (Redirect hops, by contrast, are re-checked.)
    */
   setUrl: (url: string) => void
 

@@ -65,8 +65,8 @@ npm i @iso4/sandbox @iso4/fetch
 
 ## Rules
 
-Every request must match a declared rule before any middleware runs or any
-network call is made. Unmatched requests are denied immediately.
+Every request must match a declared rule before any middleware runs.
+Unmatched requests are denied immediately.
 
 ```ts
 const fetch = createSafeFetch({
@@ -119,6 +119,33 @@ createSafeFetch({
   },
 })
 ```
+
+The rules are matched once, on the agent's original URL — that match runs the
+allow/deny + SSRF checks and picks the middleware pipeline and `params`. The
+three layers then wrap the HTTP call, sharing one `ctx.req`:
+
+```
+  agent request
+       │
+       ▼
+  match rules ──────────── once, on the original URL
+       │   allow/deny · SSRF · picks middleware + params
+       ▼
+  global → origin → route   mutate ctx.req (header/setUrl/setBody)
+       │                     setUrl retargets but is NOT re-checked
+       ▼
+  HTTP request → redirects   each redirect hop IS re-checked
+       │
+       ▼
+  route → origin → global   unwind; may read or rewrite the response
+       │
+       ▼
+  response
+```
+
+`setUrl` is a trusted retarget: it changes the outgoing URL without re-running
+the rules, and the pipeline and `params` stay fixed to the original route.
+Validate a URL built from agent-influenced data before passing it to `setUrl`.
 
 ### Request mutation (auth, URL rewrite, headers)
 
