@@ -192,6 +192,11 @@ type MatchResult
  * @param compiled
  */
 function matchRules(req: SafeFetchRequest, compiled: CompiledRule[]): MatchResult {
+  // A hostname match claims the origin: if some rule matched the host but the
+  // request was still rejected (scheme/port/route), it is denied rather than
+  // delegated to `policy`. A scheme/port failure `continue`s so a broader rule
+  // may still allow it, but if none does the final result is `deny-route`.
+  let hostMatched = false
   for (const pass of ['exact', 'wildcard'] as const) {
     for (const { rule, hosts, router } of compiled) {
       // Only consider rules that match at the current specificity level
@@ -200,6 +205,7 @@ function matchRules(req: SafeFetchRequest, compiled: CompiledRule[]): MatchResul
         : hosts.some((rh) => hostWildcard(req.host, rh))
       if (!hostOk)
         continue
+      hostMatched = true
 
       if (rule.httpsOnly !== false && req.protocol !== 'https')
         continue
@@ -231,7 +237,7 @@ function matchRules(req: SafeFetchRequest, compiled: CompiledRule[]): MatchResul
     }
   }
 
-  return { kind: 'no-origin' }
+  return hostMatched ? { kind: 'deny-route' } : { kind: 'no-origin' }
 }
 
 // ─────────────────────────────────────────────────────────────────────────

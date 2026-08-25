@@ -436,6 +436,34 @@ describe('rules + policy: fallback semantics', () => {
     ).resolves.toBeDefined()
     expect(policySpy).not.toHaveBeenCalled()
   })
+
+  // A host match claims the origin: a scheme or port that the matched rule
+  // rejects is denied, not delegated to the (typically coarser) policy.
+  it('denies a scheme mismatch on a matched host instead of consulting policy', async () => {
+    const policySpy = vi.fn(() => true) // would allow if consulted
+    const { handler } = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] }, // httpsOnly by default
+      policy: policySpy,
+      pinDns: false,
+    })
+    await expect(
+      handler('http://api.example.com/admin', { method: 'GET', headers: {}, body: null }),
+    ).rejects.toThrow()
+    expect(policySpy).not.toHaveBeenCalled()
+  })
+
+  it('denies a port mismatch on a matched host instead of consulting policy', async () => {
+    const policySpy = vi.fn(() => true)
+    const { handler } = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] }, // default port only
+      policy: policySpy,
+      pinDns: false,
+    })
+    await expect(
+      handler('https://api.example.com:8443/admin', { method: 'GET', headers: {}, body: null }),
+    ).rejects.toThrow()
+    expect(policySpy).not.toHaveBeenCalled()
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────
