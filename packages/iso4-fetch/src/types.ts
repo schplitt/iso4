@@ -403,8 +403,12 @@ export interface SafeFetchOptions {
   pinDns?: boolean
 
   /**
-   * Auto-follow redirects up to this many hops. The full allow/deny +
-   * middleware chain re-runs on each hop. `0` passes 3xx responses through.
+   * Auto-follow redirects up to this many hops. The allow/deny policy is
+   * re-checked on every hop. On a cross-origin hop `authorization`, `cookie`
+   * and `proxy-authorization` are dropped, and on a method-changing hop (303,
+   * or POST to GET on 301/302) `content-*` headers are dropped — matching
+   * undici. Middleware runs once around the whole request, not per hop. `0`
+   * passes 3xx responses through.
    *
    * @default 0
    */

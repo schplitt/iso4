@@ -678,13 +678,17 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
       let currentUrl = ctx.req.url
       let currentMethod = method
       let currentBody = ctx.req.body
+      // Reassigned to a fresh object on any hop that strips headers, so a
+      // previous hop's request is never mutated and the object middleware
+      // populated (ctx.req.headers) is left untouched.
+      let currentHeaders: Record<string, string> = ctx.req.headers
       let hop = 0
 
       for (;;) {
         const { response, bodyBytes } = await httpRequest(
           currentUrl,
           currentMethod,
-          ctx.req.headers,
+          currentHeaders,
           currentBody,
           agent,
           timeoutMs,
@@ -711,12 +715,35 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
           return
         }
 
-        // Security check for the redirect destination
+        // Mirror undici's RedirectHandler header hygiene on the outgoing hop.
+        // Header names are already lower-cased (parseFetchArgs / ctx.req.header).
+        const crossOrigin = nextUrl.origin !== new URL(currentUrl).origin
+        const methodChanges = response.status === 303
+          || ((response.status === 301 || response.status === 302) && currentMethod === 'POST')
+        if (crossOrigin || methodChanges) {
+          currentHeaders = { ...currentHeaders }
+          if (crossOrigin) {
+            // Never carry the host's credentials to a new origin.
+            delete currentHeaders['authorization']
+            delete currentHeaders['cookie']
+            delete currentHeaders['proxy-authorization']
+          }
+          if (methodChanges) {
+            // The body is dropped, so its content-* framing must go with it.
+            for (const name of Object.keys(currentHeaders)) {
+              if (name.startsWith('content-'))
+                delete currentHeaders[name]
+            }
+          }
+        }
+
+        // Security check for the redirect destination, with the headers that
+        // will actually be sent.
         hop++
-        const redirectReq = await buildSafeFetchRequest(nextUrl, currentMethod, ctx.req.headers, hop)
+        const redirectReq = await buildSafeFetchRequest(nextUrl, currentMethod, currentHeaders, hop)
         await checkRequest(redirectReq)
 
-        if (response.status === 303 || ((response.status === 301 || response.status === 302) && currentMethod === 'POST')) {
+        if (methodChanges) {
           currentMethod = 'GET'
           currentBody = null
         }

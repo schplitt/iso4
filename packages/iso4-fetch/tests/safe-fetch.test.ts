@@ -852,6 +852,80 @@ describe('redirect following (maxRedirects > 0)', () => {
     // After maxRedirects (1) is exhausted, the raw redirect is returned
     expect(result.status).toBe(302)
   })
+
+  // Mirror undici's RedirectHandler: on a cross-origin hop, drop
+  // authorization/cookie/proxy-authorization so a host secret injected by
+  // middleware is not replayed to the redirect destination.
+  it('strips credential headers on a cross-origin redirect', async () => {
+    const { handler } = createSafeFetch({
+      policy: (req) => req.host === 'api.example.com' || req.host === 'other.example.com',
+      middleware: async (ctx, next) => {
+        ctx.req.header('authorization', 'Bearer secret')
+        ctx.req.header('cookie', 'session=abc')
+        await next()
+      },
+      maxRedirects: 1,
+      pinDns: false,
+    })
+
+    mockFetch
+      .mockResolvedValueOnce(redirectResponse('https://other.example.com/landing', 302))
+      .mockResolvedValueOnce(okResponse())
+
+    await handler('https://api.example.com/start', { method: 'GET', headers: {}, body: null })
+
+    const firstHeaders = mockFetch.mock.calls[0]?.[1]?.headers as Record<string, string>
+    const secondHeaders = mockFetch.mock.calls[1]?.[1]?.headers as Record<string, string>
+    // Injected on the first hop…
+    expect(firstHeaders.authorization).toBe('Bearer secret')
+    // …and gone on the cross-origin hop.
+    expect(secondHeaders.authorization).toBeUndefined()
+    expect(secondHeaders.cookie).toBeUndefined()
+  })
+
+  it('keeps credential headers on a same-origin redirect', async () => {
+    const { handler } = createSafeFetch({
+      policy: (req) => req.host === 'api.example.com',
+      middleware: async (ctx, next) => {
+        ctx.req.header('authorization', 'Bearer secret')
+        await next()
+      },
+      maxRedirects: 1,
+      pinDns: false,
+    })
+
+    mockFetch
+      .mockResolvedValueOnce(redirectResponse('https://api.example.com/new', 302))
+      .mockResolvedValueOnce(okResponse())
+
+    await handler('https://api.example.com/old', { method: 'GET', headers: {}, body: null })
+
+    const secondHeaders = mockFetch.mock.calls[1]?.[1]?.headers as Record<string, string>
+    expect(secondHeaders.authorization).toBe('Bearer secret')
+  })
+
+  it('strips content-* headers when a 303 turns POST into GET', async () => {
+    const { handler } = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      maxRedirects: 1,
+      pinDns: false,
+    })
+
+    mockFetch
+      .mockResolvedValueOnce(redirectResponse('https://api.example.com/result', 303))
+      .mockResolvedValueOnce(okResponse())
+
+    await handler('https://api.example.com/submit', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"a":1}',
+    })
+
+    const secondCall = mockFetch.mock.calls[1]
+    expect(secondCall?.[1]?.method).toBe('GET')
+    const secondHeaders = secondCall?.[1]?.headers as Record<string, string>
+    expect(secondHeaders['content-type']).toBeUndefined()
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────
