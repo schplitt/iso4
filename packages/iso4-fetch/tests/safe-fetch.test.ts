@@ -973,6 +973,26 @@ describe('redirect following (maxRedirects > 0)', () => {
     const secondHeaders = secondCall?.[1]?.headers as Record<string, string>
     expect(secondHeaders['content-type']).toBeUndefined()
   })
+
+  it('applies one timeout deadline across the whole redirect chain', async () => {
+    const { handler } = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      maxRedirects: 1,
+      pinDns: false,
+    })
+
+    mockFetch
+      .mockResolvedValueOnce(redirectResponse('https://api.example.com/next', 302))
+      .mockResolvedValueOnce(okResponse())
+
+    await handler('https://api.example.com/start', { method: 'GET', headers: {}, body: null })
+
+    const s0 = mockFetch.mock.calls[0]?.[1]?.signal
+    const s1 = mockFetch.mock.calls[1]?.[1]?.signal
+    expect(s0).toBeDefined()
+    // The same deadline spans both hops — not a fresh timeout per hop.
+    expect(s1).toBe(s0)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────
