@@ -275,4 +275,28 @@ describe('platform parity — the sandbox throws where Node throws', () => {
     expect((value as Response).bodyUsed).toBe(false)
     await expect((value as Response).text()).resolves.toBe('')
   })
+
+  // The sandbox validates header content at construction, but the backing
+  // `_l` slot is writable, so guest code can plant a CR/LF value that skips
+  // that check. iso4 does not re-validate header *content* at the boundary;
+  // the host reconstruction (`new globalThis.Headers` via undici) does, so a
+  // smuggled value is rejected on the way in rather than reaching the network.
+  // The rejection surfaces as a decode error from `run()`, and the sandbox
+  // stays usable afterwards. This pins that containment and backs the note in
+  // `@iso4/fetch`'s README.
+  test('a header value smuggled past sandbox validation is rejected on the host, not forwarded', async () => {
+    await expect(
+      sandbox.run({
+        code: `
+          const r = new Response('x')
+          r.headers._l = ['x-injected', 'a\\r\\nevil: 1']
+          export default r
+        `,
+      }),
+    ).rejects.toThrow(/invalid header value/i)
+
+    // The failure did not desync the connection — the next run works.
+    const after = await run(`export default new Response('ok').status`)
+    expect(after).toBe(200)
+  })
 })

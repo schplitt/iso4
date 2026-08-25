@@ -134,6 +134,17 @@ async function someRequestMiddleware(ctx, next) {
 or `header(name, val)`), `body` (via `setBody()`), `params`, `hop`, `raw`
 (original unmodified bridge request).
 
+> **Header content is not re-validated by iso4.** iso4 does not guarantee that
+> header names and values crossing the sandbox boundary are well-formed. On the
+> normal path this is safe: a Request or Response is reconstructed host-side
+> through Node's `undici`, which rejects CR/LF in header values, invalid names
+> and methods, and URL credentials — so a malformed header fails the run before
+> it reaches the network (see
+> `packages/iso4-sandbox/tests/web-types.test.ts`, "smuggled past sandbox
+> validation"). If your middleware pulls `ctx.req.headers` out and forwards them
+> to something other than undici (a raw socket, a log line, another HTTP
+> client), validate the names and values yourself first.
+
 ### Response inspection / logging
 
 ```ts
