@@ -128,9 +128,14 @@ function flatHeaders(headers: Headers): string[] {
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 
 async function materializeBody(source: Request | Response): Promise<MaterializedBody> {
-  // `bodyUsed` would make the read throw; report it as the caller's mistake.
-  if (source.bodyUsed)
-    throw new HostTypeError('[iso4] cannot serialize a Request/Response whose body was already read')
+  // Serializing reads (and so consumes) the body; a second delivery of the
+  // same instance has nothing left to read.
+  if (source.bodyUsed) {
+    throw new HostTypeError(
+      '[iso4] cannot serialize a Request/Response whose body was already read — '
+      + 'pass a fresh instance (cache the bytes, not the object)',
+    )
+  }
 
   const stream = source.body as ReadableStream<Uint8Array> | null
   if (stream === null || stream === undefined) {
@@ -208,9 +213,13 @@ const MAX_DEPTH = 32
  * Replace every `Request`/`Response`/`Headers` anywhere in `value` with a
  * branded plain object, returning a graph ordinary serialization can write.
  *
- * Structure is rebuilt rather than mutated, so the caller's value is untouched.
- * Object identity and cycles are preserved through `seen`. `Map`/`Set` are
- * rebuilt because a host type can hide in either.
+ * Structure is rebuilt rather than mutated, so the surrounding objects are
+ * untouched. A `Request`/`Response` body, however, is read into bytes here and
+ * is therefore consumed — one-shot, like any body read: pass an unread
+ * instance and do not reuse it afterwards (streams cannot cross the boundary,
+ * so the body must be buffered rather than forwarded). Object identity and
+ * cycles are preserved through `seen`. `Map`/`Set` are rebuilt because a host
+ * type can hide in either.
  * @param value the value to transform
  */
 export async function materializeHostTypes(value: unknown): Promise<unknown> {
