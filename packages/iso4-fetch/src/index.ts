@@ -241,6 +241,7 @@ function makeFetchContext(
   raw: HostFetchRequest,
 ): FetchContext {
   let _url = initialUrl
+  let _body = initialBody
   const _headers: Record<string, string> = { ...initialHeaders }
 
   const req: FetchContextReq = {
@@ -248,9 +249,14 @@ function makeFetchContext(
     params,
     hop,
     raw,
-    body: initialBody,
     get url() {
       return _url
+    },
+    get body() {
+      return _body
+    },
+    set body(b: Uint8Array | string | null) {
+      _body = b
     },
     get headers() {
       return _headers
@@ -261,8 +267,9 @@ function makeFetchContext(
     setUrl(url: string): void {
       _url = url
     },
+    // Closure-based like the others, so it survives being detached from `req`.
     setBody(b: Uint8Array | string | null): void {
-      this.body = b
+      _body = b
     },
   }
 

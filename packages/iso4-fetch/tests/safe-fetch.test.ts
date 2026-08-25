@@ -1093,6 +1093,20 @@ describe('middleware', () => {
     expect(sentBody).toBe('injected body')
   })
 
+  it('setBody works when detached from ctx.req', async () => {
+    const { handler } = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      middleware: async (ctx, next) => {
+        const { setBody } = ctx.req
+        setBody('detached body')
+        await next()
+      },
+      pinDns: false,
+    })
+    await handler('https://api.example.com/data', { method: 'POST', headers: {}, body: 'original' })
+    expect(mockFetch.mock.calls[0]?.[1]?.body).toBe('detached body')
+  })
+
   it('middleware sees route params', async () => {
     const seenParams: Record<string, string>[] = []
     const { handler } = createSafeFetch({
