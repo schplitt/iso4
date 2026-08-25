@@ -18,6 +18,7 @@ import {
   serializationProbe,
   serializeValue,
 } from '../src/v8-codec.js'
+import { materializeHostTypes } from '../src/web-codec.js'
 
 function roundtrip(value: unknown): unknown {
   return deserializeValue(serializeValue(value))
@@ -216,6 +217,18 @@ describe('__proto__ as an own key', () => {
     const back = roundtrip({ __proto__: { polluted: true }, x: 1 }) as Record<string, unknown>
     expect(Object.hasOwn(back, '__proto__')).toBe(false)
     expect(back.x).toBe(1)
+  })
+
+  // The host->sandbox pre-pass (`materializeHostTypes`) rebuilds plain objects
+  // by hand, so it must copy an own `__proto__` as data rather than firing the
+  // prototype setter (which would drop the key before serialization).
+  test('materializeHostTypes keeps an own-enumerable __proto__ key', async () => {
+    const source = JSON.parse('{"__proto__":{"x":1},"y":2}') as Record<string, unknown>
+    const out = await materializeHostTypes(source) as Record<string, unknown>
+    const desc = Object.getOwnPropertyDescriptor(out, '__proto__')
+    expect(desc).toBeDefined()
+    expect((desc?.value as Record<string, unknown>)?.x).toBe(1)
+    expect(out.y).toBe(2)
   })
 })
 
