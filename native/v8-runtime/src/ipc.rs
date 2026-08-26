@@ -29,22 +29,21 @@ use std::io::{self, Read, Write};
 ///
 /// This must stay in sync with `docs/protocol.md` and the TypeScript codec in
 /// `packages/iso4-sandbox/src/ipc.ts`.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Default maximum frame length in bytes, including the 1-byte message type.
 pub const DEFAULT_MAX_FRAME_LENGTH: u32 = 64 * 1024 * 1024;
 
 /// Maximum frame length accepted for the `Authenticate` frame — the one frame
-/// read from a peer that has not yet shown it holds the token.
+/// read from a peer that has not yet completed the handshake.
 ///
-/// An `AuthenticatePayload` is a `u16`, a probe of a few bytes and a token, so
-/// a few dozen bytes in practice. The default ceiling is sized for run payloads
+/// An `AuthenticatePayload` is a `u16` and a probe of a few bytes, so a few
+/// dozen bytes in practice. The default ceiling is sized for run payloads
 /// carrying prefix source and serialized values, and it is a poor fit here: a
 /// frame body is buffered to its declared length, so applying the run ceiling
 /// to the handshake lets an unproven peer name a size six orders of magnitude
-/// past anything the handshake needs. 4 KiB leaves room for a token far longer
-/// than the runtime generates while keeping that buffer to a size the peer
-/// could plausibly deliver.
+/// past anything the handshake needs. 4 KiB keeps that buffer to a size the
+/// peer could plausibly deliver.
 pub const AUTH_MAX_FRAME_LENGTH: u32 = 4 * 1024;
 
 /// Message types sent from the TypeScript host to Rust.
@@ -89,7 +88,7 @@ pub enum RustToTsMessageType {
     /// Internal runtime diagnostic log (not sandbox stdout/stderr).
     Log = 0x04,
     /// Handshake acknowledgement — the first frame sent on a new connection,
-    /// answering `Authenticate` (protocol v2).
+    /// answering `Authenticate`.
     Hello = 0x05,
     /// Capacity/usage snapshot answering a `Stats` request (#65).
     StatsResult = 0x06,
@@ -133,10 +132,9 @@ pub type RustToTsFrame = TypedFrame<RustToTsMessageType>;
 
 /// Parsed contents of an `Authenticate` payload.
 ///
-/// Payload layout (protocol v2):
+/// Payload layout:
 /// - `u16` protocol version (big-endian)
 /// - `u32` probe length + probe bytes
-/// - remaining bytes: UTF-8 token
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatePayload {
     pub protocol_version: u16,
@@ -144,7 +142,6 @@ pub struct AuthenticatePayload {
     /// byte is the format version Node writes. Compared against this binary's
     /// own write version during the handshake.
     pub probe: Vec<u8>,
-    pub token: String,
 }
 
 /// Read a single raw frame from `reader` using the default frame-length cap.
@@ -309,7 +306,7 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
     }
     let protocol_version = u16::from_be_bytes([payload[0], payload[1]]);
     let probe_len = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
-    let token_start = 6usize
+    let probe_end = 6usize
         .checked_add(probe_len)
         .filter(|end| *end <= payload.len())
         .ok_or_else(|| {
@@ -318,24 +315,26 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
                 "Authenticate payload truncated (probe)",
             )
         })?;
-    let probe = payload[6..token_start].to_vec();
-    let token = String::from_utf8(payload[token_start..].to_vec())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "token is not valid UTF-8"))?;
+    if probe_end != payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Authenticate payload has trailing bytes",
+        ));
+    }
+    let probe = payload[6..probe_end].to_vec();
     Ok(AuthenticatePayload {
         protocol_version,
         probe,
-        token,
     })
 }
 
 /// Encode an `Authenticate` payload from structured fields — the inverse of
 /// `parse_authenticate_payload`, used by tests.
 pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(6 + auth.probe.len() + auth.token.len());
+    let mut payload = Vec::with_capacity(6 + auth.probe.len());
     payload.extend_from_slice(&auth.protocol_version.to_be_bytes());
     payload.extend_from_slice(&(auth.probe.len() as u32).to_be_bytes());
     payload.extend_from_slice(&auth.probe);
-    payload.extend_from_slice(auth.token.as_bytes());
     payload
 }
 
@@ -1016,17 +1015,29 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_payload_roundtrip_preserves_version_probe_and_token() {
+    fn authenticate_payload_roundtrip_preserves_version_and_probe() {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
             probe: vec![0xff, 0x0f, 0x30],
-            token: "secret-token".to_string(),
         };
 
         let payload = encode_authenticate_payload(&auth);
         let parsed = parse_authenticate_payload(&payload).unwrap();
 
         assert_eq!(parsed, auth);
+    }
+
+    #[test]
+    fn authenticate_payload_rejects_trailing_bytes() {
+        let mut v = Vec::new();
+        v.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        push_u32(&mut v, 3);
+        v.extend_from_slice(&[0xff, 0x0f, 0x30]);
+        v.extend_from_slice(b"extra");
+
+        let err = parse_authenticate_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "Authenticate payload has trailing bytes");
     }
 
     #[test]
@@ -1076,16 +1087,6 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "payload too short for Authenticate");
-    }
-
-    #[test]
-    fn parse_authenticate_payload_rejects_invalid_utf8_token() {
-        // version(2) + probeLen(0) + a token byte that is not valid UTF-8.
-        let err =
-            parse_authenticate_payload(&[0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0xff]).unwrap_err();
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(err.to_string(), "token is not valid UTF-8");
     }
 
     #[test]

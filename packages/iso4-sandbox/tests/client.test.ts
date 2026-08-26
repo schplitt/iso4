@@ -100,7 +100,6 @@ describe('RuntimeIpcClient', () => {
       expect(authFrame.messageType).toBe(TsToRustMessageTypes.Authenticate)
       const auth = decodeAuthenticatePayload(authFrame.payload)
       expect(auth.protocolVersion).toBe(PROTOCOL_VERSION)
-      expect(auth.token).toBe('dev-token')
       // The probe is a serialized `null`; byte 1 is Node's format version.
       expect(Buffer.from(auth.probe)).toEqual(serializationProbe())
       writeHello(socket)
@@ -125,10 +124,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({
-      socketPath,
-      token: 'dev-token',
-    })
+    const client = await RuntimeIpcClient.connect({ socketPath })
     const result = await client.runRawCode('export default 42')
 
     expect(Buffer.from(result.result).subarray(4).toString('utf8')).toBe('payload')
@@ -159,7 +155,7 @@ describe('RuntimeIpcClient', () => {
       socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('nonsense')))
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const client = await RuntimeIpcClient.connect({ socketPath })
     const stats = await client.stats()
     expect(stats.warmBudgetBytes).toBe(7)
     expect(stats.prefixes).toEqual([])
@@ -180,7 +176,7 @@ describe('RuntimeIpcClient', () => {
       socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('nonsense')))
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const client = await RuntimeIpcClient.connect({ socketPath })
     await expect(client.precompile({ code: 'export const x = 1' }))
       .rejects
       .toThrow(/unexpected frame type 0x02/)
@@ -205,7 +201,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     await expect(
-      RuntimeIpcClient.connect({ socketPath, token: 'dev-token' }),
+      RuntimeIpcClient.connect({ socketPath }),
     ).rejects.toThrow(/V8 serialization format mismatch/)
   })
 
@@ -230,7 +226,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     await expect(
-      RuntimeIpcClient.connect({ socketPath, token: 'dev-token' }),
+      RuntimeIpcClient.connect({ socketPath }),
     ).rejects.toThrow(/V8 serialization format mismatch/)
   })
 
@@ -245,7 +241,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     await expect(
-      RuntimeIpcClient.connect({ socketPath, token: 'dev-token' }),
+      RuntimeIpcClient.connect({ socketPath }),
     ).rejects.toThrow(/expected a Hello frame/)
   })
 
@@ -304,7 +300,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     const dispatched: unknown[] = []
-    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const client = await RuntimeIpcClient.connect({ socketPath })
     const raw = await client.runRawCode('export default 1', {
       globals: [{ kind: 'bridge', name: 'greet' }],
       dispatch: {
@@ -383,7 +379,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const client = await RuntimeIpcClient.connect({ socketPath })
     const raw = await client.runRawCode('export default 1', {
       globals: [{ kind: 'bridge', name: 'big' }],
       dispatch: {
@@ -428,7 +424,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const client = await RuntimeIpcClient.connect({ socketPath })
     ;(client as unknown as { nextRunId: number }).nextRunId = 0x7FFFFFFF
 
     await expect(client.runRawCode('export default 42')).resolves.toBeDefined()
@@ -463,7 +459,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const client = await RuntimeIpcClient.connect({ socketPath })
 
     await expect(client.runRawCode('export default 42')).rejects.toThrow(
       /Result frame carries runId .* but run \d+ is in flight/,
@@ -537,7 +533,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     const dispatched: unknown[] = []
-    const client = await RuntimeIpcClient.connect({ socketPath, token: 'dev-token' })
+    const client = await RuntimeIpcClient.connect({ socketPath })
     const raw = await client.runRawCode('export default 1', {
       globals: [{ kind: 'bridge', name: 'greet' }],
       dispatch: {

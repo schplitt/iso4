@@ -32,7 +32,6 @@ import { deserializeValue, serializationProbe, serializeHostValue } from './v8-c
 
 export interface RuntimeIpcClientOptions {
   socketPath: string
-  token: string
 }
 
 export interface RawRunResult {
@@ -185,7 +184,7 @@ export class RuntimeIpcClient {
   }
 
   /**
-   * Open a connection and complete the v2 handshake.
+   * Open a connection and complete the handshake.
    *
    * Values cross this socket as V8 serialization blobs, so both V8s must agree
    * on the serialization format version. Each side sends a probe (a serialized
@@ -206,7 +205,6 @@ export class RuntimeIpcClient {
           encodeAuthenticatePayload({
             protocolVersion: PROTOCOL_VERSION,
             probe: serializationProbe(),
-            token: options.token,
           }),
         ),
       )

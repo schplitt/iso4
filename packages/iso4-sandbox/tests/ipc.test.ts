@@ -231,17 +231,15 @@ describe('buffered frame reader', () => {
 })
 
 describe('Authenticate payload', () => {
-  test('auth payload roundtrip preserves protocol version, probe and token', () => {
+  test('auth payload roundtrip preserves protocol version and probe', () => {
     const probe = serializationProbe()
     const payload = encodeAuthenticatePayload({
       protocolVersion: PROTOCOL_VERSION,
       probe,
-      token: 'secret-token',
     })
     const auth = decodeAuthenticatePayload(payload)
 
     expect(auth.protocolVersion).toBe(PROTOCOL_VERSION)
-    expect(auth.token).toBe('secret-token')
     expect(Buffer.from(auth.probe)).toEqual(probe)
   })
 

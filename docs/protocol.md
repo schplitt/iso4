@@ -47,9 +47,9 @@ Frame readers MUST reject:
 | EOF before all `length` bytes arrive           | connection error |
 | unknown message type for the current direction | protocol error   |
 
-Current protocol version: **`2`** (still in development; v2 now includes the
-optional host → sandbox `call` on `Run`/`PrefixRun`, an optional
-`PrefixRun.code`, and `skippedExports` on the success payload — #58).
+Current protocol version: **`1`** — nothing is released yet, so there is no
+version history and no compatibility handling: both sides must speak exactly
+this version, and the handshake hard-fails otherwise (§8).
 
 ---
 
@@ -59,7 +59,7 @@ optional host → sandbox `call` on `Run`/`PrefixRun`, an optional
 
 |   Byte | Name             | Payload                 | Response                                                                                                                         |
 | -----: | ---------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a bad token Rust closes the socket without replying                                                      |
+| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a malformed payload Rust closes the socket without replying                                              |
 | `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
 | `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                   |
 | `0x04` | `PrefixRun`      | `PrefixRunPayload`      | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
@@ -475,11 +475,15 @@ it. Additive fields go in `extras` and need no tag at all.
 
 `AuthenticatePayload` (TS → Rust, MUST be the first frame on every connection):
 
-| Field             | Encoding                                     | Notes                                              |
-| ----------------- | -------------------------------------------- | -------------------------------------------------- |
-| `protocolVersion` | `u16`                                        | Must equal the runtime's `PROTOCOL_VERSION`.       |
-| `probe`           | `u32 byteLength` + bytes                     | A serialized `null` — see below.                   |
-| `token`           | UTF-8 bytes for the remainder of the payload | Must equal the token the runtime was started with. |
+| Field             | Encoding                 | Notes                                        |
+| ----------------- | ------------------------ | -------------------------------------------- |
+| `protocolVersion` | `u16`                    | Must equal the runtime's `PROTOCOL_VERSION`. |
+| `probe`           | `u32 byteLength` + bytes | A serialized `null` — see below.             |
+
+The payload ends with the probe; trailing bytes are rejected as malformed.
+There is no auth token — access to the socket is controlled by the owner-only
+(0700) per-sandbox directory the host creates it in, which the kernel checks
+on every `connect(2)`.
 
 `HelloPayload` (Rust → TS, the first frame the runtime sends):
 
@@ -492,7 +496,7 @@ it. Additive fields go in `extras` and need no tag at all.
 **The `Authenticate` frame is read on its own terms.** It arrives from a peer
 that has shown nothing yet, so it does not get the frame ceiling the rest of
 the connection uses (§2): the runtime caps it at **4 KiB**, which is ample for
-a `u16`, a short probe and a token, and it MUST arrive complete within **2
+a `u16` and a short probe, and it MUST arrive complete within **2
 seconds** of the connection being accepted. The deadline covers the frame as a
 whole rather than each read within it, so a peer that sends its bytes slowly is
 bounded by the same budget as one that sends nothing. Both are enforced only
@@ -515,8 +519,8 @@ negotiation and no fallback codec:
    plumbing reaches the session layer, and no per-connection V8 work happens.
 2. On a protocol-version or format-version mismatch the runtime sends a
    `Hello` carrying the error status and an actionable message, then closes.
-   (On a **bad token** it closes silently — an unauthenticated peer learns
-   nothing.)
+   (On a **malformed payload** it closes silently — that peer is not speaking
+   this protocol at all.)
 3. The host awaits the `Hello`, and empirically `v8.deserialize`s the
    runtime's probe rather than trusting the version byte alone. Any failure
    rejects `createSandbox()` with a typed error naming the remedy: update
@@ -914,7 +918,7 @@ multiplexing.
 ```txt
 TS (one connection slot)              Rust (one isolate thread)
 │                                       │
-│──── Authenticate ────────────────────▶│  version + V8 format + token check
+│──── Authenticate ────────────────────▶│  version + V8 format check
 │◀─── Hello ────────────────────────────│  handshake accepted (or refused)
 │                                       │
 │──── Run / PrefixRun ─────────────────▶│  create or restore isolate
