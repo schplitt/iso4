@@ -325,7 +325,11 @@ pub fn tag_of(scope: &mut v8::PinScope, obj: v8::Local<v8::Object>) -> Option<u3
         ("Request", TAG_REQUEST),
         ("Headers", TAG_HEADERS),
     ] {
-        let ctor = class(scope, name)?;
+        // Guest code can delete or shadow any one of these globals; a missing
+        // candidate only rules out that tag, never the remaining ones.
+        let Some(ctor) = class(scope, name) else {
+            continue;
+        };
         if obj.instance_of(scope, ctor.into()) == Some(true) {
             return Some(tag);
         }
@@ -508,6 +512,25 @@ mod tests {
             obj.internal_field_count()
         });
         assert_eq!(out, 1, "Response instances must carry the routing field");
+    }
+
+    #[test]
+    fn tag_of_skips_a_missing_class_instead_of_aborting_the_lookup() {
+        // Guest code can delete or shadow any of our globals. Identifying an
+        // intact Headers must not depend on Response (checked first in the
+        // loop) still being present.
+        let out = with_web(|scope| {
+            let s = v8::String::new(
+                scope,
+                "delete globalThis.Response; new Headers([['x-a','1']])",
+            )
+            .unwrap();
+            let script = v8::Script::compile(scope, s, None).unwrap();
+            let value = script.run(scope).unwrap();
+            let obj: v8::Local<v8::Object> = value.try_into().unwrap();
+            tag_of(scope, obj)
+        });
+        assert_eq!(out, Some(TAG_HEADERS));
     }
 
     #[test]
