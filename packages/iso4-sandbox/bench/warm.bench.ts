@@ -155,33 +155,43 @@ try {
   throw error
 }
 
+// Every body checks its results: `call()` resolves with `ok: false` instead
+// of throwing, and a failure return is far cheaper than a real call — left
+// unchecked, calls failing mid-loop would be recorded as a speedup.
+
 describe('call latency', () => {
   bench('sync handler, empty prefix', async () => {
-    await syncPrefix.call({ export: 'default.fetch', args: [{ n: 7 }] })
+    assertOk(await syncPrefix.call({ export: 'default.fetch', args: [{ n: 7 }] }), 'bench sync call')
   }, HEAVY_OPTS)
 
   bench('async handler, empty prefix', async () => {
-    await asyncPrefix.call({ export: 'default.fetch', args: [{ n: 7 }] })
+    assertOk(await asyncPrefix.call({ export: 'default.fetch', args: [{ n: 7 }] }), 'bench async call')
   }, HEAVY_OPTS)
 
   bench('sync handler, realistic prefix (~2KB)', async () => {
-    await realisticPrefix.call({ export: 'default.fetch', args: [{ n: 7 }] })
+    assertOk(await realisticPrefix.call({ export: 'default.fetch', args: [{ n: 7 }] }), 'bench realistic call')
   }, HEAVY_OPTS)
 })
 
 describe('call throughput', () => {
   bench(`same prefix, ${SLOTS} slots [x${BATCH}]`, async () => {
-    await Promise.all(
+    const results = await Promise.all(
       Array.from({ length: BATCH }, (_, i) =>
         tpPrefixA.call({ export: 'default.fetch', args: [{ n: i }] })),
     )
+    for (const result of results) {
+      assertOk(result, 'same-prefix throughput call')
+    }
   }, HEAVY_OPTS)
 
   bench(`two prefixes interleaved, ${SLOTS} slots [x${BATCH}]`, async () => {
-    await Promise.all(
+    const results = await Promise.all(
       Array.from({ length: BATCH }, (_, i) =>
         (i % 2 === 0 ? tpPrefixA : tpPrefixB)
           .call({ export: 'default.fetch', args: [{ n: i }] })),
     )
+    for (const result of results) {
+      assertOk(result, 'interleaved throughput call')
+    }
   }, HEAVY_OPTS)
 })

@@ -14,9 +14,10 @@
  * an `[xN]` suffix; `scripts/bench-transform.ts` multiplies the measured
  * ops/sec by N to report events/sec.
  *
- * Every benched operation is probed once at module load and asserted `ok` —
- * `RunResult` failures don't throw, and without the guard a broken bench
- * would happily measure the (fast) error path and report garbage.
+ * Every benched operation is probed once at module load and asserted `ok`,
+ * and every timed body checks its own result too — `RunResult` failures
+ * don't throw, and a run that starts failing mid-loop resolves fast, so an
+ * unchecked bench would measure the error path and report it as a speedup.
  *
  * Run with the RELEASE native binary (`pnpm build:native`) — a debug
  * iso4-v8 invalidates every number here.
@@ -61,10 +62,10 @@ describe('run round trip', () => {
     bench(
       name,
       async () => {
-        await rt.run({
+        assertOk(await rt.run({
           code: 'export default EVENT',
           globals: { EVENT: { kind: 'data', value: payload } },
-        })
+        }), `bench ${name}`)
       },
       HEAVY_OPTS,
     )
@@ -115,11 +116,11 @@ describe('loop mode', () => {
   bench(
     `bridge round trip, sparse1k [x${LOOP_EVENTS}]`,
     async () => {
-      await rt.run({
+      assertOk(await rt.run({
         code: LOOP_CODE,
         globals: { next: async () => loopEvent },
         limits: { maxBridgeCalls: LOOP_EVENTS },
-      })
+      }), 'bench loop mode')
     },
     HEAVY_OPTS,
   )
