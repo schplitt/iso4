@@ -36,9 +36,10 @@ fn main() {
     // isolate plumbing in the session layer, no per-connection cost.
     blob::probe();
 
-    // Remove stale socket from a previous run if present.
-    let _ = std::fs::remove_file(&socket_path);
-
+    // No pre-bind cleanup: the host hands this process a fresh path inside a
+    // per-sandbox private directory, so a file already at it means two
+    // children were given the same path. Deleting it would hide that bug;
+    // failing the bind surfaces it.
     let listener = match UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
