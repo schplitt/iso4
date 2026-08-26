@@ -11,7 +11,7 @@
  * handshake", and the real binary does neither on demand.
  */
 
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -115,4 +115,37 @@ describe('createSandbox startup failures', () => {
     expect(socketPath).toMatch(/iso4-v8-.*\.sock$/)
     expect(existsSync(socketPath)).toBe(false)
   })
+})
+
+describe('socket placement', () => {
+  // Uses the real runtime binary: the property under test is where
+  // `createSandbox` puts the socket, and the access control on a unix socket
+  // is the directory it lives in. Any other local user must be stopped by the
+  // kernel at that directory, so it has to be owner-only and per-sandbox.
+  test('the socket lives in an owner-only per-sandbox directory that dispose removes', async () => {
+    const outer = await mkdtemp(join(tmpdir(), 'iso4-socketdir-'))
+    const previousTmpdir = process.env.TMPDIR
+    process.env.TMPDIR = outer
+    try {
+      const sandbox = await createSandbox({ maxIsolates: 1 })
+      try {
+        const entries = await readdir(outer, { withFileTypes: true })
+        expect(entries.length).toBe(1)
+        expect(entries.every((entry) => entry.isDirectory())).toBe(true)
+        for (const entry of entries) {
+          const mode = (await stat(join(outer, entry.name))).mode & 0o777
+          expect(mode).toBe(0o700)
+        }
+      } finally {
+        await sandbox.dispose()
+      }
+      expect(await readdir(outer)).toEqual([])
+    } finally {
+      if (previousTmpdir === undefined)
+        delete process.env.TMPDIR
+      else
+        process.env.TMPDIR = previousTmpdir
+      await rm(outer, { recursive: true, force: true })
+    }
+  }, 20_000)
 })

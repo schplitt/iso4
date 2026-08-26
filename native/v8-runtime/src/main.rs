@@ -9,7 +9,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
-    let (socket_path, token, warm_budget_bytes) = parse_args();
+    let (socket_path, warm_budget_bytes) = parse_args();
 
     // The warm budget is enforced by comparing this process's own resident
     // memory against it, so a budget with no way to read that memory is not a
@@ -49,9 +49,11 @@ fn main() {
 
     eprintln!("[iso4-v8] listening on {socket_path}");
 
-    // Shared state across all connection threads: prefix snapshots, the
-    // counter used to generate unique PrefixIds, and the auth token.
-    let shared = Arc::new(session::SharedState::new(token, warm_budget_bytes));
+    // Shared state across all connection threads: prefix snapshots and the
+    // counter used to generate unique PrefixIds. Access control is the
+    // owner-only directory the host created the socket path in — the kernel
+    // checks it on every connect, so no application-level secret is needed.
+    let shared = Arc::new(session::SharedState::new(warm_budget_bytes));
 
     for stream in listener.incoming() {
         match stream {
@@ -67,10 +69,9 @@ fn main() {
     }
 }
 
-fn parse_args() -> (String, String, u64) {
+fn parse_args() -> (String, u64) {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
-    let mut token: Option<String> = None;
     let mut warm_budget_bytes: u64 = 0;
 
     let mut i = 1;
@@ -78,10 +79,6 @@ fn parse_args() -> (String, String, u64) {
         match args[i].as_str() {
             "--socket" if i + 1 < args.len() => {
                 socket = Some(args[i + 1].clone());
-                i += 2;
-            }
-            "--token" if i + 1 < args.len() => {
-                token = Some(args[i + 1].clone());
                 i += 2;
             }
             "--warm-budget-bytes" if i + 1 < args.len() => {
@@ -116,10 +113,6 @@ fn parse_args() -> (String, String, u64) {
         eprintln!("[iso4-v8] --socket <path> is required");
         std::process::exit(1);
     });
-    let token = token.unwrap_or_else(|| {
-        eprintln!("[iso4-v8] --token <secret> is required");
-        std::process::exit(1);
-    });
 
-    (socket, token, warm_budget_bytes)
+    (socket, warm_budget_bytes)
 }

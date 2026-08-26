@@ -161,7 +161,7 @@ host hands it over by name.
   ┌─────────────────────────────────────────────────────────┐    
   │ iso4-v8 (Rust binary, ships per-platform via npm)         │  
   │                                                         │    
-  │   main.rs  ─ UDS accept loop, auth, signal handling      │   
+  │   main.rs  ─ UDS accept loop, handshake, signal handling │   
   │      │                                                  │    
   │      ├─ one OS thread per isolate                       │    
   │      │     v8::Isolate (heap_limits + custom allocator) │    
@@ -832,6 +832,14 @@ the same signature later.
 Length-prefixed binary frames over a Unix domain socket. The canonical
 reference is `docs/protocol.md`; this section is the design summary.
 
+Access control on that socket is the directory it lives in: `createSandbox`
+creates a fresh owner-only (0700) directory per sandbox (`mkdtemp`) and binds
+the socket inside it, so the kernel refuses any other local user at
+`connect(2)` time. There is no application-level secret — a same-uid process
+can reach the socket, but a same-uid process can equally read this process's
+memory, so a token would add nothing. This is the same model workerd,
+postgres and ssh-agent use: the filesystem is the ACL.
+
 ### 6.1 Frame format
 
 ```
@@ -854,7 +862,7 @@ direction. Both tables start at `0x01`.
 
 | Byte   | Name             | Purpose                                                                |
 | ------ | ---------------- | ---------------------------------------------------------------------- |
-| `0x01` | `Authenticate`   | First message on connect: protocol version + V8 format probe + token   |
+| `0x01` | `Authenticate`   | First message on connect: protocol version + V8 format probe           |
 | `0x02` | `Run`            | Start a sandboxed execution in a fresh isolate                         |
 | `0x03` | `Precompile`     | Validate prefix code and store it under a `PrefixId`                   |
 | `0x04` | `PrefixRun`      | Execute against a prepared prefix (served by a warm instance, §13.2.1) |

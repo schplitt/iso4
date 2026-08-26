@@ -178,8 +178,6 @@ pub struct SharedState {
     pub prefix_store: Mutex<HashMap<String, Arc<PrefixData>>>,
     /// Monotonically increasing counter for generating unique PrefixIds.
     pub next_prefix_id: AtomicU64,
-    /// Auth token — must match the token sent in every Authenticate frame.
-    pub token: String,
     /// Warm instance registry (#64): every PrefixRun is served by a resident
     /// isolate from here; one-off runs share the same slot accounting.
     pub warm: crate::warm::WarmRegistry,
@@ -189,11 +187,10 @@ impl SharedState {
     /// `warm_budget_bytes` is the RSS mark the registry sheds against
     /// (#66) — the memory control; 0 disables it. Concurrency is bounded
     /// by the host pool; there is no instance-count cap.
-    pub fn new(token: String, warm_budget_bytes: u64) -> Self {
+    pub fn new(warm_budget_bytes: u64) -> Self {
         Self {
             prefix_store: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),
-            token,
             warm: crate::warm::WarmRegistry::new(warm_budget_bytes),
         }
     }
@@ -397,13 +394,6 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
         }
     }
 
-    if auth.token != shared.token {
-        // Deliberately silent: an unauthenticated peer learns nothing about
-        // why it was refused.
-        eprintln!("[iso4-v8] bad token — closing");
-        return;
-    }
-
     if let Err(e) = ipc::write_rust_to_ts_frame(
         &mut stream,
         ipc::RustToTsMessageType::Hello,
@@ -413,7 +403,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
         return;
     }
 
-    eprintln!("[iso4-v8] client authenticated");
+    eprintln!("[iso4-v8] handshake complete");
 
     // Per-connection bridge call-ID counter.  Monotonically increasing across
     // all runs on this connection so callIds never reset to 0 between runs.
@@ -951,9 +941,9 @@ mod tests {
 
     /// Drive `handle_client` over a socket pair with the given Authenticate
     /// payload and return the first frame it writes back (if any).
-    fn handshake(payload: Vec<u8>, token: &str) -> Option<ipc::RustToTsFrame> {
+    fn handshake(payload: Vec<u8>) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(token.to_string(), 0));
+        let shared = Arc::new(SharedState::new(0));
         let server = std::thread::spawn(move || handle_client(runtime, shared));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)
@@ -969,9 +959,9 @@ mod tests {
     /// the caller keeps open, plus a receiver that fires when the session
     /// thread finishes — so a session that never ends fails the test instead of
     /// hanging the suite.
-    fn spawn_session(token: &str) -> (UnixStream, crossbeam_channel::Receiver<()>) {
+    fn spawn_session() -> (UnixStream, crossbeam_channel::Receiver<()>) {
         let (host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(token.to_string(), 0));
+        let shared = Arc::new(SharedState::new(0));
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
             handle_client(runtime, shared);
@@ -986,7 +976,7 @@ mod tests {
         // can end this session: no EOF, no error, just a peer that says
         // nothing. Before the deadline existed the read blocked forever and the
         // thread was never reclaimed.
-        let (_host, done) = spawn_session("tok");
+        let (_host, done) = spawn_session();
 
         done.recv_timeout(HANDSHAKE_DEADLINE * 20)
             .expect("a silent peer kept its session thread");
@@ -994,17 +984,18 @@ mod tests {
 
     #[test]
     fn a_first_frame_over_the_handshake_ceiling_is_refused() {
-        // Correct token, valid probe, right protocol version — the frame is
-        // refused purely for its size, which is what the pre-auth ceiling is
-        // for: how much an unproven peer can make the runtime buffer. A real
-        // token is a UUID, so nothing legitimate comes near 4 KiB.
-        let token = "t".repeat(5_000);
-        let (mut host, done) = spawn_session(&token);
+        // Valid probe bytes up front, right protocol version — the frame is
+        // refused purely for its size, which is what the pre-handshake ceiling
+        // is for: how much an unproven peer can make the runtime buffer. A
+        // real probe is a few bytes, so nothing legitimate comes near 4 KiB.
+        let mut probe = crate::blob::probe().to_vec();
+        probe.resize(5_000, 0);
+        let (mut host, done) = spawn_session();
 
         ipc::write_ts_to_rust_frame(
             &mut host,
             ipc::TsToRustMessageType::Authenticate,
-            &authenticate(crate::blob::probe().to_vec(), &token),
+            &authenticate(probe),
         )
         .unwrap();
         host.flush().unwrap();
@@ -1017,11 +1008,10 @@ mod tests {
         );
     }
 
-    fn authenticate(probe: Vec<u8>, token: &str) -> Vec<u8> {
+    fn authenticate(probe: Vec<u8>) -> Vec<u8> {
         ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
             probe,
-            token: token.to_string(),
         })
     }
 
@@ -1039,8 +1029,8 @@ mod tests {
 
     #[test]
     fn valid_handshake_is_acknowledged_with_the_runtime_probe() {
-        let frame = handshake(authenticate(crate::blob::probe().to_vec(), "tok"), "tok")
-            .expect("expected a Hello frame");
+        let frame =
+            handshake(authenticate(crate::blob::probe().to_vec())).expect("expected a Hello frame");
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Hello);
         let (status, probe, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
@@ -1053,7 +1043,7 @@ mod tests {
         // A probe claiming a serialization format far newer than anything this
         // V8 can read. The old protocol closed the socket silently here.
         let probe = vec![crate::blob::V8_BLOB_HEADER_TAG, 0x63, 0x30];
-        let frame = handshake(authenticate(probe, "tok"), "tok").expect("expected a Hello frame");
+        let frame = handshake(authenticate(probe)).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::V8FormatMismatch as u8);
         assert!(
@@ -1064,8 +1054,7 @@ mod tests {
 
     #[test]
     fn probe_that_is_not_a_blob_is_refused_loudly() {
-        let frame = handshake(authenticate(vec![0x01, 0x02], "tok"), "tok")
-            .expect("expected a Hello frame");
+        let frame = handshake(authenticate(vec![0x01, 0x02])).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::V8FormatMismatch as u8);
         assert!(message.contains("unrecognised format"), "{message}");
@@ -1076,17 +1065,11 @@ mod tests {
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION + 1,
             probe: crate::blob::probe().to_vec(),
-            token: "tok".to_string(),
         });
-        let frame = handshake(payload, "tok").expect("expected a Hello frame");
+        let frame = handshake(payload).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::ProtocolVersionMismatch as u8);
         assert!(message.contains("protocol version mismatch"), "{message}");
     }
 
-    #[test]
-    fn bad_token_closes_without_a_hello() {
-        // Deliberately silent: an unauthenticated peer learns nothing.
-        assert!(handshake(authenticate(crate::blob::probe().to_vec(), "wrong"), "tok").is_none());
-    }
 }

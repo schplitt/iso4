@@ -18,7 +18,7 @@ import type {
  */
 export type WireResourceLimits = ResourceLimits & { memoryMb?: number }
 
-export const PROTOCOL_VERSION: 2 = 2
+export const PROTOCOL_VERSION: 1 = 1
 
 export const DEFAULT_MAX_FRAME_LENGTH: number = 64 * 1024 * 1024
 
@@ -47,7 +47,7 @@ export const RustToTsMessageTypes = {
   Log: 0x04,
   /**
    * Handshake acknowledgement — the first frame the runtime sends on a new
-   * connection, answering `Authenticate` (protocol v2).
+   * connection, answering `Authenticate`.
    */
   Hello: 0x05,
   /**
@@ -80,7 +80,6 @@ export interface AuthenticatePayload {
    * when it cannot read that version (see `HelloPayload`).
    */
   probe: Uint8Array
-  token: string
 }
 
 /**
@@ -409,8 +408,7 @@ export function decodeRustToTsFrame(bytes: Uint8Array): RustToTsFrame {
 
 /**
  * Encode an `Authenticate` payload per `docs/protocol.md` §5.1:
- * `u16 protocolVersion`, `u32 probeLength + probe bytes`, then the token as
- * UTF-8 for the remainder of the payload.
+ * `u16 protocolVersion`, then `u32 probeLength + probe bytes`.
  * @param auth
  */
 export function encodeAuthenticatePayload(
@@ -423,13 +421,11 @@ export function encodeAuthenticatePayload(
     throw new Error(`protocolVersion out of u16 range: ${auth.protocolVersion}`)
   }
 
-  const token = Buffer.from(auth.token, 'utf8')
-  const payload = Buffer.allocUnsafe(2 + 4 + auth.probe.byteLength + token.byteLength)
+  const payload = Buffer.allocUnsafe(2 + 4 + auth.probe.byteLength)
   payload.writeUInt16BE(auth.protocolVersion, 0)
   payload.writeUInt32BE(auth.probe.byteLength, 2)
   Buffer.from(auth.probe.buffer, auth.probe.byteOffset, auth.probe.byteLength)
     .copy(payload, 6)
-  token.copy(payload, 6 + auth.probe.byteLength)
   return payload
 }
 
@@ -445,10 +441,12 @@ export function decodeAuthenticatePayload(
   if (view.byteLength < 6 + probeLength) {
     throw new Error('Authenticate payload truncated (probe)')
   }
+  if (view.byteLength > 6 + probeLength) {
+    throw new Error('Authenticate payload has trailing bytes')
+  }
   return {
     protocolVersion: view.readUInt16BE(0),
     probe: view.subarray(6, 6 + probeLength),
-    token: view.subarray(6 + probeLength).toString('utf8'),
   }
 }
 

@@ -5,11 +5,10 @@
  * isolate slot), and exposes the `Sandbox` + `Prefix` API.
  */
 
-import { access, unlink } from 'node:fs/promises'
-import { unlinkSync } from 'node:fs'
+import { access, mkdtemp, rm } from 'node:fs/promises'
+import { rmSync } from 'node:fs'
 import { availableParallelism, tmpdir, totalmem } from 'node:os'
-import { join } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
@@ -102,11 +101,12 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const maxIsolates = options?.maxIsolates ?? availableParallelism()
   const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb)
 
-  // Generate a per-process unique socket path and a cryptographically
-  // random auth token. Both are passed as CLI args to the Rust binary so
-  // no other process can predict the path or authenticate.
-  const socketPath = join(tmpdir(), `iso4-v8-${process.pid}-${randomUUID().slice(0, 8)}.sock`)
-  const token = randomUUID()
+  // Access control on the socket is the directory it lives in: a fresh
+  // owner-only (0700) directory per sandbox, so the kernel refuses any other
+  // local user at connect time. Same model as workerd, postgres and
+  // ssh-agent — the filesystem is the ACL, no application-level secret.
+  const socketDir = await mkdtemp(join(tmpdir(), 'iso4-v8-'))
+  const socketPath = join(socketDir, 'runtime.sock')
 
   // The runtime needs exactly one capacity fact: the warm budget in bytes,
   // the RSS mark it sheds against (#66). Concurrency is bounded by this
@@ -115,8 +115,6 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const proc = spawn(binaryPath, [
     '--socket',
     socketPath,
-    '--token',
-    token,
     '--warm-budget-bytes',
     String(warmBudgetBytes),
   ], {
@@ -149,7 +147,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     // below closes them anyway, but only after they have each held a thread in
     // it, and only if the kill lands.
     const connect = (): Promise<RuntimeIpcClient> =>
-      RuntimeIpcClient.connect({ socketPath, token })
+      RuntimeIpcClient.connect({ socketPath })
     const settled = await Promise.allSettled(
       Array.from({ length: maxIsolates }, () => connect()),
     )
@@ -187,10 +185,10 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     return new SandboxImpl(proc, pool, statsClient, socketPath, options?.memoryMb)
   } catch (error) {
     proc.kill()
-    // The runtime leaves its socket file behind, and nothing else will remove
-    // it now — `dispose()` is the only other place that does, and there is no
-    // instance to call it on.
-    await unlink(socketPath).catch(() => {})
+    // The runtime leaves its socket directory behind, and nothing else will
+    // remove it now — `dispose()` is the only other place that does, and there
+    // is no instance to call it on.
+    await rm(socketDir, { recursive: true, force: true }).catch(() => {})
     throw error
   }
 }
@@ -399,7 +397,7 @@ class SandboxImpl implements Sandbox {
     this.exitHook = () => {
       this.proc.kill()
       try {
-        unlinkSync(this.socketPath)
+        rmSync(dirname(this.socketPath), { recursive: true, force: true })
       } catch {
         // already gone, or never created
       }
@@ -597,9 +595,9 @@ class SandboxImpl implements Sandbox {
     await this.statsClient.dispose()
     this.proc.kill()
     // Best-effort cleanup: the Rust process leaves the socket file on disk
-    // after it exits. Remove it; ignore the error if it's already gone.
+    // after it exits. Remove its directory; ignore if it's already gone.
     try {
-      await unlink(this.socketPath)
+      await rm(dirname(this.socketPath), { recursive: true, force: true })
     } catch {
       // already removed or never created - that's fine
     }

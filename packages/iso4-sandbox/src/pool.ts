@@ -24,7 +24,7 @@ interface Waiter {
 
 /**
  * Opens a fresh connection. Supplied by `createSandbox`, which holds the socket
- * path and auth token.
+ * path.
  */
 export type ConnectFn = () => Promise<RuntimeIpcClient>
 
