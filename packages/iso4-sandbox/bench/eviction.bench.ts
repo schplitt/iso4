@@ -112,10 +112,10 @@ afterAll(async () => {
 
 describe('eviction path: cold instance per call', () => {
   bench('sync handler, empty prefix (boot + eval per call)', async () => {
-    await coldSync.call({ export: 'default.fetch', args: [{ n: 7 }] })
+    assertOk(await coldSync.call({ export: 'default.fetch', args: [{ n: 7 }] }), 'bench cold sync call')
   }, HEAVY_OPTS)
 
   bench('sync handler, realistic prefix ~2KB (boot + eval per call)', async () => {
-    await coldRealistic.call({ export: 'default.fetch', args: [{ n: 7 }] })
+    assertOk(await coldRealistic.call({ export: 'default.fetch', args: [{ n: 7 }] }), 'bench cold realistic call')
   }, HEAVY_OPTS)
 })
