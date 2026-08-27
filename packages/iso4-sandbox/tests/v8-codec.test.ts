@@ -18,11 +18,13 @@ import {
   serializationProbe,
   serializeValue,
 } from '../src/v8-codec.js'
-import { materializeHostTypes } from '../src/web-codec.js'
+import { brandKeyForToken, materializeHostTypes } from '../src/web-codec.js'
 
 function roundtrip(value: unknown): unknown {
   return deserializeValue(serializeValue(value))
 }
+
+const TEST_BRAND_KEY = brandKeyForToken(new Uint8Array(16).fill(0xAB))
 
 describe('serializeValue / deserializeValue — primitives', () => {
   test.each([
@@ -224,7 +226,7 @@ describe('__proto__ as an own key', () => {
   // prototype setter (which would drop the key before serialization).
   test('materializeHostTypes keeps an own-enumerable __proto__ key', async () => {
     const source = JSON.parse('{"__proto__":{"x":1},"y":2}') as Record<string, unknown>
-    const out = await materializeHostTypes(source) as Record<string, unknown>
+    const out = await materializeHostTypes(source, TEST_BRAND_KEY) as Record<string, unknown>
     const desc = Object.getOwnPropertyDescriptor(out, '__proto__')
     expect(desc).toBeDefined()
     expect((desc?.value as Record<string, unknown>)?.x).toBe(1)
@@ -234,6 +236,27 @@ describe('__proto__ as an own key', () => {
 
 // Accepted trade-off (docs/protocol.md §4.2): Node exposes no serializer hook
 // to reject class instances, so they flatten to their own enumerable props.
+describe('host-type descriptors', () => {
+  test('a Response is replaced by a descriptor stamped with the session brand key', async () => {
+    const out = await materializeHostTypes(
+      { res: new Response('hi', { status: 201 }) },
+      TEST_BRAND_KEY,
+    ) as { res: Record<string, unknown> }
+    expect(out.res[TEST_BRAND_KEY]).toBe(3) // TAG_RESPONSE
+    expect(out.res.status).toBe(201)
+    // Nothing under the bare prefix: the stamp IS the key.
+    expect(Object.hasOwn(out.res, '__iso4_ht')).toBe(false)
+  })
+
+  test('plain data carrying a brand-shaped key is left untouched', async () => {
+    const source = { __iso4_ht: 3, status: 500, headers: [], body: null }
+    const out = await materializeHostTypes({ d: source }, TEST_BRAND_KEY) as { d: Record<string, unknown> }
+    expect(out.d.__iso4_ht).toBe(3)
+    expect(out.d.status).toBe(500)
+    expect(Object.hasOwn(out.d, TEST_BRAND_KEY)).toBe(false)
+  })
+})
+
 describe('class instances', () => {
   test('flatten to their own enumerable properties', () => {
     class Row {

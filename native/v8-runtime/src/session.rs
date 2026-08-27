@@ -403,6 +403,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
         return;
     }
 
+    // Brand key for host-emitted host-type descriptors (docs/protocol.md
+    // §4.4.6): derived from the handshake token, installed for this session
+    // thread (one-off runs, precompile) and handed to every warm instance this
+    // connection spawns. Only descriptors stamped with it rehydrate.
+    let brand_key = crate::webcodec::brand_key_for_token(&auth.descriptor_token);
+    crate::webcodec::set_session_brand_key(brand_key.clone());
+
     eprintln!("[iso4-v8] handshake complete");
 
     // Per-connection bridge call-ID counter.  Monotonically increasing across
@@ -749,6 +756,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     crate::warm::spawn_instance(
                                         Arc::clone(&prefix_data),
                                         payload.limits.memory_mb,
+                                        brand_key.clone(),
                                     ),
                                     true,
                                 ),
@@ -756,6 +764,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     crate::warm::spawn_instance(
                                         Arc::clone(&prefix_data),
                                         payload.limits.memory_mb,
+                                        brand_key.clone(),
                                     ),
                                     false,
                                 ),
@@ -1012,6 +1021,7 @@ mod tests {
         ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
             probe,
+            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
         })
     }
 
@@ -1065,11 +1075,28 @@ mod tests {
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION + 1,
             probe: crate::blob::probe().to_vec(),
+            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
         });
         let frame = handshake(payload).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::ProtocolVersionMismatch as u8);
         assert!(message.contains("protocol version mismatch"), "{message}");
+    }
+
+    #[test]
+    fn a_malformed_descriptor_token_is_refused_without_a_reply() {
+        // A wrong-size token is a malformed payload: the peer is not speaking
+        // this protocol, so the connection closes with no Hello — same policy
+        // as any other malformed Authenticate.
+        let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
+            protocol_version: ipc::PROTOCOL_VERSION,
+            probe: crate::blob::probe().to_vec(),
+            descriptor_token: vec![0xab; 8],
+        });
+        assert!(
+            handshake(payload).is_none(),
+            "a malformed token must not be answered"
+        );
     }
 
 }

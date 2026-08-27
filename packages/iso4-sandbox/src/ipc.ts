@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer'
 import { deserializeValue, serializeValue } from './v8-codec.js'
+import { DESCRIPTOR_TOKEN_LEN } from './web-codec.js'
 import type {
   BridgeCallEntry,
   CallResult,
@@ -80,6 +81,14 @@ export interface AuthenticatePayload {
    * when it cannot read that version (see `HelloPayload`).
    */
   probe: Uint8Array
+  /**
+   * Random per-sandbox descriptor token, exactly 16 bytes
+   * (`docs/protocol.md` §5.1). Host-emitted host-type descriptors are stamped
+   * with the brand key derived from it (`web-codec.ts`), and the runtime
+   * rehydrates only stamped descriptors. Every connection of one sandbox
+   * sends the same token.
+   */
+  descriptorToken: Uint8Array
 }
 
 /**
@@ -408,7 +417,8 @@ export function decodeRustToTsFrame(bytes: Uint8Array): RustToTsFrame {
 
 /**
  * Encode an `Authenticate` payload per `docs/protocol.md` §5.1:
- * `u16 protocolVersion`, then `u32 probeLength + probe bytes`.
+ * `u16 protocolVersion`, then `u32 probeLength + probe bytes`, then
+ * `u32 tokenLength + descriptor token bytes` (exactly 16).
  * @param auth
  */
 export function encodeAuthenticatePayload(
@@ -420,12 +430,22 @@ export function encodeAuthenticatePayload(
   if (auth.protocolVersion < 0 || auth.protocolVersion > 0xffff) {
     throw new Error(`protocolVersion out of u16 range: ${auth.protocolVersion}`)
   }
+  if (auth.descriptorToken.byteLength !== DESCRIPTOR_TOKEN_LEN) {
+    throw new Error(
+      `descriptor token must be exactly ${DESCRIPTOR_TOKEN_LEN} bytes, got ${auth.descriptorToken.byteLength}`,
+    )
+  }
 
-  const payload = Buffer.allocUnsafe(2 + 4 + auth.probe.byteLength)
+  const token = auth.descriptorToken
+  const payload = Buffer.allocUnsafe(2 + 4 + auth.probe.byteLength + 4 + token.byteLength)
   payload.writeUInt16BE(auth.protocolVersion, 0)
   payload.writeUInt32BE(auth.probe.byteLength, 2)
   Buffer.from(auth.probe.buffer, auth.probe.byteOffset, auth.probe.byteLength)
     .copy(payload, 6)
+  const tokenStart = 6 + auth.probe.byteLength
+  payload.writeUInt32BE(token.byteLength, tokenStart)
+  Buffer.from(token.buffer, token.byteOffset, token.byteLength)
+    .copy(payload, tokenStart + 4)
   return payload
 }
 
@@ -438,15 +458,26 @@ export function decodeAuthenticatePayload(
 
   const view = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
   const probeLength = view.readUInt32BE(2)
-  if (view.byteLength < 6 + probeLength) {
+  if (view.byteLength < 6 + probeLength + 4) {
     throw new Error('Authenticate payload truncated (probe)')
   }
-  if (view.byteLength > 6 + probeLength) {
+  const tokenStart = 6 + probeLength
+  const tokenLength = view.readUInt32BE(tokenStart)
+  if (tokenLength !== DESCRIPTOR_TOKEN_LEN) {
+    throw new Error(
+      `descriptor token must be exactly ${DESCRIPTOR_TOKEN_LEN} bytes, got ${tokenLength}`,
+    )
+  }
+  if (view.byteLength < tokenStart + 4 + tokenLength) {
+    throw new Error('Authenticate payload truncated (descriptor token)')
+  }
+  if (view.byteLength > tokenStart + 4 + tokenLength) {
     throw new Error('Authenticate payload has trailing bytes')
   }
   return {
     protocolVersion: view.readUInt16BE(0),
     probe: view.subarray(6, 6 + probeLength),
+    descriptorToken: view.subarray(tokenStart + 4, tokenStart + 4 + tokenLength),
   }
 }
 

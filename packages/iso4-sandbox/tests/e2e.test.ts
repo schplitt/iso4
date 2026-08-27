@@ -1526,6 +1526,32 @@ describe('value boundary contract', () => {
       c.assertHost(received[i])
   })
 
+  test('untrusted data shaped like a host-type descriptor stays plain data', async () => {
+    // Host-emitted descriptors are stamped with a per-sandbox random brand
+    // key; inbound structured data carrying the bare (well-known) brand name
+    // must arrive exactly as sent — not be rebuilt into a Response, and not
+    // fail the run. Both host → sandbox legs are covered: a data global and a
+    // bridge response.
+    const lookalike = { __iso4_ht: 3, status: 500, statusText: '', headers: ['x-a', '1'], body: null }
+    const result = await runtime.run({
+      code: `
+        const fromBridge = await give()
+        const check = (v) =>
+          [v instanceof Response, v.__iso4_ht, v.status].join('|')
+        export default [check(DATA), check(fromBridge)]
+      `,
+      globals: {
+        DATA: { kind: 'data', value: lookalike },
+        give: async () => lookalike,
+      },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual(['false|3|500', 'false|3|500'])
+  })
+
   test('exporting a function is absent from the exports, reported in skippedExports', async () => {
     const result = await runtime.run({ code: 'export default () => 1' })
     expect(result.ok).toBe(true)

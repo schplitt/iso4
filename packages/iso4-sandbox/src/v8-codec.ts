@@ -88,9 +88,11 @@ export function serializeValue(value: unknown): Buffer {
  * (`docs/protocol.md` §4.4.6). Node's serializer exposes no host-object write
  * hook, which is why the descriptor detour exists at all.
  * @param value the value to encode
+ * @param brandKey the sandbox's session brand key — descriptors are stamped
+ * with it, and the runtime rehydrates only stamped descriptors
  */
-export async function serializeHostValue(value: unknown): Promise<Buffer> {
-  return serializeValue(await materializeHostTypes(value))
+export async function serializeHostValue(value: unknown, brandKey: string): Promise<Buffer> {
+  return serializeValue(await materializeHostTypes(value, brandKey))
 }
 
 /**
@@ -104,14 +106,16 @@ export async function serializeHostValue(value: unknown): Promise<Buffer> {
  *
  * Nested host types are handled, at any depth.
  * @param defs global definitions, mutated in place
+ * @param brandKey the sandbox's session brand key ({@link serializeHostValue})
  */
 export async function materializeHostTypesInGlobals(
   defs: GlobalDefPayload[],
+  brandKey: string,
 ): Promise<void> {
   for (const def of defs) {
     if (def.kind !== 'data')
       continue
-    def.value = (await materializeHostTypes(def.value)) as typeof def.value
+    def.value = (await materializeHostTypes(def.value, brandKey)) as typeof def.value
   }
 }
 

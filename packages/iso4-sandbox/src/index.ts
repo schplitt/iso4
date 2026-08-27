@@ -11,6 +11,7 @@ import { availableParallelism, tmpdir, totalmem } from 'node:os'
 import { dirname, join } from 'node:path'
 import process from 'node:process'
 import { spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import type { ChildProcess } from 'node:child_process'
 
 import { resolveRuntimeBinary } from './binary'
@@ -53,6 +54,7 @@ import {
 } from './imports.js'
 import type { ImportHandlerMap } from './imports.js'
 import { materializeHostTypesInGlobals, serializeHostValue } from './v8-codec.js'
+import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN } from './web-codec.js'
 
 export type {
   ResourceLimits,
@@ -108,6 +110,13 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const socketDir = await mkdtemp(join(tmpdir(), 'iso4-v8-'))
   const socketPath = join(socketDir, 'runtime.sock')
 
+  // Random per-sandbox descriptor token (docs/protocol.md §5.1): every
+  // connection sends it at handshake, and host-type descriptors are stamped
+  // with the brand key derived from it, so the runtime rehydrates only
+  // descriptors this host actually emitted. Never surfaced to sandbox code.
+  const descriptorToken = randomBytes(DESCRIPTOR_TOKEN_LEN)
+  const brandKey = brandKeyForToken(descriptorToken)
+
   // The runtime needs exactly one capacity fact: the warm budget in bytes,
   // the RSS mark it sheds against (#66). Concurrency is bounded by this
   // host's connection pool; there is no instance-count cap (celld's
@@ -147,7 +156,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     // below closes them anyway, but only after they have each held a thread in
     // it, and only if the kill lands.
     const connect = (): Promise<RuntimeIpcClient> =>
-      RuntimeIpcClient.connect({ socketPath })
+      RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const settled = await Promise.allSettled(
       Array.from({ length: maxIsolates }, () => connect()),
     )
@@ -182,7 +191,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
       throw error
     }
 
-    return new SandboxImpl(proc, pool, statsClient, socketPath, options?.memoryMb)
+    return new SandboxImpl(proc, pool, statsClient, socketPath, brandKey, options?.memoryMb)
   } catch (error) {
     proc.kill()
     // The runtime leaves its socket directory behind, and nothing else will
@@ -369,6 +378,12 @@ class SandboxImpl implements Sandbox {
    * accumulate listeners.
    */
   private readonly exitHook: () => void
+  /**
+   * Session brand key for host-type descriptors (see `web-codec.ts`) —
+   * derived from the sandbox's random descriptor token, stamped onto every
+   * descriptor this host emits.
+   */
+  private readonly brandKey: string
   private _alive = true
 
   constructor(
@@ -376,12 +391,14 @@ class SandboxImpl implements Sandbox {
     pool: ConnectionPool,
     statsClient: RuntimeIpcClient,
     socketPath: string,
+    brandKey: string,
     memoryMb?: number,
   ) {
     this.proc = proc
     this.pool = pool
     this.statsClient = statsClient
     this.socketPath = socketPath
+    this.brandKey = brandKey
     this.memoryMb = memoryMb
     proc.once('exit', () => {
       this._alive = false
@@ -425,7 +442,7 @@ class SandboxImpl implements Sandbox {
     const { defs, dispatch } = processGlobals(options.globals ?? {})
     // Drain any Request/Response body before the payload encoder, which is
     // synchronous. See materializeHostTypesInGlobals.
-    await materializeHostTypesInGlobals(defs)
+    await materializeHostTypesInGlobals(defs, this.brandKey)
     // Host modules cross the wire as shape data; the runtime builds them
     // natively and dispatches function-leaf calls back here by
     // (specifier, path) through `handlers`.
@@ -437,7 +454,7 @@ class SandboxImpl implements Sandbox {
       ? undefined
       : {
           exportPath: options.call.export,
-          argsBlob: await serializeHostValue(options.call.args ?? []),
+          argsBlob: await serializeHostValue(options.call.args ?? [], this.brandKey),
         }
     try {
       return await this.pool.withClient(async (client) => {
@@ -554,7 +571,7 @@ class SandboxImpl implements Sandbox {
     return this.pool.withClient(async (client) => {
       const rawGlobals = options.globals ?? {} as G
       const { defs } = processGlobals(rawGlobals)
-      await materializeHostTypesInGlobals(defs)
+      await materializeHostTypesInGlobals(defs, this.brandKey)
       // The declared import shape travels as data and is stored with the
       // prefix on the Rust side — it is the runtime's reference for building
       // the modules on every run and for validating rebind attempts. The
@@ -582,7 +599,7 @@ class SandboxImpl implements Sandbox {
         throw err
       }
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers, this.memoryMb)
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers, this.brandKey, this.memoryMb)
     })
   }
 
@@ -638,6 +655,10 @@ implements Prefix<G, M> {
    * exist (the cap is baked into the isolate at creation).
    */
   private readonly memoryMb: number | undefined
+  /**
+   * Session brand key for host-type descriptors — see `SandboxImpl`.
+   */
+  private readonly brandKey: string
   private _alive = true
 
   constructor(
@@ -645,12 +666,14 @@ implements Prefix<G, M> {
     pool: ConnectionPool,
     defaultGlobals: G,
     defaultImportHandlers: ImportHandlerMap,
+    brandKey: string,
     memoryMb?: number,
   ) {
     this.id = id
     this.pool = pool
     this.defaultGlobals = defaultGlobals
     this.defaultImportHandlers = defaultImportHandlers
+    this.brandKey = brandKey
     this.memoryMb = memoryMb
   }
 
@@ -686,7 +709,7 @@ implements Prefix<G, M> {
     // (async body drain) works at any depth, as one blob holding the array.
     const call = {
       exportPath: options.export,
-      argsBlob: await serializeHostValue(options.args ?? []),
+      argsBlob: await serializeHostValue(options.args ?? [], this.brandKey),
     }
     const result = await this.dispatch(options, { call })
     return result as CallResult

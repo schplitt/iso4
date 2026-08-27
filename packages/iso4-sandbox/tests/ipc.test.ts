@@ -231,16 +231,28 @@ describe('buffered frame reader', () => {
 })
 
 describe('Authenticate payload', () => {
-  test('auth payload roundtrip preserves protocol version and probe', () => {
+  const descriptorToken = new Uint8Array(16).fill(0xAB)
+
+  test('auth payload roundtrip preserves protocol version, probe and token', () => {
     const probe = serializationProbe()
     const payload = encodeAuthenticatePayload({
       protocolVersion: PROTOCOL_VERSION,
       probe,
+      descriptorToken,
     })
     const auth = decodeAuthenticatePayload(payload)
 
     expect(auth.protocolVersion).toBe(PROTOCOL_VERSION)
     expect(Buffer.from(auth.probe)).toEqual(probe)
+    expect(Buffer.from(auth.descriptorToken)).toEqual(Buffer.from(descriptorToken))
+  })
+
+  test('auth payload rejects a wrong-size descriptor token', () => {
+    expect(() => encodeAuthenticatePayload({
+      protocolVersion: PROTOCOL_VERSION,
+      probe: serializationProbe(),
+      descriptorToken: new Uint8Array(8),
+    })).toThrow(/descriptor token must be exactly 16 bytes/)
   })
 
   test('the probe is a serialized null carrying the format version', () => {

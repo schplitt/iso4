@@ -113,11 +113,19 @@ fn dead_instance_outcome() -> sandbox::CallOutcome {
 /// created lazily on the first job so a creation failure surfaces as that
 /// call's result (warm-up still runs under its own fixed budget — the
 /// failure is reported to, not billed to, the triggering call).
-pub fn spawn_instance(prefix: Arc<PrefixData>, memory_mb: u32) -> InstanceHandle {
+///
+/// `brand_key` is the spawning session's descriptor brand key; it is per
+/// sandbox (every connection of one host sends the same token), so installing
+/// the spawner's key covers every later call routed to this instance.
+pub fn spawn_instance(
+    prefix: Arc<PrefixData>,
+    memory_mb: u32,
+    brand_key: String,
+) -> InstanceHandle {
     let (tx, rx) = crossbeam_channel::unbounded::<Job>();
     std::thread::Builder::new()
         .name("iso4-warm-instance".to_string())
-        .spawn(move || instance_main(prefix, memory_mb, rx))
+        .spawn(move || instance_main(prefix, memory_mb, brand_key, rx))
         .expect("failed to spawn warm instance thread");
     InstanceHandle {
         jobs: tx,
@@ -129,8 +137,13 @@ pub fn spawn_instance(prefix: Arc<PrefixData>, memory_mb: u32) -> InstanceHandle
 fn instance_main(
     prefix: Arc<PrefixData>,
     memory_mb: u32,
+    brand_key: String,
     jobs: crossbeam_channel::Receiver<Job>,
 ) {
+    // Host-type descriptors deserialized on this thread — call args, bridge
+    // responses, and the cold-start replay of stored data globals — rehydrate
+    // only when stamped with this key.
+    crate::webcodec::set_session_brand_key(brand_key);
     let mut core: Option<sandbox::InstanceCore> = None;
     while let Ok(Job::Call(job, respond)) = jobs.recv() {
         if core.is_none() {
@@ -546,6 +559,10 @@ mod tests {
         })
     }
 
+    fn test_brand_key() -> String {
+        crate::webcodec::brand_key_for_token(&[0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN])
+    }
+
     fn bump_job() -> CallJob {
         CallJob {
             code: None,
@@ -572,7 +589,7 @@ mod tests {
     #[test]
     fn instance_thread_serves_calls_and_keeps_state() {
         sandbox::init_platform();
-        let handle = spawn_instance(counter_prefix(), 0);
+        let handle = spawn_instance(counter_prefix(), 0, test_brand_key());
         for expected in 1..=3 {
             let outcome = handle.call(bump_job());
             assert!(!outcome.tainted);
@@ -587,7 +604,7 @@ mod tests {
         let Acquired::CreateNew = registry.acquire("p0") else {
             panic!("first acquire must create");
         };
-        let handle = spawn_instance(counter_prefix(), 0);
+        let handle = spawn_instance(counter_prefix(), 0, test_brand_key());
         let outcome = handle.call(bump_job());
         assert_eq!(bump_value(&outcome), 1.0);
         registry.release("p0", handle, false, outcome.heap_used_bytes, true);
@@ -606,7 +623,7 @@ mod tests {
         sandbox::init_platform();
         let registry = WarmRegistry::new(0);
         assert!(matches!(registry.acquire("p0"), Acquired::CreateNew));
-        let handle = spawn_instance(counter_prefix(), 0);
+        let handle = spawn_instance(counter_prefix(), 0, test_brand_key());
         let outcome = handle.call(bump_job());
         registry.release("p0", handle, true, outcome.heap_used_bytes, true);
 
@@ -614,7 +631,7 @@ mod tests {
         let Acquired::CreateNew = registry.acquire("p0") else {
             panic!("tainted instance must not be reused");
         };
-        let handle = spawn_instance(counter_prefix(), 0);
+        let handle = spawn_instance(counter_prefix(), 0, test_brand_key());
         let outcome = handle.call(bump_job());
         assert_eq!(bump_value(&outcome), 1.0, "fresh instance, fresh state");
         registry.release("p0", handle, false, outcome.heap_used_bytes, true);
@@ -629,9 +646,9 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB);
         registry.set_rss_for_test(10 * TEST_MB);
         assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
-        registry.release("a", spawn_instance(counter_prefix(), 0), false, 0, true);
+        registry.release("a", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 0, true);
         assert!(matches!(registry.acquire("b"), Acquired::CreateNew));
-        registry.release("b", spawn_instance(counter_prefix(), 0), false, 0, true);
+        registry.release("b", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 0, true);
 
         // RSS reaches the mark: the pass sheds one (2 idle / 10 → min 1),
         // and it must be "a" — released first, idle longest.
@@ -647,7 +664,7 @@ mod tests {
     fn dispose_prefix_drops_idle_instances() {
         let registry = WarmRegistry::new(0);
         assert!(matches!(registry.acquire("p0"), Acquired::CreateNew));
-        registry.release("p0", spawn_instance(counter_prefix(), 0), false, 0, true);
+        registry.release("p0", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 0, true);
         registry.dispose_prefix("p0");
         assert!(matches!(registry.acquire("p0"), Acquired::CreateNew));
     }
@@ -657,7 +674,7 @@ mod tests {
         let registry = WarmRegistry::new(0);
         assert!(matches!(registry.acquire("p0"), Acquired::CreateNew));
         // prefix_alive = false: DisposePrefix landed while the call ran.
-        registry.release("p0", spawn_instance(counter_prefix(), 0), false, 0, false);
+        registry.release("p0", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 0, false);
         assert!(matches!(registry.acquire("p0"), Acquired::CreateNew));
     }
 
@@ -669,7 +686,7 @@ mod tests {
         let registry = WarmRegistry::new(0);
         for prefix in ["a", "b", "c", "d"] {
             assert!(matches!(registry.acquire(prefix), Acquired::CreateNew));
-            registry.release(prefix, spawn_instance(counter_prefix(), 0), false, 0, true);
+            registry.release(prefix, spawn_instance(counter_prefix(), 0, test_brand_key()), false, 0, true);
         }
         registry.reserve_oneoff();
         registry.release_oneoff();
@@ -690,9 +707,9 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB);
         registry.set_rss_for_test(10 * TEST_MB);
         assert!(matches!(registry.acquire("small"), Acquired::CreateNew));
-        registry.release("small", spawn_instance(counter_prefix(), 0), false, 1_000, true);
+        registry.release("small", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 1_000, true);
         assert!(matches!(registry.acquire("big"), Acquired::CreateNew));
-        registry.release("big", spawn_instance(counter_prefix(), 0), false, 1024 * TEST_MB, true);
+        registry.release("big", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 1024 * TEST_MB, true);
 
         registry.set_rss_for_test(100 * TEST_MB);
         // Any registry event runs the pressure pass: idle 2 → shed target 1.
@@ -728,9 +745,9 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB);
         registry.set_rss_for_test(10 * TEST_MB);
         assert!(matches!(registry.acquire("p"), Acquired::CreateNew));
-        registry.release("p", spawn_instance(counter_prefix(), 0), false, 1_000, true);
+        registry.release("p", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 1_000, true);
         assert!(matches!(registry.acquire("q"), Acquired::CreateNew));
-        registry.release("q", spawn_instance(counter_prefix(), 0), false, 1024 * TEST_MB, true);
+        registry.release("q", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 1024 * TEST_MB, true);
 
         // At the mark: one shed pass takes "q" (highest score); the flat
         // sample after it stops the walk, so "p" stays.
@@ -782,7 +799,7 @@ mod tests {
         // known heap measurement. Plus one running one-off.
         assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
         assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
-        registry.release("a", spawn_instance(counter_prefix(), 0), false, 1_000, true);
+        registry.release("a", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 1_000, true);
         registry.reserve_oneoff();
 
         let stats = registry.stats();
@@ -798,8 +815,8 @@ mod tests {
         let Acquired::Reused(_) = registry.acquire("a") else {
             panic!("idle instance must be reused");
         };
-        registry.release("a", spawn_instance(counter_prefix(), 0), true, 0, true);
-        registry.release("a", spawn_instance(counter_prefix(), 0), true, 0, true);
+        registry.release("a", spawn_instance(counter_prefix(), 0, test_brand_key()), true, 0, true);
+        registry.release("a", spawn_instance(counter_prefix(), 0, test_brand_key()), true, 0, true);
         let stats = registry.stats();
         assert_eq!(stats.oneoff_running, 0);
         assert_eq!(stats.warm_busy, 0);
@@ -813,7 +830,7 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB);
         registry.set_rss_for_test(10 * TEST_MB);
         assert!(matches!(registry.acquire("a"), Acquired::CreateNew));
-        registry.release("a", spawn_instance(counter_prefix(), 0), false, 500, true);
+        registry.release("a", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 500, true);
 
         // RSS reaches the mark: the one-off's pressure pass evicts a's idle
         // instance — every count and the summed idle heap must reflect
@@ -830,7 +847,7 @@ mod tests {
         // Pressure gone: pooling resumes and the counts follow.
         registry.set_rss_for_test(10 * TEST_MB);
         assert!(matches!(registry.acquire("b"), Acquired::CreateNew));
-        registry.release("b", spawn_instance(counter_prefix(), 0), false, 300, true);
+        registry.release("b", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 300, true);
         let stats = registry.stats();
         assert_eq!(stats.warm_idle, 1);
         assert_eq!(stats.warm_busy, 0);
@@ -846,7 +863,7 @@ mod tests {
         let stats = registry.stats();
         assert_eq!(stats.warm_busy, 1);
         // The release then observes the prefix gone and drops the instance.
-        registry.release("p0", spawn_instance(counter_prefix(), 0), false, 0, false);
+        registry.release("p0", spawn_instance(counter_prefix(), 0, test_brand_key()), false, 0, false);
         let stats = registry.stats();
         assert_eq!(stats.warm_busy, 0);
         assert!(stats.per_prefix.is_empty());
@@ -864,7 +881,7 @@ mod tests {
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),
         });
-        let dead = spawn_instance(looping, 0);
+        let dead = spawn_instance(looping, 0, test_brand_key());
         let first = dead.call(bump_job());
         assert!(first.tainted);
         assert!(matches!(
