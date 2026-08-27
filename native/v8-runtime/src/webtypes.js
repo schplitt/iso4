@@ -959,4 +959,8 @@
       configurable: true,
     })
   }
+
+  // Returned to `install()`, which keeps these references in private slots so
+  // deserialization never depends on the (guest-mutable) globals above.
+  return [Headers, Request, Response]
 })

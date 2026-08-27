@@ -429,8 +429,14 @@ objects. Enabling it would make V8 call back into the embedder for _every_ plain
 object serialized.
 
 The internal field is deliberately left **empty** (zeroed at construction).
-The type tag comes from an `instanceof` check inside `write_host_object`,
-which only runs for objects V8 already routed there.
+The type tag lives in a **private-symbol property** stamped onto every
+instance at construction. Private symbols are unreachable from guest JS, so
+the tag cannot be forged or removed, and identifying an instance never
+consults guest-mutable state (`globalThis` lookups, `instanceof`,
+`Symbol.hasInstance`). The runtime likewise captures the three class
+references once at install time into private slots, so rehydrating an
+instance wires its prototype from a stable handle rather than the live
+global.
 
 Node has no write-side equivalent. `v8.Serializer` exposes no delegate to
 JavaScript and `_writeHostObject` never fires for a class instance — the object
@@ -457,8 +463,10 @@ The asymmetry is safe because the two directions never share a reader: Rust read
 what Node writes and vice versa, never both.
 
 Sandbox-side subclasses (`class My extends Response {}`) keep their internal
-fields and route normally. A _lookalike_ that re-points its prototype without
-calling the real constructor has no internal field and is not supported.
+fields, receive the type stamp in the shell constructor `super()` reaches, and
+route normally. A _lookalike_ that re-points its prototype without calling the
+real constructor has no internal field and no stamp: it crosses as the plain
+data it is.
 
 #### 4.4.7 Versioning
 
