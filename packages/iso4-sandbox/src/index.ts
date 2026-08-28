@@ -121,9 +121,10 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     // stdin, stdout, and stderr are closed so runtime diagnostics do not add
     // I/O overhead to normal runs.
     //
-    // Per-run trace lines and native diagnostics are discarded so logging does
-    // not add I/O overhead to normal runs.
-    stdio: ['ignore', 'ignore', 'ignore'],
+    // Per-run trace lines and native diagnostics are discarded by default so
+    // logging does not add I/O overhead to normal runs. Set ISO4_V8_TRACE=1
+    // when diagnostics are needed.
+    stdio: ['ignore', 'ignore', process.env['ISO4_V8_TRACE'] === '1' ? 'inherit' : 'ignore'],
   })
 
   proc.once('error', (err) => {
