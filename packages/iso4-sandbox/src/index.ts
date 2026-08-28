@@ -121,10 +121,8 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     // stdin, stdout, and stderr are closed so runtime diagnostics do not add
     // I/O overhead to normal runs.
     //
-    // Per-run trace lines are off by default — writing two lines to an
-    // inherited stderr costs 2-4 % of a hot run. Set `ISO4_V8_TRACE=1` in the
-    // environment to re-enable them; errors and lifecycle events are still
-    // recorded by the native process.
+    // Per-run trace lines and native diagnostics are discarded so logging does
+    // not add I/O overhead to normal runs.
     stdio: ['ignore', 'ignore', 'ignore'],
   })
 
