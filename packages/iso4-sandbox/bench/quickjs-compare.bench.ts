@@ -16,8 +16,8 @@ const ISO4_CODE = 'export default 42'
 const QUICKJS_CODE = '42'
 
 const iso4: Sandbox = await createSandbox({ maxIsolates: 1 })
-const prefix: Prefix = await iso4.precompile({ code: 'export default () => 42' })
-const prefixWarmup = await prefix.call({ export: 'default', args: [] })
+const prefix: Prefix = await iso4.precompile({ code: 'export default { value: () => 42 }' })
+const prefixWarmup = await prefix.call({ export: 'default.value', args: [] })
 if (!prefixWarmup.ok || prefixWarmup.value !== 42)
   throw new Error('iso4 prefix warm-up sanity check failed')
 
@@ -45,7 +45,7 @@ describe('resident runtime evaluation + round trip', () => {
   bench(
     'iso4 sandbox.prefix (warm isolate → call → socket round trip)',
     async () => {
-      const result = await prefix.call({ export: 'default', args: [] })
+      const result = await prefix.call({ export: 'default.value', args: [] })
       if (!result.ok || result.value !== 42)
         throw new Error('iso4 sandbox.prefix sanity check failed')
     },
