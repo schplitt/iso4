@@ -56,9 +56,12 @@ describe('resident runtime evaluation + round trip', () => {
     'QuickJS (resident context → eval)',
     () => {
       const result = quickjs.unwrapResult(quickjs.evalCode(QUICKJS_CODE))
-      if (quickjs.dump(result) !== 42)
-        throw new Error('QuickJS sanity check failed')
-      result.dispose()
+      try {
+        if (quickjs.dump(result) !== 42)
+          throw new Error('QuickJS sanity check failed')
+      } finally {
+        result.dispose()
+      }
     },
     HEAVY_OPTS,
   )
