@@ -51,6 +51,7 @@
     "@schplitt/eslint-config": "catalog:",
     "@types/node": "catalog:",
     "eslint": "catalog:",
+    "quickjs-emscripten": "catalog:",
     "tsdown": "catalog:",
     "tsnapi": "catalog:",
     "typescript": "catalog:",

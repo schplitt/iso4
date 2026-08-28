@@ -118,14 +118,14 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     '--warm-budget-bytes',
     String(warmBudgetBytes),
   ], {
-    // stdin closed, stdout ignored, stderr forwarded so runtime diagnostics
-    // (the [iso4-v8] lines) appear in the host process's stderr.
+    // stdin, stdout, and stderr are closed so runtime diagnostics do not add
+    // I/O overhead to normal runs.
     //
     // Per-run trace lines are off by default — writing two lines to an
     // inherited stderr costs 2-4 % of a hot run. Set `ISO4_V8_TRACE=1` in the
-    // environment to re-enable them; errors and lifecycle events are always
-    // logged.
-    stdio: ['ignore', 'ignore', 'inherit'],
+    // environment to re-enable them; errors and lifecycle events are still
+    // recorded by the native process.
+    stdio: ['ignore', 'ignore', 'ignore'],
   })
 
   proc.once('error', (err) => {
