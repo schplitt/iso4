@@ -4103,6 +4103,35 @@ describe('eval and new Function are prepare()-time only', () => {
     expect(result.exports.default).toEqual(['EvalError', 'EvalError'])
   })
 
+  test('a global declared enumerable: false is hidden from enumeration but callable (#123)', async () => {
+    const result = await runtime.run({
+      code: `
+        const keys = Object.keys(globalThis)
+        export default {
+          hiddenListed: keys.includes('hiddenTool') || keys.includes('SECRETS'),
+          visibleListed: keys.includes('visibleTool'),
+          hiddenWorks: await hiddenTool('x'),
+          secret: SECRETS.token,
+        }
+      `,
+      globals: {
+        hiddenTool: { kind: 'bridge', handler: async (q: unknown) => `ok:${String(q)}`, enumerable: false },
+        SECRETS: { kind: 'data', value: { token: 't-1' }, enumerable: false },
+        visibleTool: async () => 1,
+      },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      hiddenListed: false,
+      visibleListed: true,
+      hiddenWorks: 'ok:x',
+      secret: 't-1',
+    })
+  })
+
   test('runtime internals never surface through enumeration (#84)', async () => {
     // A tool global plus a host import (which installs the internal
     // dispatcher). Enumeration sees the declared name only; the plumbing

@@ -11,7 +11,7 @@ export interface BridgeCallEntry {
   ok: boolean;
   blocked: boolean;
 }
-export interface BridgeWithShim<H extends (...args: unknown[]) => unknown = (...args: unknown[]) => unknown> {
+export interface BridgeWithShim<H extends (...args: unknown[]) => unknown = (...args: unknown[]) => unknown> extends GlobalOptions {
   kind: "bridge-with-shim";
   handler: H;
   shim: string;
@@ -31,7 +31,7 @@ export interface CallTarget {
   export: string;
   args?: unknown[];
 }
-export interface DataGlobal {
+export interface DataGlobal extends GlobalOptions {
   kind: "data";
   value: HostExportData | Request | Response | Headers;
 }
@@ -170,14 +170,14 @@ export type HostExportData = null | undefined | boolean | number | bigint | stri
 };
 export type HostExportFunction = (..._: unknown[]) => unknown;
 export type HostGlobals = Record<string, HostGlobalValue>;
-export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> | DataGlobal;
+export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> | DataGlobal | BridgeGlobal<any> | StringGlobal;
 export type HostModuleValue = HostExportFunction | HostExportData | HostModuleObject;
 export type Imports<M extends Record<string, ImportValue> = Record<string, ImportValue>> = M;
 export type ImportValue = string | HostModuleObject;
-export type RebindGlobals<G extends HostGlobals> = { [K in keyof G as G[K] extends string | DataGlobal ? never : K]?: RebindValue<G[K]> };
+export type RebindGlobals<G extends HostGlobals> = { [K in keyof G as G[K] extends string | DataGlobal | StringGlobal ? never : K]?: RebindValue<G[K]> };
 export type RebindHostModule<T> = T extends HostExportFunction ? T : T extends HostModuleObject ? { [K in keyof T as T[K] extends HostExportFunction ? K : T[K] extends HostModuleObject ? K : never]?: T[K] extends HostExportFunction ? T[K] : T[K] extends HostModuleObject ? RebindHostModule<T[K]> : never } : never;
 export type RebindImports<M extends Record<string, ImportValue>> = Record<string, ImportValue> extends M ? Record<string, never> : { [K in keyof M as M[K] extends string ? never : K]?: M[K] extends HostModuleObject ? RebindHostModule<M[K]> : never };
-export type RebindValue<V extends HostGlobalValue> = V extends BridgeWithShim<infer H> ? H : V extends HostExportFunction ? V : never;
+export type RebindValue<V extends HostGlobalValue> = V extends BridgeWithShim<infer H> ? H : V extends BridgeGlobal<infer H> ? H : V extends HostExportFunction ? V : never;
 export type RunErrorCode = "ERR_USER_CODE" | "ERR_MEMORY_LIMIT" | "ERR_CPU_TIMEOUT" | "ERR_WALL_TIMEOUT" | "ERR_ABORTED" | "ERR_MODULE_NOT_FOUND" | "ERR_COMPILE" | "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED" | "ERR_EXPORT_NOT_SERIALIZABLE" | "ERR_TYPE_NOT_SERIALIZABLE" | "ERR_EXPORT_TOO_LARGE" | "ERR_CALL_TARGET_NOT_FOUND" | "ERR_HOST_BRIDGE" | "ERR_BRIDGE_PAYLOAD_TOO_LARGE" | "ERR_BRIDGE_CALL_LIMIT_EXCEEDED" | "ERR_UNDECLARED_BINDING" | "ERR_PREFIX_DID_NOT_SETTLE" | "ERR_PREFIX_BRIDGE_CALL" | "ERR_WARMUP_LIMIT" | "ERR_PREFIX_DISPOSED" | "ERR_PROTOCOL_DESYNC" | "ERR_INTERNAL";
 export type RunResult = RunSuccess | RunFailure | RunAborted;
 export type SandboxExports = {

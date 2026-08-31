@@ -136,18 +136,75 @@ export type HostGlobals = Record<string, HostGlobalValue>
  * The value types accepted for a named global.
  *
  * - `HostExportFunction` — bridge call: every sandbox invocation dispatches
- *   to the host handler.
+ *   to the host handler. Shorthand for `BridgeGlobal` with the defaults.
  * - `string` — a JS expression the runtime evaluates once and installs as
  *   `globalThis.<name>`. Use for pure sandbox utilities that need no host
  *   involvement. The expression is evaluated by Rust as its own script, so it
- *   never shifts the line numbers of user code.
+ *   never shifts the line numbers of user code. Shorthand for `StringGlobal`
+ *   with the defaults.
+ * - `BridgeGlobal` / `StringGlobal` — the same two as object forms, for when
+ *   an option (`enumerable`) is needed.
  * - `DataGlobal` — a plain constant carried as data and installed natively;
  *   no code text, no host involvement.
  * - `BridgeWithShim` — bridge call + in-sandbox result wrapper. The handler
  *   can be rebound per `prefix.run()`; the shim is part of the prefix state.
+ *
+ * Every **object** form accepts `enumerable?: boolean` (default `true`).
+ * The bare-function and bare-string shorthands are always enumerable.
  */
 
-export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> | DataGlobal
+export type HostGlobalValue
+  = HostExportFunction | string | BridgeWithShim<any> | DataGlobal | BridgeGlobal<any> | StringGlobal
+
+/**
+ * Shared option of every object-form global.
+ *
+ * `enumerable: false` keeps the name out of `for...in`, `Object.keys`, and
+ * spreads of `globalThis`, so enumeration-driven sandbox code (serializers,
+ * "copy the environment" patterns) never sweeps it up. This is hygiene, not
+ * secrecy: the property still appears in `Object.getOwnPropertyNames` (a
+ * language-level fact, identical in every engine), and code that knows the
+ * name can still call it. A capability that must be undiscoverable belongs in
+ * `imports`, which nothing can enumerate.
+ */
+export interface GlobalOptions {
+  /**
+   * Whether the installed global shows up in enumeration. Defaults to `true`,
+   * matching how browsers keep `fetch` enumerable on `window`.
+   */
+  enumerable?: boolean
+}
+
+/**
+ * Object form of the bare-function bridge global, for when options are
+ * needed. `handler` is exactly the function the shorthand would be.
+ *
+ * ```ts
+ * globals: { myTool: { kind: 'bridge', handler: async (q) => search(q), enumerable: false } }
+ * ```
+ */
+export interface BridgeGlobal<
+  H extends HostExportFunction = HostExportFunction,
+> extends GlobalOptions {
+  kind: 'bridge'
+  /**
+   * Bridge handler — every sandbox invocation dispatches to it. Can be
+   * rebound per `prefix.run()` like a shorthand bridge global.
+   */
+  handler: H
+}
+
+/**
+ * Object form of the bare-string expression global, for when options are
+ * needed. `expr` is exactly the expression the shorthand would be.
+ */
+export interface StringGlobal extends GlobalOptions {
+  kind: 'string'
+  /**
+   * JS expression the runtime evaluates once and installs under the name.
+   */
+  expr: string
+}
 
 /**
  * A plain **constant** global — a data value installed directly on the sandbox
@@ -166,7 +223,7 @@ export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> 
  * Like string globals, a data global is a constant — it cannot be rebound per
  * `prefix.run()`.
  */
-export interface DataGlobal {
+export interface DataGlobal extends GlobalOptions {
   kind: 'data'
   /**
    * Any `HostExportData`, or a `Request`/`Response`/`Headers` — including nested
@@ -202,7 +259,7 @@ export interface DataGlobal {
  */
 export interface BridgeWithShim<
   H extends (...args: unknown[]) => unknown = (...args: unknown[]) => unknown,
-> {
+> extends GlobalOptions {
   kind: 'bridge-with-shim'
   /**
    * Bridge handler — registered as `__iso4_<name>_h` for rebinding.
@@ -237,8 +294,9 @@ export interface BridgeWithShim<
  */
 export type RebindValue<V extends HostGlobalValue>
   = V extends BridgeWithShim<infer H> ? H
-    : V extends HostExportFunction ? V
-      : never
+    : V extends BridgeGlobal<infer H> ? H
+      : V extends HostExportFunction ? V
+        : never
 
 /**
  * The per-run globals override map for a `Prefix<G>`.
@@ -252,7 +310,7 @@ export type RebindValue<V extends HostGlobalValue>
  * enforces the correct constraint per global kind.
  */
 export type RebindGlobals<G extends HostGlobals> = {
-  [K in keyof G as G[K] extends string | DataGlobal ? never : K]?: RebindValue<G[K]>
+  [K in keyof G as G[K] extends string | DataGlobal | StringGlobal ? never : K]?: RebindValue<G[K]>
 }
 
 // ─────────────────────────────────────────────────────────────────────────

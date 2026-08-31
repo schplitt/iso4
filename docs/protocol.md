@@ -648,8 +648,9 @@ distinct from absent.
 Each host global is installed **natively** by the runtime — the client never
 prepends generated source to user code, so user code always starts at line 1,
 and a global's name reaches the sandbox global object through the V8 API
-(`object.set`), never interpolated into an identifier position. Every entry is a
-`u8` kind tag, then a `String` name, then a kind-specific tail:
+(`object.set`), never interpolated into an identifier position. Every entry is
+a `u8` kind tag, then a `String` name, then a `bool enumerable`, then a
+kind-specific tail:
 
 | Kind Byte | Kind     | Tail                              | Install                                                                                                                            |
 | --------- | -------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
@@ -657,6 +658,14 @@ and a global's name reaches the sandbox global object through the V8 API
 | `0x01`    | `string` | `String expr`                     | Runtime evaluates `(expr)` as its own script; sets `globalThis[name]`.                                                             |
 | `0x02`    | `data`   | `ValueBlob value`                 | Materialised via the value codec (§4); sets `globalThis[name]`.                                                                    |
 | `0x03`    | `shim`   | `String shim, String handlerName` | Installs a bridge stub under `handlerName` and a wrapper `async (...a) => shim(await globalThis[handlerName](...a))` under `name`. |
+
+`enumerable` is the host's per-global opt-out of enumeration (`false` installs
+the public name with `DONT_ENUM`, keeping it out of `for...in` /
+`Object.keys` while staying reachable by name). It applies to the name a run
+sees; the runtime installs the same attribute on that name's between-runs
+placeholder so the enumerated surface never differs between prepare time and
+run time. Runtime-internal names (`__iso4_*`, e.g. a shim's `handlerName`)
+install non-enumerable regardless of the flag.
 
 Only `bridge` and `shim` install a bridge stub (and so require the session
 socket); `string`/`data` are pure in-isolate installs. On `PrefixRun` every
