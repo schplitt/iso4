@@ -147,6 +147,32 @@ describe('runtime.run() — direct execution', () => {
     expect(result.exports.default).toEqual({ x: 1, y: 2 })
   })
 
+  // Locale-aware calls route through ICU. Without ICU data embedded in the
+  // runtime binary, V8 aborts the whole process on the first one ("Fatal
+  // process out of memory: DateTimePatternGeneratorCache::CreateGenerator"),
+  // so these assert real localized output, not just survival.
+  test('Intl — toLocaleString returns localized output', async () => {
+    const result = await runtime.run({
+      code: 'export default new Date(0).toLocaleString("de-DE", { timeZone: "UTC" })',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toContain('1.1.1970')
+  })
+
+  test('Intl — NumberFormat works and the runtime survives', async () => {
+    const result = await runtime.run({
+      code: 'export default new Intl.NumberFormat("de-DE").format(1234.5)',
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('1.234,5')
+    const after = await runtime.run({ code: 'export default 2 + 2' })
+    expect(after.ok).toBe(true)
+  })
+
   test('export default array', async () => {
     const result = await runtime.run({ code: 'export default [1, 2, 3]' })
     expect(result.ok).toBe(true)
