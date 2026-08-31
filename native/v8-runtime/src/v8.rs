@@ -1174,6 +1174,16 @@ fn run_call_phase(
     install_value_globals(scope, globals)
         .map_err(|e| failure(termination_or(reason, e), unsafe { &*logs }, start))?;
 
+    // Setup is complete; everything that executes from here on is per-run
+    // sandbox input. Disable code generation from strings (eval,
+    // new Function) for it: code a prepared module builds at prepare() time
+    // is reproducible from its stored source, while strings evaluated here
+    // would be production code with no source of record (#76 — workerd draws
+    // the same line between startup and run time). V8 throws a catchable
+    // EvalError at the call site; the run itself continues. On a warm
+    // instance the retained context simply stays denied across calls.
+    context_local.set_allow_generation_from_strings(false);
+
     v8::tc_scope!(let scope, scope);
 
     // Shared settle machinery — the module evaluation promise and a requested
@@ -6151,6 +6161,73 @@ mod tests {
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
+    // ── #76: code generation from strings is a prepare()-time capability ────
+
+    #[test]
+    fn run_code_cannot_eval_or_new_function() {
+        let out = execute(
+            "const probe = (fn) => { try { fn(); return 'allowed' } catch (e) { \
+               return (e instanceof EvalError) + ':' + e.constructor.name } }\n\
+             export default [probe(() => eval('1')), \
+               probe(() => new Function('return 1'))].join('|')",
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        // Catchable EvalError at the call site — the run itself completed.
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("true:EvalError|true:EvalError")
+        );
+    }
+
+    #[test]
+    fn prepared_setup_keeps_codegen_and_its_products_stay_callable() {
+        // The zod-shaped pattern: setup compiles fast paths from strings at
+        // prepare() time; run code calls the compiled functions but cannot
+        // generate code of its own.
+        let prefix = prepared(
+            "globalThis.double = new Function('a', 'return a * 2')\n\
+             globalThis.viaEval = eval('(x) => x + 1')",
+            &[],
+            &[],
+        );
+        let out = execute_with_prefix(
+            prefix,
+            Some(
+                "const denied = (() => { try { eval('1'); return 'allowed' } \
+                   catch (e) { return e instanceof EvalError } })()\n\
+                 export default [double(21), viaEval(41), denied].join('|')",
+            ),
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("42|42|true"));
+    }
+
+    #[test]
+    fn precompile_validation_permits_codegen() {
+        precompile(
+            "globalThis.f = new Function('return 1'); eval('2')",
+            None,
+            &[],
+            &[],
+            0,
+        )
+        .unwrap();
+    }
+
     // GH #55: top-level `await` used to fail every prefix because nothing
     // drained the microtask queue after module evaluation.
 
@@ -9506,6 +9583,45 @@ mod tests {
             assert!(!outcome.tainted);
             let out = outcome.result.expect("bump succeeds");
             assert_eq!(value_of(&out), WireValue::Number(f64::from(expected)));
+        }
+    }
+
+    #[test]
+    fn codegen_stays_denied_across_warm_calls_while_setup_products_work() {
+        // The retained context is switched to deny-codegen on the first call
+        // and must stay that way for every later call, while functions the
+        // setup compiled at warm-up keep working (#76).
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "globalThis.mk = new Function('return 7')",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("setup using new Function warms up");
+        for _ in 0..2 {
+            let outcome = run_call_on_core(
+                &mut core,
+                Some(
+                    "const denied = (() => { try { new Function('1'); return 'allowed' } \
+                       catch (e) { return e instanceof EvalError } })()\n\
+                     export default [mk(), denied].join('|')",
+                ),
+                "<iso4>",
+                &[],
+                Limits::default(),
+                &[],
+                &[],
+                None,
+                Arc::new(AtomicU32::new(0)),
+                None,
+            );
+            assert!(!outcome.tainted);
+            let out = outcome.result.expect("call succeeds");
+            assert_eq!(get_default(&out).as_deref(), Some("7|true"));
         }
     }
 

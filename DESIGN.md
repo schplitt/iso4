@@ -963,10 +963,16 @@ Documented up front so we don't drift into rebuilding secure-exec:
 3. **No streaming.** `fetch` buffers the full response body. Cap defaults to
    16 MB. Streaming would require handle-based `ReadableStream`s; not v1.
 
-4. **No `eval` / `new Function`.** `context.allow_code_generation_from_strings(false)`
-   by default. The sandbox cannot generate code from strings at runtime.
-   This blocks some libraries (JSON5 parsers using `Function("return …")`).
-   Override per-run if needed.
+4. **No `eval` / `new Function` in run code.** Code generation from strings
+   is a `prepare()`-time capability: it is allowed while prepared setup code
+   evaluates (whose output is reproducible from the stored source — the
+   zod-style compile-fast-paths-at-setup pattern works there), and disabled
+   the moment per-run code starts, on one-off runs and warm instances alike.
+   Run code calling `eval` or `new Function` gets a catchable `EvalError` at
+   the call site; the run itself continues. Same line workerd draws between
+   startup and run time, for the same reason: everything that executes per
+   run should be code the host actually handed over, not strings assembled
+   from per-run input. There is no override.
 
 5. **No WebAssembly.** `set_allow_wasm_code_generation_callback(_ => false)`.
 
