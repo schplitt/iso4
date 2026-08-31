@@ -1,5 +1,11 @@
 # @iso4/sandbox
 
+## 0.4.2
+
+### Patch Changes
+
+- 47ff51a: Embed ICU data in the runtime binary. Locale-aware calls in sandboxed code (`toLocaleString`, `Intl.*`, `localeCompare`) previously aborted the whole V8 runtime process with "Fatal process out of memory: DateTimePatternGeneratorCache::CreateGenerator", leaving the sandbox unreachable for every subsequent run. They now return correctly localized output.
+
 ## 0.4.1
 
 ### Patch Changes
