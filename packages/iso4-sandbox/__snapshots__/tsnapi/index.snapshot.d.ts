@@ -11,6 +11,10 @@ export interface BridgeCallEntry {
   ok: boolean;
   blocked: boolean;
 }
+export interface BridgeGlobal<H extends HostExportFunction = HostExportFunction> extends GlobalOptions {
+  kind: "bridge";
+  handler: H;
+}
 export interface BridgeWithShim<H extends (...args: unknown[]) => unknown = (...args: unknown[]) => unknown> extends GlobalOptions {
   kind: "bridge-with-shim";
   handler: H;
@@ -26,6 +30,7 @@ export interface CallSuccess {
   cpuTimeMs: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
+  waitUntil?: Promise<WaitUntilResult>;
 }
 export interface CallTarget {
   export: string;
@@ -34,6 +39,9 @@ export interface CallTarget {
 export interface DataGlobal extends GlobalOptions {
   kind: "data";
   value: HostExportData | Request | Response | Headers;
+}
+export interface GlobalOptions {
+  enumerable?: boolean;
 }
 export interface HostModuleObject {
   [name: string]: HostModuleValue;
@@ -85,6 +93,7 @@ export interface ResourceLimits {
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
   maxBridgeCalls?: number;
+  graceMs?: number;
 }
 export interface RunCallOptions extends RunOptions {
   call: CallTarget;
@@ -126,6 +135,7 @@ export interface RunSuccess {
   cpuTimeMs: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
+  waitUntil?: Promise<WaitUntilResult>;
 }
 export interface Sandbox {
   run: {
@@ -159,6 +169,22 @@ export interface SandboxStats {
     idle: number;
     busy: number;
   }>;
+}
+export interface StringGlobal extends GlobalOptions {
+  kind: "string";
+  expr: string;
+}
+export interface WaitUntilResult {
+  status: "settled" | "truncated" | "failed";
+  durationMs: number;
+  cpuTimeMs: number;
+  stdout: string[];
+  stderr: string[];
+  bridgeCalls: BridgeCallEntry[];
+  error?: {
+    name: string;
+    message: string;
+  };
 }
 // #endregion
 

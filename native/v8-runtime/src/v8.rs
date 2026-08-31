@@ -76,6 +76,10 @@ pub struct Limits {
     /// Default on the TS side is 10 when the host does not set an explicit
     /// value, so the door is never accidentally left open.
     pub max_bridge_calls: u32,
+    /// Wall budget for the `waitUntil` epilogue after the run's value settles
+    /// (#71). Zero disables the epilogue: registered background work dies at
+    /// settle, exactly the pre-#71 behavior.
+    pub grace_ms: u32,
 }
 
 /// Termination reason set by the first limit-guard thread to fire.
@@ -479,6 +483,19 @@ impl BridgeCallLog {
         }
     }
 
+    /// Non-draining snapshot for the early Result frame (#71): a clone of
+    /// the records so far, in-flight entries stamped with their
+    /// duration-until-now, in-flight tracking untouched so grace-time
+    /// settlement keeps working.
+    fn snapshot(&self, now_ms: f64) -> Vec<wire::BridgeCallRecord> {
+        let mut records = self.records.clone();
+        for idx in self.in_flight.values() {
+            let r = &mut records[*idx];
+            r.duration_ms = round_micro((now_ms - r.start_ms).max(0.0));
+        }
+        records
+    }
+
     /// Snapshot the records for the run result. Calls still in flight get
     /// their duration set to "until run end" and stay `ok: false`.
     fn finalize(&mut self, now_ms: f64) -> Vec<wire::BridgeCallRecord> {
@@ -526,10 +543,103 @@ pub struct Output {
     /// with microsecond resolution.
     pub cpu_time_ms: f64,
 
+    /// The `waitUntil` epilogue's outcome (#71), when the run registered
+    /// background work and `limits.grace_ms` allowed a grace phase. `None`
+    /// for every run that registered nothing — the common case, which pays
+    /// nothing.
+    pub background: Option<GraceReport>,
+
     /// One record per bridge call the sandbox attempted, in attempt order —
     /// including attempts blocked Rust-side (limit exceeded, oversized
     /// payload, function arguments) that never reached the host.
     pub bridge_calls: Vec<wire::BridgeCallRecord>,
+}
+
+// ── waitUntil ─────────────────────────────────────────────────
+
+/// How a `waitUntil` grace phase ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraceStatus {
+    /// Every registered promise settled (fulfilled) within the budget.
+    Settled,
+    /// The grace budget (wall at a turn boundary, or the CPU guard mid-turn)
+    /// or a host `Terminate` cut the work short.
+    Truncated,
+    /// At least one registered promise rejected; the rest were driven to
+    /// completion. A normal outcome — the code finished via its error path.
+    Failed,
+}
+
+/// Telemetry of one grace phase, carried on the `RunComplete` frame.
+#[derive(Debug, Clone)]
+pub struct GraceReport {
+    pub status: GraceStatus,
+    /// Wall time of the grace phase (after the Result shipped), ms.
+    pub duration_ms: f64,
+    /// Active V8 execution time during grace, ms.
+    pub cpu_time_ms: f64,
+    /// Console lines written during grace (the run's own lines already
+    /// shipped on the Result).
+    pub stdout: Vec<String>,
+    pub stderr: Vec<String>,
+    /// Bridge calls attempted during grace.
+    pub bridge_calls: Vec<wire::BridgeCallRecord>,
+    /// `name`/`message` of the first rejection when `status == Failed`, or of
+    /// the fatal error that ended a truncated phase, when one exists.
+    pub error: Option<(String, String)>,
+    /// Whether the early Result frame was written by the run flow. Always
+    /// true on the session paths; false only in direct-API use without a
+    /// socket or epilogue spec (tests), where grace ran before returning.
+    pub early_result_sent: bool,
+}
+
+/// Per-run identity the run flow needs to write the early Result frame
+/// itself (#71). Installed per run as thread state by the session loop and
+/// the warm owner thread — the same pattern as the descriptor brand key
+/// (#94) — so the deep call chain stays unchanged. Unset (direct API, tests)
+/// means grace runs in hold mode: work is driven before the run returns.
+#[derive(Clone, Copy)]
+pub struct EpilogueSpec {
+    /// The run's wire id, echoed on the early Result and the RunComplete.
+    pub run_id: u32,
+    /// Whether the early Result reports `heapUsedBytes` (prefix runs feed
+    /// eviction scoring; one-off runs do not).
+    pub report_heap: bool,
+}
+
+thread_local! {
+    static EPILOGUE_SPEC: std::cell::Cell<Option<EpilogueSpec>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Install the epilogue spec for the next run executed on this thread.
+/// Consumed by that run; set it before every `execute`/`run_call_on_core`.
+pub fn set_run_epilogue_spec(spec: Option<EpilogueSpec>) {
+    EPILOGUE_SPEC.with(|c| c.set(spec));
+}
+
+fn take_epilogue_spec() -> Option<EpilogueSpec> {
+    EPILOGUE_SPEC.with(|c| c.take())
+}
+
+/// Background work registered by `waitUntil` (#71).
+///
+/// Instance-lifetime storage with a stable heap address (same pattern as the
+/// console's `LogBuffers`): the native callback reaches it through an
+/// `External`. `slot` is `None` outside run code — setup evaluation, between
+/// calls — so a prepare()-time `waitUntil` throws a catchable error; it is
+/// armed with an empty set at the setup-to-run boundary (the same line where
+/// codegen-from-strings switches off, #76) and disarmed after the run.
+pub struct PendingWork {
+    slot: RefCell<Option<Vec<v8::Global<v8::Promise>>>>,
+}
+
+impl PendingWork {
+    fn boxed() -> Box<Self> {
+        Box::new(Self {
+            slot: RefCell::new(None),
+        })
+    }
 }
 
 /// The result of a failed JavaScript execution.
@@ -840,6 +950,8 @@ fn run_module_inner(
         max_stderr_bytes: limits.max_stderr_bytes,
         ..LogBuffers::default()
     };
+    // waitUntil registrations (#71); one-off runs hold it for the run's life.
+    let pending_work = PendingWork::boxed();
 
     // `reason` is created before the isolate so it can be shared with the
     // ArrayBuffer allocator (which is registered in CreateParams, before the
@@ -1005,6 +1117,11 @@ fn run_module_inner(
     install_async_context(scope)
         .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
 
+    // waitUntil (#71): installed disarmed — run_call_phase arms it at the
+    // setup-to-run boundary.
+    install_wait_until(scope, &*pending_work)
+        .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
+
         v8::Global::new(scope, context)
     };
 
@@ -1034,6 +1151,8 @@ fn run_module_inner(
             bridge_log: &bridge_log,
             reason: &reason,
             logs: std::ptr::addr_of!(logs),
+            pending: &*pending_work,
+            epilogue: take_epilogue_spec(),
             cancel_wall: &cancel_wall,
             cancel_cpu: &cancel_cpu,
             cancel_handle: &cancel_handle,
@@ -1060,6 +1179,12 @@ struct CallPhaseCtx<'a> {
     /// pointer; only transient borrows are taken, never across JS execution
     /// — the same discipline the pre-split code applied to its `logs` local.
     logs: *const LogBuffers,
+    /// The run's `waitUntil` registration set (#71) — instance-lifetime Box,
+    /// same pointer discipline as `logs`. Armed at the setup-to-run boundary
+    /// below, drained by the grace phase, disarmed by the caller.
+    pending: *const PendingWork,
+    /// Per-run identity for the early Result frame (#71); `None` = hold mode.
+    epilogue: Option<EpilogueSpec>,
     cancel_wall: &'a crossbeam_channel::Sender<()>,
     cancel_cpu: &'a crossbeam_channel::Sender<()>,
     cancel_handle: &'a v8::IsolateHandle,
@@ -1094,6 +1219,8 @@ fn run_call_phase(
         bridge_log,
         reason,
         logs,
+        pending,
+        epilogue,
         cancel_wall,
         cancel_cpu,
         cancel_handle,
@@ -1187,6 +1314,14 @@ fn run_call_phase(
     // EvalError at the call site; the run itself continues. On a warm
     // instance the retained context simply stays denied across calls.
     context_local.set_allow_generation_from_strings(false);
+
+    // Arm waitUntil for this run (#71) at the same boundary: setup code could
+    // not register background work (the slot was None and the call threw);
+    // run code now can.
+    // SAFETY: `pending` points at the instance-lifetime PendingWork Box.
+    unsafe {
+        *(*pending).slot.borrow_mut() = Some(Vec::new());
+    }
 
     v8::tc_scope!(let scope, scope);
 
@@ -1700,7 +1835,7 @@ fn run_call_phase(
         return Err(failure(RunError::ExportTooLarge, unsafe { &*logs }, start));
     }
 
-    Ok(Output {
+    let mut output = Output {
         exports,
         skipped_exports,
         stdout: unsafe { &*logs }.stdout.clone(),
@@ -1709,7 +1844,348 @@ fn run_call_phase(
         // Stamped by run_module from the shared run state.
         cpu_time_ms: 0.0,
         bridge_calls: Vec::new(),
-    })
+        background: None,
+    };
+
+    // ── waitUntil ─────────────────────────────────────────────
+    // The value is settled and serialized; if the run registered background
+    // work (and the grace budget allows any), the run's second phase starts:
+    // the Result ships early, the pending set is driven under its own
+    // budgets, and the outcome travels on a final RunComplete frame. A run
+    // that registered nothing takes none of these branches and behaves
+    // exactly as before #71.
+    let has_pending = unsafe {
+        (*pending)
+            .slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|set| !set.is_empty())
+    };
+    if has_pending && limits.grace_ms > 0 {
+        // The run phase is over: its guards come down before grace arms its
+        // own (idempotent with the caller's GuardCanceller).
+        cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
+        cancel_handle.cancel_terminate_execution();
+
+        output.background = Some(run_grace_phase(
+            scope,
+            &mut output,
+            pending,
+            epilogue,
+            &GracePhaseCtx {
+                stream_fd,
+                limits,
+                start,
+                reason,
+                cpu_budget,
+                bridge_log,
+                bridge_error: &bridge_error,
+                pending_resolvers: &pending_resolvers,
+                cancel_handle,
+                logs,
+            },
+        ));
+    }
+
+    Ok(output)
+}
+
+/// Cap the error strings carried on a `RunComplete` frame (#71 review): the
+/// rejection message is guest-authored and otherwise unbounded, and the frame
+/// has no per-field limits of its own.
+fn capped_grace_error(name: String, message: String) -> (String, String) {
+    let mut name = name;
+    let mut message = message;
+    name.truncate(256);
+    if message.len() > 2048 {
+        message.truncate(2048);
+        message.push_str("… [truncated]");
+    }
+    (name, message)
+}
+
+/// The run-phase state the grace phase borrows. A subset of `CallPhaseCtx`
+/// plus the shared bridge state that lives in `run_call_phase` locals.
+struct GracePhaseCtx<'a> {
+    stream_fd: Option<RawFd>,
+    limits: &'a Limits,
+    start: std::time::Instant,
+    reason: &'a Arc<ReasonCell>,
+    cpu_budget: &'a Arc<CpuBudget>,
+    bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
+    bridge_error: &'a Arc<OnceLock<RunError>>,
+    pending_resolvers: &'a PendingResolvers,
+    cancel_handle: &'a v8::IsolateHandle,
+    logs: *const LogBuffers,
+}
+
+/// Drive the registered background work after the run's value settled (#71).
+///
+/// Writes the early Result frame itself when a spec and socket exist (the
+/// session paths), then keeps the poll loop running — bridge calls included —
+/// until the pending set settles or the grace budgets end it. Grace has its
+/// own metering: a fresh CPU allotment (guarded — a mid-turn kill taints via
+/// the run's reason cell) and the `grace_ms` wall applied at turn boundaries
+/// through the poll loop's read timeout (a decoy reason cell, so a clean
+/// boundary stop does not taint).
+fn run_grace_phase(
+    scope: &mut v8::PinScope,
+    output: &mut Output,
+    pending: *const PendingWork,
+    epilogue: Option<EpilogueSpec>,
+    ctx: &GracePhaseCtx<'_>,
+) -> GraceReport {
+    // Freeze the run-phase telemetry for the early Result, and hand the
+    // console buffers over to grace: lines from here on belong to the report.
+    let run_cpu_ms = ctx.cpu_budget.elapsed_ms_precise();
+    let now_ms = elapsed_ms(ctx.start);
+    let run_records = ctx
+        .bridge_log
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .snapshot(now_ms);
+    let run_record_count = run_records.len();
+    // SAFETY: transient exclusive access to the console sink between JS
+    // executions — the discipline `logs` is held under everywhere else.
+    unsafe {
+        let l = ctx.logs.cast_mut();
+        (*l).stdout.clear();
+        (*l).stderr.clear();
+    }
+
+    let early_result_sent = match (epilogue, ctx.stream_fd) {
+        (Some(spec), Some(fd)) => {
+            let heap_used_bytes = spec.report_heap.then(|| {
+                let stats = scope.get_heap_statistics();
+                stats.used_heap_size() as u64
+            });
+            let payload = wire::encode_run_completion_payload(
+                spec.run_id,
+                wire::RunCompletion::Success(wire::RunSuccessPayload {
+                    exports: output.exports.clone(),
+                    skipped_exports: output.skipped_exports.clone(),
+                    stdout: output.stdout.clone(),
+                    stderr: output.stderr.clone(),
+                    duration_ms: output.duration_ms,
+                    cpu_time_ms: run_cpu_ms,
+                    bridge_calls: run_records,
+                    heap_used_bytes,
+                    background_pending: true,
+                }),
+            );
+            // SAFETY: same ManuallyDrop pattern as the bridge callbacks — the
+            // session thread is parked for the duration of the call, so this
+            // thread is the socket's only user.
+            let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
+            match ipc::write_rust_to_ts_frame(
+                &mut *sock,
+                ipc::RustToTsMessageType::Result,
+                &payload,
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    // Fall back to hold mode: the session writes the Result
+                    // (without the pending flag) after grace completes.
+                    eprintln!("[iso4-v8] early Result write failed ({e}); holding");
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+
+    // ── Grace budgets ────────────────────────────────────────────────────────
+    // CPU: a fresh allotment sized like the run's, or grace_ms when the run
+    // is CPU-unlimited, so a tight loop inside a continuation is always
+    // bounded. The guard writes the REAL reason cell and terminates — a
+    // mid-turn kill is a taint, per the fired-guard doctrine. Wall: enforced
+    // at turn boundaries by the poll loop's read timeout against a decoy
+    // cell — stopping between turns is clean and does not taint.
+    let grace_start = std::time::Instant::now();
+    let grace_cpu = Arc::new(CpuBudget::new());
+    let grace_cpu_cap = if ctx.limits.cpu_time_ms > 0 {
+        ctx.limits.cpu_time_ms
+    } else {
+        ctx.limits.grace_ms
+    };
+    let (grace_cancel_cpu, grace_cpu_join) = start_cpu_guard(
+        ctx.cancel_handle.clone(),
+        Arc::clone(ctx.reason),
+        Arc::clone(&grace_cpu),
+        grace_cpu_cap,
+    );
+    let decoy_reason = Arc::new(ReasonCell::new());
+
+    let mut error: Option<(String, String)> = None;
+    let mut status;
+    grace_cpu.enter();
+    v8::tc_scope!(let tc, scope);
+    'grace: loop {
+        tc.perform_microtask_checkpoint();
+
+        // The grace CPU guard writes the REAL reason cell when it kills a
+        // runaway continuation; end the phase the moment that happened
+        // instead of idling out the wall — the instance is tainted either
+        // way, but the pool slot frees now (#71 review, finding 2).
+        if ctx.reason.get().is_some() {
+            status = GraceStatus::Truncated;
+            break 'grace;
+        }
+
+        // Drain the set: drop what settled, note the first rejection, keep
+        // driving the rest. New registrations (waitUntil from a continuation)
+        // land in the same slot and are picked up next round.
+        // SAFETY: pending outlives the call; borrow is transient.
+        let taken = unsafe { (*pending).slot.borrow_mut().take() };
+        let mut still: Vec<v8::Global<v8::Promise>> = Vec::new();
+        for g in taken.unwrap_or_default() {
+            let p = v8::Local::new(tc, &g);
+            match p.state() {
+                v8::PromiseState::Pending => still.push(g),
+                v8::PromiseState::Rejected => {
+                    if error.is_none() {
+                        let rejection = p.result(tc);
+                        error = Some(capped_grace_error(
+                            error_name_from_value(tc, rejection)
+                                .unwrap_or_else(|| "Error".to_string()),
+                            error_message_from_value(tc, rejection)
+                                .unwrap_or_else(|| "background work failed".to_string()),
+                        ));
+                    }
+                }
+                v8::PromiseState::Fulfilled => {}
+            }
+        }
+        if still.is_empty() {
+            unsafe { *(*pending).slot.borrow_mut() = Some(Vec::new()) };
+            status = if error.is_some() {
+                GraceStatus::Failed
+            } else {
+                GraceStatus::Settled
+            };
+            break 'grace;
+        }
+        if grace_start.elapsed() >= Duration::from_millis(ctx.limits.grace_ms as u64) {
+            unsafe { *(*pending).slot.borrow_mut() = Some(still) };
+            status = GraceStatus::Truncated;
+            break 'grace;
+        }
+
+        // One aggregate promise over the remaining set, driven by the same
+        // settle machinery as the run itself (bridge frames, Terminate,
+        // boundary timeouts). Built with the pristine Promise.allSettled
+        // captured at install time from a private slot, so guest tampering
+        // with the public one changes nothing here.
+        let list = v8::Array::new(tc, still.len() as i32);
+        for (i, g) in still.iter().enumerate() {
+            let p = v8::Local::new(tc, g);
+            list.set_index(tc, i as u32, p.into());
+        }
+        unsafe { *(*pending).slot.borrow_mut() = Some(still) };
+        let aggregate = (|| -> Option<v8::Local<v8::Promise>> {
+            let global = tc.get_current_context().global(tc);
+            let key = grace_all_settled_key(tc)?;
+            let all_settled =
+                v8::Local::<v8::Function>::try_from(global.get_private(tc, key)?).ok()?;
+            let recv = v8::undefined(tc).into();
+            let p = all_settled.call(tc, recv, &[list.into()])?;
+            v8::Local::<v8::Promise>::try_from(p).ok()
+        })();
+        let Some(aggregate) = aggregate else {
+            status = GraceStatus::Truncated;
+            if error.is_none() {
+                error = Some((
+                    "Error".to_string(),
+                    "grace aggregate could not be built".to_string(),
+                ));
+            }
+            break 'grace;
+        };
+
+        // Wait in short ticks rather than one long sleep, so a mid-turn CPU
+        // kill (real reason cell) or the overall wall is observed within
+        // ~250 ms instead of holding the slot for the rest of grace_ms.
+        let remaining_ms = (ctx.limits.grace_ms as u64)
+            .saturating_sub(grace_start.elapsed().as_millis() as u64)
+            .max(1);
+        let tick_limits = Limits {
+            wall_time_ms: remaining_ms.min(250) as u32,
+            ..*ctx.limits
+        };
+        let tick_ctx = SettleCtx {
+            stream_fd: ctx.stream_fd,
+            limits: &tick_limits,
+            start: std::time::Instant::now(),
+            reason: &decoy_reason,
+            cpu_budget: &grace_cpu,
+            bridge_log: ctx.bridge_log,
+            bridge_error: ctx.bridge_error,
+            pending_resolvers: ctx.pending_resolvers,
+            cancel_handle: ctx.cancel_handle,
+        };
+        match settle_promise(tc, aggregate, &tick_ctx) {
+            // allSettled fulfils; re-enter the drain to pick up outcomes and
+            // any promises registered meanwhile.
+            Ok(v8::PromiseState::Fulfilled) => continue 'grace,
+            // No socket and nothing can resolve the rest.
+            Ok(_) => {
+                status = GraceStatus::Truncated;
+                break 'grace;
+            }
+            // A tick expired: loop back — the top of the loop decides whether
+            // the CPU guard fired or the overall wall is spent.
+            Err(RunError::WallTimeout) => continue 'grace,
+            // A host Terminate mid-grace (abort during the epilogue) — clean.
+            Err(RunError::Aborted) => {
+                status = GraceStatus::Truncated;
+                break 'grace;
+            }
+            // The grace CPU guard fired mid-turn (real reason cell set → the
+            // caller's taint verdict sees it), or a fatal bridge error.
+            Err(e) => {
+                status = GraceStatus::Truncated;
+                if error.is_none() {
+                    error = Some(capped_grace_error(
+                        "Error".to_string(),
+                        format!("{e:?}"),
+                    ));
+                }
+                break 'grace;
+            }
+        }
+    }
+    grace_cpu.leave();
+    let _ = grace_cancel_cpu.send(());
+    if let Some(j) = grace_cpu_join {
+        j.join().ok();
+    }
+
+    // Grace-only telemetry: records appended after the early snapshot, and
+    // the console lines written since the buffers were handed over.
+    let all_records = ctx
+        .bridge_log
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .snapshot(elapsed_ms(ctx.start));
+    let bridge_calls = all_records.get(run_record_count..).unwrap_or(&[]).to_vec();
+    let (stdout, stderr) = unsafe {
+        let l = ctx.logs.cast_mut();
+        (
+            std::mem::take(&mut (*l).stdout),
+            std::mem::take(&mut (*l).stderr),
+        )
+    };
+
+    GraceReport {
+        status,
+        duration_ms: elapsed_ms(grace_start),
+        cpu_time_ms: grace_cpu.elapsed_ms_precise(),
+        stdout,
+        stderr,
+        bridge_calls,
+        error,
+        early_result_sent,
+    }
 }
 
 // ── Warm instances (#64) ────────────────────────────────────────────────────
@@ -1757,6 +2233,9 @@ pub struct InstanceCore {
     /// stub `Function` ever created in this context, re-pointed per call and
     /// disarmed between calls.
     stub_slots: StubSlots,
+    /// `waitUntil` registration set (#71) — the native callback holds a raw
+    /// pointer into this Box; armed per call, disarmed between calls.
+    pending: Box<PendingWork>,
     /// True until the first call: warm-up console output (the prefix's
     /// `console.log`s) is sitting in `logs` and is delivered on the
     /// cold-start call's result instead of being dropped.
@@ -1871,6 +2350,8 @@ pub fn create_instance_core(
     };
 
     let logs_ptr: *mut LogBuffers = &mut *logs;
+    let pending_work = PendingWork::boxed();
+    let pending_ptr: *const PendingWork = &*pending_work;
     let setup = (|| -> Result<(v8::Global<v8::Context>, Option<v8::Global<v8::Module>>), RunError> {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
@@ -1878,6 +2359,8 @@ pub fn create_instance_core(
         install_console(scope, logs_ptr)?;
         crate::webtypes::install(scope).map_err(RunError::Internal)?;
         install_async_context(scope)?;
+        // Disarmed during prefix evaluation: a setup-time waitUntil throws.
+        install_wait_until(scope, pending_ptr)?;
         let mut prefix_module: Option<v8::Global<v8::Module>> = None;
         if let Some(prefix) = &prefix {
             // Enter the CPU meter for compile + evaluate only — isolate boot
@@ -1923,6 +2406,7 @@ pub fn create_instance_core(
                 alloc_state,
                 near_heap,
                 stub_slots: StubSlots::new(),
+                pending: pending_work,
                 warmup_logs_pending: true,
             })
         }
@@ -2045,6 +2529,8 @@ pub fn run_call_on_core(
                     bridge_log: &bridge_log,
                     reason: &core.reason,
                     logs: std::ptr::addr_of!(*core.logs),
+                    pending: &*core.pending,
+                    epilogue: take_epilogue_spec(),
                     cancel_wall: &cancel_wall,
                     cancel_cpu: &cancel_cpu,
                     cancel_handle: &cancel_handle,
@@ -2072,6 +2558,9 @@ pub fn run_call_on_core(
     for slot in core.stub_slots.values() {
         *slot.data.borrow_mut() = None;
     }
+    // Disarm waitUntil too (#71): a between-calls registration must throw,
+    // and lingering Globals from the finished run should not pin objects.
+    *core.pending.slot.borrow_mut() = None;
 
     // Stamp telemetry exactly as `run_module` does for the one-off path.
     let cpu_time_ms = cpu_budget.elapsed_ms_precise();
@@ -2676,6 +3165,12 @@ fn validate_prefix_module(
             start,
         )
     })?;
+    // Disarmed waitUntil for surface parity: `typeof waitUntil` matches run
+    // code; calling it here throws the catchable setup-time error (#71).
+    let validation_pending = PendingWork::boxed();
+    install_wait_until(scope, &*validation_pending).map_err(|e| {
+        failure(termination_or(&reason, e), &logs, start)
+    })?;
     v8::tc_scope!(let scope, scope);
     warmup_budget.enter();
     let result = evaluate_prefix_module(scope, code, filename, globals, imports);
@@ -2911,6 +3406,10 @@ fn module_resolver_callback<'a>(
                 module: ImportModule::Source(ASYNC_HOOKS_MODULE_SRC.to_string()),
             }
         }
+        None if specifier_str == ISO4_RUNTIME_SPECIFIER => ImportBinding {
+            specifier: specifier_str.clone(),
+            module: ImportModule::Source(ISO4_RUNTIME_MODULE_SRC.to_string()),
+        },
         None => return None,
     };
     let module = match &binding.module {
@@ -3749,7 +4248,6 @@ fn install_bridge_globals(
     log: Arc<Mutex<BridgeCallLog>>,
     slots: &mut StubSlots,
 ) -> Result<(), RunError> {
-    let global_obj = scope.get_current_context().global(scope);
     for spec in stubs {
         // A bridge stub installs under its public name, so it can shadow a
         // reserved class just as a data global can. Private shim handler names
@@ -3843,6 +4341,7 @@ const PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC: &str = r#"(name, kind) => (...args)
 /// `packages/iso4-sandbox/src/types.ts` and DESIGN.md §4.2.
 pub const RESERVED_GLOBAL_NAMES: &[&str] = &[
     "console",
+    "waitUntil",
     "Headers",
     "Request",
     "Response",
@@ -4277,6 +4776,106 @@ fn prefix_bridge_call_from_value(
     let message = error_message_from_value(scope, value)
         .unwrap_or_else(|| "bridge call during prepare()".to_string());
     Some(RunError::PrefixBridgeCall(message))
+}
+
+/// Reserved module specifier resolving to the built-in runtime module, which
+/// re-exports `waitUntil` (#71). Resolvable in setup code too (capturing the
+/// function for later run-time use is legitimate); calling it during setup
+/// throws.
+const ISO4_RUNTIME_SPECIFIER: &str = "iso4:runtime";
+
+/// Global-registry symbol under which the native `waitUntil` is stashed for
+/// the module re-export, so deleting the `waitUntil` global cannot break the
+/// import. Must match `Symbol.for(...)` in [`ISO4_RUNTIME_MODULE_SRC`].
+const ISO4_RUNTIME_WAITUNTIL_SYMBOL: &str = "iso4.runtime.waitUntil";
+
+/// Private-symbol key holding the pristine `Promise.allSettled` (bound),
+/// captured at install time — before any guest code runs — and called by the
+/// grace loop. A guest replacing `Promise.allSettled` therefore sabotages
+/// nothing: privates are unreachable from JS (#95's mechanism).
+const GRACE_ALL_SETTLED_KEY: &str = "iso4::graceAllSettled";
+
+fn grace_all_settled_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
+    let name = v8::String::new(scope, GRACE_ALL_SETTLED_KEY)?;
+    Some(v8::Private::for_api(scope, Some(name)))
+}
+
+/// ESM source of the built-in `iso4:runtime` module.
+const ISO4_RUNTIME_MODULE_SRC: &str =
+    "export const waitUntil = globalThis[Symbol.for('iso4.runtime.waitUntil')];\n";
+
+/// Install the `waitUntil` global (#71): a native function pushing its
+/// argument into the run's [`PendingWork`] set. Installed non-enumerable like
+/// the web classes (#84 convention), reserved as a name, and additionally
+/// stashed under a registry symbol for the `iso4:runtime` re-export.
+fn install_wait_until(scope: &mut v8::PinScope, pending: *const PendingWork) -> Result<(), RunError> {
+    let data = v8::External::new(scope, pending.cast_mut().cast::<c_void>());
+    let function = v8::Function::builder(wait_until_callback)
+        .data(data.into())
+        .build(scope)
+        .ok_or_else(|| RunError::Internal("failed to create waitUntil".to_string()))?;
+    define_global(scope, "waitUntil", function.into(), false)?;
+
+    let global = scope.get_current_context().global(scope);
+    let desc = v8::String::new(scope, ISO4_RUNTIME_WAITUNTIL_SYMBOL)
+        .ok_or_else(|| RunError::Internal("failed to intern waitUntil symbol".to_string()))?;
+    let key = v8::Symbol::for_key(scope, desc);
+    global
+        .set(scope, key.into(), function.into())
+        .ok_or_else(|| RunError::Internal("failed to stash waitUntil".to_string()))?;
+
+    // Capture the pristine Promise.allSettled before any guest code exists,
+    // into a private slot the grace loop calls directly from Rust.
+    let all_settled = eval_script(
+        scope,
+        "(Promise.allSettled.bind(Promise))",
+        "<iso4:runtime-install>",
+    )?;
+    let all_settled_key = grace_all_settled_key(scope)
+        .ok_or_else(|| RunError::Internal("failed to intern allSettled key".to_string()))?;
+    global
+        .set_private(scope, all_settled_key, all_settled)
+        .ok_or_else(|| RunError::Internal("failed to stash allSettled".to_string()))?;
+    Ok(())
+}
+
+/// `waitUntil(value)` — register background work to be driven after the
+/// run's value settles (#71). Non-promise values are accepted and count as
+/// already-settled work, mirroring `Promise.resolve` semantics.
+fn wait_until_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    // SAFETY: the External points at the PendingWork Box owned by the
+    // instance core / run frame, alive for the isolate's lifetime — the same
+    // contract as the console's LogBuffers pointer.
+    let pending = unsafe { &*args.data().cast::<v8::External>().value().cast::<PendingWork>() };
+    let mut slot = pending.slot.borrow_mut();
+    let Some(registered) = slot.as_mut() else {
+        drop(slot);
+        throw_v8_error(
+            scope,
+            "[iso4] waitUntil is only available to run code — setup evaluated at \
+             prepare() time must finish its work within the warm-up budget",
+        );
+        return;
+    };
+    let value = args.get(0);
+    let promise: v8::Local<v8::Promise> = match v8::Local::<v8::Promise>::try_from(value) {
+        Ok(p) => p,
+        Err(_) => {
+            let Some(resolver) = v8::PromiseResolver::new(scope) else {
+                drop(slot);
+                throw_v8_error(scope, "[iso4] waitUntil could not register the value");
+                return;
+            };
+            resolver.resolve(scope, value);
+            resolver.get_promise(scope)
+        }
+    };
+    registered.push(v8::Global::new(scope, promise));
+    rv.set_undefined();
 }
 
 fn install_console(scope: &mut v8::PinScope, buffers: *mut LogBuffers) -> Result<(), RunError> {
@@ -6277,6 +6876,232 @@ mod tests {
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42|42|true"));
+    }
+
+    // ── #71: waitUntil grace phase (hold mode — no epilogue spec/socket) ────
+
+    /// Direct-API grace defaults: the epilogue budget on, everything else
+    /// default.
+    fn grace_limits() -> Limits {
+        Limits {
+            grace_ms: 5_000,
+            ..Limits::default()
+        }
+    }
+
+    #[test]
+    fn wait_until_work_that_finished_with_the_run_reports_settled() {
+        // `await 0` resolves within the run's own microtask drain, so the
+        // work (and its console line) completes before the value settles;
+        // the grace phase then just confirms the set is settled. Work that
+        // genuinely outlives the run is covered by the bridge test below.
+        let out = execute(
+            "waitUntil((async () => { await 0; console.log('bg done') })())\n\
+             export default 'early'",
+            None,
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("early"));
+        assert_eq!(out.stdout, vec!["bg done".to_string()]);
+        let bg = out.background.expect("grace phase ran");
+        assert_eq!(bg.status, GraceStatus::Settled);
+        assert!(bg.stdout.is_empty());
+        assert!(!bg.early_result_sent);
+    }
+
+    #[test]
+    fn wait_until_rejection_reports_failed_and_the_run_still_succeeds() {
+        let out = execute(
+            "waitUntil(Promise.reject(new TypeError('db write failed')))\n\
+             export default 1",
+            None,
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        let bg = out.background.expect("grace phase ran");
+        assert_eq!(bg.status, GraceStatus::Failed);
+        let (name, message) = bg.error.expect("rejection captured");
+        assert_eq!(name, "TypeError");
+        assert!(message.contains("db write failed"), "{message}");
+    }
+
+    #[test]
+    fn wait_until_accepts_non_promise_values() {
+        let out = execute(
+            "waitUntil(42)\nexport default 'ok'",
+            None,
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out.background.expect("grace phase ran").status,
+            GraceStatus::Settled
+        );
+    }
+
+    #[test]
+    fn grace_ms_zero_disables_the_epilogue() {
+        let out = execute(
+            "waitUntil(new Promise(() => {}))\nexport default 'ok'",
+            None,
+            Limits::default(), // grace_ms: 0
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert!(out.background.is_none());
+    }
+
+    #[test]
+    fn wait_until_throws_a_catchable_error_in_setup_code() {
+        let prefix = prepared(
+            "globalThis.setupMsg = (() => { \
+               try { waitUntil(1); return 'allowed' } catch (e) { return e.message } })()",
+            &[],
+            &[],
+        );
+        let out = execute_with_prefix(
+            prefix,
+            Some("export default [globalThis.setupMsg, typeof waitUntil].join('|')"),
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        let got = get_default(&out).unwrap();
+        assert!(
+            got.contains("only available to run code") && got.ends_with("|function"),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn wait_until_is_importable_from_iso4_runtime() {
+        let out = execute(
+            "import { waitUntil as wu } from 'iso4:runtime'\n\
+             wu((async () => { await 0; console.log('via import') })())\n\
+             export default typeof wu",
+            None,
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("function"));
+        assert_eq!(out.stdout, vec!["via import".to_string()]);
+        assert_eq!(
+            out.background.expect("grace phase ran").status,
+            GraceStatus::Settled
+        );
+    }
+
+    #[test]
+    fn a_bridge_call_keeps_working_during_grace() {
+        // The background task's bridge round trip completes AFTER the value
+        // settled: the fire-and-forget frame was written during the run, the
+        // response is consumed by the grace poll loop.
+        let (out, h) = {
+            use std::mem::ManuallyDrop;
+            use std::os::unix::io::AsRawFd;
+            let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+            let client = ManuallyDrop::new(client);
+            let fd = client.as_raw_fd();
+            let handle = spawn_responder(server, |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::Number(42.0)),
+                )
+                .unwrap();
+            });
+            let result = execute(
+                "waitUntil((async () => { console.log('bg:' + (await myTool())) })())\n\
+                 export default 'early'",
+                None,
+                grace_limits(),
+                &[HostGlobalDef::bridge("myTool")],
+                &[],
+                Some(fd),
+                Arc::new(AtomicU32::new(0)),
+                None,
+            );
+            (result, handle)
+        };
+        h.join().unwrap();
+        let out = out.unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("early"));
+        let bg = out.background.expect("grace phase ran");
+        assert_eq!(bg.status, GraceStatus::Settled);
+        assert_eq!(bg.stdout, vec!["bg:42".to_string()]);
+        assert_eq!(bg.bridge_calls.len(), 0, "the call was attempted pre-settle");
+    }
+
+    #[test]
+    fn an_unresolvable_grace_promise_truncates_cleanly_and_the_core_stays_reusable() {
+        // Boundary truncation (nothing to drive, no socket) is not a taint:
+        // no JS was interrupted, the instance keeps serving calls.
+        init_platform();
+        let mut core = create_instance_core(None, &[], 0).expect("core");
+        let outcome = run_call_on_core(
+            &mut core,
+            Some("waitUntil(new Promise(() => {}))\nexport default 1"),
+            "<iso4>",
+            &[],
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        );
+        assert!(!outcome.tainted, "boundary truncation must not taint");
+        let out = outcome.result.expect("run succeeded");
+        assert_eq!(
+            out.background.expect("grace ran").status,
+            GraceStatus::Truncated
+        );
+
+        let second = run_call_on_core(
+            &mut core,
+            Some("export default typeof waitUntil"),
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        );
+        let out = second.result.expect("instance reusable after clean truncation");
+        assert_eq!(get_default(&out).as_deref(), Some("function"));
+        assert!(out.background.is_none());
     }
 
     #[test]

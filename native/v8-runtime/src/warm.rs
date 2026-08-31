@@ -57,6 +57,8 @@ pub struct CallJob {
     /// The connection's monotonically increasing bridge call-ID counter.
     pub call_id_counter: Arc<AtomicU32>,
     pub call: Option<ipc::CallSpec>,
+    /// Per-run identity for the `waitUntil` early Result frame (#71).
+    pub epilogue: Option<sandbox::EpilogueSpec>,
 }
 
 enum Job {
@@ -168,6 +170,7 @@ fn instance_main(
                 }
             }
         }
+        sandbox::set_run_epilogue_spec(job.epilogue);
         let outcome = sandbox::run_call_on_core(
             core.as_mut().expect("core created above"),
             job.code.as_deref(),
@@ -575,6 +578,7 @@ mod tests {
                 export_path: "bump".to_string(),
                 args_blob: testval::to_blob(&TestValue::Array(Vec::new())),
             }),
+            epilogue: None,
         }
     }
 

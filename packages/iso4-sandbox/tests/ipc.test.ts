@@ -368,9 +368,9 @@ describe('payload encoders', () => {
       code: 'x',
       call: { exportPath: 'default.fetch', argsBlob },
     })
-    // Skip runId(4) + code(4+1) + filename absent(1) + limits(8) +
+    // Skip runId(4) + code(4+1) + filename absent(1) + limits(9) +
     // globals count(4) + imports count(4)
-    let off = 4 + 4 + 1 + 1 + 8 + 4 + 4
+    let off = 4 + 4 + 1 + 1 + 9 + 4 + 4
     expect(buf[off]).toBe(1) // call: present
     off += 1
     const { value: path, end } = readString(buf, off)
@@ -425,8 +425,8 @@ describe('payload encoders', () => {
         { specifier: 'lib:math', source: 'export const add = (a, b) => a + b' },
       ],
     })
-    // Skip runId(4) + code(4+1) + filename absent(1) + limits(8) + globals count(4)
-    let off = 4 + 4 + 1 + 1 + 8 + 4
+    // Skip runId(4) + code(4+1) + filename absent(1) + limits(9) + globals count(4)
+    let off = 4 + 4 + 1 + 1 + 9 + 4
     expect(readU32BE(buf, off)).toBe(1) // imports count
     off += 4
     const { value: specifier, end: e1 } = readString(buf, off)
@@ -453,7 +453,7 @@ describe('payload encoders', () => {
         },
       ],
     })
-    let off = 4 + 4 + 1 + 1 + 8 + 4
+    let off = 4 + 4 + 1 + 1 + 9 + 4
     expect(readU32BE(buf, off)).toBe(1) // imports count
     off += 4
     const { value: specifier, end: e1 } = readString(buf, off)
@@ -494,7 +494,7 @@ describe('payload encoders', () => {
         { specifier: 'lib:b', source: 'export const b = 2' },
       ],
     })
-    let off = 4 + 4 + 1 + 1 + 8 + 4
+    let off = 4 + 4 + 1 + 1 + 9 + 4
     expect(readU32BE(buf, off)).toBe(2) // imports count
     off += 4
     const { value: s1, end: e1 } = readString(buf, off)

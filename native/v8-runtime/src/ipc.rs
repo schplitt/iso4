@@ -92,6 +92,10 @@ pub enum RustToTsMessageType {
     Hello = 0x05,
     /// Capacity/usage snapshot answering a `Stats` request (#65).
     StatsResult = 0x06,
+    /// Final frame of a run whose Result reported pending background work
+    /// (#71): carries the `waitUntil` epilogue's outcome and telemetry, and
+    /// releases the run's connection slot.
+    RunComplete = 0x07,
 }
 
 /// Handshake status reported on a `Hello` frame.
@@ -402,6 +406,9 @@ pub const DEFAULT_MAX_STDOUT_BYTES: u32 = 1024 * 1024;
 pub const DEFAULT_MAX_STDERR_BYTES: u32 = 1024 * 1024;
 pub const DEFAULT_MAX_BRIDGE_CALL_BYTES: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_BRIDGE_CALLS: u32 = 10;
+/// Grace budget for `waitUntil` background work after the Result frame (#71),
+/// Cloudflare's number. Zero disables the epilogue entirely.
+pub const DEFAULT_GRACE_MS: u32 = 30_000;
 
 /// Resource limits applied to a `Run` request, with runtime defaults already
 /// resolved: each field is the caller's explicit value or, when the caller left
@@ -421,6 +428,9 @@ pub struct ResourceLimits {
     /// Maximum number of bridge calls (globals + host imports combined) allowed
     /// per run. Zero means no limit.
     pub max_bridge_calls: u32,
+    /// Wall budget for `waitUntil` background work after the Result frame
+    /// (#71). Zero disables the epilogue: registered work dies at settle.
+    pub grace_ms: u32,
 }
 
 impl Default for ResourceLimits {
@@ -436,6 +446,7 @@ impl Default for ResourceLimits {
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
             max_bridge_call_bytes: DEFAULT_MAX_BRIDGE_CALL_BYTES,
             max_bridge_calls: DEFAULT_MAX_BRIDGE_CALLS,
+            grace_ms: DEFAULT_GRACE_MS,
         }
     }
 }
@@ -758,6 +769,7 @@ impl<'a> PayloadReader<'a> {
             max_bridge_calls: self
                 .read_optional_u32()?
                 .unwrap_or(DEFAULT_MAX_BRIDGE_CALLS),
+            grace_ms: self.read_optional_u32()?.unwrap_or(DEFAULT_GRACE_MS),
         })
     }
 
@@ -1347,7 +1359,7 @@ mod tests {
 
     /// Eight absent `Optional<u32>` limit fields (one presence byte each).
     fn push_absent_limits(v: &mut Vec<u8>) {
-        v.extend_from_slice(&[0u8; 8]);
+        v.extend_from_slice(&[0u8; 9]);
     }
 
     fn push_string(v: &mut Vec<u8>, s: &str) {
@@ -1389,6 +1401,7 @@ mod tests {
         push_optional_u32(&mut v, Some(512 * 1024)); // max_stderr_bytes
         push_optional_u32(&mut v, Some(64 * 1024)); // max_bridge_call_bytes
         push_optional_u32(&mut v, Some(1_000)); // max_bridge_calls
+        push_optional_u32(&mut v, Some(5_000)); // grace_ms
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
@@ -1437,6 +1450,7 @@ mod tests {
         push_optional_u32(&mut v, None); // max_stderr_bytes
         push_optional_u32(&mut v, None); // max_bridge_call_bytes
         push_optional_u32(&mut v, Some(0)); // max_bridge_calls: explicitly unlimited
+        push_optional_u32(&mut v, Some(0)); // grace_ms: epilogue explicitly off
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent

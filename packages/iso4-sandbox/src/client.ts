@@ -21,10 +21,12 @@ import {
   encodeRunPayload,
   encodeTerminatePayload,
   encodeTsToRustFrame,
+  decodeRunCompletePayload,
   peekBridgeCallId,
+  peekRunCompletionBackgroundPending,
   peekRunCompletionRunId,
 } from './ipc'
-import type { WireResourceLimits, CallPayload, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RuntimeStatsPayload } from './ipc'
+import type { WireResourceLimits, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
@@ -44,6 +46,13 @@ export interface RuntimeIpcClientOptions {
 
 export interface RawRunResult {
   result: Uint8Array
+  /**
+   * Present when the Result reported pending `waitUntil` work (#71): the run
+   * continues runtime-side and this settles when its `RunComplete` frame
+   * arrives — `undefined` on connection loss. The pool defers reusing the
+   * connection until then ({@link RuntimeIpcClient.pendingEpilogue}).
+   */
+  epilogue?: Promise<DecodedRunComplete | undefined>
 }
 
 /**
@@ -147,6 +156,13 @@ export class RuntimeIpcClient {
    * checks `usable` and replaces it with a fresh connection instead.
    */
   private broken = false
+
+  /**
+   * Settles when the in-flight `waitUntil` epilogue (#71) ends. The pool
+   * defers reusing this connection until then — grace-time frames belong to
+   * the finished run, not the next one. `null` when no epilogue is running.
+   */
+  pendingEpilogue: Promise<void> | null = null
 
   /**
    * Session brand key for host-type descriptors written on this connection.
@@ -583,7 +599,7 @@ export class RuntimeIpcClient {
 
     this.inFlightRunId = runId
     try {
-      return await this.drainFrames(dispatcher, runId)
+      return await this.drainFrames(dispatcher, runId, signal)
     } catch (error) {
       // The fallback `abortConnection` closes the reader, which makes the frame
       // loop reject. Translate that (or any error observed once the signal has
@@ -622,13 +638,15 @@ export class RuntimeIpcClient {
    *   `runId` of the payload it is answering onto every completion path
    *   (`session.rs` → `wire::encode_run_completion_payload`), so a mismatch is
    *   proof that this connection is delivering someone else's run.
+   * @param signal
    */
   private async drainFrames(
     dispatcher: BridgeCallDispatcher | undefined,
     runId: number,
+    signal?: AbortSignal,
   ): Promise<RawRunResult> {
     try {
-      return await this.drainFramesInner(dispatcher, runId)
+      return await this.drainFramesInner(dispatcher, runId, signal)
     } catch (error) {
       // Anything escaping the frame loop leaves the peer mid-run on a
       // connection whose alignment we can no longer vouch for — most sharply a
@@ -641,9 +659,245 @@ export class RuntimeIpcClient {
     }
   }
 
+  /**
+   * Keep draining this connection after an early Result (#71) until the run's
+   * `RunComplete` frame arrives, dispatching grace-time bridge calls exactly
+   * like the run's own loop. Never throws: a lost connection (or a desync)
+   * resolves `undefined` and the caller synthesizes a truncated report —
+   * the run's value was already delivered, so nothing user-facing can fail.
+   * @param dispatcher the run's bridge dispatcher
+   * @param runId the run being completed
+   * @param signal
+   */
+  private drainEpilogue(
+    dispatcher: BridgeCallDispatcher | undefined,
+    runId: number,
+    signal?: AbortSignal,
+  ): Promise<DecodedRunComplete | undefined> {
+    // Aborting during the epilogue cancels the background work gracefully:
+    // a Terminate frame truncates the grace phase runtime-side and the
+    // RunComplete still arrives (status `truncated`). No teardown fallback —
+    // the caller already has their value, and the grace wall bounds a
+    // runtime that cannot read the frame.
+    const cancelGrace = (): void => {
+      this.write(
+        encodeTsToRustFrame(
+          TsToRustMessageTypes.Terminate,
+          encodeTerminatePayload(runId),
+        ),
+      ).catch(() => {
+        // Socket already gone — the epilogue resolves through the reader.
+      })
+    }
+    if (signal?.aborted)
+      cancelGrace()
+    else
+      signal?.addEventListener('abort', cancelGrace, { once: true })
+
+    const epilogue = (async (): Promise<DecodedRunComplete | undefined> => {
+      try {
+        for await (const frame of this.reader) {
+          switch (frame.messageType) {
+            case RustToTsMessageTypes.RunComplete: {
+              const report = decodeRunCompletePayload(frame.payload)
+              if (report.runId !== runId) {
+                this.abortConnection()
+                return undefined
+              }
+              return report
+            }
+
+            case RustToTsMessageTypes.Log:
+              break
+
+            case RustToTsMessageTypes.BridgeCall:
+              await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId)
+              break
+
+            default:
+              // Frame alignment lost mid-epilogue: never hand this
+              // connection to the next caller.
+              this.abortConnection()
+              return undefined
+          }
+        }
+        return undefined
+      } catch {
+        return undefined
+      }
+    })()
+    const hold = epilogue.then(
+      () => {},
+      () => {},
+    )
+    this.pendingEpilogue = hold
+    hold.then(() => {
+      if (this.pendingEpilogue === hold)
+        this.pendingEpilogue = null
+    })
+    return epilogue
+  }
+
+  /**
+   * Handle one `BridgeCall` frame: decode, dispatch to the host handler
+   * (fire-and-forget), and answer decode/dispatch failures inline. Shared by
+   * the run's frame loop and the `waitUntil` epilogue loop (#71).
+   * @param payload the frame payload
+   * @param dispatcher the run's bridge dispatcher
+   * @param runId the run the frame belongs to
+   */
+  private async dispatchBridgeCallFrame(
+    payload: Uint8Array,
+    dispatcher: BridgeCallDispatcher | undefined,
+    runId: number,
+  ): Promise<void> {
+    // Guest-controlled bytes. A host type the sandbox accepted but this
+    // Node refuses to reconstruct (a URL carrying credentials, say)
+    // throws here, and the peer is parked waiting for our response — so
+    // answer the call with the error instead of letting it escape and
+    // cost the connection. `callId` is read before the value blob, so it
+    // survives a failure in the blob itself; only a payload too damaged
+    // to yield one falls through to the teardown in `drainFrames`.
+    let call: ReturnType<typeof decodeBridgeCallPayload>
+    try {
+      call = decodeBridgeCallPayload(payload)
+    } catch (error) {
+      const callId = peekBridgeCallId(payload)
+      if (callId === undefined)
+        throw error
+      await this.write(
+        encodeTsToRustFrame(
+          TsToRustMessageTypes.BridgeResponse,
+          encodeBridgeResponsePayload(
+            callId,
+            false,
+            undefined,
+            {
+              name: 'TypeError',
+              message: `host could not decode bridge call arguments: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            },
+          ),
+        ),
+      )
+      return
+    }
+
+    if (dispatcher === undefined) {
+      // No handler — send a synchronous error response.
+      await this.write(
+        encodeTsToRustFrame(
+          TsToRustMessageTypes.BridgeResponse,
+          encodeBridgeResponsePayload(
+            call.callId,
+            false,
+            undefined,
+            { name: 'Error', message: 'no bridge dispatcher configured' },
+          ),
+        ),
+      )
+    } else {
+      // Fire-and-forget the handler.
+      // Do NOT await it — the loop reads the next frame immediately.
+      // When the handler settles the response is written back.
+      // If the run timed out by then, Rust ignores the late frame.
+      const { callId } = call
+      dispatcher({
+        targetKind: call.targetKind,
+        specifier: call.specifier,
+        exportName: call.exportName,
+        args: call.args,
+      }).then(
+        async (value) => {
+          // serializeHostValue throws for the handful of types V8 refuses
+          // to clone (function, symbol, promise, WeakMap, proxy). Catch
+          // and send an error response so the sandbox receives
+          // ERR_HOST_BRIDGE rather than hanging.
+          //
+          // The async variant is used here because a handler may return a
+          // Request/Response — a `fetch` handler returning the real thing
+          // rather than a plain object — and draining its body is async.
+          let encoded: Uint8Array
+          try {
+            encoded = await serializeHostValue(value, this.brandKey)
+          } catch (e) {
+            return this.write(
+              encodeTsToRustFrame(
+                TsToRustMessageTypes.BridgeResponse,
+                encodeBridgeResponsePayload(
+                  callId,
+                  false,
+                  undefined,
+                  {
+                    name: 'Error',
+                    message: e instanceof Error ? e.message : String(e),
+                  },
+                ),
+              ),
+            )
+          }
+          return this.write(
+            encodeTsToRustFrame(
+              TsToRustMessageTypes.BridgeResponse,
+              encodeBridgeResponsePayload(callId, true, encoded),
+            ),
+          )
+        },
+        (err: unknown) => this.write(
+          encodeTsToRustFrame(
+            TsToRustMessageTypes.BridgeResponse,
+            encodeBridgeResponsePayload(
+              callId,
+              false,
+              undefined,
+              bridgeErrorPayloadFromUnknown(err),
+            ),
+          ),
+        ),
+      ).catch(async (err: unknown) => {
+        // Encoding or writing the response itself failed — most reachably
+        // `encodeFrame`'s 64 MiB ceiling on a large handler return value.
+        // Nothing was written, so the sandbox's awaited bridge promise
+        // never settles and the run hangs until the wall deadline, or
+        // forever under the supported `wallTimeMs: 0` (Rust installs
+        // neither a read timeout nor a wall-guard thread in that case, and
+        // freezes the CPU accumulator while parked). Answer with the
+        // failure instead: a small payload where the original was not.
+        //
+        // Safe to send late. This handler is orphaned when the run
+        // completes without it, and Rust discards responses for callIds it
+        // no longer knows.
+        try {
+          await this.write(
+            encodeTsToRustFrame(
+              TsToRustMessageTypes.BridgeResponse,
+              encodeBridgeResponsePayload(
+                callId,
+                false,
+                undefined,
+                bridgeErrorPayloadFromUnknown(err),
+              ),
+            ),
+          )
+        } catch {
+          // The connection cannot even carry the failure. Tear it down so
+          // the run fails fast instead of waiting out the wall clock — but
+          // only while it is still OUR run: by now the slot may have been
+          // returned to the pool and be serving someone else, and killing
+          // a healthy connection under a different caller would turn this
+          // into the very cross-run fault this branch closes.
+          if (this.inFlightRunId === runId)
+            this.abortConnection()
+        }
+      })
+    }
+  }
+
   private async drainFramesInner(
     dispatcher: BridgeCallDispatcher | undefined,
     runId: number,
+    signal?: AbortSignal,
   ): Promise<RawRunResult> {
     for await (const frame of this.reader) {
       switch (frame.messageType) {
@@ -656,154 +910,20 @@ export class RuntimeIpcClient {
               + 'answering a different run, so this run never executed',
             )
           }
-          return { result: frame.payload }
+          if (!peekRunCompletionBackgroundPending(frame.payload))
+            return { result: frame.payload }
+          // waitUntil: the value is delivered now; the run
+          // keeps going runtime-side. Keep draining this connection —
+          // detached, bridge dispatch included — until its RunComplete frame,
+          // and hold the connection out of the pool for the duration.
+          return { result: frame.payload, epilogue: this.drainEpilogue(dispatcher, runId, signal) }
         }
 
         case RustToTsMessageTypes.Log:
           break
 
         case RustToTsMessageTypes.BridgeCall: {
-          // Guest-controlled bytes. A host type the sandbox accepted but this
-          // Node refuses to reconstruct (a URL carrying credentials, say)
-          // throws here, and the peer is parked waiting for our response — so
-          // answer the call with the error instead of letting it escape and
-          // cost the connection. `callId` is read before the value blob, so it
-          // survives a failure in the blob itself; only a payload too damaged
-          // to yield one falls through to the teardown in `drainFrames`.
-          let call: ReturnType<typeof decodeBridgeCallPayload>
-          try {
-            call = decodeBridgeCallPayload(frame.payload)
-          } catch (error) {
-            const callId = peekBridgeCallId(frame.payload)
-            if (callId === undefined)
-              throw error
-            await this.write(
-              encodeTsToRustFrame(
-                TsToRustMessageTypes.BridgeResponse,
-                encodeBridgeResponsePayload(
-                  callId,
-                  false,
-                  undefined,
-                  {
-                    name: 'TypeError',
-                    message: `host could not decode bridge call arguments: ${
-                      error instanceof Error ? error.message : String(error)
-                    }`,
-                  },
-                ),
-              ),
-            )
-            break
-          }
-
-          if (dispatcher === undefined) {
-            // No handler — send a synchronous error response.
-            await this.write(
-              encodeTsToRustFrame(
-                TsToRustMessageTypes.BridgeResponse,
-                encodeBridgeResponsePayload(
-                  call.callId,
-                  false,
-                  undefined,
-                  { name: 'Error', message: 'no bridge dispatcher configured' },
-                ),
-              ),
-            )
-          } else {
-            // Fire-and-forget the handler.
-            // Do NOT await it — the loop reads the next frame immediately.
-            // When the handler settles the response is written back.
-            // If the run timed out by then, Rust ignores the late frame.
-            const { callId } = call
-            dispatcher({
-              targetKind: call.targetKind,
-              specifier: call.specifier,
-              exportName: call.exportName,
-              args: call.args,
-            }).then(
-              async (value) => {
-                // serializeHostValue throws for the handful of types V8 refuses
-                // to clone (function, symbol, promise, WeakMap, proxy). Catch
-                // and send an error response so the sandbox receives
-                // ERR_HOST_BRIDGE rather than hanging.
-                //
-                // The async variant is used here because a handler may return a
-                // Request/Response — a `fetch` handler returning the real thing
-                // rather than a plain object — and draining its body is async.
-                let encoded: Uint8Array
-                try {
-                  encoded = await serializeHostValue(value, this.brandKey)
-                } catch (e) {
-                  return this.write(
-                    encodeTsToRustFrame(
-                      TsToRustMessageTypes.BridgeResponse,
-                      encodeBridgeResponsePayload(
-                        callId,
-                        false,
-                        undefined,
-                        {
-                          name: 'Error',
-                          message: e instanceof Error ? e.message : String(e),
-                        },
-                      ),
-                    ),
-                  )
-                }
-                return this.write(
-                  encodeTsToRustFrame(
-                    TsToRustMessageTypes.BridgeResponse,
-                    encodeBridgeResponsePayload(callId, true, encoded),
-                  ),
-                )
-              },
-              (err: unknown) => this.write(
-                encodeTsToRustFrame(
-                  TsToRustMessageTypes.BridgeResponse,
-                  encodeBridgeResponsePayload(
-                    callId,
-                    false,
-                    undefined,
-                    bridgeErrorPayloadFromUnknown(err),
-                  ),
-                ),
-              ),
-            ).catch(async (err: unknown) => {
-              // Encoding or writing the response itself failed — most reachably
-              // `encodeFrame`'s 64 MiB ceiling on a large handler return value.
-              // Nothing was written, so the sandbox's awaited bridge promise
-              // never settles and the run hangs until the wall deadline, or
-              // forever under the supported `wallTimeMs: 0` (Rust installs
-              // neither a read timeout nor a wall-guard thread in that case, and
-              // freezes the CPU accumulator while parked). Answer with the
-              // failure instead: a small payload where the original was not.
-              //
-              // Safe to send late. This handler is orphaned when the run
-              // completes without it, and Rust discards responses for callIds it
-              // no longer knows.
-              try {
-                await this.write(
-                  encodeTsToRustFrame(
-                    TsToRustMessageTypes.BridgeResponse,
-                    encodeBridgeResponsePayload(
-                      callId,
-                      false,
-                      undefined,
-                      bridgeErrorPayloadFromUnknown(err),
-                    ),
-                  ),
-                )
-              } catch {
-                // The connection cannot even carry the failure. Tear it down so
-                // the run fails fast instead of waiting out the wall clock — but
-                // only while it is still OUR run: by now the slot may have been
-                // returned to the pool and be serving someone else, and killing
-                // a healthy connection under a different caller would turn this
-                // into the very cross-run fault this branch closes.
-                if (this.inFlightRunId === runId)
-                  this.abortConnection()
-              }
-            })
-          }
+          await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId)
           break
         }
 

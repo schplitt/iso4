@@ -22,7 +22,7 @@ import {
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
 } from './ipc'
-import type { CallPayload } from './ipc'
+import type { CallPayload, DecodedRunComplete } from './ipc'
 import type {
   CallResult,
   HostGlobals,
@@ -42,6 +42,7 @@ import type {
   SandboxOptions,
   SandboxStats,
   Imports,
+  WaitUntilResult,
 } from './types'
 
 // ── Global processing (imported from globals.ts for testability) ──────────
@@ -62,7 +63,10 @@ export type {
   HostGlobalValue,
   DataGlobal,
   BridgeCallEntry,
+  BridgeGlobal,
   BridgeWithShim,
+  GlobalOptions,
+  StringGlobal,
   RebindValue,
   RebindGlobals,
   Imports,
@@ -94,6 +98,7 @@ export type {
   SandboxExports,
   RunError,
   RunErrorCode,
+  WaitUntilResult,
 } from './types'
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -323,6 +328,36 @@ async function waitForSocket(
  * telemetry to carry over — every field is empty by construction.
  * @param error
  */
+/**
+ * Map a decoded `RunComplete` frame to the public {@link WaitUntilResult},
+ * synthesizing a truncated report when the connection died mid-grace (#71).
+ * @param report the decoded frame, or `undefined` on connection loss
+ */
+function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilResult {
+  if (report === undefined) {
+    return {
+      status: 'truncated',
+      durationMs: 0,
+      cpuTimeMs: 0,
+      stdout: [],
+      stderr: [],
+      bridgeCalls: [],
+      error: { name: 'Error', message: 'connection lost during the waitUntil grace phase' },
+    }
+  }
+  const out: WaitUntilResult = {
+    status: report.status,
+    durationMs: report.durationMs,
+    cpuTimeMs: report.cpuTimeMs,
+    stdout: report.stdout,
+    stderr: report.stderr,
+    bridgeCalls: report.bridgeCalls,
+  }
+  if (report.error !== undefined)
+    out.error = report.error
+  return out
+}
+
 function desyncResult(error: ProtocolDesyncError): RunResult {
   return {
     status: 'failed',
@@ -475,6 +510,10 @@ class SandboxImpl implements Sandbox {
         const decoded = call === undefined
           ? decodeRunCompletionPayload(raw.result).result
           : decodeRunCompletionPayload(raw.result, 'call').result
+        // waitUntil (#71): the value arrived early; hand the caller the grace
+        // outcome as a never-rejecting promise.
+        if (raw.epilogue !== undefined && decoded.ok)
+          decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
         // Graceful terminate (#36): a run whose signal aborted and whose Rust
         // Result carries ERR_ABORTED is a deliberate abort, not a failure —
         // remap to `status: 'aborted'` with the abort reason, keeping the real
@@ -819,6 +858,9 @@ implements Prefix<G, M> {
         const decoded = payload.call === undefined
           ? decodeRunCompletionPayload(raw.result).result
           : decodeRunCompletionPayload(raw.result, 'call').result
+        // waitUntil (#71) — see the note in SandboxImpl.run.
+        if (raw.epilogue !== undefined && decoded.ok)
+          decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
         // See the note in SandboxImpl.run — remap a graceful ERR_ABORTED Result
         // to `status: 'aborted'`, preserving the runtime's telemetry.
         if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')

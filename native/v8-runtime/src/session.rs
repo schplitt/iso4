@@ -305,6 +305,30 @@ fn write_result_frame(stream: &mut UnixStream, run_id: u32, payload: &[u8]) -> s
     }
 }
 
+/// Write a `RunComplete` frame (#71), substituting a minimal one when the
+/// grace report is too large to frame — same recovery `write_result_frame`
+/// gives Result frames, so a guest-authored oversized rejection message (or
+/// an unbounded record list under `maxBridgeCalls: 0`) costs its telemetry,
+/// never the connection. The status byte survives (payload offset 4).
+fn write_run_complete_frame(
+    stream: &mut UnixStream,
+    run_id: u32,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    match ipc::write_rust_to_ts_frame(stream, ipc::RustToTsMessageType::RunComplete, payload) {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            eprintln!(
+                "[iso4-v8] RunComplete frame for run {run_id} too large to send ({e}) — \
+                 substituting a minimal report"
+            );
+            let status_byte = payload.get(4).copied().unwrap_or(1);
+            let minimal = wire::encode_minimal_run_complete(run_id, status_byte);
+            ipc::write_rust_to_ts_frame(stream, ipc::RustToTsMessageType::RunComplete, &minimal)
+        }
+        other => other,
+    }
+}
+
 pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
@@ -459,18 +483,22 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         .unwrap_or("-"),
                 );
 
-                // A socket is needed only when some global installs a bridge
-                // stub or some host import declares a function leaf.
-                // String/data-only runs need no socket.
-                let stream_fd = if needs_bridge_stub(&payload.globals, &payload.imports) {
-                    Some(stream.as_raw_fd())
-                } else {
-                    None
-                };
+                // The socket now travels with every run: bridge stubs need it
+                // during the call, and the waitUntil needs it
+                // to write the early Result frame. The session thread executes
+                // the run synchronously, so it has exactly one user either way.
+                let stream_fd = Some(stream.as_raw_fd());
                 // One-off runs always get a fresh isolate (never the warm
                 // registry), but they share the slot budget with warm
                 // instances — taking a slot may evict an idle one (#64).
                 shared.warm.reserve_oneoff();
+                sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
+                    run_id: payload.run_id,
+                    report_heap: false,
+                }));
+                // Set when the run flow already wrote the early Result (#71):
+                // the payload below is then the final RunComplete frame.
+                let mut frame_is_run_complete = false;
                 let result_payload = match sandbox::execute(
                     &payload.code,
                     payload.filename.as_deref(),
@@ -483,6 +511,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         max_stderr_bytes: payload.limits.max_stderr_bytes,
                         max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
                         max_bridge_calls: payload.limits.max_bridge_calls,
+                        grace_ms: payload.limits.grace_ms,
                     },
                     &payload.globals,
                     &payload.imports,
@@ -492,19 +521,29 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 ) {
                     Ok(output) => {
                         trace!("[iso4-v8] run succeeded in {:.3}ms", output.duration_ms);
-                        wire::encode_run_completion_payload(
-                            payload.run_id,
-                            wire::RunCompletion::Success(wire::RunSuccessPayload {
-                                exports: output.exports,
-                                skipped_exports: output.skipped_exports,
-                                stdout: output.stdout,
-                                stderr: output.stderr,
-                                duration_ms: output.duration_ms,
-                                cpu_time_ms: output.cpu_time_ms,
-                                bridge_calls: output.bridge_calls,
-                                heap_used_bytes: None,
-                            }),
-                        )
+                        match &output.background {
+                            // The run flow already wrote the early Result and
+                            // drove the grace phase (#71); what remains is the
+                            // final RunComplete frame.
+                            Some(bg) if bg.early_result_sent => {
+                                frame_is_run_complete = true;
+                                wire::encode_run_complete_payload(payload.run_id, bg)
+                            }
+                            _ => wire::encode_run_completion_payload(
+                                payload.run_id,
+                                wire::RunCompletion::Success(wire::RunSuccessPayload {
+                                    exports: output.exports,
+                                    skipped_exports: output.skipped_exports,
+                                    stdout: output.stdout,
+                                    stderr: output.stderr,
+                                    duration_ms: output.duration_ms,
+                                    cpu_time_ms: output.cpu_time_ms,
+                                    bridge_calls: output.bridge_calls,
+                                    heap_used_bytes: None,
+                                    background_pending: false,
+                                }),
+                            ),
+                        }
                     }
                     Err(failure) => {
                         trace!(
@@ -528,8 +567,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 };
                 shared.warm.release_oneoff();
 
-                if let Err(e) = write_result_frame(&mut stream, payload.run_id, &result_payload) {
-                    eprintln!("[iso4-v8] failed to write Result frame: {e}");
+                let write_outcome = if frame_is_run_complete {
+                    write_run_complete_frame(&mut stream, payload.run_id, &result_payload)
+                } else {
+                    write_result_frame(&mut stream, payload.run_id, &result_payload)
+                };
+                if let Err(e) = write_outcome {
+                    eprintln!("[iso4-v8] failed to write completion frame: {e}");
                     break;
                 }
             }
@@ -625,6 +669,9 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                 };
 
+                // Set when the owner thread already wrote the early Result
+                // (#71): the payload below is then the RunComplete frame.
+                let mut frame_is_run_complete = false;
                 // An `Arc` handle, so the store lock is held for one refcount
                 // bump — not for a deep clone of the source and global defs on
                 // every run of every slot.
@@ -724,14 +771,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             // re-install (string/data globals and shim
                             // wrappers are replayed from the stored prefix
                             // defs during prefix evaluation).
-                            let stream_fd = if needs_bridge_stub(
-                                &payload.globals,
-                                &prefix_data.declared_imports,
-                            ) {
-                                Some(stream.as_raw_fd())
-                            } else {
-                                None
-                            };
+                            // Always passed (#71): the waitUntil epilogue
+                            // writes the early Result on this fd even when no
+                            // bridge stub exists. The session thread parks on
+                            // the response channel, so the fd has one user.
+                            let stream_fd = Some(stream.as_raw_fd());
                             trace!(
                             "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports, call={})",
                             payload.run_id, payload.prefix_id,
@@ -781,11 +825,16 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     max_stderr_bytes: payload.limits.max_stderr_bytes,
                                     max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
                                     max_bridge_calls: payload.limits.max_bridge_calls,
+                                    grace_ms: payload.limits.grace_ms,
                                 },
                                 globals: payload.globals,
                                 stream_fd,
                                 call_id_counter: Arc::clone(&call_id_counter),
                                 call: payload.call,
+                                epilogue: Some(sandbox::EpilogueSpec {
+                                    run_id: payload.run_id,
+                                    report_heap: true,
+                                }),
                             });
                             // An instance of a since-disposed prefix must not
                             // return to the pool. The aliveness check and the
@@ -825,19 +874,29 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                         payload.run_id,
                                         output.duration_ms
                                     );
-                                    wire::encode_run_completion_payload(
-                                        payload.run_id,
-                                        wire::RunCompletion::Success(wire::RunSuccessPayload {
-                                            exports: output.exports,
-                                            skipped_exports: output.skipped_exports,
-                                            stdout: output.stdout,
-                                            stderr: output.stderr,
-                                            duration_ms: output.duration_ms,
-                                            cpu_time_ms: output.cpu_time_ms,
-                                            bridge_calls: output.bridge_calls,
-                                            heap_used_bytes: Some(outcome.heap_used_bytes),
-                                        }),
-                                    )
+                                    match &output.background {
+                                        // Early Result already written by the
+                                        // owner thread (#71); finish the run
+                                        // with the RunComplete frame.
+                                        Some(bg) if bg.early_result_sent => {
+                                            frame_is_run_complete = true;
+                                            wire::encode_run_complete_payload(payload.run_id, bg)
+                                        }
+                                        _ => wire::encode_run_completion_payload(
+                                            payload.run_id,
+                                            wire::RunCompletion::Success(wire::RunSuccessPayload {
+                                                exports: output.exports,
+                                                skipped_exports: output.skipped_exports,
+                                                stdout: output.stdout,
+                                                stderr: output.stderr,
+                                                duration_ms: output.duration_ms,
+                                                cpu_time_ms: output.cpu_time_ms,
+                                                bridge_calls: output.bridge_calls,
+                                                heap_used_bytes: Some(outcome.heap_used_bytes),
+                                                background_pending: false,
+                                            }),
+                                        ),
+                                    }
                                 }
                                 Err(failure) => {
                                     trace!(
@@ -864,8 +923,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     }
                 };
 
-                if let Err(e) = write_result_frame(&mut stream, payload.run_id, &result_payload) {
-                    eprintln!("[iso4-v8] failed to write Result frame: {e}");
+                let write_outcome = if frame_is_run_complete {
+                    write_run_complete_frame(&mut stream, payload.run_id, &result_payload)
+                } else {
+                    write_result_frame(&mut stream, payload.run_id, &result_payload)
+                };
+                if let Err(e) = write_outcome {
+                    eprintln!("[iso4-v8] failed to write completion frame: {e}");
                     break;
                 }
             }

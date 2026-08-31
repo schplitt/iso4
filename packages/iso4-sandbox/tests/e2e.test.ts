@@ -4164,6 +4164,213 @@ describe('eval and new Function are prepare()-time only', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// waitUntil (#71): the value ships early, registered background work keeps
+// running under the grace budget, and the outcome arrives on result.waitUntil.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('waitUntil', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('the result resolves before slow background work, which still completes', async () => {
+    let auditWritten = false
+    let releaseAudit: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      releaseAudit = resolve
+    })
+
+    const result = await runtime.run({
+      code: `
+        waitUntil((async () => { await audit('record') })())
+        export default 'answered'
+      `,
+      globals: {
+        audit: async (entry: unknown) => {
+          await gate
+          auditWritten = true
+          return `stored:${String(entry)}`
+        },
+      },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    // The caller has the value while the background bridge call is still
+    // parked on the host handler.
+    expect(result.exports.default).toBe('answered')
+    expect(auditWritten).toBe(false)
+    expect(result.waitUntil).toBeDefined()
+
+    releaseAudit()
+    const report = await result.waitUntil!
+    expect(report.status).toBe('settled')
+    expect(auditWritten).toBe(true)
+  })
+
+  test('a run that registers nothing has no waitUntil field', async () => {
+    const result = await runtime.run({ code: 'export default 1' })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.waitUntil).toBeUndefined()
+  })
+
+  test('a rejected background promise reports failed; the run stays successful', async () => {
+    const result = await runtime.run({
+      code: `
+        waitUntil(Promise.reject(new TypeError('flush failed')))
+        export default 'ok'
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const report = await result.waitUntil!
+    expect(report.status).toBe('failed')
+    expect(report.error).toEqual({ name: 'TypeError', message: 'flush failed' })
+  })
+
+  test('unresolvable background work truncates at the grace budget; the slot recovers', async () => {
+    const result = await runtime.run({
+      code: `
+        waitUntil(new Promise(() => {}))
+        export default 'ok'
+      `,
+      limits: { graceMs: 200 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const report = await result.waitUntil!
+    expect(report.status).toBe('truncated')
+
+    // The connection went back to the pool after the epilogue; new runs work.
+    const next = await runtime.run({ code: 'export default 2' })
+    expect(next.ok && next.exports.default === 2).toBe(true)
+  })
+
+  test('graceMs: 0 disables the epilogue entirely', async () => {
+    const result = await runtime.run({
+      code: `
+        waitUntil(new Promise(() => {}))
+        export default 'ok'
+      `,
+      limits: { graceMs: 0 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.waitUntil).toBeUndefined()
+  })
+
+  test('a worker-style handler responds early and finishes its write on a warm instance', async () => {
+    const written: string[] = []
+    const prefix = await runtime.prepare({
+      code: `export default {
+        async fetch(request) {
+          waitUntil(db(new URL(request.url).pathname))
+          return new Response('accepted', { status: 202 })
+        },
+      }`,
+      globals: { db: async (row: unknown) => {
+        written.push(String(row))
+        return 1
+      } },
+    })
+    for (const path of ['/a', '/b']) {
+      const result = await prefix.call({
+        export: 'default.fetch',
+        args: [new Request(`https://example.com${path}`)],
+        globals: { db: async (row: unknown) => {
+          written.push(String(row))
+          return 1
+        } },
+      })
+      expect(result.ok).toBe(true)
+      if (!result.ok)
+        return
+      expect((result.value as Response).status).toBe(202)
+      const report = await result.waitUntil!
+      expect(report.status).toBe('settled')
+      // The call was ATTEMPTED during the run (waitUntil(db(...)) invokes db
+      // synchronously), so its record ships with the run's own telemetry;
+      // only its response was consumed during grace.
+      expect(result.bridgeCalls.map((c) => c.name)).toEqual(['db'])
+      expect(report.bridgeCalls).toEqual([])
+    }
+    expect(written).toEqual(['/a', '/b'])
+    await prefix.dispose()
+  })
+
+  test('aborting during the grace phase cancels the background work', async () => {
+    const controller = new AbortController()
+    const started = Date.now()
+    const result = await runtime.run({
+      code: `
+        waitUntil(new Promise(() => {}))
+        export default 'ok'
+      `,
+      limits: { graceMs: 10_000 },
+      signal: controller.signal,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    controller.abort(new Error('caller moved on'))
+    const report = await result.waitUntil!
+    expect(report.status).toBe('truncated')
+    // Cancelled promptly, not held for the 10 s budget.
+    expect(Date.now() - started).toBeLessThan(3_000)
+
+    const next = await runtime.run({ code: 'export default 3' })
+    expect(next.ok && next.exports.default === 3).toBe(true)
+  })
+
+  test('a huge rejection message is capped and never costs the connection', async () => {
+    const result = await runtime.run({
+      code: `
+        waitUntil(Promise.reject(new Error('x'.repeat(80 * 1024 * 1024))))
+        export default 'ok'
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const report = await result.waitUntil!
+    expect(report.status).toBe('failed')
+    // Capped at the runtime, not lost to an oversized frame.
+    expect(report.error!.message.length).toBeLessThan(3_000)
+    expect(report.error!.message.endsWith('[truncated]')).toBe(true)
+
+    const next = await runtime.run({ code: 'export default 4' })
+    expect(next.ok && next.exports.default === 4).toBe(true)
+  })
+
+  test('waitUntil is importable from iso4:runtime', async () => {
+    const result = await runtime.run({
+      code: `
+        import { waitUntil as wu } from 'iso4:runtime'
+        wu(Promise.resolve())
+        export default typeof wu
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('function')
+    expect((await result.waitUntil!).status).toBe('settled')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // readExports (#58): the deploy-path declaration reader
 // ─────────────────────────────────────────────────────────────────────────────
 

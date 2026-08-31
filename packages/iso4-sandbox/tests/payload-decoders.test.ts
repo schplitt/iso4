@@ -147,6 +147,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
       valueSlot(spec.exports),
       strList(spec.skippedExports ?? []),
       tail,
+      Buffer.from([0]), // backgroundPending = false (#71)
       Buffer.from([0]), // failurePresent = 0
     ])
   }

@@ -57,16 +57,16 @@ this version, and the handshake hard-fails otherwise (§8).
 
 ### 2.1 TS → Rust
 
-|   Byte | Name             | Payload                 | Response                                                                                                                         |
-| -----: | ---------------- | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a malformed payload Rust closes the socket without replying                                              |
-| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
-| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                   |
-| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | zero or more `BridgeCall`, then exactly one `Result`                                                                             |
-| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                             |
-| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                          |
-| `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown |
-| `0x08` | `Stats`          | empty                   | exactly one `StatsResult` (#65)                                                                                                  |
+|   Byte | Name             | Payload                 | Response                                                                                                                                        |
+| -----: | ---------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a malformed payload Rust closes the socket without replying                                                             |
+| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`; when it reports pending background work: more `BridgeCall`s, then one `RunComplete` (#71) |
+| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                                  |
+| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | same as `Run`                                                                                                                                   |
+| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                                            |
+| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                                         |
+| `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown                |
+| `0x08` | `Stats`          | empty                   | exactly one `StatsResult` (#65)                                                                                                                 |
 
 ### 2.2 Rust → TS
 
@@ -78,6 +78,7 @@ this version, and the handshake hard-fails otherwise (§8).
 | `0x04` | `Log`              | `DiagnosticLogPayload`    | Internal runtime diagnostic; not sandbox stdout/stderr.                                               |
 | `0x05` | `Hello`            | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.               |
 | `0x06` | `StatsResult`      | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request (#65).                                            |
+| `0x07` | `RunComplete`      | `RunCompletePayload`      | Final frame of a run whose `Result` reported pending background work (#71); frees the run's slot.     |
 
 ---
 
@@ -642,6 +643,7 @@ distinct from absent.
 | `maxStderrBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
 | `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
 | `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.               |
+| `graceMs`            | `Optional<u32>` | `30000`  | Wall budget for `waitUntil` background work after the Result ships (#71), one budget for the whole registered set. Zero disables the grace phase entirely.       |
 
 `GlobalDef`:
 
@@ -909,7 +911,38 @@ afterwards, so later calls report only their own lines.
 | `prefixId` | `Optional<PrefixId>`        | Present when `ok = true`.  |
 | `error`    | `Optional<RunErrorPayload>` | Present when `ok = false`. |
 
-### 5.7 Stats payloads
+### 5.7 RunComplete payloads (#71)
+
+Sent exactly once, as the final frame of a run whose `Result` carried
+`backgroundPending = true` — after the `waitUntil` grace phase ends. Grace
+telemetry only: the run's own numbers already shipped on the `Result`.
+
+`RunCompletePayload`:
+
+| Field         | Encoding                                | Notes                                                                                                             |
+| ------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `runId`       | `u32`                                   | The run being completed; checked by the host like the Result's.                                                   |
+| `status`      | `u8`                                    | `0 = settled` (all work finished), `1 = truncated` (budget or host abort), `2 = failed` (a registered rejection). |
+| `durationMs`  | `f64`                                   | Grace wall time (after the Result shipped).                                                                       |
+| `cpuTimeMs`   | `f64`                                   | Active V8 time during grace — metered separately from the run's.                                                  |
+| `stdout`      | `List<String>`                          | Console lines written during grace.                                                                               |
+| `stderr`      | `List<String>`                          |                                                                                                                   |
+| `bridgeCalls` | `List<BridgeCallRecord>`                | Bridge calls **attempted** during grace (a call attempted pre-settle ships on the Result's records).              |
+| `error`       | `Optional<String name, String message>` | The first rejection (`status = 2`), or the fatal error ending a truncated phase, when one exists.                 |
+
+Between the `Result` and the `RunComplete` the connection still belongs to
+the run: grace-time `BridgeCall`/`BridgeResponse` traffic flows exactly as
+during the run, and the host must not start a new run on the slot until the
+`RunComplete` arrives. This post-Result phase is the designed home for
+future in-run streaming frames (#96).
+
+A `RunComplete` too large to frame is substituted by a minimal one — same
+`runId` and `status`, empty telemetry, and an error naming the substitution —
+mirroring the oversize recovery `Result` frames have, so an oversized grace
+report costs its telemetry, never the connection. The carried error strings
+are additionally capped at the runtime (256-byte name, 2048-byte message).
+
+### 5.8 Stats payloads
 
 A `Stats` request has an **empty payload** and is answered with exactly one
 `StatsResult` frame — a point-in-time snapshot of the warm registry (#65).
@@ -967,6 +1000,13 @@ TS (one connection slot)              Rust (one isolate thread)
 │                                       │
 │  next Run/PrefixRun may now begin     │
 ```
+
+A run whose `Result` reports `backgroundPending = true` (#71) is not over:
+the connection stays bound to it while `waitUntil` background work runs —
+grace-time `BridgeCall`/`BridgeResponse` traffic included — until exactly one
+`RunComplete` frame ends the run and frees the slot. The host resolves the
+caller at the `Result` (that is the point of the feature) and keeps draining
+the connection in the background.
 
 `Precompile` uses the same authenticated connection but is not a run. It
 validates the prefix (compile + instantiate + evaluate in a throwaway
