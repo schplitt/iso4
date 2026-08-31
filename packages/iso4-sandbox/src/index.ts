@@ -55,7 +55,7 @@ import {
 } from './imports.js'
 import type { ImportHandlerMap } from './imports.js'
 import { materializeHostTypesInGlobals, serializeHostValue } from './v8-codec.js'
-import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN } from './web-codec.js'
+import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN, StreamSourceRegistry } from './web-codec.js'
 
 export type {
   ResourceLimits,
@@ -485,11 +485,14 @@ class SandboxImpl implements Sandbox {
     // Call args cross as one blob holding the argument array — the same
     // host-type-aware leg as bridge responses, so a real `Request` (whose
     // body drain is async) works at any depth.
+    // Per-run stream registry: bodies that outgrow the probe cross as
+    // stream handles pumped under flow control instead of inline bytes.
+    const streams = new StreamSourceRegistry()
     const call = options.call === undefined
       ? undefined
       : {
           exportPath: options.call.export,
-          argsBlob: await serializeHostValue(options.call.args ?? [], this.brandKey),
+          argsBlob: await serializeHostValue(options.call.args ?? [], this.brandKey, streams),
         }
     try {
       return await this.pool.withClient(async (client) => {
@@ -504,6 +507,7 @@ class SandboxImpl implements Sandbox {
           importDispatch: handlers,
           signal: options.signal,
           call,
+          streams,
         })
         // `call` present ⇒ the value blob is the function's return value;
         // absent ⇒ the exports object. Never both.
@@ -523,6 +527,10 @@ class SandboxImpl implements Sandbox {
         return decoded
       }, options.signal)
     } catch (error) {
+      // Failure before or during the exchange: nothing will pump these
+      // sources anymore; release them (idempotent with the client's own
+      // terminal cleanup on the success paths).
+      streams.releaseAll()
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
       if (error instanceof ProtocolDesyncError)
@@ -746,11 +754,14 @@ implements Prefix<G, M> {
   async call(options: PrefixCallOptions<G, M>): Promise<CallResult> {
     // Same host-type-aware args leg as SandboxImpl.run — a real `Request`
     // (async body drain) works at any depth, as one blob holding the array.
+    // The stream registry covers both the args and this run's bridge
+    // responses.
+    const streams = new StreamSourceRegistry()
     const call = {
       exportPath: options.export,
-      argsBlob: await serializeHostValue(options.args ?? [], this.brandKey),
+      argsBlob: await serializeHostValue(options.args ?? [], this.brandKey, streams),
     }
-    const result = await this.dispatch(options, { call })
+    const result = await this.dispatch(options, { call, streams })
     return result as CallResult
   }
 
@@ -775,7 +786,8 @@ implements Prefix<G, M> {
       signal?: AbortSignal
       filename?: string
     },
-    payload: { code: string, call?: undefined } | { code?: undefined, call: CallPayload },
+    payload: { code: string, call?: undefined, streams?: StreamSourceRegistry }
+      | { code?: undefined, call: CallPayload, streams?: StreamSourceRegistry },
   ): Promise<RunResult | CallResult> {
     if (!this._alive) {
       return {
@@ -839,6 +851,7 @@ implements Prefix<G, M> {
       }
       throw e
     }
+    const streams = payload.streams ?? new StreamSourceRegistry()
     try {
       return await this.pool.withClient(async (client) => {
         const raw = await client.prefixRun({
@@ -852,6 +865,7 @@ implements Prefix<G, M> {
           importDispatch: merged.handlers,
           signal: options.signal,
           call: payload.call,
+          streams,
         })
         // `call` present ⇒ the value blob is the function's return value;
         // absent ⇒ the exports object. Never both.
@@ -868,6 +882,7 @@ implements Prefix<G, M> {
         return decoded
       }, options.signal)
     } catch (error) {
+      streams.releaseAll()
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
       if (error instanceof ProtocolDesyncError)

@@ -36,6 +36,15 @@ export const TsToRustMessageTypes = {
    * `StatsResult` frame.
    */
   Stats: 0x08,
+  /**
+   * One chunk of a streamed host-type body — only inside the granted credit
+   * window.
+   */
+  StreamChunk: 0x09,
+  /**
+   * End of a streamed body: clean EOF or a source failure.
+   */
+  StreamEnd: 0x0A,
 } as const
 
 export type TsToRustMessageType
@@ -61,6 +70,15 @@ export const RustToTsMessageTypes = {
    * connection slot.
    */
   RunComplete: 0x07,
+  /**
+   * Streaming-body credit grant: the sandbox consumed bytes, the host may
+   * have that many more in flight.
+   */
+  StreamPull: 0x08,
+  /**
+   * The sandbox cancelled a streamed body; stop pumping, release the source.
+   */
+  StreamCancel: 0x09,
 } as const
 
 export type RustToTsMessageType
@@ -1346,6 +1364,77 @@ export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
 }
 
 /**
+ * Streaming bodies — wire constants mirroring `ipc.rs`.
+ */
+export const STREAM_CHUNK_MAX_BYTES: number = 64 * 1024
+export const STREAM_CREDIT_WINDOW_BYTES: number = 256 * 1024
+/**
+ * Bodies that end within this many bytes take the buffered path unchanged;
+ * larger ones stream. Host-side policy, not wire contract.
+ */
+export const STREAM_PROBE_BYTES: number = 64 * 1024
+
+/**
+ * Encode a `StreamChunk` payload: `u32 runId, u32 streamId, Bytes data`.
+ * @param runId the run the stream belongs to
+ * @param streamId the stream
+ * @param data at most {@link STREAM_CHUNK_MAX_BYTES} bytes
+ */
+export function encodeStreamChunkPayload(runId: number, streamId: number, data: Uint8Array): Buffer {
+  const out = Buffer.allocUnsafe(12 + data.byteLength)
+  out.writeUInt32BE(runId, 0)
+  out.writeUInt32BE(streamId, 4)
+  out.writeUInt32BE(data.byteLength, 8)
+  Buffer.from(data.buffer, data.byteOffset, data.byteLength).copy(out, 12)
+  return out
+}
+
+/**
+ * Encode a `StreamEnd` payload: `u32 runId, u32 streamId, bool ok,
+ * Optional<String> error` (only when `ok = false`).
+ * @param runId the run
+ * @param streamId the stream
+ * @param error present = the source failed with this message
+ */
+export function encodeStreamEndPayload(runId: number, streamId: number, error?: string): Buffer {
+  const writer = new PayloadWriter()
+  writer.writeU32(runId)
+  writer.writeU32(streamId)
+  writer.writeU8(error === undefined ? 1 : 0)
+  if (error !== undefined) {
+    writer.writeU8(1)
+    writer.writeString(error)
+  }
+  return Buffer.concat(writer.parts)
+}
+
+/**
+ * Decode a `StreamPull` payload: `u32 runId, u32 streamId, u32 credit`.
+ * @param payload the frame payload
+ */
+export function decodeStreamPullPayload(payload: Uint8Array): { runId: number, streamId: number, credit: number } {
+  const reader = new PayloadReader(payload)
+  const runId = reader.readU32()
+  const streamId = reader.readU32()
+  const credit = reader.readU32()
+  reader.assertDone()
+  return { runId, streamId, credit }
+}
+
+/**
+ * Decode a `StreamCancel` payload: `u32 runId, u32 streamId, String reason`.
+ * @param payload the frame payload
+ */
+export function decodeStreamCancelPayload(payload: Uint8Array): { runId: number, streamId: number, reason: string } {
+  const reader = new PayloadReader(payload)
+  const runId = reader.readU32()
+  const streamId = reader.readU32()
+  const reason = reader.readString()
+  reader.assertDone()
+  return { runId, streamId, reason }
+}
+
+/**
  * Read just the `backgroundPending` flag off a `Result` frame payload,
  * without decoding the rest. Both encoders write strict layouts with no
  * trailing bytes, so on a success payload the flag is the second-to-last byte
@@ -1721,6 +1810,8 @@ export function parseRustToTsMessageType(
     case RustToTsMessageTypes.Hello:
     case RustToTsMessageTypes.StatsResult:
     case RustToTsMessageTypes.RunComplete:
+    case RustToTsMessageTypes.StreamPull:
+    case RustToTsMessageTypes.StreamCancel:
       return byte
     default:
       throw new Error(`unknown Rust->TS message type: ${formatByte(byte)}`)

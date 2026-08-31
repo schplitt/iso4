@@ -234,6 +234,13 @@ fn encode_body(
     helper: &dyn ValueSerializerHelper,
     body: v8::Local<v8::Value>,
 ) -> Codec<()> {
+    if crate::v8::body_stream_id_of(scope, body).is_some() {
+        return Err(CodecError::Unsupported(
+            "a streamed body cannot be returned to the host yet — read it first \
+             (await res.arrayBuffer()) and return the bytes"
+                .to_string(),
+        ));
+    }
     let body = check_body(body)?;
     // V8 writes the bytes once, straight out of the backing store. Framing it
     // by hand meant copy_contents into a Vec and then a second copy into the
@@ -571,6 +578,42 @@ fn descriptor_field<'s>(
     }
 }
 
+/// The streamed body for a descriptor carrying a `bodyStream` handle, or
+/// `None` when the descriptor's body is inline. Registers the stream in the
+/// executing run's table and builds the sandbox-side stream object.
+fn hydrated_stream_body<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    desc: v8::Local<v8::Object>,
+) -> Codec<Option<v8::Local<'s, v8::Value>>> {
+    let Some(key) = v8::String::new(scope, "bodyStream") else {
+        return malformed("could not intern the bodyStream key");
+    };
+    // Own property only: a prototype-chain getter (guest-poisoned
+    // Object.prototype) must not fabricate a handle on a buffered descriptor.
+    // Self-harm either way, but cheap to close.
+    if !desc.has_own_property(scope, key.into()).unwrap_or(false) {
+        return Ok(None);
+    }
+    let Some(value) = desc.get(scope, key.into()) else {
+        return Ok(None);
+    };
+    if !value.is_uint32() {
+        return Ok(None);
+    }
+    let Some(stream_id) = value.uint32_value(scope) else {
+        return Ok(None);
+    };
+    if !crate::v8::register_hydrated_stream(stream_id) {
+        return Err(CodecError::Unsupported(
+            "a streamed body can only be delivered to a running sandbox".to_string(),
+        ));
+    }
+    match crate::v8::make_body_stream(scope, stream_id) {
+        Some(stream) => Ok(Some(stream.into())),
+        None => malformed("could not construct the body stream"),
+    }
+}
+
 /// Turn one branded descriptor into a real instance.
 ///
 /// Adding a type here plus a tag is the whole cost of making a new class cross
@@ -605,7 +648,10 @@ fn build_from_descriptor<'s>(
         TAG_REQUEST => {
             let url = descriptor_field(scope, desc, "url")?;
             let method = descriptor_field(scope, desc, "method")?;
-            let body = check_body(descriptor_field(scope, desc, "body")?)?;
+            let body = match hydrated_stream_body(scope, desc)? {
+                Some(stream) => stream,
+                None => check_body(descriptor_field(scope, desc, "body")?)?,
+            };
             match webtypes::make_request(scope, url, method, headers, body) {
                 Some(r) => Ok(r),
                 None => malformed("could not construct Request"),
@@ -616,7 +662,10 @@ fn build_from_descriptor<'s>(
                 .uint32_value(scope)
                 .unwrap_or(200);
             let status_text = descriptor_field(scope, desc, "statusText")?;
-            let body = check_body(descriptor_field(scope, desc, "body")?)?;
+            let body = match hydrated_stream_body(scope, desc)? {
+                Some(stream) => stream,
+                None => check_body(descriptor_field(scope, desc, "body")?)?,
+            };
             match webtypes::make_response(scope, status, status_text, headers, body) {
                 Some(r) => Ok(r),
                 None => malformed("could not construct Response"),

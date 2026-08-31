@@ -16,7 +16,7 @@
 // parser (url.rs), and the URL class below is only the object surface. Like
 // the shells, they are never exposed on globalThis.
 
-(function (HeadersShell, RequestShell, ResponseShell, urlParse, urlSet) {
+(function (HeadersShell, RequestShell, ResponseShell, urlParse, urlSet, streamRead, streamCancel) {
   'use strict'
 
   const def = (target, name, value) =>
@@ -691,6 +691,12 @@
       return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength))
     if (body instanceof ArrayBuffer)
       return new Uint8Array(body.slice(0))
+    if (body instanceof Iso4BodyStream) {
+      throw new TypeError(
+        'A streamed body cannot be re-wrapped in a new Request/Response — read '
+        + 'it first (await res.arrayBuffer()) and construct from the bytes',
+      )
+    }
     if (typeof body === 'object' && typeof body.getReader === 'function') {
       throw new TypeError(
         'A ReadableStream body cannot cross the sandbox boundary — buffer it first',
@@ -699,50 +705,229 @@
     return String(body)
   }
 
+  // ── Streamed bodies ────────────────────────────────────────────────────────
+  //
+  // A host body too large for the buffered path arrives as a stream handle;
+  // this minimal reader surface is what `.body` exposes on such instances.
+  // Chunks are pulled from the runtime on demand (`streamRead` resolves with
+  // a Uint8Array, null at EOF, and rejects on a source failure); consuming a
+  // chunk replenishes the host's flow-control credit. Not a full WHATWG
+  // ReadableStream — a reader, cancellation, and async iteration, which is
+  // what body-processing code actually uses.
+  class Iso4BodyStream {
+    // `source` is either a numeric stream id (native-backed, hydrated by the
+    // runtime) or a { pull, cancel } pair (a tee branch — see teeBodyStream).
+    constructor(source) {
+      def(this, '_src', source)
+      def(this, '_locked', false)
+      def(this, '_done', false)
+      // Spec "disturbed": the stream has been read from or cancelled. Feeds
+      // bodyUsed, matching Node.
+      def(this, '_disturbed', false)
+    }
+
+    get locked() {
+      return this._locked
+    }
+
+    async _pull() {
+      def(this, '_disturbed', true)
+      if (typeof this._src === 'number')
+        return streamRead(this._src)
+      return this._src.pull()
+    }
+
+    _cancelSource(reason) {
+      def(this, '_disturbed', true)
+      if (typeof this._src === 'number')
+        streamCancel(this._src, reason)
+      else
+        this._src.cancel(reason)
+    }
+
+    getReader() {
+      if (this._locked)
+        throw new TypeError('This stream is already locked to a reader')
+      def(this, '_locked', true)
+      const self = this
+      return {
+        read: async () => {
+          if (self._done)
+            return { done: true, value: undefined }
+          const chunk = await self._pull()
+          if (chunk === null) {
+            def(self, '_done', true)
+            return { done: true, value: undefined }
+          }
+          return { done: false, value: chunk }
+        },
+        cancel: async (reason) => {
+          def(self, '_done', true)
+          self._cancelSource(reason === undefined ? '' : String(reason))
+        },
+        releaseLock: () => {
+          def(self, '_locked', false)
+        },
+      }
+    }
+
+    cancel(reason) {
+      if (this._locked)
+        throw new TypeError('Cannot cancel a stream locked to a reader')
+      def(this, '_done', true)
+      this._cancelSource(reason === undefined ? '' : String(reason))
+      return Promise.resolve()
+    }
+
+    async * [Symbol.asyncIterator]() {
+      const reader = this.getReader()
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done)
+          return
+        yield value
+      }
+    }
+  }
+
+  // Split one streamed body into two independent branches (fetch-spec tee):
+  // the underlying stream is pulled once, every chunk lands in both branch
+  // queues, and the host source is released only when both branches
+  // cancelled. The slower branch's backlog lives in the guest heap, which the
+  // isolate's memory cap already bounds.
+  function teeBodyStream(stream) {
+    const queues = [[], []]
+    const cancelledFlags = [false, false]
+    let done = false
+    let failure = null
+    let inFlight = null
+
+    const pullShared = () => {
+      if (inFlight === null) {
+        inFlight = (async () => {
+          try {
+            const chunk = await stream._pull()
+            if (chunk === null) {
+              done = true
+            } else {
+              if (!cancelledFlags[0])
+                queues[0].push(chunk)
+              if (!cancelledFlags[1])
+                queues[1].push(chunk)
+            }
+          } catch (e) {
+            failure = e
+          } finally {
+            inFlight = null
+          }
+        })()
+      }
+      return inFlight
+    }
+
+    const branch = (i) => new Iso4BodyStream({
+      pull: async () => {
+        for (;;) {
+          if (queues[i].length > 0)
+            return queues[i].shift()
+          if (failure !== null)
+            throw failure
+          if (done || cancelledFlags[i])
+            return null
+          await pullShared()
+        }
+      },
+      cancel: (reason) => {
+        cancelledFlags[i] = true
+        queues[i] = []
+        if (cancelledFlags[0] && cancelledFlags[1] && !done)
+          stream._cancelSource(reason)
+      },
+    })
+
+    return [branch(0), branch(1)]
+  }
+
+  // Drain a streamed body completely into one Uint8Array (the body helpers'
+  // path for streamed instances).
+  async function drainStream(stream) {
+    const chunks = []
+    let total = 0
+    for await (const chunk of stream) {
+      chunks.push(chunk)
+      total += chunk.byteLength
+    }
+    const out = new Uint8Array(total)
+    let offset = 0
+    for (const chunk of chunks) {
+      out.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return out
+  }
+
   function installBody(proto) {
+    // A streamed body is drained on first consumption; buffered bodies are
+    // returned as-is. Either way the body domain after this is
+    // null | string | Uint8Array.
+    async function settleBody(self) {
+      const b = consume(self)
+      if (b instanceof Iso4BodyStream)
+        return drainStream(b)
+      return b
+    }
     def(proto, 'arrayBuffer', async function arrayBuffer() {
-      const b = consume(this)
+      const b = await settleBody(this)
       if (b === null)
         return new ArrayBuffer(0)
       const bytes = typeof b === 'string' ? utf8Encode(b) : b
       return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
     })
     def(proto, 'bytes', async function bytes() {
-      const b = consume(this)
+      const b = await settleBody(this)
       if (b === null)
         return new Uint8Array(0)
       return typeof b === 'string' ? utf8Encode(b) : b
     })
     def(proto, 'text', async function text() {
-      const b = consume(this)
+      const b = await settleBody(this)
       if (b === null)
         return ''
       return typeof b === 'string' ? b : utf8Decode(b)
     })
     def(proto, 'json', async function json() {
-      const b = consume(this)
+      const b = await settleBody(this)
       if (b === null)
         throw new SyntaxError('Unexpected end of JSON input')
       return JSON.parse(typeof b === 'string' ? b : utf8Decode(b))
     })
     Object.defineProperty(proto, 'bodyUsed', {
       get() {
+        // A streamed body read through `.body` (or cancelled) is disturbed
+        // and counts as used, matching Node.
         return this._used === true
+          || (this._b instanceof Iso4BodyStream && this._b._disturbed === true)
       },
       enumerable: false,
       configurable: true,
     })
-    // `.body` is deliberately absent rather than null: a ReadableStream cannot
-    // cross the boundary, and returning null would claim the body is empty.
+    // `.body` is a stream only for instances that arrived with a streamed
+    // host body; buffered bodies keep the historical shape (absent-as-null
+    // would claim emptiness, so it stays null only when there is nothing to
+    // stream — use text()/bytes()/arrayBuffer() for those).
+    Object.defineProperty(proto, 'body', {
+      get() {
+        return this._b instanceof Iso4BodyStream ? this._b : null
+      },
+      enumerable: false,
+      configurable: true,
+    })
   }
 
-  // clone() must tee into independent bodies. `_b` is only ever null, an
-  // immutable string, or a Uint8Array (the body domain enforced by `bodyInit`
-  // and the codec's check_body), so only the buffer variant can be mutated
-  // through and needs a copy — a shared string cannot observe a change, and
-  // null is nothing. Copying a string would just be a wasted allocation on
-  // the common text-body path. This is the same copy rule `bodyInit` applies
-  // at construction; clone() skipped it and aliased the buffer.
+  // clone() must tee into independent bodies. For the buffered domain (null,
+  // an immutable string, a Uint8Array) only the buffer variant can be mutated
+  // through and needs a copy; streamed bodies go through teeBodyStream in
+  // clone() itself, because the original's body is swapped for one branch.
   function cloneBody(body) {
     return body instanceof Uint8Array ? new Uint8Array(body) : body
   }
@@ -836,7 +1021,13 @@
       if (this._used)
         throw new TypeError('Body has already been consumed')
       const copy = new Request(this._u, { method: this._m, headers: this._h })
-      def(copy, '_b', cloneBody(this._b))
+      if (this._b instanceof Iso4BodyStream) {
+        const [mine, theirs] = teeBodyStream(this._b)
+        def(this, '_b', mine)
+        def(copy, '_b', theirs)
+      } else {
+        def(copy, '_b', cloneBody(this._b))
+      }
       def(copy, '_x', this._x)
       return copy
     }
@@ -913,7 +1104,13 @@
         headers: this._h,
       })
       def(copy, '_s', this._s)
-      def(copy, '_b', cloneBody(this._b))
+      if (this._b instanceof Iso4BodyStream) {
+        const [mine, theirs] = teeBodyStream(this._b)
+        def(this, '_b', mine)
+        def(copy, '_b', theirs)
+      } else {
+        def(copy, '_b', cloneBody(this._b))
+      }
       return copy
     }
 
@@ -961,6 +1158,7 @@
   }
 
   // Returned to `install()`, which keeps these references in private slots so
-  // deserialization never depends on the (guest-mutable) globals above.
-  return [Headers, Request, Response]
+  // deserialization never depends on the (guest-mutable) globals above. The
+  // fourth entry builds the body-stream object for hydrated stream handles.
+  return [Headers, Request, Response, (id) => new Iso4BodyStream(id)]
 })

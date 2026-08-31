@@ -983,6 +983,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     break;
                 }
             }
+            ipc::TsToRustMessageType::StreamChunk | ipc::TsToRustMessageType::StreamEnd => {
+                // Stream frames reaching the top-level session loop belong to
+                // a run that already completed (the host's pump raced the
+                // Result). The run's stream table died with it; discard,
+                // mirroring the late-BridgeResponse arm above.
+                eprintln!("[iso4-v8] ignoring late stream frame (run already completed)");
+            }
             ipc::TsToRustMessageType::Terminate => {
                 // A Terminate reaching the top-level session loop targets a run
                 // that has already completed — its Result was sent just before

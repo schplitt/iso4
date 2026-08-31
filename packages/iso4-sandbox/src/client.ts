@@ -25,12 +25,19 @@ import {
   peekBridgeCallId,
   peekRunCompletionBackgroundPending,
   peekRunCompletionRunId,
+  STREAM_CHUNK_MAX_BYTES,
+  STREAM_CREDIT_WINDOW_BYTES,
+  decodeStreamCancelPayload,
+  decodeStreamPullPayload,
+  encodeStreamChunkPayload,
+  encodeStreamEndPayload,
 } from './ipc'
 import type { WireResourceLimits, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
+import type { StreamSourceRegistry } from './web-codec.js'
 import { brandKeyForToken } from './web-codec.js'
 
 export interface RuntimeIpcClientOptions {
@@ -326,6 +333,10 @@ export class RuntimeIpcClient {
     // When D11 (concurrent async bridge) lands, add a
     // `do { ... } while (inFlightRuns.has(id))` guard here.
     this.nextRunId = (this.nextRunId + 1) >>> 0
+    // Run id 0 disables stream-frame run validation on both sides (it means
+    // "no epilogue spec" runtime-side), so skip it on wrap.
+    if (this.nextRunId === 0)
+      this.nextRunId = 1
     return this.nextRunId
   }
 
@@ -346,6 +357,7 @@ export class RuntimeIpcClient {
       importDispatch?: ImportHandlerMap
       signal?: AbortSignal
       call?: CallPayload
+      streams?: StreamSourceRegistry
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -366,11 +378,14 @@ export class RuntimeIpcClient {
         }),
       ),
     )
+    // The frame carrying stream handles is on the wire; start their pumps.
+    this.activateStreams(options?.streams, runId)
 
     return this.drainUntilResult(
       makeDispatcher(options?.dispatch ?? {}, options?.importDispatch),
       runId,
       options?.signal,
+      options?.streams,
     )
   }
 
@@ -436,6 +451,7 @@ export class RuntimeIpcClient {
       importDispatch?: ImportHandlerMap
       signal?: AbortSignal
       call?: CallPayload
+      streams?: StreamSourceRegistry
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -457,11 +473,13 @@ export class RuntimeIpcClient {
         }),
       ),
     )
+    this.activateStreams(options.streams, runId)
 
     return this.drainUntilResult(
       makeDispatcher(options.dispatch ?? {}, options.importDispatch),
       runId,
       options.signal,
+      options.streams,
     )
   }
 
@@ -561,11 +579,13 @@ export class RuntimeIpcClient {
    * @param dispatcher
    * @param runId
    * @param signal
+   * @param streams
    */
   private async drainUntilResult(
     dispatcher: BridgeCallDispatcher | undefined,
     runId: number,
     signal?: AbortSignal,
+    streams?: StreamSourceRegistry,
   ): Promise<RawRunResult> {
     // If the signal aborted between the run-entry check in index.ts and here,
     // tear down before we start reading frames. The Run frame is already on the
@@ -599,7 +619,7 @@ export class RuntimeIpcClient {
 
     this.inFlightRunId = runId
     try {
-      return await this.drainFrames(dispatcher, runId, signal)
+      return await this.drainFrames(dispatcher, runId, signal, streams)
     } catch (error) {
       // The fallback `abortConnection` closes the reader, which makes the frame
       // loop reject. Translate that (or any error observed once the signal has
@@ -639,14 +659,16 @@ export class RuntimeIpcClient {
    *   (`session.rs` → `wire::encode_run_completion_payload`), so a mismatch is
    *   proof that this connection is delivering someone else's run.
    * @param signal
+   * @param streams
    */
   private async drainFrames(
     dispatcher: BridgeCallDispatcher | undefined,
     runId: number,
     signal?: AbortSignal,
+    streams?: StreamSourceRegistry,
   ): Promise<RawRunResult> {
     try {
-      return await this.drainFramesInner(dispatcher, runId, signal)
+      return await this.drainFramesInner(dispatcher, runId, signal, streams)
     } catch (error) {
       // Anything escaping the frame loop leaves the peer mid-run on a
       // connection whose alignment we can no longer vouch for — most sharply a
@@ -660,6 +682,140 @@ export class RuntimeIpcClient {
   }
 
   /**
+   * Start pumps for every stream registered since the last activation,
+   * seeding each with the initial credit window. Called right after the
+   * frame carrying the stream handles has been written.
+   * @param streams the run's registry
+   * @param runId the run the streams belong to
+   */
+  private activateStreams(streams: StreamSourceRegistry | undefined, runId: number): void {
+    if (streams === undefined)
+      return
+    for (const id of streams.takeNewIds()) {
+      const source = streams.sources.get(id)
+      if (source === undefined)
+        continue
+      source.credit = STREAM_CREDIT_WINDOW_BYTES
+      this.pumpStream(streams, runId, id)
+    }
+  }
+
+  /**
+   * Credit grant from the runtime: the sandbox consumed bytes, send more.
+   * @param payload the StreamPull frame payload
+   * @param streams the run's registry
+   * @param runId the in-flight run (frames for other runs are stale)
+   */
+  private handleStreamPull(
+    payload: Uint8Array,
+    streams: StreamSourceRegistry | undefined,
+    runId: number,
+  ): void {
+    if (streams === undefined)
+      return
+    const pull = decodeStreamPullPayload(payload)
+    if (pull.runId !== 0 && pull.runId !== runId)
+      return
+    const source = streams.sources.get(pull.streamId)
+    if (source === undefined)
+      return
+    source.credit += pull.credit
+    this.pumpStream(streams, runId, pull.streamId)
+  }
+
+  /**
+   * The sandbox is done with a stream: stop pumping, release the source.
+   * @param payload the StreamCancel frame payload
+   * @param streams the run's registry
+   * @param runId
+   */
+  private handleStreamCancel(
+    payload: Uint8Array,
+    streams: StreamSourceRegistry | undefined,
+    runId: number,
+  ): void {
+    if (streams === undefined)
+      return
+    const cancel = decodeStreamCancelPayload(payload)
+    if (cancel.runId !== 0 && cancel.runId !== runId)
+      return
+    const source = streams.sources.get(cancel.streamId)
+    if (source === undefined)
+      return
+    source.done = true
+    source.reader.cancel(cancel.reason).catch(() => {})
+    streams.sources.delete(cancel.streamId)
+  }
+
+  /**
+   * Pump one stream: send buffered probe chunks first, then pull the source,
+   * staying inside the credit window and the per-chunk cap. Fire-and-forget;
+   * re-entered by credit grants. Errors end the stream with a `StreamEnd`
+   * carrying the message — the sandbox's pending read rejects catchably.
+   * @param streams the run's registry
+   * @param runId the run
+   * @param streamId the stream to pump
+   */
+  private pumpStream(streams: StreamSourceRegistry, runId: number, streamId: number): void {
+    const source = streams.sources.get(streamId)
+    if (source === undefined || source.pumping || source.done)
+      return
+    source.pumping = true;
+    (async () => {
+      try {
+        while (source.credit > 0 && !source.done) {
+          let chunk = source.prefix.shift()
+          if (chunk === undefined) {
+            const { done, value } = await source.reader.read()
+            if (done) {
+              source.done = true
+              streams.sources.delete(streamId)
+              await this.write(
+                encodeTsToRustFrame(
+                  TsToRustMessageTypes.StreamEnd,
+                  encodeStreamEndPayload(runId, streamId),
+                ),
+              )
+              return
+            }
+            chunk = value
+          }
+          // Respect both the per-chunk cap and the remaining credit; the
+          // remainder goes back to the front of the prefix queue.
+          const limit = Math.min(STREAM_CHUNK_MAX_BYTES, source.credit)
+          if (chunk.byteLength > limit) {
+            source.prefix.unshift(chunk.subarray(limit))
+            chunk = chunk.subarray(0, limit)
+          }
+          source.credit -= chunk.byteLength
+          await this.write(
+            encodeTsToRustFrame(
+              TsToRustMessageTypes.StreamChunk,
+              encodeStreamChunkPayload(runId, streamId, chunk),
+            ),
+          )
+        }
+      } catch (error) {
+        source.done = true
+        source.reader.cancel().catch(() => {})
+        streams.sources.delete(streamId)
+        await this.write(
+          encodeTsToRustFrame(
+            TsToRustMessageTypes.StreamEnd,
+            encodeStreamEndPayload(
+              runId,
+              streamId,
+              error instanceof Error ? error.message : String(error),
+            ),
+          ),
+        ).catch(() => {})
+      } finally {
+        source.pumping = false
+      }
+    })()
+  }
+
+  /**
    * Keep draining this connection after an early Result until the run's
    * `RunComplete` frame arrives, dispatching grace-time bridge calls exactly
    * like the run's own loop. Never throws: a lost connection (or a desync)
@@ -668,11 +824,13 @@ export class RuntimeIpcClient {
    * @param dispatcher the run's bridge dispatcher
    * @param runId the run being completed
    * @param signal
+   * @param streams
    */
   private drainEpilogue(
     dispatcher: BridgeCallDispatcher | undefined,
     runId: number,
     signal?: AbortSignal,
+    streams?: StreamSourceRegistry,
   ): Promise<DecodedRunComplete | undefined> {
     // Aborting during the epilogue cancels the background work gracefully:
     // a Terminate frame truncates the grace phase runtime-side and the
@@ -711,7 +869,15 @@ export class RuntimeIpcClient {
               break
 
             case RustToTsMessageTypes.BridgeCall:
-              await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId)
+              await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId, streams)
+              break
+
+            case RustToTsMessageTypes.StreamPull:
+              this.handleStreamPull(frame.payload, streams, runId)
+              break
+
+            case RustToTsMessageTypes.StreamCancel:
+              this.handleStreamCancel(frame.payload, streams, runId)
               break
 
             default:
@@ -745,11 +911,13 @@ export class RuntimeIpcClient {
    * @param payload the frame payload
    * @param dispatcher the run's bridge dispatcher
    * @param runId the run the frame belongs to
+   * @param streams
    */
   private async dispatchBridgeCallFrame(
     payload: Uint8Array,
     dispatcher: BridgeCallDispatcher | undefined,
     runId: number,
+    streams?: StreamSourceRegistry,
   ): Promise<void> {
     // Guest-controlled bytes. A host type the sandbox accepted but this
     // Node refuses to reconstruct (a URL carrying credentials, say)
@@ -820,7 +988,7 @@ export class RuntimeIpcClient {
           // rather than a plain object — and draining its body is async.
           let encoded: Uint8Array
           try {
-            encoded = await serializeHostValue(value, this.brandKey)
+            encoded = await serializeHostValue(value, this.brandKey, streams)
           } catch (e) {
             return this.write(
               encodeTsToRustFrame(
@@ -837,12 +1005,15 @@ export class RuntimeIpcClient {
               ),
             )
           }
-          return this.write(
+          await this.write(
             encodeTsToRustFrame(
               TsToRustMessageTypes.BridgeResponse,
               encodeBridgeResponsePayload(callId, true, encoded),
             ),
           )
+          // The response carrying stream handles is on the wire; start their
+          // pumps.
+          this.activateStreams(streams, runId)
         },
         (err: unknown) => this.write(
           encodeTsToRustFrame(
@@ -898,6 +1069,7 @@ export class RuntimeIpcClient {
     dispatcher: BridgeCallDispatcher | undefined,
     runId: number,
     signal?: AbortSignal,
+    streams?: StreamSourceRegistry,
   ): Promise<RawRunResult> {
     for await (const frame of this.reader) {
       switch (frame.messageType) {
@@ -910,20 +1082,39 @@ export class RuntimeIpcClient {
               + 'answering a different run, so this run never executed',
             )
           }
-          if (!peekRunCompletionBackgroundPending(frame.payload))
+          if (!peekRunCompletionBackgroundPending(frame.payload)) {
+            // The run is over: release any body source still registered
+            // (the runtime cancelled its side already).
+            streams?.releaseAll()
             return { result: frame.payload }
+          }
           // waitUntil: the value is delivered now; the run
           // keeps going runtime-side. Keep draining this connection —
           // detached, bridge dispatch included — until its RunComplete frame,
-          // and hold the connection out of the pool for the duration.
-          return { result: frame.payload, epilogue: this.drainEpilogue(dispatcher, runId, signal) }
+          // and hold the connection out of the pool for the duration. The
+          // stream registry rides along: grace-time reads keep their flow
+          // control, and grace-time bridge responses can stream too.
+          return {
+            result: frame.payload,
+            epilogue: this.drainEpilogue(dispatcher, runId, signal, streams),
+          }
         }
 
         case RustToTsMessageTypes.Log:
           break
 
         case RustToTsMessageTypes.BridgeCall: {
-          await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId)
+          await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId, streams)
+          break
+        }
+
+        case RustToTsMessageTypes.StreamPull: {
+          this.handleStreamPull(frame.payload, streams, runId)
+          break
+        }
+
+        case RustToTsMessageTypes.StreamCancel: {
+          this.handleStreamCancel(frame.payload, streams, runId)
           break
         }
 

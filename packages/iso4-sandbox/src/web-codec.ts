@@ -29,6 +29,7 @@
 
 import { Buffer } from 'node:buffer'
 import v8 from 'node:v8'
+import { STREAM_PROBE_BYTES } from './ipc.js'
 
 // ── Type tags (frozen — docs/protocol.md §4.4.1) ─────────────────────────────
 
@@ -93,13 +94,81 @@ export function brandKeyForToken(token: Uint8Array): string {
   return BRAND_PREFIX + Buffer.from(token.buffer, token.byteOffset, token.byteLength).toString('hex')
 }
 
+// ── Streamed bodies (host → sandbox) ─────────────────────────────────────────
+
+/**
+ * One registered body source: the reader being pumped, chunks already read
+ * during the probe (sent first), and the flow-control state the client's
+ * pump loop maintains.
+ */
+export interface StreamSource {
+  reader: ReadableStreamDefaultReader<Uint8Array>
+  /**
+   * Chunks read while probing (and oversized-chunk remainders), pumped before
+   * the reader is pulled again.
+   */
+  prefix: Uint8Array[]
+  /**
+   * Bytes the runtime currently allows in flight. Replenished by
+   * `StreamPull` frames as the sandbox consumes.
+   */
+  credit: number
+  pumping: boolean
+  done: boolean
+}
+
+/**
+ * The per-run registry of body sources being streamed to the sandbox. Created
+ * by the run entry points, filled by {@link materializeHostTypes} when a body
+ * outgrows the probe, pumped by the client's frame loop.
+ */
+export class StreamSourceRegistry {
+  private nextId = 1
+  readonly sources: Map<number, StreamSource> = new Map()
+  private readonly newIds: number[] = []
+
+  /**
+   * Register a source and return its stream id.
+   * @param reader the body reader, positioned after the probe
+   * @param prefix probed chunks to send first
+   */
+  register(reader: ReadableStreamDefaultReader<Uint8Array>, prefix: Uint8Array[]): number {
+    const id = this.nextId++
+    this.sources.set(id, { reader, prefix, credit: 0, pumping: false, done: false })
+    this.newIds.push(id)
+    return id
+  }
+
+  /**
+   * Stream ids registered since the last take — the client activates their
+   * pumps once the frame carrying the descriptors has been written.
+   */
+  takeNewIds(): number[] {
+    return this.newIds.splice(0)
+  }
+
+  /**
+   * Release every remaining source (run over, or torn down).
+   */
+  releaseAll(): void {
+    for (const source of this.sources.values()) {
+      source.done = true
+      source.reader.cancel().catch(() => {})
+    }
+    this.sources.clear()
+    this.newIds.length = 0
+  }
+}
+
 // ── Materialized form ────────────────────────────────────────────────────────
 
 /**
- * A body reduced to something synchronously writable. V8 preserves which of
- * the three it is, so no kind discriminator travels on the wire.
+ * A body reduced to something synchronously writable — or a handle to a
+ * registered stream when the body outgrew the probe. V8 preserves which of
+ * the three inline shapes it is, so no kind discriminator travels on the
+ * wire; the stream handle travels as the descriptor's `bodyStream` field.
  */
-type MaterializedBody = Uint8Array | string | null
+type MaterializedBody = Uint8Array | string | null | { streamId: number }
 
 /**
  * A host type flattened into plain data. The session brand key (a dynamic
@@ -116,7 +185,13 @@ interface Descriptor {
   status?: number
   statusText?: string
   headers: string[]
-  body: MaterializedBody
+  body: Uint8Array | string | null
+  /**
+   * Stream handle when the body outgrew the probe: the bytes follow as
+   * `StreamChunk` frames under flow control, and the sandbox's `body`
+   * becomes a socket-backed stream.
+   */
+  bodyStream?: number
 }
 
 function flatHeaders(headers: Headers): string[] {
@@ -146,7 +221,10 @@ function flatHeaders(headers: Headers): string[] {
  */
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 
-async function materializeBody(source: Request | Response): Promise<MaterializedBody> {
+async function materializeBody(
+  source: Request | Response,
+  streams?: StreamSourceRegistry,
+): Promise<MaterializedBody> {
   // Serializing reads (and so consumes) the body; a second delivery of the
   // same instance has nothing left to read.
   if (source.bodyUsed) {
@@ -162,31 +240,40 @@ async function materializeBody(source: Request | Response): Promise<Materialized
     return buffer.byteLength === 0 ? null : new Uint8Array(buffer)
   }
 
-  // Drained by hand rather than with `arrayBuffer()` so the byte count is
-  // checked as it arrives. There is no way to tell a buffered body from a
-  // genuinely streaming one — in Node both are a ReadableStream, including
-  // `new Response('text')` — so refusing streams outright would refuse
-  // everything. Capping the read is the mitigation that actually applies.
+  // Probe first: bodies that end within the probe take the buffered path
+  // exactly as before (the common case — in Node even `new Response('text')`
+  // is a ReadableStream, so shape alone cannot pick). On legs with a stream
+  // registry, a body that outgrows the probe is registered for streaming
+  // instead of being buffered whole; on legs without one (data globals,
+  // whose values replay per instance), the historical full drain and its
+  // byte cap apply.
+  const probeLimit = streams === undefined ? MAX_BODY_BYTES : STREAM_PROBE_BYTES
   const reader = stream.getReader()
   const chunks: Uint8Array[] = []
   let total = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done)
-        break
-      total += value.byteLength
-      if (total > MAX_BODY_BYTES) {
-        throw new HostTypeError(
-          `[iso4] body exceeds ${MAX_BODY_BYTES} bytes; a Request/Response crossing the `
-          + 'boundary must be bounded — buffer and truncate it first',
-        )
-      }
-      chunks.push(value)
+  for (;;) {
+    let result: Awaited<ReturnType<typeof reader.read>>
+    try {
+      result = await reader.read()
+    } catch (error) {
+      reader.releaseLock()
+      throw error
     }
-  } finally {
-    reader.releaseLock()
+    if (result.done)
+      break
+    total += result.value.byteLength
+    chunks.push(result.value)
+    if (total > probeLimit) {
+      if (streams !== undefined)
+        return { streamId: streams.register(reader, chunks) }
+      reader.releaseLock()
+      throw new HostTypeError(
+        `[iso4] body exceeds ${MAX_BODY_BYTES} bytes; a Request/Response crossing the `
+        + 'boundary must be bounded — buffer and truncate it first',
+      )
+    }
   }
+  reader.releaseLock()
   if (total === 0)
     return null
   const out = new Uint8Array(total)
@@ -198,14 +285,24 @@ async function materializeBody(source: Request | Response): Promise<Materialized
   return out
 }
 
-async function toDescriptor(value: object, brandKey: string): Promise<Descriptor | undefined> {
+function bodyFields(body: MaterializedBody): { body: Uint8Array | string | null, bodyStream?: number } {
+  if (body !== null && typeof body === 'object' && 'streamId' in body)
+    return { body: null, bodyStream: body.streamId }
+  return { body }
+}
+
+async function toDescriptor(
+  value: object,
+  brandKey: string,
+  streams?: StreamSourceRegistry,
+): Promise<Descriptor | undefined> {
   if (value instanceof globalThis.Response) {
     return {
       [brandKey]: TAG_RESPONSE,
       status: value.status,
       statusText: value.statusText,
       headers: flatHeaders(value.headers),
-      body: await materializeBody(value),
+      ...bodyFields(await materializeBody(value, streams)),
     }
   }
   if (value instanceof globalThis.Request) {
@@ -214,7 +311,7 @@ async function toDescriptor(value: object, brandKey: string): Promise<Descriptor
       url: value.url,
       method: value.method,
       headers: flatHeaders(value.headers),
-      body: await materializeBody(value),
+      ...bodyFields(await materializeBody(value, streams)),
     }
   }
   if (value instanceof globalThis.Headers)
@@ -242,14 +339,20 @@ const MAX_DEPTH = 32
  * @param value the value to transform
  * @param brandKey the sandbox's session brand key ({@link brandKeyForToken});
  * the runtime rehydrates only descriptors stamped with it
+ * @param streams
  */
-export async function materializeHostTypes(value: unknown, brandKey: string): Promise<unknown> {
-  return transform(value, brandKey, new Map(), 0)
+export async function materializeHostTypes(
+  value: unknown,
+  brandKey: string,
+  streams?: StreamSourceRegistry,
+): Promise<unknown> {
+  return transform(value, brandKey, streams, new Map(), 0)
 }
 
 async function transform(
   value: unknown,
   brandKey: string,
+  streams: StreamSourceRegistry | undefined,
   seen: Map<object, unknown>,
   depth: number,
 ): Promise<unknown> {
@@ -265,7 +368,7 @@ async function transform(
   if (existing !== undefined)
     return existing
 
-  const descriptor = await toDescriptor(value, brandKey)
+  const descriptor = await toDescriptor(value, brandKey, streams)
   if (descriptor !== undefined) {
     seen.set(value, descriptor)
     return descriptor
@@ -281,7 +384,7 @@ async function transform(
   if (Array.isArray(value)) {
     const out: unknown[] = []
     seen.set(value, out)
-    for (const item of value) out.push(await transform(item, brandKey, seen, depth + 1))
+    for (const item of value) out.push(await transform(item, brandKey, streams, seen, depth + 1))
     return out
   }
 
@@ -289,14 +392,14 @@ async function transform(
     const out = new Map<unknown, unknown>()
     seen.set(value, out)
     for (const [k, v] of value)
-      out.set(await transform(k, brandKey, seen, depth + 1), await transform(v, brandKey, seen, depth + 1))
+      out.set(await transform(k, brandKey, streams, seen, depth + 1), await transform(v, brandKey, streams, seen, depth + 1))
     return out
   }
 
   if (value instanceof Set) {
     const out = new Set<unknown>()
     seen.set(value, out)
-    for (const v of value) out.add(await transform(v, brandKey, seen, depth + 1))
+    for (const v of value) out.add(await transform(v, brandKey, streams, seen, depth + 1))
     return out
   }
 
@@ -309,7 +412,7 @@ async function transform(
   const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>
   seen.set(value, out)
   for (const [k, v] of Object.entries(value))
-    out[k] = await transform(v, brandKey, seen, depth + 1)
+    out[k] = await transform(v, brandKey, streams, seen, depth + 1)
   return out
 }
 
