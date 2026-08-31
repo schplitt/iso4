@@ -1130,6 +1130,9 @@ fn run_call_phase(
                     _ => public_record_name(stub).to_string(),
                 },
                 import_handles: None,
+                // Internal stub names (shim handlers) are forced DONT_ENUM by
+                // define_global regardless of this flag.
+                enumerable: g.enumerable(),
             })
         })
         .collect();
@@ -1144,6 +1147,7 @@ fn run_call_phase(
             stub_name: BRIDGE_DISPATCH_GLOBAL.to_string(),
             record_name: BRIDGE_DISPATCH_GLOBAL.to_string(),
             import_handles: Some(Arc::new(import_handles)),
+            enumerable: true, // internal name — DONT_ENUM applies regardless
         });
     }
 
@@ -3718,6 +3722,9 @@ struct BridgeStubSpec {
     /// `Some` for the host-import dispatcher stub — the handle table it
     /// resolves leading handle-ID arguments against.
     import_handles: Option<Arc<Vec<ImportHandleEntry>>>,
+    /// The declared enumerability of the public name (#123). Ignored in
+    /// effect for internal stub names, which install DONT_ENUM regardless.
+    enumerable: bool,
 }
 
 /// Install a bridge stub for each spec.
@@ -3782,7 +3789,7 @@ fn install_bridge_globals(
                 RunError::Internal(format!("failed to build bridge stub for '{name}'"))
             })?;
 
-        define_global(scope, name, function.into())?;
+        define_global(scope, name, function.into(), spec.enumerable)?;
     }
     Ok(())
 }
@@ -3865,12 +3872,20 @@ fn install_value_globals(
         match def {
             // Installed as a bridge stub by install_bridge_globals.
             HostGlobalDef::Bridge { .. } => {}
-            HostGlobalDef::StringExpr { name, expr } => {
+            HostGlobalDef::StringExpr {
+                name,
+                expr,
+                enumerable,
+            } => {
                 check_not_reserved(name)?;
                 let value = eval_global_expression(scope, expr, name)?;
-                set_global(scope, name, value)?;
+                install_public_global(scope, name, value, *enumerable)?;
             }
-            HostGlobalDef::Data { name, blob } => {
+            HostGlobalDef::Data {
+                name,
+                blob,
+                enumerable,
+            } => {
                 check_not_reserved(name)?;
                 // Web-aware: a data global is one of the two ways a host
                 // Request/Response reaches the sandbox.
@@ -3883,12 +3898,13 @@ fn install_value_globals(
                             )),
                         }
                     })?;
-                set_global(scope, name, v8_value)?;
+                install_public_global(scope, name, v8_value, *enumerable)?;
             }
             HostGlobalDef::Shim {
                 name,
                 shim,
                 handler_name,
+                enumerable,
             } => {
                 check_not_reserved(name)?;
                 let factory = match shim_factory {
@@ -3909,11 +3925,30 @@ fn install_value_globals(
                     .ok_or_else(|| {
                         RunError::Internal(format!("failed to build shim wrapper for '{name}'"))
                     })?;
-                set_global(scope, name, wrapper)?;
+                install_public_global(scope, name, wrapper, *enumerable)?;
             }
         }
     }
     Ok(())
+}
+
+/// Install a host-declared value global, honoring its `enumerable` flag.
+///
+/// The enumerable path keeps the historical `[[Set]]` install (these run in a
+/// context no sandbox code has touched yet); a non-enumerable one must go
+/// through `DefineOwnProperty`, because `[[Set]]` always creates enumerable
+/// properties.
+fn install_public_global(
+    scope: &mut v8::PinScope,
+    name: &str,
+    value: v8::Local<v8::Value>,
+    enumerable: bool,
+) -> Result<(), RunError> {
+    if enumerable {
+        set_global(scope, name, value)
+    } else {
+        define_global(scope, name, value, false)
+    }
 }
 
 /// Set `globalThis[name] = value` via the V8 API. The name is a property key,
@@ -3934,17 +3969,23 @@ fn install_prefix_bridge_placeholders(
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
 ) -> Result<(), RunError> {
-    // (install name, display name, kind) per the factory's parameters.
-    let mut targets: Vec<(String, String, i32)> = Vec::new();
+    // (install name, display name, kind, enumerable) per the factory's
+    // parameters plus the attribute the placeholder installs with — it must
+    // match the live stub so the enumerated surface never differs between
+    // prepare time and run time (#123). Internal names are non-enumerable
+    // regardless (#84).
+    let mut targets: Vec<(String, String, i32, bool)> = Vec::new();
     for def in globals {
         match def {
-            HostGlobalDef::Bridge { name } => {
+            HostGlobalDef::Bridge {
+                name, enumerable, ..
+            } => {
                 check_not_reserved(name)?;
-                targets.push((name.clone(), name.clone(), 0));
+                targets.push((name.clone(), name.clone(), 0, *enumerable));
             }
             HostGlobalDef::Shim {
                 name, handler_name, ..
-            } => targets.push((handler_name.clone(), name.clone(), 0)),
+            } => targets.push((handler_name.clone(), name.clone(), 0, true)),
             HostGlobalDef::StringExpr { .. } | HostGlobalDef::Data { .. } => {}
         }
     }
@@ -3956,6 +3997,7 @@ fn install_prefix_bridge_placeholders(
             BRIDGE_DISPATCH_GLOBAL.to_string(),
             BRIDGE_DISPATCH_GLOBAL.to_string(),
             1,
+            true,
         ));
     }
     if targets.is_empty() {
@@ -3971,7 +4013,7 @@ fn install_prefix_bridge_placeholders(
         RunError::Internal("placeholder factory did not evaluate to a function".to_string())
     })?;
     let receiver: v8::Local<v8::Value> = v8::undefined(scope).into();
-    for (install_name, display_name, kind) in targets {
+    for (install_name, display_name, kind, enumerable) in targets {
         let name_arg = v8::String::new(scope, &display_name).ok_or_else(|| {
             RunError::Internal(format!(
                 "failed to intern placeholder name '{display_name}'"
@@ -3985,7 +4027,7 @@ fn install_prefix_bridge_placeholders(
                     "failed to build bridge placeholder for '{display_name}'"
                 ))
             })?;
-        define_global(scope, &install_name, placeholder)?;
+        define_global(scope, &install_name, placeholder, enumerable)?;
     }
     Ok(())
 }
@@ -4009,16 +4051,19 @@ const INTERNAL_GLOBAL_PREFIX: &str = "__iso4_";
 /// property non-configurable — callers treat that as an internal error, which
 /// taints the instance.
 ///
-/// Runtime-internal names ([`INTERNAL_GLOBAL_PREFIX`]) get `DONT_ENUM`.
+/// Runtime-internal names ([`INTERNAL_GLOBAL_PREFIX`]) get `DONT_ENUM`
+/// regardless of `enumerable`; for public names the flag is the host's
+/// per-global opt-out (#123).
 fn define_global(
     scope: &mut v8::PinScope,
     name: &str,
     value: v8::Local<v8::Value>,
+    enumerable: bool,
 ) -> Result<(), RunError> {
     let global = scope.get_current_context().global(scope);
     let key = v8::String::new(scope, name)
         .ok_or_else(|| RunError::Internal(format!("failed to intern global name '{name}'")))?;
-    let attributes = if name.starts_with(INTERNAL_GLOBAL_PREFIX) {
+    let attributes = if name.starts_with(INTERNAL_GLOBAL_PREFIX) || !enumerable {
         v8::PropertyAttribute::DONT_ENUM
     } else {
         v8::PropertyAttribute::NONE
@@ -6403,6 +6448,7 @@ mod tests {
             name: "fetch".to_string(),
             shim: "(raw) => raw".to_string(),
             handler_name: "__iso4_fetch_h".to_string(),
+            enumerable: true,
         }];
         let imports = [host_import(
             "tools:search",
@@ -6436,11 +6482,95 @@ mod tests {
     }
 
     #[test]
+    fn a_non_enumerable_global_is_hidden_but_callable() {
+        // #123: the host's per-global opt-out. Hidden names stay reachable
+        // (hygiene, not secrecy); undeclared-flag names stay enumerable.
+        use std::os::unix::io::AsRawFd;
+        init_platform();
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let globals = [
+            HostGlobalDef::Bridge {
+                name: "hiddenTool".to_string(),
+                enumerable: false,
+            },
+            HostGlobalDef::StringExpr {
+                name: "HIDDEN_CONST".to_string(),
+                expr: "41".to_string(),
+                enumerable: false,
+            },
+            HostGlobalDef::bridge("visibleTool"),
+        ];
+        let out = execute(
+            "const keys = Object.keys(globalThis)\n\
+             export default [\n\
+               keys.includes('hiddenTool'),\n\
+               keys.includes('HIDDEN_CONST'),\n\
+               keys.includes('visibleTool'),\n\
+               typeof hiddenTool,\n\
+               HIDDEN_CONST + 1,\n\
+             ].join('|')",
+            None,
+            Limits::default(),
+            &globals,
+            &[],
+            Some(client.as_raw_fd()),
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        drop(server);
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("false|false|true|function|42")
+        );
+    }
+
+    #[test]
+    fn a_non_enumerable_global_has_the_same_surface_at_prepare_and_run_time() {
+        // The between-runs placeholder installs with the declared flag, so
+        // enumeration inside the prefix and inside a run agree (#123).
+        use std::os::unix::io::AsRawFd;
+        init_platform();
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let globals = [HostGlobalDef::Bridge {
+            name: "tool".to_string(),
+            enumerable: false,
+        }];
+        let prefix = prepared(
+            "globalThis.prefixEnumerated = Object.keys(globalThis).includes('tool')\n\
+             globalThis.prefixType = typeof tool",
+            &globals,
+            &[],
+        );
+        let out = execute_with_prefix(
+            prefix,
+            Some(
+                "export default [prefixEnumerated, prefixType, \
+                   Object.keys(globalThis).includes('tool'), typeof tool].join('|')",
+            ),
+            None,
+            Limits::default(),
+            &globals,
+            &[],
+            Some(client.as_raw_fd()),
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        drop(server);
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("false|function|false|function")
+        );
+    }
+
+    #[test]
     fn precompile_calling_shim_global_fails_with_prefix_bridge_call() {
         let globals = [HostGlobalDef::Shim {
             name: "fetch".to_string(),
             shim: "(raw) => raw".to_string(),
             handler_name: "__iso4_fetch_h".to_string(),
+            enumerable: true,
         }];
         let err =
             precompile("await fetch('https://example.com')", None, &globals, &[], 0).unwrap_err();

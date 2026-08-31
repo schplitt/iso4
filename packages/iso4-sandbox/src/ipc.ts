@@ -550,10 +550,10 @@ export function decodeHelloPayload(payload: Uint8Array): HelloPayload {
  * into an identifier position.
  */
 export type GlobalDefPayload
-  = | { kind: 'bridge', name: string }
-    | { kind: 'string', name: string, expr: string }
-    | { kind: 'data', name: string, value: unknown }
-    | { kind: 'shim', name: string, shim: string, handlerName: string }
+  = | { kind: 'bridge', name: string, enumerable: boolean }
+    | { kind: 'string', name: string, expr: string, enumerable: boolean }
+    | { kind: 'data', name: string, value: unknown, enumerable: boolean }
+    | { kind: 'shim', name: string, shim: string, handlerName: string, enumerable: boolean }
 
 /**
  * Wire tag for each `GlobalDefPayload` kind. Mirrors `HostGlobalDef` on the
@@ -636,12 +636,14 @@ class PayloadWriter {
 
   writeGlobalDefs(defs: readonly GlobalDefPayload[]): this {
     // Wire layout per docs/protocol.md §5.2: a length-prefixed list of
-    // tagged global definitions. Each entry is `u8 kind, String name`
-    // followed by a kind-specific tail. See `GlobalDefPayload`.
+    // tagged global definitions. Each entry is `u8 kind, String name,
+    // bool enumerable` followed by a kind-specific tail. See
+    // `GlobalDefPayload`.
     this.writeU32(defs.length)
     for (const def of defs) {
       this.writeU8(GLOBAL_DEF_KIND[def.kind])
       this.writeString(def.name)
+      this.writeU8(def.enumerable ? 1 : 0)
       switch (def.kind) {
         case 'bridge':
           break

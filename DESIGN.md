@@ -357,15 +357,26 @@ for things user code expects to find as a bare name (`fetch(url)` not
 `import { fetch } from 'host:net'`). When in doubt, prefer `imports` —
 they are statically greppable and cannot accidentally shadow a built-in.
 
-Host-provided globals are **enumerable**, the way browsers keep `fetch`
-enumerable on `window`. The runtime's own plumbing is not: every name under
-the `__iso4_` prefix (the `__iso4_call` dispatcher, shim handler keys) and
-the web classes install with `enumerable: false`, so enumeration-driven
-sandbox code (`for (const k in globalThis)`, serializers, environment
-snapshots) never trips over internals. The names stay reachable by string —
-this is hygiene, not secrecy. `__iso4_` is therefore the runtime-internal
-namespace: a host global under that prefix would install non-enumerable too;
-do not name globals into it.
+Host-provided globals are **enumerable by default**, the way browsers keep
+`fetch` enumerable on `window`. The object global forms accept
+`enumerable: false` as a per-global opt-out (#123) — useful when an injected
+capability should not be swept up by enumeration-driven sandbox code; the
+bare-function and bare-string shorthands are always enumerable by design. The
+flag is stored with the prefix declaration, so the between-runs placeholder
+installs with the same attribute and the enumerated surface never differs
+between prepare time and run time. Non-enumerable is hygiene, not secrecy:
+the name still appears in `Object.getOwnPropertyNames` (language semantics,
+identical in every engine) and stays callable by anyone who knows it — a
+capability that must be undiscoverable belongs in `imports`, which nothing
+can enumerate.
+
+The runtime's own plumbing is never enumerable: every name under the
+`__iso4_` prefix (the `__iso4_call` dispatcher, shim handler keys) and the
+web classes install with `enumerable: false` regardless of any flag, so
+enumeration-driven sandbox code (`for (const k in globalThis)`, serializers,
+environment snapshots) never trips over internals. `__iso4_` is therefore the
+runtime-internal namespace: a host global under that prefix would install
+non-enumerable too; do not name globals into it.
 
 ### 4.2.1 The web runtime
 

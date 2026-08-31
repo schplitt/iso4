@@ -16,12 +16,14 @@
 
 import type { GlobalDefPayload } from './ipc.js'
 import type {
+  BridgeGlobal,
   BridgeWithShim,
   DataGlobal,
   HostExportFunction,
   HostGlobalValue,
   HostGlobals,
   RebindGlobals,
+  StringGlobal,
 } from './types.js'
 
 export function isBridgeWithShim(v: HostGlobalValue): v is BridgeWithShim {
@@ -37,6 +39,22 @@ export function isDataGlobal(v: HostGlobalValue): v is DataGlobal {
     typeof v === 'object'
     && v !== null
     && (v as DataGlobal).kind === 'data'
+  )
+}
+
+export function isBridgeGlobal(v: HostGlobalValue): v is BridgeGlobal {
+  return (
+    typeof v === 'object'
+    && v !== null
+    && (v as BridgeGlobal).kind === 'bridge'
+  )
+}
+
+export function isStringGlobal(v: HostGlobalValue): v is StringGlobal {
+  return (
+    typeof v === 'object'
+    && v !== null
+    && (v as StringGlobal).kind === 'string'
   )
 }
 
@@ -81,16 +99,29 @@ export function processGlobals(globals: HostGlobals): ProcessedGlobals {
   const dispatch: Record<string, HostExportFunction> = {}
 
   for (const [name, value] of Object.entries(globals)) {
+    // The bare shorthands are always enumerable by design; the object forms
+    // carry an optional opt-out (default true).
     if (typeof value === 'function') {
-      defs.push({ kind: 'bridge', name })
+      defs.push({ kind: 'bridge', name, enumerable: true })
       dispatch[name] = value
     } else if (typeof value === 'string') {
-      defs.push({ kind: 'string', name, expr: value })
+      defs.push({ kind: 'string', name, expr: value, enumerable: true })
+    } else if (isBridgeGlobal(value)) {
+      defs.push({ kind: 'bridge', name, enumerable: value.enumerable ?? true })
+      dispatch[name] = value.handler as HostExportFunction
+    } else if (isStringGlobal(value)) {
+      defs.push({ kind: 'string', name, expr: value.expr, enumerable: value.enumerable ?? true })
     } else if (isDataGlobal(value)) {
-      defs.push({ kind: 'data', name, value: value.value })
+      defs.push({ kind: 'data', name, value: value.value, enumerable: value.enumerable ?? true })
     } else if (isBridgeWithShim(value)) {
       const handlerName = shimHandlerName(name)
-      defs.push({ kind: 'shim', name, shim: value.shim, handlerName })
+      defs.push({
+        kind: 'shim',
+        name,
+        shim: value.shim,
+        handlerName,
+        enumerable: value.enumerable ?? true,
+      })
       dispatch[handlerName] = value.handler as HostExportFunction
     }
   }
@@ -148,16 +179,22 @@ export function extractBridgeGlobals(
   const dispatch: Record<string, HostExportFunction> = {}
 
   for (const [name, value] of Object.entries(precompileGlobals)) {
-    if (typeof value === 'string' || isDataGlobal(value))
+    if (typeof value === 'string' || isStringGlobal(value) || isDataGlobal(value))
       continue // constants replayed from the declared prefix defs; no bridge stub
 
     if (isBridgeWithShim(value)) {
       // RebindValue<BridgeWithShim<H>> = H — override is always a function, never a new shim.
+      // The handler stub is runtime-internal (`__iso4_*`) and non-enumerable
+      // regardless; the declared flag applies to the shim wrapper the prefix
+      // replays.
       const handlerName = shimHandlerName(name)
-      defs.push({ kind: 'bridge', name: handlerName })
+      defs.push({ kind: 'bridge', name: handlerName, enumerable: true })
       dispatch[handlerName] = resolveOverride(runGlobals, name, value.handler)
+    } else if (isBridgeGlobal(value)) {
+      defs.push({ kind: 'bridge', name, enumerable: value.enumerable ?? true })
+      dispatch[name] = resolveOverride(runGlobals, name, value.handler as HostExportFunction)
     } else if (typeof value === 'function') {
-      defs.push({ kind: 'bridge', name })
+      defs.push({ kind: 'bridge', name, enumerable: true })
       dispatch[name] = resolveOverride(runGlobals, name, value as HostExportFunction)
     }
   }
@@ -171,7 +208,7 @@ export function extractBridgeGlobals(
     if (name in precompileGlobals)
       continue
     if (typeof override === 'function') {
-      defs.push({ kind: 'bridge', name })
+      defs.push({ kind: 'bridge', name, enumerable: true })
       dispatch[name] = override as HostExportFunction
     }
   }

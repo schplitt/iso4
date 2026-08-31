@@ -34,7 +34,7 @@ describe('processGlobals', () => {
     it('emits a bridge def and a dispatch entry under its own name', () => {
       const fn: HostExportFunction = () => 42
       const { defs, dispatch } = processGlobals({ myTool: fn })
-      expect(defFor(defs, 'myTool')).toEqual({ kind: 'bridge', name: 'myTool' })
+      expect(defFor(defs, 'myTool')).toEqual({ kind: 'bridge', name: 'myTool', enumerable: true })
       expect(dispatch['myTool']).toBe(fn)
     })
 
@@ -42,8 +42,8 @@ describe('processGlobals', () => {
       const a: HostExportFunction = () => 'a'
       const b: HostExportFunction = () => 'b'
       const { defs, dispatch } = processGlobals({ a, b })
-      expect(defFor(defs, 'a')).toEqual({ kind: 'bridge', name: 'a' })
-      expect(defFor(defs, 'b')).toEqual({ kind: 'bridge', name: 'b' })
+      expect(defFor(defs, 'a')).toEqual({ kind: 'bridge', name: 'a', enumerable: true })
+      expect(defFor(defs, 'b')).toEqual({ kind: 'bridge', name: 'b', enumerable: true })
       expect(dispatch['a']).toBe(a)
       expect(dispatch['b']).toBe(b)
     })
@@ -52,19 +52,19 @@ describe('processGlobals', () => {
   describe('string global', () => {
     it('emits a string-expr def and no dispatch entry', () => {
       const { defs, dispatch } = processGlobals({ PI: `Math.PI` })
-      expect(defFor(defs, 'PI')).toEqual({ kind: 'string', name: 'PI', expr: 'Math.PI' })
+      expect(defFor(defs, 'PI')).toEqual({ kind: 'string', name: 'PI', expr: 'Math.PI', enumerable: true })
       expect(Object.keys(dispatch)).toHaveLength(0)
     })
 
     it('carries the raw expression verbatim (no globalThis wrapping in the client)', () => {
       const { defs } = processGlobals({ VERSION: `'2.0'` })
-      expect(defFor(defs, 'VERSION')).toEqual({ kind: 'string', name: 'VERSION', expr: `'2.0'` })
+      expect(defFor(defs, 'VERSION')).toEqual({ kind: 'string', name: 'VERSION', expr: `'2.0'`, enumerable: true })
     })
 
     it('multiple string globals produce multiple defs', () => {
       const { defs } = processGlobals({ A: `1`, B: `2` })
-      expect(defFor(defs, 'A')).toEqual({ kind: 'string', name: 'A', expr: '1' })
-      expect(defFor(defs, 'B')).toEqual({ kind: 'string', name: 'B', expr: '2' })
+      expect(defFor(defs, 'A')).toEqual({ kind: 'string', name: 'A', expr: '1', enumerable: true })
+      expect(defFor(defs, 'B')).toEqual({ kind: 'string', name: 'B', expr: '2', enumerable: true })
     })
   })
 
@@ -73,8 +73,32 @@ describe('processGlobals', () => {
       const value = { model: 'gpt-4', maxTokens: 1000 }
       const dataGlobal: DataGlobal = { kind: 'data', value }
       const { defs, dispatch } = processGlobals({ config: dataGlobal })
-      expect(defFor(defs, 'config')).toEqual({ kind: 'data', name: 'config', value })
+      expect(defFor(defs, 'config')).toEqual({ kind: 'data', name: 'config', value, enumerable: true })
       expect(Object.keys(dispatch)).toHaveLength(0)
+    })
+  })
+
+  describe('object forms with enumerable (#123)', () => {
+    it('bridge object form carries the handler and the flag', () => {
+      const handler: HostExportFunction = async () => 1
+      const { defs, dispatch } = processGlobals({
+        hidden: { kind: 'bridge', handler, enumerable: false },
+      })
+      expect(defFor(defs, 'hidden')).toEqual({ kind: 'bridge', name: 'hidden', enumerable: false })
+      expect(dispatch['hidden']).toBe(handler)
+    })
+
+    it('string and data object forms carry the flag; omitted defaults to true', () => {
+      const { defs } = processGlobals({
+        A: { kind: 'string', expr: '1', enumerable: false },
+        B: { kind: 'string', expr: '2' },
+        C: { kind: 'data', value: 3, enumerable: false },
+        D: { kind: 'bridge-with-shim', handler: async () => 4, shim: '(r) => r', enumerable: false },
+      })
+      expect(defFor(defs, 'A')).toEqual({ kind: 'string', name: 'A', expr: '1', enumerable: false })
+      expect(defFor(defs, 'B')).toEqual({ kind: 'string', name: 'B', expr: '2', enumerable: true })
+      expect(defFor(defs, 'C')).toEqual({ kind: 'data', name: 'C', value: 3, enumerable: false })
+      expect(defFor(defs, 'D')).toMatchObject({ kind: 'shim', enumerable: false })
     })
   })
 
@@ -97,6 +121,7 @@ describe('processGlobals', () => {
         name: 'fetch',
         shim,
         handlerName: '__iso4_fetch_h',
+        enumerable: true,
       })
     })
 
@@ -166,14 +191,14 @@ describe('extractBridgeGlobals', () => {
 
   it('shimmed global with no override re-installs the private handler stub with the default', () => {
     const { defs, dispatch } = extractBridgeGlobals({}, precompileGlobals)
-    expect(defFor(defs, '__iso4_fetch_h')).toEqual({ kind: 'bridge', name: '__iso4_fetch_h' })
+    expect(defFor(defs, '__iso4_fetch_h')).toEqual({ kind: 'bridge', name: '__iso4_fetch_h', enumerable: true })
     expect(dispatch['__iso4_fetch_h']).toBe(defaultHandler)
     expect(dispatch['fetch']).toBeUndefined()
   })
 
   it('plain function with no override uses the precompile handler at own name', () => {
     const { defs, dispatch } = extractBridgeGlobals({}, precompileGlobals)
-    expect(defFor(defs, 'myTool')).toEqual({ kind: 'bridge', name: 'myTool' })
+    expect(defFor(defs, 'myTool')).toEqual({ kind: 'bridge', name: 'myTool', enumerable: true })
     expect(dispatch['myTool']).toBe(plainFn)
   })
 

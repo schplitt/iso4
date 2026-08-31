@@ -443,21 +443,34 @@ impl Default for ResourceLimits {
 /// A host global the sandbox is allowed to reference, tagged by how the
 /// runtime installs it natively. Mirrors `GlobalDefPayload` on the TS side
 /// (`ipc.ts`); see `docs/protocol.md` §5.2.
+/// Every variant carries `enumerable`: whether the installed public name
+/// shows up in `for...in` / `Object.keys` (#123). Host shorthands always send
+/// `true`; the object global forms may opt out. Runtime-internal names
+/// (`__iso4_*`) install non-enumerable regardless (#84).
 #[derive(Debug, Clone)]
 pub enum HostGlobalDef {
     /// A plain host function — installed as a bridge stub under `name`.
-    Bridge { name: String },
+    Bridge { name: String, enumerable: bool },
     /// A JS expression the runtime evaluates as its own script and sets on
     /// `globalThis[name]`.
-    StringExpr { name: String, expr: String },
+    StringExpr {
+        name: String,
+        expr: String,
+        enumerable: bool,
+    },
     /// A constant carried as a V8 serialization blob, materialised natively.
-    Data { name: String, blob: Vec<u8> },
+    Data {
+        name: String,
+        blob: Vec<u8>,
+        enumerable: bool,
+    },
     /// A bridge handler (installed as a stub under `handler_name`) plus a shim
     /// expression the runtime wraps and sets on `globalThis[name]`.
     Shim {
         name: String,
         shim: String,
         handler_name: String,
+        enumerable: bool,
     },
 }
 
@@ -470,9 +483,19 @@ impl HostGlobalDef {
     /// the `ERR_UNDECLARED_BINDING` check validates against.
     pub fn bridge_stub_name(&self) -> Option<&str> {
         match self {
-            HostGlobalDef::Bridge { name } => Some(name),
+            HostGlobalDef::Bridge { name, .. } => Some(name),
             HostGlobalDef::Shim { handler_name, .. } => Some(handler_name),
             HostGlobalDef::StringExpr { .. } | HostGlobalDef::Data { .. } => None,
+        }
+    }
+
+    /// Whether the installed public name is enumerable (#123).
+    pub fn enumerable(&self) -> bool {
+        match self {
+            HostGlobalDef::Bridge { enumerable, .. }
+            | HostGlobalDef::StringExpr { enumerable, .. }
+            | HostGlobalDef::Data { enumerable, .. }
+            | HostGlobalDef::Shim { enumerable, .. } => *enumerable,
         }
     }
 
@@ -481,6 +504,7 @@ impl HostGlobalDef {
     pub fn bridge(name: &str) -> Self {
         HostGlobalDef::Bridge {
             name: name.to_string(),
+            enumerable: true,
         }
     }
 }
@@ -597,6 +621,19 @@ impl<'a> PayloadReader<'a> {
         let n = u32::from_be_bytes(self.data[self.offset..self.offset + 4].try_into().unwrap());
         self.offset += 4;
         Ok(n)
+    }
+
+    /// Strict wire bool per §3: `0 = false`, `1 = true`, anything else is
+    /// malformed.
+    fn read_bool(&mut self) -> io::Result<bool> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid boolean byte: {other:#04x}"),
+            )),
+        }
     }
 
     /// Read the `u32` entry count that introduces a `List<…>` block and return
@@ -740,20 +777,24 @@ impl<'a> PayloadReader<'a> {
         for _ in 0..count {
             let kind = self.read_u8()?;
             let name = self.read_string()?;
+            let enumerable = self.read_bool()?;
             let def = match kind {
-                0 => HostGlobalDef::Bridge { name },
+                0 => HostGlobalDef::Bridge { name, enumerable },
                 1 => HostGlobalDef::StringExpr {
                     name,
                     expr: self.read_string()?,
+                    enumerable,
                 },
                 2 => HostGlobalDef::Data {
                     name,
                     blob: self.read_value_blob()?,
+                    enumerable,
                 },
                 3 => HostGlobalDef::Shim {
                     name,
                     shim: self.read_string()?,
                     handler_name: self.read_string()?,
+                    enumerable,
                 },
                 other => {
                     return Err(io::Error::new(
@@ -1417,8 +1458,10 @@ mod tests {
         push_u32(&mut v, 2); // 2 globals
         v.push(0); // kind: bridge
         push_string(&mut v, "fetch");
+        v.push(1); // enumerable
         v.push(0); // kind: bridge
         push_string(&mut v, "myTool");
+        v.push(1); // enumerable
         push_u32(&mut v, 0); // 0 imports
         v.push(0); // call: absent
 
@@ -1436,22 +1479,26 @@ mod tests {
         v.push(0); // no filename
         push_absent_limits(&mut v); // limits
         push_u32(&mut v, 4); // 4 globals
-                             // bridge
+                             // bridge (enumerable)
         v.push(0);
         push_string(&mut v, "fetch");
-        // string expr
+        v.push(1); // enumerable
+        // string expr (non-enumerable — the flag parses on every kind)
         v.push(1);
         push_string(&mut v, "PI");
+        v.push(0); // enumerable = false
         push_string(&mut v, "3.14159");
         // data: a value slot — u32 length + V8 serialization blob. The parser
         // carries the bytes verbatim (materialising them needs an isolate).
         v.push(2);
         push_string(&mut v, "flag");
+        v.push(1); // enumerable
         push_u32(&mut v, 3);
         v.extend_from_slice(&[0xff, 0x0f, 0x54]);
         // shim
         v.push(3);
         push_string(&mut v, "wrapped");
+        v.push(1); // enumerable
         push_string(&mut v, "(r) => r");
         push_string(&mut v, "__iso4_wrapped_h");
         push_u32(&mut v, 0); // 0 imports
@@ -1459,16 +1506,18 @@ mod tests {
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.globals.len(), 4);
-        assert!(matches!(&p.globals[0], HostGlobalDef::Bridge { name } if name == "fetch"));
+        assert!(matches!(&p.globals[0], HostGlobalDef::Bridge { name, .. } if name == "fetch"));
         assert!(
-            matches!(&p.globals[1], HostGlobalDef::StringExpr { name, expr } if name == "PI" && expr == "3.14159")
+            matches!(&p.globals[1], HostGlobalDef::StringExpr { name, expr, .. } if name == "PI" && expr == "3.14159")
         );
+        assert!(p.globals[0].enumerable());
+        assert!(!p.globals[1].enumerable());
         assert!(
-            matches!(&p.globals[2], HostGlobalDef::Data { name, blob } if name == "flag" && blob == &[0xff, 0x0f, 0x54])
+            matches!(&p.globals[2], HostGlobalDef::Data { name, blob, .. } if name == "flag" && blob == &[0xff, 0x0f, 0x54])
         );
         assert!(matches!(
             &p.globals[3],
-            HostGlobalDef::Shim { name, shim, handler_name }
+            HostGlobalDef::Shim { name, shim, handler_name, .. }
                 if name == "wrapped" && shim == "(r) => r" && handler_name == "__iso4_wrapped_h"
         ));
         // Only bridge + shim install a stub.
