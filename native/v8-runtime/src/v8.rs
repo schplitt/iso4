@@ -3990,6 +3990,17 @@ fn install_prefix_bridge_placeholders(
     Ok(())
 }
 
+/// Names under this prefix are runtime plumbing (`__iso4_call`, the
+/// `__iso4_<name>_h` shim handler keys, their placeholders) and install
+/// non-enumerable, so enumeration-driven sandbox code (`for (const k in
+/// globalThis)`, serializers, "copy the environment" patterns) never trips
+/// over them — celld's ops went through exactly that accident before moving
+/// to DONT_ENUM (#84). The web classes already install non-enumerable
+/// (`webtypes.js`); host-declared globals stay enumerable the way browsers
+/// keep `fetch` enumerable. The names remain reachable by string — this is
+/// hygiene, not secrecy.
+const INTERNAL_GLOBAL_PREFIX: &str = "__iso4_";
+
 /// Install a global via `DefineOwnProperty` — replaces any existing property
 /// **without invoking accessors**. `set_global` goes through `[[Set]]`, which
 /// runs a setter if sandbox code planted one under the name; on a reused
@@ -3997,6 +4008,8 @@ fn install_prefix_bridge_placeholders(
 /// control to user code outside any guard. Fails when sandbox code made the
 /// property non-configurable — callers treat that as an internal error, which
 /// taints the instance.
+///
+/// Runtime-internal names ([`INTERNAL_GLOBAL_PREFIX`]) get `DONT_ENUM`.
 fn define_global(
     scope: &mut v8::PinScope,
     name: &str,
@@ -4005,7 +4018,12 @@ fn define_global(
     let global = scope.get_current_context().global(scope);
     let key = v8::String::new(scope, name)
         .ok_or_else(|| RunError::Internal(format!("failed to intern global name '{name}'")))?;
-    match global.define_own_property(scope, key.into(), value, v8::PropertyAttribute::NONE) {
+    let attributes = if name.starts_with(INTERNAL_GLOBAL_PREFIX) {
+        v8::PropertyAttribute::DONT_ENUM
+    } else {
+        v8::PropertyAttribute::NONE
+    };
+    match global.define_own_property(scope, key.into(), value, attributes) {
         Some(true) => Ok(()),
         _ => Err(RunError::Internal(format!(
             "failed to define global '{name}' (made non-configurable by sandbox code?)"
@@ -6369,6 +6387,52 @@ mod tests {
                 other => panic!("expected PrefixBridgeCall for {code:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn runtime_internals_are_hidden_from_enumeration_but_reachable() {
+        // #84: the `__iso4_*` plumbing (dispatcher, shim handler keys) must
+        // not surface through enumeration — the celld accident class is
+        // generic sandbox code enumerating the global and invoking every key.
+        // The names stay reachable by string (hygiene, not secrecy), and
+        // host-declared names stay enumerable like `fetch` in a browser.
+        use std::os::unix::io::AsRawFd;
+        init_platform();
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let globals = [HostGlobalDef::Shim {
+            name: "fetch".to_string(),
+            shim: "(raw) => raw".to_string(),
+            handler_name: "__iso4_fetch_h".to_string(),
+        }];
+        let imports = [host_import(
+            "tools:search",
+            vec![("query", HostModuleNode::Function)],
+        )];
+        let out = execute(
+            "const internals = (list) => list.filter((k) => k.startsWith('__iso4_'))\n\
+             const forIn = []\n\
+             for (const k in globalThis) forIn.push(k)\n\
+             export default [\n\
+               internals(Object.keys(globalThis)).length,\n\
+               internals(forIn).length,\n\
+               typeof globalThis['__iso4_call'],\n\
+               typeof globalThis['__iso4_fetch_h'],\n\
+               Object.keys(globalThis).includes('fetch'),\n\
+             ].join('|')",
+            None,
+            Limits::default(),
+            &globals,
+            &imports,
+            Some(client.as_raw_fd()),
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        drop(server);
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("0|0|function|function|true")
+        );
     }
 
     #[test]

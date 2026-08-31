@@ -357,6 +357,16 @@ for things user code expects to find as a bare name (`fetch(url)` not
 `import { fetch } from 'host:net'`). When in doubt, prefer `imports` —
 they are statically greppable and cannot accidentally shadow a built-in.
 
+Host-provided globals are **enumerable**, the way browsers keep `fetch`
+enumerable on `window`. The runtime's own plumbing is not: every name under
+the `__iso4_` prefix (the `__iso4_call` dispatcher, shim handler keys) and
+the web classes install with `enumerable: false`, so enumeration-driven
+sandbox code (`for (const k in globalThis)`, serializers, environment
+snapshots) never trips over internals. The names stay reachable by string —
+this is hygiene, not secrecy. `__iso4_` is therefore the runtime-internal
+namespace: a host global under that prefix would install non-enumerable too;
+do not name globals into it.
+
 ### 4.2.1 The web runtime
 
 The sandbox ships a minimal, deliberately incomplete web runtime so that
