@@ -4102,6 +4102,36 @@ describe('eval and new Function are prepare()-time only', () => {
       return
     expect(result.exports.default).toEqual(['EvalError', 'EvalError'])
   })
+
+  test('runtime internals never surface through enumeration (#84)', async () => {
+    // A tool global plus a host import (which installs the internal
+    // dispatcher). Enumeration sees the declared name only; the plumbing
+    // stays out of Object.keys / for-in, matching the web classes.
+    const result = await runtime.run({
+      code: `
+        import { search } from 'tools:web'
+        const keys = Object.keys(globalThis)
+        const forIn = []
+        for (const k in globalThis) forIn.push(k)
+        export default {
+          internals: [...keys, ...forIn].filter((k) => k.startsWith('__iso4_')),
+          tool: keys.includes('myTool'),
+          searchWorks: await search('q'),
+        }
+      `,
+      globals: { myTool: async () => 1 },
+      imports: { 'tools:web': { search: async (q: unknown) => `hit:${String(q)}` } },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      internals: [],
+      tool: true,
+      searchWorks: 'hit:q',
+    })
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
