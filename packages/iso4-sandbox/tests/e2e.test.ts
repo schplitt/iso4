@@ -3869,6 +3869,188 @@ describe('host → sandbox calls', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Web-server pattern: worker-style fetch handlers driven from the Node side.
+// The host passes real Request instances in via `call`, sandbox code behaves
+// like an HTTP handler (routing, JSON, binary bodies, an upstream fetch over
+// the bridge), and the host gets real Response instances back.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('web-server pattern (worker-style fetch handlers)', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('a JSON API handler routes on method and URL and answers Response.json', async () => {
+    const prefix = await runtime.prepare({
+      code: `export default {
+        async fetch(request) {
+          const url = new URL(request.url)
+          if (request.method !== 'POST' || url.pathname !== '/api/items')
+            return new Response('not found', { status: 404 })
+          const item = await request.json()
+          return Response.json(
+            { created: item.name, q: url.searchParams.get('q') },
+            { status: 201, headers: { 'x-handler': 'items' } },
+          )
+        },
+      }`,
+    })
+
+    const created = await prefix.call({
+      export: 'default.fetch',
+      args: [new Request('https://api.example.com/api/items?q=7', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'widget' }),
+      })],
+    })
+    expect(created.ok).toBe(true)
+    if (!created.ok)
+      return
+    const response = created.value as Response
+    expect(response).toBeInstanceOf(Response)
+    expect(response.status).toBe(201)
+    expect(response.headers.get('content-type')).toBe('application/json')
+    expect(response.headers.get('x-handler')).toBe('items')
+    expect(await response.json()).toEqual({ created: 'widget', q: '7' })
+
+    const missed = await prefix.call({
+      export: 'default.fetch',
+      args: [new Request('https://api.example.com/other')],
+    })
+    expect(missed.ok).toBe(true)
+    if (!missed.ok)
+      return
+    expect((missed.value as Response).status).toBe(404)
+    await prefix.dispose()
+  })
+
+  test('a binary upload round-trips through the handler byte for byte', async () => {
+    const payload = new Uint8Array([0, 1, 2, 253, 254, 255])
+    const result = await runtime.run({
+      code: `export default {
+        async fetch(request) {
+          const bytes = new Uint8Array(await request.arrayBuffer())
+          bytes.reverse()
+          return new Response(bytes, {
+            headers: { 'content-type': 'application/octet-stream' },
+          })
+        },
+      }`,
+      call: {
+        export: 'default.fetch',
+        args: [new Request('https://example.com/upload', { method: 'PUT', body: payload })],
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const response = result.value as Response
+    expect(response).toBeInstanceOf(Response)
+    const echoed = new Uint8Array(await response.arrayBuffer())
+    expect(Array.from(echoed)).toEqual([255, 254, 253, 2, 1, 0])
+  })
+
+  test('a handler proxies an upstream fetch over the bridge, cookies intact', async () => {
+    // The full loop a proxying worker exercises: host Request in (call args),
+    // sandbox Request out to the host handler (bridge args), host Response in
+    // (bridge response), sandbox Response out (call result). Duplicate
+    // set-cookie entries must survive every leg — a Record cannot carry them,
+    // so this pins that no leg folds headers through one.
+    let upstreamSaw: Request | undefined
+    const result = await runtime.run({
+      code: `export default {
+        async fetch(request) {
+          const upstreamResponse = await upstream(
+            new Request('https://origin.internal' + new URL(request.url).pathname, {
+              headers: { 'x-forwarded-host': new URL(request.url).host },
+            }),
+          )
+          const headers = new Headers({ 'x-proxied': '1' })
+          for (const cookie of upstreamResponse.headers.getSetCookie())
+            headers.append('set-cookie', cookie)
+          return new Response(await upstreamResponse.text(), {
+            status: upstreamResponse.status,
+            headers,
+          })
+        },
+      }`,
+      globals: {
+        upstream: async (request: unknown) => {
+          upstreamSaw = request as Request
+          return new Response('from origin', {
+            status: 203,
+            headers: [
+              ['set-cookie', 'a=1'],
+              ['set-cookie', 'b=2'],
+            ],
+          })
+        },
+      },
+      call: {
+        export: 'default.fetch',
+        args: [new Request('https://edge.example.com/assets/logo')],
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    // The bridge handler received a real Request built inside the sandbox.
+    expect(upstreamSaw).toBeInstanceOf(Request)
+    expect(upstreamSaw?.url).toBe('https://origin.internal/assets/logo')
+    expect(upstreamSaw?.headers.get('x-forwarded-host')).toBe('edge.example.com')
+    const response = result.value as Response
+    expect(response).toBeInstanceOf(Response)
+    expect(response.status).toBe(203)
+    expect(response.headers.get('x-proxied')).toBe('1')
+    expect(response.headers.getSetCookie()).toEqual(['a=1', 'b=2'])
+    expect(await response.text()).toBe('from origin')
+  })
+
+  test('sequential requests against one prepared handler stay independent', async () => {
+    // The warm-instance path: the first call cold-starts an instance, later
+    // calls reuse it, and every call's Request must rehydrate on that
+    // instance's thread exactly like the first.
+    const prefix = await runtime.prepare({
+      code: `export default {
+        async fetch(request) {
+          return Response.json({
+            method: request.method,
+            path: new URL(request.url).pathname,
+            body: request.method === 'GET' ? null : await request.text(),
+          })
+        },
+      }`,
+    })
+    const requests = [
+      new Request('https://example.com/a'),
+      new Request('https://example.com/b', { method: 'POST', body: 'two' }),
+      new Request('https://example.com/c', { method: 'PUT', body: 'three' }),
+    ]
+    const seen: unknown[] = []
+    for (const request of requests) {
+      const result = await prefix.call({ export: 'default.fetch', args: [request] })
+      expect(result.ok).toBe(true)
+      if (!result.ok)
+        return
+      seen.push(await (result.value as Response).json())
+    }
+    expect(seen).toEqual([
+      { method: 'GET', path: '/a', body: null },
+      { method: 'POST', path: '/b', body: 'two' },
+      { method: 'PUT', path: '/c', body: 'three' },
+    ])
+    await prefix.dispose()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // readExports (#58): the deploy-path declaration reader
 // ─────────────────────────────────────────────────────────────────────────────
 
