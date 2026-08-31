@@ -26,13 +26,18 @@ async function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Holds its instance busy for `ms` so concurrent calls must overlap.
+ * Holds its instance busy for `ms` so concurrent calls must overlap. The
+ * hold parks on a host bridge sleep — the sandbox clock is frozen during
+ * execution, so an in-sandbox spin-wait would never terminate — and a call
+ * awaiting a bridge response holds its slot exactly like a running one.
+ * Prefixes prepared from this must declare `globals: { hostSleep }`.
  */
-const SLOW = `export function slow(ms) {
-  const t = Date.now()
-  while (Date.now() - t < ms) { /* hold the instance busy */ }
+const SLOW = `export async function slow(ms) {
+  await hostSleep(ms)
   return 1
 }`
+
+const hostSleep = (ms: number): Promise<void> => sleep(ms)
 
 describe('memory budget → live-isolate cap', () => {
   test('idle instances outlive the run-slot count under the default budget', async () => {
@@ -203,7 +208,7 @@ describe('saturation queues FIFO', () => {
     // No queue knobs, deliberately: saturation always queues, and the wait
     // is bounded in practice because every run has wall/CPU limits.
     await using single = await createSandbox({ maxIsolates: 1 })
-    await using prefix = await single.prepare({ code: SLOW })
+    await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
 
     const busy = prefix.call({
       export: 'slow',
@@ -246,7 +251,7 @@ describe('stats()', () => {
     // The control connection is not a pool slot: with the only slot held by
     // a running call, stats() must still answer — that is its whole point.
     await using single = await createSandbox({ maxIsolates: 1 })
-    await using prefix = await single.prepare({ code: SLOW })
+    await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
 
     const busy = prefix.call({
       export: 'slow',
@@ -266,9 +271,8 @@ describe('stats()', () => {
   test('counts a running one-off in activeRuns', async () => {
     await using dual = await createSandbox({ maxIsolates: 2 })
     const busy = dual.run({
-      code: `const t = Date.now()
-while (Date.now() - t < 500) { /* spin */ }
-export default 1`,
+      globals: { hostSleep },
+      code: 'await hostSleep(500)\nexport default 1',
       limits: { cpuTimeMs: 5_000 },
     })
     await sleep(100)

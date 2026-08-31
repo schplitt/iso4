@@ -16,7 +16,7 @@
 // parser (url.rs), and the URL class below is only the object surface. Like
 // the shells, they are never exposed on globalThis.
 
-(function (HeadersShell, RequestShell, ResponseShell, urlParse, urlSet, streamRead, streamCancel) {
+(function (HeadersShell, RequestShell, ResponseShell, urlParse, urlSet, streamRead, streamCancel, frozenClock) {
   'use strict'
 
   const def = (target, name, value) =>
@@ -1137,6 +1137,95 @@
     }
   }
   installBody(Response.prototype)
+
+  // ── Frozen clock ───────────────────────────────────────────────────────────
+  //
+  // `frozenClock.t` is the run's notion of "now" (whole ms since the epoch).
+  // It only moves when the runtime regains control at a socket frame — run
+  // entry, bridge responses, stream frames — never while guest code executes
+  // (workerd's model; DESIGN.md §1.2). Every guest-visible clock below reads
+  // it; the natives it replaces survive only in this closure.
+
+  {
+    const now = () => frozenClock.t
+
+    // Date: `Date.now()`, no-arg `new Date()` and `Date()` return frozen time;
+    // every explicit-argument construction and all instance methods pass
+    // through untouched. A function (not a class) so bare `Date()` stays
+    // callable; Reflect.construct keeps `class D extends Date` working.
+    const NativeDate = Date
+    function DateShim(...args) {
+      if (new.target === undefined)
+        return new NativeDate(now()).toString()
+      if (args.length === 0)
+        return Reflect.construct(NativeDate, [now()], new.target)
+      return Reflect.construct(NativeDate, args, new.target)
+    }
+    DateShim.prototype = NativeDate.prototype
+    def(NativeDate.prototype, 'constructor', DateShim)
+    Object.defineProperty(DateShim, 'name', { value: 'Date', configurable: true })
+    Object.defineProperty(DateShim, 'length', { value: NativeDate.length, configurable: true })
+    def(DateShim, 'parse', NativeDate.parse)
+    def(DateShim, 'UTC', NativeDate.UTC)
+    const shimNow = function () {
+      return now()
+    }
+    Object.defineProperty(shimNow, 'name', { value: 'now', configurable: true })
+    def(DateShim, 'now', shimNow)
+    globalThis.Date = DateShim
+
+    // Intl.DateTimeFormat formats "now" when called without a date — default
+    // the argument to the frozen clock instead of the real one. Formatting an
+    // explicit date is pure computation and stays native.
+    if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
+      const proto = Intl.DateTimeFormat.prototype
+      const desc = Object.getOwnPropertyDescriptor(proto, 'format')
+      if (desc && desc.get) {
+        const nativeGet = desc.get
+        Object.defineProperty(proto, 'format', {
+          get() {
+            const bound = nativeGet.call(this)
+            return (date) => bound(date === undefined ? now() : date)
+          },
+          enumerable: false,
+          configurable: true,
+        })
+      }
+      if (typeof proto.formatToParts === 'function') {
+        const native = proto.formatToParts
+        def(proto, 'formatToParts', function formatToParts(date) {
+          return native.call(this, date === undefined ? now() : date)
+        })
+      }
+    }
+
+    // Temporal.Now: derive everything from the frozen instant. Existence
+    // checks per method — the Temporal surface is still moving between V8
+    // versions.
+    if (typeof Temporal !== 'undefined' && Temporal.Now) {
+      const Now = Temporal.Now
+      const instant = () => Temporal.Instant.fromEpochMilliseconds(now())
+      const zoned = (tz) => instant().toZonedDateTimeISO(tz === undefined ? Now.timeZoneId() : tz)
+      if (Now.instant)
+        def(Now, 'instant', () => instant())
+      if (Now.zonedDateTimeISO)
+        def(Now, 'zonedDateTimeISO', (tz) => zoned(tz))
+      if (Now.plainDateTimeISO)
+        def(Now, 'plainDateTimeISO', (tz) => zoned(tz).toPlainDateTime())
+      if (Now.plainDateISO)
+        def(Now, 'plainDateISO', (tz) => zoned(tz).toPlainDate())
+      if (Now.plainTimeISO)
+        def(Now, 'plainTimeISO', (tz) => zoned(tz).toPlainTime())
+    }
+
+    // SharedArrayBuffer: removed outright — shared memory plus a counting
+    // thread is the canonical replacement timer, and no guest has a second
+    // thread to share with anyway. Browsers hide it the same way outside
+    // cross-origin isolation, so libraries feature-detect its absence.
+    // (`Atomics` stays: legal on plain ArrayBuffers everywhere, and inert
+    // without shared memory; `Atomics.wait` is disabled isolate-wide in Rust.)
+    delete globalThis.SharedArrayBuffer
+  }
 
   // ── Publish ────────────────────────────────────────────────────────────────
 

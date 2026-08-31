@@ -179,6 +179,57 @@ fn response_shell_ctor(
 /// codec's rehydration path in `v8.rs`.
 pub const BODY_STREAM_FACTORY_KEY: &str = "iso4::bodyStreamFactory";
 
+/// Private-symbol key on the global object holding the frozen-clock cell —
+/// the plain object whose `t` property backs every guest-visible clock
+/// (`Date`, no-arg `Intl.DateTimeFormat` formatting, `Temporal.Now`). The
+/// shims capture the cell in closures at install time; the Rust side advances
+/// it through this key, so guest code can neither reach the cell nor observe
+/// time passing while it executes.
+const FROZEN_CLOCK_KEY: &str = "iso4::frozenClock";
+
+fn clock_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
+    let name = v8::String::new(scope, FROZEN_CLOCK_KEY)?;
+    Some(v8::Private::for_api(scope, Some(name)))
+}
+
+/// Wall clock in whole ms since the epoch — the value the frozen clock
+/// advances to. Truncation to ms is deliberate: the guest never sees sub-ms
+/// resolution even at an advance boundary.
+fn wall_now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// Advance the current context's frozen clock to `max(current, wall now)`.
+///
+/// Called only where the runtime regains control from the socket — run entry
+/// and each received frame in the poll loop — never while guest code is on
+/// the stack. Monotone by construction; a context without the cell (a partly
+/// failed install) is left alone.
+pub fn advance_frozen_clock(scope: &mut v8::PinScope) {
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let Some(key) = clock_key(scope) else { return };
+    let Some(cell) = global.get_private(scope, key) else {
+        return;
+    };
+    let Ok(cell) = v8::Local::<v8::Object>::try_from(cell) else {
+        return;
+    };
+    let Some(prop) = v8::String::new(scope, "t") else { return };
+    let prev = cell
+        .get(scope, prop.into())
+        .and_then(|v| v.number_value(scope))
+        .unwrap_or(0.0);
+    let now = wall_now_ms();
+    if now > prev {
+        let value = v8::Number::new(scope, now);
+        cell.set(scope, prop.into(), value.into());
+    }
+}
+
 /// Install the web globals into the current context, without streamed-body
 /// support (unit tests): the stream natives are `undefined` and a streamed
 /// body read fails cleanly in JS.
@@ -233,9 +284,24 @@ pub fn install_with_streams(
     factory_args.push(stream_read);
     factory_args.push(stream_cancel);
 
+    // The frozen-clock cell (see FROZEN_CLOCK_KEY). Initialized to the wall
+    // clock at context creation, so prefix evaluation runs on a frozen "now"
+    // exactly like calls do.
+    let clock_cell = v8::Object::new(scope);
+    {
+        let prop = v8::String::new(scope, "t")
+            .ok_or_else(|| "intern frozen clock prop failed".to_string())?;
+        let value = v8::Number::new(scope, wall_now_ms());
+        clock_cell
+            .set(scope, prop.into(), value.into())
+            .ok_or_else(|| "init frozen clock failed".to_string())?;
+    }
+    factory_args.push(clock_cell.into());
+
     // The runtime source is an expression evaluating to a function; calling it
-    // with the three shells and the two URL callbacks installs the classes.
-    // None of the five are ever exposed on `globalThis`.
+    // with the three shells, the two URL callbacks, the stream natives, and
+    // the frozen-clock cell installs the classes and the clock shims. None of
+    // the arguments are ever exposed on `globalThis`.
     let source = v8::String::new(scope, RUNTIME_JS)
         .ok_or_else(|| "intern web runtime source failed".to_string())?;
     let origin_name = v8::String::new(scope, "iso4:web")
@@ -302,6 +368,14 @@ pub fn install_with_streams(
     global
         .set_private(tc, factory_key, factory_fn)
         .ok_or_else(|| "store body-stream factory failed".to_string())?;
+
+    // Keep the frozen-clock cell reachable for advance_frozen_clock. Private
+    // slot, same reasoning as the classes above.
+    let clock_key =
+        clock_key(tc).ok_or_else(|| "intern frozen clock key failed".to_string())?;
+    global
+        .set_private(tc, clock_key, clock_cell.into())
+        .ok_or_else(|| "store frozen clock cell failed".to_string())?;
     Ok(())
 }
 

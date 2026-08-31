@@ -1120,6 +1120,13 @@ fn run_module_inner(
     // export extraction (D9 hardening).
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
 
+    // `Atomics.wait` throws: a blocking timed sleep on the isolate thread is
+    // a DoS primitive and a timing building block, and with no shared memory
+    // (SharedArrayBuffer is removed by the web runtime) it has no legitimate
+    // caller. Matches workerd (SetAllowAtomicsWait(false)) and browser main
+    // threads.
+    isolate.set_allow_atomics_wait(false);
+
     // Host modules receive their natively-built values through import.meta
     // (see `build_host_module`); the callback consults the resolver context to
     // find the values array staged for the module being initialised.
@@ -1350,6 +1357,11 @@ fn run_call_phase(
     v8::scope!(let scope, isolate);
     let context_local = v8::Local::new(scope, context);
     let scope = &mut v8::ContextScope::new(scope, context_local);
+
+    // Each call starts on fresh frozen time — the only other advance points
+    // are received frames in the poll loop, so on a warm instance the clock
+    // would otherwise still read the previous call's last frame time.
+    crate::webtypes::advance_frozen_clock(scope);
 
     // Shared state for all bridge callbacks in this call. All three are Arcs-
     // call_id, bridge_error, and pending_resolvers are shared between the
@@ -2431,6 +2443,8 @@ fn new_capped_isolate(
     }
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
+    // Same rationale as the one-off path: no blocking Atomics.wait, ever.
+    isolate.set_allow_atomics_wait(false);
 
     let near_heap: Option<Box<NearHeapData>> = if memory_mb > 0 {
         let data = Box::new(NearHeapData {
@@ -3025,6 +3039,10 @@ fn settle_promise(
                 return Err(RunError::Internal(format!("poll loop socket read: {e}")));
             }
             Ok(frame) => {
+                // A frame arrived — the runtime holds control, so this is an
+                // observable I/O boundary: the frozen clock advances before
+                // anything of the frame is delivered into JS.
+                crate::webtypes::advance_frozen_clock(scope);
                 // ── Validate and decode the frame ────────────────────────
                 match frame.message_type {
                     ipc::TsToRustMessageType::BridgeResponse => {}

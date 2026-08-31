@@ -181,15 +181,21 @@ describe('warm instances: concurrency', () => {
   test('concurrent calls on one prefix get separate instances', async () => {
     // v1 concurrency: one call at a time per instance — parallelism for one
     // prefix means more instances, which share no state (the workerd
-    // instances-across-machines contract). Each call busy-waits so the two
-    // must overlap; each sees its own fresh n.
+    // instances-across-machines contract). Each call parks on a host sleep
+    // so the two must overlap (the sandbox clock is frozen during execution,
+    // so a spin-wait would never terminate); each sees its own fresh n.
     await using prefix = await dual.prepare({
       code: `let n = 0
-export function slowBump() {
-  const t = Date.now()
-  while (Date.now() - t < 200) { /* hold the instance busy */ }
+export async function slowBump() {
+  await hold()
   return ++n
 }`,
+      globals: {
+        hold: async () =>
+          new Promise((resolve) => {
+            setTimeout(resolve, 200)
+          }),
+      },
     })
     const [first, second] = await Promise.all([
       prefix.call({ export: 'slowBump', limits: { cpuTimeMs: 5_000 } }),
