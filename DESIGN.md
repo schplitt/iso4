@@ -82,6 +82,20 @@ An in-process embedding (V8 inside the host process via NAPI / napi-rs)
 for sub-µs call overhead is the analytics product's concern, not this
 product's. See §9.1.
 
+**Timing posture.** One runtime process deliberately hosts isolates from
+many mutually-distrusting tenants (that co-residency is the memory
+economics of the product), and same-process isolate separation is
+sufficient for that only when combined with timing mitigations —
+Spectre-class attacks read memory across a boundary by measuring
+nanosecond cache-timing differences, and a precise clock is the
+measurement tool. So the sandbox clock is **frozen during execution and
+advances only at observable I/O** (run entry and received socket frames,
+clamped monotone to whole ms) — the same model workerd documents, applied
+to every guest-visible clock; §7.11 lists the exact surfaces and the
+`SharedArrayBuffer`/`Atomics.wait` consequences. Process isolation
+remains the escape hatch for a prefix that must not share a process with
+others: give it its own `createSandbox()` runtime.
+
 There is no `SandboxOptions.backend` flag and no plan to add one. The
 analytics use case is served by a separate package, not a backend swap.
 
@@ -1074,6 +1088,20 @@ Documented up front so we don't drift into rebuilding secure-exec:
 
 10. **Identity is not preserved across the boundary.** Not relevant in v1
     because nothing crosses by reference; flagged here for future tiers.
+
+11. **The clock is frozen while sandbox code executes.** `Date.now()`,
+    no-arg `new Date()` / `Date()`, no-arg `Intl.DateTimeFormat`
+    `format()`/`formatToParts()`, and `Temporal.Now.*` all read one frozen
+    per-context value that advances — monotone, whole milliseconds — only
+    when the runtime regains control at a socket frame: run entry, each
+    bridge response, each stream frame. Sandbox code can never observe its
+    own elapsed execution time (§1.2 explains why). Consequences:
+    `SharedArrayBuffer` is removed from the global (a shared counter is the
+    canonical replacement timer; browsers hide it the same way outside
+    cross-origin isolation), `Atomics.wait` throws (blocking sleep;
+    `Atomics` itself stays, matching browsers and Node), and `performance`
+    remains absent. Formatting an *explicit* date and all other
+    `Date`/`Temporal` computation is untouched.
 
 ---
 
