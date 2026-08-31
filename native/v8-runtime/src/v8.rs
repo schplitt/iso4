@@ -43,6 +43,13 @@ struct LogBuffers {
 /// `Once` ensures it runs exactly once per process.
 pub fn init_platform() {
     INIT.call_once(|| {
+        // ICU data must be loaded before V8 initializes. Without it, the
+        // first locale-aware call in sandboxed code (`toLocaleString`,
+        // `Intl.*`, `localeCompare`) aborts the whole process: V8 reports
+        // any ICU failure there as "Fatal process out of memory:
+        // DateTimePatternGeneratorCache::CreateGenerator".
+        v8::icu::set_common_data_77(deno_core_icudata::ICU_DATA)
+            .expect("failed to load embedded ICU data");
         let platform = v8::new_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
