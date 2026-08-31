@@ -19,6 +19,7 @@ import type { Buffer } from 'node:buffer'
 import v8 from 'node:v8'
 import type { GlobalDefPayload } from './ipc.js'
 import { HostTypeDeserializer, materializeHostTypes } from './web-codec.js'
+import type { StreamSourceRegistry } from './web-codec.js'
 
 /**
  * The subset of `v8.Serializer` we need that `@types/node` does not declare.
@@ -90,9 +91,16 @@ export function serializeValue(value: unknown): Buffer {
  * @param value the value to encode
  * @param brandKey the sandbox's session brand key — descriptors are stamped
  * with it, and the runtime rehydrates only stamped descriptors
+ * @param streams the run's stream registry; a body outgrowing the probe is
+ * registered there and crosses as a stream handle instead of inline bytes.
+ * Omit on legs that must stay buffered (data globals, whose values replay).
  */
-export async function serializeHostValue(value: unknown, brandKey: string): Promise<Buffer> {
-  return serializeValue(await materializeHostTypes(value, brandKey))
+export async function serializeHostValue(
+  value: unknown,
+  brandKey: string,
+  streams?: StreamSourceRegistry,
+): Promise<Buffer> {
+  return serializeValue(await materializeHostTypes(value, brandKey, streams))
 }
 
 /**

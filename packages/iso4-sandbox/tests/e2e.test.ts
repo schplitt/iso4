@@ -4371,6 +4371,303 @@ describe('waitUntil', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Streaming bodies: a Request/Response body that outgrows the probe crosses
+// as a stream handle pumped under flow control; the sandbox reads it through
+// `.body` / the body helpers. Small bodies keep the buffered path untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('streaming bodies', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  /**
+   * A deterministic pattern body of `size` bytes. Built over an explicit
+   * ArrayBuffer and left to inference so newer TS libs see the
+   * `Uint8Array<ArrayBuffer>` that `BodyInit` demands.
+   * @param size body size in bytes
+   */
+  function patternBytes(size: number) {
+    const out = new Uint8Array(new ArrayBuffer(size))
+    for (let i = 0; i < size; i++) out[i] = (i * 7 + 13) & 0xFF
+    return out
+  }
+
+  test('a large call-arg body streams in and survives byte for byte', async () => {
+    const size = 1024 * 1024
+    const body = patternBytes(size)
+    const prefix = await runtime.prepare({
+      code: `export default {
+        async fetch(request) {
+          const bytes = new Uint8Array(await request.arrayBuffer())
+          let sum = 0
+          for (let i = 0; i < bytes.length; i += 4096) sum = (sum + bytes[i]) % 65536
+          return Response.json({ length: bytes.length, sum, streamed: true })
+        },
+      }`,
+    })
+    // Two calls: the second exercises a reused warm instance with a fresh
+    // stream table.
+    for (let round = 0; round < 2; round++) {
+      const result = await prefix.call({
+        export: 'default.fetch',
+        args: [new Request('https://example.com/upload', { method: 'POST', body: patternBytes(size) })],
+      })
+      expect(result.ok).toBe(true)
+      if (!result.ok)
+        return
+      const report = await (result.value as Response).json() as { length: number, sum: number }
+      expect(report.length).toBe(size)
+      let sum = 0
+      for (let i = 0; i < body.length; i += 4096) sum = (sum + body[i]!) % 65536
+      expect(report.sum).toBe(sum)
+    }
+    await prefix.dispose()
+  })
+
+  test('a large bridge-response body streams and is readable incrementally', async () => {
+    const size = 512 * 1024
+    const result = await runtime.run({
+      code: `
+        const res = await fetchUpstream()
+        const streamed = res.body !== null
+        let chunks = 0
+        let total = 0
+        for await (const chunk of res.body) { chunks++; total += chunk.byteLength }
+        export default { streamed, chunks, total }
+      `,
+      globals: {
+        fetchUpstream: async () => new Response(patternBytes(size)),
+      },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const out = result.exports.default as { streamed: boolean, chunks: number, total: number }
+    expect(out.streamed).toBe(true)
+    expect(out.total).toBe(size)
+    // Flow control caps a chunk at 64 KiB, so a 512 KiB body needs several.
+    expect(out.chunks).toBeGreaterThan(1)
+  })
+
+  test('a small body keeps the buffered path (no stream, body getter is null)', async () => {
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        export default { hasStream: res.body !== null, text: await res.text() }
+      `,
+      globals: { give: async () => new Response('small enough') },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({ hasStream: false, text: 'small enough' })
+  })
+
+  test('cancelling releases the host source', async () => {
+    let cancelled = false
+    const endless = (): ReadableStream<Uint8Array> => new ReadableStream({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(16 * 1024))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        const reader = res.body.getReader()
+        const first = await reader.read()
+        await reader.cancel('done early')
+        export default { got: first.value.byteLength > 0 }
+      `,
+      globals: { give: async () => new Response(endless()) },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({ got: true })
+    // The cancel frame reaches the pump asynchronously.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100)
+    })
+    expect(cancelled).toBe(true)
+  })
+
+  test('a mid-stream source failure rejects the read catchably', async () => {
+    let pulls = 0
+    const failing = (): ReadableStream<Uint8Array> => new ReadableStream({
+      pull(controller) {
+        pulls++
+        if (pulls > 3)
+          throw new Error('disk on fire')
+        controller.enqueue(new Uint8Array(64 * 1024))
+      },
+    })
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        let failure = null
+        let total = 0
+        try {
+          for await (const chunk of res.body) total += chunk.byteLength
+        } catch (e) { failure = e.message }
+        export default { failure, gotSome: total > 0 }
+      `,
+      globals: { give: async () => new Response(failing()) },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const out = result.exports.default as { failure: string, gotSome: boolean }
+    expect(out.gotSome).toBe(true)
+    expect(out.failure).toContain('disk on fire')
+  })
+
+  test('a streamed body keeps flowing during the waitUntil grace phase', async () => {
+    const size = 1024 * 1024
+    const started = Date.now()
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        waitUntil((async () => {
+          const bytes = new Uint8Array(await res.arrayBuffer())
+          console.log('drained:' + bytes.length)
+        })())
+        export default 'early'
+      `,
+      globals: { give: async () => new Response(patternBytes(size)) },
+      limits: { maxBridgeCalls: 2, graceMs: 10_000 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('early')
+    const report = await result.waitUntil!
+    // The 1 MiB body crosses the 256 KiB credit window four times during
+    // grace: a stalled StreamPull loop would park until graceMs instead.
+    expect(report.status).toBe('settled')
+    expect(report.stdout).toEqual([`drained:${size}`])
+    expect(Date.now() - started).toBeLessThan(5_000)
+  })
+
+  test('a failed run releases the host body source', async () => {
+    let cancelled = false
+    const endless = (): ReadableStream<Uint8Array> => new ReadableStream({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(16 * 1024))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        res.body.getReader() // hydrated and held
+        throw new Error('handler exploded')
+      `,
+      globals: { give: async () => new Response(endless()) },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(false)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100)
+    })
+    expect(cancelled).toBe(true)
+  })
+
+  test('clone() tees a streamed body: both instances read the full body independently', async () => {
+    const size = 256 * 1024
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        const copy = res.clone()
+        // Interleaved consumption: the copy drains while the original reads,
+        // which only works when the two branches are independent.
+        const [a, b] = await Promise.all([res.arrayBuffer(), copy.arrayBuffer()])
+        const bytesA = new Uint8Array(a)
+        const bytesB = new Uint8Array(b)
+        let equal = bytesA.length === bytesB.length
+        for (let i = 0; equal && i < bytesA.length; i += 1024) equal = bytesA[i] === bytesB[i]
+        export default { lenA: bytesA.length, lenB: bytesB.length, equal }
+      `,
+      globals: { give: async () => new Response(patternBytes(size)) },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({ lenA: size, lenB: size, equal: true })
+  })
+
+  test('cancelling one tee branch leaves the other readable', async () => {
+    const size = 512 * 1024
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        const copy = res.clone()
+        await copy.body.cancel('not needed')
+        const bytes = new Uint8Array(await res.arrayBuffer())
+        export default bytes.length
+      `,
+      globals: { give: async () => new Response(patternBytes(size)) },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe(size)
+  })
+
+  test('reading through .body marks bodyUsed, matching Node', async () => {
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        const before = res.bodyUsed
+        const reader = res.body.getReader()
+        await reader.read()
+        export default { before, after: res.bodyUsed }
+      `,
+      globals: { give: async () => new Response(patternBytes(256 * 1024)) },
+      limits: { maxBridgeCalls: 2 },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({ before: false, after: true })
+  })
+
+  test('a Response with a streamed body cannot be returned to the host (clear error)', async () => {
+    const result = await runtime.run({
+      code: `
+        const res = await give()
+        export default res
+      `,
+      globals: { give: async () => new Response(patternBytes(256 * 1024)) },
+      limits: { maxBridgeCalls: 2 },
+    })
+    // Host types keep their loud codec diagnostic: the run fails naming the
+    // remedy instead of silently skipping or delivering a gutted Response.
+    expect(result.ok).toBe(false)
+    if (result.ok || result.status !== 'failed')
+      return
+    expect(result.error.message).toContain('streamed body')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // readExports: the deploy-path declaration reader
 // ─────────────────────────────────────────────────────────────────────────────
 

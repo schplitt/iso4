@@ -447,9 +447,11 @@ be neither forged nor destroyed by a run.
 
 **Deliberate deviations from spec**, in scope terms rather than bugs:
 
-- No `.body` getter. That is a `ReadableStream`, and streams cannot cross a
-  one-shot boundary (`docs/protocol.md` §4.4.5). Use `text()`, `json()`,
-  `arrayBuffer()`, `bytes()`.
+- `.body` is a minimal reader-shaped stream only on instances that arrived
+  with a streamed host body (`docs/protocol.md` §5.5): `getReader()`,
+  `cancel()`, async iteration — not a full WHATWG `ReadableStream`. On
+  buffered bodies it is `null`; use `text()`, `json()`, `arrayBuffer()`,
+  `bytes()`, which also drain streamed bodies transparently.
 - No `Blob` or `FormData`, so no `blob()`/`formData()` and neither works as a
   body initializer.
 - No `crypto`, `AbortController`, `AbortSignal`, `Event`, `structuredClone`,
@@ -1027,8 +1029,18 @@ Documented up front so we don't drift into rebuilding secure-exec:
    data in, pure data out. (Future tier-2 may add a callback handle table.
    Not v1.)
 
-3. **No streaming.** `fetch` buffers the full response body. Cap defaults to
-   16 MB. Streaming would require handle-based `ReadableStream`s; not v1.
+3. **Streaming is inbound-only.** A host → sandbox `Request`/`Response`
+   body that outgrows a 64 KiB probe crosses as a stream handle pumped under
+   credit-based flow control (`docs/protocol.md` §5.5); the sandbox reads it
+   through `.body` or the body helpers. Small bodies keep the buffered path,
+   and data globals stay buffered (their values replay per instance). The
+   sandbox → host direction still buffers: a streamed body cannot be
+   returned or re-wrapped — only its bytes after reading it. `clone()` tees
+   a streamed body per the fetch spec (the slower branch's backlog lives in
+   the guest heap, which the isolate memory cap bounds), and reading through
+   `.body` marks `bodyUsed`, matching Node. Total body size on streaming
+   legs is bounded by flow control plus the guest heap cap rather than the
+   16 MiB buffered-path cap.
 
 4. **No `eval` / `new Function` in run code.** Code generation from strings
    is a `prepare()`-time capability: it is allowed while prepared setup code

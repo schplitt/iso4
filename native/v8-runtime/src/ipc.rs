@@ -69,6 +69,12 @@ pub enum TsToRustMessageType {
     /// Request a capacity/usage snapshot. Empty payload; answered
     /// with a `StatsResult` frame.
     Stats = 0x08,
+    /// One chunk of a streamed host-type body. Only legal inside the credit
+    /// window the runtime granted for the stream.
+    StreamChunk = 0x09,
+    /// End of a streamed body: clean EOF, or a source failure carrying a
+    /// message the pending sandbox read rejects with.
+    StreamEnd = 0x0A,
 }
 
 /// Message types sent from Rust to the TypeScript host.
@@ -92,10 +98,16 @@ pub enum RustToTsMessageType {
     Hello = 0x05,
     /// Capacity/usage snapshot answering a `Stats` request.
     StatsResult = 0x06,
-    /// Final frame of a run whose Result reported pending background work
-    ///: carries the `waitUntil` epilogue's outcome and telemetry, and
+    /// Final frame of a run whose Result reported pending background work:
+    /// carries the `waitUntil` epilogue's outcome and telemetry, and
     /// releases the run's connection slot.
     RunComplete = 0x07,
+    /// Grant of streaming-body credit: the sandbox consumed bytes off a
+    /// streamed body, the host may have that many more bytes in flight.
+    StreamPull = 0x08,
+    /// The sandbox cancelled a streamed body (`reader.cancel()`, instance
+    /// teardown); the host must stop pumping and release the source.
+    StreamCancel = 0x09,
 }
 
 /// Handshake status reported on a `Hello` frame.
@@ -409,6 +421,14 @@ pub const DEFAULT_MAX_BRIDGE_CALLS: u32 = 10;
 /// Grace budget for `waitUntil` background work after the Result frame,
 /// Cloudflare's number. Zero disables the epilogue entirely.
 pub const DEFAULT_GRACE_MS: u32 = 30_000;
+
+/// Streaming bodies: hard cap on one `StreamChunk`'s byte length. The host
+/// splits larger reads; the runtime rejects a violation as malformed.
+pub const STREAM_CHUNK_MAX_BYTES: u32 = 64 * 1024;
+/// Streaming bodies: the credit window — how many un-consumed bytes may be in
+/// flight per stream. Granted implicitly at hydration; replenished by
+/// `StreamPull` as the sandbox consumes. Bounds runtime-side buffering.
+pub const STREAM_CREDIT_WINDOW_BYTES: u32 = 256 * 1024;
 
 /// Resource limits applied to a `Run` request, with runtime defaults already
 /// resolved: each field is the caller's explicit value or, when the caller left
@@ -1045,6 +1065,100 @@ pub fn parse_terminate_payload(payload: &[u8]) -> io::Result<u32> {
 ///
 /// You can use this after `read_frame()` when reading from a host connection.
 /// Unknown bytes should return `InvalidData`.
+/// Parsed `StreamChunk` payload: `u32 runId, u32 streamId, Bytes data`.
+pub struct StreamChunkPayload<'a> {
+    pub run_id: u32,
+    pub stream_id: u32,
+    pub data: &'a [u8],
+}
+
+/// Parse a `StreamChunk` frame payload (borrowing the chunk bytes).
+pub fn parse_stream_chunk_payload(payload: &[u8]) -> io::Result<StreamChunkPayload<'_>> {
+    if payload.len() < 12 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload too short for StreamChunk",
+        ));
+    }
+    let run_id = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+    let stream_id = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+    let len = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+    if len > STREAM_CHUNK_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("stream chunk of {len} bytes exceeds the {STREAM_CHUNK_MAX_BYTES} cap"),
+        ));
+    }
+    if payload.len() != 12 + len as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "StreamChunk payload length mismatch",
+        ));
+    }
+    Ok(StreamChunkPayload {
+        run_id,
+        stream_id,
+        data: &payload[12..],
+    })
+}
+
+/// Parsed `StreamEnd` payload: `u32 runId, u32 streamId, bool ok,
+/// Optional<String> error` (present when `ok = false`).
+pub struct StreamEndPayload {
+    pub run_id: u32,
+    pub stream_id: u32,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Parse a `StreamEnd` frame payload.
+pub fn parse_stream_end_payload(payload: &[u8]) -> io::Result<StreamEndPayload> {
+    let mut r = PayloadReader::new(payload);
+    let run_id = r.read_u32()?;
+    let stream_id = r.read_u32()?;
+    let ok = r.read_bool()?;
+    let error = if ok {
+        None
+    } else {
+        match r.read_u8()? {
+            0 => None,
+            1 => Some(r.read_string()?),
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid optional presence byte: {other:#04x}"),
+                ))
+            }
+        }
+    };
+    r.assert_done()?;
+    Ok(StreamEndPayload {
+        run_id,
+        stream_id,
+        ok,
+        error,
+    })
+}
+
+/// Encode a `StreamPull` payload: `u32 runId, u32 streamId, u32 credit`.
+pub fn encode_stream_pull_payload(run_id: u32, stream_id: u32, credit: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&run_id.to_be_bytes());
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    out.extend_from_slice(&credit.to_be_bytes());
+    out
+}
+
+/// Encode a `StreamCancel` payload: `u32 runId, u32 streamId, String reason`.
+pub fn encode_stream_cancel_payload(run_id: u32, stream_id: u32, reason: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + reason.len());
+    out.extend_from_slice(&run_id.to_be_bytes());
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    out.extend_from_slice(&(reason.len() as u32).to_be_bytes());
+    out.extend_from_slice(reason.as_bytes());
+    out
+}
+
 pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType> {
     match byte {
         0x01 => Ok(TsToRustMessageType::Authenticate),
@@ -1055,6 +1169,8 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
         0x06 => Ok(TsToRustMessageType::BridgeResponse),
         0x07 => Ok(TsToRustMessageType::Terminate),
         0x08 => Ok(TsToRustMessageType::Stats),
+        0x09 => Ok(TsToRustMessageType::StreamChunk),
+        0x0A => Ok(TsToRustMessageType::StreamEnd),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown TS->Rust message type: {byte:#04x}"),
@@ -1073,6 +1189,9 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
         0x04 => Ok(RustToTsMessageType::Log),
         0x05 => Ok(RustToTsMessageType::Hello),
         0x06 => Ok(RustToTsMessageType::StatsResult),
+        0x07 => Ok(RustToTsMessageType::RunComplete),
+        0x08 => Ok(RustToTsMessageType::StreamPull),
+        0x09 => Ok(RustToTsMessageType::StreamCancel),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown Rust->TS message type: {byte:#04x}"),
@@ -1140,6 +1259,64 @@ mod tests {
         let err = parse_authenticate_payload(&v).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "Authenticate payload truncated (probe)");
+    }
+
+    #[test]
+    fn stream_chunk_payload_roundtrips_and_caps() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&7u32.to_be_bytes());
+        payload.extend_from_slice(&3u32.to_be_bytes());
+        payload.extend_from_slice(&4u32.to_be_bytes());
+        payload.extend_from_slice(&[1, 2, 3, 4]);
+        let chunk = parse_stream_chunk_payload(&payload).unwrap();
+        assert_eq!(
+            (chunk.run_id, chunk.stream_id, chunk.data),
+            (7, 3, &[1u8, 2, 3, 4][..])
+        );
+
+        // Oversized chunk claim → malformed, before any allocation.
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&7u32.to_be_bytes());
+        oversized.extend_from_slice(&3u32.to_be_bytes());
+        oversized.extend_from_slice(&(STREAM_CHUNK_MAX_BYTES + 1).to_be_bytes());
+        assert!(parse_stream_chunk_payload(&oversized).is_err());
+
+        // Length mismatch → malformed.
+        let mut short = payload.clone();
+        short.pop();
+        assert!(parse_stream_chunk_payload(&short).is_err());
+    }
+
+    #[test]
+    fn stream_end_payload_carries_the_error_only_on_failure() {
+        let mut ok = Vec::new();
+        ok.extend_from_slice(&7u32.to_be_bytes());
+        ok.extend_from_slice(&3u32.to_be_bytes());
+        ok.push(1); // ok
+        let end = parse_stream_end_payload(&ok).unwrap();
+        assert!(end.ok && end.error.is_none());
+
+        let mut failed = Vec::new();
+        failed.extend_from_slice(&7u32.to_be_bytes());
+        failed.extend_from_slice(&3u32.to_be_bytes());
+        failed.push(0); // ok = false
+        failed.push(1); // error present
+        push_string(&mut failed, "disk on fire");
+        let end = parse_stream_end_payload(&failed).unwrap();
+        assert_eq!((end.ok, end.error.as_deref()), (false, Some("disk on fire")));
+    }
+
+    #[test]
+    fn stream_pull_and_cancel_encoders_match_the_documented_layout() {
+        let pull = encode_stream_pull_payload(7, 3, 65536);
+        assert_eq!(&pull[0..4], &7u32.to_be_bytes());
+        assert_eq!(&pull[4..8], &3u32.to_be_bytes());
+        assert_eq!(&pull[8..12], &65536u32.to_be_bytes());
+
+        let cancel = encode_stream_cancel_payload(7, 3, "done");
+        assert_eq!(&cancel[0..8], &pull[0..8]);
+        assert_eq!(&cancel[8..12], &4u32.to_be_bytes());
+        assert_eq!(&cancel[12..], b"done");
     }
 
     #[test]

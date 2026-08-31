@@ -174,11 +174,31 @@ fn response_shell_ctor(
 
 // ── Installation ─────────────────────────────────────────────────────────────
 
+/// Private-symbol key under which `install` stashes the body-stream factory
+/// the web runtime returns (for hydrating streamed host bodies). Read by the
+/// codec's rehydration path in `v8.rs`.
+pub const BODY_STREAM_FACTORY_KEY: &str = "iso4::bodyStreamFactory";
+
+/// Install the web globals into the current context, without streamed-body
+/// support (unit tests): the stream natives are `undefined` and a streamed
+/// body read fails cleanly in JS.
+pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
+    let read = v8::undefined(scope).into();
+    let cancel = v8::undefined(scope).into();
+    install_with_streams(scope, read, cancel)
+}
+
 /// Install the web globals into the current context.
 ///
 /// Called at context creation on every path — prefix validation and every
-/// run — so prefix and postfix code see the same environment.
-pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
+/// run — so prefix and postfix code see the same environment. `stream_read`
+/// and `stream_cancel` are the native callbacks backing streamed host bodies
+/// (built in `v8.rs` around the run's stream table).
+pub fn install_with_streams(
+    scope: &mut v8::PinScope,
+    stream_read: v8::Local<v8::Value>,
+    stream_cancel: v8::Local<v8::Value>,
+) -> Result<(), String> {
     let mut factory_args = Vec::with_capacity(5);
     for (name, ctor) in [
         ("HeadersShell", headers_shell_ctor.map_fn_to()),
@@ -208,6 +228,10 @@ pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
             .ok_or_else(|| format!("create {name} failed"))?;
         factory_args.push(v8::Local::<v8::Value>::from(func));
     }
+
+    // Streamed-body natives (or `undefined` in stream-less installs).
+    factory_args.push(stream_read);
+    factory_args.push(stream_cancel);
 
     // The runtime source is an expression evaluating to a function; calling it
     // with the three shells and the two URL callbacks installs the classes.
@@ -265,6 +289,19 @@ pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
             .set_private(tc, key, class)
             .ok_or_else(|| format!("store {name} class reference failed"))?;
     }
+
+    // The body-stream factory for hydrating streamed host bodies, stashed
+    // under a private key like the classes.
+    let factory_fn = classes
+        .get_index(tc, 3)
+        .filter(|c| c.is_function())
+        .ok_or_else(|| "web runtime did not return the body-stream factory".to_string())?;
+    let factory_name = v8::String::new(tc, BODY_STREAM_FACTORY_KEY)
+        .ok_or_else(|| "intern body-stream factory key failed".to_string())?;
+    let factory_key = v8::Private::for_api(tc, Some(factory_name));
+    global
+        .set_private(tc, factory_key, factory_fn)
+        .ok_or_else(|| "store body-stream factory failed".to_string())?;
     Ok(())
 }
 

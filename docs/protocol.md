@@ -67,6 +67,8 @@ this version, and the handshake hard-fails otherwise (§8).
 | `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                                   |
 | `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown          |
 | `0x08` | `Stats`          | empty                   | exactly one `StatsResult`                                                                                                                 |
+| `0x09` | `StreamChunk`    | `StreamChunkPayload`    | one chunk of a streamed body (§5.5), inside the granted credit window; no reply                                                           |
+| `0x0A` | `StreamEnd`      | `StreamEndPayload`      | end of a streamed body: clean EOF or a source failure; no reply                                                                           |
 
 ### 2.2 Rust → TS
 
@@ -79,6 +81,8 @@ this version, and the handshake hard-fails otherwise (§8).
 | `0x05` | `Hello`            | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.               |
 | `0x06` | `StatsResult`      | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request.                                                  |
 | `0x07` | `RunComplete`      | `RunCompletePayload`      | Final frame of a run whose `Result` reported pending background work; frees the run's slot.           |
+| `0x08` | `StreamPull`       | `StreamPullPayload`       | Credit grant: the sandbox consumed streamed-body bytes; the host may send that many more (§5.5).      |
+| `0x09` | `StreamCancel`     | `StreamCancelPayload`     | The sandbox cancelled a streamed body; the host stops pumping and releases the source (§5.5).         |
 
 ---
 
@@ -366,8 +370,11 @@ serializer.
 
 A body that is anything else — a stream — is rejected before it reaches V8, so
 the error names the real problem rather than surfacing as "could not be
-cloned". A future streaming body would be a **host object nested in the body
-slot**, which already works: the runtime routes host objects at any depth.
+cloned". This applies to the sandbox → host direction: a hydrated streamed
+body (§5.5) cannot be sent back and is refused with a message naming the
+remedy (read it first). Host → sandbox, a large body crosses as a **stream
+handle** in the descriptor (§4.4.6) with the bytes following as `StreamChunk`
+frames — see §5.5.
 
 `extras` is a length-delimited V8 blob holding a plain object of
 forward-compatible fields (`redirect`, `cf`, `signal`, …). It exists so new
@@ -388,7 +395,7 @@ does not differ per type.
 
 | Value                                                           | Reason                        |
 | --------------------------------------------------------------- | ----------------------------- |
-| a body that is a `ReadableStream`                               | not self-contained            |
+| a sandbox body that is a stream (outbound)                      | not self-contained            |
 | `WebSocket`, `AbortSignal`                                      | not self-contained            |
 | a tag this build does not implement                             | unimplemented type            |
 | a host type nested below the top level of a host → sandbox slot | unreachable position (§4.4.6) |
@@ -461,6 +468,13 @@ property name is reserved.
 //                                       statusText: '', headers: [...],
 //                                       body: Uint8Array } }
 ```
+
+A descriptor whose body outgrew the host's probe carries a `bodyStream`
+field (a `u32` stream id) instead of inline body bytes; the runtime hydrates
+it into a socket-backed stream the sandbox reads through `.body` and the body
+helpers, with the bytes following as `StreamChunk` frames (§5.5). Only
+stamped descriptors are interpreted at all, so untrusted data cannot name a
+stream handle.
 
 Because the graph is an ordinary V8 value, nesting, cycles, `Map`/`Set` and
 object identity all work for free, and a new type costs one tag plus one
@@ -564,7 +578,7 @@ time. Never per run, never per value.
 
 | Field      | Encoding              | Notes                                                                                                       |
 | ---------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `runId`    | `u32`                 | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.6. |
+| `runId`    | `u32`                 | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.7. |
 | `code`     | `String`              | ESM source.                                                                                                 |
 | `filename` | `Optional<String>`    | Used in stack traces.                                                                                       |
 | `limits`   | `ResourceLimits`      | Only caller-set fields sent; runtime fills defaults.                                                        |
@@ -576,7 +590,7 @@ time. Never per run, never per value.
 
 | Field      | Encoding             | Notes                                                                                                                      |
 | ---------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `runId`    | `u32`                | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.6.                |
+| `runId`    | `u32`                | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.7.                |
 | `prefixId` | `PrefixId`           | Prefix handle returned by `Precompile`.                                                                                    |
 | `code`     | `Optional<String>`   | ESM postfix source. A frame carries a postfix **or** a call — exactly one; both parser and encoder enforce this.           |
 | `filename` | `Optional<String>`   | Used in stack traces.                                                                                                      |
@@ -824,7 +838,45 @@ any frame is written to the socket. The runtime applies the default of `10`
 when the caller leaves the field absent, so the limit is always active by
 default; an explicit `0` disables it.
 
-### 5.5 Diagnostic log payloads
+### 5.5 Streaming bodies
+
+A `Request`/`Response` body that outgrows the host's probe (64 KiB) crosses
+as a stream handle (§4.4.6) instead of inline bytes; small bodies keep the
+buffered path unchanged. The bytes follow as frames on the run's connection,
+interleaved with bridge traffic, under credit-based flow control. Streaming
+applies to the per-run host → sandbox legs (call args, bridge responses);
+data globals stay buffered because their values replay per instance. The
+sandbox → host direction stays buffered in this version.
+
+Every stream frame carries the **run id** alongside the stream id. Today one
+run owns a connection at a time and the field is validated against the run in
+flight; it exists so activating connection multiplexing later is a semantic
+change, not a layout change.
+
+**Flow control.** The runtime implicitly grants each stream an initial credit
+window of 262144 bytes at hydration. The host may have at most that many
+unconsumed bytes in flight; each chunk is at most 65536 bytes. As the sandbox
+consumes bytes the runtime sends `StreamPull` frames replenishing exactly the
+consumed count, so runtime-side buffering never exceeds the window (plus one
+in-flight chunk of slack for benign races). A host exceeding the window is a
+protocol fault that fails the run.
+
+| Frame          | Direction | Payload                                                                  |
+| -------------- | --------- | ------------------------------------------------------------------------ |
+| `StreamChunk`  | TS → Rust | `u32 runId, u32 streamId, Bytes data` (≤ 65536 bytes)                    |
+| `StreamEnd`    | TS → Rust | `u32 runId, u32 streamId, bool ok, Optional<String> error` (when not ok) |
+| `StreamPull`   | Rust → TS | `u32 runId, u32 streamId, u32 credit`                                    |
+| `StreamCancel` | Rust → TS | `u32 runId, u32 streamId, String reason`                                 |
+
+Semantics: a clean `StreamEnd` resolves the sandbox's next read as EOF once
+the buffer drains; a failed one rejects the pending read with a catchable
+error carrying the message. `StreamCancel` (sandbox `reader.cancel()`, or the
+run ending with the stream unread) tells the host to stop pumping and release
+the source; chunks already in flight are dropped. Stream frames arriving for
+a completed run are discarded. During a `waitUntil` grace phase (§5.8)
+streams keep flowing like bridge traffic.
+
+### 5.6 Diagnostic log payloads
 
 `DiagnosticLogPayload` is for internal runtime diagnostics only. Sandbox
 `console.*` output is captured by Rust and returned at the end of the run in
@@ -845,7 +897,7 @@ evaluates its prefix is carried on the completion of the call that
 cold-started the instance (the run that paid for the warm-up) and cleared
 afterwards, so later calls report only their own lines.
 
-### 5.6 Completion payloads
+### 5.7 Completion payloads
 
 `RunCompletionPayload`:
 
@@ -911,7 +963,7 @@ afterwards, so later calls report only their own lines.
 | `prefixId` | `Optional<PrefixId>`        | Present when `ok = true`.  |
 | `error`    | `Optional<RunErrorPayload>` | Present when `ok = false`. |
 
-### 5.7 RunComplete payloads
+### 5.8 RunComplete payloads
 
 Sent exactly once, as the final frame of a run whose `Result` carried
 `backgroundPending = true` — after the `waitUntil` grace phase ends. Grace
@@ -942,7 +994,7 @@ mirroring the oversize recovery `Result` frames have, so an oversized grace
 report costs its telemetry, never the connection. The carried error strings
 are additionally capped at the runtime (256-byte name, 2048-byte message).
 
-### 5.8 Stats payloads
+### 5.9 Stats payloads
 
 A `Stats` request has an **empty payload** and is answered with exactly one
 `StatsResult` frame — a point-in-time snapshot of the warm registry.
@@ -1047,7 +1099,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                                                                                                                                                                   |
 | `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                                                                                                                                                                       |
 | `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                                                                                                                                                              |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.6).                                                                                                                                                      |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.7).                                                                                                                                                      |
 | `ERR_CALL_TARGET_NOT_FOUND`           | A `call.exportPath` (§5.2) does not resolve against the module's exports, or resolves to a value that is not callable. The message says which and names the path.                                                                                                                                                                                  |
 | `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                                                                                                                                                                    |
 | `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                                                                                                                                                            |
@@ -1059,7 +1111,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage.                                                                                                                                            |
 | `ERR_WARMUP_LIMIT`                    | Prefix evaluation (plus the per-instance runtime installs) exceeded its fixed warm-up budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model). Isolate boot itself precedes the budget. Enforced at `Precompile` and at instance cold-start. Move expensive setup into the handler (lazy init on first call).            |
 | `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                                                                                                    |
-| `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.6. |
+| `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.7. |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                                                                                                    |
 
 ---

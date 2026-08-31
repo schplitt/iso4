@@ -642,6 +642,108 @@ impl PendingWork {
     }
 }
 
+// ── Streamed host-type bodies ────────────────────────────────────────────────
+
+/// Runtime-side state of one streamed body: chunks the host has sent that
+/// the sandbox has not read yet, terminal state, and the sandbox read (at
+/// most one) waiting for data.
+struct StreamState {
+    buffered: std::collections::VecDeque<Vec<u8>>,
+    buffered_bytes: usize,
+    /// `Some(Ok(()))` after a clean `StreamEnd`; `Some(Err(msg))` after a
+    /// source failure. Reads observe EOF / rejection once the buffer drains.
+    ended: Option<Result<(), String>>,
+    cancelled: bool,
+    pending: Option<v8::Global<v8::PromiseResolver>>,
+}
+
+impl StreamState {
+    fn new() -> Self {
+        Self {
+            buffered: std::collections::VecDeque::new(),
+            buffered_bytes: 0,
+            ended: None,
+            cancelled: false,
+            pending: None,
+        }
+    }
+}
+
+/// Per-run registry of streamed bodies. Instance-lifetime Box (stable
+/// address, the `PendingWork` pattern); armed per call, disarmed after —
+/// hydrating or reading a stream outside a run fails cleanly.
+pub struct StreamTable {
+    slot: RefCell<Option<StreamTableState>>,
+}
+
+struct StreamTableState {
+    streams: HashMap<u32, StreamState>,
+    /// Wire identity for outbound `StreamPull`/`StreamCancel` frames.
+    run_id: u32,
+    stream_fd: Option<RawFd>,
+}
+
+impl StreamTable {
+    fn boxed() -> Box<Self> {
+        Box::new(Self {
+            slot: RefCell::new(None),
+        })
+    }
+}
+
+thread_local! {
+    /// The armed stream table of the run executing on this thread, so the
+    /// codec's rehydration walk (which has no context parameter) can register
+    /// hydrated streams — the same per-thread pattern as the descriptor brand
+    /// key. Null outside runs.
+    static STREAM_TABLE_PTR: std::cell::Cell<*const StreamTable> =
+        const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Register a hydrated stream in the executing run's table. Returns false
+/// when no run is executing on this thread (a descriptor carrying a stream
+/// outside a run — refused by the codec).
+pub fn register_hydrated_stream(stream_id: u32) -> bool {
+    STREAM_TABLE_PTR.with(|c| {
+        let ptr = c.get();
+        if ptr.is_null() {
+            return false;
+        }
+        // SAFETY: set only while the owning run frame is live on this thread.
+        let table = unsafe { &*ptr };
+        let mut slot = table.slot.borrow_mut();
+        match slot.as_mut() {
+            Some(state) => {
+                state.streams.insert(stream_id, StreamState::new());
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Write a `StreamPull` credit grant for consumed bytes. Best-effort: a dead
+/// socket surfaces through the run's own I/O soon enough.
+fn send_stream_credit(state: &StreamTableState, stream_id: u32, credit: u32) {
+    let Some(fd) = state.stream_fd else { return };
+    if credit == 0 {
+        return;
+    }
+    let payload = ipc::encode_stream_pull_payload(state.run_id, stream_id, credit);
+    // SAFETY: same single-owner ManuallyDrop discipline as bridge writes.
+    let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
+    let _ = ipc::write_rust_to_ts_frame(&mut *sock, ipc::RustToTsMessageType::StreamPull, &payload);
+}
+
+/// Write a `StreamCancel` so the host stops pumping and releases the source.
+fn send_stream_cancel(state: &StreamTableState, stream_id: u32, reason: &str) {
+    let Some(fd) = state.stream_fd else { return };
+    let payload = ipc::encode_stream_cancel_payload(state.run_id, stream_id, reason);
+    let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
+    let _ =
+        ipc::write_rust_to_ts_frame(&mut *sock, ipc::RustToTsMessageType::StreamCancel, &payload);
+}
+
 /// The result of a failed JavaScript execution.
 ///
 /// Logs are preserved on failures too: if user code logs and then throws, the
@@ -952,6 +1054,8 @@ fn run_module_inner(
     };
     // waitUntil registrations; one-off runs hold it for the run's life.
     let pending_work = PendingWork::boxed();
+    // Streamed-body registry, same lifetime.
+    let stream_table = StreamTable::boxed();
 
     // `reason` is created before the isolate so it can be shared with the
     // ArrayBuffer allocator (which is registered in CreateParams, before the
@@ -1107,8 +1211,9 @@ fn run_module_inner(
     install_console(scope, &mut logs as *mut LogBuffers)
         .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
 
-    // Web globals (Headers/Request/Response/URL/TextEncoder/…).
-    crate::webtypes::install(scope)
+    // Web globals (Headers/Request/Response/URL/TextEncoder/…), with the
+    // streamed-body natives wired to this run's table.
+    install_web_runtime(scope, &*stream_table)
         .map_err(|e| failure(termination_or(&reason, RunError::Internal(e)), &logs, start))?;
 
     // Install AsyncLocalStorage (importable via `node:async_hooks`) for this
@@ -1132,7 +1237,7 @@ fn run_module_inner(
     // One-off runs keep the slot table as a run-local: the context (and any
     // stub Function sandbox code stashed) dies with the isolate right after.
     let mut stub_slots = StubSlots::new();
-    run_call_phase(
+    let result = run_call_phase(
         &mut isolate,
         &context_global,
         None,
@@ -1152,12 +1257,18 @@ fn run_module_inner(
             reason: &reason,
             logs: std::ptr::addr_of!(logs),
             pending: &*pending_work,
+            streams: &*stream_table,
             epilogue: take_epilogue_spec(),
             cancel_wall: &cancel_wall,
             cancel_cpu: &cancel_cpu,
             cancel_handle: &cancel_handle,
         },
-    )
+    );
+    // Failure paths return out of run_call_phase before its own stream
+    // cleanup: close here too (idempotent), so the host releases its sources
+    // and the per-thread table pointer never dangles past the Box.
+    close_run_streams(&*stream_table);
+    result
 }
 
 /// Per-call parameters for [`run_call_phase`] — bundled so the one-off path
@@ -1183,6 +1294,8 @@ struct CallPhaseCtx<'a> {
     /// same pointer discipline as `logs`. Armed at the setup-to-run boundary
     /// below, drained by the grace phase, disarmed by the caller.
     pending: *const PendingWork,
+    /// The run's streamed-body registry — same pointer discipline as `logs`.
+    streams: *const StreamTable,
     /// Per-run identity for the early Result frame; `None` = hold mode.
     epilogue: Option<EpilogueSpec>,
     cancel_wall: &'a crossbeam_channel::Sender<()>,
@@ -1220,6 +1333,7 @@ fn run_call_phase(
         reason,
         logs,
         pending,
+        streams,
         epilogue,
         cancel_wall,
         cancel_cpu,
@@ -1322,6 +1436,18 @@ fn run_call_phase(
     unsafe {
         *(*pending).slot.borrow_mut() = Some(Vec::new());
     }
+    // Arm the streamed-body registry for this run, and expose it per thread
+    // for the codec's rehydration walk (which has no context parameter —
+    // the brand-key pattern).
+    // SAFETY: `streams` points at the instance-lifetime StreamTable Box.
+    unsafe {
+        *(*streams).slot.borrow_mut() = Some(StreamTableState {
+            streams: HashMap::new(),
+            run_id: epilogue.map(|e| e.run_id).unwrap_or(0),
+            stream_fd,
+        });
+    }
+    STREAM_TABLE_PTR.with(|c| c.set(streams));
 
     v8::tc_scope!(let scope, scope);
 
@@ -1337,6 +1463,7 @@ fn run_call_phase(
         bridge_error: &bridge_error,
         pending_resolvers: &pending_resolvers,
         cancel_handle,
+        streams,
     };
 
     // Compile, instantiate, evaluate, and settle the postfix module when the
@@ -1883,9 +2010,14 @@ fn run_call_phase(
                 pending_resolvers: &pending_resolvers,
                 cancel_handle,
                 logs,
+                streams,
             },
         ));
     }
+
+    // Streams are per run: tell the host to release any source still being
+    // pumped, and disarm the registry.
+    close_run_streams(streams);
 
     Ok(output)
 }
@@ -1917,6 +2049,7 @@ struct GracePhaseCtx<'a> {
     pending_resolvers: &'a PendingResolvers,
     cancel_handle: &'a v8::IsolateHandle,
     logs: *const LogBuffers,
+    streams: *const StreamTable,
 }
 
 /// Drive the registered background work after the run's value settled.
@@ -2122,6 +2255,7 @@ fn run_grace_phase(
             bridge_error: ctx.bridge_error,
             pending_resolvers: ctx.pending_resolvers,
             cancel_handle: ctx.cancel_handle,
+            streams: ctx.streams,
         };
         match settle_promise(tc, aggregate, &tick_ctx) {
             // allSettled fulfils; re-enter the drain to pick up outcomes and
@@ -2236,6 +2370,8 @@ pub struct InstanceCore {
     /// `waitUntil` registration set — the native callback holds a raw
     /// pointer into this Box; armed per call, disarmed between calls.
     pending: Box<PendingWork>,
+    /// Streamed-body registry, same pointer discipline and lifecycle.
+    streams: Box<StreamTable>,
     /// True until the first call: warm-up console output (the prefix's
     /// `console.log`s) is sitting in `logs` and is delivered on the
     /// cold-start call's result instead of being dropped.
@@ -2352,12 +2488,14 @@ pub fn create_instance_core(
     let logs_ptr: *mut LogBuffers = &mut *logs;
     let pending_work = PendingWork::boxed();
     let pending_ptr: *const PendingWork = &*pending_work;
+    let stream_table = StreamTable::boxed();
+    let stream_ptr: *const StreamTable = &*stream_table;
     let setup = (|| -> Result<(v8::Global<v8::Context>, Option<v8::Global<v8::Module>>), RunError> {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         install_console(scope, logs_ptr)?;
-        crate::webtypes::install(scope).map_err(RunError::Internal)?;
+        install_web_runtime(scope, stream_ptr).map_err(RunError::Internal)?;
         install_async_context(scope)?;
         // Disarmed during prefix evaluation: a setup-time waitUntil throws.
         install_wait_until(scope, pending_ptr)?;
@@ -2407,6 +2545,7 @@ pub fn create_instance_core(
                 near_heap,
                 stub_slots: StubSlots::new(),
                 pending: pending_work,
+                streams: stream_table,
                 warmup_logs_pending: true,
             })
         }
@@ -2530,6 +2669,7 @@ pub fn run_call_on_core(
                     reason: &core.reason,
                     logs: std::ptr::addr_of!(*core.logs),
                     pending: &*core.pending,
+                    streams: &*core.streams,
                     epilogue: take_epilogue_spec(),
                     cancel_wall: &cancel_wall,
                     cancel_cpu: &cancel_cpu,
@@ -2561,6 +2701,10 @@ pub fn run_call_on_core(
     // Disarm waitUntil too: a between-calls registration must throw,
     // and lingering Globals from the finished run should not pin objects.
     *core.pending.slot.borrow_mut() = None;
+    // The stream table was disarmed (and live streams cancelled) by
+    // run_call_phase's normal exit; this covers the failure paths that never
+    // reached it. Idempotent.
+    close_run_streams(&*core.streams);
 
     // Stamp telemetry exactly as `run_module` does for the one-off path.
     let cpu_time_ms = cpu_budget.elapsed_ms_precise();
@@ -2629,6 +2773,128 @@ fn owned_bridge_error(err: &RunError) -> RunError {
 /// Everything the poll loop needs besides the promise it settles. One run
 /// builds this once; both settle points — the module evaluation promise and a
 /// requested call's return promise — share it.
+/// Deliver one `StreamChunk`/`StreamEnd` frame into the run's stream table:
+/// resolve the pending sandbox read when one waits (crediting consumed
+/// bytes), buffer otherwise. Ignores frames for unknown or cancelled streams
+/// (benign races with a cancel already sent).
+fn deliver_stream_frame(
+    scope: &mut v8::PinScope,
+    streams: *const StreamTable,
+    frame: &ipc::TsToRustFrame,
+) -> Result<(), RunError> {
+    // SAFETY: the table outlives the run frame; transient borrow.
+    let table = unsafe { &*streams };
+    let mut slot = table.slot.borrow_mut();
+    let Some(state) = slot.as_mut() else {
+        return Ok(()); // no run armed (stray frame) — drop it
+    };
+
+    match frame.message_type {
+        ipc::TsToRustMessageType::StreamChunk => {
+            let chunk = ipc::parse_stream_chunk_payload(&frame.payload)
+                .map_err(|e| RunError::Internal(format!("stream chunk decode: {e}")))?;
+            if state.run_id != 0 && chunk.run_id != state.run_id {
+                return Ok(());
+            }
+            let stream_id = chunk.stream_id;
+            let Some(stream) = state.streams.get_mut(&stream_id) else {
+                return Ok(());
+            };
+            if stream.cancelled {
+                return Ok(());
+            }
+            if let Some(pending) = stream.pending.take() {
+                let credit = chunk.data.len() as u32;
+                let data = chunk.data.to_vec();
+                send_stream_credit(state, stream_id, credit);
+                drop(slot);
+                let value = bytes_to_uint8array(scope, data);
+                let resolver = v8::Local::new(scope, pending);
+                match value {
+                    Some(v) => {
+                        resolver.resolve(scope, v.into());
+                    }
+                    None => {
+                        let msg =
+                            v8_error_value(scope, "[iso4] stream chunk could not be materialised");
+                        resolver.reject(scope, msg);
+                    }
+                }
+                return Ok(());
+            }
+            // Buffered: the host must stay inside the credit window; a small
+            // slack of one max chunk absorbs frames in flight when a cancel
+            // races the pump.
+            let cap = ipc::STREAM_CREDIT_WINDOW_BYTES as usize
+                + ipc::STREAM_CHUNK_MAX_BYTES as usize;
+            if stream.buffered_bytes + chunk.data.len() > cap {
+                return Err(RunError::Internal(
+                    "stream credit window violated by the host".to_string(),
+                ));
+            }
+            stream.buffered_bytes += chunk.data.len();
+            stream.buffered.push_back(chunk.data.to_vec());
+            Ok(())
+        }
+        ipc::TsToRustMessageType::StreamEnd => {
+            let end = ipc::parse_stream_end_payload(&frame.payload)
+                .map_err(|e| RunError::Internal(format!("stream end decode: {e}")))?;
+            if state.run_id != 0 && end.run_id != state.run_id {
+                return Ok(());
+            }
+            let Some(stream) = state.streams.get_mut(&end.stream_id) else {
+                return Ok(());
+            };
+            let outcome: Result<(), String> = if end.ok {
+                Ok(())
+            } else {
+                Err(end
+                    .error
+                    .unwrap_or_else(|| "the host body source failed".to_string()))
+            };
+            stream.ended = Some(outcome.clone());
+            // A read waiting on an empty buffer observes the end immediately.
+            if stream.buffered.is_empty() {
+                if let Some(pending) = stream.pending.take() {
+                    drop(slot);
+                    let resolver = v8::Local::new(scope, pending);
+                    match outcome {
+                        Ok(()) => {
+                            let null = v8::null(scope).into();
+                            resolver.resolve(scope, null);
+                        }
+                        Err(message) => {
+                            let msg = v8_error_value(
+                                scope,
+                                &format!("[iso4] body stream failed: {message}"),
+                            );
+                            resolver.reject(scope, msg);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// End-of-run stream cleanup: cancel every stream the host may still be
+/// pumping, disarm the table, and clear the per-thread pointer. Idempotent.
+fn close_run_streams(streams: *const StreamTable) {
+    // SAFETY: same contract as deliver_stream_frame.
+    let table = unsafe { &*streams };
+    let taken = table.slot.borrow_mut().take();
+    if let Some(state) = taken {
+        for (id, stream) in &state.streams {
+            if stream.ended.is_none() && !stream.cancelled {
+                send_stream_cancel(&state, *id, "run ended");
+            }
+        }
+    }
+    STREAM_TABLE_PTR.with(|c| c.set(std::ptr::null()));
+}
+
 struct SettleCtx<'a> {
     /// Socket for BridgeResponse reads. `None` when no bridge stub exists.
     stream_fd: Option<RawFd>,
@@ -2640,6 +2906,9 @@ struct SettleCtx<'a> {
     bridge_error: &'a Arc<OnceLock<RunError>>,
     pending_resolvers: &'a PendingResolvers,
     cancel_handle: &'a v8::IsolateHandle,
+    /// The run's streamed-body registry: chunk/end frames arriving between
+    /// bridge responses are delivered here.
+    streams: *const StreamTable,
 }
 
 /// Drive microtasks until `promise` settles, draining `BridgeResponse` frames
@@ -2789,6 +3058,15 @@ fn settle_promise(
                         }
                         ctx.cancel_handle.terminate_execution();
                         return Err(RunError::Aborted);
+                    }
+                    ipc::TsToRustMessageType::StreamChunk
+                    | ipc::TsToRustMessageType::StreamEnd => {
+                        deliver_stream_frame(scope, ctx.streams, &frame)?;
+                        // Run the continuations the delivery may have resolved,
+                        // then keep polling — a stream frame settles no
+                        // bridge call and no promise state on its own.
+                        scope.perform_microtask_checkpoint();
+                        continue;
                     }
                     other => {
                         return Err(RunError::Internal(format!(
@@ -4803,6 +5081,209 @@ fn grace_all_settled_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Loc
 /// ESM source of the built-in `iso4:runtime` module.
 const ISO4_RUNTIME_MODULE_SRC: &str =
     "export const waitUntil = globalThis[Symbol.for('iso4.runtime.waitUntil')];\n";
+
+/// Private-symbol key stamping a hydrated body-stream object with its stream
+/// id — Rust-readable, guest-invisible, and how the outbound codec refuses to
+/// serialize a stream back to the host.
+const BODY_STREAM_ID_KEY: &str = "iso4::bodyStreamId";
+
+fn body_stream_private<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Private>> {
+    let key = v8::String::new(scope, name)?;
+    Some(v8::Private::for_api(scope, Some(key)))
+}
+
+/// The stream id a hydrated body-stream object was stamped with, if this is
+/// one. Used by the outbound body check.
+pub fn body_stream_id_of(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Option<u32> {
+    let obj = v8::Local::<v8::Object>::try_from(value).ok()?;
+    let key = body_stream_private(scope, BODY_STREAM_ID_KEY)?;
+    let stamped = obj.get_private(scope, key)?;
+    if !stamped.is_uint32() {
+        return None;
+    }
+    stamped.uint32_value(scope)
+}
+
+/// Build the sandbox-side body-stream object for a hydrated stream handle:
+/// calls the factory the web runtime returned at install and stamps the
+/// stream id under a private key. Runs during the rehydration walk (JS is
+/// legal there).
+pub fn make_body_stream<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream_id: u32,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let factory_key = body_stream_private(scope, crate::webtypes::BODY_STREAM_FACTORY_KEY)?;
+    let factory =
+        v8::Local::<v8::Function>::try_from(global.get_private(scope, factory_key)?).ok()?;
+    let recv = v8::undefined(scope).into();
+    let id_arg = v8::Integer::new_from_unsigned(scope, stream_id);
+    let stream = factory.call(scope, recv, &[id_arg.into()])?;
+    let stream = v8::Local::<v8::Object>::try_from(stream).ok()?;
+    let id_key = body_stream_private(scope, BODY_STREAM_ID_KEY)?;
+    let id_value = v8::Integer::new_from_unsigned(scope, stream_id);
+    stream.set_private(scope, id_key, id_value.into())?;
+    Some(stream)
+}
+
+/// Install the web runtime with streamed-body support: the two natives are
+/// built around this instance's stream table and handed to the JS factory.
+fn install_web_runtime(
+    scope: &mut v8::PinScope,
+    streams: *const StreamTable,
+) -> Result<(), String> {
+    let data = v8::External::new(scope, streams.cast_mut().cast::<c_void>());
+    let read = v8::Function::builder(stream_read_callback)
+        .data(data.into())
+        .build(scope)
+        .ok_or_else(|| "failed to create streamRead".to_string())?;
+    let cancel = v8::Function::builder(stream_cancel_callback)
+        .data(data.into())
+        .build(scope)
+        .ok_or_else(|| "failed to create streamCancel".to_string())?;
+    crate::webtypes::install_with_streams(scope, read.into(), cancel.into())
+}
+
+/// `streamRead(streamId)` — native pull for the sandbox body stream: resolves
+/// with a `Uint8Array` chunk, `null` at EOF, or rejects on a source failure.
+/// Consumed bytes replenish the host's credit window.
+fn stream_read_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    // SAFETY: instance-lifetime StreamTable Box, same contract as PendingWork.
+    let table = unsafe { &*args.data().cast::<v8::External>().value().cast::<StreamTable>() };
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        throw_v8_error(scope, "[iso4] stream read could not allocate");
+        return;
+    };
+    rv.set(resolver.get_promise(scope).into());
+    let stream_id = args.get(0).uint32_value(scope).unwrap_or(0);
+
+    let mut slot = table.slot.borrow_mut();
+    let Some(state) = slot.as_mut() else {
+        drop(slot);
+        let msg = v8_error_value(scope, "[iso4] streamed bodies are only readable during a run");
+        resolver.reject(scope, msg);
+        return;
+    };
+    let Some(stream) = state.streams.get_mut(&stream_id) else {
+        drop(slot);
+        let msg = v8_error_value(scope, "[iso4] unknown body stream");
+        resolver.reject(scope, msg);
+        return;
+    };
+
+    if let Some(chunk) = stream.buffered.pop_front() {
+        stream.buffered_bytes -= chunk.len();
+        let credit = chunk.len() as u32;
+        let value = bytes_to_uint8array(scope, chunk);
+        send_stream_credit(state, stream_id, credit);
+        drop(slot);
+        match value {
+            Some(v) => {
+                resolver.resolve(scope, v.into());
+            }
+            None => {
+                let msg = v8_error_value(scope, "[iso4] stream chunk could not be materialised");
+                resolver.reject(scope, msg);
+            }
+        }
+        return;
+    }
+    if stream.cancelled {
+        drop(slot);
+        let null = v8::null(scope).into();
+        resolver.resolve(scope, null);
+        return;
+    }
+    match &stream.ended {
+        Some(Ok(())) => {
+            drop(slot);
+            let null = v8::null(scope).into();
+            resolver.resolve(scope, null);
+        }
+        Some(Err(message)) => {
+            let message = message.clone();
+            drop(slot);
+            let msg = v8_error_value(scope, &format!("[iso4] body stream failed: {message}"));
+            resolver.reject(scope, msg);
+        }
+        None => {
+            if stream.pending.is_some() {
+                drop(slot);
+                let msg = v8_error_value(scope, "[iso4] a read is already pending on this stream");
+                resolver.reject(scope, msg);
+                return;
+            }
+            stream.pending = Some(v8::Global::new(scope, resolver));
+        }
+    }
+}
+
+/// `streamCancel(streamId, reason)` — the sandbox is done with the body: the
+/// host is told to stop pumping and release the source; buffered chunks drop.
+fn stream_cancel_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let table = unsafe { &*args.data().cast::<v8::External>().value().cast::<StreamTable>() };
+    let stream_id = args.get(0).uint32_value(scope).unwrap_or(0);
+    let reason = args
+        .get(1)
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+    let mut slot = table.slot.borrow_mut();
+    let mut pending_read: Option<v8::Global<v8::PromiseResolver>> = None;
+    if let Some(state) = slot.as_mut() {
+        let mut notify_host = false;
+        if let Some(stream) = state.streams.get_mut(&stream_id) {
+            if !stream.cancelled && stream.ended.is_none() {
+                stream.cancelled = true;
+                stream.buffered.clear();
+                stream.buffered_bytes = 0;
+                notify_host = true;
+            }
+            pending_read = stream.pending.take();
+        }
+        if notify_host {
+            send_stream_cancel(state, stream_id, &reason);
+        }
+    }
+    drop(slot);
+    if let Some(pending) = pending_read {
+        let resolver = v8::Local::new(scope, pending);
+        let null = v8::null(scope).into();
+        resolver.resolve(scope, null);
+    }
+    rv.set_undefined();
+}
+
+/// A plain `Error` value for rejections built inside native callbacks.
+fn v8_error_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    message: &str,
+) -> v8::Local<'s, v8::Value> {
+    let msg = v8::String::new(scope, message).unwrap_or_else(|| v8::String::empty(scope));
+    v8::Exception::type_error(scope, msg)
+}
+
+/// Copy chunk bytes into a fresh sandbox `Uint8Array`.
+fn bytes_to_uint8array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::Uint8Array>> {
+    let len = bytes.len();
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    v8::Uint8Array::new(scope, buffer, 0, len)
+}
 
 /// Install the `waitUntil` global: a native function pushing its
 /// argument into the run's [`PendingWork`] set. Installed non-enumerable like
