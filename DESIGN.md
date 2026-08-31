@@ -372,7 +372,11 @@ internal field. The field is what makes serialization work: V8 routes objects
 with internal fields to `WriteHostObject` off a map field read, leaving
 `HasCustomHostObject()` `false` so no embedder callback fires for ordinary
 objects. workerd depends on the same property. Behaviour above the shell is JS,
-evaluated into every run's context at creation (~0.5 ms, measured).
+evaluated into every run's context at creation (~0.5 ms, measured). *Which*
+type an instance is comes from a private-symbol tag stamped at construction —
+never from `instanceof` or `globalThis` lookups, both of which guest code can
+redirect. Private symbols are unreachable from guest JS, so the identity can
+be neither forged nor destroyed by a run.
 
 **Deliberate deviations from spec**, in scope terms rather than bugs:
 

@@ -37,9 +37,16 @@
 //! `unsafe`, a per-instance allocation, and a dependency on the layout of
 //! `rusty_v8`'s own `InternalFieldData` — far worse.
 //!
-//! The type tag therefore comes from an `instanceof` check inside
-//! `write_host_object`, which only ever runs for objects V8 has already routed
-//! there. It costs nothing on the ordinary path.
+//! The type tag therefore lives in a **private-symbol property** stamped onto
+//! every instance at construction (the shell constructors and
+//! `make_instance`). Private symbols are unreachable from guest JS — no
+//! reflection API surfaces them — so the tag cannot be forged, removed, or
+//! redirected via `Symbol.hasInstance`, and reading it is a plain data read
+//! that is legal inside the `DisallowJavascriptExecutionScope` V8 holds during
+//! deserialization. `tag_of` reads that stamp and consults nothing else; the
+//! class references `make_instance` wires prototypes from are captured once at
+//! `install()` into private slots on the global object, so neither direction
+//! depends on what guest code has done to `globalThis`.
 //!
 //! Everything above the shell — the actual spec behaviour — is JS, evaluated
 //! once into the context. A JS subclass of a shell keeps the internal field,
@@ -72,8 +79,8 @@ const EMBEDDER_DATA_TYPE_TAG_DEFAULT: u16 = 0;
 
 /// Zero the shell instance's internal field.
 ///
-/// The field's *value* is still never used — the type tag comes from an
-/// `instanceof` check in `write_host_object`. But the slot must be a real
+/// The field's *value* is still never used — the type tag lives in a private
+/// property (see `stamp_tag`). But the slot must be a real
 /// external-pointer slot before V8's snapshot callback reads it. `rusty_v8`
 /// documents `get_aligned_pointer_from_internal_field` as undefined behaviour
 /// unless `SetAlignedPointerInInternalField` wrote the field first, and since
@@ -96,33 +103,73 @@ fn zero_internal_field(args: &v8::FunctionCallbackArguments) {
     );
 }
 
-/// The shells do nothing beyond making their internal field readable.
+/// Private-symbol key holding a host-type instance's type tag.
+///
+/// Stamped at construction, read by `tag_of`. Private symbols are invisible to
+/// every guest-reachable reflection API, so guest JS can neither forge nor
+/// remove the stamp.
+const TYPE_TAG_KEY: &str = "iso4::webTypeTag";
+
+fn tag_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
+    let name = v8::String::new(scope, TYPE_TAG_KEY)?;
+    Some(v8::Private::for_api(scope, Some(name)))
+}
+
+/// Private-symbol key on the global object holding one captured class
+/// reference (`iso4::webClass::Headers`, …). Written once by `install()`.
+fn class_key<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    class_name: &str,
+) -> Option<v8::Local<'s, v8::Private>> {
+    let name = v8::String::new(scope, &format!("iso4::webClass::{class_name}"))?;
+    Some(v8::Private::for_api(scope, Some(name)))
+}
+
+/// Stamp the type tag onto an instance. `set_private` defines a data property
+/// directly — no JS runs, so this is legal on the deserialize path too.
+fn stamp_tag(scope: &mut v8::PinScope, obj: v8::Local<v8::Object>, tag: u32) -> Option<()> {
+    let key = tag_key(scope)?;
+    let value = v8::Integer::new_from_unsigned(scope, tag);
+    obj.set_private(scope, key, value.into()).map(|_| ())
+}
+
+/// The shells make their internal field readable and stamp the type tag.
 ///
 /// They exist so that `super()` produces an object built from an instance
-/// template with one internal field — which is what V8 dispatches on. See the
-/// module docs on why the field carries no data.
+/// template with one internal field — which is what V8 dispatches on (see the
+/// module docs on why the field carries no data) — and so that every
+/// construction path, including JS subclasses, passes through the stamp.
 fn headers_shell_ctor(
-    _scope: &mut v8::PinScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
     zero_internal_field(&args);
+    // A failed stamp (allocation failure interning the key) leaves an instance
+    // that later refuses to serialize with a clear message — not a crash path.
+    let _ = stamp_tag(scope, args.this(), TAG_HEADERS);
 }
 
 fn request_shell_ctor(
-    _scope: &mut v8::PinScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
     zero_internal_field(&args);
+    // A failed stamp (allocation failure interning the key) leaves an instance
+    // that later refuses to serialize with a clear message — not a crash path.
+    let _ = stamp_tag(scope, args.this(), TAG_REQUEST);
 }
 
 fn response_shell_ctor(
-    _scope: &mut v8::PinScope,
+    scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
     zero_internal_field(&args);
+    // A failed stamp (allocation failure interning the key) leaves an instance
+    // that later refuses to serialize with a clear message — not a crash path.
+    let _ = stamp_tag(scope, args.this(), TAG_RESPONSE);
 }
 
 // ── Installation ─────────────────────────────────────────────────────────────
@@ -194,9 +241,30 @@ pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
         .map_err(|_| "web runtime did not evaluate to a function".to_string())?;
 
     let recv = v8::undefined(tc).into();
-    factory
+    let returned = factory
         .call(tc, recv, &factory_args)
         .ok_or_else(|| exception_text(tc, "install web runtime"))?;
+
+    // The factory returns [Headers, Request, Response]. Keep each under a
+    // private slot on the global object: `make_instance` wires prototypes from
+    // these captured references, so deserialization no longer depends on the
+    // guest-mutable `globalThis` properties. Private slots survive anything
+    // guest code can do and are readable without running JS.
+    let classes: v8::Local<v8::Array> = returned
+        .try_into()
+        .map_err(|_| "web runtime did not return its classes".to_string())?;
+    let global = tc.get_current_context().global(tc);
+    for (index, name) in ["Headers", "Request", "Response"].iter().enumerate() {
+        let class = classes
+            .get_index(tc, index as u32)
+            .filter(|c| c.is_function())
+            .ok_or_else(|| format!("web runtime did not return the {name} class"))?;
+        let key =
+            class_key(tc, name).ok_or_else(|| format!("intern {name} class key failed"))?;
+        global
+            .set_private(tc, key, class)
+            .ok_or_else(|| format!("store {name} class reference failed"))?;
+    }
     Ok(())
 }
 
@@ -298,43 +366,34 @@ fn define(
         .map(|_| ())
 }
 
-/// Look up one of our classes on `globalThis`.
+/// Look up one of our classes from the private slot `install()` captured it
+/// into.
 ///
-/// Resolved per call rather than cached in a `Global`: a prefix snapshot is
-/// restored into a fresh isolate per run, so any cache would have to be
-/// per-run anyway, and this is a single property get on a value we are about
-/// to do far more work with.
+/// Never `globalThis.<name>`: those properties are guest-writable, and this
+/// lookup runs on the deserialize path where the result decides which
+/// prototype a minted instance gets. The private read is also JS-free, which
+/// `make_instance`'s `DisallowJavascriptExecutionScope` context requires.
 fn class<'s>(scope: &mut v8::PinScope<'s, '_>, name: &str) -> Option<v8::Local<'s, v8::Function>> {
     let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, name)?;
-    global.get(scope, key.into())?.try_into().ok()
+    let key = class_key(scope, name)?;
+    global.get_private(scope, key)?.try_into().ok()
 }
 
-/// Identify which of our types `obj` is.
+/// Identify which of our types `obj` is by reading its private type stamp.
 ///
 /// Only called for objects V8 has already routed to `write_host_object` — i.e.
-/// objects carrying an internal field — so the `instanceof` walk here never
-/// runs for ordinary values. Returns `None` for an internal-field object that
-/// is not one of ours; no such object exists in this runtime today.
+/// objects carrying an internal field. Returns `None` for an internal-field
+/// object that carries no stamp; no such object exists in this runtime today.
+/// The stamp is written at construction and guest JS cannot reach it, so the
+/// answer does not depend on `globalThis`, `Symbol.hasInstance`, or anything
+/// else a run can mutate.
 pub fn tag_of(scope: &mut v8::PinScope, obj: v8::Local<v8::Object>) -> Option<u32> {
-    if obj.internal_field_count() < INTERNAL_FIELD_COUNT {
+    let key = tag_key(scope)?;
+    let value = obj.get_private(scope, key)?;
+    if !value.is_uint32() {
         return None;
     }
-    for (name, tag) in [
-        ("Response", TAG_RESPONSE),
-        ("Request", TAG_REQUEST),
-        ("Headers", TAG_HEADERS),
-    ] {
-        // Guest code can delete or shadow any one of these globals; a missing
-        // candidate only rules out that tag, never the remaining ones.
-        let Some(ctor) = class(scope, name) else {
-            continue;
-        };
-        if obj.instance_of(scope, ctor.into()) == Some(true) {
-            return Some(tag);
-        }
-    }
-    None
+    value.uint32_value(scope)
 }
 
 pub fn headers_view<'s>(
@@ -399,12 +458,14 @@ fn make_instance<'s>(
     tmpl.set_internal_field_count(INTERNAL_FIELD_COUNT);
     let obj = tmpl.new_instance(scope)?;
 
-    // The internal field stays empty — see the module docs. `tag` is accepted
-    // so the call sites read symmetrically with the wire format, and to keep
-    // the type visible at each construction site.
-    let _ = tag;
+    // The internal field stays empty — see the module docs. The type identity
+    // is the private stamp: a minted instance must re-serialize under the same
+    // tag it arrived with, exactly like a constructed one.
+    stamp_tag(scope, obj, tag)?;
 
-    // `instanceof` and every prototype method come from here.
+    // `instanceof` and every prototype method come from here — the reference
+    // captured at install(), untouched by whatever the guest did to the
+    // `globalThis` property of the same name.
     let ctor = class(scope, class_name)?;
     let key = v8::String::new(scope, "prototype")?;
     let proto = ctor.get(scope, key.into())?;
@@ -514,23 +575,78 @@ mod tests {
         assert_eq!(out, 1, "Response instances must carry the routing field");
     }
 
+    /// Compile and run `src`, returning the produced value as an object.
+    fn eval_obj<'s>(scope: &mut v8::PinScope<'s, '_>, src: &str) -> v8::Local<'s, v8::Object> {
+        let s = v8::String::new(scope, src).unwrap();
+        let script = v8::Script::compile(scope, s, None).unwrap();
+        script.run(scope).unwrap().try_into().unwrap()
+    }
+
     #[test]
-    fn tag_of_skips_a_missing_class_instead_of_aborting_the_lookup() {
-        // Guest code can delete or shadow any of our globals. Identifying an
-        // intact Headers must not depend on Response (checked first in the
-        // loop) still being present.
+    fn tagging_does_not_consult_globalthis() {
+        // Guest code can delete or shadow every one of our globals. Identity
+        // is the construction-time stamp, so intact instances still tag.
         let out = with_web(|scope| {
-            let s = v8::String::new(
+            let pair = eval_obj(
                 scope,
-                "delete globalThis.Response; new Headers([['x-a','1']])",
-            )
-            .unwrap();
-            let script = v8::Script::compile(scope, s, None).unwrap();
-            let value = script.run(scope).unwrap();
-            let obj: v8::Local<v8::Object> = value.try_into().unwrap();
+                "(() => { const h = new Headers([['x-a','1']]); \
+                   const r = new Response('x'); \
+                   delete globalThis.Headers; delete globalThis.Request; \
+                   delete globalThis.Response; return [h, r] })()",
+            );
+            let array: v8::Local<v8::Array> = pair.try_into().unwrap();
+            let headers: v8::Local<v8::Object> =
+                array.get_index(scope, 0).unwrap().try_into().unwrap();
+            let response: v8::Local<v8::Object> =
+                array.get_index(scope, 1).unwrap().try_into().unwrap();
+            (tag_of(scope, headers), tag_of(scope, response))
+        });
+        assert_eq!(out, (Some(TAG_HEADERS), Some(TAG_RESPONSE)));
+    }
+
+    #[test]
+    fn an_overridden_hasinstance_cannot_mistag() {
+        // `instanceof` consults Symbol.hasInstance, which guest code can
+        // override to claim everything. The stamp does not.
+        let out = with_web(|scope| {
+            let obj = eval_obj(
+                scope,
+                "Object.defineProperty(Response, Symbol.hasInstance, { value: () => true }); \
+                 Object.defineProperty(Request, Symbol.hasInstance, { value: () => true }); \
+                 new Headers([['x-a','1']])",
+            );
             tag_of(scope, obj)
         });
         assert_eq!(out, Some(TAG_HEADERS));
+    }
+
+    #[test]
+    fn a_prototype_lookalike_carries_no_tag() {
+        // Re-pointing a prototype does not run a constructor, so there is no
+        // stamp (and no internal field) — the object is not one of ours.
+        let out = with_web(|scope| {
+            let obj = eval_obj(
+                scope,
+                "Object.setPrototypeOf({ _l: ['x-a','1'] }, Headers.prototype)",
+            );
+            tag_of(scope, obj)
+        });
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn the_stamp_is_unreachable_from_guest_js() {
+        // Private symbols do not surface through any reflection API, so guest
+        // code cannot read, copy, or delete the tag.
+        let out = with_web(|scope| {
+            eval_str(
+                scope,
+                "const r = new Response('x'); \
+                 [Object.getOwnPropertySymbols(r).length, \
+                  Reflect.ownKeys(r).some(k => typeof k === 'symbol')].join('|')",
+            )
+        });
+        assert_eq!(out, "0|false");
     }
 
     #[test]

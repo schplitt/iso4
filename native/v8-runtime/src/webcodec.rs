@@ -346,9 +346,9 @@ fn decode_response<'s>(
 
 /// Write `obj` as a host-object payload: the type tag, then the type's body.
 ///
-/// The caller has already established that this is one of ours — either V8
-/// routed it here via an internal field, or a slot-boundary lookalike check
-/// matched. `tag` comes from whichever of those it was.
+/// The caller has already established that this is one of ours — V8 routed it
+/// here via an internal field, and `tag` is the private type stamp
+/// `webtypes::tag_of` read off the instance.
 pub fn encode(
     scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
@@ -684,6 +684,47 @@ mod tests {
               [...__rt.s].join(',')].join('|')",
         );
         assert_eq!(out, "1700000000000|1|2|1,2|3");
+    }
+
+    #[test]
+    fn round_trip_survives_deleted_and_shadowed_classes() {
+        // Type identity is the construction-time private stamp and the class
+        // references captured at install(), so neither serializing nor
+        // deserializing depends on what guest code did to `globalThis`.
+        // (Before #95, deleting Response made an intact Response unserializable
+        // and rewiring the prototype came from the guest-visible class.)
+        let out = round_trip(
+            "(() => { const r = new Response('x', { status: 201 }); \
+               delete globalThis.Headers; globalThis.Response = class Fake {}; \
+               return r })()",
+            "[typeof __rt.text, __rt.status, __rt instanceof Response].join('|')",
+        );
+        assert_eq!(out, "function|201|false");
+    }
+
+    #[test]
+    fn an_overridden_hasinstance_does_not_change_the_wire_tag() {
+        // Guest code claiming `x instanceof Response === true` for everything
+        // must not make a Headers serialize under the Response tag.
+        let out = round_trip(
+            "(() => { \
+               Object.defineProperty(Response, Symbol.hasInstance, { value: () => true }); \
+               return new Headers([['x-a','1']]) })()",
+            "[__rt instanceof Headers, __rt.get('x-a')].join('|')",
+        );
+        assert_eq!(out, "true|1");
+    }
+
+    #[test]
+    fn a_prototype_lookalike_crosses_as_plain_data() {
+        // Re-pointing a prototype runs no constructor: no internal field, no
+        // stamp. The object serializes as the plain data it is — a forged
+        // "host type" cannot be minted from guest JS.
+        let out = round_trip(
+            "Object.setPrototypeOf({ _l: ['x-a', '1'] }, Headers.prototype)",
+            "[__rt instanceof Headers, typeof __rt.get, Object.hasOwn(__rt, '_l')].join('|')",
+        );
+        assert_eq!(out, "false|undefined|true");
     }
 
     #[test]
