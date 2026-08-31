@@ -440,24 +440,34 @@ global.
 
 Node has no write-side equivalent. `v8.Serializer` exposes no delegate to
 JavaScript and `_writeHostObject` never fires for a class instance — the object
-silently flattens. So the host does not attempt it: each instance is replaced by
-a plain object carrying the same fields plus a `__iso4_ht` property holding its
+silently flattens. So the host does not attempt it: each instance is replaced
+by a plain object carrying the same fields plus a **brand key** holding its
 type tag, the graph is serialized normally, and the runtime walks the result
 substituting real instances.
 
+The brand key is `__iso4_ht_` followed by the sandbox's 16-byte descriptor
+token (§5.1) in lowercase hex — 42 characters total. The runtime rehydrates a
+descriptor **only** under that exact key: because the key contains the
+session's random token, inbound structured data cannot name it, so a
+descriptor-shaped object in untrusted data (including one carrying the
+well-known `__iso4_ht_` prefix) passes through as the plain data it is. No
+property name is reserved.
+
 ```txt
+// brand key:        __iso4_ht_<32 hex chars of the session token>
 // host has:         { meta: 'x', res: Response }
-// host serializes:  { meta: 'x', res: { __iso4_ht: 3, status: 200,
+// host serializes:  { meta: 'x', res: { [brandKey]: 3, status: 200,
 //                                       statusText: '', headers: [...],
 //                                       body: Uint8Array } }
 ```
 
 Because the graph is an ordinary V8 value, nesting, cycles, `Map`/`Set` and
 object identity all work for free, and a new type costs one tag plus one
-constructor in the rehydration switch. The walk runs only on host → sandbox legs
-— bridge responses and data globals — and is guarded by a byte scan for the
-brand, so a payload with no host types pays only that scan. Depth is capped at
-32 levels on both sides.
+constructor in the rehydration switch. The walk runs only on host → sandbox
+legs — bridge responses, data globals, and call args — and is guarded by a
+byte scan for the session brand key, so a payload with no stamped descriptors
+pays only that scan (the random token in the needle makes false positives
+practically impossible). Depth is capped at 32 levels on both sides.
 
 The asymmetry is safe because the two directions never share a reader: Rust reads
 what Node writes and vice versa, never both.
@@ -483,15 +493,25 @@ it. Additive fields go in `extras` and need no tag at all.
 
 `AuthenticatePayload` (TS → Rust, MUST be the first frame on every connection):
 
-| Field             | Encoding                 | Notes                                        |
-| ----------------- | ------------------------ | -------------------------------------------- |
-| `protocolVersion` | `u16`                    | Must equal the runtime's `PROTOCOL_VERSION`. |
-| `probe`           | `u32 byteLength` + bytes | A serialized `null` — see below.             |
+| Field             | Encoding                 | Notes                                             |
+| ----------------- | ------------------------ | ------------------------------------------------- |
+| `protocolVersion` | `u16`                    | Must equal the runtime's `PROTOCOL_VERSION`.      |
+| `probe`           | `u32 byteLength` + bytes | A serialized `null` — see below.                  |
+| `descriptorToken` | `u32 byteLength` + bytes | Exactly **16 random bytes** — see below (§4.4.6). |
 
-The payload ends with the probe; trailing bytes are rejected as malformed.
-There is no auth token — access to the socket is controlled by the owner-only
-(0700) per-sandbox directory the host creates it in, which the kernel checks
-on every `connect(2)`.
+The payload ends with the token; a wrong-size token and trailing bytes are
+rejected as malformed. There is no auth token — access to the socket is
+controlled by the owner-only (0700) per-sandbox directory the host creates it
+in, which the kernel checks on every `connect(2)`.
+
+**The descriptor token** is not an authentication secret; it authenticates
+**data**, not peers. The host draws 16 random bytes once per sandbox and sends
+the same token on every connection. Host-emitted host-type descriptors
+(§4.4.6) are stamped with the brand key derived from it, and the runtime
+rehydrates only descriptors carrying that key — so inbound structured data
+that merely looks like a descriptor is never reinterpreted as a host type.
+The token never reaches sandbox code: descriptors are replaced wholesale, key
+and all, before a value is handed to guest JS.
 
 `HelloPayload` (Rust → TS, the first frame the runtime sends):
 

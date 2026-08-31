@@ -16,6 +16,7 @@ import {
   encodeRustToTsFrame,
 } from '../src/ipc'
 import { serializationProbe, serializeValue } from '../src/v8-codec'
+import { DESCRIPTOR_TOKEN_LEN } from '../src/web-codec'
 import { Buffer } from 'node:buffer'
 
 let server: Server | undefined
@@ -90,6 +91,8 @@ function resultPayload(runId: number, body: string): Buffer {
   return Buffer.concat([head, Buffer.from(body, 'utf8')])
 }
 
+const descriptorToken = new Uint8Array(DESCRIPTOR_TOKEN_LEN).fill(0xAB)
+
 describe('RuntimeIpcClient', () => {
   test('connects, authenticates, sends Run, and receives Result', async () => {
     const socketPath = await listen(async (socket) => {
@@ -102,6 +105,7 @@ describe('RuntimeIpcClient', () => {
       expect(auth.protocolVersion).toBe(PROTOCOL_VERSION)
       // The probe is a serialized `null`; byte 1 is Node's format version.
       expect(Buffer.from(auth.probe)).toEqual(serializationProbe())
+      expect(Buffer.from(auth.descriptorToken)).toEqual(Buffer.from(descriptorToken))
       writeHello(socket)
 
       const runFrame = await reader.readFrame()
@@ -124,7 +128,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const result = await client.runRawCode('export default 42')
 
     expect(Buffer.from(result.result).subarray(4).toString('utf8')).toBe('payload')
@@ -155,7 +159,7 @@ describe('RuntimeIpcClient', () => {
       socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('nonsense')))
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const stats = await client.stats()
     expect(stats.warmBudgetBytes).toBe(7)
     expect(stats.prefixes).toEqual([])
@@ -176,7 +180,7 @@ describe('RuntimeIpcClient', () => {
       socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('nonsense')))
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     await expect(client.precompile({ code: 'export const x = 1' }))
       .rejects
       .toThrow(/unexpected frame type 0x02/)
@@ -201,7 +205,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     await expect(
-      RuntimeIpcClient.connect({ socketPath }),
+      RuntimeIpcClient.connect({ socketPath, descriptorToken }),
     ).rejects.toThrow(/V8 serialization format mismatch/)
   })
 
@@ -226,7 +230,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     await expect(
-      RuntimeIpcClient.connect({ socketPath }),
+      RuntimeIpcClient.connect({ socketPath, descriptorToken }),
     ).rejects.toThrow(/V8 serialization format mismatch/)
   })
 
@@ -241,7 +245,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     await expect(
-      RuntimeIpcClient.connect({ socketPath }),
+      RuntimeIpcClient.connect({ socketPath, descriptorToken }),
     ).rejects.toThrow(/expected a Hello frame/)
   })
 
@@ -300,7 +304,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     const dispatched: unknown[] = []
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const raw = await client.runRawCode('export default 1', {
       globals: [{ kind: 'bridge', name: 'greet' }],
       dispatch: {
@@ -379,7 +383,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const raw = await client.runRawCode('export default 1', {
       globals: [{ kind: 'bridge', name: 'big' }],
       dispatch: {
@@ -424,7 +428,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     ;(client as unknown as { nextRunId: number }).nextRunId = 0x7FFFFFFF
 
     await expect(client.runRawCode('export default 42')).resolves.toBeDefined()
@@ -459,7 +463,7 @@ describe('RuntimeIpcClient', () => {
       )
     })
 
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
 
     await expect(client.runRawCode('export default 42')).rejects.toThrow(
       /Result frame carries runId .* but run \d+ is in flight/,
@@ -533,7 +537,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     const dispatched: unknown[] = []
-    const client = await RuntimeIpcClient.connect({ socketPath })
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const raw = await client.runRawCode('export default 1', {
       globals: [{ kind: 'bridge', name: 'greet' }],
       dispatch: {

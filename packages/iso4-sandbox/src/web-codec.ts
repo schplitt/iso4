@@ -27,7 +27,7 @@
  * plain graph that ordinary synchronous serialization can then write.
  */
 
-import type { Buffer } from 'node:buffer'
+import { Buffer } from 'node:buffer'
 import v8 from 'node:v8'
 
 // ── Type tags (frozen — docs/protocol.md §4.4.1) ─────────────────────────────
@@ -68,12 +68,30 @@ export class HostTypeError extends TypeError {
 }
 
 /**
- * Property name marking a branded descriptor — a plain object standing in for a
- * host type on the way into the sandbox, which the runtime swaps for a real
- * instance. Wire contract: kept in sync with `BRAND` in
+ * Prefix of the property name marking a branded descriptor — a plain object
+ * standing in for a host type on the way into the sandbox, which the runtime
+ * swaps for a real instance. The full brand key is this prefix followed by the
+ * sandbox's random descriptor token in hex ({@link brandKeyForToken}), so the
+ * runtime rehydrates only descriptors this host actually stamped: inbound
+ * structured data that happens to carry a brand-shaped key passes through as
+ * the plain data it is. Wire contract: kept in sync with `BRAND_PREFIX` in
  * `native/v8-runtime/src/webcodec.rs`.
  */
-export const BRAND = '__iso4_ht'
+export const BRAND_PREFIX = '__iso4_ht_'
+
+/**
+ * Byte length of the descriptor token carried in the `Authenticate` frame.
+ * Mirrors `DESCRIPTOR_TOKEN_LEN` in `webcodec.rs`.
+ */
+export const DESCRIPTOR_TOKEN_LEN = 16
+
+/**
+ * Build the session brand key for a descriptor token.
+ * @param token the sandbox's random descriptor token
+ */
+export function brandKeyForToken(token: Uint8Array): string {
+  return BRAND_PREFIX + Buffer.from(token.buffer, token.byteOffset, token.byteLength).toString('hex')
+}
 
 // ── Materialized form ────────────────────────────────────────────────────────
 
@@ -84,14 +102,15 @@ export const BRAND = '__iso4_ht'
 type MaterializedBody = Uint8Array | string | null
 
 /**
- * A host type flattened into plain data.
+ * A host type flattened into plain data. The session brand key (a dynamic
+ * property name — see {@link brandKeyForToken}) holds the numeric type tag.
  *
  * Header entries are flattened to `[name, value, name, value, …]` — the shape
  * the sandbox keeps internally, so the runtime does not rebuild it. Never a
  * `Record`: a record cannot represent duplicate `set-cookie`.
  */
 interface Descriptor {
-  [BRAND]: number
+  [brandKey: string]: unknown
   url?: string
   method?: string
   status?: number
@@ -179,10 +198,10 @@ async function materializeBody(source: Request | Response): Promise<Materialized
   return out
 }
 
-async function toDescriptor(value: object): Promise<Descriptor | undefined> {
+async function toDescriptor(value: object, brandKey: string): Promise<Descriptor | undefined> {
   if (value instanceof globalThis.Response) {
     return {
-      [BRAND]: TAG_RESPONSE,
+      [brandKey]: TAG_RESPONSE,
       status: value.status,
       statusText: value.statusText,
       headers: flatHeaders(value.headers),
@@ -191,7 +210,7 @@ async function toDescriptor(value: object): Promise<Descriptor | undefined> {
   }
   if (value instanceof globalThis.Request) {
     return {
-      [BRAND]: TAG_REQUEST,
+      [brandKey]: TAG_REQUEST,
       url: value.url,
       method: value.method,
       headers: flatHeaders(value.headers),
@@ -199,7 +218,7 @@ async function toDescriptor(value: object): Promise<Descriptor | undefined> {
     }
   }
   if (value instanceof globalThis.Headers)
-    return { [BRAND]: TAG_HEADERS, headers: flatHeaders(value), body: null }
+    return { [brandKey]: TAG_HEADERS, headers: flatHeaders(value), body: null }
   return undefined
 }
 
@@ -221,13 +240,16 @@ const MAX_DEPTH = 32
  * cycles are preserved through `seen`. `Map`/`Set` are rebuilt because a host
  * type can hide in either.
  * @param value the value to transform
+ * @param brandKey the sandbox's session brand key ({@link brandKeyForToken});
+ * the runtime rehydrates only descriptors stamped with it
  */
-export async function materializeHostTypes(value: unknown): Promise<unknown> {
-  return transform(value, new Map(), 0)
+export async function materializeHostTypes(value: unknown, brandKey: string): Promise<unknown> {
+  return transform(value, brandKey, new Map(), 0)
 }
 
 async function transform(
   value: unknown,
+  brandKey: string,
   seen: Map<object, unknown>,
   depth: number,
 ): Promise<unknown> {
@@ -243,7 +265,7 @@ async function transform(
   if (existing !== undefined)
     return existing
 
-  const descriptor = await toDescriptor(value)
+  const descriptor = await toDescriptor(value, brandKey)
   if (descriptor !== undefined) {
     seen.set(value, descriptor)
     return descriptor
@@ -259,7 +281,7 @@ async function transform(
   if (Array.isArray(value)) {
     const out: unknown[] = []
     seen.set(value, out)
-    for (const item of value) out.push(await transform(item, seen, depth + 1))
+    for (const item of value) out.push(await transform(item, brandKey, seen, depth + 1))
     return out
   }
 
@@ -267,14 +289,14 @@ async function transform(
     const out = new Map<unknown, unknown>()
     seen.set(value, out)
     for (const [k, v] of value)
-      out.set(await transform(k, seen, depth + 1), await transform(v, seen, depth + 1))
+      out.set(await transform(k, brandKey, seen, depth + 1), await transform(v, brandKey, seen, depth + 1))
     return out
   }
 
   if (value instanceof Set) {
     const out = new Set<unknown>()
     seen.set(value, out)
-    for (const v of value) out.add(await transform(v, seen, depth + 1))
+    for (const v of value) out.add(await transform(v, brandKey, seen, depth + 1))
     return out
   }
 
@@ -287,7 +309,7 @@ async function transform(
   const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>
   seen.set(value, out)
   for (const [k, v] of Object.entries(value))
-    out[k] = await transform(v, seen, depth + 1)
+    out[k] = await transform(v, brandKey, seen, depth + 1)
   return out
 }
 

@@ -180,22 +180,28 @@ pub fn serialize_value(
 }
 
 /// Read one V8 value back from a blob, materialising any host types the host
-/// sent as branded descriptors.
+/// sent as stamped descriptors.
 ///
-/// Use this on host → sandbox legs (data globals, bridge responses). Ordinary
-/// `deserialize_value` is for everything else and never walks.
+/// Use this on host → sandbox legs (data globals, bridge responses, call
+/// args). Ordinary `deserialize_value` is for everything else and never walks.
 ///
-/// The walk is guarded by a byte scan for the brand, so a payload with no host
-/// types pays only that scan.
+/// Only descriptors carrying this session's brand key rehydrate (the key is
+/// installed per thread from the handshake token — `webcodec`); anything else,
+/// including data that merely looks branded, passes through as plain data.
+/// The walk is guarded by a byte scan for the session key, so a payload with
+/// no stamped descriptors pays only that scan.
 pub fn deserialize_value_with_web_types<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
 ) -> Option<v8::Local<'s, v8::Value>> {
     let value = deserialize_value(scope, bytes)?;
-    if !webcodec::might_contain_web_types(bytes) {
+    let Some(brand_key) = webcodec::session_brand_key() else {
+        return Some(value);
+    };
+    if !webcodec::might_contain_web_types(bytes, &brand_key) {
         return Some(value);
     }
-    match webcodec::rehydrate(scope, value) {
+    match webcodec::rehydrate(scope, value, &brand_key) {
         Ok(v) => Some(v),
         Err(e) => {
             LAST_CODEC_ERROR.with(|slot| *slot.borrow_mut() = Some(e));
@@ -473,5 +479,42 @@ mod tests {
     fn probe_format_version_rejects_non_blob_bytes() {
         assert_eq!(probe_format_version(&[]), None);
         assert_eq!(probe_format_version(&[0x01, 0x02]), None);
+    }
+
+    #[test]
+    fn descriptors_rehydrate_only_under_an_installed_session_key() {
+        // Each #[test] runs on its own thread, so the thread-local starts
+        // unset here: the first read must pass the descriptor through as
+        // plain data (fail-closed), the second — after the key is installed —
+        // must produce a real instance.
+        crate::v8::init_platform();
+        let isolate = &mut v8::Isolate::new(Default::default());
+        v8::scope!(let scope, isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        crate::webtypes::install(scope).expect("install web globals");
+
+        let key = webcodec::brand_key_for_token(&[0xab; webcodec::DESCRIPTOR_TOKEN_LEN]);
+        let value = eval(
+            scope,
+            &format!("({{ '{key}': 1, headers: ['x-a','1'] }})"),
+        );
+        let bytes = serialize_value(scope, value).expect("serialize");
+
+        let plain = deserialize_value_with_web_types(scope, &bytes).expect("deserialize");
+        let global = scope.get_current_context().global(scope);
+        let name = v8::String::new(scope, "__rt").unwrap();
+        global.set(scope, name.into(), plain);
+        let probe = eval(scope, "String(__rt instanceof Headers)");
+        assert_eq!(probe.to_rust_string_lossy(scope), "false");
+
+        webcodec::set_session_brand_key(key);
+        let instance = deserialize_value_with_web_types(scope, &bytes).expect("deserialize");
+        global.set(scope, name.into(), instance);
+        let probe = eval(
+            scope,
+            "[__rt instanceof Headers, __rt.get('x-a')].join('|')",
+        );
+        assert_eq!(probe.to_rust_string_lossy(scope), "true|1");
     }
 }

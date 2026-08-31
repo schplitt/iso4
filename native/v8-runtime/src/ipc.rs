@@ -135,6 +135,7 @@ pub type RustToTsFrame = TypedFrame<RustToTsMessageType>;
 /// Payload layout:
 /// - `u16` protocol version (big-endian)
 /// - `u32` probe length + probe bytes
+/// - `u32` token length + token bytes (exactly 16)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatePayload {
     pub protocol_version: u16,
@@ -142,6 +143,12 @@ pub struct AuthenticatePayload {
     /// byte is the format version Node writes. Compared against this binary's
     /// own write version during the handshake.
     pub probe: Vec<u8>,
+    /// Random per-sandbox descriptor token (`docs/protocol.md` §5.1). Host-
+    /// emitted host-type descriptors are stamped with a brand key derived from
+    /// it; the runtime rehydrates only descriptors carrying that key. Exactly
+    /// [`crate::webcodec::DESCRIPTOR_TOKEN_LEN`] bytes; the host sends the
+    /// same token on every connection of one sandbox.
+    pub descriptor_token: Vec<u8>,
 }
 
 /// Read a single raw frame from `reader` using the default frame-length cap.
@@ -308,33 +315,59 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
     let probe_len = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
     let probe_end = 6usize
         .checked_add(probe_len)
-        .filter(|end| *end <= payload.len())
+        .filter(|end| *end + 4 <= payload.len())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Authenticate payload truncated (probe)",
             )
         })?;
-    if probe_end != payload.len() {
+    let probe = payload[6..probe_end].to_vec();
+
+    let token_len = u32::from_be_bytes(
+        payload[probe_end..probe_end + 4]
+            .try_into()
+            .expect("bounds checked above"),
+    ) as usize;
+    if token_len != crate::webcodec::DESCRIPTOR_TOKEN_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "descriptor token must be exactly {} bytes, got {token_len}",
+                crate::webcodec::DESCRIPTOR_TOKEN_LEN
+            ),
+        ));
+    }
+    let token_end = probe_end + 4 + token_len;
+    if token_end > payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Authenticate payload truncated (descriptor token)",
+        ));
+    }
+    if token_end != payload.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Authenticate payload has trailing bytes",
         ));
     }
-    let probe = payload[6..probe_end].to_vec();
     Ok(AuthenticatePayload {
         protocol_version,
         probe,
+        descriptor_token: payload[probe_end + 4..token_end].to_vec(),
     })
 }
 
 /// Encode an `Authenticate` payload from structured fields — the inverse of
 /// `parse_authenticate_payload`, used by tests.
 pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(6 + auth.probe.len());
+    let mut payload =
+        Vec::with_capacity(6 + auth.probe.len() + 4 + auth.descriptor_token.len());
     payload.extend_from_slice(&auth.protocol_version.to_be_bytes());
     payload.extend_from_slice(&(auth.probe.len() as u32).to_be_bytes());
     payload.extend_from_slice(&auth.probe);
+    payload.extend_from_slice(&(auth.descriptor_token.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&auth.descriptor_token);
     payload
 }
 
@@ -1015,10 +1048,11 @@ mod tests {
     }
 
     #[test]
-    fn authenticate_payload_roundtrip_preserves_version_and_probe() {
+    fn authenticate_payload_roundtrip_preserves_version_probe_and_token() {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
             probe: vec![0xff, 0x0f, 0x30],
+            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
         };
 
         let payload = encode_authenticate_payload(&auth);
@@ -1029,10 +1063,12 @@ mod tests {
 
     #[test]
     fn authenticate_payload_rejects_trailing_bytes() {
-        let mut v = Vec::new();
-        v.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-        push_u32(&mut v, 3);
-        v.extend_from_slice(&[0xff, 0x0f, 0x30]);
+        let auth = AuthenticatePayload {
+            protocol_version: PROTOCOL_VERSION,
+            probe: vec![0xff, 0x0f, 0x30],
+            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
+        };
+        let mut v = encode_authenticate_payload(&auth);
         v.extend_from_slice(b"extra");
 
         let err = parse_authenticate_payload(&v).unwrap_err();
@@ -1047,6 +1083,37 @@ mod tests {
         v.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
         push_u32(&mut v, 99);
         v.extend_from_slice(&[0xff, 0x0f]);
+
+        let err = parse_authenticate_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "Authenticate payload truncated (probe)");
+    }
+
+    #[test]
+    fn authenticate_payload_rejects_a_wrong_size_descriptor_token() {
+        for wrong_len in [0usize, 8, 15, 17, 32] {
+            let auth = AuthenticatePayload {
+                protocol_version: PROTOCOL_VERSION,
+                probe: vec![0xff, 0x0f, 0x30],
+                descriptor_token: vec![0xab; wrong_len],
+            };
+            let err = parse_authenticate_payload(&encode_authenticate_payload(&auth)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "len {wrong_len}");
+            assert!(
+                err.to_string().contains("descriptor token must be exactly"),
+                "len {wrong_len}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticate_payload_rejects_a_missing_descriptor_token() {
+        // The pre-token layout: version + probe, nothing after. The token is
+        // required; both halves release in lockstep, so absence is malformed.
+        let mut v = Vec::new();
+        v.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        push_u32(&mut v, 3);
+        v.extend_from_slice(&[0xff, 0x0f, 0x30]);
 
         let err = parse_authenticate_payload(&v).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);

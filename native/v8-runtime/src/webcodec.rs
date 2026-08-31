@@ -30,6 +30,8 @@
 //!
 //! The asymmetry is safe because the two directions never share a reader.
 
+use std::cell::RefCell;
+
 use v8::{ValueDeserializerHelper, ValueSerializerHelper};
 
 use crate::webtypes;
@@ -388,22 +390,88 @@ pub fn decode<'s>(
 
 // ── Rehydration (host → sandbox) ─────────────────────────────────────────────
 
-/// Property name marking a branded descriptor. Wire contract — kept in sync
-/// with `BRAND` in `packages/iso4-sandbox/src/web-codec.ts`.
-pub const BRAND: &str = "__iso4_ht";
+/// Prefix of the property name marking a branded descriptor. The full brand
+/// key is this prefix followed by the session's descriptor token in lowercase
+/// hex, so only descriptors the host actually stamped rehydrate: an inbound
+/// object carrying the bare prefix — or any key with a wrong token — is
+/// ordinary data and passes through untouched. Wire contract — kept in sync
+/// with `BRAND_PREFIX` in `packages/iso4-sandbox/src/web-codec.ts`.
+pub const BRAND_PREFIX: &str = "__iso4_ht_";
 
-/// Cheap pre-check: could this blob contain a branded descriptor at all?
-///
-/// V8 writes property names as literal bytes, so if the brand is present the
-/// string appears verbatim. A false positive costs one harmless walk; a false
-/// negative is impossible. This keeps the walk off the overwhelmingly common
-/// path where a value contains no host types.
-pub fn might_contain_web_types(blob: &[u8]) -> bool {
-    let needle = BRAND.as_bytes();
-    blob.len() >= needle.len() && blob.windows(needle.len()).any(|w| w == needle)
+/// Exact byte length of the descriptor token carried in the `Authenticate`
+/// frame (`docs/protocol.md` §5.1). 128 random bits: unguessable, and never
+/// surfaced to guest JS (descriptors are replaced wholesale before a value
+/// reaches the isolate's code).
+pub const DESCRIPTOR_TOKEN_LEN: usize = 16;
+
+/// Build the session brand key from a descriptor token.
+pub fn brand_key_for_token(token: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut key = String::with_capacity(BRAND_PREFIX.len() + token.len() * 2);
+    key.push_str(BRAND_PREFIX);
+    for byte in token {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
-/// Replace every branded descriptor in `value` with a real instance, in place.
+thread_local! {
+    /// The brand key for descriptors deserialized on this thread. Set from the
+    /// connection's handshake token on the session thread, and on each warm
+    /// instance owner thread at spawn. Unset (e.g. unit tests driving the run
+    /// paths directly) is fail-closed: nothing rehydrates and branded-looking
+    /// objects pass through as the plain data they are.
+    static SESSION_BRAND_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Install the brand key for host-type descriptors handled on this thread.
+pub fn set_session_brand_key(key: String) {
+    SESSION_BRAND_KEY.with(|slot| *slot.borrow_mut() = Some(key));
+}
+
+/// The brand key installed on this thread, if any.
+pub fn session_brand_key() -> Option<String> {
+    SESSION_BRAND_KEY.with(|slot| slot.borrow().clone())
+}
+
+/// Cheap pre-check: could this blob contain a stamped descriptor at all?
+///
+/// V8 writes property names as literal bytes, so if the brand key is present
+/// it appears verbatim. A false positive costs one harmless walk; a false
+/// negative is impossible. The needle contains the session's random token, so
+/// data that merely resembles a descriptor never gets past this scan — the
+/// overwhelmingly common path pays the scan and nothing else.
+///
+/// Two-phase rather than `windows().any()`: scan for the needle's first byte
+/// (a tight byte-equality loop LLVM vectorises), and run the full comparison
+/// only at candidate positions — for payload-sized blobs the per-window
+/// `bcmp` of the naive form was the measurable cost, ~1.5 ms on a 2 MB
+/// data global.
+pub fn might_contain_web_types(blob: &[u8], brand_key: &str) -> bool {
+    let needle = brand_key.as_bytes();
+    let Some((&first, rest)) = needle.split_first() else {
+        return false;
+    };
+    if blob.len() < needle.len() {
+        return false;
+    }
+    // Candidates can only start where the whole needle still fits.
+    let last_start = blob.len() - needle.len();
+    let mut from = 0;
+    while let Some(offset) = blob[from..].iter().position(|&b| b == first) {
+        let start = from + offset;
+        if start > last_start {
+            return false;
+        }
+        if &blob[start + 1..start + needle.len()] == rest {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Replace every stamped descriptor in `value` with a real instance, in place.
 ///
 /// Depth-limited rather than cycle-tracked: V8 preserves object identity, so a
 /// cyclic graph would otherwise recurse forever. 32 levels is far past anything
@@ -412,8 +480,14 @@ pub fn might_contain_web_types(blob: &[u8]) -> bool {
 pub fn rehydrate<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
+    brand_key: &str,
 ) -> Codec<v8::Local<'s, v8::Value>> {
-    rehydrate_at(scope, value, 0)
+    // Interned once for the whole walk; V8 caches the string's hash after the
+    // first lookup, so per-object cost does not depend on the key's length.
+    let Some(key) = v8::String::new(scope, brand_key) else {
+        return malformed("could not intern the brand key");
+    };
+    rehydrate_at(scope, value, key, 0)
 }
 
 const MAX_DEPTH: u32 = 32;
@@ -421,6 +495,7 @@ const MAX_DEPTH: u32 = 32;
 fn rehydrate_at<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
+    brand_key: v8::Local<'s, v8::String>,
     depth: u32,
 ) -> Codec<v8::Local<'s, v8::Value>> {
     if depth > MAX_DEPTH {
@@ -436,15 +511,15 @@ fn rehydrate_at<'s>(
         Err(_) => return Ok(value),
     };
 
-    // A branded descriptor is replaced wholesale; its own fields are plain data.
-    if let Some(tag) = brand_of(scope, obj)? {
+    // A stamped descriptor is replaced wholesale; its own fields are plain data.
+    if let Some(tag) = brand_of(scope, obj, brand_key) {
         return build_from_descriptor(scope, obj, tag).map(|o| o.into());
     }
 
     if let Ok(array) = v8::Local::<v8::Array>::try_from(value) {
         for i in 0..array.length() {
             if let Some(item) = array.get_index(scope, i) {
-                let replaced = rehydrate_at(scope, item, depth + 1)?;
+                let replaced = rehydrate_at(scope, item, brand_key, depth + 1)?;
                 array.set_index(scope, i, replaced);
             }
         }
@@ -463,7 +538,7 @@ fn rehydrate_at<'s>(
         let Some(item) = obj.get(scope, key) else {
             continue;
         };
-        let replaced = rehydrate_at(scope, item, depth + 1)?;
+        let replaced = rehydrate_at(scope, item, brand_key, depth + 1)?;
         if replaced != item {
             obj.set(scope, key, replaced);
         }
@@ -471,13 +546,14 @@ fn rehydrate_at<'s>(
     Ok(value)
 }
 
-fn brand_of(scope: &mut v8::PinScope, obj: v8::Local<v8::Object>) -> Codec<Option<u32>> {
-    let Some(key) = v8::String::new(scope, BRAND) else {
-        return malformed("could not intern the brand key");
-    };
-    match obj.get(scope, key.into()) {
-        Some(v) if v.is_uint32() => Ok(v.uint32_value(scope)),
-        _ => Ok(None),
+fn brand_of(
+    scope: &mut v8::PinScope,
+    obj: v8::Local<v8::Object>,
+    brand_key: v8::Local<v8::String>,
+) -> Option<u32> {
+    match obj.get(scope, brand_key.into()) {
+        Some(v) if v.is_uint32() => v.uint32_value(scope),
+        _ => None,
     }
 }
 
@@ -744,6 +820,95 @@ mod tests {
             message.contains("buffer it first"),
             "expected an actionable message, got: {message}"
         );
+    }
+
+    #[test]
+    fn brand_key_is_the_prefix_plus_lowercase_hex() {
+        let mut token = [0u8; DESCRIPTOR_TOKEN_LEN];
+        token[0] = 0x00;
+        token[1] = 0xff;
+        token[15] = 0x1a;
+        let key = brand_key_for_token(&token);
+        assert_eq!(key, "__iso4_ht_00ff000000000000000000000000001a");
+    }
+
+    #[test]
+    fn only_a_descriptor_stamped_with_the_session_key_rehydrates() {
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let out = with_web(|scope| {
+            // One descriptor stamped with the session key, one carrying the
+            // bare prefix the way untrusted structured data might.
+            let value = eval(
+                scope,
+                &format!(
+                    "({{ real: {{ '{key}': 3, status: 201, statusText: '', \
+                        headers: ['x-a','1'], body: null }}, \
+                       fake: {{ __iso4_ht: 3, status: 500, statusText: '', \
+                        headers: [], body: null }} }})"
+                ),
+            );
+            let out = rehydrate(scope, value, &key).expect("rehydrate");
+            let global = scope.get_current_context().global(scope);
+            let name = v8::String::new(scope, "__rt").unwrap();
+            global.set(scope, name.into(), out);
+            let probe = eval(
+                scope,
+                "[__rt.real instanceof Response, __rt.real.status, \
+                  __rt.real.headers.get('x-a'), \
+                  __rt.fake instanceof Response, __rt.fake.__iso4_ht].join('|')",
+            );
+            probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
+        });
+        assert_eq!(out, "true|201|1|false|3");
+    }
+
+    #[test]
+    fn a_wrong_token_key_is_plain_data() {
+        let session = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let other = brand_key_for_token(&[0xcd; DESCRIPTOR_TOKEN_LEN]);
+        let out = with_web(|scope| {
+            let value = eval(
+                scope,
+                &format!("({{ '{other}': 1, headers: ['x-a','1'] }})"),
+            );
+            let out = rehydrate(scope, value, &session).expect("rehydrate");
+            let global = scope.get_current_context().global(scope);
+            let name = v8::String::new(scope, "__rt").unwrap();
+            global.set(scope, name.into(), out);
+            let probe = eval(scope, "__rt instanceof Headers");
+            probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
+        });
+        assert_eq!(out, "false");
+    }
+
+    #[test]
+    fn the_byte_scan_needle_is_the_full_session_key() {
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let stamped = format!("payload with {key} inside");
+        assert!(might_contain_web_types(stamped.as_bytes(), &key));
+        // The bare prefix — what untrusted data can contain — never triggers
+        // the walk.
+        assert!(!might_contain_web_types(
+            b"payload with __iso4_ht inside",
+            &key
+        ));
+        assert!(!might_contain_web_types(b"", &key));
+        // Boundary positions and near-misses for the two-phase scan.
+        assert!(might_contain_web_types(key.as_bytes(), &key));
+        assert!(might_contain_web_types(format!("{key}x").as_bytes(), &key));
+        assert!(might_contain_web_types(format!("x{key}").as_bytes(), &key));
+        let truncated = &key[..key.len() - 1];
+        assert!(!might_contain_web_types(truncated.as_bytes(), &key));
+        // A first-byte hit too close to the end must not match or panic.
+        assert!(!might_contain_web_types(
+            format!("xxxx{truncated}").as_bytes(),
+            &key
+        ));
+        // A failed candidate must not stop the scan before a later real match.
+        assert!(might_contain_web_types(
+            format!("__iso4_ht_zz{key}").as_bytes(),
+            &key
+        ));
     }
 
     #[test]

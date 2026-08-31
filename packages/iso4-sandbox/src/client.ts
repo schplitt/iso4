@@ -29,9 +29,17 @@ import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
+import { brandKeyForToken } from './web-codec.js'
 
 export interface RuntimeIpcClientOptions {
   socketPath: string
+  /**
+   * The sandbox's random descriptor token (16 bytes), sent in the
+   * `Authenticate` frame. The runtime rehydrates only host-type descriptors
+   * stamped with the brand key derived from it — see `web-codec.ts`. One token
+   * per sandbox, shared by every pooled connection.
+   */
+  descriptorToken: Uint8Array
 }
 
 export interface RawRunResult {
@@ -140,8 +148,14 @@ export class RuntimeIpcClient {
    */
   private broken = false
 
-  private constructor(socket: Socket) {
+  /**
+   * Session brand key for host-type descriptors written on this connection.
+   */
+  private readonly brandKey: string
+
+  private constructor(socket: Socket, brandKey: string) {
     this.socket = socket
+    this.brandKey = brandKey
     this.reader = new FrameReader()
     socket.on('data', (chunk: Buffer) => {
       this.reader.push(chunk)
@@ -196,7 +210,7 @@ export class RuntimeIpcClient {
    */
   static async connect(options: RuntimeIpcClientOptions): Promise<RuntimeIpcClient> {
     const socket = await connectSocket(options.socketPath)
-    const client = new RuntimeIpcClient(socket)
+    const client = new RuntimeIpcClient(socket, brandKeyForToken(options.descriptorToken))
 
     try {
       await client.write(
@@ -205,6 +219,7 @@ export class RuntimeIpcClient {
           encodeAuthenticatePayload({
             protocolVersion: PROTOCOL_VERSION,
             probe: serializationProbe(),
+            descriptorToken: options.descriptorToken,
           }),
         ),
       )
@@ -717,7 +732,7 @@ export class RuntimeIpcClient {
                 // rather than a plain object — and draining its body is async.
                 let encoded: Uint8Array
                 try {
-                  encoded = await serializeHostValue(value)
+                  encoded = await serializeHostValue(value, this.brandKey)
                 } catch (e) {
                   return this.write(
                     encodeTsToRustFrame(
