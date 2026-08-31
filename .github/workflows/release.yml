@@ -2,7 +2,9 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    # release/* enables hotfix releases from a branch cut at an old tag:
+    # the changesets flow runs there exactly as it does on main.
+    branches: [main, 'release/*']
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
