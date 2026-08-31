@@ -12,7 +12,7 @@ import type {
 
 /**
  * The limits shape the wire carries. `memoryMb` left `ResourceLimits` when it
- * became a Runtime-level setting (#64: uniform heap cap, set at isolate
+ * became a Runtime-level setting (uniform heap cap, set at isolate
  * creation, impossible to renegotiate per run) — but the frame layout is
  * unchanged, so the encoder takes the public limits plus the sandbox-level
  * `memoryMb` injected by the `Sandbox`/`Prefix` implementations.
@@ -32,7 +32,7 @@ export const TsToRustMessageTypes = {
   BridgeResponse: 0x06,
   Terminate: 0x07,
   /**
-   * Request a capacity/usage snapshot (#65). Empty payload; answered with a
+   * Request a capacity/usage snapshot. Empty payload; answered with a
    * `StatsResult` frame.
    */
   Stats: 0x08,
@@ -52,7 +52,7 @@ export const RustToTsMessageTypes = {
    */
   Hello: 0x05,
   /**
-   * Capacity/usage snapshot answering a `Stats` request (#65).
+   * Capacity/usage snapshot answering a `Stats` request.
    */
   StatsResult: 0x06,
   /**
@@ -928,7 +928,7 @@ export type HostModuleNodePayload
  *
  * A source module carries ESM text verbatim; a host module carries its shape
  * as ordered `(exportName, node)` pairs. The runtime builds host modules
- * natively — the client generates no sandbox source (#37).
+ * natively — the client generates no sandbox source.
  */
 export type ImportBindingPayload
   = | { specifier: string, source: string }
@@ -953,7 +953,7 @@ export interface ImportRebindPayload {
 // ── CallPayload ─────────────────────────────────────────────────────────────
 
 /**
- * A host → sandbox function call carried by a `Run`/`PrefixRun` payload (#58).
+ * A host → sandbox function call carried by a `Run`/`PrefixRun` payload.
  *
  * `exportPath` addresses a callable relative to the module's exports
  * (`"named"`, `"default.fetch"`), never `globalThis`. `argsBlob` is **one**
@@ -1030,7 +1030,7 @@ export interface PrefixRunPayloadOptions {
   prefixId: string
   /**
    * Postfix module source. A `PrefixRun` frame carries a postfix *or* a call
-   * (#58) — exactly one; the encoder enforces this before any bytes are
+   * — exactly one; the encoder enforces this before any bytes are
    * written, mirroring the Rust parser.
    */
   code?: string
@@ -1090,7 +1090,7 @@ export function encodeDisposePrefixPayload(prefixId: string): Buffer {
 /**
  * Encode a `Terminate` payload — just the RunId (u32) of the run to stop.
  * Sent when an `AbortSignal` fires mid-run so Rust can gracefully abort the
- * run and reply with a real `ERR_ABORTED` Result (see #36 / client.ts).
+ * run and reply with a real `ERR_ABORTED` Result (see client.ts).
  * @param runId
  */
 export function encodeTerminatePayload(runId: number): Buffer {
@@ -1282,14 +1282,14 @@ export interface DecodedRunCompletion {
   result: RunResult
   /**
    * True when `waitUntil` background work is still running runtime-side
-   * (#71): a `RunComplete` frame follows on this connection. Always false on
+   *: a `RunComplete` frame follows on this connection. Always false on
    * failures.
    */
   backgroundPending: boolean
 }
 
 /**
- * `decodeRunCompletionPayload` result for a run that carried a call (#58):
+ * `decodeRunCompletionPayload` result for a run that carried a call:
  * the value blob holds the called function's return value, not an exports
  * object.
  */
@@ -1303,7 +1303,7 @@ export interface DecodedCallCompletion {
 }
 
 /**
- * Decoded `RunComplete` frame payload (#71) — the `waitUntil` epilogue's
+ * Decoded `RunComplete` frame payload — the `waitUntil` epilogue's
  * outcome. Mirrors `encode_run_complete_payload` in `wire.rs`.
  */
 export interface DecodedRunComplete {
@@ -1318,7 +1318,7 @@ export interface DecodedRunComplete {
 }
 
 /**
- * Decode a `RunComplete` frame payload (#71).
+ * Decode a `RunComplete` frame payload.
  * @param buf the frame payload
  */
 export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
@@ -1346,7 +1346,7 @@ export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
 }
 
 /**
- * Read just the `backgroundPending` flag off a `Result` frame payload (#71),
+ * Read just the `backgroundPending` flag off a `Result` frame payload,
  * without decoding the rest. Both encoders write strict layouts with no
  * trailing bytes, so on a success payload the flag is the second-to-last byte
  * (followed only by the `failurePresent = 0` byte); failures never carry
@@ -1401,7 +1401,7 @@ export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
  *   f64  durationMs
  *   f64  cpuTimeMs
  *   List<BridgeCallRecord>  bridgeCalls
- *   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
+ *   Optional<u64>  heapUsedBytes   (present for prefix runs)
  * u8    failurePresent   (1 when ok = 0)
  *   String  code
  *   String  name
@@ -1413,7 +1413,7 @@ export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
  *   f64  durationMs
  *   f64  cpuTimeMs
  *   List<BridgeCallRecord>  bridgeCalls
- *   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
+ *   Optional<u64>  heapUsedBytes   (present for prefix runs)
  * ```
  * @param buf
  */
@@ -1609,7 +1609,7 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
 
 /**
  * The runtime's capacity/usage snapshot as decoded off a `StatsResult`
- * frame (#65). Raw registry numbers; `sandbox.stats()` merges them with
+ * frame. Raw registry numbers; `sandbox.stats()` merges them with
  * host-side pool counters into the public `SandboxStats` shape.
  */
 export interface RuntimeStatsPayload {
@@ -1630,18 +1630,18 @@ export interface RuntimeStatsPayload {
    */
   idleHeapBytes: number
   /**
-   * The warm budget in bytes the runtime sheds against (#66);
+   * The warm budget in bytes the runtime sheds against;
    * 0 = watermarks disabled.
    */
   warmBudgetBytes: number
   /**
    * The runtime process's resident set size in bytes at snapshot time
-   * (0 when unreadable) — the signal the RSS mark acts on (#66).
+   * (0 when unreadable) — the signal the RSS mark acts on.
    */
   rssBytes: number
   /**
    * True while the shedding latch is held: RSS reached the budget and has
-   * not yet fallen back to 4/5 of it (#66).
+   * not yet fallen back to 4/5 of it.
    */
   underPressure: boolean
   /**

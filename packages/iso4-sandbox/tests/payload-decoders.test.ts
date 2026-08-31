@@ -137,7 +137,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
     f64(spec.durationMs ?? 0),
     f64(spec.cpuTimeMs ?? 0),
     bridgeRecords(spec.bridgeCalls ?? []),
-    optionalU64(spec.heapUsedBytes), // #64: Optional<u64> heapUsedBytes
+    optionalU64(spec.heapUsedBytes), // Optional<u64> heapUsedBytes
   ])
 
   if (spec.ok) {
@@ -147,7 +147,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
       valueSlot(spec.exports),
       strList(spec.skippedExports ?? []),
       tail,
-      Buffer.from([0]), // backgroundPending = false (#71)
+      Buffer.from([0]), // backgroundPending = false
       Buffer.from([0]), // failurePresent = 0
     ])
   }
@@ -656,8 +656,8 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       warmBusy: 2,
       warmIdle: 3,
       idleHeapBytes: 5_000_000_000, // above u32 — exercises the u64 read
-      warmBudgetBytes: 7_000_000_000, // also above u32 (#66)
-      rssBytes: 6_000_000_000, // also above u32 (#66)
+      warmBudgetBytes: 7_000_000_000, // also above u32
+      rssBytes: 6_000_000_000, // also above u32
       underPressure: true,
       prefixes: [
         { prefixId: '0', idle: 2, busy: 1 },

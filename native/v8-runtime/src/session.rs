@@ -146,7 +146,7 @@ fn find_host_node<'a>(
 /// the lock instead of deep-cloning the source and global defs on every run.
 /// Each run re-evaluates the source into its fresh context; there is no
 /// runtime snapshot (V8 14.x cannot create snapshots safely in a live
-/// multi-isolate process — #60/#61).
+/// multi-isolate process).
 pub struct PrefixData {
     /// The prefix module source, exactly as validated at precompile time.
     pub code: String,
@@ -178,14 +178,14 @@ pub struct SharedState {
     pub prefix_store: Mutex<HashMap<String, Arc<PrefixData>>>,
     /// Monotonically increasing counter for generating unique PrefixIds.
     pub next_prefix_id: AtomicU64,
-    /// Warm instance registry (#64): every PrefixRun is served by a resident
+    /// Warm instance registry: every PrefixRun is served by a resident
     /// isolate from here; one-off runs share the same slot accounting.
     pub warm: crate::warm::WarmRegistry,
 }
 
 impl SharedState {
     /// `warm_budget_bytes` is the RSS mark the registry sheds against
-    /// (#66) — the memory control; 0 disables it. Concurrency is bounded
+    /// — the memory control; 0 disables it. Concurrency is bounded
     /// by the host pool; there is no instance-count cap.
     pub fn new(warm_budget_bytes: u64) -> Self {
         Self {
@@ -305,7 +305,7 @@ fn write_result_frame(stream: &mut UnixStream, run_id: u32, payload: &[u8]) -> s
     }
 }
 
-/// Write a `RunComplete` frame (#71), substituting a minimal one when the
+/// Write a `RunComplete` frame, substituting a minimal one when the
 /// grace report is too large to frame — same recovery `write_result_frame`
 /// gives Result frames, so a guest-authored oversized rejection message (or
 /// an unbounded record list under `maxBridgeCalls: 0`) costs its telemetry,
@@ -490,13 +490,13 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 let stream_fd = Some(stream.as_raw_fd());
                 // One-off runs always get a fresh isolate (never the warm
                 // registry), but they share the slot budget with warm
-                // instances — taking a slot may evict an idle one (#64).
+                // instances — taking a slot may evict an idle one.
                 shared.warm.reserve_oneoff();
                 sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
                     run_id: payload.run_id,
                     report_heap: false,
                 }));
-                // Set when the run flow already wrote the early Result (#71):
+                // Set when the run flow already wrote the early Result:
                 // the payload below is then the final RunComplete frame.
                 let mut frame_is_run_complete = false;
                 let result_payload = match sandbox::execute(
@@ -523,7 +523,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         trace!("[iso4-v8] run succeeded in {:.3}ms", output.duration_ms);
                         match &output.background {
                             // The run flow already wrote the early Result and
-                            // drove the grace phase (#71); what remains is the
+                            // drove the grace phase; what remains is the
                             // final RunComplete frame.
                             Some(bg) if bg.early_result_sent => {
                                 frame_is_run_complete = true;
@@ -670,7 +670,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 };
 
                 // Set when the owner thread already wrote the early Result
-                // (#71): the payload below is then the RunComplete frame.
+                //: the payload below is then the RunComplete frame.
                 let mut frame_is_run_complete = false;
                 // An `Arc` handle, so the store lock is held for one refcount
                 // bump — not for a deep clone of the source and global defs on
@@ -771,7 +771,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             // re-install (string/data globals and shim
                             // wrappers are replayed from the stored prefix
                             // defs during prefix evaluation).
-                            // Always passed (#71): the waitUntil epilogue
+                            // Always passed: the waitUntil epilogue
                             // writes the early Result on this fd even when no
                             // bridge stub exists. The session thread parks on
                             // the response channel, so the fd has one user.
@@ -783,7 +783,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                             payload.globals.len(), prefix_data.declared_imports.len(),
                             payload.call.as_ref().map(|c| c.export_path.as_str()).unwrap_or("-"),
                         );
-                            // ── Warm instance flow (#64/#66) ─────────────────
+                            // ── Warm instance flow ─────────────────
                             // Reuse the warmest idle instance of this prefix,
                             // or take a slot (shedding scored victims if the
                             // RSS watermark demands it) and cold-start a
@@ -876,7 +876,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                                     );
                                     match &output.background {
                                         // Early Result already written by the
-                                        // owner thread (#71); finish the run
+                                        // owner thread; finish the run
                                         // with the RunComplete frame.
                                         Some(bg) if bg.early_result_sent => {
                                             frame_is_run_complete = true;
@@ -970,7 +970,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 eprintln!("[iso4-v8] ignoring late BridgeResponse (run already completed)");
             }
             ipc::TsToRustMessageType::Stats => {
-                // Capacity/usage snapshot (#65). Sent by the host's dedicated
+                // Capacity/usage snapshot. Sent by the host's dedicated
                 // control connection, so it never queues behind runs; the
                 // payload is empty and the reply is one StatsResult frame.
                 let stats = shared.warm.stats();

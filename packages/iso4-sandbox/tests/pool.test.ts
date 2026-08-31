@@ -3,7 +3,7 @@
  *
  * A dead connection is dropped and its capacity reopened on demand, so a
  * transient connect failure fails one run instead of permanently costing the
- * pool a slot. Removing the fixed slot set entirely is #89.
+ * pool a slot. Removing the fixed slot set entirely is a planned pool rework.
  */
 
 import { describe, expect, test, vi } from 'vitest'

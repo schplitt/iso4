@@ -53,8 +53,8 @@ iso4/                              ← workspace root
         main.rs                    ← arg parsing, UDS accept loop
         session.rs                 ← per-connection message loop, prefix store
         v8.rs                      ← isolates, contexts, prefix evaluation, limits
-        warm.rs                    ← warm-instance registry (#64)
-        policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader (#66)
+        warm.rs                    ← warm-instance registry
+        policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader
         ipc.rs, wire.rs, blob.rs   ← frames, payload codecs, V8 serialization
 ```
 

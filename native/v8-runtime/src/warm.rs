@@ -1,4 +1,4 @@
-//! Warm instance registry (#64): prefix id → pool of resident isolates.
+//! Warm instance registry: prefix id → pool of resident isolates.
 //!
 //! Every prepared prefix is served by warm instances. An instance is one
 //! isolate with the prefix already evaluated, owned cradle-to-grave by a
@@ -9,9 +9,9 @@
 //! a channel; while a call runs, the session thread blocks on the response,
 //! so the session socket has exactly one user at a time (the instance thread
 //! does the bridge I/O during the call, the session thread between calls —
-//! the same discipline as before #64, just on another thread).
+//! the same discipline as before warm instances, just on another thread).
 //!
-//! Capacity model (v3, #66 — celld's, whole): the memory control is ONE
+//! Capacity model (v3 — celld's, whole): the memory control is ONE
 //! RSS mark, the warm budget (`--warm-budget-bytes`, 0 = disabled). Every
 //! acquire/release samples the process RSS (~0.4 µs) and folds it through
 //! the pure policy in `policy.rs`: RSS at/above the budget latches
@@ -24,7 +24,7 @@
 //! deliberately NO instance-count cap: celld defaults its resident
 //! ceiling to `usize::MAX` after a default count cap caused eviction
 //! churn; concurrency is bounded by the host pool, memory by the mark.
-//! The wait-vs-cold-start acquire policy is #77.
+//! The wait-vs-cold-start acquire policy is future work (prefix-aware acquire).
 //!
 //! Instances of one prefix share no state with each other; state inside one
 //! instance survives between calls as a cache, never a guarantee — any
@@ -57,7 +57,7 @@ pub struct CallJob {
     /// The connection's monotonically increasing bridge call-ID counter.
     pub call_id_counter: Arc<AtomicU32>,
     pub call: Option<ipc::CallSpec>,
-    /// Per-run identity for the `waitUntil` early Result frame (#71).
+    /// Per-run identity for the `waitUntil` early Result frame.
     pub epilogue: Option<sandbox::EpilogueSpec>,
 }
 
@@ -74,10 +74,10 @@ enum Job {
 pub struct InstanceHandle {
     jobs: crossbeam_channel::Sender<Job>,
     /// When this instance last finished a call — the idleTime factor of the
-    /// eviction score (#66).
+    /// eviction score.
     last_used: Instant,
     /// `used_heap_size` after the last call — Result-frame report and the
-    /// heap factor of the eviction score (#66).
+    /// heap factor of the eviction score.
     pub heap_used_bytes: u64,
 }
 
@@ -205,7 +205,7 @@ pub enum Acquired {
     CreateCold,
 }
 
-/// A point-in-time snapshot of the registry for `stats()` (#65). Counts are
+/// A point-in-time snapshot of the registry for `stats()`. Counts are
 /// consistent with each other (taken under one lock), stale the moment the
 /// lock drops — diagnostics, not synchronization.
 pub struct RegistryStats {
@@ -224,7 +224,7 @@ pub struct RegistryStats {
     /// to `rss_bytes` so utilization is computable from one snapshot.
     pub warm_budget_bytes: u64,
     /// The runtime process's RSS at snapshot time (0 when unreadable) —
-    /// the signal the mark acts on (#66).
+    /// the signal the mark acts on.
     pub rss_bytes: u64,
     /// The shedding latch: RSS reached the budget and has not yet fallen
     /// back to 4/5 of it.
@@ -251,7 +251,7 @@ struct PrefixSlots {
     /// warmest; eviction removes the front).
     idle: Vec<InstanceHandle>,
     /// Instances currently serving a call — counted for `stats()` and for
-    /// the per-prefix state #77's acquire policy will need.
+    /// the per-prefix state a prefix-aware acquire policy will need.
     busy: usize,
 }
 
@@ -451,7 +451,7 @@ impl WarmRegistry {
         inner.idle_total += 1;
         // Pressure check AFTER pooling: the just-released instance is a
         // candidate like any other (its score is ~0 — no grace period
-        // needed, the idleTime factor already protects it; see #66).
+        // needed, the idleTime factor already protects it).
         inner.pressure_pass(rss_sample, self.warm_budget_bytes);
     }
 
@@ -473,7 +473,7 @@ impl WarmRegistry {
         }
     }
 
-    /// Snapshot the registry for the `Stats` frame (#65).
+    /// Snapshot the registry for the `Stats` frame.
     pub fn stats(&self) -> RegistryStats {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let mut warm_busy = 0;
@@ -510,7 +510,7 @@ impl WarmRegistry {
     }
 }
 
-/// Drop the highest-scored idle instance across ALL prefixes (#66):
+/// Drop the highest-scored idle instance across ALL prefixes:
 /// `heapUsed × idleTime`, ties to the longest-idle — `policy::pick_victim`
 /// decides, this function only gathers facts and performs. Returns false
 /// when nothing is idle. The single victim-picking path: every eviction

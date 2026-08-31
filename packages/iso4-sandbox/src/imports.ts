@@ -8,7 +8,7 @@
  *   object  → host module:   walked recursively and lowered to a plain data
  *                            tree (`HostModuleNodePayload`). The Rust runtime
  *                            builds the module natively from that shape — the
- *                            client never generates sandbox source (#37).
+ *                            client never generates sandbox source.
  *
  * Dispatch mechanism — location-addressed handlers:
  *

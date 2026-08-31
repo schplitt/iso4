@@ -1,8 +1,8 @@
 /**
- * Execution-model stress smoke (#67) — the permanent CI regression guard
- * distilled from the #60 loop-under-load repro.
+ * Execution-model stress smoke — the permanent CI regression guard
+ * distilled from the loop-under-load crash repro.
  *
- * #60's crash (concurrent snapshot creation racing V8's process-shared
+ * The original crash (concurrent snapshot creation racing V8's process-shared
  * read-only heap) was resolved by REMOVING runtime snapshots, not by
  * locking. These tests pin the invariants the warm execution model must
  * hold under concurrent load, so a future change that reintroduces shared
@@ -23,8 +23,8 @@ import { createSandbox } from '../src/index.js'
 
 const COUNTER = 'let n = 0\nexport function bump() { return ++n }'
 
-describe('stress smoke: execution model under concurrent load (#67)', () => {
-  test('concurrent prepare() calls all succeed (the #60 crash vector)', async () => {
+describe('stress smoke: execution model under concurrent load', () => {
+  test('concurrent prepare() calls all succeed (the historic crash vector)', async () => {
     // Concurrent precompiles on separate pool connections were exactly what
     // segfaulted the child under V8 14.7. prepare() no longer creates
     // snapshots; this pins that it stays safe to call concurrently.
@@ -86,7 +86,7 @@ describe('stress smoke: execution model under concurrent load (#67)', () => {
     // memoryBudgetMb: 8 pins RSS over the hard mark, so the registry rejects
     // pooling while concurrent calls keep demanding instances — admission
     // and eviction race constantly. Calls must still all succeed, and state
-    // must never leak between the cold instances (#66 contract: correctness
+    // must never leak between the cold instances (contract: correctness
     // never depends on warmth).
     await using pressured = await createSandbox({ maxIsolates: 2, memoryBudgetMb: 8 })
     const prefixes = await Promise.all(
@@ -116,7 +116,7 @@ describe('stress smoke: execution model under concurrent load (#67)', () => {
   })
 
   test('queue saturation: 32 concurrent calls on one slot all complete', async () => {
-    // Saturation queues FIFO with no knobs (#65); the guard is that a deep
+    // Saturation queues FIFO with no knobs; the guard is that a deep
     // queue drains completely — no starvation, no dropped calls — and that
     // stats() keeps answering from its control connection mid-saturation.
     await using single = await createSandbox({ maxIsolates: 1 })

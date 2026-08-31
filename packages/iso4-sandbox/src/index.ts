@@ -123,7 +123,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const brandKey = brandKeyForToken(descriptorToken)
 
   // The runtime needs exactly one capacity fact: the warm budget in bytes,
-  // the RSS mark it sheds against (#66). Concurrency is bounded by this
+  // the RSS mark it sheds against. Concurrency is bounded by this
   // host's connection pool; there is no instance-count cap (celld's
   // stance — their resident ceiling defaults to unlimited).
   const proc = spawn(binaryPath, [
@@ -183,7 +183,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     // rather than holding a fixed set of slots (see `pool.ts`).
     const pool = new ConnectionPool(clients, connect)
 
-    // Dedicated control connection for `stats()` (#65): it never enters the
+    // Dedicated control connection for `stats()`: it never enters the
     // pool, so a capacity snapshot answers even while every run slot is busy —
     // exactly when it is most wanted.
     let statsClient: RuntimeIpcClient
@@ -209,7 +209,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
 
 /**
  * The warm budget in bytes — the ONE capacity fact the runtime needs
- * (#66, celld's model): the RSS mark it sheds against, `0` = disabled.
+ * (celld's model): the RSS mark it sheds against, `0` = disabled.
  * Independent of `memoryMb`: RSS is measured, not derived from per-isolate
  * caps, so an uncapped-heap sandbox is budgeted all the same.
  * @param memoryBudgetMb the explicit budget knob (`0` opts out of
@@ -313,7 +313,7 @@ async function waitForSocket(
  * is retained for backward compatibility; `reason` carries whatever was passed
  * to `abort(reason)`.
  *
- * When graceful termination (#36) succeeds, Rust sends a real `ERR_ABORTED`
+ * When graceful termination succeeds, Rust sends a real `ERR_ABORTED`
  * Result and `from` carries its telemetry — duration, CPU time, bridge records,
  * and any logs produced before the abort landed — which is grafted onto the
  * aborted shape. When it falls back to socket teardown (or the signal was
@@ -330,7 +330,7 @@ async function waitForSocket(
  */
 /**
  * Map a decoded `RunComplete` frame to the public {@link WaitUntilResult},
- * synthesizing a truncated report when the connection died mid-grace (#71).
+ * synthesizing a truncated report when the connection died mid-grace.
  * @param report the decoded frame, or `undefined` on connection loss
  */
 function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilResult {
@@ -401,7 +401,7 @@ class SandboxImpl implements Sandbox {
   private readonly statsClient: RuntimeIpcClient
   private readonly socketPath: string
   /**
-   * Uniform per-isolate heap cap (#64), set once at `createSandbox` and
+   * Uniform per-isolate heap cap, set once at `createSandbox` and
    * injected into every frame's limits — the wire still carries `memoryMb`
    * per run, this is simply the only writer. `undefined` defers to the
    * runtime default (128 MB).
@@ -470,7 +470,7 @@ class SandboxImpl implements Sandbox {
     if (options.limits !== undefined && 'memoryMb' in options.limits) {
       throw new TypeError(
         '[@iso4/sandbox] limits.memoryMb was removed: the heap cap is uniform '
-        + 'per Runtime and baked into each isolate at creation (#64) — set it '
+        + 'per Runtime and baked into each isolate at creation — set it '
         + 'once via createSandbox({ memoryMb }) instead',
       )
     }
@@ -510,11 +510,11 @@ class SandboxImpl implements Sandbox {
         const decoded = call === undefined
           ? decodeRunCompletionPayload(raw.result).result
           : decodeRunCompletionPayload(raw.result, 'call').result
-        // waitUntil (#71): the value arrived early; hand the caller the grace
+        // waitUntil: the value arrived early; hand the caller the grace
         // outcome as a never-rejecting promise.
         if (raw.epilogue !== undefined && decoded.ok)
           decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
-        // Graceful terminate (#36): a run whose signal aborted and whose Rust
+        // Graceful terminate: a run whose signal aborted and whose Rust
         // Result carries ERR_ABORTED is a deliberate abort, not a failure —
         // remap to `status: 'aborted'` with the abort reason, keeping the real
         // telemetry Rust reported.
@@ -690,7 +690,7 @@ implements Prefix<G, M> {
   private readonly defaultImportHandlers: ImportHandlerMap
   /**
    * The sandbox-level uniform heap cap — see `SandboxImpl.memoryMb`. Warm
-   * instances (#64) are created with this cap; per-run values no longer
+   * instances are created with this cap; per-run values no longer
    * exist (the cap is baked into the isolate at creation).
    */
   private readonly memoryMb: number | undefined
@@ -800,7 +800,7 @@ implements Prefix<G, M> {
     if (options.limits !== undefined && 'memoryMb' in options.limits) {
       throw new TypeError(
         '[@iso4/sandbox] limits.memoryMb was removed: the heap cap is uniform '
-        + 'per Runtime and baked into each isolate at creation (#64) — set it '
+        + 'per Runtime and baked into each isolate at creation — set it '
         + 'once via createSandbox({ memoryMb }) instead',
       )
     }
@@ -858,7 +858,7 @@ implements Prefix<G, M> {
         const decoded = payload.call === undefined
           ? decodeRunCompletionPayload(raw.result).result
           : decodeRunCompletionPayload(raw.result, 'call').result
-        // waitUntil (#71) — see the note in SandboxImpl.run.
+        // waitUntil — see the note in SandboxImpl.run.
         if (raw.epilogue !== undefined && decoded.ok)
           decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
         // See the note in SandboxImpl.run — remap a graceful ERR_ABORTED Result

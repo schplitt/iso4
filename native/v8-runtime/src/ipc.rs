@@ -66,7 +66,7 @@ pub enum TsToRustMessageType {
     BridgeResponse = 0x06,
     /// Force-stop a running isolate.
     Terminate = 0x07,
-    /// Request a capacity/usage snapshot (#65). Empty payload; answered
+    /// Request a capacity/usage snapshot. Empty payload; answered
     /// with a `StatsResult` frame.
     Stats = 0x08,
 }
@@ -90,10 +90,10 @@ pub enum RustToTsMessageType {
     /// Handshake acknowledgement — the first frame sent on a new connection,
     /// answering `Authenticate`.
     Hello = 0x05,
-    /// Capacity/usage snapshot answering a `Stats` request (#65).
+    /// Capacity/usage snapshot answering a `Stats` request.
     StatsResult = 0x06,
     /// Final frame of a run whose Result reported pending background work
-    /// (#71): carries the `waitUntil` epilogue's outcome and telemetry, and
+    ///: carries the `waitUntil` epilogue's outcome and telemetry, and
     /// releases the run's connection slot.
     RunComplete = 0x07,
 }
@@ -406,7 +406,7 @@ pub const DEFAULT_MAX_STDOUT_BYTES: u32 = 1024 * 1024;
 pub const DEFAULT_MAX_STDERR_BYTES: u32 = 1024 * 1024;
 pub const DEFAULT_MAX_BRIDGE_CALL_BYTES: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_BRIDGE_CALLS: u32 = 10;
-/// Grace budget for `waitUntil` background work after the Result frame (#71),
+/// Grace budget for `waitUntil` background work after the Result frame,
 /// Cloudflare's number. Zero disables the epilogue entirely.
 pub const DEFAULT_GRACE_MS: u32 = 30_000;
 
@@ -429,7 +429,7 @@ pub struct ResourceLimits {
     /// per run. Zero means no limit.
     pub max_bridge_calls: u32,
     /// Wall budget for `waitUntil` background work after the Result frame
-    /// (#71). Zero disables the epilogue: registered work dies at settle.
+    ///. Zero disables the epilogue: registered work dies at settle.
     pub grace_ms: u32,
 }
 
@@ -455,9 +455,9 @@ impl Default for ResourceLimits {
 /// runtime installs it natively. Mirrors `GlobalDefPayload` on the TS side
 /// (`ipc.ts`); see `docs/protocol.md` §5.2.
 /// Every variant carries `enumerable`: whether the installed public name
-/// shows up in `for...in` / `Object.keys` (#123). Host shorthands always send
+/// shows up in `for...in` / `Object.keys`. Host shorthands always send
 /// `true`; the object global forms may opt out. Runtime-internal names
-/// (`__iso4_*`) install non-enumerable regardless (#84).
+/// (`__iso4_*`) install non-enumerable regardless.
 #[derive(Debug, Clone)]
 pub enum HostGlobalDef {
     /// A plain host function — installed as a bridge stub under `name`.
@@ -500,7 +500,7 @@ impl HostGlobalDef {
         }
     }
 
-    /// Whether the installed public name is enumerable (#123).
+    /// Whether the installed public name is enumerable.
     pub fn enumerable(&self) -> bool {
         match self {
             HostGlobalDef::Bridge { enumerable, .. }
@@ -568,7 +568,7 @@ pub struct ImportRebind {
 }
 
 /// A host → sandbox function call requested by a `Run` / `PrefixRun` frame
-/// (#58). `export_path` addresses a callable relative to the module's exports
+///. `export_path` addresses a callable relative to the module's exports
 /// (`"named"`, `"default.fetch"`); `args_blob` is **one** V8 serialization
 /// blob holding an array of arguments — the same convention as `BridgeCall`
 /// args, identity between arguments preserved.
