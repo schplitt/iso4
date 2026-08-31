@@ -350,7 +350,7 @@ describe('payload encoders', () => {
     expect(readU32BE(buf, 0)).toBe(3) // runId
     const { value: prefixId, end } = readString(buf, 4)
     expect(prefixId).toBe('42')
-    expect(buf[end]).toBe(1) // code: present (Optional<String> since #58)
+    expect(buf[end]).toBe(1) // code: present (Optional<String>)
     const { value: code } = readString(buf, end + 1)
     expect(code).toBe('y')
     expect(buf[buf.byteLength - 1]).toBe(0) // call: absent

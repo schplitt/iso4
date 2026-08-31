@@ -78,7 +78,7 @@ describe('processGlobals', () => {
     })
   })
 
-  describe('object forms with enumerable (#123)', () => {
+  describe('object forms with enumerable', () => {
     it('bridge object form carries the handler and the flag', () => {
       const handler: HostExportFunction = async () => 1
       const { defs, dispatch } = processGlobals({

@@ -53,7 +53,7 @@
 //! which is what makes this split possible.
 //!
 //! There is no startup-snapshot coupling anymore: runtime snapshot creation
-//! was removed (#60/#61 — V8 14.x cannot create snapshots safely in a live
+//! was removed (V8 14.x cannot create snapshots safely in a live
 //! multi-isolate process), so the classes are installed fresh into every
 //! context and no external-references table exists. If snapshots ever return
 //! (e.g. via a public `IsolateGroup` API), the table must come back with
@@ -302,10 +302,10 @@ fn exception_text(
 /// Startup cost: this source is compiled and evaluated into every fresh
 /// context. Deno avoids that by precompiling its JS runtime into a build-time
 /// V8 snapshot, and that stays on the table for static sources like this one
-/// (what #60/#61 removed was *runtime* snapshot creation of live prefix state
+/// (what was removed was *runtime* snapshot creation of live prefix state
 /// in a multi-isolate process). A build-time snapshot must carry the
 /// external-references table for every native callback above (see module
-/// docs); the nearer-term step is the process-wide code cache tracked in #83.
+/// docs); the nearer-term step is a process-wide code cache.
 const RUNTIME_JS: &str = include_str!("webtypes.js");
 
 // ── Adapter ──────────────────────────────────────────────────────────────────

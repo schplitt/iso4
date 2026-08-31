@@ -767,7 +767,7 @@ mod tests {
         // Type identity is the construction-time private stamp and the class
         // references captured at install(), so neither serializing nor
         // deserializing depends on what guest code did to `globalThis`.
-        // (Before #95, deleting Response made an intact Response unserializable
+        // (Previously, deleting Response made an intact Response unserializable
         // and rewiring the prototype came from the guest-visible class.)
         let out = round_trip(
             "(() => { const r = new Response('x', { status: 201 }); \

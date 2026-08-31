@@ -1,5 +1,5 @@
 /**
- * Capacity manager acceptance tests (#65/#66).
+ * Capacity manager acceptance tests.
  *
  * Two independent resources, two knobs: `maxIsolates` caps concurrent runs
  * (the connection pool, unchanged), `memoryBudgetMb` is the ONE memory
@@ -34,10 +34,10 @@ const SLOW = `export function slow(ms) {
   return 1
 }`
 
-describe('memory budget → live-isolate cap (#65)', () => {
+describe('memory budget → live-isolate cap', () => {
   test('idle instances outlive the run-slot count under the default budget', async () => {
     // One run slot, but the budget-derived live cap (machine memory minus
-    // the safety net) keeps BOTH prefixes resident — the #64 model would
+    // the safety net) keeps BOTH prefixes resident — the old slot model would
     // have evicted A to warm B.
     await using single = await createSandbox({ maxIsolates: 1 })
     await using prefixA = await single.prepare({ code: COUNTER })
@@ -56,10 +56,10 @@ describe('memory budget → live-isolate cap (#65)', () => {
     expect(a2.value).toBe(2)
   })
 
-  test('a healthy explicit budget keeps every prefix resident (#66)', async () => {
+  test('a healthy explicit budget keeps every prefix resident', async () => {
     // Memory, not instance count, decides how much stays warm: with RSS
     // far below the soft mark of a generous budget, warming a third prefix
-    // evicts nothing — under #65's count model (256 ÷ 128 = 2 slots) prefix
+    // evicts nothing — under the old count model (256 ÷ 128 = 2 slots) prefix
     // C would have displaced A here.
     await using sandbox = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 4096 })
     await using prefixA = await sandbox.prepare({ code: COUNTER })
@@ -83,7 +83,7 @@ describe('memory budget → live-isolate cap (#65)', () => {
     expect(stats.underPressure).toBe(false)
   })
 
-  test('hard memory pressure degrades prefix runs to cold isolates (#66)', async () => {
+  test('hard memory pressure degrades prefix runs to cold isolates', async () => {
     // A budget far below the process's real footprint pins RSS over the
     // hard mark from the first sample: nothing may be pooled, every prefix
     // run gets a fresh cold isolate — calls still succeed, state resets
@@ -111,7 +111,7 @@ describe('memory budget → live-isolate cap (#65)', () => {
     expect(stats.rssBytes).toBeGreaterThan(8 * 1024 * 1024)
   })
 
-  test('memoryBudgetMb works with uncapped isolates (#66)', async () => {
+  test('memoryBudgetMb works with uncapped isolates', async () => {
     // Under the count model this combination threw (no per-isolate cap to
     // divide by). RSS is measured, not derived, so the budget now applies
     // regardless of memoryMb.
@@ -172,7 +172,7 @@ describe('memory budget → live-isolate cap (#65)', () => {
       const stats = await sandbox.stats()
       const totalMb = totalmem() / (1024 * 1024)
       // The default budget must be clamped to the host total, not the
-      // sentinel; stats reports it in bytes since #66.
+      // sentinel; stats reports it in bytes.
       const expected = Math.floor(totalMb - Math.max(512, totalMb * 0.25)) * 1024 * 1024
       expect(stats.budgetBytes).toBe(expected)
     } finally {
@@ -184,7 +184,7 @@ describe('memory budget → live-isolate cap (#65)', () => {
     // Pretend the process runs in a 2 GB container: constrainedMemory()
     // reports the cgroup limit os.totalmem() cannot see. Budget = 2048 minus
     // the max(512 MB, 25 %) safety net = 1536 MB — the RSS mark the runtime
-    // sheds against (#66).
+    // sheds against.
     const constrained = vi
       .spyOn(process, 'constrainedMemory')
       .mockReturnValue(2 * 1024 * 1024 * 1024)
@@ -198,7 +198,7 @@ describe('memory budget → live-isolate cap (#65)', () => {
   })
 })
 
-describe('saturation queues FIFO (#65)', () => {
+describe('saturation queues FIFO', () => {
   test('a queued call waits for the busy slot and then runs', async () => {
     // No queue knobs, deliberately: saturation always queues, and the wait
     // is bounded in practice because every run has wall/CPU limits.
@@ -221,7 +221,7 @@ describe('saturation queues FIFO (#65)', () => {
   })
 })
 
-describe('stats() (#65)', () => {
+describe('stats()', () => {
   test('reports idle warm instances and their measured heap', async () => {
     await using sandbox = await createSandbox({ maxIsolates: 2 })
     await using prefix = await sandbox.prepare({ code: COUNTER })
@@ -234,7 +234,7 @@ describe('stats() (#65)', () => {
     expect(stats.warmInstances).toBe(1)
     expect(stats.idleInstances).toBe(1)
     expect(stats.idleHeapBytes).toBeGreaterThan(0)
-    // #66: the watermark signal is visible — the mark, a real RSS reading,
+    // The watermark signal is visible — the mark, a real RSS reading,
     // and no pressure with a healthy default budget on an idle sandbox.
     expect(stats.budgetBytes).toBeGreaterThan(0)
     expect(stats.rssBytes).toBeGreaterThan(1024 * 1024)

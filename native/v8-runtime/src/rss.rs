@@ -1,4 +1,5 @@
-//! Process RSS (resident set size) — the memory-pressure signal for #66.
+//! Process RSS (resident set size) — the memory-pressure signal the warm
+//! budget acts on.
 //!
 //! Read in THIS process: the watermarks compare the runtime's own footprint
 //! against the warm budget (Node's `process.memoryUsage().rss` would measure

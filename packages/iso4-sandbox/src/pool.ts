@@ -11,7 +11,7 @@
  * is dropped, not replaced on the spot. Capacity is a number, so the drop frees
  * a unit of it and the next caller that needs a connection opens one. That is
  * why a failed connect fails a *run* rather than permanently costing the pool a
- * slot. Removing the fixed slot set entirely is #89.
+ * slot. Removing the fixed slot set entirely is a planned pool rework.
  */
 
 import { RunAbortedError } from './client'
@@ -163,7 +163,7 @@ export class ConnectionPool {
   }
 
   private release(client: RuntimeIpcClient): void {
-    // A run that ended with pending waitUntil work (#71) still owns its
+    // A run that ended with pending waitUntil work still owns its
     // connection: grace-time bridge frames and the final RunComplete belong
     // to it. Hold the slot until the epilogue settles, then release for real.
     const hold = client.pendingEpilogue

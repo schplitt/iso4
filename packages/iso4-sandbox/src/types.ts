@@ -105,7 +105,7 @@ export interface ResourceLimits {
 
   /**
    * Wall budget in milliseconds for `waitUntil` background work after the
-   * run's value has been delivered (#71). One budget for the whole registered
+   * run's value has been delivered. One budget for the whole registered
    * set, started when the result ships. Grace work additionally gets a fresh
    * CPU allotment sized like `cpuTimeMs`. `0` disables the grace phase
    * entirely: registered work dies when the value settles.
@@ -512,7 +512,7 @@ export interface SandboxOptions {
    *
    * This caps *concurrent runs* only. How many isolates stay resident
    * (warm instances included) is the memory budget's job — see
-   * `memoryBudgetMb`. There is no instance-count cap of any kind (#66), so
+   * `memoryBudgetMb`. There is no instance-count cap of any kind, so
    * idle warm instances may outnumber the slots here, or fall below them
    * under memory pressure.
    *
@@ -527,7 +527,7 @@ export interface SandboxOptions {
    * larger than its own memory budget).
    *
    * Uniform across ALL isolates of this Sandbox and settable only here —
-   * never per run or per prefix (#64). The cap is baked into the isolate at
+   * never per run or per prefix. The cap is baked into the isolate at
    * creation, and prefix runs reuse warm isolates, so a per-run value is
    * structurally impossible; a uniform cap also keeps capacity math simple
    * (slots × cap). Memory accumulates across calls on a warm instance —
@@ -539,7 +539,7 @@ export interface SandboxOptions {
   memoryMb?: number
 
   /**
-   * The runtime's memory mark, in megabytes (#66 — celld's model, one
+   * The runtime's memory mark, in megabytes (celld's model, one
    * mark). The runtime watches its own process RSS against it: at/above
    * the mark it evicts idle warm instances by `heapUsed × idleTime` score
    * (highest first) AND stops pooling new instances — prefix runs without
@@ -577,7 +577,7 @@ export interface SandboxOptions {
 }
 
 /**
- * A point-in-time capacity/usage snapshot from `sandbox.stats()` (#65).
+ * A point-in-time capacity/usage snapshot from `sandbox.stats()`.
  * The runtime-side numbers are mutually consistent (taken under one
  * registry lock); `queueDepth` is a separate host-side read taken after
  * the round trip. All of it is stale the moment it returns —
@@ -620,7 +620,7 @@ export interface SandboxStats {
    */
   rssBytes: number
   /**
-   * True while the runtime is shedding (#66): RSS reached the budget and
+   * True while the runtime is shedding: RSS reached the budget and
    * has not yet fallen back to 80 % of it. While shedding, idle instances
    * are evicted by score and new warm admissions stop (prefix runs without
    * an idle instance degrade to cold one-off isolates).
@@ -706,7 +706,7 @@ export interface Sandbox {
   ) => Promise<Prefix<G, M>>
 
   /**
-   * A point-in-time capacity/usage snapshot (#65): active runs, queue
+   * A point-in-time capacity/usage snapshot: active runs, queue
    * depth, warm-instance counts and their measured memory. Served over a
    * dedicated control connection, so it answers even while every run slot
    * is busy. See {@link SandboxStats}.
@@ -782,7 +782,7 @@ export interface PrecompileOptions<
    * **Currently a no-op placeholder.** Pass limits directly to each
    * `prefix.run()` call. The one budget that DOES apply here is not
    * configurable: prefix evaluation runs under the fixed warm-up budget
-   * (1 s wall / 1 s CPU, #64) — a prefix that cannot evaluate inside it is
+   * (1 s wall / 1 s CPU) — a prefix that cannot evaluate inside it is
    * rejected with `ERR_WARMUP_LIMIT` at `prepare()` time, because it could
    * never cold-start a warm instance either.
    */
@@ -802,7 +802,7 @@ export interface PrecompileOptions<
  * declared global's implementation per run, but you cannot add names that
  * were not declared at precompile time.
  *
- * **Warm instances (#64).** Runs on a prefix are served by resident
+ * **Warm instances.** Runs on a prefix are served by resident
  * isolates: the first run cold-starts one (prefix evaluated once, under the
  * fixed warm-up budget), later runs reuse it and skip isolate boot and
  * prefix re-evaluation. Warmth is a cache, never a guarantee — module-scope
@@ -935,7 +935,7 @@ export interface PrefixCallOptions<
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Host → sandbox calls (#58)
+// Host → sandbox calls
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -1056,12 +1056,12 @@ export interface CallSuccess {
   bridgeCalls: BridgeCallEntry[]
   /**
    * `used_heap_size` of the isolate that served this call, measured after
-   * the call settled (#64). Reported for prefix calls (warm instances);
+   * the call settled. Reported for prefix calls (warm instances);
    * `undefined` for one-off `sandbox.run({ call })`.
    */
   heapUsedBytes?: number
   /**
-   * Present when the call registered background work with `waitUntil` (#71) —
+   * Present when the call registered background work with `waitUntil` —
    * see {@link RunSuccess.waitUntil}. Never rejects.
    */
   waitUntil?: Promise<WaitUntilResult>
@@ -1119,7 +1119,7 @@ export interface BridgeCallEntry {
 }
 
 /**
- * Outcome of a run's `waitUntil` grace phase (#71), delivered through
+ * Outcome of a run's `waitUntil` grace phase, delivered through
  * {@link RunSuccess.waitUntil} / {@link CallSuccess.waitUntil}. The promise
  * always **resolves** (never rejects), so ignoring it — the intended common
  * case — produces no unhandled-rejection noise.
@@ -1170,7 +1170,7 @@ export interface RunSuccess {
   /**
    * Export names absent from `exports` because their value cannot cross the
    * boundary — a function (`export default { fetch }`), a Promise, or a value
-   * whose serialization failed. Skipping is never fatal (#58); the names are
+   * whose serialization failed. Skipping is never fatal; the names are
    * reported here so nothing is silently hidden.
    *
    * A Promise is skipped **whatever its state**: the export path never awaits,
@@ -1211,13 +1211,13 @@ export interface RunSuccess {
   bridgeCalls: BridgeCallEntry[]
   /**
    * `used_heap_size` of the isolate that served this run, measured after the
-   * run settled (#64). Reported for prefix runs — warm instances keep their
+   * run settled. Reported for prefix runs — warm instances keep their
    * heap between calls, and this number feeds eviction. `undefined` for
    * one-off `sandbox.run()` runs, whose isolate is disposed with the run.
    */
   heapUsedBytes?: number
   /**
-   * Present when the run registered background work with `waitUntil` (#71):
+   * Present when the run registered background work with `waitUntil`:
    * the value in this result was delivered early, the work keeps running
    * runtime-side, and this promise resolves with the grace phase's outcome
    * once it ends. `undefined` for every run that registered nothing. Safe to
@@ -1237,7 +1237,7 @@ export interface RunFailure {
   bridgeCalls: BridgeCallEntry[]
   /**
    * `used_heap_size` of the isolate that served this run, measured after the
-   * run settled (#64). Reported for prefix runs — warm instances keep their
+   * run settled. Reported for prefix runs — warm instances keep their
    * heap between calls, and this number feeds eviction. `undefined` for
    * one-off `sandbox.run()` runs, whose isolate is disposed with the run.
    */
@@ -1262,7 +1262,7 @@ export interface RunAborted {
   cpuTimeMs: number
   /**
    * Bridge calls recorded before the abort landed. Populated when the runtime
-   * terminates gracefully (#36) — the common case, where the run was suspended
+   * terminates gracefully — the common case, where the run was suspended
    * awaiting a bridge response. Empty (and `durationMs`/`cpuTimeMs` zero) only
    * when graceful termination falls back to socket teardown — e.g. a run
    * aborted while stuck in a tight synchronous loop, or a signal already
@@ -1346,7 +1346,7 @@ export type RunErrorCode
     /**
      * Warm-up (prefix evaluation + per-instance runtime installs) exceeded its fixed budget
      * (1 s wall / 1 s CPU — not configurable; Cloudflare's script-startup
-     * model, #64). Enforced at `prepare()` and again at every instance
+     * model). Enforced at `prepare()` and again at every instance
      * cold-start. Move expensive setup into the handler: lazy init on first
      * call runs under that call's budget and survives warm reuse.
      */

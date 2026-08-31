@@ -47,7 +47,7 @@ export interface RuntimeIpcClientOptions {
 export interface RawRunResult {
   result: Uint8Array
   /**
-   * Present when the Result reported pending `waitUntil` work (#71): the run
+   * Present when the Result reported pending `waitUntil` work: the run
    * continues runtime-side and this settles when its `RunComplete` frame
    * arrives — `undefined` on connection loss. The pool defers reusing the
    * connection until then ({@link RuntimeIpcClient.pendingEpilogue}).
@@ -73,7 +73,7 @@ export type { ResourceLimits }
 
 /**
  * How long TS waits for Rust's graceful `ERR_ABORTED` Result after sending a
- * `Terminate` frame, before falling back to tearing the connection down (#36).
+ * `Terminate` frame, before falling back to tearing the connection down.
  *
  * The common case — a run suspended awaiting a bridge response — has the Rust
  * V8 thread parked on a socket read, so it consumes the `Terminate` and replies
@@ -158,7 +158,7 @@ export class RuntimeIpcClient {
   private broken = false
 
   /**
-   * Settles when the in-flight `waitUntil` epilogue (#71) ends. The pool
+   * Settles when the in-flight `waitUntil` epilogue ends. The pool
    * defers reusing this connection until then — grace-time frames belong to
    * the finished run, not the next one. `null` when no epilogue is running.
    */
@@ -466,7 +466,7 @@ export class RuntimeIpcClient {
   }
 
   /**
-   * Request the runtime's capacity/usage snapshot (#65). Empty request
+   * Request the runtime's capacity/usage snapshot. Empty request
    * payload; the reply is one `StatsResult` frame. Sent on the sandbox's
    * dedicated control connection so it never queues behind runs.
    */
@@ -540,7 +540,7 @@ export class RuntimeIpcClient {
    * continue to completion. Rust silently ignores any late `BridgeResponse`
    * that arrives after the run has completed (see session.rs).
    *
-   * ── In-flight abort (graceful terminate, #36) ─────────────────────────────
+   * ── In-flight abort (graceful terminate) ──────────────────────────────────
    * When `signal` fires mid-run — including while a bridge call is in flight —
    * we first ask Rust to stop gracefully: send a `Terminate` frame (carrying
    * `runId`) and keep draining, leaving the socket open. In the common case the
@@ -660,7 +660,7 @@ export class RuntimeIpcClient {
   }
 
   /**
-   * Keep draining this connection after an early Result (#71) until the run's
+   * Keep draining this connection after an early Result until the run's
    * `RunComplete` frame arrives, dispatching grace-time bridge calls exactly
    * like the run's own loop. Never throws: a lost connection (or a desync)
    * resolves `undefined` and the caller synthesizes a truncated report —
@@ -741,7 +741,7 @@ export class RuntimeIpcClient {
   /**
    * Handle one `BridgeCall` frame: decode, dispatch to the host handler
    * (fire-and-forget), and answer decode/dispatch failures inline. Shared by
-   * the run's frame loop and the `waitUntil` epilogue loop (#71).
+   * the run's frame loop and the `waitUntil` epilogue loop.
    * @param payload the frame payload
    * @param dispatcher the run's bridge dispatcher
    * @param runId the run the frame belongs to

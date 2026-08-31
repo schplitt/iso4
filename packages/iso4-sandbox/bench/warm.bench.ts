@@ -1,7 +1,7 @@
 /**
  * Warm-path benchmarks: `prefix.call()` latency and same-prefix throughput.
  *
- * These are the numbers the warm-isolate registry (#64) is meant to move —
+ * These are the numbers the warm-isolate registry is meant to move —
  * today every call pays isolate boot + prefix re-evaluation + teardown; a
  * warm instance skips all three. Run once before and once after on the same
  * idle machine for the A/B.

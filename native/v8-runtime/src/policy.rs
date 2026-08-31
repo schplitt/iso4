@@ -1,11 +1,11 @@
-//! Eviction and memory-pressure policy (#66): pure decision functions.
+//! Eviction and memory-pressure policy: pure decision functions.
 //!
 //! Every function here takes its facts as parameters and returns a verdict —
 //! no clock reads, no RSS reads, no registry access. `warm.rs` gathers the
 //! facts under its lock, calls in, and performs what comes back. That split
 //! keeps the acceptance tests plain unit tests (a hand-written fact slice in,
 //! an assertion on the verdict out) and makes the rules replaceable, which
-//! #77's acquire policy will rely on. Pattern reference: denoland/celld
+//! a future prefix-aware acquire policy will rely on. Pattern reference: denoland/celld
 //! `crates/logic` (`pressure.rs` for the watermark mechanics).
 //!
 //! The pressure model is celld's, whole (decided 2026-08-14): ONE mark.
@@ -19,7 +19,7 @@
 //! ceiling to `usize::MAX`; a default count cap caused them eviction
 //! churn) and no grace period after last use — the `heapUsed × idleTime`
 //! score already sends a just-used instance to the back of every pass
-//! (recorded on #66; celld sheds in plain LRU order for the same reason).
+//! (celld sheds in plain LRU order for the same reason).
 
 use std::time::Instant;
 

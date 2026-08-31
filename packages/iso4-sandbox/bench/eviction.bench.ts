@@ -1,8 +1,8 @@
 /**
- * Eviction-path benchmarks (#67): what a call costs when warmth is NOT there.
+ * Eviction-path benchmarks: what a call costs when warmth is NOT there.
  *
  * Together with `warm.bench.ts` (the warm hit) and `runtime.bench.ts`
- * (one-off and full cold start), this completes the issue-#67 matrix:
+ * (one-off and full cold start), this completes the cold-path matrix:
  *
  *   warm hit            — warm.bench.ts `call latency`
  *   one-off run         — runtime.bench.ts `hot run / direct`

@@ -265,7 +265,7 @@ Every call to `runtime.run(opts)`:
   maxStdoutBytes: 1 * 1024 * 1024,          // console.log lines; over-limit lines silently dropped
   maxStderrBytes: 1 * 1024 * 1024,          // console.warn/error lines; same truncation rule
   maxBridgeCalls: 10,                       // 0 = unlimited; default 10 protects against runaway loops
-  graceMs: 30_000,                          // waitUntil background-work budget after the result ships; 0 disables (#71)
+  graceMs: 30_000,                          // waitUntil background-work budget after the result ships; 0 disables
 }
 ```
 
@@ -338,7 +338,8 @@ Hardening from the pre-merge security review: the grace loop waits in
 ~250 ms ticks, so a CPU-killed background task frees the connection slot
 within a quarter second instead of holding it for the rest of `graceMs` (a
 slot is only held long-term by work that is genuinely still running — freeing
-it during live grace requires the run-tagged post-Result frames #96 designs,
+it during live grace requires the run-tagged post-Result frames the
+streaming design introduces,
 recorded there as a requirement). The aggregate is driven by the pristine
 `Promise.allSettled` captured into a private slot before any guest code runs,
 so tampering with the public one changes nothing. The rejection text carried
@@ -385,7 +386,8 @@ names is rejected with `ERR_UNDECLARED_BINDING`. Allowing a host to shadow
 > `Request`, `Response`, `TextEncoder`, `TextDecoder`, `URL` and
 > `URLSearchParams` are now installed by the runtime (see §4.4 below);
 > `crypto`, `Event`, `AbortController` and `AbortSignal` still do not exist
-> and are **not** reserved. `waitUntil` joined the reserved list with #71.
+> and are **not** reserved. `waitUntil` joined the reserved list with the
+> grace-phase feature.
 
 Any name **not** on that reserved list may be provided by the host as a
 global. The host passes `globals: { fetch: fn, myTool: fn, transform: fn }`
@@ -403,7 +405,7 @@ they are statically greppable and cannot accidentally shadow a built-in.
 
 Host-provided globals are **enumerable by default**, the way browsers keep
 `fetch` enumerable on `window`. The object global forms accept
-`enumerable: false` as a per-global opt-out (#123) — useful when an injected
+`enumerable: false` as a per-global opt-out — useful when an injected
 capability should not be swept up by enumeration-driven sandbox code; the
 bare-function and bare-string shorthands are always enumerable by design. The
 flag is stored with the prefix declaration, so the between-runs placeholder
@@ -474,7 +476,7 @@ value type is the discriminator:
   `import`s resolve back through the same map. Zero per-call bridge cost.
 - **Object value — host module.** The host provides a JS object whose
   shape becomes the module's exports. The client walks the object
-  recursively and ships the **shape as plain data** over the wire (#37):
+  recursively and ships the **shape as plain data** over the wire:
   function leaves as bare markers, data leaves as V8 value blobs, nested
   objects as trees. No JS source is ever generated from the data. The
   Rust runtime builds the module natively:
@@ -568,7 +570,7 @@ validates them against the shape stored with the prefix, returning
 shared with the undeclared-globals check, that a non-TS client cannot
 skip.
 
-#### Implementation note: how host modules are built (shape-as-data, #37)
+#### Implementation note: how host modules are built (shape-as-data)
 
 Two earlier iterations informed the current design:
 
@@ -709,7 +711,7 @@ exported. A call's return value is the exception and behaves the opposite
 way: `prefix.call()` awaits a returned Promise and gives you its value
 (§5.3).
 
-How a refusal surfaces depends on the position (#58):
+How a refusal surfaces depends on the position:
 
 - **Exports are skipped, never fatal.** An export whose value cannot cross —
   directly (`export default () => {}`) or nested
@@ -823,7 +825,7 @@ The result is _always_ an object; `status` (or the `ok` alias) discriminates.
 `run()` does not throw for sandboxed failures — only for infrastructure failures
 (e.g., the Rust process crashed).
 
-### 5.3 Host → sandbox calls (#58)
+### 5.3 Host → sandbox calls
 
 Bridge calls run sandbox → host. The call API is the other direction: invoke a
 function that already lives inside the sandbox, with real typed arguments, and
@@ -846,7 +848,7 @@ await prefix.call({ export: 'default.fetch', args: [request],
                     globals: { fetch: perRequestFetch } })
 ```
 
-The decided semantics (issue #58):
+The decided semantics:
 
 - **Addressing is always relative to the module's exports**, never
   `globalThis`: a top-level exported function (`"handler"`) or a method on an
@@ -885,7 +887,7 @@ The decided semantics (issue #58):
 This is a **capability, not a perf win** (recorded so it is not re-argued):
 against the pull-over-the-bridge baseline a call frame saves ~2 % of a
 request at every handler size measured. The warm-isolate roadmap (§13.2.1,
-#64–#67) later makes the same API fast without changing its shape.
+warm instances) later makes the same API fast without changing its shape.
 
 `sandbox.readExports({ code })` rounds out the deploy path: load a module
 once and read its declaration exports (IaC-style limits/connections), with
@@ -938,7 +940,7 @@ direction. Both tables start at `0x01`.
 | `0x05` | `DisposePrefix`  | Drop a stored prefix and its instances                                 |
 | `0x06` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                                      |
 | `0x07` | `Terminate`      | Abort a running run; Rust replies with an `ERR_ABORTED` result (§14.7) |
-| `0x08` | `Stats`          | Ask for a registry snapshot (empty payload, #65)                       |
+| `0x08` | `Stats`          | Ask for a registry snapshot (empty payload)                            |
 
 Next free TS → Rust byte: `0x09`.
 
@@ -1112,10 +1114,10 @@ warm instances, §13.2.1; the phase order is unchanged.)
 | 6 ✅   | Imports: source modules (Flavor B); host-supplied ESM strings compiled per-isolate. No separate code-cache LRU — the stored prefix is the cache.   | `import { add } from "lib:math"` works when the host declares the source     |
 | 7 ✅   | Imports: host modules — host provides a JS object; the shape crosses the wire as plain data and the Rust runtime builds the module natively (data leaves via the value codec, function leaves as trampolines dispatching `BridgeCall { targetKind: 1 }` with runtime-resolved names). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for arbitrarily-nested mixed data/function shapes; bridge records report `host:tools.search` with no client-side name resolution |
 | 8 ✅   | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
-| 9 ✅   | Resident warm instances per prefix — registry, taint-and-evict, memory budget, eviction scoring (epic #61; shipped as always-on, not behind an option — §13.2.1) | Sub-ms warm calls for high-throughput workloads                            |
+| 9 ✅   | Resident warm instances per prefix — registry, taint-and-evict, memory budget, eviction scoring (shipped as always-on, not behind an option — §13.2.1) | Sub-ms warm calls for high-throughput workloads                            |
 | 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |
 | 11    | **Sync bridge calls.** Per-leaf sync tag on the wire shape; the runtime builds a sync trampoline (`__iso4_call_sync`, blocks the isolate on UDS read) instead of the async one. Leaf classification + the opt-in-vs-auto policy question are covered in the §4.3 "sync function leaves" note. CPU budget bracketed; wall guard preempts via `terminate_execution`. | `import { readFileSync } from "host:fs"` works without `await`. Foundational for a future node-compat layer. |
-| 12    | ~~Native host-module binding.~~ Superseded by #37: host modules already cross as data and are built natively by the runtime, which owns the handle table and emits `BridgeCall { targetKind: 1 }` with resolved names. Full synthetic modules remain deliberately unused (native evaluation-steps pointers would need external-reference bookkeeping to survive prefix snapshots). | — |
+| 12    | ~~Native host-module binding.~~ Superseded: host modules already cross as data and are built natively by the runtime, which owns the handle table and emits `BridgeCall { targetKind: 1 }` with resolved names. Full synthetic modules remain deliberately unused (native evaluation-steps pointers would need external-reference bookkeeping to survive prefix snapshots). | — |
 | 13    | **Callable handles for return values.** Functions crossing back from a bridge call get a per-run integer ID; sandbox invokes via `BridgeCall { targetKind: 2 }`. Host-side handle registry, GC on run end. | `await fetch().then(r => r.json())`, `cursor.next()`, any host-returned method callable from sandbox. |
 
 Each phase is independently shippable. Phases 11–13 are post-v1; nothing
@@ -1200,7 +1202,7 @@ To be resolved as we build, not blocking the start:
   multi-agent parallelism.
 
 - ~~**How aggressive should the export validator be?**~~ **Resolved and
-  shipped** (#58): neither answer won. A value that cannot cross — a
+  shipped**: neither answer won. A value that cannot cross — a
   function, a class, a Promise still pending — is **skipped, never fatal**:
   it is absent from `exports` and its name is listed in `skippedExports`, so
   `export default { fetch }` alongside plain declarations reads cleanly.
@@ -1272,7 +1274,7 @@ stock snapshot, re-evaluates the prefix, then runs the postfix. The
 expensive, error-prone part of the loop — authoring and validating the setup
 — is paid once; runs pay only the evaluation.
 
-Since #64 that per-run evaluation is itself skipped whenever an idle warm
+That per-run evaluation is itself skipped whenever an idle warm
 instance of the prefix is available: the flow below is what a **cold start**
 costs, and §13.2.1 is what happens on reuse.
 
@@ -1297,7 +1299,7 @@ Steady-state cold start target (after the first call): **<5 ms** from
 `prefix.execute()` to user code executing, for typical (small) prefixes.
 Cold-start cost grows with prefix size — a prefix that takes 20 ms to
 evaluate costs 20 ms on every cold start. Heavy prefixes are the reason for
-the resident-isolate model (§13.2.1, epic #61), which pays that cost once per
+the resident-isolate model (§13.2.1), which pays that cost once per
 instance instead of once per run.
 
 ### 11.3 The prefix contract
@@ -1335,7 +1337,7 @@ sees is exactly what the prefix produces deterministically:
     (that isolate is a throwaway and `prepare()` returns no streams), while
     the output of the evaluation that warms an instance is delivered once, on
     the result of the call that paid for the cold start (§13.2.1). Whether
-    that is the right contract is GH #86; the behavior above is what ships
+    that is the right contract is an open question; the behavior above is what ships
     today.
   - A nondeterministic prefix (`Math.random()`, `Date.now()`) produces
     per-run state that differs between runs — validated once, evaluated
@@ -1373,7 +1375,7 @@ also rejects a non-function rebind.
 
 Isolate boot + prefix evaluation costs low single-digit ms for typical
 prefixes, which is plenty for interactive agents but not for sub-millisecond
-or heavy-prefix workloads. Epic #61 shipped the answer: a registry of
+or heavy-prefix workloads. The answer that shipped: a registry of
 resident **warm instances** per prepared prefix — idle isolates with the
 prefix already evaluated, taken by the next `PrefixRun` and skipping boot and
 evaluation entirely.
@@ -1390,7 +1392,7 @@ contract, threading, taint rules, and pressure model are §13.2.1.
 
 Until 2026-08 the prefix mechanism was a **V8 startup snapshot** created at
 `prepare()` time (`SnapshotCreator` + `create_blob`) and restored per run.
-It was removed deliberately (#60 → #61/#62); do not reintroduce it without
+It was removed deliberately; do not reintroduce it without
 reading this.
 
 **What broke.** V8 14.x made two changes that are fatal to runtime snapshot
@@ -1431,7 +1433,7 @@ groups. If that (or an equivalent) becomes public embedder API and rusty_v8
 exposes it, snapshots can return behind the unchanged `prepare()` API as a
 pure optimization. Until then: prefix = validated source, re-evaluated per
 run; heavy prefixes and sub-ms calls belong to the warm-isolate model
-(epic #61).
+(the resident-instances work).
 
 ## 12. Security model — fetch hardening
 
@@ -1550,8 +1552,7 @@ prefix.execute({ code }) / prefix.call({ export, args }) → RunResult / CallRes
 
 Each run executes against the prefix and returns its result in one IPC round
 trip (Run → … → Result). One-off `sandbox.run()` creates a fresh isolate per
-run and tears it down. Prefix runs are served by **warm instances** (#64,
-§13.2.1): resident isolates that skip boot and prefix re-evaluation on
+run and tears it down. Prefix runs are served by **warm instances** (§13.2.1): resident isolates that skip boot and prefix re-evaluation on
 reuse — a transparent cache, not a semantic change; state carryover between
 runs is permitted but never guaranteed. This is the AI-agent prefix/postfix
 pattern described in §11 and the request-handler pattern from §5.3.
@@ -1740,7 +1741,7 @@ user code (for example, a missing binding), not with a fetch-specific runtime
 error. The session API is intentionally narrow: pure data in, pure data out,
 no async I/O.
 
-### 13.2.1 Warm instances (#64 — shipped)
+### 13.2.1 Warm instances (shipped)
 
 Every prepared prefix is served by **warm instances**: resident isolates
 with the prefix already evaluated. The first `execute()`/`call()` on a
@@ -1790,11 +1791,11 @@ The heap cap is the exception — see below.
 evaluates, so `console.*` written by prefix code is captured. It is delivered
 on the result of the **cold-start call** — the call that paid for the warm-up
 — and the buffers are cleared afterwards, so later calls on that instance see
-only their own output. Pre-#64 the prefix re-evaluated per run and its output
+only their own output. Previously the prefix re-evaluated per run and its output
 appeared on every result; the one-off delivery is the closest equivalent.
 Prefix output produced at `prepare()` validation is discarded (throwaway
 isolate, no result frame). Whether prefix logs should instead be dropped,
-tagged, or repeated is GH #86 — the text here records what ships today.
+tagged, or repeated is an open question — the text here records what ships today.
 
 **Taint-and-evict.** Any fired guard (CPU, wall, heap), an abort landing
 mid-call, a fatal bridge violation, or an internal failure discards the
@@ -1811,7 +1812,7 @@ impossible, and a uniform cap keeps capacity math `slots × cap`. Heap and
 ArrayBuffer usage accumulate across calls on an instance — hitting the cap
 taints it. Passing the old per-run field throws.
 
-**Capacity (v3, #66): one RSS mark, scored eviction — celld's model,
+**Capacity (v3): one RSS mark, scored eviction — celld's model,
 whole.** Two independent resources, two knobs. `maxIsolates` (the
 connection pool size) caps **concurrent runs**; the **memory budget**
 (`memoryBudgetMb` on `createSandbox`, passed as `--warm-budget-bytes`,
@@ -1821,7 +1822,7 @@ undercount (external ArrayBuffers, V8 overhead, allocator fragmentation,
 later SQLite), and the number the container OOM killer actually acts on.
 Sampled per registry event (~0.4 µs `task_info` / `statm` read — no
 polling timers), folded through pure decision functions (`policy.rs`, the
-same replaceable-rule style #77 will use):
+same replaceable-rule style a prefix-aware acquire policy will use):
 
 - **RSS at/above the budget latches shedding**: evict idle instances by
   `heapUsed × idleTime` score — highest first, ties to the longest-idle —
@@ -1834,14 +1835,14 @@ same replaceable-rule style #77 will use):
   error, no new error code. **No grace period** after last use: the
   idleTime factor already sends a just-used instance to the back of every
   pass (celld sheds in plain LRU order for the same reason; recorded
-  on #66).
+  during the capacity design).
 - **The latch releases at 4/5 of the budget** — the hysteresis gap that
   stops evict/admit flapping (celld's ratio).
 - **Futility check**: freed heap returns to the OS lazily, so a pass that
   left RSS flat (within 5 %) stops the walk instead of evicting the world;
   the latch holds, and a sample that moves either way re-arms it.
 
-There is deliberately **no instance-count cap** (the #65
+There is deliberately **no instance-count cap** (the earlier
 `--max-live-isolates` is gone): celld defaults its resident ceiling to
 unlimited after a default count cap caused eviction churn, and a count
 answers a question ("how many?") that memory pressure — the thing that
@@ -1870,20 +1871,20 @@ behind it, so the deployment fails on the first `createSandbox()` rather
 than silently running without the ceiling. `memoryBudgetMb: 0` disables
 the watermarks by request and skips the check with them.
 
-**Saturation and stats (#65).** Saturated run slots always queue FIFO —
+**Saturation and stats.** Saturated run slots always queue FIFO —
 deliberately no per-call policy knobs (fail-fast / max-wait were built and
 removed: every run has wall/CPU limits, so the wait is bounded by the
 running calls themselves, and the knobs only complicated the API). Smarter
-admission is #77's cost model. `sandbox.stats()` returns a point-in-time
+admission is the future prefix-aware cost model. `sandbox.stats()` returns a point-in-time
 snapshot (active runs, queue depth, warm/idle instance counts, summed idle
 heap, the mark and the signal it acts on (`budgetBytes`/`rssBytes`) and
-the shedding latch (`underPressure`, #66), per-prefix counts) over a
+the shedding latch (`underPressure`), per-prefix counts) over a
 **dedicated control connection** outside the run pool, so it answers
 precisely when everything is saturated. `used_heap_size` is reported on
 every `PrefixRun` Result frame (`heapUsedBytes`) and feeds the
 `heapUsed × idleTime` victim scoring. Per-prefix fairness caps and the
 wait-vs-cold-start acquire policy are deliberately not here: they are
-#77's cost model, built on the per-prefix busy/idle state the registry
+the prefix-aware cost model, built on the per-prefix busy/idle state the registry
 now tracks.
 
 **Instance pools, not singletons.** The registry maps prefix → pool of
@@ -2068,7 +2069,7 @@ a callback-handle protocol symmetric to callable return values. The same Phase
 fires **at any point during a run**, not just at entry. A pre-aborted signal
 short-circuits to `ERR_ABORTED` before any frame is sent; an abort that lands
 mid-run stops the run promptly and, wherever possible, **gracefully** — with a
-real result frame from Rust rather than a synthesized one (#36).
+real result frame from Rust rather than a synthesized one.
 
 Graceful mechanism (the common case — a run suspended awaiting a bridge
 response, which is exactly how `durable-isolates` suspension works):

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Loop-under-load stress run (#67) — the full #60-shaped acceptance bar:
+# Loop-under-load stress run — the full loop-under-load acceptance bar:
 # saturate every core, then run the execution-model test suites N times.
 # All N rounds must pass. This deliberately does NOT run in CI: saturating
 # shared runners flakes; run it on a real, otherwise-idle machine before

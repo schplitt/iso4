@@ -83,7 +83,7 @@ fn parse_args() -> (String, u64) {
                 i += 2;
             }
             "--warm-budget-bytes" if i + 1 < args.len() => {
-                // The one RSS mark the registry sheds against (#66). 0 is
+                // The one RSS mark the registry sheds against. 0 is
                 // valid and means watermarks off; absent means the same.
                 // Concurrency needs no flag — the host pool bounds it, and
                 // there is no instance-count cap (celld's stance).

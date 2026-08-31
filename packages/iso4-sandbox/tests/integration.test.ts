@@ -278,7 +278,7 @@ describe('error handling', () => {
     expect(result.error.stack).toContain('outer')
   })
 
-  test('export function is skipped and reported (#58)', async () => {
+  test('export function is skipped and reported', async () => {
     const result = await runtime.run({ code: 'export default function() {}' })
     expect(result.ok).toBe(true)
     if (!result.ok)
@@ -341,7 +341,7 @@ describe('precompile + prefix.run()', () => {
   })
 
   test('warm reuse: state carryover is permitted, never guaranteed', async () => {
-    // Since #64 prefix runs reuse warm instances: mutations MAY survive into
+    // Prefix runs reuse warm instances: mutations MAY survive into
     // the next run on the same instance (warmth is a cache — the workerd
     // stance). Relying on carryover is a documented antipattern; relying on
     // isolation per run is simply wrong now. With one connection and
@@ -1415,7 +1415,7 @@ describe('resource limits (Phase 3/8)', () => {
   }, 5_000)
 
   test('heap limit kills memory hog via TypedArray', async () => {
-    // Heap cap is per-Runtime since #64 — dedicated small-cap sandbox.
+    // Heap cap is per-Runtime — dedicated small-cap sandbox.
     const small = await createRuntime({ maxIsolates: 1, memoryMb: 16 })
     try {
       const result = await small.run({
@@ -1593,7 +1593,7 @@ describe('export types — full coverage', () => {
     expect(result.exports['default']).toBeUndefined()
   })
 
-  // Non-serializable exports are skipped and reported, never fatal (#58).
+  // Non-serializable exports are skipped and reported, never fatal.
 
   test('Symbol export is skipped and reported', async () => {
     const result = await runtime.run({ code: 'export default Symbol("s")' })
@@ -2286,7 +2286,7 @@ describe('globals bridge — BridgeWithShim (Phase 4)', () => {
   })
 
   test('line numbers: a user error reports its real line even with globals configured', async () => {
-    // Regression for #38: globals used to be installed by prepending generated
+    // Regression test: globals used to be installed by prepending generated
     // source to user code, which shifted every stack-trace line. Native install
     // means user code starts at line 1 regardless of how many globals exist.
     const result = await runtime.run({

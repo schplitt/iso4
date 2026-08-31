@@ -1,5 +1,5 @@
 /**
- * Warm instance acceptance tests (#64).
+ * Warm instance acceptance tests.
  *
  * Every prepared prefix is served by warm instances: the first run
  * cold-starts an isolate (prefix evaluated under the fixed warm-up budget),
@@ -18,7 +18,7 @@ import type { Sandbox } from '../src/index.js'
 
 const COUNTER = 'let n = 0\nexport function bump() { return ++n }'
 
-describe('warm instances (#64)', () => {
+describe('warm instances', () => {
   let single: Sandbox
 
   beforeAll(async () => {
@@ -64,8 +64,8 @@ describe('warm instances (#64)', () => {
     expect(fresh.value).toBe(1)
   })
 
-  test('no count cap: warming another prefix displaces nothing (#66)', async () => {
-    // The count-based eviction of #64/#65 is gone — celld's stance (their
+  test('no count cap: warming another prefix displaces nothing', async () => {
+    // The earlier count-based eviction is gone — celld's stance (their
     // resident ceiling defaults to unlimited after a default count cap
     // caused eviction churn). Even with a single run slot and watermarks
     // explicitly disabled, warming B leaves A resident; only RSS pressure
@@ -153,7 +153,7 @@ describe('warm instances (#64)', () => {
   })
 })
 
-describe('warm instances: concurrency (#64)', () => {
+describe('warm instances: concurrency', () => {
   let dual: Sandbox
 
   beforeAll(async () => {

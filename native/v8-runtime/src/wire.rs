@@ -172,12 +172,12 @@ pub struct RunSuccessPayload {
     /// All exports as **one** V8 serialization blob holding a plain
     /// `{ name: value }` object. The `default` export (if present) is the
     /// `"default"` key alongside named exports; an empty module produces a
-    /// blob holding `{}`. For a run that carried a `call` (#58) this is the
+    /// blob holding `{}`. For a run that carried a `call` this is the
     /// called function's return value instead — the host knows which it asked
     /// for, so the slot needs no tag.
     pub exports: Vec<u8>,
     /// Export names absent from `exports` because their value cannot cross
-    /// the boundary (#58). Always empty for a call run.
+    /// the boundary. Always empty for a call run.
     pub skipped_exports: Vec<String>,
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
@@ -187,11 +187,11 @@ pub struct RunSuccessPayload {
     /// One record per bridge call attempt, in attempt order.
     pub bridge_calls: Vec<BridgeCallRecord>,
     /// `used_heap_size` of the isolate that served the run, measured after
-    /// the run settled (#64). Present for prefix runs (warm instances —
-    /// feeds eviction scoring, #66); absent for one-off runs, whose isolate
+    /// the run settled. Present for prefix runs (warm instances —
+    /// feeds eviction scoring); absent for one-off runs, whose isolate
     /// is already gone.
     pub heap_used_bytes: Option<u64>,
-    /// True when `waitUntil` background work is still running (#71): a final
+    /// True when `waitUntil` background work is still running: a final
     /// `RunComplete` frame follows this Result on the same connection.
     pub background_pending: bool,
 }
@@ -232,8 +232,8 @@ pub enum RunCompletion {
 ///   f64  durationMs
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
-///   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
-///   bool backgroundPending          (#71: a RunComplete frame follows)
+///   Optional<u64>  heapUsedBytes   (present for prefix runs)
+///   bool backgroundPending          (a RunComplete frame follows)
 /// u8    failurePresent  (1 when ok = 0)
 ///   RunErrorPayload  error
 ///   List<String>  stdout
@@ -241,7 +241,7 @@ pub enum RunCompletion {
 ///   f64  durationMs
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
-///   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
+///   Optional<u64>  heapUsedBytes   (present for prefix runs)
 /// ```
 pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> Vec<u8> {
     let mut out = Vec::new();
@@ -279,7 +279,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
     out
 }
 
-/// Encode a `RunCompletePayload` (#71) — the final frame of a run whose
+/// Encode a `RunCompletePayload` — the final frame of a run whose
 /// Result reported pending background work.
 ///
 /// Wire layout:
@@ -318,7 +318,7 @@ pub fn encode_run_complete_payload(run_id: u32, report: &crate::v8::GraceReport)
 }
 
 /// Minimal `RunCompletePayload` substituted when the real grace report is too
-/// large to frame (#71 review, finding 1): same runId and status byte, empty
+/// large to frame (review, finding 1): same runId and status byte, empty
 /// telemetry, and an error naming the substitution. Small by construction.
 pub fn encode_minimal_run_complete(run_id: u32, status_byte: u8) -> Vec<u8> {
     let mut out = Vec::new();
@@ -633,7 +633,7 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
 // ── StatsPayload encoder ─────────────────────────────────────────────────────
 
 /// Encode a `StatsPayload` per `docs/protocol.md` §5.7 — the reply to a
-/// `Stats` request (#65).
+/// `Stats` request.
 ///
 /// Wire layout:
 /// ```text
@@ -641,9 +641,9 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
 /// u32   warmBusy
 /// u32   warmIdle
 /// u64   idleHeapBytes
-/// u64   warmBudgetBytes (the RSS mark; 0 = watermarks disabled, #66)
+/// u64   warmBudgetBytes (the RSS mark; 0 = watermarks disabled)
 /// u64   rssBytes        (0 = unreadable)
-/// u8    underPressure   (1 = shedding latch is held, #66)
+/// u8    underPressure   (1 = shedding latch is held)
 /// u32   prefixCount, then per prefix:
 ///   String  prefixId
 ///   u32     idle

@@ -291,7 +291,7 @@ describe('precompile + prefix.run()', () => {
   test('warm reuse: a later run may see an earlier run\'s globals', async () => {
     const prefix = await runtime.precompile({ code: '' })
 
-    // Since #64 prefix runs reuse warm instances of the same prefix, so a
+    // Prefix runs reuse warm instances of the same prefix, so a
     // mutation made by one run MAY be visible to the next — permitted,
     // unguaranteed, evictable at any time (warmth is a cache). Back-to-back
     // runs on one prefix reuse deterministically, so assert the carryover.
@@ -326,7 +326,7 @@ describe('precompile + prefix.run()', () => {
     await prefix.dispose()
   })
 
-  test('prefix with top-level await settles and snapshots (GH #55)', async () => {
+  test('prefix with top-level await settles and snapshots', async () => {
     const prefix = await runtime.precompile({
       code: `globalThis.a = await Promise.resolve(41)
 globalThis.b = await new Response('body').text()`,
@@ -960,7 +960,7 @@ describe('error handling', () => {
     expect(result.error.stack).toContain('inner')
   })
 
-  test('exporting a function is skipped and reported, not fatal (#58)', async () => {
+  test('exporting a function is skipped and reported, not fatal', async () => {
     const result = await runtime.run({
       code: 'export default function() {}\nexport const kept = 1',
     })
@@ -1046,7 +1046,7 @@ describe('error handling', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7b. Value boundary contract — data, not behavior (GH #9)
+// 7b. Value boundary contract — data, not behavior
 //
 // Values cross as V8 serialization blobs, so everything the V8 format carries
 // arrives as a real instance in BOTH directions: primitives, bigint, string,
@@ -1564,7 +1564,7 @@ describe('value boundary contract', () => {
   test('a function nested inside a plain object skips that export only', async () => {
     // The whole offending export is dropped (whole-export skip); sibling
     // exports keep crossing. This is what makes `export default { fetch }` a
-    // readable module shape (#58).
+    // readable module shape.
     const result = await runtime.run({
       code: 'export default { fn: () => 1 }\nexport const limits = { memoryMb: 64 }',
     })
@@ -1614,7 +1614,7 @@ describe('resource limits', () => {
   })
 
   test('memory limit is enforced — TypedArray', async () => {
-    // The heap cap is per-Runtime since #64 (uniform across isolates, set at
+    // The heap cap is per-Runtime (uniform across isolates, set at
     // createSandbox) — a dedicated small-cap sandbox exercises it.
     const small = await createRuntime({ maxIsolates: 1, memoryMb: 32 })
     try {
@@ -1684,7 +1684,7 @@ describe('resource limits', () => {
   }, 15_000)
 
   test('per-run memoryMb is rejected loudly', async () => {
-    // Removed in #64: the cap is baked into each isolate at creation and
+    // Removed deliberately: the cap is baked into each isolate at creation and
     // prefix runs reuse warm isolates, so a per-run value is impossible.
     await expect(
       runtime.run({
@@ -1846,7 +1846,7 @@ describe('AbortSignal cancellation', () => {
 
   test('graceful abort reports runtime telemetry (bridge records + timings)', async () => {
     // Aborting while the sandbox is suspended awaiting a bridge call takes the
-    // graceful terminate path (#36): Rust sends a real ERR_ABORTED result, so
+    // graceful terminate path: Rust sends a real ERR_ABORTED result, so
     // the aborted RunResult carries the in-flight bridge record and non-zero
     // timings rather than the synthesized zeros of a socket teardown.
     const controller = new AbortController()
@@ -2760,7 +2760,7 @@ describe('custom error classes end-to-end', () => {
   })
 
   test('round-trip: sandbox rebuilds a fresh error from the caught one (durable-execution pattern)', async () => {
-    // The pattern from #22: rebuild an equivalent error in-sandbox. Since
+    // The durable-execution pattern: rebuild an equivalent error in-sandbox. Since
     // carried fields are direct own-enumerable props, a plain spread copies
     // them all; the fresh object is user code's own, so ERR_USER_CODE.
     const result = await runtime.run({
@@ -3627,8 +3627,8 @@ describe('bridge report', () => {
     expect(violating.responseBytes).toBe(0)
   })
 
-  test('aborted runs carry the bridge report from the graceful terminate result (#36)', async () => {
-    // Graceful termination (#36): the abort lands while the run is suspended
+  test('aborted runs carry the bridge report from the graceful terminate result', async () => {
+    // Graceful termination: the abort lands while the run is suspended
     // awaiting `hang()`, so Rust sends a real ERR_ABORTED result carrying the
     // in-flight bridge record and timings — no longer synthesized zeros.
     const controller = new AbortController()
@@ -3668,7 +3668,7 @@ describe('bridge report', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Host → sandbox calls (#58): run({ code, call }) and prefix.call()
+// Host → sandbox calls: run({ code, call }) and prefix.call()
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('host → sandbox calls', () => {
@@ -4051,7 +4051,7 @@ describe('web-server pattern (worker-style fetch handlers)', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Code generation from strings (#76): a prepare()-time capability. Setup code
+// Code generation from strings: a prepare()-time capability. Setup code
 // may compile fast paths with eval / new Function; run code may only call
 // what setup built, and gets a catchable EvalError if it tries to generate
 // code of its own.
@@ -4103,7 +4103,7 @@ describe('eval and new Function are prepare()-time only', () => {
     expect(result.exports.default).toEqual(['EvalError', 'EvalError'])
   })
 
-  test('a global declared enumerable: false is hidden from enumeration but callable (#123)', async () => {
+  test('a global declared enumerable: false is hidden from enumeration but callable', async () => {
     const result = await runtime.run({
       code: `
         const keys = Object.keys(globalThis)
@@ -4132,7 +4132,7 @@ describe('eval and new Function are prepare()-time only', () => {
     })
   })
 
-  test('runtime internals never surface through enumeration (#84)', async () => {
+  test('runtime internals never surface through enumeration', async () => {
     // A tool global plus a host import (which installs the internal
     // dispatcher). Enumeration sees the declared name only; the plumbing
     // stays out of Object.keys / for-in, matching the web classes.
@@ -4164,7 +4164,7 @@ describe('eval and new Function are prepare()-time only', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// waitUntil (#71): the value ships early, registered background work keeps
+// waitUntil: the value ships early, registered background work keeps
 // running under the grace budget, and the outcome arrives on result.waitUntil.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4371,7 +4371,7 @@ describe('waitUntil', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// readExports (#58): the deploy-path declaration reader
+// readExports: the deploy-path declaration reader
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('readExports', () => {

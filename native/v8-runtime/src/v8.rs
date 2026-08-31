@@ -77,8 +77,8 @@ pub struct Limits {
     /// value, so the door is never accidentally left open.
     pub max_bridge_calls: u32,
     /// Wall budget for the `waitUntil` epilogue after the run's value settles
-    /// (#71). Zero disables the epilogue: registered background work dies at
-    /// settle, exactly the pre-#71 behavior.
+    ///. Zero disables the epilogue: registered background work dies at
+    /// settle, exactly the pre-waitUntil behavior.
     pub grace_ms: u32,
 }
 
@@ -100,7 +100,7 @@ enum TerminationReason {
 ///
 /// Used to be a `OnceLock`, which cannot be re-armed. The allocator and the
 /// near-heap callback are registered once per *isolate* while guards and
-/// classification are per *call*, so a reused isolate (warm instances, #64)
+/// classification are per *call*, so a reused isolate (warm instances)
 /// needs one long-lived cell that resets between calls instead of a fresh
 /// `OnceLock` the isolate-lifetime consumers can never re-point to.
 struct ReasonCell(Mutex<Option<TerminationReason>>);
@@ -483,7 +483,7 @@ impl BridgeCallLog {
         }
     }
 
-    /// Non-draining snapshot for the early Result frame (#71): a clone of
+    /// Non-draining snapshot for the early Result frame: a clone of
     /// the records so far, in-flight entries stamped with their
     /// duration-until-now, in-flight tracking untouched so grace-time
     /// settlement keeps working.
@@ -518,14 +518,14 @@ pub struct Output {
     /// `"default"` key alongside named exports. An empty module produces a
     /// blob holding `{}`.
     ///
-    /// When the run carried a `call` (#58), this is the called function's
+    /// When the run carried a `call`, this is the called function's
     /// return value instead — still exactly one blob; the host knows which it
     /// asked for.
     pub exports: Vec<u8>,
 
     /// Export names absent from `exports` because their value cannot cross
     /// the boundary (a function, an unresolved Promise, or a value whose
-    /// serialization failed). Never fatal (#58); reported so nothing is
+    /// serialization failed). Never fatal; reported so nothing is
     /// silently hidden. Always empty for a call run.
     pub skipped_exports: Vec<String>,
 
@@ -543,7 +543,7 @@ pub struct Output {
     /// with microsecond resolution.
     pub cpu_time_ms: f64,
 
-    /// The `waitUntil` epilogue's outcome (#71), when the run registered
+    /// The `waitUntil` epilogue's outcome, when the run registered
     /// background work and `limits.grace_ms` allowed a grace phase. `None`
     /// for every run that registered nothing — the common case, which pays
     /// nothing.
@@ -594,9 +594,9 @@ pub struct GraceReport {
 }
 
 /// Per-run identity the run flow needs to write the early Result frame
-/// itself (#71). Installed per run as thread state by the session loop and
+/// itself. Installed per run as thread state by the session loop and
 /// the warm owner thread — the same pattern as the descriptor brand key
-/// (#94) — so the deep call chain stays unchanged. Unset (direct API, tests)
+/// — so the deep call chain stays unchanged. Unset (direct API, tests)
 /// means grace runs in hold mode: work is driven before the run returns.
 #[derive(Clone, Copy)]
 pub struct EpilogueSpec {
@@ -622,14 +622,14 @@ fn take_epilogue_spec() -> Option<EpilogueSpec> {
     EPILOGUE_SPEC.with(|c| c.take())
 }
 
-/// Background work registered by `waitUntil` (#71).
+/// Background work registered by `waitUntil`.
 ///
 /// Instance-lifetime storage with a stable heap address (same pattern as the
 /// console's `LogBuffers`): the native callback reaches it through an
 /// `External`. `slot` is `None` outside run code — setup evaluation, between
 /// calls — so a prepare()-time `waitUntil` throws a catchable error; it is
 /// armed with an empty set at the setup-to-run boundary (the same line where
-/// codegen-from-strings switches off, #76) and disarmed after the run.
+/// codegen-from-strings switches off) and disarmed after the run.
 pub struct PendingWork {
     slot: RefCell<Option<Vec<v8::Global<v8::Promise>>>>,
 }
@@ -733,7 +733,7 @@ pub enum RunError {
     WarmupLimit,
     /// A requested host → sandbox call's export path does not resolve against
     /// the module's exports, or resolves to something that is not callable
-    /// (#58). The message says which, and names the path.
+    ///. The message says which, and names the path.
     CallTargetNotFound(String),
     /// A function value was passed as a bridge argument.
     FunctionArgumentNotSupported,
@@ -743,8 +743,8 @@ pub enum RunError {
     ExportTooLarge,
     /// Total bridge calls in this run exceeded `limits.maxBridgeCalls`.
     BridgeCallLimitExceeded,
-    /// The host asked to stop the run via a `Terminate` frame (graceful abort,
-    /// #36). Surfaced to the sandbox consumer as `ERR_ABORTED`. Unlike the
+    /// The host asked to stop the run via a `Terminate` frame (graceful
+    /// abort). Surfaced to the sandbox consumer as `ERR_ABORTED`. Unlike the
     /// socket-teardown fallback, this arm carries the real duration, CPU time,
     /// and bridge-call records collected before the abort landed.
     Aborted,
@@ -792,7 +792,7 @@ pub fn execute(
 /// creation mutates the process-shared read-only heap and the shared
 /// artifacts die with the last isolate, so runtime `create_blob` is only
 /// safe in the single-isolate, single-shot workflow V8 itself uses
-/// (issue #60, decision in #61). The prefix is now re-evaluated per run.
+/// The prefix is now re-evaluated per run.
 #[derive(Clone, Copy)]
 pub struct PrefixSpec<'a> {
     pub code: &'a str,
@@ -823,7 +823,7 @@ pub fn execute_with_prefix(
     init_platform();
     // Cold start of a warm-capable instance: warm-up (isolate boot + prefix
     // evaluation) runs under its own fixed budget, never the caller's limits
-    // (#64) — a prefix that loops reports ERR_WARMUP_LIMIT, not the run's
+    // — a prefix that loops reports ERR_WARMUP_LIMIT, not the run's
     // timeout. The call itself then gets fresh guards from dispatch to
     // settle. The warm registry keeps the core alive between calls; this
     // one-shot wrapper drops it.
@@ -851,7 +851,7 @@ pub fn execute_with_prefix(
 /// The caller's per-run limits do not apply — prefix code is host-authored —
 /// but validation is not unbounded: it runs under the same heap cap as a real
 /// instance and the fixed warm-up budget (`WARMUP_WALL_MS` / `WARMUP_CPU_MS`,
-/// #64), so a looping or heap-hungry prefix fails here instead of on every
+/// per instance), so a looping or heap-hungry prefix fails here instead of on every
 /// cold start.
 pub fn precompile(
     code: &str,
@@ -875,7 +875,7 @@ pub fn precompile(
 /// only during bridge calls and is never closed by this function.
 ///
 /// When `call` is `Some`, the run's value is the called function's return
-/// value instead of the exports (#58): the export path resolves against the
+/// value instead of the exports: the export path resolves against the
 /// postfix module when `code` is `Some`, or against the prefix module for a
 /// call-only prefix run (`code` = `None`, only valid with a prefix).
 fn run_module(
@@ -950,7 +950,7 @@ fn run_module_inner(
         max_stderr_bytes: limits.max_stderr_bytes,
         ..LogBuffers::default()
     };
-    // waitUntil registrations (#71); one-off runs hold it for the run's life.
+    // waitUntil registrations; one-off runs hold it for the run's life.
     let pending_work = PendingWork::boxed();
 
     // `reason` is created before the isolate so it can be shared with the
@@ -1117,7 +1117,7 @@ fn run_module_inner(
     install_async_context(scope)
         .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
 
-    // waitUntil (#71): installed disarmed — run_call_phase arms it at the
+    // waitUntil: installed disarmed — run_call_phase arms it at the
     // setup-to-run boundary.
     install_wait_until(scope, &*pending_work)
         .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
@@ -1126,7 +1126,7 @@ fn run_module_inner(
     };
 
     // Setup is done — hand over to the per-call phase shared with warm
-    // instances (#64). Globals carry the context and prefix module across the
+    // instances. Globals carry the context and prefix module across the
     // scope boundary; the guards stay armed, so a one-off run covers setup +
     // execution with a single budget exactly as before.
     // One-off runs keep the slot table as a run-local: the context (and any
@@ -1161,7 +1161,7 @@ fn run_module_inner(
 }
 
 /// Per-call parameters for [`run_call_phase`] — bundled so the one-off path
-/// (`run_module_inner`) and warm instances (#64, `run_call_on_core`) drive
+/// (`run_module_inner`) and warm instances (`run_call_on_core`) drive
 /// the identical phase with their own guard and telemetry lifetimes.
 struct CallPhaseCtx<'a> {
     limits: &'a Limits,
@@ -1179,11 +1179,11 @@ struct CallPhaseCtx<'a> {
     /// pointer; only transient borrows are taken, never across JS execution
     /// — the same discipline the pre-split code applied to its `logs` local.
     logs: *const LogBuffers,
-    /// The run's `waitUntil` registration set (#71) — instance-lifetime Box,
+    /// The run's `waitUntil` registration set — instance-lifetime Box,
     /// same pointer discipline as `logs`. Armed at the setup-to-run boundary
     /// below, drained by the grace phase, disarmed by the caller.
     pending: *const PendingWork,
-    /// Per-run identity for the early Result frame (#71); `None` = hold mode.
+    /// Per-run identity for the early Result frame; `None` = hold mode.
     epilogue: Option<EpilogueSpec>,
     cancel_wall: &'a crossbeam_channel::Sender<()>,
     cancel_cpu: &'a crossbeam_channel::Sender<()>,
@@ -1309,13 +1309,13 @@ fn run_call_phase(
     // sandbox input. Disable code generation from strings (eval,
     // new Function) for it: code a prepared module builds at prepare() time
     // is reproducible from its stored source, while strings evaluated here
-    // would be production code with no source of record (#76 — workerd draws
+    // would be production code with no source of record (workerd draws
     // the same line between startup and run time). V8 throws a catchable
     // EvalError at the call site; the run itself continues. On a warm
     // instance the retained context simply stays denied across calls.
     context_local.set_allow_generation_from_strings(false);
 
-    // Arm waitUntil for this run (#71) at the same boundary: setup code could
+    // Arm waitUntil for this run at the same boundary: setup code could
     // not register background work (the slot was None and the call threw);
     // run code now can.
     // SAFETY: `pending` points at the instance-lifetime PendingWork Box.
@@ -1326,7 +1326,7 @@ fn run_call_phase(
     v8::tc_scope!(let scope, scope);
 
     // Shared settle machinery — the module evaluation promise and a requested
-    // call's return promise (#58) drive the same poll loop.
+    // call's return promise drive the same poll loop.
     let settle_ctx = SettleCtx {
         stream_fd,
         limits,
@@ -1489,7 +1489,7 @@ fn run_call_phase(
 
         module
     } else {
-        // Call-only prefix run (#58): the prefix module evaluated above is the
+        // Call-only prefix run: the prefix module evaluated above is the
         // call target. Enter the CPU budget here — the postfix path enters it
         // right before evaluate() — so path resolution and the call itself are
         // measured (a path segment can be an accessor).
@@ -1527,7 +1527,7 @@ fn run_call_phase(
     let mut skipped_exports: Vec<String> = Vec::new();
 
     let exports = if let Some(call) = call {
-        // ── Host → sandbox call (#58) ────────────────────────────────────────
+        // ── Host → sandbox call ────────────────────────────────────────
         // Resolve the export path against the namespace and invoke. Runs
         // inside the CPU budget — a path segment can be an accessor, so
         // resolution itself is sandbox code.
@@ -1660,7 +1660,7 @@ fn run_call_phase(
         // The module namespace is an exotic object the V8 serializer refuses, and
         // a single blob for all exports beats one blob per export (measured).
         //
-        // Non-serializable exports are skipped, never fatal (#58): a value the
+        // Non-serializable exports are skipped, never fatal: a value the
         // pre-check refuses (function, unresolved Promise) is simply absent
         // from the result, its name reported in `skipped_exports` — this is
         // what lets `export default { fetch }` coexist with reading the
@@ -1853,7 +1853,7 @@ fn run_call_phase(
     // the Result ships early, the pending set is driven under its own
     // budgets, and the outcome travels on a final RunComplete frame. A run
     // that registered nothing takes none of these branches and behaves
-    // exactly as before #71.
+    // exactly as before waitUntil existed.
     let has_pending = unsafe {
         (*pending)
             .slot
@@ -1890,7 +1890,7 @@ fn run_call_phase(
     Ok(output)
 }
 
-/// Cap the error strings carried on a `RunComplete` frame (#71 review): the
+/// Cap the error strings carried on a `RunComplete` frame (review): the
 /// rejection message is guest-authored and otherwise unbounded, and the frame
 /// has no per-field limits of its own.
 fn capped_grace_error(name: String, message: String) -> (String, String) {
@@ -1919,7 +1919,7 @@ struct GracePhaseCtx<'a> {
     logs: *const LogBuffers,
 }
 
-/// Drive the registered background work after the run's value settled (#71).
+/// Drive the registered background work after the run's value settled.
 ///
 /// Writes the early Result frame itself when a spec and socket exist (the
 /// session paths), then keeps the poll loop running — bridge calls included —
@@ -2026,7 +2026,7 @@ fn run_grace_phase(
         // The grace CPU guard writes the REAL reason cell when it kills a
         // runaway continuation; end the phase the moment that happened
         // instead of idling out the wall — the instance is tainted either
-        // way, but the pool slot frees now (#71 review, finding 2).
+        // way, but the pool slot frees now (review, finding 2).
         if ctx.reason.get().is_some() {
             status = GraceStatus::Truncated;
             break 'grace;
@@ -2188,7 +2188,7 @@ fn run_grace_phase(
     }
 }
 
-// ── Warm instances (#64) ────────────────────────────────────────────────────
+// ── Warm instances ────────────────────────────────────────────────────
 
 /// Fixed budget for warm-up, deliberately not user-configurable —
 /// Cloudflare's script-startup limit (1 s since 2025-10) is the model. The
@@ -2233,7 +2233,7 @@ pub struct InstanceCore {
     /// stub `Function` ever created in this context, re-pointed per call and
     /// disarmed between calls.
     stub_slots: StubSlots,
-    /// `waitUntil` registration set (#71) — the native callback holds a raw
+    /// `waitUntil` registration set — the native callback holds a raw
     /// pointer into this Box; armed per call, disarmed between calls.
     pending: Box<PendingWork>,
     /// True until the first call: warm-up console output (the prefix's
@@ -2424,7 +2424,7 @@ pub struct CallOutcome {
     /// instance reusable.
     pub tainted: bool,
     /// `used_heap_size` after the call — reported on the Result frame and
-    /// the input to eviction scoring (#66).
+    /// the input to eviction scoring.
     pub heap_used_bytes: u64,
 }
 
@@ -2452,7 +2452,7 @@ pub fn run_call_on_core(
     // Per-call reset of instance-lifetime state: the termination-reason slot
     // and the console sink (whose caps are per-call limits). The cold-start
     // call keeps the buffers: they hold the prefix's warm-up console output,
-    // which belongs to the run that paid for the warm-up — pre-#64 the
+    // which belongs to the run that paid for the warm-up — previously the
     // prefix re-evaluated per run, so its output appeared on every result.
     core.reason.reset();
     {
@@ -2558,7 +2558,7 @@ pub fn run_call_on_core(
     for slot in core.stub_slots.values() {
         *slot.data.borrow_mut() = None;
     }
-    // Disarm waitUntil too (#71): a between-calls registration must throw,
+    // Disarm waitUntil too: a between-calls registration must throw,
     // and lingering Globals from the finished run should not pin objects.
     *core.pending.slot.borrow_mut() = None;
 
@@ -2628,7 +2628,7 @@ fn owned_bridge_error(err: &RunError) -> RunError {
 
 /// Everything the poll loop needs besides the promise it settles. One run
 /// builds this once; both settle points — the module evaluation promise and a
-/// requested call's return promise (#58) — share it.
+/// requested call's return promise — share it.
 struct SettleCtx<'a> {
     /// Socket for BridgeResponse reads. `None` when no bridge stub exists.
     stream_fd: Option<RawFd>,
@@ -2753,7 +2753,7 @@ fn settle_promise(
                 match frame.message_type {
                     ipc::TsToRustMessageType::BridgeResponse => {}
                     ipc::TsToRustMessageType::Terminate => {
-                        // Graceful abort (#36). The TS host sends `Terminate`
+                        // Graceful abort. The TS host sends `Terminate`
                         // (carrying the run ID) when its `AbortSignal` fires
                         // while the sandbox is suspended awaiting a bridge
                         // response — precisely the durable-isolates suspension
@@ -2907,7 +2907,7 @@ fn settle_promise(
 /// sandbox code (an accessor).
 const MAX_CALL_PATH_SEGMENTS: usize = 16;
 
-/// Resolve a call's export path (#58) against the module namespace: the
+/// Resolve a call's export path against the module namespace: the
 /// callable, plus the receiver its `this` is bound to — the object the final
 /// segment was read from, i.e. plain `a.b.c()` semantics (the namespace itself
 /// for a single-segment path), so `export default { fetch() { this.… } }`
@@ -2984,7 +2984,7 @@ const PREFIX_SETTLE_MAX_CHECKPOINTS: usize = 1000;
 /// globals are not installed here (bridge stubs are recreated per
 /// `execute_with_prefix`), and `node:async_hooks` is not resolvable while a
 /// prefix evaluates. The returned handle is what a `prefix.call()` resolves
-/// its export path against (#58); validation callers drop it.
+/// its export path against; validation callers drop it.
 fn evaluate_prefix_module(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     code: &str,
@@ -3110,7 +3110,7 @@ fn evaluate_prefix_module(
 /// host-authored setup with no bridge/network side effects, so evaluating it
 /// here and again on every run is safe.
 ///
-/// Runs under the same fixed warm-up budget as a cold start (#64): a prefix
+/// Runs under the same fixed warm-up budget as a cold start: a prefix
 /// that cannot evaluate inside [`WARMUP_WALL_MS`]/[`WARMUP_CPU_MS`] would
 /// fail *every* instance creation with `ERR_WARMUP_LIMIT`, so it is rejected
 /// here, at deploy time — the same reason wrangler enforces Cloudflare's
@@ -3166,7 +3166,7 @@ fn validate_prefix_module(
         )
     })?;
     // Disarmed waitUntil for surface parity: `typeof waitUntil` matches run
-    // code; calling it here throws the catchable setup-time error (#71).
+    // code; calling it here throws the catchable setup-time error.
     let validation_pending = PendingWork::boxed();
     install_wait_until(scope, &*validation_pending).map_err(|e| {
         failure(termination_or(&reason, e), &logs, start)
@@ -3456,7 +3456,7 @@ fn compile_source_module<'s>(
     }
 }
 
-// ── Host modules (built natively from shape data, #37) ───────────────────────
+// ── Host modules (built natively from shape data) ────────────────────────────
 //
 // A host module crosses the wire as data: named top-level exports, each a
 // tree of function leaves and data leaves. No JS is ever generated from that
@@ -4221,7 +4221,7 @@ struct BridgeStubSpec {
     /// `Some` for the host-import dispatcher stub — the handle table it
     /// resolves leading handle-ID arguments against.
     import_handles: Option<Arc<Vec<ImportHandleEntry>>>,
-    /// The declared enumerability of the public name (#123). Ignored in
+    /// The declared enumerability of the public name. Ignored in
     /// effect for internal stub names, which install DONT_ENUM regardless.
     enumerable: bool,
 }
@@ -4330,7 +4330,7 @@ const PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC: &str = r#"(name, kind) => (...args)
 ///
 /// Every public name reaches the global object through `object.set(key, value)`
 /// — a plain string, never interpolated into an identifier position — so no
-/// global name can shape generated source (issue #38). String expressions and
+/// global name can shape generated source. String expressions and
 /// shim expressions are evaluated as their own scripts with their own
 /// filenames, so they never shift the line numbers of user code.
 /// Names the runtime owns. A host global using one of these is rejected rather
@@ -4471,8 +4471,8 @@ fn install_prefix_bridge_placeholders(
     // (install name, display name, kind, enumerable) per the factory's
     // parameters plus the attribute the placeholder installs with — it must
     // match the live stub so the enumerated surface never differs between
-    // prepare time and run time (#123). Internal names are non-enumerable
-    // regardless (#84).
+    // prepare time and run time. Internal names are non-enumerable
+    // regardless.
     let mut targets: Vec<(String, String, i32, bool)> = Vec::new();
     for def in globals {
         match def {
@@ -4536,7 +4536,7 @@ fn install_prefix_bridge_placeholders(
 /// non-enumerable, so enumeration-driven sandbox code (`for (const k in
 /// globalThis)`, serializers, "copy the environment" patterns) never trips
 /// over them — celld's ops went through exactly that accident before moving
-/// to DONT_ENUM (#84). The web classes already install non-enumerable
+/// to DONT_ENUM. The web classes already install non-enumerable
 /// (`webtypes.js`); host-declared globals stay enumerable the way browsers
 /// keep `fetch` enumerable. The names remain reachable by string — this is
 /// hygiene, not secrecy.
@@ -4552,7 +4552,7 @@ const INTERNAL_GLOBAL_PREFIX: &str = "__iso4_";
 ///
 /// Runtime-internal names ([`INTERNAL_GLOBAL_PREFIX`]) get `DONT_ENUM`
 /// regardless of `enumerable`; for public names the flag is the host's
-/// per-global opt-out (#123).
+/// per-global opt-out.
 fn define_global(
     scope: &mut v8::PinScope,
     name: &str,
@@ -4779,7 +4779,7 @@ fn prefix_bridge_call_from_value(
 }
 
 /// Reserved module specifier resolving to the built-in runtime module, which
-/// re-exports `waitUntil` (#71). Resolvable in setup code too (capturing the
+/// re-exports `waitUntil`. Resolvable in setup code too (capturing the
 /// function for later run-time use is legitimate); calling it during setup
 /// throws.
 const ISO4_RUNTIME_SPECIFIER: &str = "iso4:runtime";
@@ -4792,7 +4792,7 @@ const ISO4_RUNTIME_WAITUNTIL_SYMBOL: &str = "iso4.runtime.waitUntil";
 /// Private-symbol key holding the pristine `Promise.allSettled` (bound),
 /// captured at install time — before any guest code runs — and called by the
 /// grace loop. A guest replacing `Promise.allSettled` therefore sabotages
-/// nothing: privates are unreachable from JS (#95's mechanism).
+/// nothing: privates are unreachable from JS (the type-tag mechanism).
 const GRACE_ALL_SETTLED_KEY: &str = "iso4::graceAllSettled";
 
 fn grace_all_settled_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
@@ -4804,9 +4804,9 @@ fn grace_all_settled_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Loc
 const ISO4_RUNTIME_MODULE_SRC: &str =
     "export const waitUntil = globalThis[Symbol.for('iso4.runtime.waitUntil')];\n";
 
-/// Install the `waitUntil` global (#71): a native function pushing its
+/// Install the `waitUntil` global: a native function pushing its
 /// argument into the run's [`PendingWork`] set. Installed non-enumerable like
-/// the web classes (#84 convention), reserved as a name, and additionally
+/// the web classes (convention), reserved as a name, and additionally
 /// stashed under a registry symbol for the `iso4:runtime` re-export.
 fn install_wait_until(scope: &mut v8::PinScope, pending: *const PendingWork) -> Result<(), RunError> {
     let data = v8::External::new(scope, pending.cast_mut().cast::<c_void>());
@@ -4840,7 +4840,7 @@ fn install_wait_until(scope: &mut v8::PinScope, pending: *const PendingWork) -> 
 }
 
 /// `waitUntil(value)` — register background work to be driven after the
-/// run's value settles (#71). Non-promise values are accepted and count as
+/// run's value settles. Non-promise values are accepted and count as
 /// already-settled work, mirroring `Promise.resolve` semantics.
 fn wait_until_callback(
     scope: &mut v8::PinScope,
@@ -5792,7 +5792,7 @@ mod tests {
 
     // ── Export validation ─────────────────────────────────────────────────
     //
-    // Non-serializable exports are skipped, never fatal (#58): the value is
+    // Non-serializable exports are skipped, never fatal: the value is
     // absent from the exports and its name is reported in `skipped_exports`.
 
     #[test]
@@ -6823,7 +6823,7 @@ mod tests {
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
-    // ── #76: code generation from strings is a prepare()-time capability ────
+    // ── Code generation from strings is a prepare()-time capability ─────────
 
     #[test]
     fn run_code_cannot_eval_or_new_function() {
@@ -6878,7 +6878,7 @@ mod tests {
         assert_eq!(get_default(&out).as_deref(), Some("42|42|true"));
     }
 
-    // ── #71: waitUntil grace phase (hold mode — no epilogue spec/socket) ────
+    // ── waitUntil grace phase (hold mode — no epilogue spec/socket) ─────────
 
     /// Direct-API grace defaults: the epilogue budget on, everything else
     /// default.
@@ -7116,7 +7116,7 @@ mod tests {
         .unwrap();
     }
 
-    // GH #55: top-level `await` used to fail every prefix because nothing
+    // Top-level `await` used to fail every prefix because nothing
     // drained the microtask queue after module evaluation.
 
     #[test]
@@ -7261,7 +7261,7 @@ mod tests {
 
     #[test]
     fn runtime_internals_are_hidden_from_enumeration_but_reachable() {
-        // #84: the `__iso4_*` plumbing (dispatcher, shim handler keys) must
+        // The `__iso4_*` plumbing (dispatcher, shim handler keys) must
         // not surface through enumeration — the celld accident class is
         // generic sandbox code enumerating the global and invoking every key.
         // The names stay reachable by string (hygiene, not secrecy), and
@@ -7308,7 +7308,7 @@ mod tests {
 
     #[test]
     fn a_non_enumerable_global_is_hidden_but_callable() {
-        // #123: the host's per-global opt-out. Hidden names stay reachable
+        // The host's per-global opt-out. Hidden names stay reachable
         // (hygiene, not secrecy); undeclared-flag names stay enumerable.
         use std::os::unix::io::AsRawFd;
         init_platform();
@@ -7353,7 +7353,7 @@ mod tests {
     #[test]
     fn a_non_enumerable_global_has_the_same_surface_at_prepare_and_run_time() {
         // The between-runs placeholder installs with the declared flag, so
-        // enumeration inside the prefix and inside a run agree (#123).
+        // enumeration inside the prefix and inside a run agree.
         use std::os::unix::io::AsRawFd;
         init_platform();
         let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -8043,7 +8043,7 @@ mod tests {
 
     #[test]
     fn terminate_frame_aborts_run_with_telemetry() {
-        // Graceful abort (#36): while the sandbox is suspended awaiting a bridge
+        // Graceful abort: while the sandbox is suspended awaiting a bridge
         // response, the host sends `Terminate` instead of a `BridgeResponse`.
         // The run must return `ERR_ABORTED` and still carry the in-flight bridge
         // record and real timings — not the synthesized zeros of a teardown.
@@ -9594,7 +9594,7 @@ mod tests {
         .unwrap();
     }
 
-    // ── Host modules built natively from shape data (#37) ────────────────────
+    // ── Host modules built natively from shape data ────────────────────
     //
     // Host modules cross the wire as data trees; the runtime builds the module
     // itself. Data leaves need no socket. Function leaves dispatch through the
@@ -10052,7 +10052,7 @@ mod tests {
         assert_eq!(host_module_base_id(&imports, "b"), 3);
     }
 
-    // ── Host → sandbox calls (#58) ───────────────────────────────────────────
+    // ── Host → sandbox calls ───────────────────────────────────────────
 
     /// Build a `CallSpec` with the args encoded as one blob holding an array.
     fn call_spec(path: &str, args: &[WireValue]) -> ipc::CallSpec {
@@ -10558,7 +10558,7 @@ mod tests {
         assert!(out.skipped_exports.is_empty());
     }
 
-    // ── Warm instances (#64): create/call split, taint, warm-up budget ──────
+    // ── Warm instances: create/call split, taint, warm-up budget ──────
 
     /// A counting prefix: module-scope state observable through a call.
     const COUNTER_PREFIX: &str = "let n = 0\nexport function bump() { return ++n }";
@@ -10609,7 +10609,7 @@ mod tests {
     fn codegen_stays_denied_across_warm_calls_while_setup_products_work() {
         // The retained context is switched to deny-codegen on the first call
         // and must stay that way for every later call, while functions the
-        // setup compiled at warm-up keep working (#76).
+        // setup compiled at warm-up keep working.
         init_platform();
         let mut core = create_instance_core(
             Some(PrefixSpec {
@@ -10759,7 +10759,7 @@ mod tests {
     fn prepare_validation_rejects_a_looping_prefix() {
         // Same budget at prepare() (validate_prefix_module), so an
         // un-warmable prefix fails at deploy time, not on the first call.
-        // Pre-#64 this hung prepare() forever.
+        // Before warm instances this hung prepare() forever.
         let failure =
             validate_prefix_module("for (;;) {}", "<prefix>", &[], &[], 0).expect_err("must reject");
         assert!(matches!(failure.error, RunError::WarmupLimit));
@@ -10808,9 +10808,9 @@ mod tests {
         }
     }
 
-    // ── Review fixes for #64 (PR #72) ───────────────────────────────────────
+    // ── Review fixes from the warm-instances review ──────────────────────────
 
-    /// #1 (critical): a bridge stub stashed by sandbox code on one call must
+    /// Finding 1 (critical): a bridge stub stashed by sandbox code on one call must
     /// NOT dereference freed per-call state when invoked on a later call —
     /// the slot is disarmed between calls, so the stashed function throws a
     /// catchable error instead of a use-after-free. Pre-fix this dereferenced
@@ -10874,7 +10874,7 @@ mod tests {
         assert_eq!(get_default(&out).as_deref(), Some("threw"));
     }
 
-    /// #2: a postfix can plant a hostile accessor under a bridge-global name;
+    /// Finding 2: a postfix can plant a hostile accessor under a bridge-global name;
     /// the next call's placeholder re-arm must overwrite it WITHOUT invoking
     /// the setter. Pre-fix the re-arm went through `[[Set]]`, so a
     /// looping setter hung the owner thread (only bounded, post-guards-move,
@@ -10936,7 +10936,7 @@ mod tests {
         assert_eq!(get_default(&out2.result.unwrap()).as_deref(), Some("7"));
     }
 
-    /// #7: blowing the heap cap during warm-up reports `ERR_MEMORY_LIMIT`,
+    /// Finding 7: blowing the heap cap during warm-up reports `ERR_MEMORY_LIMIT`,
     /// not the time-shaped `ERR_WARMUP_LIMIT`.
     #[test]
     fn warmup_memory_blowout_reports_memory_limit() {
@@ -10961,7 +10961,7 @@ mod tests {
         );
     }
 
-    /// #6: prefix `console.log` output is delivered on the cold-start call's
+    /// Finding 6: prefix `console.log` output is delivered on the cold-start call's
     /// result (the run that paid for warm-up), then cleared — not dropped.
     #[test]
     fn warmup_console_output_appears_on_the_first_call_only() {
@@ -11018,13 +11018,13 @@ mod tests {
         );
     }
 
-    /// CHARACTERIZATION of a KNOWN gap (issue #73), not a guarantee: a promise
+    /// CHARACTERIZATION of a KNOWN gap, not a guarantee: a promise
     /// whose resolver is stashed on `globalThis` in one run, then resolved in
     /// a later run, runs its `.then` continuation DURING that later run and
     /// observes the later run's state. This is the cross-run confused-deputy —
     /// the leftover continuation looks globals up by name and reaches the new
     /// run's freshly re-bound bindings. Pinned so the behavior can't shift
-    /// silently before #73 fixes it (run-id gated host effects), at which
+    /// silently until run-id gated host effects fix it, at which
     /// point this test flips to assert refusal.
     #[test]
     fn stale_continuation_runs_in_the_next_call_and_sees_its_state() {
@@ -11099,7 +11099,7 @@ mod tests {
             get_default(&run3).as_deref(),
             Some("run2-secret"),
             "run 1's continuation ran during run 2 and observed run 2's state \
-             (cross-run confused-deputy, issue #73)"
+             (cross-run confused-deputy)"
         );
     }
 }

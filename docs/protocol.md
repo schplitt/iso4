@@ -57,16 +57,16 @@ this version, and the handshake hard-fails otherwise (§8).
 
 ### 2.1 TS → Rust
 
-|   Byte | Name             | Payload                 | Response                                                                                                                                        |
-| -----: | ---------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a malformed payload Rust closes the socket without replying                                                             |
-| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`; when it reports pending background work: more `BridgeCall`s, then one `RunComplete` (#71) |
-| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                                  |
-| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | same as `Run`                                                                                                                                   |
-| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                                            |
-| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                                         |
-| `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown                |
-| `0x08` | `Stats`          | empty                   | exactly one `StatsResult` (#65)                                                                                                                 |
+|   Byte | Name             | Payload                 | Response                                                                                                                                  |
+| -----: | ---------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a malformed payload Rust closes the socket without replying                                                       |
+| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`; when it reports pending background work: more `BridgeCall`s, then one `RunComplete` |
+| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                            |
+| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | same as `Run`                                                                                                                             |
+| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                                      |
+| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                                   |
+| `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown          |
+| `0x08` | `Stats`          | empty                   | exactly one `StatsResult`                                                                                                                 |
 
 ### 2.2 Rust → TS
 
@@ -77,8 +77,8 @@ this version, and the handshake hard-fails otherwise (§8).
 | `0x03` | `PrecompileResult` | `PrecompileResultPayload` | Result of `Precompile`.                                                                               |
 | `0x04` | `Log`              | `DiagnosticLogPayload`    | Internal runtime diagnostic; not sandbox stdout/stderr.                                               |
 | `0x05` | `Hello`            | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.               |
-| `0x06` | `StatsResult`      | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request (#65).                                            |
-| `0x07` | `RunComplete`      | `RunCompletePayload`      | Final frame of a run whose `Result` reported pending background work (#71); frees the run's slot.     |
+| `0x06` | `StatsResult`      | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request.                                                  |
+| `0x07` | `RunComplete`      | `RunCompletePayload`      | Final frame of a run whose `Result` reported pending background work; frees the run's slot.           |
 
 ---
 
@@ -310,7 +310,7 @@ blob  := u32 byteLength, V8 serialization blob   (byteLength 0 = absent)
 both sides — the header list, the body — is written with a nested `WriteValue`
 rather than framed by hand. V8 then walks it internally instead of the embedder
 pushing elements across the API boundary one at a time, which is the cost
-`#48` measured at ~87 ns per `obj.set()` when it deleted the old `WireValue`
+measured at ~87 ns per `obj.set()` when the old `WireValue`
 codec. Only scalars that are _not_ already JS values (a status code, a URL
 string being read out of an instance) are hand-framed.
 
@@ -570,7 +570,7 @@ time. Never per run, never per value.
 | `limits`   | `ResourceLimits`      | Only caller-set fields sent; runtime fills defaults.                                                        |
 | `globals`  | `List<GlobalDef>`     | Host globals + how the runtime installs each one.                                                           |
 | `imports`  | `List<ImportBinding>` | Source or host import declarations.                                                                         |
-| `call`     | `Optional<CallSpec>`  | Host → sandbox call resolved against the freshly evaluated module (#58).                                    |
+| `call`     | `Optional<CallSpec>`  | Host → sandbox call resolved against the freshly evaluated module.                                          |
 
 `PrefixRunPayload`:
 
@@ -583,9 +583,9 @@ time. Never per run, never per value.
 | `limits`   | `ResourceLimits`     | Fully normalized by TS before sending.                                                                                     |
 | `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs). |
 | `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                          |
-| `call`     | `Optional<CallSpec>` | Host → sandbox call resolved against the prefix module's exports (#58).                                                    |
+| `call`     | `Optional<CallSpec>` | Host → sandbox call resolved against the prefix module's exports.                                                          |
 
-`CallSpec` (#58):
+`CallSpec`:
 
 A host → sandbox function call. `exportPath` addresses a callable **relative
 to the module's exports** — a top-level exported function (`"handler"`) or a
@@ -643,7 +643,7 @@ distinct from absent.
 | `maxStderrBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
 | `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
 | `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.               |
-| `graceMs`            | `Optional<u32>` | `30000`  | Wall budget for `waitUntil` background work after the Result ships (#71), one budget for the whole registered set. Zero disables the grace phase entirely.       |
+| `graceMs`            | `Optional<u32>` | `30000`  | Wall budget for `waitUntil` background work after the Result ships, one budget for the whole registered set. Zero disables the grace phase entirely.             |
 
 `GlobalDef`:
 
@@ -861,13 +861,13 @@ afterwards, so later calls report only their own lines.
 | Field            | Encoding                 | Notes                                                                                                                                                                                                                                       |
 | ---------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `exports`        | `ValueBlob`              | One blob holding a flat object: `default` plus named exports as direct properties. For a run that carried a `call` (§5.2) this is the called function's return value instead — the host knows which it asked for, so the slot needs no tag. |
-| `skippedExports` | `List<String>`           | Export names absent from `exports` because their value cannot cross (a function, a Promise in any state — the export path never awaits — or a failed serialization). Skipping is never fatal (#58). Always empty for a call run.            |
+| `skippedExports` | `List<String>`           | Export names absent from `exports` because their value cannot cross (a function, a Promise in any state — the export path never awaits — or a failed serialization). Skipping is never fatal. Always empty for a call run.                  |
 | `stdout`         | `List<String>`           | Captured stdout log lines.                                                                                                                                                                                                                  |
 | `stderr`         | `List<String>`           | Captured stderr log lines.                                                                                                                                                                                                                  |
 | `durationMs`     | `f64`                    | Wall-clock runtime duration.                                                                                                                                                                                                                |
 | `cpuTimeMs`      | `f64`                    | Active V8 execution time; bridge waits excluded.                                                                                                                                                                                            |
 | `bridgeCalls`    | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.                                                                                                                                                                                       |
-| `heapUsedBytes`  | `Optional<u64>`          | `used_heap_size` of the isolate that served the run, measured after it settled (#64). Present for `PrefixRun` (warm instances — feeds eviction); absent for one-off `Run`, whose isolate is already gone.                                   |
+| `heapUsedBytes`  | `Optional<u64>`          | `used_heap_size` of the isolate that served the run, measured after it settled. Present for `PrefixRun` (warm instances — feeds eviction); absent for one-off `Run`, whose isolate is already gone.                                         |
 
 `RunFailurePayload`:
 
@@ -911,7 +911,7 @@ afterwards, so later calls report only their own lines.
 | `prefixId` | `Optional<PrefixId>`        | Present when `ok = true`.  |
 | `error`    | `Optional<RunErrorPayload>` | Present when `ok = false`. |
 
-### 5.7 RunComplete payloads (#71)
+### 5.7 RunComplete payloads
 
 Sent exactly once, as the final frame of a run whose `Result` carried
 `backgroundPending = true` — after the `waitUntil` grace phase ends. Grace
@@ -934,7 +934,7 @@ Between the `Result` and the `RunComplete` the connection still belongs to
 the run: grace-time `BridgeCall`/`BridgeResponse` traffic flows exactly as
 during the run, and the host must not start a new run on the slot until the
 `RunComplete` arrives. This post-Result phase is the designed home for
-future in-run streaming frames (#96).
+future in-run streaming frames.
 
 A `RunComplete` too large to frame is substituted by a minimal one — same
 `runId` and `status`, empty telemetry, and an error naming the substitution —
@@ -945,7 +945,7 @@ are additionally capped at the runtime (256-byte name, 2048-byte message).
 ### 5.8 Stats payloads
 
 A `Stats` request has an **empty payload** and is answered with exactly one
-`StatsResult` frame — a point-in-time snapshot of the warm registry (#65).
+`StatsResult` frame — a point-in-time snapshot of the warm registry.
 Counts are mutually consistent (taken under one registry lock) but stale the
 moment they are sent: diagnostics, not synchronization. The host sends
 `Stats` on a dedicated control connection outside its run pool, so a
@@ -959,9 +959,9 @@ snapshot answers even while every run slot is busy.
 | `warmBusy`        | `u32`               | Warm instances currently serving a call.                                                               |
 | `warmIdle`        | `u32`               | Idle warm instances ready for reuse.                                                                   |
 | `idleHeapBytes`   | `u64`               | Summed `used_heap_size` of the idle instances, each measured after its last call.                      |
-| `warmBudgetBytes` | `u64`               | The RSS mark the registry sheds against (`--warm-budget-bytes`, #66). 0 = watermarks disabled.         |
+| `warmBudgetBytes` | `u64`               | The RSS mark the registry sheds against (`--warm-budget-bytes`). 0 = watermarks disabled.              |
 | `rssBytes`        | `u64`               | The runtime process's resident set size at snapshot time; the signal the mark acts on. 0 = unreadable. |
-| `underPressure`   | `u8`                | 1 while the shedding latch is held: RSS reached the budget, not yet back at 4/5 of it (#66).           |
+| `underPressure`   | `u8`                | 1 while the shedding latch is held: RSS reached the budget, not yet back at 4/5 of it.                 |
 | `prefixes`        | `List<PrefixStats>` | Per-prefix instance counts, sorted by prefix id.                                                       |
 
 `PrefixStats`:
@@ -978,7 +978,7 @@ snapshot answers even while every run slot is busy.
 
 Each connection handles one active run at a time. The TypeScript `Runtime`
 maintains a pool of connections, one per `maxIsolates` slot, plus one
-dedicated control connection used only for `Stats` (#65) — kept outside the
+dedicated control connection used only for `Stats` — kept outside the
 pool so a snapshot answers even while every run slot is busy. `Stats` is
 legal on any authenticated connection (the runtime serves it in the
 top-level message loop), but the host never sends it on a pooled connection.
@@ -1001,7 +1001,7 @@ TS (one connection slot)              Rust (one isolate thread)
 │  next Run/PrefixRun may now begin     │
 ```
 
-A run whose `Result` reports `backgroundPending = true` (#71) is not over:
+A run whose `Result` reports `backgroundPending = true` is not over:
 the connection stays bound to it while `waitUntil` background work runs —
 grace-time `BridgeCall`/`BridgeResponse` traffic included — until exactly one
 `RunComplete` frame ends the run and frees the slot. The host resolves the
@@ -1015,7 +1015,7 @@ shape** in the Rust process under a `PrefixId`. There is no runtime snapshot
 (V8 14.x cannot create startup snapshots safely in a live multi-isolate
 process; see DESIGN.md on the removal).
 
-`PrefixRun` is served by **warm instances** (#64): the runtime keeps a
+`PrefixRun` is served by **warm instances**: the runtime keeps a
 registry of resident isolates per prefix, each owned by a dedicated runtime
 thread. The first run cold-starts an instance (prefix evaluated under the
 warm-up budget, never billed to the triggering run); later runs reuse it and
@@ -1024,7 +1024,7 @@ wire — the frames are identical warm or cold; only `heapUsedBytes` on the
 Result reports it. Instances are discarded on taint (any fired guard, abort
 mid-call, fatal bridge error), on `DisposePrefix`, and by scored eviction
 under memory pressure: there is no instance-count cap, only the RSS mark
-(`--warm-budget-bytes`, #66). At/above the mark the runtime evicts idle
+(`--warm-budget-bytes`). At/above the mark the runtime evicts idle
 instances by `heapUsed × idleTime` and stops admitting new warmth until RSS
 falls back to 4/5 of the mark, so a `PrefixRun` with no idle instance
 available runs on a fresh one-off isolate instead of pooling another. Idle
@@ -1040,7 +1040,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | Code                                  | Cause                                                                                                                                                                                                                                                                                                                                              |
 | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                                                                                                                                                                      |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's heap cap (`memoryMb` — a Runtime-level setting since #64, carried in the limits slot of every frame by the host).                                                                                                                                                                                     |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's heap cap (`memoryMb` — a Runtime-level setting, carried in the limits slot of every frame by the host).                                                                                                                                                                                               |
 | `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                                                                                                   |
 | `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                                                                                        |
 | `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                                                                                             |
@@ -1057,7 +1057,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                                                                                                                                                                        |
 | `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                                                                                                                                                                        |
 | `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage.                                                                                                                                            |
-| `ERR_WARMUP_LIMIT`                    | Prefix evaluation (plus the per-instance runtime installs) exceeded its fixed warm-up budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model, #64). Isolate boot itself precedes the budget. Enforced at `Precompile` and at instance cold-start. Move expensive setup into the handler (lazy init on first call).       |
+| `ERR_WARMUP_LIMIT`                    | Prefix evaluation (plus the per-instance runtime installs) exceeded its fixed warm-up budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model). Isolate boot itself precedes the budget. Enforced at `Precompile` and at instance cold-start. Move expensive setup into the handler (lazy init on first call).            |
 | `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                                                                                                    |
 | `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.6. |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                                                                                                    |
