@@ -265,6 +265,7 @@ Every call to `runtime.run(opts)`:
   maxStdoutBytes: 1 * 1024 * 1024,          // console.log lines; over-limit lines silently dropped
   maxStderrBytes: 1 * 1024 * 1024,          // console.warn/error lines; same truncation rule
   maxBridgeCalls: 10,                       // 0 = unlimited; default 10 protects against runaway loops
+  graceMs: 30_000,                          // waitUntil background-work budget after the result ships; 0 disables (#71)
 }
 ```
 
@@ -320,6 +321,49 @@ running byte totals during console capture. Any line whose addition would
 push the total over the configured cap is silently dropped; the run continues
 normally. Zero disables the cap.
 
+**Grace budget** (`graceMs`): after a run's value has been serialized
+and the early Result shipped, background work registered with `waitUntil`
+keeps running under its own budgets — this wall cap for the whole registered
+set (enforced at turn boundaries by the poll loop, so a boundary stop is
+clean), plus a fresh CPU allotment sized like `cpuTimeMs` (or `graceMs` when
+CPU is uncapped) whose guard terminates a runaway continuation mid-turn — a
+taint on a warm instance, like any fired guard. `maxBridgeCalls` keeps
+counting on the run's counter through grace, so one run has one bridge
+budget. Grace wall and CPU time are metered separately and reported on the
+`RunComplete` frame; they are never billed to the run's own
+`durationMs`/`cpuTimeMs`. Zero disables the grace phase: registered work dies
+when the value settles. Cloudflare's `ctx.waitUntil` (30 s) is the model.
+
+Hardening from the pre-merge security review: the grace loop waits in
+~250 ms ticks, so a CPU-killed background task frees the connection slot
+within a quarter second instead of holding it for the rest of `graceMs` (a
+slot is only held long-term by work that is genuinely still running — freeing
+it during live grace requires the run-tagged post-Result frames #96 designs,
+recorded there as a requirement). The aggregate is driven by the pristine
+`Promise.allSettled` captured into a private slot before any guest code runs,
+so tampering with the public one changes nothing. The rejection text carried
+on the final frame is capped (256/2048 bytes), and an oversized grace report
+is substituted by a minimal one rather than costing the connection. A host
+`AbortSignal` firing during the epilogue cancels the background work
+gracefully (a `Terminate` truncates the grace phase; the report still
+arrives). Grace console output shares the run's remaining
+`maxStdoutBytes`/`maxStderrBytes` budgets rather than getting fresh ones —
+deliberate, one cap per run.
+
+`waitUntil(value)` itself is a runtime-owned global (reserved name, installed
+non-enumerable like the web classes) and is also importable as
+`import { waitUntil } from 'iso4:runtime'` — the second runtime-owned module
+specifier after `node:async_hooks`. It is available to run code only: setup
+code evaluated at `prepare()` time gets a catchable error, since setup must
+finish inside the warm-up budget. Registered values that are not promises
+count as already-settled work. The host sees the outcome as
+`result.waitUntil?: Promise<WaitUntilResult>` — present only when work was
+registered, always resolving (never rejecting) with the grace status
+(`settled` / `truncated` / `failed`), grace-time telemetry, and console
+lines. A rejected background promise is a normal `failed` outcome (the code
+finished via its error path — no taint, the instance is reused); only a
+guard-fired mid-turn kill taints.
+
 ### 4.2 Globals (block-listed, not allowlisted)
 
 Globals are _not_ a free-for-all. The runtime owns a fixed set of reserved
@@ -341,7 +385,7 @@ names is rejected with `ERR_UNDECLARED_BINDING`. Allowing a host to shadow
 > `Request`, `Response`, `TextEncoder`, `TextDecoder`, `URL` and
 > `URLSearchParams` are now installed by the runtime (see §4.4 below);
 > `crypto`, `Event`, `AbortController` and `AbortSignal` still do not exist
-> and are **not** reserved.
+> and are **not** reserved. `waitUntil` joined the reserved list with #71.
 
 Any name **not** on that reserved list may be provided by the host as a
 global. The host passes `globals: { fetch: fn, myTool: fn, transform: fn }`

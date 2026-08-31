@@ -191,6 +191,9 @@ pub struct RunSuccessPayload {
     /// feeds eviction scoring, #66); absent for one-off runs, whose isolate
     /// is already gone.
     pub heap_used_bytes: Option<u64>,
+    /// True when `waitUntil` background work is still running (#71): a final
+    /// `RunComplete` frame follows this Result on the same connection.
+    pub background_pending: bool,
 }
 
 /// Payload for a failed run.
@@ -230,6 +233,7 @@ pub enum RunCompletion {
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
 ///   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
+///   bool backgroundPending          (#71: a RunComplete frame follows)
 /// u8    failurePresent  (1 when ok = 0)
 ///   RunErrorPayload  error
 ///   List<String>  stdout
@@ -255,6 +259,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_f64(s.cpu_time_ms, &mut out);
             encode_bridge_call_records(&s.bridge_calls, &mut out);
             encode_optional_u64(s.heap_used_bytes, &mut out);
+            encode_bool(s.background_pending, &mut out);
             out.push(0); // Optional<RunFailurePayload> absent
         }
         RunCompletion::Failure(f) => {
@@ -271,6 +276,65 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
         }
     }
 
+    out
+}
+
+/// Encode a `RunCompletePayload` (#71) — the final frame of a run whose
+/// Result reported pending background work.
+///
+/// Wire layout:
+/// ```text
+/// u32   runId
+/// u8    status  (0 = settled, 1 = truncated, 2 = failed)
+/// f64   durationMs      (grace wall time after the Result)
+/// f64   cpuTimeMs       (active V8 time during grace)
+/// List<String>  stdout  (console lines written during grace)
+/// List<String>  stderr
+/// List<BridgeCallRecord>  bridgeCalls  (attempted during grace)
+/// Optional<(String name, String message)>  error
+/// ```
+pub fn encode_run_complete_payload(run_id: u32, report: &crate::v8::GraceReport) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_u32(run_id, &mut out);
+    out.push(match report.status {
+        crate::v8::GraceStatus::Settled => 0,
+        crate::v8::GraceStatus::Truncated => 1,
+        crate::v8::GraceStatus::Failed => 2,
+    });
+    encode_f64(report.duration_ms, &mut out);
+    encode_f64(report.cpu_time_ms, &mut out);
+    encode_string_list(&report.stdout, &mut out);
+    encode_string_list(&report.stderr, &mut out);
+    encode_bridge_call_records(&report.bridge_calls, &mut out);
+    match &report.error {
+        Some((name, message)) => {
+            out.push(1);
+            encode_string(name, &mut out);
+            encode_string(message, &mut out);
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// Minimal `RunCompletePayload` substituted when the real grace report is too
+/// large to frame (#71 review, finding 1): same runId and status byte, empty
+/// telemetry, and an error naming the substitution. Small by construction.
+pub fn encode_minimal_run_complete(run_id: u32, status_byte: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_u32(run_id, &mut out);
+    out.push(status_byte);
+    encode_f64(0.0, &mut out);
+    encode_f64(0.0, &mut out);
+    encode_string_list(&[], &mut out);
+    encode_string_list(&[], &mut out);
+    encode_bridge_call_records(&[], &mut out);
+    out.push(1);
+    encode_string("Error", &mut out);
+    encode_string(
+        "the grace report was too large to send; its telemetry was dropped",
+        &mut out,
+    );
     out
 }
 

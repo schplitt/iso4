@@ -163,6 +163,21 @@ export class ConnectionPool {
   }
 
   private release(client: RuntimeIpcClient): void {
+    // A run that ended with pending waitUntil work (#71) still owns its
+    // connection: grace-time bridge frames and the final RunComplete belong
+    // to it. Hold the slot until the epilogue settles, then release for real.
+    const hold = client.pendingEpilogue
+    if (hold) {
+      hold.then(() => {
+        client.pendingEpilogue = null
+        this.releaseNow(client)
+      })
+      return
+    }
+    this.releaseNow(client)
+  }
+
+  private releaseNow(client: RuntimeIpcClient): void {
     this.leased--
 
     if (this.disposed) {

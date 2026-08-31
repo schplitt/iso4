@@ -55,6 +55,12 @@ export const RustToTsMessageTypes = {
    * Capacity/usage snapshot answering a `Stats` request (#65).
    */
   StatsResult: 0x06,
+  /**
+   * Final frame of a run whose Result reported pending background work:
+   * carries the `waitUntil` epilogue outcome and frees the run's
+   * connection slot.
+   */
+  RunComplete: 0x07,
 } as const
 
 export type RustToTsMessageType
@@ -747,6 +753,7 @@ class PayloadWriter {
     this.writeOptionalU32(limits.maxStderrBytes)
     this.writeOptionalU32(limits.maxBridgeCallBytes)
     this.writeOptionalU32(limits.maxBridgeCalls)
+    this.writeOptionalU32(limits.graceMs)
     return this
   }
 
@@ -1273,6 +1280,12 @@ export interface DecodedRunCompletion {
    */
   runId: number
   result: RunResult
+  /**
+   * True when `waitUntil` background work is still running runtime-side
+   * (#71): a `RunComplete` frame follows on this connection. Always false on
+   * failures.
+   */
+  backgroundPending: boolean
 }
 
 /**
@@ -1283,6 +1296,68 @@ export interface DecodedRunCompletion {
 export interface DecodedCallCompletion {
   runId: number
   result: CallResult
+  /**
+   * See {@link DecodedRunCompletion.backgroundPending}.
+   */
+  backgroundPending: boolean
+}
+
+/**
+ * Decoded `RunComplete` frame payload (#71) — the `waitUntil` epilogue's
+ * outcome. Mirrors `encode_run_complete_payload` in `wire.rs`.
+ */
+export interface DecodedRunComplete {
+  runId: number
+  status: 'settled' | 'truncated' | 'failed'
+  durationMs: number
+  cpuTimeMs: number
+  stdout: string[]
+  stderr: string[]
+  bridgeCalls: BridgeCallEntry[]
+  error?: { name: string, message: string }
+}
+
+/**
+ * Decode a `RunComplete` frame payload (#71).
+ * @param buf the frame payload
+ */
+export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
+  const reader = new PayloadReader(buf)
+  const runId = reader.readU32()
+  const statusByte = reader.readU8()
+  const status = (['settled', 'truncated', 'failed'] as const)[statusByte]
+  if (status === undefined) {
+    throw new PayloadDecodeError(`unknown RunComplete status byte: ${statusByte}`)
+  }
+  const durationMs = reader.readF64()
+  const cpuTimeMs = reader.readF64()
+  const stdout = reader.readStringList()
+  const stderr = reader.readStringList()
+  const bridgeCalls = readBridgeCallRecords(reader)
+  const errorPresent = reader.readU8()
+  const error = errorPresent === 1
+    ? { name: reader.readString(), message: reader.readString() }
+    : undefined
+  reader.assertDone()
+  const decoded: DecodedRunComplete = { runId, status, durationMs, cpuTimeMs, stdout, stderr, bridgeCalls }
+  if (error !== undefined)
+    decoded.error = error
+  return decoded
+}
+
+/**
+ * Read just the `backgroundPending` flag off a `Result` frame payload (#71),
+ * without decoding the rest. Both encoders write strict layouts with no
+ * trailing bytes, so on a success payload the flag is the second-to-last byte
+ * (followed only by the `failurePresent = 0` byte); failures never carry
+ * pending work.
+ * @param payload the raw Result frame payload
+ */
+export function peekRunCompletionBackgroundPending(payload: Uint8Array): boolean {
+  if (payload.byteLength < 7)
+    return false
+  const ok = payload[4] === 1
+  return ok && payload[payload.byteLength - 2] === 1
 }
 
 /**
@@ -1341,7 +1416,6 @@ export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
  *   Optional<u64>  heapUsedBytes   (#64: present for prefix runs)
  * ```
  * @param buf
- * @param resultKind
  */
 export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletion
 export function decodeRunCompletionPayload(buf: Uint8Array, resultKind: 'call'): DecodedCallCompletion
@@ -1368,12 +1442,14 @@ export function decodeRunCompletionPayload(
     const cpuTimeMs = reader.readF64()
     const bridgeCalls = readBridgeCallRecords(reader)
     const heapUsedBytes = reader.readOptionalU64()
+    const backgroundPending = reader.readBool()
     reader.readU8() // failurePresent = 0; consumed for forward-compat
 
     reader.assertDone()
     if (resultKind === 'call') {
       return {
         runId,
+        backgroundPending,
         result: {
           status: 'completed',
           ok: true,
@@ -1389,6 +1465,7 @@ export function decodeRunCompletionPayload(
     }
     return {
       runId,
+      backgroundPending,
       result: {
         status: 'completed',
         ok: true,
@@ -1427,6 +1504,7 @@ export function decodeRunCompletionPayload(
   reader.assertDone()
   return {
     runId,
+    backgroundPending: false,
     result: {
       status: 'failed',
       ok: false,
@@ -1642,6 +1720,7 @@ export function parseRustToTsMessageType(
     case RustToTsMessageTypes.Log:
     case RustToTsMessageTypes.Hello:
     case RustToTsMessageTypes.StatsResult:
+    case RustToTsMessageTypes.RunComplete:
       return byte
     default:
       throw new Error(`unknown Rust->TS message type: ${formatByte(byte)}`)

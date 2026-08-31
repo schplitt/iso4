@@ -102,6 +102,16 @@ export interface ResourceLimits {
    * @default 10
    */
   maxBridgeCalls?: number
+
+  /**
+   * Wall budget in milliseconds for `waitUntil` background work after the
+   * run's value has been delivered (#71). One budget for the whole registered
+   * set, started when the result ships. Grace work additionally gets a fresh
+   * CPU allotment sized like `cpuTimeMs`. `0` disables the grace phase
+   * entirely: registered work dies when the value settles.
+   * @default 30_000
+   */
+  graceMs?: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -113,9 +123,9 @@ export interface ResourceLimits {
  * permitted. Each value becomes a bridge stub in the sandbox global object.
  *
  * Reserved names (rejected with `ERR_UNDECLARED_BINDING`): `console`,
- * `Headers`, `Request`, `Response`, `TextEncoder`, `TextDecoder`, `URL`,
- * `URLSearchParams`. These are owned by the runtime; shadowing `Response` would
- * silently break serialization.
+ * `waitUntil`, `Headers`, `Request`, `Response`, `TextEncoder`,
+ * `TextDecoder`, `URL`, `URLSearchParams`. These are owned by the runtime;
+ * shadowing `Response` would silently break serialization.
  *
  * Common usage:
  * ```ts
@@ -1050,6 +1060,11 @@ export interface CallSuccess {
    * `undefined` for one-off `sandbox.run({ call })`.
    */
   heapUsedBytes?: number
+  /**
+   * Present when the call registered background work with `waitUntil` (#71) —
+   * see {@link RunSuccess.waitUntil}. Never rejects.
+   */
+  waitUntil?: Promise<WaitUntilResult>
 }
 
 /**
@@ -1101,6 +1116,45 @@ export interface BridgeCallEntry {
    * reached the host.
    */
   blocked: boolean
+}
+
+/**
+ * Outcome of a run's `waitUntil` grace phase (#71), delivered through
+ * {@link RunSuccess.waitUntil} / {@link CallSuccess.waitUntil}. The promise
+ * always **resolves** (never rejects), so ignoring it — the intended common
+ * case — produces no unhandled-rejection noise.
+ */
+export interface WaitUntilResult {
+  /**
+   * `settled`: every registered promise finished within the grace budget.
+   * `truncated`: the budget (or a host abort) cut the work short.
+   * `failed`: at least one registered promise rejected — a normal outcome,
+   * the code finished via its error path; the rest were still driven.
+   */
+  status: 'settled' | 'truncated' | 'failed'
+  /**
+   * Wall time of the grace phase (after the result shipped), ms.
+   */
+  durationMs: number
+  /**
+   * Active V8 execution time during the grace phase, ms.
+   */
+  cpuTimeMs: number
+  /**
+   * Console lines written during the grace phase — the run's own lines
+   * arrived on the result itself.
+   */
+  stdout: string[]
+  stderr: string[]
+  /**
+   * Bridge calls attempted during the grace phase.
+   */
+  bridgeCalls: BridgeCallEntry[]
+  /**
+   * The first rejection when `status === 'failed'`, or the fatal error that
+   * ended a truncated phase, when one exists.
+   */
+  error?: { name: string, message: string }
 }
 
 /**
@@ -1162,6 +1216,14 @@ export interface RunSuccess {
    * one-off `sandbox.run()` runs, whose isolate is disposed with the run.
    */
   heapUsedBytes?: number
+  /**
+   * Present when the run registered background work with `waitUntil` (#71):
+   * the value in this result was delivered early, the work keeps running
+   * runtime-side, and this promise resolves with the grace phase's outcome
+   * once it ends. `undefined` for every run that registered nothing. Safe to
+   * ignore — it never rejects.
+   */
+  waitUntil?: Promise<WaitUntilResult>
 }
 
 export interface RunFailure {
