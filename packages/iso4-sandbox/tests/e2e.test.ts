@@ -4051,6 +4051,60 @@ describe('web-server pattern (worker-style fetch handlers)', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Code generation from strings (#76): a prepare()-time capability. Setup code
+// may compile fast paths with eval / new Function; run code may only call
+// what setup built, and gets a catchable EvalError if it tries to generate
+// code of its own.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('eval and new Function are prepare()-time only', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('setup-compiled functions work in runs; run code cannot eval', async () => {
+    // The zod-shaped pattern: compile a matcher from strings once at
+    // prepare(), call it cheaply per run.
+    const prefix = await runtime.prepare({
+      code: `globalThis.matcher = new Function('s', 'return /^item-[0-9]+$/.test(s)')`,
+    })
+    const result = await prefix.execute({
+      code: `
+        const denied = (() => {
+          try { eval('1'); return 'allowed' }
+          catch (e) { return e instanceof EvalError && e.name }
+        })()
+        export default { ok: matcher('item-42'), no: matcher('nope'), denied }
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({ ok: true, no: false, denied: 'EvalError' })
+    await prefix.dispose()
+  })
+
+  test('one-off runs deny eval and new Function from the first line', async () => {
+    const result = await runtime.run({
+      code: `
+        const probe = (fn) => { try { fn(); return 'allowed' } catch (e) { return e.name } }
+        export default [probe(() => eval('1')), probe(() => new Function('return 1'))]
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual(['EvalError', 'EvalError'])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // readExports (#58): the deploy-path declaration reader
 // ─────────────────────────────────────────────────────────────────────────────
 
