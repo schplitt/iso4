@@ -2757,6 +2757,17 @@ fn build_output_and_maybe_grace(
         return finished(Err(rs.fail(RunError::ExportTooLarge)));
     }
 
+    // A terminate with NO reason at this point is a routed abort
+    // (`abort_executing`) that landed after the last JS left the isolate:
+    // nothing was interrupted, but the demux consumed the Terminate frame
+    // expecting this run to end. Cancel the pending flag and honor the
+    // abort as a boundary abandon — absorbing it into a success Result (or
+    // into grace) would silently un-abort the run.
+    if facts.reason.get().is_none() && facts.cancel_handle.is_execution_terminating() {
+        facts.cancel_handle.cancel_terminate_execution();
+        return finished(Err(rs.fail(RunError::Aborted)));
+    }
+
     let output = Output {
         exports,
         skipped_exports,
@@ -2791,10 +2802,17 @@ fn build_output_and_maybe_grace(
 
     // The run phase is over: its budget and guard come down before grace
     // arms its own, and a lingering termination flag must not kill grace
-    // work.
+    // work. The flag is INSPECTED before it is cancelled: a bare terminate
+    // here is a routed abort that raced the settled value — honor it as a
+    // boundary abandon rather than absorbing it into grace.
     rs.cpu_budget.leave();
     facts.guard.clear();
+    let bare_terminate =
+        facts.reason.get().is_none() && facts.cancel_handle.is_execution_terminating();
     facts.cancel_handle.cancel_terminate_execution();
+    if bare_terminate {
+        return finished(Err(rs.fail(RunError::Aborted)));
+    }
 
     // A guard may have fired in the microsecond between the settled-value
     // check above and the clear. The whole window is Rust bookkeeping — no
