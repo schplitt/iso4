@@ -573,12 +573,15 @@ export function decodeHelloPayload(payload: Uint8Array): HelloPayload {
  * The name of the global is always a plain string here — it reaches the sandbox
  * global object through the V8 API (`object.set`), never through interpolation
  * into an identifier position.
+ *
+ * `enumerable` defaults to `true` when omitted; the wire always carries an
+ * explicit bool.
  */
 export type GlobalDefPayload
-  = | { kind: 'bridge', name: string, enumerable: boolean }
-    | { kind: 'string', name: string, expr: string, enumerable: boolean }
-    | { kind: 'data', name: string, value: unknown, enumerable: boolean }
-    | { kind: 'shim', name: string, shim: string, handlerName: string, enumerable: boolean }
+  = | { kind: 'bridge', name: string, enumerable?: boolean }
+    | { kind: 'string', name: string, expr: string, enumerable?: boolean }
+    | { kind: 'data', name: string, value: unknown, enumerable?: boolean }
+    | { kind: 'shim', name: string, shim: string, handlerName: string, enumerable?: boolean }
 
 /**
  * Wire tag for each `GlobalDefPayload` kind. Mirrors `HostGlobalDef` on the
@@ -668,7 +671,7 @@ class PayloadWriter {
     for (const def of defs) {
       this.writeU8(GLOBAL_DEF_KIND[def.kind])
       this.writeString(def.name)
-      this.writeU8(def.enumerable ? 1 : 0)
+      this.writeU8((def.enumerable ?? true) ? 1 : 0)
       switch (def.kind) {
         case 'bridge':
           break
