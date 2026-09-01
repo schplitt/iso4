@@ -134,6 +134,26 @@ pub struct RunErrorPayload {
     /// Own-enumerable properties beyond `name`/`message`/`stack`, as a V8
     /// serialization blob holding a plain object. `None` when there are none.
     pub fields: Option<Vec<u8>>,
+    /// Present only for `ERR_INSTANCE_RESET`: the cause class and the wire
+    /// run id of the run whose mid-JS interruption reset the instance.
+    pub reset: Option<ResetInfo>,
+}
+
+/// The `ERR_INSTANCE_RESET` extras — see `RunErrorPayload::reset`.
+#[derive(Clone, Copy)]
+pub struct ResetInfo {
+    pub cause: crate::v8::ResetCause,
+    pub culprit_run_id: u32,
+}
+
+fn reset_cause_byte(cause: crate::v8::ResetCause) -> u8 {
+    match cause {
+        crate::v8::ResetCause::Cpu => 0,
+        crate::v8::ResetCause::Memory => 1,
+        crate::v8::ResetCause::Abort => 2,
+        crate::v8::ResetCause::Internal => 3,
+        crate::v8::ResetCause::Wall => 4,
+    }
 }
 
 /// Per-call metadata for one bridge call attempt — names, timing, and sizes
@@ -426,6 +446,14 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
         keep
     });
     encode_optional_value_blob(fields, out);
+    match &error.reset {
+        Some(info) => {
+            out.push(1);
+            out.push(reset_cause_byte(info.cause));
+            encode_u32(info.culprit_run_id, out);
+        }
+        None => out.push(0),
+    }
 }
 
 // ── PrecompileResultPayload encoder ──────────────────────────────────────────
@@ -470,70 +498,49 @@ pub fn encode_precompile_result_payload(
 /// Convert a V8 `RunError` into the wire-level `RunErrorPayload` per the error
 /// code table in `docs/protocol.md` §7.
 pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
+    fn plain(code: &str, name: &str, message: String) -> RunErrorPayload {
+        RunErrorPayload {
+            code: code.to_string(),
+            name: name.to_string(),
+            message,
+            stack: None,
+            fields: None,
+            reset: None,
+        }
+    }
     match error {
-        RunError::InvalidPayload(msg) => RunErrorPayload {
-            code: "ERR_INTERNAL".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::CompileError(msg) => RunErrorPayload {
-            code: "ERR_COMPILE".to_string(),
-            name: "SyntaxError".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
+        RunError::InvalidPayload(msg) => plain("ERR_INTERNAL", "Error", msg.clone()),
+        RunError::CompileError(msg) => plain("ERR_COMPILE", "SyntaxError", msg.clone()),
         RunError::RuntimeError(inner) => RunErrorPayload {
             code: "ERR_USER_CODE".to_string(),
             name: inner.name.clone(),
             message: inner.message.clone(),
             stack: inner.stack.clone(),
             fields: inner.fields.clone(),
+            reset: None,
         },
-        RunError::ModuleNotFound(msg) => RunErrorPayload {
-            code: "ERR_MODULE_NOT_FOUND".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::ExportNotSerializable(msg) => RunErrorPayload {
-            code: "ERR_EXPORT_NOT_SERIALIZABLE".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::TypeNotSerializable(msg) => RunErrorPayload {
-            code: "ERR_TYPE_NOT_SERIALIZABLE".to_string(),
-            name: "TypeError".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::CpuTimeout => RunErrorPayload {
-            code: "ERR_CPU_TIMEOUT".to_string(),
-            name: "Error".to_string(),
-            message: "CPU time limit exceeded".to_string(),
-            stack: None,
-            fields: None,
-        },
-        RunError::WallTimeout => RunErrorPayload {
-            code: "ERR_WALL_TIMEOUT".to_string(),
-            name: "Error".to_string(),
-            message: "Wall time limit exceeded".to_string(),
-            stack: None,
-            fields: None,
-        },
-        RunError::MemoryLimit => RunErrorPayload {
-            code: "ERR_MEMORY_LIMIT".to_string(),
-            name: "Error".to_string(),
-            message: "Memory limit exceeded".to_string(),
-            stack: None,
-            fields: None,
-        },
+        RunError::ModuleNotFound(msg) => plain("ERR_MODULE_NOT_FOUND", "Error", msg.clone()),
+        RunError::ExportNotSerializable(msg) => {
+            plain("ERR_EXPORT_NOT_SERIALIZABLE", "Error", msg.clone())
+        }
+        RunError::TypeNotSerializable(msg) => {
+            plain("ERR_TYPE_NOT_SERIALIZABLE", "TypeError", msg.clone())
+        }
+        RunError::CpuTimeout => plain(
+            "ERR_CPU_TIMEOUT",
+            "Error",
+            "CPU time limit exceeded".to_string(),
+        ),
+        RunError::WallTimeout => plain(
+            "ERR_WALL_TIMEOUT",
+            "Error",
+            "Wall time limit exceeded".to_string(),
+        ),
+        RunError::MemoryLimit => plain(
+            "ERR_MEMORY_LIMIT",
+            "Error",
+            "Memory limit exceeded".to_string(),
+        ),
         RunError::HostBridge(err) => RunErrorPayload {
             code: "ERR_HOST_BRIDGE".to_string(),
             name: err.name.clone(),
@@ -542,91 +549,73 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             // file paths and infrastructure details.
             stack: None,
             fields: err.fields.clone(),
+            reset: None,
         },
-        RunError::UndeclaredBinding(msg) => RunErrorPayload {
-            code: "ERR_UNDECLARED_BINDING".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::PrefixDidNotSettle(msg) => RunErrorPayload {
-            code: "ERR_PREFIX_DID_NOT_SETTLE".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::PrefixBridgeCall(msg) => RunErrorPayload {
-            code: "ERR_PREFIX_BRIDGE_CALL".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::CallTargetNotFound(msg) => RunErrorPayload {
-            code: "ERR_CALL_TARGET_NOT_FOUND".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
-        RunError::FunctionArgumentNotSupported => RunErrorPayload {
-            code: "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED".to_string(),
-            name: "Error".to_string(),
-            message: "function arguments are not supported across the bridge boundary".to_string(),
-            stack: None,
-            fields: None,
-        },
-        RunError::BridgeCallPayloadTooLarge => RunErrorPayload {
-            code: "ERR_BRIDGE_PAYLOAD_TOO_LARGE".to_string(),
-            name: "Error".to_string(),
-            message: "bridge call payload exceeds configured maxBridgeCallBytes limit".to_string(),
-            stack: None,
-            fields: None,
-        },
-        RunError::ExportTooLarge => RunErrorPayload {
-            code: "ERR_EXPORT_TOO_LARGE".to_string(),
-            name: "Error".to_string(),
-            message: "serialised export payload exceeds configured maxExportBytes limit"
-                .to_string(),
-            stack: None,
-            fields: None,
-        },
-        RunError::BridgeCallLimitExceeded => RunErrorPayload {
-            code: "ERR_BRIDGE_CALL_LIMIT_EXCEEDED".to_string(),
-            name: "Error".to_string(),
-            message: "run exceeded the configured maxBridgeCalls limit".to_string(),
-            stack: None,
-            fields: None,
-        },
-        RunError::Aborted => RunErrorPayload {
-            code: "ERR_ABORTED".to_string(),
-            name: "AbortError".to_string(),
-            message: "run was aborted".to_string(),
-            stack: None,
-            fields: None,
-        },
-        RunError::WarmupLimit => RunErrorPayload {
-            code: "ERR_WARMUP_LIMIT".to_string(),
+        RunError::UndeclaredBinding(msg) => plain("ERR_UNDECLARED_BINDING", "Error", msg.clone()),
+        RunError::PrefixDidNotSettle(msg) => {
+            plain("ERR_PREFIX_DID_NOT_SETTLE", "Error", msg.clone())
+        }
+        RunError::PrefixBridgeCall(msg) => plain("ERR_PREFIX_BRIDGE_CALL", "Error", msg.clone()),
+        RunError::CallTargetNotFound(msg) => {
+            plain("ERR_CALL_TARGET_NOT_FOUND", "Error", msg.clone())
+        }
+        RunError::FunctionArgumentNotSupported => plain(
+            "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED",
+            "Error",
+            "function arguments are not supported across the bridge boundary".to_string(),
+        ),
+        RunError::BridgeCallPayloadTooLarge => plain(
+            "ERR_BRIDGE_PAYLOAD_TOO_LARGE",
+            "Error",
+            "bridge call payload exceeds configured maxBridgeCallBytes limit".to_string(),
+        ),
+        RunError::ExportTooLarge => plain(
+            "ERR_EXPORT_TOO_LARGE",
+            "Error",
+            "serialised export payload exceeds configured maxExportBytes limit".to_string(),
+        ),
+        RunError::BridgeCallLimitExceeded => plain(
+            "ERR_BRIDGE_CALL_LIMIT_EXCEEDED",
+            "Error",
+            "run exceeded the configured maxBridgeCalls limit".to_string(),
+        ),
+        RunError::Aborted => plain("ERR_ABORTED", "AbortError", "run was aborted".to_string()),
+        RunError::InstanceReset {
+            cause,
+            culprit_run_id,
+        } => RunErrorPayload {
+            code: "ERR_INSTANCE_RESET".to_string(),
             name: "Error".to_string(),
             message: format!(
+                "the shared instance was reset by a co-resident run ({}): this run \
+                 was in flight on it and could not continue",
+                match cause {
+                    crate::v8::ResetCause::Cpu => "CPU limit",
+                    crate::v8::ResetCause::Memory => "memory limit",
+                    crate::v8::ResetCause::Wall => "wall deadline",
+                    crate::v8::ResetCause::Abort => "mid-execution abort",
+                    crate::v8::ResetCause::Internal => "internal failure",
+                },
+            ),
+            stack: None,
+            fields: None,
+            reset: Some(ResetInfo {
+                cause: *cause,
+                culprit_run_id: *culprit_run_id,
+            }),
+        },
+        RunError::WarmupLimit => plain(
+            "ERR_WARMUP_LIMIT",
+            "Error",
+            format!(
                 "prefix evaluation exceeded its fixed warm-up budget ({}ms wall / \
                  {}ms CPU); move expensive setup into the handler (lazy init on \
                  first call)",
                 crate::v8::WARMUP_WALL_MS,
                 crate::v8::WARMUP_CPU_MS,
             ),
-            stack: None,
-            fields: None,
-        },
-        RunError::Internal(msg) => RunErrorPayload {
-            code: "ERR_INTERNAL".to_string(),
-            name: "Error".to_string(),
-            message: msg.clone(),
-            stack: None,
-            fields: None,
-        },
+        ),
+        RunError::Internal(msg) => plain("ERR_INTERNAL", "Error", msg.clone()),
     }
 }
 
@@ -679,6 +668,7 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 ///
 /// Wire layout:
 /// ```text
+/// u32                runId       (the owning run — leads every run-scoped frame)
 /// u32                callId
 /// u8                 targetKind  (0 = global, 1 = import)
 /// Optional<String>   specifier   (present when targetKind = 1)
@@ -697,6 +687,7 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 /// payload length, so the caller can check the cap first and then write the
 /// two pieces in sequence.
 pub fn encode_bridge_call_header(
+    run_id: u32,
     call_id: u32,
     target_kind: u8, // 0 = global
     specifier: Option<&str>,
@@ -704,6 +695,11 @@ pub fn encode_bridge_call_header(
     args_blob_len: u32,
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    // The owning run leads the frame, like every other run-scoped frame:
+    // handlers are per run, and the host cannot map callId → run on its own
+    // (call ids are allocated child-side). 0 = a direct-API run with no wire
+    // identity.
+    encode_u32(run_id, &mut out);
     encode_u32(call_id, &mut out);
     out.push(target_kind);
     match specifier {
@@ -744,6 +740,7 @@ pub struct BridgeErrorPayload {
 ///
 /// Wire layout:
 /// ```text
+/// u32                 runId   (echoed from the BridgeCall being answered)
 /// u32                 callId
 /// u8                  ok
 /// Optional<ValueBlob> value   (present when ok = true)
@@ -754,13 +751,18 @@ pub struct BridgeErrorPayload {
 #[allow(clippy::type_complexity)]
 pub fn parse_bridge_response_payload(
     payload: &[u8],
-) -> io::Result<(u32, Result<Option<Vec<u8>>, BridgeErrorPayload>)> {
+) -> io::Result<(u32, u32, Result<Option<Vec<u8>>, BridgeErrorPayload>)> {
     let mut offset = 0;
 
-    // callId - returned to the caller for validation.  In v1 bridge calls are
-    // sequential within a run, but the connection is reused across runs so a
-    // stale BridgeResponse from a previous run's orphaned handler can arrive
-    // here.  The caller compares this value against the callId it sent.
+    // runId — the host echoes the id from the BridgeCall it is answering, so
+    // the session demux routes the frame statelessly. A stale response for a
+    // finished run fails the demux lookup and is discarded.
+    let run_id = read_u32(payload, &mut offset)?;
+
+    // callId - returned to the caller for validation.  Within a run several
+    // calls can be in flight (Promise.all), and the connection is reused
+    // across runs, so a stale BridgeResponse from a previous run's orphaned
+    // handler can arrive here.  The caller routes by this value.
     let call_id = read_u32(payload, &mut offset)?;
 
     let ok_byte = read_u8(payload, &mut offset)?;
@@ -773,7 +775,7 @@ pub fn parse_bridge_response_payload(
             } else {
                 None
             };
-            Ok((call_id, Ok(value)))
+            Ok((run_id, call_id, Ok(value)))
         }
         0 => {
             // ok = false - read the error payload: code name message stack fields
@@ -795,6 +797,7 @@ pub fn parse_bridge_response_payload(
                 None
             };
             Ok((
+                run_id,
                 call_id,
                 Err(BridgeErrorPayload {
                     name,
@@ -824,6 +827,7 @@ mod tests {
                     message,
                     stack,
                     fields,
+                    reset: None,
                 },
                 stdout: Vec::new(),
                 stderr: Vec::new(),

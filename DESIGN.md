@@ -177,11 +177,13 @@ host hands it over by name.
   │                                                         │    
   │   main.rs  ─ UDS accept loop, handshake, signal handling │   
   │      │                                                  │    
-  │      ├─ one OS thread per isolate                       │    
+  │      ├─ one demux thread per connection (only reader;   │    
+  │      │     routes frames per run; serialized writer)    │    
+  │      ├─ one OS thread per isolate — the turn loop       │    
   │      │     v8::Isolate (heap_limits + custom allocator) │    
   │      │     v8::Context with curated globals             │    
-  │      │     timeout guard thread (terminate_execution)   │    
-  │      │     CPU budget tracker (enter/leave bracketing)  │    
+  │      │     one guard thread (parked while idle)         │    
+  │      │     per-run CPU budgets (enter/leave per turn)   │    
   │      └─ stock V8 snapshot for sub-ms isolate boot       │    
   └─────────────────────────────────────────────────────────┘    
 ```
@@ -274,7 +276,6 @@ Every call to `runtime.run(opts)`:
   maxStdoutBytes: 1 * 1024 * 1024,
   maxStderrBytes: 1 * 1024 * 1024,
   maxBridgeCallBytes: 16 * 1024 * 1024,     // sandbox → host args per call
-  maxBridgeResponseBytes: 16 * 1024 * 1024, // host → sandbox return per call; must be ≤ memoryMb
   maxExportBytes: 16 * 1024 * 1024,         // serialised exports total
   maxStdoutBytes: 1 * 1024 * 1024,          // console.log lines; over-limit lines silently dropped
   maxStderrBytes: 1 * 1024 * 1024,          // console.warn/error lines; same truncation rule
@@ -314,16 +315,12 @@ whose guard fires during serialization fails with the timeout error; it never
 returns a partial result. workerd enforces its limits across serialization
 the same way.
 
-**Bridge payload sizes** (`maxBridgeCallBytes`, `maxBridgeResponseBytes`):
-the two directions are capped independently. `maxBridgeCallBytes` limits
-what untrusted sandbox code can send to host handlers; `maxBridgeResponseBytes`
-limits what the host can return per call. Both violations surface as
-`ERR_BRIDGE_PAYLOAD_TOO_LARGE`. `maxBridgeResponseBytes` must be ≤
-`memoryMb × 1 MiB` (a response larger than the sandbox's memory budget cannot
-be used); the TS layer validates this at `run()`/`precompile()` time. The Rust
-poll loop additionally reads `BridgeResponse` frames with a cap of
-`min(maxBridgeResponseBytes, memoryMb × 1 MiB)`, ensuring the memory budget
-acts as a natural inbound frame limit.
+**Bridge payload sizes**: `maxBridgeCallBytes` caps what untrusted sandbox
+code can send to host handlers per call (violation:
+`ERR_BRIDGE_PAYLOAD_TOO_LARGE`, fatal). The inbound direction has no
+dedicated knob: a run's `memoryMb` is its natural allowance — a response the
+sandbox couldn't hold is pointless — enforced by the session demux per run
+when it routes the frame (64 MiB framing default when `memoryMb = 0`).
 
 **Export size** (`maxExportBytes`): Rust serializes all exports into one V8
 blob and measures that blob. If it exceeds `maxExportBytes` the run fails with
@@ -338,8 +335,8 @@ normally. Zero disables the cap.
 **Grace budget** (`graceMs`): after a run's value has been serialized
 and the early Result shipped, background work registered with `waitUntil`
 keeps running under its own budgets — this wall cap for the whole registered
-set (enforced at turn boundaries by the poll loop, so a boundary stop is
-clean), plus a fresh CPU allotment sized like `cpuTimeMs` (or `graceMs` when
+set (enforced as a loop deadline of the instance's turn loop, so a boundary
+stop is clean), plus a fresh CPU allotment sized like `cpuTimeMs` (or `graceMs` when
 CPU is uncapped) whose guard terminates a runaway continuation mid-turn — a
 taint on a warm instance, like any fired guard. `maxBridgeCalls` keeps
 counting on the run's counter through grace, so one run has one bridge
@@ -893,11 +890,11 @@ The decided semantics:
   crosses back. Args are host-authored (the trusted direction): no dedicated
   size limit, the frame read is capped by `memoryMb` exactly like bridge
   responses. The return value respects `maxExportBytes`.
-- **A sync return value skips the poll loop entirely**; an async handler
-  re-enters the same settle machinery as the module evaluation promise, so
-  mid-request bridge calls work for free and poll rounds track bridge round
+- **A sync return value completes inside the start turn**; an async handler
+  suspends on the same turn machinery as the module evaluation promise, so
+  mid-request bridge calls work for free and turns track bridge round
   trips, not `await`s. Path resolution and the call run inside the CPU
-  budget, under the run's wall/CPU guards.
+  budget, under the run's guards.
 - A throw inside the handler is `ERR_USER_CODE`, exactly like postfix code.
 
 This is a **capability, not a perf win** (recorded so it is not re-argued):
@@ -1073,8 +1070,9 @@ Documented up front so we don't drift into rebuilding secure-exec:
    is always a fresh `v8::Context`, and no run may *depend* on state left by
    another. Prefix runs are served by warm instances, so state can in fact
    survive between calls on one instance as a cache that may vanish at any
-   moment; the contract, the concurrency rule (one call at a time per
-   instance), and the supported lazy-init pattern are §13.2.1.
+   moment; the contract, the per-instance turn loop (several runs in flight,
+   one turn at a time, per-run state separation), and the supported
+   lazy-init pattern are §13.2.1.
 
 7. **No filesystem.** No FS module is provided. If host code wants to expose
    read-only files, it does so via a custom import.
@@ -1805,10 +1803,14 @@ eviction.
 (`OwnedIsolate` is `!Send`, `Drop` asserts current-thread ownership and
 reverse creation order, no `Locker` exposed — re-verified on v8 147.4.0).
 Each instance is therefore owned cradle-to-grave by a dedicated runtime
-thread; session threads forward calls over a channel and park on the
-response, so the session socket keeps exactly one user at a time (the
-instance thread does bridge I/O during a call). Idle instances hold memory,
-not threads-in-use, and no clocks are armed while idle.
+thread running the per-instance turn loop: jobs arrive over the handle's
+channel, inbound frames arrive demux-routed per run, and any number of runs
+can be suspended on the instance while it executes one turn at a time. The
+connection's demux thread is its only socket reader; every outbound frame
+goes through one serialized writer, so concurrent runs never interleave
+mid-frame. Session dispatch never parks — a job's completion hook writes
+the run's frames and releases the instance. Idle instances hold memory, not
+threads-in-use; their guard thread is parked and no clocks are armed.
 
 **Warm-up budget.** Prefix evaluation (plus the per-instance runtime
 installs) runs under a fixed 1 s wall / 1 s CPU budget — isolate boot itself
@@ -1837,13 +1839,19 @@ Prefix output produced at `prepare()` validation is discarded (throwaway
 isolate, no result frame). Whether prefix logs should instead be dropped,
 tagged, or repeated is an open question — the text here records what ships today.
 
-**Taint-and-evict.** Any fired guard (CPU, wall, heap), an abort landing
-mid-call, a fatal bridge violation, or an internal failure discards the
-instance: `terminate_execution` rips arbitrary mid-execution state, so
-prefix coherence is unprovable afterwards. Ordinary uncaught exceptions are
-clean completions and do NOT taint. The next call pays a cold start; the
-misbehaving tenant pays, everyone else is unaffected. Never reuse a tainted
-instance; never evict a running one.
+**Taint-and-evict — narrowed to mid-execution interruption (epic #124).**
+An instance is discarded exactly when a turn was interrupted **while JS was
+executing**: a fired guard (CPU, heap, or a wall deadline hitting mid-turn)
+or a forced terminate — `terminate_execution` rips arbitrary mid-execution
+state, so prefix coherence is unprovable afterwards. Everything that ends a
+run **between** turns is a clean per-run failure and does NOT taint: a
+suspended run's wall expiry, its connection dying, or an abort (which simply
+abandons the run — its continuations never execute again). Ordinary uncaught
+exceptions are clean completions. When a reset does happen, the interrupted
+run fails with its own classified error and every co-resident run in flight
+fails with `ERR_INSTANCE_RESET` (cause class + culprit run id). The next
+call pays a cold start; never reuse a tainted instance; never evict a
+running one.
 
 **Uniform heap cap.** `memoryMb` moved from per-run `ResourceLimits` to
 `createSandbox()` (default 128 MB, workerd's number): the cap is baked into
@@ -1931,10 +1939,14 @@ now tracks.
 instances, because the same trigger fires concurrently: a call takes an
 idle instance or cold-starts another. Instances of one prefix share **no
 state** with each other (same contract as workerd instances across
-machines). **v1 concurrency: one call at a time per instance** —
-parallelism for one prefix = more instances. Async interleaving of multiple
-in-flight calls inside one isolate (the full workerd model) stays deferred:
-it needs multiplexed bridge calls and per-request context separation.
+machines). **Concurrency: a per-instance turn loop** (#125) — the owner
+thread selects over new jobs, frames routed to its in-flight runs, and the
+nearest per-run deadline; any number of runs can be suspended on one
+instance, each with its own budgets, console, streams, and bridge bindings
+(per-run state table + CPED-rider attribution). Wire multiplexing and
+attach-to-busy admission activate at #127; until then the host still
+dispatches one run per connection, so observable concurrency for one prefix
+= more instances.
 
 **One-off runs are untouched**: `sandbox.run()` always gets a fresh isolate
 with unchanged semantics.
@@ -2111,42 +2123,43 @@ short-circuits to `ERR_ABORTED` before any frame is sent; an abort that lands
 mid-run stops the run promptly and, wherever possible, **gracefully** — with a
 real result frame from Rust rather than a synthesized one.
 
-Graceful mechanism (the common case — a run suspended awaiting a bridge
-response, which is exactly how `durable-isolates` suspension works):
+Graceful mechanism:
 
 1. **Send `Terminate`**: `drainUntilResult` subscribes to the signal. On abort
    it writes a `Terminate` frame (carrying the `runId`) and keeps draining,
    leaving the socket open.
-2. **Rust aborts and reports**: the run's poll loop is parked on the socket read
-   awaiting a `BridgeResponse`; it reads the `Terminate` instead, calls
-   `terminate_execution()`, and returns an `ERR_ABORTED` result carrying the
-   real `durationMs`, `cpuTimeMs`, and the bridge-call records collected so far.
+2. **Rust aborts and reports** — two shapes, decided by the session demux:
+   a run **suspended** (awaiting a bridge response — the durable-isolates
+   case) is simply **abandoned**: its continuations never execute again, no
+   guest code runs (no `catch`/`finally`), nothing is interrupted mid-JS, so
+   the warm instance is NOT tainted and keeps serving with its state. A run
+   whose own turn is **executing** (a CPU-bound spin) is terminated
+   mid-turn via the instance guard's cross-thread face — that IS a mid-JS
+   interruption, so the instance is reset (co-residents get
+   `ERR_INSTANCE_RESET`). Both shapes return an `ERR_ABORTED` result
+   carrying the real `durationMs`, `cpuTimeMs`, and bridge records.
 3. **Remap and reuse**: that result flows back through `drainFrames`; `index.ts`
    sees the aborted signal + `ERR_ABORTED` code and remaps it to
    `status: 'aborted'` with the abort `reason`, keeping the telemetry. The
    connection stays healthy and is **returned to the pool** — no reconnect.
 4. **Drop the late response**: an orphaned bridge handler that resolves *after*
    the abort writes its `BridgeResponse` onto the (reused) connection, where it
-   is discarded — session.rs ignores stray responses and the monotonic
-   per-connection call-ID counter guarantees a stale callId never matches a
-   later run's resolver. The sandbox therefore never observes a return value for
-   the call that was in flight when the abort landed, so `controller.abort()`
-   from inside a bridge handler is a spoof-proof way to stop a run.
+   is discarded — the demux finds no route for the finished run, and the
+   monotonic per-connection call-ID counter guarantees a stale callId never
+   matches a later run's resolver. The sandbox therefore never observes a
+   return value for the call that was in flight when the abort landed, so
+   `controller.abort()` from inside a bridge handler is a spoof-proof way to
+   stop a run.
 
-**Fallback (CPU-bound caveat)**: a purely CPU-bound run (no bridge call in
-flight) is spinning inside `module.evaluate()` and never reaches the poll-loop
-frame read, so Rust cannot consume the `Terminate`. If no result arrives within
-a short grace window (`TERMINATE_GRACE_MS`, ~100 ms), TS falls back to the
-teardown path: it closes the frame reader and destroys the socket. The `run()`
-promise resolves as aborted immediately with synthesized zeros, the connection
-is marked unusable and dropped by `ConnectionPool`. `maxIsolates` is a capacity,
-not a fixed set of sockets, so dropping it frees a unit of that capacity and the
-next caller that needs a connection opens one — a connect failure fails that run
-rather than permanently shrinking the pool. The abandoned isolate is reclaimed only when its
-**CPU guard** fires — bounded by `cpuTimeMs`, not `wallTimeMs`. Promptly
-interrupting a busy isolate would require a Rust-side `terminate_execution`
-driven by an out-of-band signal (e.g. a socket-hangup watcher); this is
-deferred until a consumer needs it.
+**Fallback (wedged-runtime caveat)**: the mid-turn kill above means a
+CPU-bound run no longer needs the teardown path — the demux consumes the
+`Terminate` and terminates the executing turn directly. The TS fallback
+remains as a last resort for a runtime that cannot answer at all (wedged
+process, dead demux): if no result arrives within `TERMINATE_GRACE_MS`
+(~100 ms), TS closes the frame reader and destroys the socket. The `run()`
+promise resolves as aborted immediately with synthesized zeros, and the
+connection is marked unusable and dropped by `ConnectionPool` — a capacity
+unit, so the next caller opens a fresh one.
 
 The `run()` promise resolves with `status: 'aborted'` (see §5.2) in all cases —
 carrying the value passed to `abort(reason)`, and retaining `error.code:

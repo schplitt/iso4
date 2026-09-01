@@ -126,7 +126,66 @@ describe('warm instances', () => {
     expect(second.exports.default).toBe('fresh')
   })
 
-  test('an aborted call taints: the next call cold-starts clean', async () => {
+  test('a wall timeout while suspended keeps the instance warm', async () => {
+    // The run is parked awaiting a bridge response when its wall budget runs
+    // out: a boundary failure, not a mid-execution kill — the instance and
+    // its state survive (this used to evict).
+    await using prefix = await single.prepare({
+      code: `${COUNTER}\nexport async function hangOnBridge() { n++; await hang(); return n }`,
+      globals: { hang: async () => new Promise(() => {}) },
+    })
+    const warm = await prefix.call({ export: 'bump' })
+    expect(warm.ok && warm.value === 1).toBe(true)
+
+    const timedOut = await prefix.call({
+      export: 'hangOnBridge',
+      limits: { wallTimeMs: 300 },
+    })
+    expect(timedOut.ok).toBe(false)
+    if (timedOut.ok)
+      return
+    expect(timedOut.error.code).toBe('ERR_WALL_TIMEOUT')
+
+    // Warm reuse with state intact: hangOnBridge's n++ is visible.
+    const fresh = await prefix.call({ export: 'bump' })
+    expect(fresh.ok).toBe(true)
+    if (!fresh.ok)
+      return
+    expect(fresh.value).toBe(3)
+  })
+
+  test('aborting a CPU-bound run kills it mid-execution with real telemetry', async () => {
+    // A synchronous spin never reads the socket, so the Terminate frame
+    // alone could not stop it — the runtime now terminates the executing
+    // turn directly. The proof it was the graceful path and not the old
+    // connection-teardown fallback: the result carries REAL telemetry
+    // (the teardown fallback synthesizes zeros).
+    const controller = new AbortController()
+    const pending = single.run({
+      code: 'for (;;) {}',
+      signal: controller.signal,
+      limits: { cpuTimeMs: 30_000, wallTimeMs: 30_000 },
+    })
+    setTimeout(() => controller.abort('cancelled'), 200)
+    const started = Date.now()
+    const aborted = await pending
+    expect(aborted.status).toBe('aborted')
+    expect(Date.now() - started).toBeLessThan(5_000)
+    if (aborted.ok)
+      return
+    expect(aborted.durationMs).toBeGreaterThan(0)
+
+    // The sandbox keeps serving afterwards.
+    const after = await single.run({ code: 'export default 1' })
+    expect(after.ok).toBe(true)
+  })
+
+  test('an abort while suspended abandons the run; the instance survives', async () => {
+    // The run is parked awaiting a bridge response when the abort lands, so
+    // nothing is interrupted mid-execution: the run is simply abandoned (its
+    // continuations never run again) and the instance stays trustworthy and
+    // warm. Only an abort landing on actively-executing code still
+    // terminates and evicts.
     await using prefix = await single.prepare({
       code: `${COUNTER}\nexport async function hangOnBridge() { n++; await hang(); return n }`,
       globals: { hang: async () => new Promise(() => {}) },
@@ -144,12 +203,13 @@ describe('warm instances', () => {
     const aborted = await pending
     expect(aborted.status).toBe('aborted')
 
-    // terminate_execution ripped the call mid-flight — instance evicted.
+    // Warm reuse: the abandoned run's completed side effect (n++ before the
+    // hang) is visible, exactly like any other state a warm instance keeps.
     const fresh = await prefix.call({ export: 'bump' })
     expect(fresh.ok).toBe(true)
     if (!fresh.ok)
       return
-    expect(fresh.value).toBe(1)
+    expect(fresh.value).toBe(3)
   })
 })
 

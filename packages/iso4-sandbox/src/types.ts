@@ -807,7 +807,8 @@ export interface PrecompileOptions<
  * fixed warm-up budget), later runs reuse it and skip isolate boot and
  * prefix re-evaluation. Warmth is a cache, never a guarantee — module-scope
  * state MAY survive between runs on one instance, but any instance can be
- * evicted at any moment (a fired limit, an abort, memory pressure,
+ * evicted at any moment (a CPU/memory limit firing mid-execution, an abort
+ * landing on running code, memory pressure,
  * `dispose()`), and concurrent runs of one prefix are served by separate
  * instances that share no state. Do not rely on carryover, and do not rely
  * on per-run isolation within a prefix either: keep durable state outside
@@ -1301,7 +1302,24 @@ export interface RunError {
    * value is an object with serializable own properties.
    */
   fields?: Record<string, unknown>
+  /**
+   * Present only for `ERR_INSTANCE_RESET`: what interrupted the co-resident
+   * run that took the shared instance down with it.
+   */
+  resetCause?: ResetCause
+  /**
+   * Present only for `ERR_INSTANCE_RESET`: the wire run id of the run whose
+   * interruption reset the instance — an opaque number, but stable across
+   * the victims of one reset, so they can be correlated.
+   */
+  culpritRunId?: number
 }
+
+/**
+ * Why a shared instance was reset under an innocent victim — see
+ * `RunError.resetCause`.
+ */
+export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal'
 
 export type RunErrorCode
   = | 'ERR_USER_CODE'
@@ -1329,6 +1347,15 @@ export type RunErrorCode
     | 'ERR_HOST_BRIDGE'
     | 'ERR_BRIDGE_PAYLOAD_TOO_LARGE'
     | 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED'
+    /**
+     * This run was an innocent victim: a co-resident run on the same shared
+     * instance was interrupted mid-execution (CPU/memory guard or a forced
+     * abort), so the instance could no longer be trusted and every run in
+     * flight on it failed. Carries `resetCause` and `culpritRunId`; the
+     * telemetry fields are this run's real partial values. Never retried
+     * automatically — the victim may have had side effects.
+     */
+    | 'ERR_INSTANCE_RESET'
     | 'ERR_UNDECLARED_BINDING'
     /**
      * Prefix top-level evaluation never settled — nothing in the isolate

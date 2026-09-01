@@ -122,9 +122,13 @@ isolates with the prefix already evaluated, so boot and prefix evaluation
 are paid once instead of per run. Automatic — no flag, no separate API.
 
 Warmth is a cache, never a guarantee. An instance can vanish between any
-two calls (memory pressure, `dispose()`), and a call that fires a limit or
-aborts always costs its instance — the next call cold-starts clean. Don't
-rely on state carrying over: `globalThis` writes and patched builtins stay
+two calls (memory pressure, `dispose()`), and a run interrupted
+**mid-execution** — a CPU or memory limit firing, or an abort landing on
+actively running code — costs its instance: the next call cold-starts
+clean. Failures that arrive while a run is _waiting_ (a wall timeout during
+a host call, an abort of a suspended run, a dropped connection) fail that
+run alone and the instance keeps serving, state intact. Don't rely on state
+carrying over either way: `globalThis` writes and patched builtins stay
 visible to later runs until eviction silently wipes them. Keep durable
 state in a database and do expensive setup lazily in the handler
 (`conn ??= await connect()`).
@@ -136,8 +140,10 @@ patching prototypes, which then affects that later run. This is intended and
 matches a shared-isolate worker: run one prefix only for callers that trust
 each other, and give mutually-distrusting workloads separate prefixes.
 
-Instances of one prefix share no state and serve one call at a time —
-concurrency means more instances. Top-level names never collide across runs
+Instances of one prefix share no state with each other; today each serves
+one call at a time, so concurrency means more instances (the engine can
+already interleave several runs on one instance — that switches on with
+wire multiplexing). Top-level names never collide across runs
 (each run is its own module). A prefix that can't finish evaluating under
 the fixed warm-up budget is rejected by `prepare()` with
 `ERR_WARMUP_LIMIT`. `console.*` from prefix evaluation arrives on the
@@ -250,12 +256,20 @@ interface RunError {
   message: string
   stack?: string
   fields?: Record<string, unknown> // all other own-enumerable props of the thrown error
+  resetCause?: 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' // ERR_INSTANCE_RESET only
+  culpritRunId?: number // ERR_INSTANCE_RESET only: the run whose interruption reset the instance
 }
 ```
 
 `run()` never throws for sandboxed failures — only for infrastructure errors
 (subprocess crashed, binary not found). `ok: false` with an error code is the
 normal failure path.
+
+One code is about a _neighbor_, not your own run: `ERR_INSTANCE_RESET` means a
+run sharing the same warm instance had to be terminated mid-execution
+(`resetCause` says why, `culpritRunId` names it), so this run — in flight on
+the now-untrusted instance — was failed with its real partial telemetry. It is
+never retried automatically, because it may already have had side effects.
 
 Thrown errors keep their identity across the bridge, in both directions:
 

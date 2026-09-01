@@ -616,9 +616,9 @@ When `call` is present the run's **result value is the called function's
 return value** (awaited first when it is a Promise) instead of the exports —
 never both. The completion payload is unchanged: it carries exactly one value
 blob either way, and the host knows which it asked for. `maxExportBytes`
-applies to the value blob; a sync return value skips the poll loop entirely,
-while an async one re-enters the same settle machinery as the module promise
-(bridge calls included).
+applies to the value blob; a sync return value completes inside the run's
+start turn, while an async one suspends on the same turn machinery as the
+module promise (bridge calls included).
 
 | Field        | Encoding    | Notes                                                                                                                                               |
 | ------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -748,7 +748,8 @@ the same enforcement point that guards undeclared globals.
 
 | Field        | Encoding           | Notes                                                                        |
 | ------------ | ------------------ | ---------------------------------------------------------------------------- |
-| `callId`     | `u32`              | Unique within one run.                                                       |
+| `runId`      | `u32`              | The owning run — handlers are per run, and call ids alone cannot name it.    |
+| `callId`     | `u32`              | Unique within one connection (the counter spans runs).                       |
 | `targetKind` | `u8`               | `0 = global`, `1 = import`.                                                  |
 | `specifier`  | `Optional<String>` | Import specifier when `targetKind = import`.                                 |
 | `exportName` | `String`           | Global/stub name for globals; the dot-joined function-leaf path for imports. |
@@ -766,17 +767,20 @@ attempt is recorded as `blocked`.
 
 `BridgeResponsePayload`:
 
-| Field    | Encoding                    | Notes                                           |
-| -------- | --------------------------- | ----------------------------------------------- |
-| `callId` | `u32`                       | Must match the pending `BridgeCall`.            |
-| `ok`     | `bool`                      | Whether the host handler succeeded.             |
-| `value`  | `Optional<ValueBlob>`       | Present when `ok = true`; absent → `undefined`. |
-| `error`  | `Optional<RunErrorPayload>` | Present when `ok = false`.                      |
+| Field    | Encoding                    | Notes                                                                                                                                                                    |
+| -------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `runId`  | `u32`                       | Echoed from the `BridgeCall` being answered — the session demux routes the response by it, statelessly. A response for a finished run fails the lookup and is discarded. |
+| `callId` | `u32`                       | Must match the pending `BridgeCall`.                                                                                                                                     |
+| `ok`     | `bool`                      | Whether the host handler succeeded.                                                                                                                                      |
+| `value`  | `Optional<ValueBlob>`       | Present when `ok = true`; absent → `undefined`.                                                                                                                          |
+| `error`  | `Optional<RunErrorPayload>` | Present when `ok = false`.                                                                                                                                               |
 
-The `error` field uses the `RunErrorPayload` layout with `code` always
-`ERR_HOST_BRIDGE` and the `stack` slot always absent: the host stack never
-crosses into the sandbox because it can expose host file paths and
-infrastructure details. `name`, `message`, and `fields` (all own-enumerable
+The `error` field is the bridge-error **subset** of `RunErrorPayload`:
+`code` (always `ERR_HOST_BRIDGE`), `name`, `message`, the `stack` slot
+(always absent — the host stack never crosses into the sandbox because it
+can expose host file paths and infrastructure details), and `fields`. It
+ends at `fields`: the trailing `reset` slot exists only on run-completion
+errors (§5.6), never on bridge responses. `name`, `message`, and `fields` (all own-enumerable
 properties of the thrown error beyond the reserved `name`/`message`/`stack`)
 are carried — whatever a handler attaches to an error is the host's
 responsibility, same as a returned value. Thrown primitives normalise to
@@ -796,9 +800,11 @@ same fields preserved on the `RunErrorPayload`. Limit violations
 `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`) remain fatal to the run even when
 caught.
 
-Bridge calls are sequential within a single run in v1: Rust sends one
-`BridgeCall` and waits for the matching `BridgeResponse` before continuing JS
-execution.
+Within one run, several bridge calls can be in flight at once
+(`Promise.all`): each `BridgeCall` returns a pending promise immediately, and
+responses route back by `callId` in any order. Across runs, one connection can
+carry several runs' bridge traffic simultaneously: the runtime's session demux
+routes every run-tagged frame by its leading `runId`.
 
 **`maxBridgeCallBytes` enforcement:** When non-zero, Rust checks the encoded
 `BridgeCallPayload` byte length before writing it to the socket. If the payload
@@ -810,12 +816,14 @@ wire are exactly as laid out above; the args blob is never copied into a second
 buffer, which would otherwise double the peak memory of every bridge call and
 place that allocation before the check meant to bound it.
 
-**BridgeResponse frame cap:** `BridgeResponse` frames are read with
-`read_frame_with_limit(memoryMb × 1 MiB)`. The sandbox cannot hold a response
-larger than its own memory budget, so `memoryMb` is the natural and only limit.
-When `memoryMb = 0` (unconstrained) the fallback is the global 64 MiB
-`DEFAULT_MAX_FRAME_LENGTH`. There is no separate per-response configuration
-field — to allow responses larger than 64 MiB, increase `memoryMb`.
+**BridgeResponse frame cap:** the sandbox cannot hold a response larger than
+its own memory budget, so `memoryMb × 1 MiB` is the natural and only limit.
+The session demux enforces it per run when routing the frame (the connection
+read ceiling is the largest in-flight allowance); a frame over its run's cap
+fails that run alone. When `memoryMb = 0` (unconstrained) the fallback is the
+global 64 MiB `DEFAULT_MAX_FRAME_LENGTH`. There is no separate per-response
+configuration field — to allow responses larger than 64 MiB, increase
+`memoryMb`.
 
 **`maxExportBytes` enforcement:** Rust copies the module namespace into a
 plain object, serializes it once, and checks the resulting **blob** length
@@ -954,6 +962,14 @@ afterwards, so later calls report only their own lines.
 | `message` | `String`              |                                                                      |
 | `stack`   | `Optional<String>`    | Always absent host → sandbox (BridgeResponse).                       |
 | `fields`  | `Optional<ValueBlob>` | Own-enumerable props beyond `name`/`message`/`stack`, as one object. |
+| `reset`   | `Optional<ResetInfo>` | Present only for `ERR_INSTANCE_RESET` (below).                       |
+
+`ResetInfo` (the `ERR_INSTANCE_RESET` extras):
+
+| Field          | Encoding | Notes                                                                                                                          |
+| -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `cause`        | `u8`     | `0 = cpu`, `1 = memory`, `2 = abort`, `3 = internal`, `4 = wall`.                                                              |
+| `culpritRunId` | `u32`    | The wire run id of the run whose mid-execution interruption reset the shared instance; stable across the victims of one reset. |
 
 `PrecompileResultPayload`:
 
@@ -1089,30 +1105,31 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 
 ## 7. Error codes
 
-| Code                                  | Cause                                                                                                                                                                                                                                                                                                                                              |
-| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                                                                                                                                                                      |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's heap cap (`memoryMb` — a Runtime-level setting, carried in the limits slot of every frame by the host).                                                                                                                                                                                               |
-| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                                                                                                   |
-| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                                                                                        |
-| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                                                                                             |
-| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                                                                                                                                                                   |
-| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                                                                                                                                                                       |
-| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                                                                                                                                                              |
-| `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.7).                                                                                                                                                      |
-| `ERR_CALL_TARGET_NOT_FOUND`           | A `call.exportPath` (§5.2) does not resolve against the module's exports, or resolves to a value that is not callable. The message says which and names the path.                                                                                                                                                                                  |
-| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                                                                                                                                                                    |
-| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                                                                                                                                                            |
-| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                                                                                                                                                                          |
-| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                                                                                                                                                                                   |
-| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5.                                                                                                                                                       |
-| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                                                                                                                                                                        |
-| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                                                                                                                                                                        |
-| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage.                                                                                                                                            |
-| `ERR_WARMUP_LIMIT`                    | Prefix evaluation (plus the per-instance runtime installs) exceeded its fixed warm-up budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model). Isolate boot itself precedes the budget. Enforced at `Precompile` and at instance cold-start. Move expensive setup into the handler (lazy init on first call).            |
-| `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                                                                                                    |
-| `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.7. |
-| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                                                                                                    |
+| Code                                  | Cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's heap cap (`memoryMb` — a Runtime-level setting, carried in the limits slot of every frame by the host).                                                                                                                                                                                                                                                                                                                        |
+| `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.7).                                                                                                                                                                                                                                                                               |
+| `ERR_CALL_TARGET_NOT_FOUND`           | A `call.exportPath` (§5.2) does not resolve against the module's exports, or resolves to a value that is not callable. The message says which and names the path.                                                                                                                                                                                                                                                                                                           |
+| `ERR_EXPORT_TOO_LARGE`                | Encoded exports exceed `limits.maxExportBytes`.                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5.                                                                                                                                                                                                                                                                                |
+| `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import not declared by `Precompile`.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                                                                                                                                                                                                                                                                                                 |
+| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage.                                                                                                                                                                                                                                                                     |
+| `ERR_WARMUP_LIMIT`                    | Prefix evaluation (plus the per-instance runtime installs) exceeded its fixed warm-up budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model). Isolate boot itself precedes the budget. Enforced at `Precompile` and at instance cold-start. Move expensive setup into the handler (lazy init on first call).                                                                                                                                     |
+| `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `ERR_INSTANCE_RESET`                  | The run was an innocent victim: a co-resident run on the same shared instance was interrupted mid-execution (a CPU/memory/wall guard fired, or a forced abort landed on running code), so the instance could no longer be trusted and every run in flight on it failed. Carries `ResetInfo` (§5.6): the cause class and the culprit's wire run id. Telemetry fields are this run's real partial values. Never retried automatically — the victim may have had side effects. |
+| `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.7.                                                                                                                          |
+| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 ---
 

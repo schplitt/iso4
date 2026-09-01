@@ -252,7 +252,7 @@ describe('RuntimeIpcClient', () => {
   test('handles BridgeCall: dispatches to handler, sends BridgeResponse, awaits Result', async () => {
     // Simulate Rust sending a BridgeCall mid-run, then sending a Result.
     // Build the BridgeCall payload manually:
-    //   u32 callId=0, u8 targetKind=0, u8 specifierPresent=0,
+    //   u32 runId=1, u32 callId=0, u8 targetKind=0, u8 specifierPresent=0,
     //   String "greet" (u32 len + bytes),
     //   value slot: u32 blobLen + one blob holding the whole args array
     const enc = (s: string) => {
@@ -265,6 +265,7 @@ describe('RuntimeIpcClient', () => {
     const argsLen = Buffer.allocUnsafe(4)
     argsLen.writeUInt32BE(argsBlob.byteLength, 0)
     const bridgeCallPayload = Buffer.concat([
+      Buffer.from([0, 0, 0, 1]), // runId = 1 (the client's first run)
       Buffer.from([0, 0, 0, 0]), // callId = 0
       Buffer.from([0]), // targetKind = global
       Buffer.from([0]), // specifier absent
@@ -319,6 +320,70 @@ describe('RuntimeIpcClient', () => {
     await client.dispose()
   })
 
+  test('a bridge response echoes the FRAME\'s runId, not the drain loop\'s', async () => {
+    // The runtime routes responses by the leading runId. Under multiplexing
+    // (#127) a grace-time BridgeCall can arrive tagged with a run other than
+    // the one this loop is draining — the echo must come from the decoded
+    // frame, or the response is misrouted.
+    const enc = (s: string): Buffer => {
+      const b = Buffer.from(s, 'utf8')
+      const h = Buffer.allocUnsafe(4)
+      h.writeUInt32BE(b.byteLength, 0)
+      return Buffer.concat([h, b])
+    }
+    const argsBlob = serializeValue([])
+    const argsLen = Buffer.allocUnsafe(4)
+    argsLen.writeUInt32BE(argsBlob.byteLength, 0)
+    const foreignRunCall = Buffer.concat([
+      Buffer.from([0, 0, 0, 9]), // runId = 9 — NOT the in-flight run (1)
+      Buffer.from([0, 0, 0, 2]), // callId = 2
+      Buffer.from([0]), // targetKind = global
+      Buffer.from([0]), // specifier absent
+      enc('greet'),
+      argsLen,
+      argsBlob,
+    ])
+
+    let echoedRunId: number | undefined
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const runFrame = await reader.readFrame()
+      const runId = Buffer.from(
+        runFrame.payload.buffer,
+        runFrame.payload.byteOffset,
+        runFrame.payload.byteLength,
+      ).readUInt32BE(0)
+
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.BridgeCall, foreignRunCall),
+      )
+      const responseFrame = await reader.readFrame()
+      echoedRunId = Buffer.from(
+        responseFrame.payload.buffer,
+        responseFrame.payload.byteOffset,
+        responseFrame.payload.byteLength,
+      ).readUInt32BE(0)
+
+      socket.write(
+        encodeRustToTsFrame(
+          RustToTsMessageTypes.Result,
+          resultPayload(runId, 'payload'),
+        ),
+      )
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    await client.runRawCode('export default 1', {
+      globals: [{ kind: 'bridge', name: 'greet' }],
+      dispatch: { greet: () => 'hello' },
+    })
+    expect(echoedRunId).toBe(9)
+    await client.dispose()
+  })
+
   test('a bridge response too large to encode is answered as an error, not swallowed', async () => {
     // The success arm caught serializeHostValue but not the encode+write that
     // follows, and the trailing .catch discarded it — so no BridgeResponse was
@@ -334,6 +399,7 @@ describe('RuntimeIpcClient', () => {
     const argsLen = Buffer.allocUnsafe(4)
     argsLen.writeUInt32BE(argsBlob.byteLength, 0)
     const bridgeCallPayload = Buffer.concat([
+      Buffer.from([0, 0, 0, 1]), // runId = 1 (the client's first run)
       Buffer.from([0, 0, 0, 3]), // callId = 3
       Buffer.from([0]), // targetKind = global
       Buffer.from([0]), // specifier absent
@@ -367,11 +433,11 @@ describe('RuntimeIpcClient', () => {
         responseFrame.payload.byteOffset,
         responseFrame.payload.byteLength,
       )
-      responseCallId = view.readUInt32BE(0)
-      responseOk = view.readUInt8(4)
-      // Failure layout: u32 callId, u8 ok, String code, String name,
-      // String message. Walk to the message.
-      let at = 5
+      responseCallId = view.readUInt32BE(4) // after the echoed runId
+      responseOk = view.readUInt8(8)
+      // Failure layout: u32 runId, u32 callId, u8 ok, String code,
+      // String name, String message. Walk to the message.
+      let at = 9
       for (let i = 0; i < 2; i++) at += 4 + view.readUInt32BE(at)
       responseMessage = view.subarray(at + 4, at + 4 + view.readUInt32BE(at)).toString('utf8')
 
@@ -491,6 +557,7 @@ describe('RuntimeIpcClient', () => {
     const argsLen = Buffer.allocUnsafe(4)
     argsLen.writeUInt32BE(garbageArgs.byteLength, 0)
     const undecodableCall = Buffer.concat([
+      Buffer.from([0, 0, 0, 1]), // runId = 1 (the client's first run)
       Buffer.from([0, 0, 0, 7]), // callId = 7
       Buffer.from([0]), // targetKind = global
       Buffer.from([0]), // specifier absent
@@ -525,8 +592,8 @@ describe('RuntimeIpcClient', () => {
         responseFrame.payload.byteOffset,
         responseFrame.payload.byteLength,
       )
-      responseCallId = view.readUInt32BE(0)
-      responseOk = view.readUInt8(4)
+      responseCallId = view.readUInt32BE(4) // after the echoed runId
+      responseOk = view.readUInt8(8)
 
       socket.write(
         encodeRustToTsFrame(

@@ -24,6 +24,10 @@
 //!   bytes until the runtime is ready to decode them.
 
 use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
 
 /// Current wire protocol version.
 ///
@@ -293,10 +297,40 @@ pub fn write_rust_to_ts_frame_parts(
         ));
     }
 
-    writer.write_all(&length.to_be_bytes())?;
-    writer.write_all(&[message_type as u8])?;
-    writer.write_all(head)?;
-    writer.write_all(tail)?;
+    // One gather-write per frame: with concurrent runs sharing a connection,
+    // every frame is written under the connection's writer lock, so the lock
+    // must hold ONE syscall, not four. The 5-byte envelope goes on the
+    // stack; the payload pieces are never copied.
+    let mut envelope = [0u8; 5];
+    envelope[..4].copy_from_slice(&length.to_be_bytes());
+    envelope[4] = message_type as u8;
+    let mut bufs = [
+        io::IoSlice::new(&envelope),
+        io::IoSlice::new(head),
+        io::IoSlice::new(tail),
+    ];
+    write_all_vectored(writer, &mut bufs)
+}
+
+/// `write_all` over a set of buffers via gather I/O, advancing across
+/// partial writes (std's `write_all_vectored` is still unstable).
+fn write_all_vectored(writer: &mut impl Write, mut bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
+    // Skip leading empty slices so `write_vectored` never sees a fully
+    // consumed set (advance_slices panics past the total length).
+    io::IoSlice::advance_slices(&mut bufs, 0);
+    while bufs.iter().any(|b| !b.is_empty()) {
+        match writer.write_vectored(bufs) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole frame",
+                ));
+            }
+            Ok(n) => io::IoSlice::advance_slices(&mut bufs, n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 
@@ -316,6 +350,56 @@ pub fn write_rust_to_ts_frame(
     payload: &[u8],
 ) -> io::Result<()> {
     write_frame(writer, message_type as u8, payload)
+}
+
+// ── Outbound frame sink ──────────────────────────────────────────────────────
+
+/// Where a run's outbound frames (BridgeCall, early Result, stream credit,
+/// RunComplete, …) go.
+///
+/// Two modes share the session protocol but not the socket discipline:
+///
+/// - `Fd`: the raw session-socket fd, written directly. The direct-API mode —
+///   one run per socket by construction, so the writing thread is the fd's
+///   only user (the `ManuallyDrop` discipline the bridge callbacks have always
+///   used: the fd stays owned by whoever opened the socket).
+/// - `Shared`: one serialized per-connection writer. Session runs share their
+///   connection with other runs, so every outbound frame takes the lock for
+///   exactly one frame write — frames from concurrent runs interleave on the
+///   stream but never mid-frame.
+#[derive(Clone)]
+pub enum FrameSink {
+    Fd(RawFd),
+    Shared(Arc<Mutex<UnixStream>>),
+}
+
+impl FrameSink {
+    /// Write one frame whose payload is already in two pieces (the
+    /// `BridgeCall` shape: small header + large blob nothing has copied).
+    /// `write(ty, payload)` is the one-piece special case.
+    pub fn write_parts(
+        &self,
+        message_type: RustToTsMessageType,
+        head: &[u8],
+        tail: &[u8],
+    ) -> io::Result<()> {
+        match self {
+            FrameSink::Fd(fd) => {
+                // SAFETY: the fd is the live session socket owned by the
+                // caller of the run; ManuallyDrop prevents closing it here.
+                let mut stream = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(*fd) });
+                write_rust_to_ts_frame_parts(&mut *stream, message_type, head, tail)
+            }
+            FrameSink::Shared(writer) => {
+                let mut stream = writer.lock().unwrap_or_else(|p| p.into_inner());
+                write_rust_to_ts_frame_parts(&mut *stream, message_type, head, tail)
+            }
+        }
+    }
+
+    pub fn write(&self, message_type: RustToTsMessageType, payload: &[u8]) -> io::Result<()> {
+        self.write_parts(message_type, payload, &[])
+    }
 }
 
 /// Parse the payload bytes of an `Authenticate` frame per
@@ -1202,6 +1286,65 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer that accepts at most one byte per call — the adversarial
+    /// case for the gather-write loop (every partial-write boundary is hit,
+    /// including ones inside the 5-byte envelope and across slice edges).
+    struct DribbleWriter(Vec<u8>);
+
+    impl Write for DribbleWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.0.push(buf[0]);
+            Ok(1)
+        }
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            for b in bufs {
+                if !b.is_empty() {
+                    self.0.push(b[0]);
+                    return Ok(1);
+                }
+            }
+            Ok(0)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn gather_write_reassembles_the_exact_frame_across_partial_writes() {
+        let mut whole = Vec::new();
+        write_rust_to_ts_frame_parts(
+            &mut whole,
+            RustToTsMessageType::BridgeCall,
+            b"header",
+            b"a larger tail payload",
+        )
+        .unwrap();
+
+        let mut dribbled = DribbleWriter(Vec::new());
+        write_rust_to_ts_frame_parts(
+            &mut dribbled,
+            RustToTsMessageType::BridgeCall,
+            b"header",
+            b"a larger tail payload",
+        )
+        .unwrap();
+
+        assert_eq!(dribbled.0, whole, "partial writes must not reorder or drop bytes");
+
+        // Empty pieces are legal (a payload-less frame, a header-only frame).
+        let mut empty_tail = DribbleWriter(Vec::new());
+        write_rust_to_ts_frame_parts(&mut empty_tail, RustToTsMessageType::Result, b"only", b"")
+            .unwrap();
+        let mut expected = Vec::new();
+        write_rust_to_ts_frame_parts(&mut expected, RustToTsMessageType::Result, b"only", b"")
+            .unwrap();
+        assert_eq!(empty_tail.0, expected);
+    }
 
     #[test]
     fn frame_roundtrip_preserves_type_and_payload() {

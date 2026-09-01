@@ -23,6 +23,7 @@ import {
   encodeTsToRustFrame,
   decodeRunCompletePayload,
   peekBridgeCallId,
+  peekBridgeCallRunId,
   peekRunCompletionBackgroundPending,
   peekRunCompletionRunId,
   STREAM_CHUNK_MAX_BYTES,
@@ -82,11 +83,10 @@ export type { ResourceLimits }
  * How long TS waits for Rust's graceful `ERR_ABORTED` Result after sending a
  * `Terminate` frame, before falling back to tearing the connection down.
  *
- * The common case — a run suspended awaiting a bridge response — has the Rust
- * V8 thread parked on a socket read, so it consumes the `Terminate` and replies
- * in well under a millisecond; this window only bites when the sandbox is stuck
- * in a tight synchronous loop (Rust never reads the frame), where we fall back.
- * Kept comfortably under the abort-latency the runtime aims for.
+ * The runtime's session demux always consumes the frame: a suspended run is
+ * abandoned on the spot, and a CPU-bound run is terminated mid-execution —
+ * both answer with a real Result in well under this window. The fallback
+ * only bites when the runtime cannot answer at all (wedged process).
  */
 const TERMINATE_GRACE_MS = 100
 
@@ -561,18 +561,18 @@ export class RuntimeIpcClient {
    * ── In-flight abort (graceful terminate) ──────────────────────────────────
    * When `signal` fires mid-run — including while a bridge call is in flight —
    * we first ask Rust to stop gracefully: send a `Terminate` frame (carrying
-   * `runId`) and keep draining, leaving the socket open. In the common case the
-   * Rust V8 thread is parked awaiting a bridge response, reads the frame, and
-   * replies with a real `ERR_ABORTED` `Result` (carrying duration, CPU time,
-   * and the bridge records collected so far). That Result flows back through
-   * `drainFrames` and the connection stays healthy for reuse.
+   * `runId`) and keep draining, leaving the socket open. The runtime's demux
+   * consumes the frame and either abandons a suspended run or terminates a
+   * CPU-bound one mid-execution; both reply with a real `ERR_ABORTED`
+   * `Result` (carrying duration, CPU time, and the bridge records collected
+   * so far). That Result flows back through `drainFrames` and the connection
+   * stays healthy for reuse.
    *
-   * If no Result arrives within {@link TERMINATE_GRACE_MS} — the sandbox is
-   * stuck in a tight synchronous loop, so Rust never reaches the frame read —
-   * we fall back to `abortConnection`: the reader is closed so this loop
-   * throws, and the socket is destroyed so Rust observes EOF (its CPU guard
-   * ultimately reclaims the busy isolate; see DESIGN.md §14.7). The loop then
-   * throws `RunAbortedError`, which `index.ts` maps to a synthesized
+   * If no Result arrives within {@link TERMINATE_GRACE_MS} — the runtime
+   * cannot answer at all (wedged process) — we fall back to
+   * `abortConnection`: the reader is closed so this loop throws, and the
+   * socket is destroyed so Rust observes EOF (see DESIGN.md §14.7). The loop
+   * then throws `RunAbortedError`, which `index.ts` maps to a synthesized
    * `ERR_ABORTED` `RunResult`. Any late `BridgeResponse` from an orphaned
    * handler is harmless either way: on the graceful path the reused connection
    * discards it (stale callId), on the fallback path the socket is gone.
@@ -588,9 +588,9 @@ export class RuntimeIpcClient {
     streams?: StreamSourceRegistry,
   ): Promise<RawRunResult> {
     // If the signal aborted between the run-entry check in index.ts and here,
-    // tear down before we start reading frames. The Run frame is already on the
-    // wire but the run has barely started (and may have no bridge poll loop to
-    // read a Terminate), so the graceful path cannot reliably apply here.
+    // tear down before we start reading frames. The Run frame is already on
+    // the wire but the run has barely started (its route/guard may not exist
+    // yet), so the graceful path cannot reliably apply here.
     if (signal?.aborted) {
       this.abortConnection()
       throw new RunAbortedError(signal.reason)
@@ -937,6 +937,10 @@ export class RuntimeIpcClient {
         encodeTsToRustFrame(
           TsToRustMessageTypes.BridgeResponse,
           encodeBridgeResponsePayload(
+            // Echo the FRAME's run id — the response routes by it. The
+            // ambient run is only the fallback for a payload too short to
+            // carry one (unreachable past the callId peek above).
+            peekBridgeCallRunId(payload) ?? runId,
             callId,
             false,
             undefined,
@@ -958,6 +962,7 @@ export class RuntimeIpcClient {
         encodeTsToRustFrame(
           TsToRustMessageTypes.BridgeResponse,
           encodeBridgeResponsePayload(
+            call.runId,
             call.callId,
             false,
             undefined,
@@ -970,7 +975,10 @@ export class RuntimeIpcClient {
       // Do NOT await it — the loop reads the next frame immediately.
       // When the handler settles the response is written back.
       // If the run timed out by then, Rust ignores the late frame.
-      const { callId } = call
+      // Responses echo the frame's own run id, not the ambient run's: the
+      // demux routes by it, and under multiplexing (#127) grace-time and
+      // concurrent frames are not always for the run this loop drains.
+      const { runId: frameRunId, callId } = call
       dispatcher({
         targetKind: call.targetKind,
         specifier: call.specifier,
@@ -994,6 +1002,7 @@ export class RuntimeIpcClient {
               encodeTsToRustFrame(
                 TsToRustMessageTypes.BridgeResponse,
                 encodeBridgeResponsePayload(
+                  frameRunId,
                   callId,
                   false,
                   undefined,
@@ -1008,7 +1017,7 @@ export class RuntimeIpcClient {
           await this.write(
             encodeTsToRustFrame(
               TsToRustMessageTypes.BridgeResponse,
-              encodeBridgeResponsePayload(callId, true, encoded),
+              encodeBridgeResponsePayload(frameRunId, callId, true, encoded),
             ),
           )
           // The response carrying stream handles is on the wire; start their
@@ -1019,6 +1028,7 @@ export class RuntimeIpcClient {
           encodeTsToRustFrame(
             TsToRustMessageTypes.BridgeResponse,
             encodeBridgeResponsePayload(
+              frameRunId,
               callId,
               false,
               undefined,
@@ -1044,6 +1054,7 @@ export class RuntimeIpcClient {
             encodeTsToRustFrame(
               TsToRustMessageTypes.BridgeResponse,
               encodeBridgeResponsePayload(
+                frameRunId,
                 callId,
                 false,
                 undefined,
