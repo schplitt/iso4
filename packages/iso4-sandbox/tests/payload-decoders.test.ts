@@ -122,6 +122,10 @@ interface FailureSpec {
   message: string
   stack?: string
   fields?: Record<string, unknown>
+  /**
+   * The ERR_INSTANCE_RESET extras: wire cause byte + culprit run id.
+   */
+  reset?: { causeByte: number, culpritRunId: number }
   stdout?: readonly string[]
   stderr?: readonly string[]
   durationMs?: number
@@ -160,6 +164,12 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
     str(spec.message),
     optionalString(spec.stack),
     optionalValueSlot(spec.fields, spec.fields !== undefined),
+    spec.reset === undefined
+      ? Buffer.from([0]) // reset info absent (only ERR_INSTANCE_RESET carries one)
+      : Buffer.concat([
+          Buffer.from([1, spec.reset.causeByte]),
+          u32(spec.reset.culpritRunId),
+        ]),
     tail,
   ])
 }
@@ -171,6 +181,7 @@ function encodeBridgeCallPayload(
   specifier?: string,
 ): Buffer {
   return Buffer.concat([
+    u32(1), // runId — leads every run-scoped frame
     u32(callId),
     Buffer.from([specifier === undefined ? 0 : 1]), // targetKind
     optionalString(specifier),
@@ -535,6 +546,7 @@ describe('decodePrecompileResultPayload', () => {
       str(message),
       optionalString(stack),
       Buffer.from([0]), // fields absent
+      Buffer.from([0]), // reset info absent
     ])
   }
 
@@ -567,6 +579,77 @@ describe('decodePrecompileResultPayload', () => {
   })
 })
 
+// ── ERR_INSTANCE_RESET extras ──────────────────────────────────────────────
+
+describe('decodeRunCompletionPayload — instance reset', () => {
+  test('resetCause and culpritRunId decode onto the error', () => {
+    const { result } = decodeRunCompletionPayload(
+      encodeCompletionPayload(3, {
+        ok: false,
+        code: 'ERR_INSTANCE_RESET',
+        name: 'Error',
+        message: 'the shared instance was reset by a co-resident run',
+        reset: { causeByte: 0, culpritRunId: 41 },
+      }),
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_INSTANCE_RESET')
+    expect(result.error.resetCause).toBe('cpu')
+    expect(result.error.culpritRunId).toBe(41)
+  })
+
+  test('every wire cause byte maps to its name (wall is byte 4)', () => {
+    // Mirrors wire.rs `reset_cause_byte`: cpu=0 memory=1 abort=2 internal=3
+    // wall=4 — NOT the Rust enum's declaration order.
+    const causes = ['cpu', 'memory', 'abort', 'internal', 'wall'] as const
+    causes.forEach((expected, byte) => {
+      const { result } = decodeRunCompletionPayload(
+        encodeCompletionPayload(1, {
+          ok: false,
+          code: 'ERR_INSTANCE_RESET',
+          name: 'Error',
+          message: 'reset',
+          reset: { causeByte: byte, culpritRunId: 7 },
+        }),
+      )
+      if (result.ok)
+        return expect.unreachable('failure payload decoded as success')
+      expect(result.error.resetCause).toBe(expected)
+    })
+  })
+
+  test('an unknown cause byte is a decode error, not a silent mislabel', () => {
+    expect(() =>
+      decodeRunCompletionPayload(
+        encodeCompletionPayload(1, {
+          ok: false,
+          code: 'ERR_INSTANCE_RESET',
+          name: 'Error',
+          message: 'reset',
+          reset: { causeByte: 9, culpritRunId: 7 },
+        }),
+      ),
+    ).toThrow(/invalid instance-reset cause/)
+  })
+
+  test('plain failures carry no reset properties', () => {
+    const { result } = decodeRunCompletionPayload(
+      encodeCompletionPayload(1, {
+        ok: false,
+        code: 'ERR_USER_CODE',
+        name: 'Error',
+        message: 'boom',
+      }),
+    )
+    if (result.ok)
+      return expect.unreachable('failure payload decoded as success')
+    expect(result.error.resetCause).toBeUndefined()
+    expect(result.error.culpritRunId).toBeUndefined()
+  })
+})
+
 // ── decodeBridgeCallPayload ────────────────────────────────────────────────
 
 describe('decodeBridgeCallPayload', () => {
@@ -575,6 +658,7 @@ describe('decodeBridgeCallPayload', () => {
       encodeBridgeCallPayload(7, 'greet', ['world', 42, { deep: true }]),
     )
     expect(call).toEqual({
+      runId: 1,
       callId: 7,
       targetKind: 0,
       specifier: undefined,
@@ -605,6 +689,7 @@ describe('decodeBridgeCallPayload', () => {
 
   test('rejects an args blob that does not hold an array', () => {
     const buf = Buffer.concat([
+      u32(1),
       u32(0),
       Buffer.from([0, 0]),
       str('f'),
@@ -614,7 +699,7 @@ describe('decodeBridgeCallPayload', () => {
   })
 
   test('rejects an invalid targetKind', () => {
-    const buf = Buffer.concat([u32(0), Buffer.from([9, 0]), str('f'), valueSlot([])])
+    const buf = Buffer.concat([u32(1), u32(0), Buffer.from([9, 0]), str('f'), valueSlot([])])
     expect(() => decodeBridgeCallPayload(buf)).toThrow(/invalid bridge targetKind/)
   })
 })

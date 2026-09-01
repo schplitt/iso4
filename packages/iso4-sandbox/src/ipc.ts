@@ -5,6 +5,7 @@ import type {
   BridgeCallEntry,
   CallResult,
   ResourceLimits,
+  ResetCause,
   RunErrorCode,
   RunResult,
   SandboxExports,
@@ -1118,6 +1119,13 @@ export function encodeTerminatePayload(runId: number): Buffer {
 // ── BridgeCall decoder (Rust → TS) ───────────────────────────────────────────
 
 export interface BridgeCallInfo {
+  /**
+   * The owning run's wire id, leading the frame like every other run-scoped
+   * frame. 0 only for direct-API runs with no wire identity (never seen by
+   * this client). Echoed back on the `BridgeResponse` so the runtime's
+   * session demux routes the answer statelessly.
+   */
+  runId: number
   callId: number
   /**
    * 0 = global, 1 = import (Phase 7)
@@ -1149,6 +1157,21 @@ export interface BridgeCallInfo {
  * @param buf
  */
 export function peekBridgeCallId(buf: Uint8Array): number | undefined {
+  // runId leads the payload; callId is the second field.
+  if (buf.byteLength < 8)
+    return undefined
+  return (
+    (buf[4]! << 24) | (buf[5]! << 16) | (buf[6]! << 8) | buf[7]!
+  ) >>> 0
+}
+
+/**
+ * Read just the `runId` off a `BridgeCall` frame payload — the leading
+ * field, recoverable even when the args blob fails to decode, so the error
+ * response can echo the right run for demux routing.
+ * @param buf
+ */
+export function peekBridgeCallRunId(buf: Uint8Array): number | undefined {
   if (buf.byteLength < 4)
     return undefined
   return (
@@ -1159,6 +1182,7 @@ export function peekBridgeCallId(buf: Uint8Array): number | undefined {
 export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
   const reader = new PayloadReader(buf)
 
+  const runId = reader.readU32()
   const callId = reader.readU32()
   const targetKindRaw = reader.readU8()
   if (targetKindRaw !== 0 && targetKindRaw !== 1)
@@ -1175,7 +1199,7 @@ export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
       }`,
     )
   }
-  return { callId, targetKind, specifier, exportName, args: decoded }
+  return { runId, callId, targetKind, specifier, exportName, args: decoded }
 }
 
 // ── BridgeResponse encoder (TS → Rust) ──────────────────────────────────────
@@ -1253,18 +1277,23 @@ export function bridgeErrorPayloadFromUnknown(err: unknown): BridgeErrorPayload 
  * When `ok = true`, `encodedValue` holds the pre-serialized value blob.
  * When `ok = false`, `error` describes the handler rejection. The stack slot
  * is always written as absent — host stacks must not leak into the sandbox.
+ * @param runId
  * @param callId
  * @param ok
  * @param encodedValue
  * @param error the handler rejection, when `ok = false`
  */
 export function encodeBridgeResponsePayload(
+  runId: number,
   callId: number,
   ok: boolean,
   encodedValue?: Uint8Array,
   error?: BridgeErrorPayload,
 ): Buffer {
   const w = new PayloadWriter()
+  // Echo the run id off the BridgeCall being answered — the runtime's
+  // session demux routes the response by it, statelessly.
+  w.writeU32(runId)
   w.writeU32(callId)
   if (ok) {
     w.writeU8(1) // ok = true
@@ -1583,6 +1612,7 @@ export function decodeRunCompletionPayload(
   const stackPresent = reader.readU8()
   const stack = stackPresent === 1 ? reader.readString() : undefined
   const fields = reader.readOptionalValueBlob() as Record<string, unknown> | undefined
+  const reset = readResetInfo(reader)
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
   const durationMs = reader.readF64()
@@ -1597,7 +1627,7 @@ export function decodeRunCompletionPayload(
     result: {
       status: 'failed',
       ok: false,
-      error: { code, name, message, stack, fields },
+      error: { code, name, message, stack, fields, ...reset },
       stdout,
       stderr,
       durationMs,
@@ -1606,6 +1636,26 @@ export function decodeRunCompletionPayload(
       heapUsedBytes,
     },
   }
+}
+
+/**
+ * The `ERR_INSTANCE_RESET` extras trailing every `RunErrorPayload`: an
+ * optional cause class + culprit run id, present only on that code. Returned
+ * as a spreadable fragment so plain errors add nothing to the error object.
+ * @param reader
+ */
+function readResetInfo(
+  reader: PayloadReader,
+): { resetCause: ResetCause, culpritRunId: number } | undefined {
+  const present = reader.readU8()
+  if (present !== 1)
+    return undefined
+  const causeByte = reader.readU8()
+  const causes: readonly ResetCause[] = ['cpu', 'memory', 'abort', 'internal', 'wall']
+  const resetCause = causes[causeByte]
+  if (resetCause === undefined)
+    throw new PayloadDecodeError(`invalid instance-reset cause byte: ${causeByte}`)
+  return { resetCause, culpritRunId: reader.readU32() }
 }
 
 /**
@@ -1692,6 +1742,7 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   const stackPresent = reader.readU8()
   const stack = stackPresent === 1 ? reader.readString() : undefined
   reader.readOptionalValueBlob() // consume; precompile errors never carry fields
+  readResetInfo(reader) // consume; precompile errors never carry one
   reader.assertDone()
   return { ok: false, error: { code, name, message, stack } }
 }

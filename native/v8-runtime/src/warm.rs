@@ -5,11 +5,14 @@
 //! dedicated OS thread — rusty_v8 pins isolates to their creating thread
 //! (`OwnedIsolate` is `!Send`, `Drop` asserts current-thread ownership, no
 //! `Locker` is exposed), so the owner thread is the only place the isolate
-//! can be created, called into, and dropped. Session threads talk to it over
-//! a channel; while a call runs, the session thread blocks on the response,
-//! so the session socket has exactly one user at a time (the instance thread
-//! does the bridge I/O during the call, the session thread between calls —
-//! the same discipline as before warm instances, just on another thread).
+//! can be created, called into, and dropped. The owner thread runs the
+//! per-instance turn loop (`v8::serve_instance`): jobs arrive over the
+//! handle's channel, inbound frames arrive demux-routed per run, and any
+//! number of session runs can be suspended on one instance at once. Session
+//! dispatch never blocks — a job's completion hook writes the run's frames
+//! through the connection's serialized writer and releases the instance;
+//! only the direct API (`InstanceHandle::call`, tests) waits on a respond
+//! channel.
 //!
 //! Capacity model (v3 — celld's, whole): the memory control is ONE
 //! RSS mark, the warm budget (`--warm-budget-bytes`, 0 = disabled). Every
@@ -31,48 +34,24 @@
 //! instance may be evicted at any moment (taint, scored eviction, dispose).
 
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
-use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::ipc;
 use crate::policy;
 use crate::rss;
 use crate::session::PrefixData;
 use crate::v8 as sandbox;
 
-/// One call forwarded to an instance owner thread.
-pub struct CallJob {
-    /// Postfix source (`execute`) — `None` for a call-only run.
-    pub code: Option<String>,
-    pub filename: Option<String>,
-    pub limits: sandbox::Limits,
-    /// Bridge-stub defs for this call (re-installed per call).
-    pub globals: Vec<ipc::HostGlobalDef>,
-    /// Session socket for bridge I/O during this call. The session thread is
-    /// parked on the response channel for the duration, so the fd has one
-    /// user at a time.
-    pub stream_fd: Option<RawFd>,
-    /// The connection's monotonically increasing bridge call-ID counter.
-    pub call_id_counter: Arc<AtomicU32>,
-    pub call: Option<ipc::CallSpec>,
-    /// Per-run identity for the `waitUntil` early Result frame.
-    pub epilogue: Option<sandbox::EpilogueSpec>,
-}
-
-enum Job {
-    Call(Box<CallJob>, crossbeam_channel::Sender<sandbox::CallOutcome>),
-    // Shutdown is signalled by dropping the sender (channel disconnect);
-    // no explicit variant needed.
-}
+/// One call forwarded to an instance owner thread — see [`sandbox::CallJob`]
+/// (the job type lives beside the turn loop that executes it).
+pub use crate::v8::CallJob;
 
 /// A live warm instance as the registry sees it: the channel to its owner
 /// thread plus the metadata eviction needs. Dropping the handle disconnects
-/// the channel; the owner thread then exits and disposes the isolate on the
-/// thread that created it.
+/// the channel; the owner thread then exits (once its in-flight runs drain)
+/// and disposes the isolate on the thread that created it.
 pub struct InstanceHandle {
-    jobs: crossbeam_channel::Sender<Job>,
+    jobs: crossbeam_channel::Sender<sandbox::JobMsg>,
     /// When this instance last finished a call — the idleTime factor of the
     /// eviction score.
     last_used: Instant,
@@ -87,14 +66,21 @@ impl InstanceHandle {
     /// `tainted: true`, so the caller evicts it like any other taint.
     pub fn call(&self, job: CallJob) -> sandbox::CallOutcome {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        if self.jobs.send(Job::Call(Box::new(job), tx)).is_err() {
+        if self.jobs.send((Box::new(job), Some(tx))).is_err() {
             return dead_instance_outcome();
         }
         rx.recv().unwrap_or_else(|_| dead_instance_outcome())
     }
+
+    /// A clone of the job channel's sender, for the session dispatch path
+    /// where the handle itself moves into the job's completion hook before
+    /// the job is sent.
+    pub fn sender(&self) -> crossbeam_channel::Sender<sandbox::JobMsg> {
+        self.jobs.clone()
+    }
 }
 
-fn dead_instance_outcome() -> sandbox::CallOutcome {
+pub(crate) fn dead_instance_outcome() -> sandbox::CallOutcome {
     sandbox::CallOutcome {
         result: Err(sandbox::FailureOutput {
             error: sandbox::RunError::Internal(
@@ -124,7 +110,7 @@ pub fn spawn_instance(
     memory_mb: u32,
     brand_key: String,
 ) -> InstanceHandle {
-    let (tx, rx) = crossbeam_channel::unbounded::<Job>();
+    let (tx, rx) = crossbeam_channel::unbounded::<sandbox::JobMsg>();
     std::thread::Builder::new()
         .name("iso4-warm-instance".to_string())
         .spawn(move || instance_main(prefix, memory_mb, brand_key, rx))
@@ -140,52 +126,56 @@ fn instance_main(
     prefix: Arc<PrefixData>,
     memory_mb: u32,
     brand_key: String,
-    jobs: crossbeam_channel::Receiver<Job>,
+    jobs: crossbeam_channel::Receiver<sandbox::JobMsg>,
 ) {
     // Host-type descriptors deserialized on this thread — call args, bridge
     // responses, and the cold-start replay of stored data globals — rehydrate
     // only when stamped with this key.
     crate::webcodec::set_session_brand_key(brand_key);
-    let mut core: Option<sandbox::InstanceCore> = None;
-    while let Ok(Job::Call(job, respond)) = jobs.recv() {
-        if core.is_none() {
-            let spec = sandbox::PrefixSpec {
-                code: &prefix.code,
-                filename: prefix.filename.as_deref().unwrap_or("<prefix>"),
-                globals: &prefix.globals,
+
+    // The isolate is created lazily on the first job so a creation failure
+    // surfaces as that call's result.
+    let Ok((mut first_job, first_respond)) = jobs.recv() else {
+        return; // evicted before ever serving
+    };
+    let spec = sandbox::PrefixSpec {
+        code: &prefix.code,
+        filename: prefix.filename.as_deref().unwrap_or("<prefix>"),
+        globals: &prefix.globals,
+    };
+    let mut core = match sandbox::create_instance_core(
+        Some(spec),
+        &prefix.declared_imports,
+        memory_mb,
+    ) {
+        Ok(c) => c,
+        Err(f) => {
+            // Warm-up failed — report it as this call's outcome and exit;
+            // the registry drops the handle on taint.
+            let outcome = sandbox::CallOutcome {
+                result: Err(f),
+                tainted: true,
+                heap_used_bytes: 0,
             };
-            match sandbox::create_instance_core(Some(spec), &prefix.declared_imports, memory_mb) {
-                Ok(c) => core = Some(c),
-                Err(f) => {
-                    // Warm-up failed — report it as this call's outcome and
-                    // exit; the registry drops the handle on taint.
-                    respond
-                        .send(sandbox::CallOutcome {
-                            result: Err(f),
-                            tainted: true,
-                            heap_used_bytes: 0,
-                        })
-                        .ok();
-                    return;
-                }
+            if let Some(complete) = first_job.complete.take() {
+                complete(outcome);
+            } else if let Some(respond) = first_respond {
+                respond.send(outcome).ok();
             }
+            return;
         }
-        sandbox::set_run_epilogue_spec(job.epilogue);
-        let outcome = sandbox::run_call_on_core(
-            core.as_mut().expect("core created above"),
-            job.code.as_deref(),
-            job.filename.as_deref().unwrap_or("<iso4>"),
-            &prefix.globals,
-            job.limits,
-            &job.globals,
-            &prefix.declared_imports,
-            job.stream_fd,
-            job.call_id_counter,
-            job.call.as_ref(),
-        );
-        respond.send(outcome).ok();
-    }
-    // Channel disconnected — the registry evicted this instance (taint, eviction,
+    };
+
+    // The per-instance turn loop: jobs, routed frames, deadlines — any
+    // number of session runs suspended at once (#125).
+    sandbox::serve_instance(
+        &mut core,
+        &prefix.globals,
+        &prefix.declared_imports,
+        (first_job, first_respond),
+        &jobs,
+    );
+    // The loop ended — the registry evicted this instance (taint, eviction,
     // dispose) or the process is shutting down. `core` drops here, on the
     // thread that created the isolate, as rusty_v8 requires.
 }
@@ -551,6 +541,7 @@ fn evict_scored(inner: &mut RegistryInner, now: Instant) -> bool {
 mod tests {
     use super::*;
     use crate::testval::{self, TestValue};
+    use std::sync::atomic::AtomicU32;
 
     fn counter_prefix() -> Arc<PrefixData> {
         Arc::new(PrefixData {
@@ -568,17 +559,20 @@ mod tests {
 
     fn bump_job() -> CallJob {
         CallJob {
+            token: 0,
             code: None,
             filename: None,
             limits: sandbox::Limits::default(),
             globals: Vec::new(),
-            stream_fd: None,
+            io: sandbox::RunIo::None,
             call_id_counter: Arc::new(AtomicU32::new(0)),
-            call: Some(ipc::CallSpec {
+            call: Some(crate::ipc::CallSpec {
                 export_path: "bump".to_string(),
                 args_blob: testval::to_blob(&TestValue::Array(Vec::new())),
             }),
             epilogue: None,
+            complete: None,
+            ctl_slot: None,
         }
     }
 
@@ -871,6 +865,271 @@ mod tests {
         let stats = registry.stats();
         assert_eq!(stats.warm_busy, 0);
         assert!(stats.per_prefix.is_empty());
+    }
+
+    // ── The per-instance turn loop: interleaved session runs ──────────────
+    //
+    // These drive `serve_instance` the way the session demux does: jobs with
+    // channel I/O, bridge frames answered by the test, outcomes read off the
+    // respond channels. One instance, several runs in flight.
+
+    use std::os::unix::net::UnixStream;
+
+    fn interleave_prefix() -> Arc<PrefixData> {
+        Arc::new(PrefixData {
+            code: "let n = 0\n\
+                   export function bump() { return ++n }\n\
+                   export async function viaTool(x) { console.log('run-' + x); const v = await tool(); return [x, v] }\n\
+                   export async function hangBump() { n++; await tool(); return n }\n\
+                   export function spin() { for (;;) {} }"
+                .to_string(),
+            filename: None,
+            globals: Vec::new(),
+            declared_globals: vec!["tool".to_string()],
+            declared_imports: Vec::new(),
+        })
+    }
+
+    struct SessionRun {
+        events: crossbeam_channel::Sender<sandbox::RunEvent>,
+        outcome: crossbeam_channel::Receiver<sandbox::CallOutcome>,
+    }
+
+    /// Submit one channel-mode job calling `export_path(args)` with a live
+    /// `tool` bridge stub writing to `sink_fd`'s socket.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_session_job(
+        handle: &InstanceHandle,
+        run_id: u32,
+        export_path: &str,
+        args: Vec<TestValue>,
+        sink: crate::ipc::FrameSink,
+        counter: &Arc<AtomicU32>,
+        limits: sandbox::Limits,
+    ) -> SessionRun {
+        let (ftx, frx) = crossbeam_channel::unbounded();
+        let (otx, orx) = crossbeam_channel::bounded(1);
+        let job = Box::new(CallJob {
+            token: sandbox::alloc_run_token(),
+            code: None,
+            filename: None,
+            limits,
+            globals: vec![crate::ipc::HostGlobalDef::bridge("tool")],
+            io: sandbox::RunIo::Session { events: frx, sink },
+            call_id_counter: Arc::clone(counter),
+            call: Some(crate::ipc::CallSpec {
+                export_path: export_path.to_string(),
+                args_blob: testval::to_blob(&TestValue::Array(args)),
+            }),
+            epilogue: Some(sandbox::EpilogueSpec {
+                run_id,
+                report_heap: false,
+            }),
+            complete: None,
+            ctl_slot: None,
+        });
+        handle
+            .sender()
+            .send((job, Some(otx)))
+            .expect("instance accepts the job");
+        SessionRun {
+            events: ftx,
+            outcome: orx,
+        }
+    }
+
+    /// Read one BridgeCall frame off the writer socket: (runId, callId).
+    fn read_bridge_call(server: &mut UnixStream) -> (u32, u32) {
+        let frame = crate::ipc::read_rust_to_ts_frame(server).expect("a BridgeCall frame");
+        assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::BridgeCall);
+        let run_id = u32::from_be_bytes(frame.payload[0..4].try_into().unwrap());
+        let call_id = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
+        (run_id, call_id)
+    }
+
+    /// A successful BridgeResponse frame event (runId, callId, number value).
+    fn bridge_response_event(run_id: u32, call_id: u32, value: f64) -> sandbox::RunEvent {
+        let mut p = Vec::new();
+        p.extend_from_slice(&run_id.to_be_bytes());
+        p.extend_from_slice(&call_id.to_be_bytes());
+        p.push(1); // ok
+        p.push(1); // value present
+        let blob = testval::to_blob(&TestValue::Number(value));
+        p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        p.extend_from_slice(&blob);
+        sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+            message_type: crate::ipc::TsToRustMessageType::BridgeResponse,
+            payload: p,
+        })
+    }
+
+    #[test]
+    fn one_instance_interleaves_two_runs_with_correct_attribution() {
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // Two runs, both suspended awaiting their bridge response.
+        let run1 = submit_session_job(
+            &handle, 101, "viaTool", vec![TestValue::Number(1.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let run2 = submit_session_job(
+            &handle, 102, "viaTool", vec![TestValue::Number(2.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+
+        // Both BridgeCall frames arrive on the one serialized writer, each
+        // leading with its run id.
+        let first = read_bridge_call(&mut server);
+        let second = read_bridge_call(&mut server);
+        let mut calls = std::collections::HashMap::from([first, second]);
+        assert_eq!(calls.len(), 2, "two distinct runs sent bridge calls");
+        let c1 = calls.remove(&101).expect("run 101 sent a call");
+        let c2 = calls.remove(&102).expect("run 102 sent a call");
+
+        // Answer run 2 FIRST: routing must deliver each response to its own
+        // run even though run 1 suspended earlier.
+        run2.events.send(bridge_response_event(102, c2, 20.0)).unwrap();
+        let out2 = run2.outcome.recv().expect("run 2 completes");
+        run1.events.send(bridge_response_event(101, c1, 10.0)).unwrap();
+        let out1 = run1.outcome.recv().expect("run 1 completes");
+
+        let v1 = out1.result.expect("run 1 ok");
+        let v2 = out2.result.expect("run 2 ok");
+        assert!(!out1.tainted && !out2.tainted);
+        assert_eq!(
+            testval::from_blob(&v1.exports),
+            TestValue::Array(vec![TestValue::Number(1.0), TestValue::Number(10.0)])
+        );
+        assert_eq!(
+            testval::from_blob(&v2.exports),
+            TestValue::Array(vec![TestValue::Number(2.0), TestValue::Number(20.0)])
+        );
+        // Console attribution: each run's lines land in ITS result, even
+        // though both ran turns on one shared instance.
+        assert_eq!(v1.stdout, vec!["run-1".to_string()]);
+        assert_eq!(v2.stdout, vec!["run-2".to_string()]);
+    }
+
+    #[test]
+    fn a_mid_turn_kill_resets_innocent_co_resident_runs() {
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // The innocent victim: suspended awaiting a bridge response.
+        let victim = submit_session_job(
+            &handle, 8, "viaTool", vec![TestValue::Number(1.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let _ = read_bridge_call(&mut server); // proof it is suspended
+
+        // The culprit: a synchronous spin killed mid-turn by the CPU guard.
+        let culprit = submit_session_job(
+            &handle, 7, "spin", vec![],
+            sink.clone(), &counter,
+            sandbox::Limits {
+                cpu_time_ms: 100,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+        );
+
+        let culprit_out = culprit.outcome.recv().expect("culprit concludes");
+        assert!(culprit_out.tainted);
+        assert!(matches!(
+            culprit_out.result.unwrap_err().error,
+            sandbox::RunError::CpuTimeout
+        ));
+
+        let victim_out = victim.outcome.recv().expect("victim concludes");
+        assert!(victim_out.tainted, "the whole instance is untrustworthy");
+        match victim_out.result.unwrap_err().error {
+            sandbox::RunError::InstanceReset {
+                cause,
+                culprit_run_id,
+            } => {
+                assert_eq!(cause, sandbox::ResetCause::Cpu);
+                assert_eq!(culprit_run_id, 7, "the culprit's wire run id is named");
+            }
+            other => panic!("expected InstanceReset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_abort_abandons_the_run_and_the_instance_survives() {
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // Suspend a run mid-bridge after it bumped the counter, then abort.
+        let run = submit_session_job(
+            &handle, 5, "hangBump", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let _ = read_bridge_call(&mut server);
+        run.events
+            .send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+                message_type: crate::ipc::TsToRustMessageType::Terminate,
+                payload: 5u32.to_be_bytes().to_vec(),
+            }))
+            .unwrap();
+        let aborted = run.outcome.recv().expect("aborted run concludes");
+        assert!(
+            !aborted.tainted,
+            "a boundary abort abandons the run without tainting the instance"
+        );
+        assert!(matches!(
+            aborted.result.unwrap_err().error,
+            sandbox::RunError::Aborted
+        ));
+
+        // The instance keeps serving, abandoned side effects intact: the
+        // n++ before the hang is visible, and its continuation never ran.
+        let outcome = handle.call(bump_job());
+        assert!(!outcome.tainted);
+        assert_eq!(bump_value(&outcome), 2.0, "n was 1 from hangBump, bump → 2");
+    }
+
+    #[test]
+    fn a_boundary_wall_expiry_does_not_taint_the_instance() {
+        // The run is suspended awaiting a bridge response when its wall
+        // budget runs out: a loop-deadline failure, not a mid-JS kill — the
+        // instance stays trustworthy and keeps its state (E1 ruling 3
+        // deliberately narrows the old taint-on-WallTimeout).
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let run = submit_session_job(
+            &handle, 9, "hangBump", vec![],
+            sink.clone(), &counter,
+            sandbox::Limits {
+                wall_time_ms: 200,
+                ..Default::default()
+            },
+        );
+        let _ = read_bridge_call(&mut server);
+        let out = run.outcome.recv().expect("run concludes at its wall");
+        assert!(!out.tainted, "boundary wall expiry must not taint");
+        assert!(matches!(
+            out.result.unwrap_err().error,
+            sandbox::RunError::WallTimeout
+        ));
+
+        // Reuse: same instance, state intact.
+        let outcome = handle.call(bump_job());
+        assert!(!outcome.tainted);
+        assert_eq!(bump_value(&outcome), 2.0);
     }
 
     #[test]

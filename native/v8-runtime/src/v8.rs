@@ -257,14 +257,11 @@ extern "C" fn near_heap_limit_cb(
 
 /// Tracks how much active V8 execution time has elapsed.
 ///
-/// `enter()` / `leave()` bracket each period when V8 is actually running JS.
-/// Time spent waiting on host bridge calls (Phase 4+) is excluded by calling
-/// `leave()` before dispatching a bridge call and `enter()` on return.
-///
-/// Without bridge calls (current), `enter()` is called once just before
-/// `module.evaluate()` and `leave()` once when the run ends, so `elapsed_ms()`
-/// equals the wall time of the evaluation phase (compile + instantiate time
-/// excluded).
+/// `enter()` / `leave()` bracket each period when V8 is actually running JS
+/// — one epoch per turn in the instance loop, entered when a turn starts
+/// executing and left at turn exit, so time parked between turns (bridge
+/// waits, queueing) is never billed. Compile/instantiate time is excluded
+/// by entering only right before `module.evaluate()` in the start turn.
 pub struct CpuBudget {
     accumulated_ns: AtomicU64,
     epoch_start: Mutex<Option<Instant>>,
@@ -687,7 +684,7 @@ struct StreamTableState {
     streams: HashMap<u32, StreamState>,
     /// Wire identity for outbound `StreamPull`/`StreamCancel` frames.
     run_id: u32,
-    stream_fd: Option<RawFd>,
+    sink: Option<ipc::FrameSink>,
 }
 
 impl StreamTable {
@@ -698,27 +695,144 @@ impl StreamTable {
     }
 }
 
+// ── Per-run state table ──────────────────────────────────────────────────────
+//
+// One instance serves several in-flight runs (the #124 interleaving model),
+// so everything a native callback used to reach through a fixed
+// instance-lifetime pointer — console buffers, the waitUntil set, the
+// streamed-body registry, bridge-stub bindings — is now keyed by the owning
+// run. Attribution: a *turn* executes on behalf of exactly one run
+// ([`CURRENT_RUN_TOKEN`], set at turn entry), and continuations created by a
+// run carry its token in the CPED rider (see `install_async_context`), so
+// work resumed during another run's turn still attributes to its creator.
+
 thread_local! {
-    /// The armed stream table of the run executing on this thread, so the
-    /// codec's rehydration walk (which has no context parameter) can register
-    /// hydrated streams — the same per-thread pattern as the descriptor brand
-    /// key. Null outside runs.
-    static STREAM_TABLE_PTR: std::cell::Cell<*const StreamTable> =
+    /// The run whose turn is executing on this thread. 0 = none (between
+    /// turns, prefix warm-up). Fallback attribution when no CPED rider is
+    /// present; the gate that refuses between-turn callback activity.
+    static CURRENT_RUN_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// The run table of the instance executing on this thread, for callback
+    /// paths that have no `scope`/External to reach it through (the codec's
+    /// rehydration walk). Null outside turns.
+    static RUN_TABLE_PTR: std::cell::Cell<*const RunTable> =
         const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Process-wide run-token allocator. Tokens are instance-local identities on
+/// the wire-facing side but allocated globally so no two live runs anywhere
+/// share one (wire run ids can collide across connections; tokens cannot).
+/// Starts at 1 — 0 means "no run".
+pub fn alloc_run_token() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Everything one in-flight run owns on its instance. Boxed in the table so
+/// the address is stable across map rehashes; pointers into an entry are
+/// derived and used only within one turn/callback invocation, and entries
+/// are inserted/removed only between turns (no JS on the stack), so such a
+/// pointer never outlives its entry.
+struct RunCallState {
+    /// Console output, capped per this run's limits.
+    logs: Box<RefCell<LogBuffers>>,
+    /// `waitUntil` registrations (armed at the setup-to-run boundary).
+    pending: Box<PendingWork>,
+    /// Streamed-body registry (armed per run).
+    streams: Box<StreamTable>,
+    /// Per-stub bridge bindings for THIS run — the per-call half of what a
+    /// stub `Function` needs; the instance-lifetime half is the
+    /// [`StubSlot`] its External points at.
+    stubs: RefCell<HashMap<String, GlobalCallbackData>>,
+}
+
+impl RunCallState {
+    fn new(max_stdout_bytes: u32, max_stderr_bytes: u32) -> Box<Self> {
+        Box::new(Self {
+            logs: Box::new(RefCell::new(LogBuffers {
+                max_stdout_bytes,
+                max_stderr_bytes,
+                ..LogBuffers::default()
+            })),
+            pending: PendingWork::boxed(),
+            streams: StreamTable::boxed(),
+            stubs: RefCell::new(HashMap::new()),
+        })
+    }
+}
+
+/// Instance-lifetime registry of in-flight runs, reachable from native
+/// callbacks through an `External` (stable Box address, the `LogBuffers`
+/// pattern generalized).
+pub struct RunTable {
+    runs: RefCell<HashMap<u64, Box<RunCallState>>>,
+    /// Console output produced outside any run — prefix warm-up — delivered
+    /// on the cold-start call (the old `warmup_logs_pending` flow).
+    setup_logs: RefCell<LogBuffers>,
+}
+
+impl RunTable {
+    fn boxed() -> Box<Self> {
+        Box::new(Self {
+            runs: RefCell::new(HashMap::new()),
+            setup_logs: RefCell::new(LogBuffers::default()),
+        })
+    }
+
+    /// Pointer to a live run's state, or null. The pointer is valid for the
+    /// remainder of the current turn (entries are only removed between
+    /// turns); callers must not hold it longer.
+    fn state_ptr(&self, token: u64) -> *const RunCallState {
+        self.runs
+            .borrow()
+            .get(&token)
+            .map_or(std::ptr::null(), |b| std::ptr::addr_of!(**b))
+    }
+}
+
+/// The token native callbacks attribute to: the CPED rider's creator token
+/// when the running continuation carries one AND that run is still live,
+/// else the current turn owner. (A stale continuation of a finished run —
+/// driven during a later run's checkpoint on a warm instance — attributes
+/// to the turn owner, exactly the pre-table behavior of the shared buffers.)
+fn attributed_token(scope: &mut v8::PinScope, table: &RunTable) -> u64 {
+    let current = CURRENT_RUN_TOKEN.with(|c| c.get());
+    let cped = scope.get_continuation_preserved_embedder_data();
+    if let Some((token, _)) = rider_parts(scope, cped) {
+        if token != current && table.runs.borrow().contains_key(&token) {
+            return token;
+        }
+        if token == current {
+            return current;
+        }
+    }
+    current
 }
 
 /// Register a hydrated stream in the executing run's table. Returns false
 /// when no run is executing on this thread (a descriptor carrying a stream
-/// outside a run — refused by the codec).
+/// outside a run — refused by the codec). The codec walk has no `scope`, so
+/// attribution is the turn owner: rehydration only happens while delivering
+/// that run's own payloads (call args, its bridge responses).
 pub fn register_hydrated_stream(stream_id: u32) -> bool {
-    STREAM_TABLE_PTR.with(|c| {
+    let token = CURRENT_RUN_TOKEN.with(|c| c.get());
+    if token == 0 {
+        return false;
+    }
+    RUN_TABLE_PTR.with(|c| {
         let ptr = c.get();
         if ptr.is_null() {
             return false;
         }
-        // SAFETY: set only while the owning run frame is live on this thread.
+        // SAFETY: set only while the owning instance's turn is live on this
+        // thread.
         let table = unsafe { &*ptr };
-        let mut slot = table.slot.borrow_mut();
+        let state = table.state_ptr(token);
+        if state.is_null() {
+            return false;
+        }
+        // SAFETY: entry pointers are valid for the remainder of the turn.
+        let mut slot = unsafe { &*state }.streams.slot.borrow_mut();
         match slot.as_mut() {
             Some(state) => {
                 state.streams.insert(stream_id, StreamState::new());
@@ -732,23 +846,19 @@ pub fn register_hydrated_stream(stream_id: u32) -> bool {
 /// Write a `StreamPull` credit grant for consumed bytes. Best-effort: a dead
 /// socket surfaces through the run's own I/O soon enough.
 fn send_stream_credit(state: &StreamTableState, stream_id: u32, credit: u32) {
-    let Some(fd) = state.stream_fd else { return };
+    let Some(sink) = &state.sink else { return };
     if credit == 0 {
         return;
     }
     let payload = ipc::encode_stream_pull_payload(state.run_id, stream_id, credit);
-    // SAFETY: same single-owner ManuallyDrop discipline as bridge writes.
-    let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
-    let _ = ipc::write_rust_to_ts_frame(&mut *sock, ipc::RustToTsMessageType::StreamPull, &payload);
+    let _ = sink.write(ipc::RustToTsMessageType::StreamPull, &payload);
 }
 
 /// Write a `StreamCancel` so the host stops pumping and releases the source.
 fn send_stream_cancel(state: &StreamTableState, stream_id: u32, reason: &str) {
-    let Some(fd) = state.stream_fd else { return };
+    let Some(sink) = &state.sink else { return };
     let payload = ipc::encode_stream_cancel_payload(state.run_id, stream_id, reason);
-    let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
-    let _ =
-        ipc::write_rust_to_ts_frame(&mut *sock, ipc::RustToTsMessageType::StreamCancel, &payload);
+    let _ = sink.write(ipc::RustToTsMessageType::StreamCancel, &payload);
 }
 
 /// The result of a failed JavaScript execution.
@@ -792,6 +902,22 @@ fn codec_error_to_run_error(error: crate::webcodec::CodecError) -> RunError {
         crate::webcodec::CodecError::Unsupported(m) => RunError::TypeNotSerializable(m),
         crate::webcodec::CodecError::Malformed(m) => RunError::Internal(m),
     }
+}
+
+/// Why a shared instance was reset under an innocent victim — the cause
+/// class carried on `ERR_INSTANCE_RESET`. Wire byte values are assigned in
+/// `wire::reset_cause_byte` (NOT this declaration order) and mirrored by the
+/// TS decoder's cause table; change all three together or victims get
+/// mislabelled causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetCause {
+    Cpu,
+    Memory,
+    /// The culprit's wall deadline fired mid-turn (possible when its CPU is
+    /// uncapped — the guard enforces min(cpu, wall) inside a turn).
+    Wall,
+    Abort,
+    Internal,
 }
 
 /// All the ways an execution can fail.
@@ -857,6 +983,17 @@ pub enum RunError {
     /// socket-teardown fallback, this arm carries the real duration, CPU time,
     /// and bridge-call records collected before the abort landed.
     Aborted,
+    /// An innocent victim of a co-resident run's mid-JS interruption: a
+    /// guard fired (CPU/memory) or a forced terminate landed while another
+    /// run's turn was executing, so the shared instance can no longer be
+    /// trusted and every in-flight run on it fails. Carries the cause class
+    /// and the culprit's wire run id; the victim's own partial telemetry
+    /// (duration, CPU time, bridge records) rides the failure payload as
+    /// usual.
+    InstanceReset {
+        cause: ResetCause,
+        culprit_run_id: u32,
+    },
     /// Unexpected internal runtime failure.
     Internal(String),
 }
@@ -880,6 +1017,40 @@ pub fn execute(
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
 ) -> Result<Output, FailureOutput> {
+    execute_with_io(
+        code,
+        filename,
+        limits,
+        globals,
+        imports,
+        stream_fd.map_or(RunIo::None, RunIo::Fd),
+        0,
+        call_id_counter,
+        call,
+        None,
+    )
+}
+
+/// [`execute`] with an explicit run I/O mode — the session's one-off worker
+/// path, where frames arrive demux-routed over a channel and outbound frames
+/// go through the connection's serialized writer.
+/// `token` is the run's table token; 0 = allocate one internally. The
+/// session demux allocates it up front and registers it in the run's route,
+/// so `GuardCtl::abort_executing(token)` can match this run's turns — pass
+/// the SAME token here or mid-turn aborts silently never land.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_with_io(
+    code: &str,
+    filename: Option<&str>,
+    limits: Limits,
+    globals: &[HostGlobalDef],
+    imports: &[ImportBinding],
+    io: RunIo,
+    token: u64,
+    call_id_counter: Arc<AtomicU32>,
+    call: Option<&ipc::CallSpec>,
+    ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
         Some(code),
@@ -887,9 +1058,11 @@ pub fn execute(
         limits,
         globals,
         imports,
-        stream_fd,
+        io,
+        token,
         call_id_counter,
         call,
+        ctl_slot,
     )
 }
 
@@ -987,15 +1160,18 @@ pub fn precompile(
 /// value instead of the exports: the export path resolves against the
 /// postfix module when `code` is `Some`, or against the prefix module for a
 /// call-only prefix run (`code` = `None`, only valid with a prefix).
+#[allow(clippy::too_many_arguments)]
 fn run_module(
     code: Option<&str>,
     filename: &str,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-    stream_fd: Option<RawFd>,
+    io: RunIo,
+    token: u64,
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
+    ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
 ) -> Result<Output, FailureOutput> {
     // The run clock, CPU budget, and bridge-call log live here (not inside
     // the inner function) so the final values can be stamped onto BOTH
@@ -1010,9 +1186,11 @@ fn run_module(
         limits,
         globals,
         imports,
-        stream_fd,
+        io,
+        token,
         call_id_counter,
         call,
+        ctl_slot,
         start,
         Arc::clone(&cpu_budget),
         Arc::clone(&bridge_log),
@@ -1042,7 +1220,8 @@ fn run_module_inner(
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-    stream_fd: Option<RawFd>,
+    io: RunIo,
+    token: u64,
     // Per-connection call-ID counter. Shared across all runs on the same
     // connection so callIds are monotonically increasing and never reset to 0
     // between runs. This prevents a stale BridgeResponse from a previous
@@ -1050,19 +1229,33 @@ fn run_module_inner(
     // next run's bridge_global_callback.
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
+    ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
     start: std::time::Instant,
     cpu_budget: Arc<CpuBudget>,
     bridge_log: Arc<Mutex<BridgeCallLog>>,
 ) -> Result<Output, FailureOutput> {
-    let mut logs = LogBuffers {
-        max_stdout_bytes: limits.max_stdout_bytes,
-        max_stderr_bytes: limits.max_stderr_bytes,
-        ..LogBuffers::default()
-    };
-    // waitUntil registrations; one-off runs hold it for the run's life.
-    let pending_work = PendingWork::boxed();
-    // Streamed-body registry, same lifetime.
-    let stream_table = StreamTable::boxed();
+    // One-off runs hold a single-entry run table for the run's life — the
+    // same routing the warm instances use, so the native installs are
+    // uniform across both paths.
+    let run_table = RunTable::boxed();
+    let token = if token != 0 { token } else { alloc_run_token() };
+    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes);
+    let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
+    let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
+    let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    run_table.runs.borrow_mut().insert(token, entry);
+    CURRENT_RUN_TOKEN.with(|c| c.set(token));
+    RUN_TABLE_PTR.with(|c| c.set(std::ptr::addr_of!(*run_table)));
+    // Clear the thread markers on every exit path — the entry dies with the
+    // table, but the thread-locals outlive this run.
+    struct TokenReset;
+    impl Drop for TokenReset {
+        fn drop(&mut self) {
+            CURRENT_RUN_TOKEN.with(|c| c.set(0));
+            RUN_TABLE_PTR.with(|c| c.set(std::ptr::null()));
+        }
+    }
+    let _token_reset = TokenReset;
 
     // `reason` is created before the isolate so it can be shared with the
     // ArrayBuffer allocator (which is registered in CreateParams, before the
@@ -1132,62 +1325,29 @@ fn run_module_inner(
     // find the values array staged for the module being initialised.
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
 
-    // ── Limit guard threads ───────────────────────────────────────────────────
-    //
-    // CURRENT APPROACH: one OS guard thread per limit type per run
-    // ─────────────────────────────────────────────────────────────
-    // Each run spawns up to two short-lived guard threads:
-    //   • wall guard  - sleeps for wall_time_ms, fires terminate_execution()
-    //   • cpu guard   - polls budget.elapsed_ms() every 10 ms, fires on excess
-    //
-    // This is simple, correct, and sufficient for typical agent workloads
-    // (10-50 concurrent runs). At 100 concurrent runs: 200 guard threads.
-    // Modern Linux supports ~10k threads; macOS supports ~2k. In practice
-    // these threads sleep for the run duration and consume negligible CPU.
-    //
-    // REVISIT IF: throughput regularly exceeds ~200-300 concurrent runs on a
-    // single binary, or thread-spawn latency shows up in profiling.
-    //
-    // POOLING ALTERNATIVE (e.g. isolated-vm's approach)
-    // ─────────────────────────────────────────────────
-    // A single shared priority-queue timer thread manages all pending deadlines:
-    //   1. Each run registers (deadline, IsolateHandle) into the shared queue.
-    //   2. The pool thread sleeps until the nearest deadline.
-    //   3. On expiry it calls isolate.request_interrupt(callback) - this
-    //      delivers a callback *within* the V8 isolate at the next JS safepoint,
-    //      and the callback calls terminate_execution().
-    //   4. RequestInterrupt is thread-safe and does not require the V8 thread.
-    //
-    // At 100 concurrent runs: ~1 pool thread instead of 200. isolated-vm uses
-    // exactly this model (src/isolate/run_with_timeout.h + src/lib/timer.cc).
-    //
-    // OTHER OPTIONS TO EVALUATE BEFORE BUILDING THE POOL
-    // ────────────────────────────────────────────────────
-    // • OS-level SIGALRM / timer_create per thread (POSIX, avoids user-space
-    //   poll but requires signal-safe V8 interaction - fragile).
-    // • tokio::time::timeout wrapping a blocking thread - does NOT work for
-    //   tight JS loops (monopolises the async executor; timer never fires).
-    // • Two-process SIGKILL as absolute backstop - iso4's architecture already
-    //   provides this: the Node host can kill the Rust subprocess unconditionally
-    //   on wall-timeout, something in-process runtimes (isolated-vm, Node vm)
-    //   fundamentally cannot do without crashing the host.
-    //
-    // See .notes/timeout-enforcement.md for the full research brief.
-    //
-    // Both guards are set up before entering V8 scopes so the IsolateHandle
-    // is obtained while we still hold a plain &Isolate borrow.
+    // ── The limit guard ──────────────────────────────────────────────────
+    // One guard thread per instance (E1 ruling 2) — a one-off run IS an
+    // instance of one call. It watches the turn currently executing; while
+    // the run is parked between turns the target is empty and boundary
+    // deadlines are the loop's business. Armed here already so setup
+    // (installs below) runs under the caller's budgets, exactly as the old
+    // per-call guard threads covered it.
     let handle = isolate.thread_safe_handle();
     let cancel_handle = handle.clone(); // for cancel_terminate_execution on success
-    // One-off runs drop the join handles (detached guards, as before the
-    // warm split): the isolate dies with the run, so a late-firing guard
-    // has nothing durable to poison.
-    let (cancel_wall, _wall_join) =
-        start_wall_guard(handle.clone(), Arc::clone(&reason), limits.wall_time_ms);
-    let (cancel_cpu, _cpu_join) = start_cpu_guard(
-        handle.clone(),
-        Arc::clone(&reason),
-        Arc::clone(&cpu_budget),
-        limits.cpu_time_ms,
+    let guard = InstanceGuard::spawn(handle.clone(), Arc::clone(&reason));
+    if let Some(slot) = &ctl_slot {
+        slot.set(guard.ctl()).ok();
+    }
+    // Armed under the run's token: a session Terminate that lands while this
+    // one-off is mid-JS must be able to kill it via `abort_executing`.
+    guard.set_for(
+        GuardTarget {
+            budget: Arc::clone(&cpu_budget),
+            cpu_cap_ms: limits.cpu_time_ms,
+            wall_deadline: (limits.wall_time_ms > 0)
+                .then(|| start + Duration::from_millis(limits.wall_time_ms as u64)),
+        },
+        token,
     );
 
     // ── Near-heap callback (V8 heap objects: strings, plain objects) ──────────
@@ -1208,38 +1368,34 @@ fn run_module_inner(
     };
     // cpu_budget.enter() is called immediately before module.evaluate() so
     // compilation and scope setup time is not charged against the CPU budget.
-    let _guard_canceller = GuardCanceller {
-        cancel_wall: &cancel_wall,
-        cancel_cpu: &cancel_cpu,
-        budget: &cpu_budget,
-    };
 
     let context_global = {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
+    let table_ptr: *const RunTable = &*run_table;
     // Every setup step below runs with the guards already armed, so each
     // failure classifies through `termination_or` — a guard firing mid-setup
     // (a very tight wall limit on a slow machine) must report the timeout,
     // not the operation it happened to interrupt.
-    install_console(scope, &mut logs as *mut LogBuffers)
-        .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
+    install_console(scope, table_ptr)
+        .map_err(|error| failure(termination_or(&reason, error), &unsafe { &*logs_ptr }.borrow(), start))?;
 
     // Web globals (Headers/Request/Response/URL/TextEncoder/…), with the
     // streamed-body natives wired to this run's table.
-    install_web_runtime(scope, &*stream_table)
-        .map_err(|e| failure(termination_or(&reason, RunError::Internal(e)), &logs, start))?;
+    install_web_runtime(scope, table_ptr)
+        .map_err(|e| failure(termination_or(&reason, RunError::Internal(e)), &unsafe { &*logs_ptr }.borrow(), start))?;
 
     // Install AsyncLocalStorage (importable via `node:async_hooks`) for this
     // run. Always installed: it registers no promise hooks, so runs that never
     // use it pay only for the class setup, not per-promise overhead.
     install_async_context(scope)
-        .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
+        .map_err(|error| failure(termination_or(&reason, error), &unsafe { &*logs_ptr }.borrow(), start))?;
 
     // waitUntil: installed disarmed — run_call_phase arms it at the
     // setup-to-run boundary.
-    install_wait_until(scope, &*pending_work)
-        .map_err(|error| failure(termination_or(&reason, error), &logs, start))?;
+    install_wait_until(scope, table_ptr)
+        .map_err(|error| failure(termination_or(&reason, error), &unsafe { &*logs_ptr }.borrow(), start))?;
 
         v8::Global::new(scope, context)
     };
@@ -1258,121 +1414,510 @@ fn run_module_inner(
         code,
         filename,
         &mut stub_slots,
+        &guard,
         CallPhaseCtx {
+            token,
+            table: std::ptr::addr_of!(*run_table),
             limits: &limits,
             globals,
             imports,
-            stream_fd,
+            io,
             call_id_counter,
             call,
             start,
             cpu_budget: &cpu_budget,
             bridge_log: &bridge_log,
             reason: &reason,
-            logs: std::ptr::addr_of!(logs),
-            pending: &*pending_work,
-            streams: &*stream_table,
+            logs: logs_ptr,
+            pending: pending_ptr,
+            streams: streams_ptr,
             epilogue: take_epilogue_spec(),
-            cancel_wall: &cancel_wall,
-            cancel_cpu: &cancel_cpu,
             cancel_handle: &cancel_handle,
         },
     );
+    guard.clear();
     // Failure paths return out of run_call_phase before its own stream
     // cleanup: close here too (idempotent), so the host releases its sources
     // and the per-thread table pointer never dangles past the Box.
-    close_run_streams(&*stream_table);
+    close_run_streams(streams_ptr);
     result
 }
 
+// ── Run I/O ──────────────────────────────────────────────────────────────────
+
+/// One event routed to a suspended run by the session demux.
+pub enum RunEvent {
+    /// An inbound frame addressed to this run (BridgeResponse, stream
+    /// frames, Terminate).
+    Frame(ipc::TsToRustFrame),
+    /// The run's connection is gone — framing died or the peer closed. The
+    /// optional detail lands in the run's failure message.
+    ConnLost(Option<String>),
+}
+
+/// Where a run's frames come from and where its frames go.
+pub enum RunIo {
+    /// Direct fd (tests / direct API): reads and writes on the raw session
+    /// socket, whose only user is this run — the pre-demux discipline.
+    Fd(RawFd),
+    /// Session mode: the demux feeds events per run; writes go through the
+    /// connection's serialized writer.
+    Session {
+        events: crossbeam_channel::Receiver<RunEvent>,
+        sink: ipc::FrameSink,
+    },
+    /// No I/O: a pure compute run (no bridge, no epilogue socket).
+    None,
+}
+
+/// The read half of [`RunIo`], as the drive loops hold it.
+enum RunSource {
+    Fd(RawFd),
+    Channel(crossbeam_channel::Receiver<RunEvent>),
+}
+
+// ── The turn loop ────────────────────────────────────────────────────────────
+//
+// One instance serves its in-flight runs as a sequence of TURNS: enter the
+// isolate on behalf of exactly one run, do one unit of work (start it,
+// deliver one frame to it, observe a deadline), run a microtask checkpoint,
+// scan the run's root promise, and leave. Nobody holds the isolate between
+// turns — a run's continuation state lives in [`RunState`], not on the
+// stack — so any number of runs can be suspended on one instance while the
+// owner thread waits for the next event. (The #81 design; this replaces the
+// per-call blocking poll loop and the separate grace phase.)
+
 /// Per-call parameters for [`run_call_phase`] — bundled so the one-off path
 /// (`run_module_inner`) and warm instances (`run_call_on_core`) drive
-/// the identical phase with their own guard and telemetry lifetimes.
+/// the identical machinery with their own state lifetimes.
 struct CallPhaseCtx<'a> {
+    /// This run's table token — the identity every native callback
+    /// attributes by.
+    token: u64,
+    /// The instance's run table.
+    table: *const RunTable,
     limits: &'a Limits,
     globals: &'a [HostGlobalDef],
     imports: &'a [ImportBinding],
-    stream_fd: Option<RawFd>,
+    io: RunIo,
     call_id_counter: Arc<AtomicU32>,
     call: Option<&'a ipc::CallSpec>,
     start: std::time::Instant,
     cpu_budget: &'a Arc<CpuBudget>,
     bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
     reason: &'a Arc<ReasonCell>,
-    /// Read-only view of the console sink for failure snapshots. A raw
-    /// pointer (not `&`) because the console concurrently holds the writing
-    /// pointer; only transient borrows are taken, never across JS execution
-    /// — the same discipline the pre-split code applied to its `logs` local.
-    logs: *const LogBuffers,
-    /// The run's `waitUntil` registration set — instance-lifetime Box,
-    /// same pointer discipline as `logs`. Armed at the setup-to-run boundary
-    /// below, drained by the grace phase, disarmed by the caller.
+    /// The run's console sink (in its table entry) for failure snapshots.
+    /// A raw pointer; only transient borrows are taken, never across JS
+    /// execution.
+    logs: *const RefCell<LogBuffers>,
+    /// The run's `waitUntil` registration set — in its table entry.
     pending: *const PendingWork,
-    /// The run's streamed-body registry — same pointer discipline as `logs`.
+    /// The run's streamed-body registry — in its table entry.
     streams: *const StreamTable,
     /// Per-run identity for the early Result frame; `None` = hold mode.
     epilogue: Option<EpilogueSpec>,
-    cancel_wall: &'a crossbeam_channel::Sender<()>,
-    cancel_cpu: &'a crossbeam_channel::Sender<()>,
     cancel_handle: &'a v8::IsolateHandle,
 }
 
+/// How far a run has gotten; what the next event means for it.
+enum RunPhase {
+    /// The start turn has not armed a root yet.
+    Starting,
+    /// The root promise is pending; frames and deadlines drive it.
+    Settling {
+        root: v8::Global<v8::Promise>,
+        /// The module whose namespace the exports come from. `None` for a
+        /// call whose return promise is already the root.
+        module: Option<v8::Global<v8::Module>>,
+        /// A requested call still has to be invoked once `root` (the module
+        /// evaluation promise) fulfils.
+        call_pending: bool,
+        /// The root's value IS the run result (a call's return promise) —
+        /// serialize it instead of walking module exports.
+        root_is_call_result: bool,
+    },
+    /// The value settled and (in session mode) the early Result shipped;
+    /// the registered `waitUntil` work is being driven under grace budgets.
+    /// Boxed: the settled Output rides in it, and most runs never grace.
+    Grace(Box<GraceState>),
+}
+
+/// Loop-side state of one in-flight run.
+struct RunState {
+    token: u64,
+    table: *const RunTable,
+    limits: Limits,
+    start: std::time::Instant,
+    epilogue: Option<EpilogueSpec>,
+    /// Where this run's events come from; `None` = nothing can wake it.
+    source: Option<RunSource>,
+    /// Outbound frames (the early Result at grace start). Bridge stubs and
+    /// stream credit carry their own clone via the table entry.
+    sink: Option<ipc::FrameSink>,
+    cpu_budget: Arc<CpuBudget>,
+    bridge_log: Arc<Mutex<BridgeCallLog>>,
+    bridge_error: Arc<OnceLock<RunError>>,
+    resolvers: PendingResolvers,
+    // Pointers into this run's table entry — valid while the entry lives
+    // (the callers remove the entry only after the drive returns).
+    logs: *const RefCell<LogBuffers>,
+    pending: *const PendingWork,
+    streams: *const StreamTable,
+    phase: RunPhase,
+}
+
+/// Grace bookkeeping — the dissolved `run_grace_phase`.
+struct GraceState {
+    /// The settled run value; `background` is stamped at grace end.
+    output: Output,
+    grace_start: std::time::Instant,
+    deadline: std::time::Instant,
+    grace_cpu: Arc<CpuBudget>,
+    grace_cpu_cap: u32,
+    error: Option<(String, String)>,
+    early_result_sent: bool,
+    /// Bridge records that belong to the run phase (already shipped on the
+    /// early Result); grace reports only what comes after.
+    run_record_count: usize,
+}
+
+impl RunState {
+    /// Snapshot the run's console sink for a failure result.
+    fn fail(&self, error: RunError) -> FailureOutput {
+        // SAFETY: `logs` points into the run's live table entry.
+        failure(error, &unsafe { &*self.logs }.borrow(), self.start)
+    }
+
+    /// The budget the current phase bills JS execution to.
+    fn active_budget(&self) -> Arc<CpuBudget> {
+        match &self.phase {
+            RunPhase::Grace(g) => Arc::clone(&g.grace_cpu),
+            _ => Arc::clone(&self.cpu_budget),
+        }
+    }
+
+    /// The read cap for inbound frames while this run waits: its own memory
+    /// budget, or the global framing cap when it opted out of one.
+    fn frame_limit(&self) -> u32 {
+        if self.limits.memory_mb > 0 {
+            self.limits.memory_mb.saturating_mul(1024 * 1024)
+        } else {
+            ipc::DEFAULT_MAX_FRAME_LENGTH
+        }
+    }
+
+    /// How long the loop may wait before this run has a boundary deadline:
+    /// the wall budget while settling (None = uncapped), the grace budget
+    /// during grace.
+    fn next_timeout(&self) -> Option<Duration> {
+        match &self.phase {
+            RunPhase::Starting | RunPhase::Settling { .. } => {
+                if self.limits.wall_time_ms > 0 {
+                    let budget = Duration::from_millis(self.limits.wall_time_ms as u64);
+                    Some(
+                        budget
+                            .saturating_sub(self.start.elapsed())
+                            .max(Duration::from_millis(1)),
+                    )
+                } else {
+                    None
+                }
+            }
+            RunPhase::Grace(g) => Some(
+                g.deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .max(Duration::from_millis(1)),
+            ),
+        }
+    }
+}
+
+/// Borrowed per-run facts the turn functions need beside the mutable state.
+struct RunFacts<'a> {
+    call: Option<&'a ipc::CallSpec>,
+    reason: &'a Arc<ReasonCell>,
+    guard: &'a InstanceGuard,
+    cancel_handle: &'a v8::IsolateHandle,
+}
+
+/// What a scan decided about one run.
+enum ScanOutcome {
+    /// Still in flight — wait for the next event.
+    Continue,
+    /// The run is over; this is its result.
+    Finished(Box<Result<Output, FailureOutput>>),
+}
+
+fn finished(r: Result<Output, FailureOutput>) -> ScanOutcome {
+    ScanOutcome::Finished(Box::new(r))
+}
+
+/// One event delivered to the loop while runs are suspended.
+enum LoopEvent {
+    Frame(ipc::TsToRustFrame),
+    /// The wait timed out — the nearest boundary deadline is due.
+    DeadlineHit,
+    /// The frame source is gone (socket died / channel closed).
+    SourceClosed(io::Error),
+}
+
+/// Wait for the next event from either source kind.
+fn wait_event(source: &RunSource, timeout: Option<Duration>, limit: u32) -> LoopEvent {
+    match source {
+        RunSource::Fd(fd) => wait_frame_on_fd(*fd, timeout, limit),
+        RunSource::Channel(rx) => {
+            let received = match timeout {
+                Some(t) => rx.recv_timeout(t),
+                None => rx
+                    .recv()
+                    .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected),
+            };
+            match received {
+                Ok(RunEvent::Frame(frame)) => LoopEvent::Frame(frame),
+                Ok(RunEvent::ConnLost(detail)) => LoopEvent::SourceClosed(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    detail.unwrap_or_else(|| "connection closed".to_string()),
+                )),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => LoopEvent::DeadlineHit,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => LoopEvent::SourceClosed(
+                    io::Error::new(io::ErrorKind::BrokenPipe, "demux gone"),
+                ),
+            }
+        }
+    }
+}
+
+/// Wait for the next inbound frame on the session socket (the direct-API /
+/// dark-mode frame source; the session demux feeds a channel instead).
+fn wait_frame_on_fd(fd: RawFd, timeout: Option<Duration>, limit: u32) -> LoopEvent {
+    // SAFETY: the fd is the live session socket owned by the caller of the
+    // run; ManuallyDrop prevents closing it here.
+    let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
+    if timeout.is_some() {
+        sock.set_read_timeout(timeout).ok();
+    }
+    let result = ipc::read_ts_to_rust_frame_with_limit(&mut *sock, limit);
+    if timeout.is_some() {
+        sock.set_read_timeout(None).ok();
+    }
+    match result {
+        Ok(frame) => LoopEvent::Frame(frame),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            LoopEvent::DeadlineHit
+        }
+        Err(e) => LoopEvent::SourceClosed(e),
+    }
+}
+
 /// The per-call half of a run: bridge stubs in, postfix/call executed and
-/// settled, value blob out. Everything before this (isolate boot, web
-/// runtime, prefix evaluation) is instance-lifetime state that one-off runs
-/// rebuild per run and warm instances retain across calls. Opens its own
-/// scopes on `isolate`/`context`; the caller owns the guards and stamps the
-/// final cpu/bridge telemetry.
+/// settled, value blob out, grace driven — as turns over [`RunState`].
+/// Everything before this (isolate boot, web runtime, prefix evaluation) is
+/// instance-lifetime state that one-off runs rebuild per run and warm
+/// instances retain across calls.
+///
+/// The caller owns the guard target for the START turn (it must already
+/// cover the pre-phase placeholder install); this function clears it when
+/// the run first suspends and every later turn re-arms it.
+#[allow(clippy::too_many_arguments)] // the two callers bundle their own state
 fn run_call_phase(
     isolate: &mut v8::OwnedIsolate,
     context: &v8::Global<v8::Context>,
     prefix_module: Option<&v8::Global<v8::Module>>,
     code: Option<&str>,
     filename: &str,
-    // Instance-lifetime stub slots (see `StubSlot`) — per-call state is
-    // installed into them here and disarmed by the caller after the call.
     stub_slots: &mut StubSlots,
-    ctx: CallPhaseCtx<'_>,
+    guard: &InstanceGuard,
+    mut ctx: CallPhaseCtx<'_>,
 ) -> Result<Output, FailureOutput> {
-    let CallPhaseCtx {
-        limits,
-        globals,
-        imports,
-        stream_fd,
-        call_id_counter,
-        call,
-        start,
-        cpu_budget,
-        bridge_log,
-        reason,
-        logs,
-        pending,
-        streams,
-        epilogue,
-        cancel_wall,
-        cancel_cpu,
-        cancel_handle,
-    } = ctx;
+    let (mut rs, start_outcome) = begin_call(
+        isolate,
+        context,
+        prefix_module,
+        code,
+        filename,
+        stub_slots,
+        guard,
+        &mut ctx,
+    );
+    if let ScanOutcome::Finished(result) = start_outcome {
+        return *result;
+    }
+    let facts = RunFacts {
+        call: ctx.call,
+        reason: ctx.reason,
+        guard,
+        cancel_handle: ctx.cancel_handle,
+    };
 
+    // The run is suspended: drive it on events until it finishes.
+    loop {
+        if rs.source.is_none() {
+            // Nothing can ever deliver an event to this run. `scan` fails a
+            // sourceless pending run, so only hold-mode grace gets here:
+            // whatever is still registered can never settle.
+            return Ok(finish_grace(&mut rs, GraceStatus::Truncated));
+        }
+        let timeout = rs.next_timeout();
+        let event = {
+            let source = rs.source.as_ref().expect("checked above");
+            wait_event(source, timeout, rs.frame_limit())
+        };
+        if let Some(result) = handle_loop_event(isolate, context, &facts, &mut rs, event) {
+            return result;
+        }
+    }
+}
+
+/// Build the run's state and execute its start turn: install this call's
+/// bridge surface, evaluate the postfix (or invoke the call), checkpoint,
+/// scan. Finishes the run outright in the common no-bridge case. The caller
+/// pre-armed the guard target (it must cover the placeholder install);
+/// this releases it — and the budget epoch — however the turn ends.
+#[allow(clippy::too_many_arguments)]
+fn begin_call(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    prefix_module: Option<&v8::Global<v8::Module>>,
+    code: Option<&str>,
+    filename: &str,
+    stub_slots: &mut StubSlots,
+    guard: &InstanceGuard,
+    ctx: &mut CallPhaseCtx<'_>,
+) -> (RunState, ScanOutcome) {
+    let facts = RunFacts {
+        call: ctx.call,
+        reason: ctx.reason,
+        guard,
+        cancel_handle: ctx.cancel_handle,
+    };
+    let (source, sink) = match std::mem::replace(&mut ctx.io, RunIo::None) {
+        RunIo::Fd(fd) => (Some(RunSource::Fd(fd)), Some(ipc::FrameSink::Fd(fd))),
+        RunIo::Session { events, sink } => (Some(RunSource::Channel(events)), Some(sink)),
+        RunIo::None => (None, None),
+    };
+    let mut rs = RunState {
+        token: ctx.token,
+        table: ctx.table,
+        limits: *ctx.limits,
+        start: ctx.start,
+        epilogue: ctx.epilogue,
+        source,
+        sink,
+        cpu_budget: Arc::clone(ctx.cpu_budget),
+        bridge_log: Arc::clone(ctx.bridge_log),
+        bridge_error: Arc::new(OnceLock::new()),
+        resolvers: Arc::new(Mutex::new(HashMap::new())),
+        logs: ctx.logs,
+        pending: ctx.pending,
+        streams: ctx.streams,
+        phase: RunPhase::Starting,
+    };
+    let start_outcome = start_turn(
+        isolate,
+        context,
+        prefix_module,
+        code,
+        filename,
+        stub_slots,
+        ctx,
+        &facts,
+        &mut rs,
+    );
+    rs.cpu_budget.leave();
+    guard.clear();
+    (rs, start_outcome)
+}
+
+/// Deliver one loop event to a suspended run. `Some` = the run finished.
+fn handle_loop_event(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+    event: LoopEvent,
+) -> Option<Result<Output, FailureOutput>> {
+    match event {
+        LoopEvent::Frame(frame) => match frame_turn(isolate, context, facts, rs, frame) {
+            ScanOutcome::Finished(result) => Some(*result),
+            ScanOutcome::Continue => None,
+        },
+        LoopEvent::DeadlineHit => Some(boundary_deadline(rs)),
+        LoopEvent::SourceClosed(e) => Some(boundary_close(rs, e)),
+    }
+}
+
+/// A boundary deadline: wall expiry while suspended is a clean per-run
+/// failure — nothing was interrupted mid-JS, the instance keeps serving
+/// (E1 ruling 3; this deliberately no longer taints). Grace deadline =
+/// truncation.
+fn boundary_deadline(rs: &mut RunState) -> Result<Output, FailureOutput> {
+    match rs.phase {
+        RunPhase::Starting | RunPhase::Settling { .. } => Err(rs.fail(RunError::WallTimeout)),
+        RunPhase::Grace(_) => Ok(finish_grace(rs, GraceStatus::Truncated)),
+    }
+}
+
+/// The run's event source died while it was suspended: fail this run alone,
+/// cleanly (E1 ruling 3 narrows the old taint).
+fn boundary_close(rs: &mut RunState, e: io::Error) -> Result<Output, FailureOutput> {
+    match rs.phase {
+        RunPhase::Starting | RunPhase::Settling { .. } => Err(rs.fail(RunError::Internal(
+            format!("poll loop socket read: {e}"),
+        ))),
+        RunPhase::Grace(_) => {
+            if let RunPhase::Grace(g) = &mut rs.phase {
+                if g.error.is_none() {
+                    g.error = Some(capped_grace_error(
+                        "Error".to_string(),
+                        format!("poll loop socket read: {e}"),
+                    ));
+                }
+            }
+            Ok(finish_grace(rs, GraceStatus::Truncated))
+        }
+    }
+}
+
+/// Whether this run's boundary deadline has passed (the multi-run loop's
+/// per-run check after a timed-out select).
+fn deadline_expired(rs: &RunState) -> bool {
+    match &rs.phase {
+        RunPhase::Starting | RunPhase::Settling { .. } => {
+            rs.limits.wall_time_ms > 0
+                && rs.start.elapsed() >= Duration::from_millis(rs.limits.wall_time_ms as u64)
+        }
+        RunPhase::Grace(g) => std::time::Instant::now() >= g.deadline,
+    }
+}
+
+/// The start turn. Returns `Continue` with `rs.phase` armed when the run
+/// suspends, `Finished` when it completed (or failed) inside the turn.
+#[allow(clippy::too_many_arguments)]
+fn start_turn(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    prefix_module: Option<&v8::Global<v8::Module>>,
+    code: Option<&str>,
+    filename: &str,
+    stub_slots: &mut StubSlots,
+    ctx: &CallPhaseCtx<'_>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+) -> ScanOutcome {
     v8::scope!(let scope, isolate);
     let context_local = v8::Local::new(scope, context);
     let scope = &mut v8::ContextScope::new(scope, context_local);
 
-    // Each call starts on fresh frozen time — the only other advance points
-    // are received frames in the poll loop, so on a warm instance the clock
-    // would otherwise still read the previous call's last frame time.
+    // Each turn starts on freshly advanced frozen time — the clock moves
+    // only when the runtime regains control at an event (E1 ruling 7).
     crate::webtypes::advance_frozen_clock(scope);
 
-    // Shared state for all bridge callbacks in this call. All three are Arcs-
-    // call_id, bridge_error, and pending_resolvers are shared between the
-    // callback stubs (via GlobalCallbackData) and the poll loop below.
-    // Shared state for all bridge callbacks in this run. All three are Arcs-
-    // call_id, bridge_error, and pending_resolvers are shared between the
-    // callback stubs (via GlobalCallbackData) and the poll loop below.
-    let call_id = call_id_counter;
-    let bridge_call_count = Arc::new(AtomicU32::new(0));
-    let bridge_error: Arc<OnceLock<RunError>> = Arc::new(OnceLock::new());
-    let pending_resolvers: PendingResolvers = Arc::new(Mutex::new(HashMap::new()));
+    // This turn executes on the run's behalf: native callbacks attribute to
+    // it, and continuations created from here carry its identity even when
+    // driven during a co-resident run's turn (the CPED rider).
+    CURRENT_RUN_TOKEN.with(|c| c.set(rs.token));
+    RUN_TABLE_PTR.with(|c| c.set(rs.table));
+    install_cped_rider(scope, rs.token);
 
     // Split the tagged defs into the bridge stubs to install (plain functions,
     // shim handlers) and everything else. Value globals (string exprs,
@@ -1380,7 +1925,8 @@ fn run_call_phase(
     // wrapper's handler stub already exists on globalThis. Each stub carries
     // the public name its bridge records report under: shim handler stubs
     // report under the public global name, everything else as-is.
-    let mut bridge_stubs: Vec<BridgeStubSpec> = globals
+    let mut bridge_stubs: Vec<BridgeStubSpec> = ctx
+        .globals
         .iter()
         .filter_map(|g| {
             g.bridge_stub_name().map(|stub| BridgeStubSpec {
@@ -1401,7 +1947,7 @@ fn run_call_phase(
     // stub. The runtime owns the handle table (id → specifier + path), so it
     // installs the dispatcher itself whenever the declared imports contain at
     // least one function leaf — the client never sends a def for it.
-    let import_handles = collect_import_handles(imports);
+    let import_handles = collect_import_handles(ctx.imports);
     if !import_handles.is_empty() {
         bridge_stubs.push(BridgeStubSpec {
             stub_name: BRIDGE_DISPATCH_GLOBAL.to_string(),
@@ -1412,31 +1958,38 @@ fn run_call_phase(
     }
 
     if !bridge_stubs.is_empty() {
-        let fd = stream_fd
-            .expect("install_bridge_globals called with bridge-backed globals but no stream_fd");
-        install_bridge_globals(
+        let sink = rs
+            .sink
+            .clone()
+            .expect("install_bridge_globals called with bridge-backed globals but no run I/O");
+        if let Err(e) = install_bridge_globals(
             scope,
             &bridge_stubs,
-            fd,
-            Arc::clone(&call_id),
-            Arc::clone(&bridge_error),
-            limits.max_bridge_call_bytes,
-            Arc::clone(&bridge_call_count),
-            limits.max_bridge_calls,
-            Arc::clone(&pending_resolvers),
-            start,
-            Arc::clone(bridge_log),
+            rs.token,
+            ctx.table,
+            rs.epilogue.map(|e| e.run_id).unwrap_or(0),
+            sink,
+            Arc::clone(&ctx.call_id_counter),
+            Arc::clone(&rs.bridge_error),
+            rs.limits.max_bridge_call_bytes,
+            Arc::new(AtomicU32::new(0)),
+            rs.limits.max_bridge_calls,
+            Arc::clone(&rs.resolvers),
+            rs.start,
+            Arc::clone(&rs.bridge_log),
             stub_slots,
-        )
-        .map_err(|e| failure(termination_or(reason, e), unsafe { &*logs }, start))?;
+        ) {
+            return finished(Err(rs.fail(termination_or(facts.reason, e))));
+        }
     }
 
     // Install the value globals (string exprs, constants, shim wrappers)
     // natively. For a direct run these arrive here; for a PrefixRun they were
-    // replayed from the prefix defs during prefix evaluation above, so
-    // `globals` carries only bridge stubs and this is a no-op.
-    install_value_globals(scope, globals)
-        .map_err(|e| failure(termination_or(reason, e), unsafe { &*logs }, start))?;
+    // replayed from the prefix defs during prefix evaluation, so `globals`
+    // carries only bridge stubs and this is a no-op.
+    if let Err(e) = install_value_globals(scope, ctx.globals) {
+        return finished(Err(rs.fail(termination_or(facts.reason, e))));
+    }
 
     // Setup is complete; everything that executes from here on is per-run
     // sandbox input. Disable code generation from strings (eval,
@@ -1451,61 +2004,41 @@ fn run_call_phase(
     // Arm waitUntil for this run at the same boundary: setup code could
     // not register background work (the slot was None and the call threw);
     // run code now can.
-    // SAFETY: `pending` points at the instance-lifetime PendingWork Box.
+    // SAFETY: `pending` points at the run entry's PendingWork Box.
     unsafe {
-        *(*pending).slot.borrow_mut() = Some(Vec::new());
+        *(*rs.pending).slot.borrow_mut() = Some(Vec::new());
     }
-    // Arm the streamed-body registry for this run, and expose it per thread
-    // for the codec's rehydration walk (which has no context parameter —
-    // the brand-key pattern).
-    // SAFETY: `streams` points at the instance-lifetime StreamTable Box.
+    // Arm the streamed-body registry for this run. The codec's rehydration
+    // walk (no context parameter) reaches it through the caller-installed
+    // RUN_TABLE_PTR + current token — the brand-key pattern.
+    // SAFETY: `streams` points at the run entry's StreamTable Box.
     unsafe {
-        *(*streams).slot.borrow_mut() = Some(StreamTableState {
+        *(*rs.streams).slot.borrow_mut() = Some(StreamTableState {
             streams: HashMap::new(),
-            run_id: epilogue.map(|e| e.run_id).unwrap_or(0),
-            stream_fd,
+            run_id: rs.epilogue.map(|e| e.run_id).unwrap_or(0),
+            sink: rs.sink.clone(),
         });
     }
-    STREAM_TABLE_PTR.with(|c| c.set(streams));
 
     v8::tc_scope!(let scope, scope);
 
-    // Shared settle machinery — the module evaluation promise and a requested
-    // call's return promise drive the same poll loop.
-    let settle_ctx = SettleCtx {
-        stream_fd,
-        limits,
-        start,
-        reason,
-        cpu_budget,
-        bridge_log,
-        bridge_error: &bridge_error,
-        pending_resolvers: &pending_resolvers,
-        cancel_handle,
-        streams,
-    };
-
-    // Compile, instantiate, evaluate, and settle the postfix module when the
-    // frame carries one. A call-only prefix run (`code` = None) has no postfix
-    // — the prefix module evaluated above is the call target.
-    let evaluated_module: v8::Local<v8::Module> = if let Some(code) = code {
-        let source_string = v8::String::new(scope, code).ok_or_else(|| {
-            failure(
-                RunError::Internal("failed to intern module source".to_string()),
-                unsafe { &*logs },
-                start,
-            )
-        })?;
-        let filename = v8::String::new(scope, filename).ok_or_else(|| {
-            failure(
-                RunError::Internal("failed to intern filename".to_string()),
-                unsafe { &*logs },
-                start,
-            )
-        })?;
+    // Compile, instantiate, and evaluate the postfix module when the frame
+    // carries one. A call-only prefix run (`code` = None) has no postfix —
+    // the prefix module evaluated at instance creation is the call target.
+    if let Some(code) = code {
+        let Some(source_string) = v8::String::new(scope, code) else {
+            return finished(Err(rs.fail(RunError::Internal(
+                "failed to intern module source".to_string(),
+            ))));
+        };
+        let Some(filename_str) = v8::String::new(scope, filename) else {
+            return finished(Err(rs.fail(RunError::Internal(
+                "failed to intern filename".to_string(),
+            ))));
+        };
         let origin = v8::ScriptOrigin::new(
             scope,
-            filename.into(),
+            filename_str.into(),
             0,
             0,
             false,
@@ -1521,20 +2054,19 @@ fn run_call_phase(
         let module = match v8::script_compiler::compile_module(scope, &mut source) {
             Some(m) => m,
             None => {
-                return Err(failure(
-                    termination_or(reason, RunError::CompileError(exception_message(scope))),
-                    unsafe { &*logs },
-                    start,
-                ))
+                return finished(Err(rs.fail(termination_or(
+                    facts.reason,
+                    RunError::CompileError(exception_message(scope)),
+                ))));
             }
         };
 
-        // ── Install module resolver for this run (Phase 6) ──────────────────────
-        // After `instantiate_module` returns we inspect `resolve_error` for any
+        // Install the module resolver for this run. After
+        // `instantiate_module` returns we inspect `resolve_error` for any
         // non-V8-throwable error recorded inside the resolver (e.g. a source
         // module that failed to compile).
         let _resolver_guard = install_resolver(ResolverContext {
-            bindings: imports.to_vec(),
+            bindings: ctx.imports.to_vec(),
             module_cache: HashMap::new(),
             pending_meta: Vec::new(),
             resolve_error: None,
@@ -1548,31 +2080,23 @@ fn run_call_phase(
             let err = take_resolver()
                 .and_then(|ctx| ctx.resolve_error)
                 .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
-            return Err(failure(termination_or(reason, err), unsafe { &*logs }, start));
+            return finished(Err(rs.fail(termination_or(facts.reason, err))));
         }
 
-        cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
+        rs.cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
         let evaluation = match module.evaluate(scope) {
             Some(value) => value,
             None => {
-                cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
-                if let Some(err) = bridge_error.get() {
-                    let owned = match err {
-                        RunError::HostBridge(m) => RunError::HostBridge(m.clone()),
-                        RunError::FunctionArgumentNotSupported => {
-                            RunError::FunctionArgumentNotSupported
-                        }
-                        RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
-                        RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
-                        RunError::Internal(m) => RunError::Internal(m.clone()),
-                        other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
-                    };
-                    return Err(failure(owned, unsafe { &*logs }, start));
+                if let Some(err) = rs.bridge_error.get() {
+                    return finished(Err(rs.fail(owned_bridge_error(err))));
                 }
-                let error = match reason.get() {
+                let error = match facts.reason.get() {
                     Some(TerminationReason::Wall) => RunError::WallTimeout,
                     Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                     Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                    // A terminate with no reason is a routed mid-turn abort
+                    // (`GuardCtl::abort_executing`) — E1 ruling 5's fallback.
+                    None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
                     None => RunError::RuntimeError(Box::new(RuntimeErrorData {
                         name: exception_name(scope),
                         message: exception_message(scope),
@@ -1580,533 +2104,730 @@ fn run_call_phase(
                         fields: exception_fields(scope),
                     })),
                 };
-                return Err(failure(error, unsafe { &*logs }, start));
+                return finished(Err(rs.fail(error)));
             }
         };
 
-        // ── Poll loop: drive microtasks until the module promise settles ──────────
-        //
-        // With MicrotasksPolicy::Explicit, microtasks do not run automatically.
-        // After each BridgeResponse is resolved we call perform_microtask_checkpoint()
-        // to advance the await chains.  When the module's top-level promise finally
-        // fulfils or rejects we exit the loop.
-        //
-        // This handles both:
-        //   • Sequential bridge calls  - Promise.all([a]) etc.
-        //   • Concurrent bridge calls  - Promise.all([a, b]) sends both BridgeCall
-        //     frames before yielding; both responses route by callId.
-        //   • No bridge calls          - pure `await Promise.resolve(42)` still
-        //     needs one checkpoint to propagate the already-resolved microtask.
-        // One checkpoint immediately after evaluate() so that:
-        //   • purely synchronous results (await Promise.resolve(42)) settle now,
-        //   • synchronous bridge errors (throw from callback) propagate to the
-        //     module's top-level Promise now,
-        //   • termination exceptions propagate now.
-        // For pending bridge calls nothing changes — resolvers aren't set yet.
+        // One checkpoint immediately after evaluate() so that purely
+        // synchronous results settle now, synchronous bridge errors propagate
+        // to the module's top-level promise now, and termination exceptions
+        // propagate now. For pending bridge calls nothing changes — the
+        // resolvers aren't set yet.
         scope.perform_microtask_checkpoint();
 
-        // ESM Module::Evaluate() always returns a Promise.  The try_from is a
+        // ESM Module::Evaluate() always returns a Promise. The try_from is a
         // belt-and-suspenders guard; failure would be an internal V8 bug.
-        let promise = v8::Local::<v8::Promise>::try_from(evaluation).map_err(|_| {
-            cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
-            failure(
-                RunError::Internal("module evaluation did not return a Promise".into()),
-                unsafe { &*logs },
-                start,
-            )
-        })?;
+        let Ok(promise) = v8::Local::<v8::Promise>::try_from(evaluation) else {
+            return finished(Err(rs.fail(RunError::Internal(
+                "module evaluation did not return a Promise".into(),
+            ))));
+        };
 
-        match settle_promise(scope, promise, &settle_ctx).map_err(|e| failure(e, unsafe { &*logs }, start))? {
-            v8::PromiseState::Fulfilled => {}
-            _ => {
-                // Pending with no socket to wait on — an un-awaited Promise that
-                // nothing in the isolate can ever resolve.
-                let error = match reason.get() {
-                    Some(TerminationReason::Wall) => RunError::WallTimeout,
-                    Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-                    Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                    None => RunError::ExportNotSerializable(
-                        "module evaluation promise is still pending after poll loop".to_string(),
-                    ),
-                };
-                return Err(failure(error, unsafe { &*logs }, start));
-            }
-        }
-
-        module
+        rs.phase = RunPhase::Settling {
+            root: v8::Global::new(scope, promise),
+            module: Some(v8::Global::new(scope, module)),
+            call_pending: facts.call.is_some(),
+            root_is_call_result: false,
+        };
+        scan(scope, facts, rs)
     } else {
-        // Call-only prefix run: the prefix module evaluated above is the
-        // call target. Enter the CPU budget here — the postfix path enters it
-        // right before evaluate() — so path resolution and the call itself are
-        // measured (a path segment can be an accessor).
-        cpu_budget.enter();
-        v8::Local::new(
+        // Call-only prefix run: the prefix module evaluated at instance
+        // creation is the call target. Enter the CPU budget here — the
+        // postfix path enters it right before evaluate() — so path
+        // resolution and the call itself are measured (a path segment can
+        // be an accessor).
+        rs.cpu_budget.enter();
+        let module = v8::Local::new(
             scope,
             prefix_module.expect("call-only run without a prefix module"),
-        )
+        );
+        match invoke_requested_call(scope, facts, rs, module) {
+            Ok(ScanOutcome::Continue) => scan(scope, facts, rs),
+            Ok(done) => done,
+            Err(f) => finished(Err(f)),
+        }
+    }
+}
+
+/// Invoke the requested call against `module`'s namespace: resolve the export
+/// path, call it, and either finish the run (sync value → serialized now) or
+/// re-suspend on the returned promise. Runs inside the CPU budget.
+fn invoke_requested_call(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+    module: v8::Local<v8::Module>,
+) -> Result<ScanOutcome, FailureOutput> {
+    let call = facts.call.expect("invoke_requested_call without a call");
+
+    let Some(namespace) = module.get_module_namespace().to_object(scope) else {
+        return Err(rs.fail(termination_or(
+            facts.reason,
+            RunError::Internal("module namespace is not an object".to_string()),
+        )));
     };
 
-    // The guards stay armed through extraction and serialization. V8's
-    // ValueSerializer follows structured-clone semantics and invokes guest
-    // getters on the properties it walks, so result serialization is guest
-    // execution and must stay under the run's wall/CPU/memory budgets —
-    // workerd does the same (its limit enforcer covers every entry into JS,
-    // serialization included). The caller's GuardCanceller stops the guards
-    // once this function returns; every failure below classifies through
-    // `termination_or` so a guard firing mid-serialization reports the
-    // timeout, not the operation it interrupted.
+    // Resolve the export path against the namespace and invoke. Runs inside
+    // the CPU budget — a path segment can be an accessor, so resolution
+    // itself is sandbox code.
+    let (target, receiver) =
+        resolve_call_target(scope, namespace, &call.export_path).map_err(|e| rs.fail(e))?;
 
-    let namespace = evaluated_module
-        .get_module_namespace()
-        .to_object(scope)
-        .ok_or_else(|| {
-            failure(
-                termination_or(
-                    reason,
-                    RunError::Internal("module namespace is not an object".to_string()),
-                ),
-                unsafe { &*logs },
-                start,
-            )
-        })?;
-
-    let mut skipped_exports: Vec<String> = Vec::new();
-
-    let exports = if let Some(call) = call {
-        // ── Host → sandbox call ────────────────────────────────────────
-        // Resolve the export path against the namespace and invoke. Runs
-        // inside the CPU budget — a path segment can be an accessor, so
-        // resolution itself is sandbox code.
-        let (target, receiver) = resolve_call_target(scope, namespace, &call.export_path)
-            .map_err(|e| failure(e, unsafe { &*logs }, start))?;
-
-        // The argument list crosses as one blob holding an array (identity
-        // between arguments preserved, same convention as BridgeCall args);
-        // host types (Request/…) rehydrate to real instances.
-        let args_value = blob::deserialize_value_with_web_types(scope, &call.args_blob)
-            .ok_or_else(|| {
-                let error = match blob::take_codec_error() {
-                    Some(e) => codec_error_to_run_error(e),
-                    None => RunError::Internal("failed to deserialize call arguments".to_string()),
-                };
-                failure(error, unsafe { &*logs }, start)
-            })?;
-        let args_array = v8::Local::<v8::Array>::try_from(args_value).map_err(|_| {
-            failure(
-                RunError::Internal("call arguments blob did not hold an array".to_string()),
-                unsafe { &*logs },
-                start,
-            )
-        })?;
-        let mut args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(args_array.length() as usize);
-        for i in 0..args_array.length() {
-            let arg = args_array.get_index(scope, i).ok_or_else(|| {
-                failure(
-                    RunError::Internal(format!("failed to read call argument {i}")),
-                    unsafe { &*logs },
-                    start,
-                )
-            })?;
-            args.push(arg);
-        }
-
-        let result = match target.call(scope, receiver, &args) {
-            Some(v) => v,
-            None => {
-                // Threw synchronously — classify like a rejected handler
-                // promise, so sync and async throws report the same
-                // name/message/stack/fields shape.
-                if let Some(err) = bridge_error.get() {
-                    return Err(failure(owned_bridge_error(err), unsafe { &*logs }, start));
-                }
-                let error = match reason.get() {
-                    Some(TerminationReason::Wall) => RunError::WallTimeout,
-                    Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-                    Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                    None => match scope.exception() {
-                        Some(exception) => runtime_error_from_value(scope, exception),
-                        None => RunError::RuntimeError(Box::new(RuntimeErrorData {
-                            name: exception_name(scope),
-                            message: exception_message(scope),
-                            stack: exception_stack(scope),
-                            fields: exception_fields(scope),
-                        })),
-                    },
-                };
-                return Err(failure(error, unsafe { &*logs }, start));
-            }
+    // The argument list crosses as one blob holding an array (identity
+    // between arguments preserved, same convention as BridgeCall args);
+    // host types (Request/…) rehydrate to real instances.
+    let Some(args_value) = blob::deserialize_value_with_web_types(scope, &call.args_blob) else {
+        let error = match blob::take_codec_error() {
+            Some(e) => codec_error_to_run_error(e),
+            None => RunError::Internal("failed to deserialize call arguments".to_string()),
         };
-
-        // A sync return value needs no poll loop at all. An async handler gets
-        // the same settle machinery as the module promise — one checkpoint
-        // first, so a promise that waits on no host I/O settles without
-        // touching the socket (rounds track bridge round trips, not awaits).
-        let value: v8::Local<v8::Value> = if result.is_promise() {
-            let promise = v8::Local::<v8::Promise>::try_from(result).map_err(|_| {
-                failure(
-                    RunError::Internal("call result claimed to be a promise but is not".into()),
-                    unsafe { &*logs },
-                    start,
-                )
-            })?;
-            scope.perform_microtask_checkpoint();
-            if let Some(err) = bridge_error.get() {
-                return Err(failure(owned_bridge_error(err), unsafe { &*logs }, start));
-            }
-            match settle_promise(scope, promise, &settle_ctx)
-                .map_err(|e| failure(e, unsafe { &*logs }, start))?
-            {
-                v8::PromiseState::Fulfilled => promise.result(scope),
-                _ => {
-                    let error = match reason.get() {
-                        Some(TerminationReason::Wall) => RunError::WallTimeout,
-                        Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-                        Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                        None => RunError::ExportNotSerializable(format!(
-                            "call \"{}\" returned a promise that is still pending after the \
-                             poll loop: nothing in the isolate can resolve it",
-                            call.export_path
-                        )),
-                    };
-                    return Err(failure(error, unsafe { &*logs }, start));
-                }
-            }
-        } else {
-            result
+        return Err(rs.fail(error));
+    };
+    let Ok(args_array) = v8::Local::<v8::Array>::try_from(args_value) else {
+        return Err(rs.fail(RunError::Internal(
+            "call arguments blob did not hold an array".to_string(),
+        )));
+    };
+    let mut args: Vec<v8::Local<v8::Value>> = Vec::with_capacity(args_array.length() as usize);
+    for i in 0..args_array.length() {
+        let Some(arg) = args_array.get_index(scope, i) else {
+            return Err(rs.fail(RunError::Internal(format!(
+                "failed to read call argument {i}"
+            ))));
         };
+        args.push(arg);
+    }
 
-        // The call settled; the guards stay armed through serialization of
-        // the return value (see the comment above the namespace read).
-        blob::serialize_value(scope, value).map_err(|message| {
-            let error = match blob::take_codec_error() {
-                Some(e) => codec_error_to_run_error(e),
-                None => RunError::ExportNotSerializable(format!(
-                    "call \"{}\" result could not be serialized: {message}",
-                    call.export_path
-                )),
+    let result = match target.call(scope, receiver, &args) {
+        Some(v) => v,
+        None => {
+            // Threw synchronously — classify like a rejected handler
+            // promise, so sync and async throws report the same
+            // name/message/stack/fields shape.
+            if let Some(err) = rs.bridge_error.get() {
+                return Err(rs.fail(owned_bridge_error(err)));
+            }
+            let error = match facts.reason.get() {
+                Some(TerminationReason::Wall) => RunError::WallTimeout,
+                Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                // A terminate with no reason is a routed mid-turn abort.
+                None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
+                None => match scope.exception() {
+                    Some(exception) => runtime_error_from_value(scope, exception),
+                    None => RunError::RuntimeError(Box::new(RuntimeErrorData {
+                        name: exception_name(scope),
+                        message: exception_message(scope),
+                        stack: exception_stack(scope),
+                        fields: exception_fields(scope),
+                    })),
+                },
             };
-            failure(termination_or(reason, error), unsafe { &*logs }, start)
-        })?
-    } else {
-        // ── Exports extraction ───────────────────────────────────────────────
-        let names = namespace
-            .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
-            .ok_or_else(|| {
-                failure(
-                    termination_or(
-                        reason,
-                        RunError::Internal("failed to read module export names".to_string()),
-                    ),
-                    unsafe { &*logs },
-                    start,
-                )
-            })?;
-
-        // Copy the exports into a fresh plain object and serialize that **once**.
-        // The module namespace is an exotic object the V8 serializer refuses, and
-        // a single blob for all exports beats one blob per export (measured).
-        //
-        // Non-serializable exports are skipped, never fatal: a value the
-        // pre-check refuses (function, unresolved Promise) is simply absent
-        // from the result, its name reported in `skipped_exports` — this is
-        // what lets `export default { fetch }` coexist with reading the
-        // module's declaration exports.
-        let exports_object = v8::Object::new(scope);
-        let mut staged: Vec<(String, v8::Local<v8::Value>)> = Vec::new();
-
-        for i in 0..names.length() {
-            let name_value = names.get_index(scope, i).ok_or_else(|| {
-                failure(
-                    termination_or(
-                        reason,
-                        RunError::Internal("failed to read export name".to_string()),
-                    ),
-                    unsafe { &*logs },
-                    start,
-                )
-            })?;
-            let name = name_value
-                .to_string(scope)
-                .map(|s| s.to_rust_string_lossy(scope))
-                .ok_or_else(|| {
-                    failure(
-                        termination_or(
-                            reason,
-                            RunError::Internal("failed to stringify export name".to_string()),
-                        ),
-                        unsafe { &*logs },
-                        start,
-                    )
-                })?;
-
-            let value = namespace.get(scope, name_value).ok_or_else(|| {
-                failure(
-                    termination_or(
-                        reason,
-                        RunError::Internal(format!("failed to read export {name}")),
-                    ),
-                    unsafe { &*logs },
-                    start,
-                )
-            })?;
-
-            // Pre-check catches the common cases cheaply (a function or
-            // Promise directly under the export name) without a trial
-            // serialization.
-            if check_export_serializable(&name, value).is_err() {
-                skipped_exports.push(name);
-                continue;
-            }
-
-            let export_key = v8::Local::<v8::Name>::try_from(name_value).map_err(|_| {
-                failure(
-                    termination_or(
-                        reason,
-                        RunError::Internal(format!("export name {name} is not a property key")),
-                    ),
-                    unsafe { &*logs },
-                    start,
-                )
-            })?;
-            exports_object
-                .create_data_property(scope, export_key, value)
-                .ok_or_else(|| {
-                    failure(
-                        termination_or(
-                            reason,
-                            RunError::Internal(format!("failed to stage export {name}")),
-                        ),
-                        unsafe { &*logs },
-                        start,
-                    )
-                })?;
-            staged.push((name, value));
+            return Err(rs.fail(error));
         }
+    };
 
-        match blob::serialize_value(scope, exports_object.into()) {
-            Ok(blob) => blob,
-            Err(_first_message) => {
-                // A registered host type that cannot cross keeps its dedicated
-                // loud diagnostic (stream bodies etc. must not vanish
-                // silently); only generic clone refusals are skippable.
-                if let Some(e) = blob::take_codec_error() {
-                    return Err(failure(
-                        termination_or(reason, codec_error_to_run_error(e)),
-                        unsafe { &*logs },
-                        start,
-                    ));
+    // A sync return value needs no further settling at all. An async handler
+    // suspends on the same machinery as the module promise — one checkpoint
+    // first, so a promise that waits on no host I/O settles without touching
+    // the socket.
+    if result.is_promise() {
+        let Ok(promise) = v8::Local::<v8::Promise>::try_from(result) else {
+            return Err(rs.fail(RunError::Internal(
+                "call result claimed to be a promise but is not".into(),
+            )));
+        };
+        scope.perform_microtask_checkpoint();
+        if let Some(err) = rs.bridge_error.get() {
+            return Err(rs.fail(owned_bridge_error(err)));
+        }
+        rs.phase = RunPhase::Settling {
+            root: v8::Global::new(scope, promise),
+            module: None,
+            call_pending: false,
+            root_is_call_result: true,
+        };
+        return Ok(ScanOutcome::Continue);
+    }
+
+    // The call returned synchronously; the guards stay armed through
+    // serialization of the return value (serialization is guest execution).
+    let exports = serialize_call_result(scope, facts, rs, result)?;
+    Ok(build_output_and_maybe_grace(
+        scope,
+        facts,
+        rs,
+        exports,
+        Vec::new(),
+    ))
+}
+
+/// Serialize a call's return value under the run's budgets.
+fn serialize_call_result(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    facts: &RunFacts<'_>,
+    rs: &RunState,
+    value: v8::Local<v8::Value>,
+) -> Result<Vec<u8>, FailureOutput> {
+    let export_path = facts
+        .call
+        .map(|c| c.export_path.as_str())
+        .unwrap_or("<call>");
+    blob::serialize_value(scope, value).map_err(|message| {
+        let error = match blob::take_codec_error() {
+            Some(e) => codec_error_to_run_error(e),
+            None => RunError::ExportNotSerializable(format!(
+                "call \"{export_path}\" result could not be serialized: {message}"
+            )),
+        };
+        rs.fail(termination_or(facts.reason, error))
+    })
+}
+
+/// One event-driven turn: deliver `frame` to the run, checkpoint, scan.
+fn frame_turn(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+    frame: ipc::TsToRustFrame,
+) -> ScanOutcome {
+    let in_grace = matches!(rs.phase, RunPhase::Grace(_));
+
+    // Re-arm the guard and the phase budget for this turn: the delivery
+    // below runs guest continuations. Both release on every exit path.
+    let _turn = TurnGuard::begin(facts.guard, rs);
+    let _epoch = BudgetEpoch::enter(rs.active_budget());
+
+    v8::scope!(let scope, isolate);
+    let context_local = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context_local);
+
+    // A frame arrived — the runtime holds control, so this is an observable
+    // I/O boundary: the frozen clock advances before anything of the frame
+    // is delivered into JS (E1 ruling 7: once per turn entry).
+    crate::webtypes::advance_frozen_clock(scope);
+    CURRENT_RUN_TOKEN.with(|c| c.set(rs.token));
+    RUN_TABLE_PTR.with(|c| c.set(rs.table));
+    install_cped_rider(scope, rs.token);
+
+    v8::tc_scope!(let scope, scope);
+
+    match frame.message_type {
+        ipc::TsToRustMessageType::BridgeResponse => {
+            match wire::parse_bridge_response_payload(&frame.payload) {
+                Err(e) => {
+                    return finished(Err(rs.fail(RunError::Internal(format!(
+                        "poll loop: response decode: {e}"
+                    )))));
                 }
-                // Something nested inside an export refuses to clone (e.g. the
-                // function in `export default { fetch }`). Trial-serialize
-                // each export and drop the offenders into `skipped_exports`.
-                let retry_object = v8::Object::new(scope);
-                for (name, value) in &staged {
-                    match blob::serialize_value(scope, *value) {
-                        Ok(_) => {
-                            let key = v8::String::new(scope, name).ok_or_else(|| {
-                                failure(
-                                    termination_or(
-                                        reason,
-                                        RunError::Internal(
-                                            "failed to intern export name".to_string(),
-                                        ),
-                                    ),
-                                    unsafe { &*logs },
-                                    start,
-                                )
-                            })?;
-                            retry_object
-                                .create_data_property(scope, key.into(), *value)
-                                .ok_or_else(|| {
-                                    failure(
-                                        termination_or(
-                                            reason,
-                                            RunError::Internal(format!(
-                                                "failed to stage export {name}"
-                                            )),
-                                        ),
-                                        unsafe { &*logs },
-                                        start,
+                // The leading runId is demux routing state; inside a run's
+                // own loop, callId routing is authoritative.
+                Ok((_run_id, call_id, result)) => {
+                    // Settle the call's bridge record: round-trip time on
+                    // the run clock plus the response value's serialized
+                    // size (frame payload minus the runId + callId + ok
+                    // header). Unknown callIds are ignored inside settle().
+                    let response_value_bytes = if result.is_ok() {
+                        frame.payload.len().saturating_sub(9) as u32
+                    } else {
+                        0
+                    };
+                    rs.bridge_log
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .settle(
+                            call_id,
+                            elapsed_ms(rs.start),
+                            result.is_ok(),
+                            response_value_bytes,
+                        );
+                    // Route to the matching resolver. An unknown callId
+                    // means a stale frame from a previous run — discard.
+                    let entry = rs
+                        .resolvers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&call_id);
+                    if let Some(PendingResolver(global_resolver)) = entry {
+                        let resolver = v8::Local::new(scope, global_resolver);
+                        match result {
+                            Ok(value_blob) => {
+                                let decoded = match &value_blob {
+                                    // Absent value slot → the handler
+                                    // returned nothing.
+                                    None => Some(v8::undefined(scope).into()),
+                                    // Web-aware: a bridge handler may
+                                    // return a Request/Response.
+                                    Some(bytes) => {
+                                        blob::deserialize_value_with_web_types(scope, bytes)
+                                    }
+                                };
+                                if let Some(v8_val) = decoded {
+                                    resolver.resolve(scope, v8_val);
+                                } else {
+                                    let detail = blob::take_codec_error()
+                                        .map(|e| e.message().to_string())
+                                        .unwrap_or_else(|| {
+                                            "failed to deserialize response value".to_string()
+                                        });
+                                    let msg = v8::String::new(
+                                        scope,
+                                        &format!("[iso4] bridge: {detail}"),
                                     )
-                                })?;
-                        }
-                        Err(_) => {
-                            if let Some(e) = blob::take_codec_error() {
-                                return Err(failure(
-                                    termination_or(reason, codec_error_to_run_error(e)),
-                                    unsafe { &*logs },
-                                    start,
-                                ));
+                                    .unwrap();
+                                    resolver.reject(scope, msg.into());
+                                }
                             }
-                            skipped_exports.push(name.clone());
+                            Err(bridge_err) => {
+                                // Reject with a real Error carrying the
+                                // handler's name/message/fields, tagged with
+                                // a private symbol so the rejected-root arm
+                                // can classify an *uncaught* one as
+                                // HostBridge. Sandbox code may catch it and
+                                // continue — host handler errors are not
+                                // run-fatal.
+                                let error_obj = host_bridge_error_to_v8(scope, &bridge_err);
+                                resolver.reject(scope, error_obj);
+                            }
                         }
                     }
                 }
-                blob::serialize_value(scope, retry_object.into()).map_err(|retry_message| {
-                    failure(
-                        termination_or(
-                            reason,
-                            RunError::ExportNotSerializable(format!(
-                                "exports could not be serialized: {retry_message}"
-                            )),
-                        ),
-                        unsafe { &*logs },
-                        start,
-                    )
-                })?
+            }
+        }
+        ipc::TsToRustMessageType::Terminate => {
+            if in_grace {
+                // A host Terminate mid-grace (abort during the epilogue):
+                // truncate the phase cleanly — the value already shipped.
+                match ipc::parse_terminate_payload(&frame.payload) {
+                    Ok(run_id) => eprintln!(
+                        "[iso4-v8] Terminate received for run {run_id} — truncating grace"
+                    ),
+                    Err(e) => eprintln!(
+                        "[iso4-v8] Terminate received with malformed payload ({e}) — truncating grace"
+                    ),
+                }
+                return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+            }
+            // Graceful abort = direct abandon (E2 amendment to E1 ruling 5):
+            // the run simply stops existing. Its continuations are never
+            // driven again, no cleanup slice runs, and nothing is
+            // interrupted mid-JS — so the instance is NOT tainted and
+            // co-resident runs are unaffected. The failure carries the real
+            // telemetry collected so far.
+            match ipc::parse_terminate_payload(&frame.payload) {
+                Ok(run_id) => {
+                    eprintln!("[iso4-v8] Terminate received for run {run_id} — abandoning")
+                }
+                Err(e) => eprintln!(
+                    "[iso4-v8] Terminate received with malformed payload ({e}) — abandoning"
+                ),
+            }
+            return finished(Err(rs.fail(RunError::Aborted)));
+        }
+        ipc::TsToRustMessageType::StreamChunk | ipc::TsToRustMessageType::StreamEnd => {
+            if let Err(e) = deliver_stream_frame(scope, rs.streams, &frame) {
+                return finished(Err(rs.fail(e)));
+            }
+        }
+        other => {
+            return finished(Err(rs.fail(RunError::Internal(format!(
+                "poll loop: expected BridgeResponse or Terminate, got {other:?}"
+            )))));
+        }
+    }
+
+    // Advance all pending continuation chains: this is the only place
+    // microtasks run (Explicit policy). The resumed code executes until it
+    // hits its next await (sending another BridgeCall) or completes.
+    scope.perform_microtask_checkpoint();
+
+    // Check for errors set during the checkpoint (inside bridge callbacks),
+    // then for a guard that fired during it — both win over the scan.
+    if let Some(err) = rs.bridge_error.get() {
+        if in_grace {
+            let msg = format!("{err:?}");
+            if let RunPhase::Grace(g) = &mut rs.phase {
+                if g.error.is_none() {
+                    g.error = Some(capped_grace_error("Error".to_string(), msg));
+                }
+            }
+            return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+        }
+        return finished(Err(rs.fail(owned_bridge_error(err))));
+    }
+    if let Some(r) = facts.reason.get() {
+        if in_grace {
+            // A mid-turn kill during grace: the caller's taint verdict sees
+            // the reason cell; end the phase now instead of idling out the
+            // wall — the slot frees immediately.
+            return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+        }
+        let error = match r {
+            TerminationReason::Wall => RunError::WallTimeout,
+            TerminationReason::Cpu => RunError::CpuTimeout,
+            TerminationReason::Memory => RunError::MemoryLimit,
+        };
+        return finished(Err(rs.fail(error)));
+    }
+
+    scan(scope, facts, rs)
+}
+
+/// Look at the run's root promise (or grace set) and advance it as far as it
+/// will go inside this turn.
+fn scan(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+) -> ScanOutcome {
+    loop {
+        let (root, module, call_pending, root_is_call_result) = match &rs.phase {
+            RunPhase::Grace(_) => return grace_scan(scope, facts, rs),
+            RunPhase::Starting => unreachable!("scan before the start turn armed a phase"),
+            RunPhase::Settling {
+                root,
+                module,
+                call_pending,
+                root_is_call_result,
+            } => (root.clone(), module.clone(), *call_pending, *root_is_call_result),
+        };
+        let root_local = v8::Local::new(scope, &root);
+        match root_local.state() {
+            v8::PromiseState::Pending => {
+                // A fatal bridge error set during this run's turns means no
+                // BridgeResponse will ever arrive — fail now, not at the
+                // wall.
+                if let Some(err) = rs.bridge_error.get() {
+                    return finished(Err(rs.fail(owned_bridge_error(err))));
+                }
+                if rs.source.is_none() {
+                    // Pending with no socket to wait on — an un-awaited
+                    // promise that nothing in the isolate can ever resolve.
+                    let error = match facts.reason.get() {
+                        Some(TerminationReason::Wall) => RunError::WallTimeout,
+                        Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                        Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                        None => {
+                            if root_is_call_result {
+                                let path = facts
+                                    .call
+                                    .map(|c| c.export_path.as_str())
+                                    .unwrap_or("<call>");
+                                RunError::ExportNotSerializable(format!(
+                                    "call \"{path}\" returned a promise that is still pending \
+                                     after the poll loop: nothing in the isolate can resolve it"
+                                ))
+                            } else {
+                                RunError::ExportNotSerializable(
+                                    "module evaluation promise is still pending after poll loop"
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    };
+                    return finished(Err(rs.fail(error)));
+                }
+                return ScanOutcome::Continue;
+            }
+            v8::PromiseState::Rejected => {
+                let rejection = root_local.result(scope);
+                // A rejection tagged as a host bridge error surfaces as
+                // ERR_HOST_BRIDGE with the handler's name/message/fields
+                // intact.
+                if let Some(err) = host_bridge_error_from_rejection(scope, rejection) {
+                    return finished(Err(rs.fail(err)));
+                }
+                if let Some(err) = rs.bridge_error.get() {
+                    return finished(Err(rs.fail(owned_bridge_error(err))));
+                }
+                let err = runtime_error_from_value(scope, rejection);
+                return finished(Err(rs.fail(err)));
+            }
+            v8::PromiseState::Fulfilled => {
+                if call_pending {
+                    // The module settled; invoke the requested call (which
+                    // may itself suspend on a new root — loop to re-scan).
+                    let module_local = v8::Local::new(
+                        scope,
+                        module.as_ref().expect("call_pending without a module"),
+                    );
+                    match invoke_requested_call(scope, facts, rs, module_local) {
+                        Ok(ScanOutcome::Continue) => continue,
+                        Ok(done) => return done,
+                        Err(f) => return finished(Err(f)),
+                    }
+                }
+                if root_is_call_result {
+                    let value = root_local.result(scope);
+                    let exports = match serialize_call_result(scope, facts, rs, value) {
+                        Ok(b) => b,
+                        Err(f) => return finished(Err(f)),
+                    };
+                    return build_output_and_maybe_grace(scope, facts, rs, exports, Vec::new());
+                }
+                // Plain module run: walk the namespace exports.
+                let module_local = v8::Local::new(
+                    scope,
+                    module.as_ref().expect("module run without a module"),
+                );
+                return extract_module_exports(scope, facts, rs, module_local);
+            }
+        }
+    }
+}
+
+/// Extract and serialize a settled module's exports, then finish (or start
+/// grace). The guards stay armed through extraction and serialization: V8's
+/// ValueSerializer follows structured-clone semantics and invokes guest
+/// getters on the properties it walks, so result serialization is guest
+/// execution and must stay under the run's budgets — workerd does the same.
+fn extract_module_exports(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+    evaluated_module: v8::Local<v8::Module>,
+) -> ScanOutcome {
+    let reason = facts.reason;
+
+    let Some(namespace) = evaluated_module.get_module_namespace().to_object(scope) else {
+        return finished(Err(rs.fail(termination_or(
+            reason,
+            RunError::Internal("module namespace is not an object".to_string()),
+        ))));
+    };
+
+    let mut skipped_exports: Vec<String> = Vec::new();
+
+    let Some(names) = namespace.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+    else {
+        return finished(Err(rs.fail(termination_or(
+            reason,
+            RunError::Internal("failed to read module export names".to_string()),
+        ))));
+    };
+
+    // Copy the exports into a fresh plain object and serialize that **once**.
+    // The module namespace is an exotic object the V8 serializer refuses, and
+    // a single blob for all exports beats one blob per export (measured).
+    //
+    // Non-serializable exports are skipped, never fatal: a value the
+    // pre-check refuses (function, unresolved Promise) is simply absent
+    // from the result, its name reported in `skipped_exports` — this is
+    // what lets `export default { fetch }` coexist with reading the
+    // module's declaration exports.
+    let exports_object = v8::Object::new(scope);
+    let mut staged: Vec<(String, v8::Local<v8::Value>)> = Vec::new();
+
+    for i in 0..names.length() {
+        let Some(name_value) = names.get_index(scope, i) else {
+            return finished(Err(rs.fail(termination_or(
+                reason,
+                RunError::Internal("failed to read export name".to_string()),
+            ))));
+        };
+        let Some(name) = name_value
+            .to_string(scope)
+            .map(|s| s.to_rust_string_lossy(scope))
+        else {
+            return finished(Err(rs.fail(termination_or(
+                reason,
+                RunError::Internal("failed to stringify export name".to_string()),
+            ))));
+        };
+
+        let Some(value) = namespace.get(scope, name_value) else {
+            return finished(Err(rs.fail(termination_or(
+                reason,
+                RunError::Internal(format!("failed to read export {name}")),
+            ))));
+        };
+
+        // Pre-check catches the common cases cheaply (a function or
+        // Promise directly under the export name) without a trial
+        // serialization.
+        if check_export_serializable(&name, value).is_err() {
+            skipped_exports.push(name);
+            continue;
+        }
+
+        let Ok(export_key) = v8::Local::<v8::Name>::try_from(name_value) else {
+            return finished(Err(rs.fail(termination_or(
+                reason,
+                RunError::Internal(format!("export name {name} is not a property key")),
+            ))));
+        };
+        if exports_object
+            .create_data_property(scope, export_key, value)
+            .is_none()
+        {
+            return finished(Err(rs.fail(termination_or(
+                reason,
+                RunError::Internal(format!("failed to stage export {name}")),
+            ))));
+        }
+        staged.push((name, value));
+    }
+
+    let exports = match blob::serialize_value(scope, exports_object.into()) {
+        Ok(blob) => blob,
+        Err(_first_message) => {
+            // A registered host type that cannot cross keeps its dedicated
+            // loud diagnostic (stream bodies etc. must not vanish
+            // silently); only generic clone refusals are skippable.
+            if let Some(e) = blob::take_codec_error() {
+                return finished(Err(
+                    rs.fail(termination_or(reason, codec_error_to_run_error(e)))
+                ));
+            }
+            // Something nested inside an export refuses to clone (e.g. the
+            // function in `export default { fetch }`). Trial-serialize
+            // each export and drop the offenders into `skipped_exports`.
+            let retry_object = v8::Object::new(scope);
+            for (name, value) in &staged {
+                match blob::serialize_value(scope, *value) {
+                    Ok(_) => {
+                        let Some(key) = v8::String::new(scope, name) else {
+                            return finished(Err(rs.fail(termination_or(
+                                reason,
+                                RunError::Internal("failed to intern export name".to_string()),
+                            ))));
+                        };
+                        if retry_object
+                            .create_data_property(scope, key.into(), *value)
+                            .is_none()
+                        {
+                            return finished(Err(rs.fail(termination_or(
+                                reason,
+                                RunError::Internal(format!("failed to stage export {name}")),
+                            ))));
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(e) = blob::take_codec_error() {
+                            return finished(Err(
+                                rs.fail(termination_or(reason, codec_error_to_run_error(e)))
+                            ));
+                        }
+                        skipped_exports.push(name.clone());
+                    }
+                }
+            }
+            match blob::serialize_value(scope, retry_object.into()) {
+                Ok(blob) => blob,
+                Err(retry_message) => {
+                    return finished(Err(rs.fail(termination_or(
+                        reason,
+                        RunError::ExportNotSerializable(format!(
+                            "exports could not be serialized: {retry_message}"
+                        )),
+                    ))));
+                }
             }
         }
     };
 
+    build_output_and_maybe_grace(scope, facts, rs, exports, skipped_exports)
+}
+
+/// The common tail of a settled run: the post-serialization termination
+/// check, the export size cap, the Output, and the grace decision.
+fn build_output_and_maybe_grace(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+    exports: Vec<u8>,
+    skipped_exports: Vec<String>,
+) -> ScanOutcome {
     // Termination only interrupts JS — the serializer's walk of plain data
     // can still complete after a guard fires (the per-export retry loop then
     // skips whatever export the interrupted getter sat on). A produced blob
     // does not make the run a success: the budget was exceeded.
-    if reason.get().is_some() {
-        return Err(failure(
-            termination_or(
-                reason,
-                RunError::Internal("terminated during result serialization".to_string()),
-            ),
-            unsafe { &*logs },
-            start,
-        ));
+    if facts.reason.get().is_some() {
+        return finished(Err(rs.fail(termination_or(
+            facts.reason,
+            RunError::Internal("terminated during result serialization".to_string()),
+        ))));
     }
 
-    // ── Export size limit ────────────────────────────────────────────────────
+    // ── Export size limit ────────────────────────────────────────────────
     // Measured on the blob itself — the payload that actually crosses the
-    // socket, so the limit is now free (no probe encode). A call's return
-    // value is capped by the same limit.
-    if limits.max_export_bytes > 0 && exports.len() > limits.max_export_bytes as usize {
-        return Err(failure(RunError::ExportTooLarge, unsafe { &*logs }, start));
+    // socket. A call's return value is capped by the same limit.
+    if rs.limits.max_export_bytes > 0 && exports.len() > rs.limits.max_export_bytes as usize {
+        return finished(Err(rs.fail(RunError::ExportTooLarge)));
     }
 
-    let mut output = Output {
+    let output = Output {
         exports,
         skipped_exports,
-        stdout: unsafe { &*logs }.stdout.clone(),
-        stderr: unsafe { &*logs }.stderr.clone(),
-        duration_ms: elapsed_ms(start),
-        // Stamped by run_module from the shared run state.
+        // SAFETY: `logs` points into the run's live table entry.
+        stdout: unsafe { &*rs.logs }.borrow().stdout.clone(),
+        stderr: unsafe { &*rs.logs }.borrow().stderr.clone(),
+        duration_ms: elapsed_ms(rs.start),
+        // Stamped by the callers from the shared run state.
         cpu_time_ms: 0.0,
         bridge_calls: Vec::new(),
         background: None,
     };
 
-    // ── waitUntil ─────────────────────────────────────────────
+    // ── waitUntil ────────────────────────────────────────────────────────
     // The value is settled and serialized; if the run registered background
     // work (and the grace budget allows any), the run's second phase starts:
     // the Result ships early, the pending set is driven under its own
-    // budgets, and the outcome travels on a final RunComplete frame. A run
-    // that registered nothing takes none of these branches and behaves
-    // exactly as before waitUntil existed.
+    // budgets as further turns, and the outcome travels on a final
+    // RunComplete frame. A run that registered nothing takes none of these
+    // branches.
+    // SAFETY: `pending` points at the run entry's PendingWork Box.
     let has_pending = unsafe {
-        (*pending)
+        (*rs.pending)
             .slot
             .borrow()
             .as_ref()
             .is_some_and(|set| !set.is_empty())
     };
-    if has_pending && limits.grace_ms > 0 {
-        // The run phase is over: its guards come down before grace arms its
-        // own (idempotent with the caller's GuardCanceller).
-        cancel_guards(cancel_wall, cancel_cpu, cpu_budget);
-        cancel_handle.cancel_terminate_execution();
-
-        output.background = Some(run_grace_phase(
-            scope,
-            &mut output,
-            pending,
-            epilogue,
-            &GracePhaseCtx {
-                stream_fd,
-                limits,
-                start,
-                reason,
-                cpu_budget,
-                bridge_log,
-                bridge_error: &bridge_error,
-                pending_resolvers: &pending_resolvers,
-                cancel_handle,
-                logs,
-                streams,
-            },
-        ));
+    if !(has_pending && rs.limits.grace_ms > 0) {
+        return finished(Ok(output));
     }
 
-    // Streams are per run: tell the host to release any source still being
-    // pumped, and disarm the registry.
-    close_run_streams(streams);
+    // The run phase is over: its budget and guard come down before grace
+    // arms its own, and a lingering termination flag must not kill grace
+    // work.
+    rs.cpu_budget.leave();
+    facts.guard.clear();
+    facts.cancel_handle.cancel_terminate_execution();
 
-    Ok(output)
-}
-
-/// Cap the error strings carried on a `RunComplete` frame (review): the
-/// rejection message is guest-authored and otherwise unbounded, and the frame
-/// has no per-field limits of its own.
-fn capped_grace_error(name: String, message: String) -> (String, String) {
-    let mut name = name;
-    let mut message = message;
-    name.truncate(256);
-    if message.len() > 2048 {
-        message.truncate(2048);
-        message.push_str("… [truncated]");
+    // A guard may have fired in the microsecond between the settled-value
+    // check above and the clear. The whole window is Rust bookkeeping — no
+    // JS ran, and the terminate is cancelled before any could — so nothing
+    // was interrupted: clear the reason (this run's guard was the only one
+    // armed) and return the clean success without grace, instead of letting
+    // the stale reason truncate grace instantly and name a successful run
+    // as an instance-reset culprit.
+    if facts.reason.get().is_some() {
+        facts.reason.reset();
+        return finished(Ok(output));
     }
-    (name, message)
-}
 
-/// The run-phase state the grace phase borrows. A subset of `CallPhaseCtx`
-/// plus the shared bridge state that lives in `run_call_phase` locals.
-struct GracePhaseCtx<'a> {
-    stream_fd: Option<RawFd>,
-    limits: &'a Limits,
-    start: std::time::Instant,
-    reason: &'a Arc<ReasonCell>,
-    cpu_budget: &'a Arc<CpuBudget>,
-    bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
-    bridge_error: &'a Arc<OnceLock<RunError>>,
-    pending_resolvers: &'a PendingResolvers,
-    cancel_handle: &'a v8::IsolateHandle,
-    logs: *const LogBuffers,
-    streams: *const StreamTable,
-}
-
-/// Drive the registered background work after the run's value settled.
-///
-/// Writes the early Result frame itself when a spec and socket exist (the
-/// session paths), then keeps the poll loop running — bridge calls included —
-/// until the pending set settles or the grace budgets end it. Grace has its
-/// own metering: a fresh CPU allotment (guarded — a mid-turn kill taints via
-/// the run's reason cell) and the `grace_ms` wall applied at turn boundaries
-/// through the poll loop's read timeout (a decoy reason cell, so a clean
-/// boundary stop does not taint).
-fn run_grace_phase(
-    scope: &mut v8::PinScope,
-    output: &mut Output,
-    pending: *const PendingWork,
-    epilogue: Option<EpilogueSpec>,
-    ctx: &GracePhaseCtx<'_>,
-) -> GraceReport {
     // Freeze the run-phase telemetry for the early Result, and hand the
-    // console buffers over to grace: lines from here on belong to the report.
-    let run_cpu_ms = ctx.cpu_budget.elapsed_ms_precise();
-    let now_ms = elapsed_ms(ctx.start);
-    let run_records = ctx
+    // console buffers over to grace: lines from here on belong to the
+    // grace report.
+    let run_cpu_ms = rs.cpu_budget.elapsed_ms_precise();
+    let now_ms = elapsed_ms(rs.start);
+    let run_records = rs
         .bridge_log
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .snapshot(now_ms);
     let run_record_count = run_records.len();
-    // SAFETY: transient exclusive access to the console sink between JS
-    // executions — the discipline `logs` is held under everywhere else.
-    unsafe {
-        let l = ctx.logs.cast_mut();
-        (*l).stdout.clear();
-        (*l).stderr.clear();
+    {
+        // SAFETY: transient exclusive access between JS executions.
+        let mut l = unsafe { &*rs.logs }.borrow_mut();
+        l.stdout.clear();
+        l.stderr.clear();
     }
 
-    let early_result_sent = match (epilogue, ctx.stream_fd) {
-        (Some(spec), Some(fd)) => {
+    let early_result_sent = match (rs.epilogue, &rs.sink) {
+        (Some(spec), Some(sink)) => {
             let heap_used_bytes = spec.report_heap.then(|| {
                 let stats = scope.get_heap_statistics();
                 stats.used_heap_size() as u64
@@ -2125,15 +2846,7 @@ fn run_grace_phase(
                     background_pending: true,
                 }),
             );
-            // SAFETY: same ManuallyDrop pattern as the bridge callbacks — the
-            // session thread is parked for the duration of the call, so this
-            // thread is the socket's only user.
-            let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
-            match ipc::write_rust_to_ts_frame(
-                &mut *sock,
-                ipc::RustToTsMessageType::Result,
-                &payload,
-            ) {
+            match sink.write(ipc::RustToTsMessageType::Result, &payload) {
                 Ok(()) => true,
                 Err(e) => {
                     // Fall back to hold mode: the session writes the Result
@@ -2146,199 +2859,224 @@ fn run_grace_phase(
         _ => false,
     };
 
-    // ── Grace budgets ────────────────────────────────────────────────────────
+    // ── Grace budgets ────────────────────────────────────────────────────
     // CPU: a fresh allotment sized like the run's, or grace_ms when the run
     // is CPU-unlimited, so a tight loop inside a continuation is always
     // bounded. The guard writes the REAL reason cell and terminates — a
-    // mid-turn kill is a taint, per the fired-guard doctrine. Wall: enforced
-    // at turn boundaries by the poll loop's read timeout against a decoy
-    // cell — stopping between turns is clean and does not taint.
+    // mid-turn kill is a taint, per the fired-guard doctrine. Wall: the
+    // grace deadline is a loop boundary — stopping between turns is clean
+    // and does not taint.
     let grace_start = std::time::Instant::now();
-    let grace_cpu = Arc::new(CpuBudget::new());
-    let grace_cpu_cap = if ctx.limits.cpu_time_ms > 0 {
-        ctx.limits.cpu_time_ms
+    let grace_cpu_cap = if rs.limits.cpu_time_ms > 0 {
+        rs.limits.cpu_time_ms
     } else {
-        ctx.limits.grace_ms
+        rs.limits.grace_ms
     };
-    let (grace_cancel_cpu, grace_cpu_join) = start_cpu_guard(
-        ctx.cancel_handle.clone(),
-        Arc::clone(ctx.reason),
-        Arc::clone(&grace_cpu),
+    rs.phase = RunPhase::Grace(Box::new(GraceState {
+        output,
+        grace_start,
+        deadline: grace_start + Duration::from_millis(rs.limits.grace_ms as u64),
+        grace_cpu: Arc::new(CpuBudget::new()),
         grace_cpu_cap,
-    );
-    let decoy_reason = Arc::new(ReasonCell::new());
+        error: None,
+        early_result_sent,
+        run_record_count,
+    }));
 
-    let mut error: Option<(String, String)> = None;
-    let mut status;
-    grace_cpu.enter();
-    v8::tc_scope!(let tc, scope);
-    'grace: loop {
-        tc.perform_microtask_checkpoint();
+    // Drain once right away, under the grace budgets — registered work may
+    // already be settled, or settle within one checkpoint.
+    let _turn = TurnGuard::begin(facts.guard, rs);
+    let _epoch = BudgetEpoch::enter(rs.active_budget());
+    grace_scan(scope, facts, rs)
+}
 
-        // The grace CPU guard writes the REAL reason cell when it kills a
-        // runaway continuation; end the phase the moment that happened
-        // instead of idling out the wall — the instance is tainted either
-        // way, but the pool slot frees now (review, finding 2).
-        if ctx.reason.get().is_some() {
-            status = GraceStatus::Truncated;
-            break 'grace;
-        }
+/// One grace drain: drive the queue, drop settled promises, note the first
+/// rejection, decide whether the phase is over. New registrations (a
+/// `waitUntil` called from a continuation) land in the same armed slot and
+/// are picked up next drain.
+fn grace_scan(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+) -> ScanOutcome {
+    // Drive whatever the current microtask queue holds before looking.
+    scope.perform_microtask_checkpoint();
 
-        // Drain the set: drop what settled, note the first rejection, keep
-        // driving the rest. New registrations (waitUntil from a continuation)
-        // land in the same slot and are picked up next round.
-        // SAFETY: pending outlives the call; borrow is transient.
-        let taken = unsafe { (*pending).slot.borrow_mut().take() };
-        let mut still: Vec<v8::Global<v8::Promise>> = Vec::new();
-        for g in taken.unwrap_or_default() {
-            let p = v8::Local::new(tc, &g);
-            match p.state() {
-                v8::PromiseState::Pending => still.push(g),
-                v8::PromiseState::Rejected => {
-                    if error.is_none() {
-                        let rejection = p.result(tc);
-                        error = Some(capped_grace_error(
-                            error_name_from_value(tc, rejection)
-                                .unwrap_or_else(|| "Error".to_string()),
-                            error_message_from_value(tc, rejection)
-                                .unwrap_or_else(|| "background work failed".to_string()),
-                        ));
-                    }
-                }
-                v8::PromiseState::Fulfilled => {}
-            }
-        }
-        if still.is_empty() {
-            unsafe { *(*pending).slot.borrow_mut() = Some(Vec::new()) };
-            status = if error.is_some() {
-                GraceStatus::Failed
-            } else {
-                GraceStatus::Settled
-            };
-            break 'grace;
-        }
-        if grace_start.elapsed() >= Duration::from_millis(ctx.limits.grace_ms as u64) {
-            unsafe { *(*pending).slot.borrow_mut() = Some(still) };
-            status = GraceStatus::Truncated;
-            break 'grace;
-        }
+    // The grace CPU guard writes the REAL reason cell when it kills a
+    // runaway continuation; end the phase the moment that happened instead
+    // of idling out the wall — the instance is tainted either way, but the
+    // slot frees now.
+    if facts.reason.get().is_some() {
+        return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+    }
 
-        // One aggregate promise over the remaining set, driven by the same
-        // settle machinery as the run itself (bridge frames, Terminate,
-        // boundary timeouts). Built with the pristine Promise.allSettled
-        // captured at install time from a private slot, so guest tampering
-        // with the public one changes nothing here.
-        let list = v8::Array::new(tc, still.len() as i32);
-        for (i, g) in still.iter().enumerate() {
-            let p = v8::Local::new(tc, g);
-            list.set_index(tc, i as u32, p.into());
-        }
-        unsafe { *(*pending).slot.borrow_mut() = Some(still) };
-        let aggregate = (|| -> Option<v8::Local<v8::Promise>> {
-            let global = tc.get_current_context().global(tc);
-            let key = grace_all_settled_key(tc)?;
-            let all_settled =
-                v8::Local::<v8::Function>::try_from(global.get_private(tc, key)?).ok()?;
-            let recv = v8::undefined(tc).into();
-            let p = all_settled.call(tc, recv, &[list.into()])?;
-            v8::Local::<v8::Promise>::try_from(p).ok()
-        })();
-        let Some(aggregate) = aggregate else {
-            status = GraceStatus::Truncated;
-            if error.is_none() {
-                error = Some((
-                    "Error".to_string(),
-                    "grace aggregate could not be built".to_string(),
-                ));
-            }
-            break 'grace;
-        };
-
-        // Wait in short ticks rather than one long sleep, so a mid-turn CPU
-        // kill (real reason cell) or the overall wall is observed within
-        // ~250 ms instead of holding the slot for the rest of grace_ms.
-        let remaining_ms = (ctx.limits.grace_ms as u64)
-            .saturating_sub(grace_start.elapsed().as_millis() as u64)
-            .max(1);
-        let tick_limits = Limits {
-            wall_time_ms: remaining_ms.min(250) as u32,
-            ..*ctx.limits
-        };
-        let tick_ctx = SettleCtx {
-            stream_fd: ctx.stream_fd,
-            limits: &tick_limits,
-            start: std::time::Instant::now(),
-            reason: &decoy_reason,
-            cpu_budget: &grace_cpu,
-            bridge_log: ctx.bridge_log,
-            bridge_error: ctx.bridge_error,
-            pending_resolvers: ctx.pending_resolvers,
-            cancel_handle: ctx.cancel_handle,
-            streams: ctx.streams,
-        };
-        match settle_promise(tc, aggregate, &tick_ctx) {
-            // allSettled fulfils; re-enter the drain to pick up outcomes and
-            // any promises registered meanwhile.
-            Ok(v8::PromiseState::Fulfilled) => continue 'grace,
-            // No socket and nothing can resolve the rest.
-            Ok(_) => {
-                status = GraceStatus::Truncated;
-                break 'grace;
-            }
-            // A tick expired: loop back — the top of the loop decides whether
-            // the CPU guard fired or the overall wall is spent.
-            Err(RunError::WallTimeout) => continue 'grace,
-            // A host Terminate mid-grace (abort during the epilogue) — clean.
-            Err(RunError::Aborted) => {
-                status = GraceStatus::Truncated;
-                break 'grace;
-            }
-            // The grace CPU guard fired mid-turn (real reason cell set → the
-            // caller's taint verdict sees it), or a fatal bridge error.
-            Err(e) => {
-                status = GraceStatus::Truncated;
-                if error.is_none() {
-                    error = Some(capped_grace_error(
-                        "Error".to_string(),
-                        format!("{e:?}"),
+    // SAFETY: `pending` points at the run entry's PendingWork Box.
+    let taken = unsafe { (*rs.pending).slot.borrow_mut().take() };
+    let mut still: Vec<v8::Global<v8::Promise>> = Vec::new();
+    let mut first_error: Option<(String, String)> = None;
+    for g in taken.unwrap_or_default() {
+        let p = v8::Local::new(scope, &g);
+        match p.state() {
+            v8::PromiseState::Pending => still.push(g),
+            v8::PromiseState::Rejected => {
+                if first_error.is_none() {
+                    let rejection = p.result(scope);
+                    first_error = Some(capped_grace_error(
+                        error_name_from_value(scope, rejection)
+                            .unwrap_or_else(|| "Error".to_string()),
+                        error_message_from_value(scope, rejection)
+                            .unwrap_or_else(|| "background work failed".to_string()),
                     ));
                 }
-                break 'grace;
             }
+            v8::PromiseState::Fulfilled => {}
         }
     }
-    grace_cpu.leave();
-    let _ = grace_cancel_cpu.send(());
-    if let Some(j) = grace_cpu_join {
-        j.join().ok();
-    }
+    let empty = still.is_empty();
+    // Re-arm the slot with whatever is still pending.
+    unsafe { *(*rs.pending).slot.borrow_mut() = Some(still) };
 
+    let RunPhase::Grace(g) = &mut rs.phase else {
+        unreachable!("grace_scan outside grace");
+    };
+    if g.error.is_none() {
+        g.error = first_error;
+    }
+    if empty {
+        let status = if g.error.is_some() {
+            GraceStatus::Failed
+        } else {
+            GraceStatus::Settled
+        };
+        return finished(Ok(finish_grace(rs, status)));
+    }
+    if g.grace_start.elapsed() >= Duration::from_millis(rs.limits.grace_ms as u64) {
+        return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+    }
+    if rs.source.is_none() {
+        // No event source and nothing can resolve the rest.
+        return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+    }
+    ScanOutcome::Continue
+}
+
+/// Close out the grace phase: stamp the report (telemetry diff since the
+/// early Result) onto the run's held Output. Pure bookkeeping — no JS runs,
+/// so boundary events (deadline, socket death) call it without a scope.
+fn finish_grace(rs: &mut RunState, status: GraceStatus) -> Output {
+    let RunPhase::Grace(g) = &mut rs.phase else {
+        unreachable!("finish_grace outside grace");
+    };
     // Grace-only telemetry: records appended after the early snapshot, and
     // the console lines written since the buffers were handed over.
-    let all_records = ctx
+    let all_records = rs
         .bridge_log
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .snapshot(elapsed_ms(ctx.start));
-    let bridge_calls = all_records.get(run_record_count..).unwrap_or(&[]).to_vec();
-    let (stdout, stderr) = unsafe {
-        let l = ctx.logs.cast_mut();
-        (
-            std::mem::take(&mut (*l).stdout),
-            std::mem::take(&mut (*l).stderr),
-        )
+        .snapshot(elapsed_ms(rs.start));
+    let bridge_calls = all_records
+        .get(g.run_record_count..)
+        .unwrap_or(&[])
+        .to_vec();
+    let (stdout, stderr) = {
+        // SAFETY: transient access between JS executions.
+        let mut l = unsafe { &*rs.logs }.borrow_mut();
+        (std::mem::take(&mut l.stdout), std::mem::take(&mut l.stderr))
     };
 
-    GraceReport {
+    let mut output = std::mem::replace(
+        &mut g.output,
+        Output {
+            exports: Vec::new(),
+            skipped_exports: Vec::new(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            duration_ms: 0.0,
+            cpu_time_ms: 0.0,
+            bridge_calls: Vec::new(),
+            background: None,
+        },
+    );
+    output.background = Some(GraceReport {
         status,
-        duration_ms: elapsed_ms(grace_start),
-        cpu_time_ms: grace_cpu.elapsed_ms_precise(),
+        duration_ms: elapsed_ms(g.grace_start),
+        cpu_time_ms: g.grace_cpu.elapsed_ms_precise(),
         stdout,
         stderr,
         bridge_calls,
-        error,
-        early_result_sent,
+        error: g.error.take(),
+        early_result_sent: g.early_result_sent,
+    });
+    output
+}
+
+/// RAII for the per-turn guard target: set on entry, cleared on drop. The
+/// set and the clear serialize with the guard's fire under the target lock,
+/// so after a turn ends any fire that beat the clear is visible in the
+/// reason cell.
+struct TurnGuard<'a> {
+    guard: &'a InstanceGuard,
+}
+
+impl<'a> TurnGuard<'a> {
+    fn begin(guard: &'a InstanceGuard, rs: &RunState) -> Self {
+        let token = rs.token;
+        let target = match &rs.phase {
+            RunPhase::Starting | RunPhase::Settling { .. } => GuardTarget {
+                budget: Arc::clone(&rs.cpu_budget),
+                cpu_cap_ms: rs.limits.cpu_time_ms,
+                // Enforced mid-turn too, so a synchronous spin under
+                // `cpuTimeMs: 0` still dies at the wall (E2 ruling closing
+                // the boundary-only gap).
+                wall_deadline: (rs.limits.wall_time_ms > 0)
+                    .then(|| rs.start + Duration::from_millis(rs.limits.wall_time_ms as u64)),
+            },
+            RunPhase::Grace(g) => GuardTarget {
+                budget: Arc::clone(&g.grace_cpu),
+                cpu_cap_ms: g.grace_cpu_cap,
+                // The grace wall is a loop boundary, never a mid-turn kill.
+                wall_deadline: None,
+            },
+        };
+        guard.set_for(target, token);
+        Self { guard }
     }
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        self.guard.clear();
+    }
+}
+
+/// RAII for one turn's CPU epoch on the phase's budget.
+struct BudgetEpoch(Arc<CpuBudget>);
+
+impl BudgetEpoch {
+    fn enter(budget: Arc<CpuBudget>) -> Self {
+        budget.enter();
+        Self(budget)
+    }
+}
+
+impl Drop for BudgetEpoch {
+    fn drop(&mut self) {
+        self.0.leave();
+    }
+}
+
+/// Cap the error strings carried on a `RunComplete` frame (review): the
+/// rejection message is guest-authored and otherwise unbounded, and the frame
+/// has no per-field limits of its own.
+fn capped_grace_error(name: String, message: String) -> (String, String) {
+    let mut name = name;
+    let mut message = message;
+    name.truncate(256);
+    if message.len() > 2048 {
+        message.truncate(2048);
+        message.push_str("… [truncated]");
+    }
+    (name, message)
 }
 
 // ── Warm instances ────────────────────────────────────────────────────
@@ -2365,10 +3103,10 @@ pub struct InstanceCore {
     context: v8::Global<v8::Context>,
     prefix_module: Option<v8::Global<v8::Module>>,
     isolate: v8::OwnedIsolate,
-    /// Console sink. The console holds a raw pointer into this Box (stable
-    /// address), so the buffers live exactly as long as the isolate; caps
-    /// are re-pointed and contents drained per call.
-    logs: Box<LogBuffers>,
+    /// Per-run state table. The once-per-instance native installs (console,
+    /// web runtime, waitUntil, bridge stubs) hold a raw pointer into this
+    /// Box (stable address) and route by the attributed run token.
+    run_table: Box<RunTable>,
     /// Termination-reason slot shared with the near-heap callback and the
     /// ArrayBuffer allocator, which are registered once per isolate. Reset
     /// per call — the reason a [`ReasonCell`] replaced the old `OnceLock`.
@@ -2382,18 +3120,16 @@ pub struct InstanceCore {
     /// Owns the near-heap callback's data for the isolate's lifetime.
     #[allow(dead_code)]
     near_heap: Option<Box<NearHeapData>>,
-    /// Bridge-stub dispatch slots (see [`StubSlot`]): the pointees of every
-    /// stub `Function` ever created in this context, re-pointed per call and
-    /// disarmed between calls.
+    /// Bridge-stub identity slots (see [`StubSlot`]): the pointees of every
+    /// stub `Function` ever created in this context. Per-run bindings live
+    /// in the run table; these Boxes only carry the name + table pointer.
     stub_slots: StubSlots,
-    /// `waitUntil` registration set — the native callback holds a raw
-    /// pointer into this Box; armed per call, disarmed between calls.
-    pending: Box<PendingWork>,
-    /// Streamed-body registry, same pointer discipline and lifecycle.
-    streams: Box<StreamTable>,
+    /// The instance's one guard thread (see [`InstanceGuard`]): warm-up and
+    /// every turn of every call publish their budgets to it.
+    guard: InstanceGuard,
     /// True until the first call: warm-up console output (the prefix's
-    /// `console.log`s) is sitting in `logs` and is delivered on the
-    /// cold-start call's result instead of being dropped.
+    /// `console.log`s) is sitting in the table's `setup_logs` and is
+    /// delivered on the cold-start call's result instead of being dropped.
     warmup_logs_pending: bool,
 }
 
@@ -2486,40 +3222,32 @@ pub fn create_instance_core(
     init_platform();
     let start = std::time::Instant::now();
 
-    let mut logs = Box::new(LogBuffers::default());
+    let run_table = RunTable::boxed();
     let reason = Arc::new(ReasonCell::new());
     let (mut isolate, alloc_state, near_heap) = new_capped_isolate(memory_mb, &reason);
 
     let handle = isolate.thread_safe_handle();
     let warmup_budget = Arc::new(CpuBudget::new());
-    let (cancel_wall, wall_join) =
-        start_wall_guard(handle.clone(), Arc::clone(&reason), WARMUP_WALL_MS);
-    let (cancel_cpu, cpu_join) = start_cpu_guard(
-        handle.clone(),
-        Arc::clone(&reason),
-        Arc::clone(&warmup_budget),
-        WARMUP_CPU_MS,
-    );
-    let guard_canceller = GuardCanceller {
-        cancel_wall: &cancel_wall,
-        cancel_cpu: &cancel_cpu,
-        budget: &warmup_budget,
-    };
+    // The instance's ONE guard thread, reused by every later call. Warm-up
+    // runs under the fixed warm-up target.
+    let guard = InstanceGuard::spawn(handle.clone(), Arc::clone(&reason));
+    guard.set(GuardTarget {
+        budget: Arc::clone(&warmup_budget),
+        cpu_cap_ms: WARMUP_CPU_MS,
+        wall_deadline: Some(start + Duration::from_millis(WARMUP_WALL_MS as u64)),
+    });
 
-    let logs_ptr: *mut LogBuffers = &mut *logs;
-    let pending_work = PendingWork::boxed();
-    let pending_ptr: *const PendingWork = &*pending_work;
-    let stream_table = StreamTable::boxed();
-    let stream_ptr: *const StreamTable = &*stream_table;
+    let table_ptr: *const RunTable = &*run_table;
     let setup = (|| -> Result<(v8::Global<v8::Context>, Option<v8::Global<v8::Module>>), RunError> {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        install_console(scope, logs_ptr)?;
-        install_web_runtime(scope, stream_ptr).map_err(RunError::Internal)?;
+        install_console(scope, table_ptr)?;
+        install_web_runtime(scope, table_ptr).map_err(RunError::Internal)?;
         install_async_context(scope)?;
-        // Disarmed during prefix evaluation: a setup-time waitUntil throws.
-        install_wait_until(scope, pending_ptr)?;
+        // No run entry exists during prefix evaluation: a setup-time
+        // waitUntil throws, and warm-up console output lands in setup_logs.
+        install_wait_until(scope, table_ptr)?;
         let mut prefix_module: Option<v8::Global<v8::Module>> = None;
         if let Some(prefix) = &prefix {
             // Enter the CPU meter for compile + evaluate only — isolate boot
@@ -2533,17 +3261,11 @@ pub fn create_instance_core(
         }
         Ok((v8::Global::new(scope, context), prefix_module))
     })();
-    drop(guard_canceller);
-    // Join the guards: cancellation only signals them, and a guard whose
-    // deadline expired concurrently may still be about to fire. This isolate
-    // is about to live on — any fire must be visible NOW, not land on the
-    // first call.
-    if let Some(j) = wall_join {
-        j.join().ok();
-    }
-    if let Some(j) = cpu_join {
-        j.join().ok();
-    }
+    warmup_budget.leave();
+    // Clearing the target serializes with any in-flight fire under the
+    // target lock: after this line, a fire that won the race has already
+    // set the reason cell, so the verdict below observes it — no join.
+    guard.clear();
 
     match setup {
         // A guard that fired *after* evaluation completed still taints: the
@@ -2551,7 +3273,7 @@ pub fn create_instance_core(
         // no exceptions to the doctrine.
         Ok(_) if reason.get().is_some() => Err(failure(
             warmup_error(&reason, RunError::WarmupLimit),
-            &logs,
+            &run_table.setup_logs.borrow(),
             start,
         )),
         Ok((context, prefix_module)) => {
@@ -2560,19 +3282,66 @@ pub fn create_instance_core(
                 context,
                 prefix_module,
                 isolate,
-                logs,
+                run_table,
                 reason,
                 alloc_state,
                 near_heap,
                 stub_slots: StubSlots::new(),
-                pending: pending_work,
-                streams: stream_table,
+                guard,
                 warmup_logs_pending: true,
             })
         }
-        Err(error) => Err(failure(warmup_error(&reason, error), &logs, start)),
+        Err(error) => Err(failure(
+            warmup_error(&reason, error),
+            &run_table.setup_logs.borrow(),
+            start,
+        )),
     }
 }
+
+/// One call forwarded to an instance owner thread (or run by a one-off
+/// worker). Owns everything a run needs: the code/call, the limits, the
+/// per-call bridge defs, and the run's I/O.
+pub struct CallJob {
+    /// The run's table token. 0 = let the runtime allocate one; the session
+    /// demux allocates it up front (via [`alloc_run_token`]) so it can route
+    /// mid-turn aborts before the instance has even started the run.
+    pub token: u64,
+    /// Postfix source (`execute`) — `None` for a call-only run.
+    pub code: Option<String>,
+    pub filename: Option<String>,
+    pub limits: Limits,
+    /// Bridge-stub defs for this call (re-installed per call).
+    pub globals: Vec<ipc::HostGlobalDef>,
+    /// The run's frame source and outbound sink.
+    pub io: RunIo,
+    /// The connection's monotonically increasing bridge call-ID counter.
+    pub call_id_counter: Arc<AtomicU32>,
+    pub call: Option<ipc::CallSpec>,
+    /// Per-run identity for the early Result frame.
+    pub epilogue: Option<EpilogueSpec>,
+    /// Session completion hook, run on the instance thread when the run
+    /// finishes: writes the Result/RunComplete frames through the shared
+    /// writer and releases registry state. `None` for direct callers, which
+    /// take the outcome off the respond channel instead.
+    pub complete: Option<CompletionHook>,
+    /// Filled with the instance guard's cross-thread face once the isolate
+    /// exists, so the session demux can terminate this run mid-turn
+    /// (Terminate for a CPU-bound run — E1 ruling 5's fallback).
+    pub ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+}
+
+/// One message to an instance owner thread: the job, plus an optional
+/// blocking-caller channel for the outcome.
+pub type JobMsg = (
+    Box<CallJob>,
+    Option<crossbeam_channel::Sender<CallOutcome>>,
+);
+
+/// The session completion hook a [`CallJob`] can carry: runs on the instance
+/// thread when the run finishes and OWNS the outcome — no payload cloning on
+/// the completion path. Mutually exclusive with the respond channel.
+pub type CompletionHook = Box<dyn FnOnce(CallOutcome) + Send>;
 
 /// What the warm layer needs to know after each call on an instance.
 pub struct CallOutcome {
@@ -2609,123 +3378,116 @@ pub fn run_call_on_core(
     let cpu_budget = Arc::new(CpuBudget::new());
     let bridge_log: Arc<Mutex<BridgeCallLog>> = Arc::new(Mutex::new(BridgeCallLog::default()));
 
-    // Per-call reset of instance-lifetime state: the termination-reason slot
-    // and the console sink (whose caps are per-call limits). The cold-start
-    // call keeps the buffers: they hold the prefix's warm-up console output,
-    // which belongs to the run that paid for the warm-up — previously the
-    // prefix re-evaluated per run, so its output appeared on every result.
+    // Per-call reset of the termination-reason slot, then a fresh run entry
+    // in the instance's table. The cold-start call adopts the warm-up
+    // console output: it belongs to the run that paid for the warm-up —
+    // previously the prefix re-evaluated per run, so its output appeared on
+    // every result. (Warm-up bytes count against the first call's caps,
+    // exactly as when the buffers were shared.)
     core.reason.reset();
-    {
-        let logs = &mut *core.logs;
-        if core.warmup_logs_pending {
-            core.warmup_logs_pending = false;
-        } else {
-            logs.stdout.clear();
-            logs.stderr.clear();
-            logs.stdout_bytes = 0;
-            logs.stderr_bytes = 0;
-        }
-        logs.max_stdout_bytes = limits.max_stdout_bytes;
-        logs.max_stderr_bytes = limits.max_stderr_bytes;
+    let token = alloc_run_token();
+    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes);
+    if core.warmup_logs_pending {
+        core.warmup_logs_pending = false;
+        let mut setup = core.run_table.setup_logs.borrow_mut();
+        let mut logs = entry.logs.borrow_mut();
+        logs.stdout = std::mem::take(&mut setup.stdout);
+        logs.stderr = std::mem::take(&mut setup.stderr);
+        logs.stdout_bytes = std::mem::take(&mut setup.stdout_bytes);
+        logs.stderr_bytes = std::mem::take(&mut setup.stderr_bytes);
     }
+    // Pointers into the Boxed entry stay valid for the whole call; the entry
+    // is removed (between turns) below before this function returns.
+    let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
+    let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
+    let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    core.run_table.runs.borrow_mut().insert(token, entry);
+    CURRENT_RUN_TOKEN.with(|c| c.set(token));
+    RUN_TABLE_PTR.with(|c| c.set(std::ptr::addr_of!(*core.run_table)));
 
-    // Guards go up BEFORE anything touches the retained context. The
-    // placeholder re-arm below runs `define_own_property` — which never
+    // The guard target goes up BEFORE anything touches the retained context.
+    // The placeholder re-arm below runs `define_own_property` — which never
     // invokes user accessors — but defence in depth: any path that can
     // execute sandbox-authored code on this thread must be under a budget,
     // or a hostile prefix/postfix could hang the owner thread forever.
-    let handle = core.isolate.thread_safe_handle();
-    let cancel_handle = handle.clone();
-    let (cancel_wall, wall_join) =
-        start_wall_guard(handle.clone(), Arc::clone(&core.reason), limits.wall_time_ms);
-    let (cancel_cpu, cpu_join) = start_cpu_guard(
-        handle,
-        Arc::clone(&core.reason),
-        Arc::clone(&cpu_budget),
-        limits.cpu_time_ms,
+    // (One guard thread per instance; run_call_phase re-arms this target per
+    // turn and clears it while the run is parked.)
+    let cancel_handle = core.isolate.thread_safe_handle();
+    core.guard.set_for(
+        GuardTarget {
+            budget: Arc::clone(&cpu_budget),
+            cpu_cap_ms: limits.cpu_time_ms,
+            wall_deadline: (limits.wall_time_ms > 0)
+                .then(|| start + Duration::from_millis(limits.wall_time_ms as u64)),
+        },
+        token,
     );
 
-    let mut result: Result<Output, FailureOutput>;
-    {
-        let guard_canceller = GuardCanceller {
-            cancel_wall: &cancel_wall,
-            cancel_cpu: &cancel_cpu,
-            budget: &cpu_budget,
-        };
-
-        // Re-arm throwing placeholders over every bridge-callable name BEFORE
-        // the live stubs bind: a name the previous call bound live but this
-        // call does not re-bind must throw, not dispatch (its slot is
-        // disarmed below either way — the placeholder gives the honest
-        // error instead of the stale-reference one).
-        let placeholder_result = {
-            v8::scope!(let scope, &mut core.isolate);
-            let context = v8::Local::new(scope, &core.context);
-            let scope = &mut v8::ContextScope::new(scope, context);
-            install_prefix_bridge_placeholders(scope, prefix_globals, imports)
-        };
-        result = match placeholder_result {
-            Err(error) => Err(failure(
-                termination_or(&core.reason, error),
-                &core.logs,
+    // Re-arm throwing placeholders over every bridge-callable name BEFORE
+    // the live stubs bind: a name the previous call bound live but this
+    // call does not re-bind must throw, not dispatch (the per-run binding
+    // is gone either way — the placeholder gives the honest error instead
+    // of the stale-reference one).
+    let placeholder_result = {
+        v8::scope!(let scope, &mut core.isolate);
+        let context = v8::Local::new(scope, &core.context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        install_prefix_bridge_placeholders(scope, prefix_globals, imports)
+    };
+    let mut result: Result<Output, FailureOutput> = match placeholder_result {
+        Err(error) => Err(failure(
+            termination_or(&core.reason, error),
+            &unsafe { &*logs_ptr }.borrow(),
+            start,
+        )),
+        Ok(()) => run_call_phase(
+            &mut core.isolate,
+            &core.context,
+            core.prefix_module.as_ref(),
+            code,
+            filename,
+            &mut core.stub_slots,
+            &core.guard,
+            CallPhaseCtx {
+                token,
+                table: std::ptr::addr_of!(*core.run_table),
+                limits: &limits,
+                globals,
+                imports,
+                io: stream_fd.map_or(RunIo::None, RunIo::Fd),
+                call_id_counter,
+                call,
                 start,
-            )),
-            Ok(()) => run_call_phase(
-                &mut core.isolate,
-                &core.context,
-                core.prefix_module.as_ref(),
-                code,
-                filename,
-                &mut core.stub_slots,
-                CallPhaseCtx {
-                    limits: &limits,
-                    globals,
-                    imports,
-                    stream_fd,
-                    call_id_counter,
-                    call,
-                    start,
-                    cpu_budget: &cpu_budget,
-                    bridge_log: &bridge_log,
-                    reason: &core.reason,
-                    logs: std::ptr::addr_of!(*core.logs),
-                    pending: &*core.pending,
-                    streams: &*core.streams,
-                    epilogue: take_epilogue_spec(),
-                    cancel_wall: &cancel_wall,
-                    cancel_cpu: &cancel_cpu,
-                    cancel_handle: &cancel_handle,
-                },
-            ),
-        };
-        drop(guard_canceller);
-    }
-    // Join the guards before judging the instance: cancellation only signals
-    // them, and a guard whose deadline expired concurrently may still be
-    // between "decide to fire" and "set reason + terminate". After the joins,
-    // any fire is visible to the taint check below instead of landing
-    // invisibly on the next call of a reused isolate.
-    if let Some(j) = wall_join {
-        j.join().ok();
-    }
-    if let Some(j) = cpu_join {
-        j.join().ok();
-    }
+                cpu_budget: &cpu_budget,
+                bridge_log: &bridge_log,
+                reason: &core.reason,
+                logs: logs_ptr,
+                pending: pending_ptr,
+                streams: streams_ptr,
+                epilogue: take_epilogue_spec(),
+                cancel_handle: &cancel_handle,
+            },
+        ),
+    };
+    // Belt and suspenders: run_call_phase clears the target on every path,
+    // and clear-vs-fire serialize under the target lock, so any fire that
+    // won a race is already visible in the reason cell for the verdict
+    // below — no thread joins.
+    core.guard.clear();
+    cpu_budget.leave();
 
-    // Disarm the stub slots: this call's bridge state (socket fd, resolver
-    // map, telemetry Arcs) dies with this function, so any stub Function
-    // sandbox code stashed must throw, not dispatch, until the next call
-    // re-points the slots.
-    for slot in core.stub_slots.values() {
-        *slot.data.borrow_mut() = None;
-    }
-    // Disarm waitUntil too: a between-calls registration must throw,
-    // and lingering Globals from the finished run should not pin objects.
-    *core.pending.slot.borrow_mut() = None;
     // The stream table was disarmed (and live streams cancelled) by
     // run_call_phase's normal exit; this covers the failure paths that never
-    // reached it. Idempotent.
-    close_run_streams(&*core.streams);
+    // reached it. Idempotent. Must happen before the entry is removed — the
+    // cancel frames read the entry's sink.
+    close_run_streams(streams_ptr);
+    // Remove the run's entry: stub Functions sandbox code stashed now fail
+    // the token lookup and throw, a between-calls waitUntil throws, and the
+    // entry's Globals (resolvers, pending promises) drop here, on the owner
+    // thread, between turns.
+    core.run_table.runs.borrow_mut().remove(&token);
+    CURRENT_RUN_TOKEN.with(|c| c.set(0));
+    RUN_TABLE_PTR.with(|c| c.set(std::ptr::null()));
 
     // Stamp telemetry exactly as `run_module` does for the one-off path.
     let cpu_time_ms = cpu_budget.elapsed_ms_precise();
@@ -2744,35 +3506,516 @@ pub fn run_call_on_core(
         }
     }
 
-    // Taint verdict. A fired guard means terminate_execution ripped
-    // arbitrary mid-execution state; a still-pending termination flag means
-    // something terminated without the clean paths' cancel (fatal bridge
-    // violations set it without a reason); the error-shape check catches the
-    // remaining fatal paths (abort, internal faults). Ordinary uncaught
-    // exceptions stay clean. When in doubt, evict — cold starts are correct,
-    // reuse is only the optimization.
-    let tainted = core.reason.get().is_some()
-        || core.isolate.is_execution_terminating()
-        || match &result {
-            Ok(_) => false,
-            Err(f) => matches!(
-                f.error,
-                RunError::Aborted
-                    | RunError::WallTimeout
-                    | RunError::CpuTimeout
-                    | RunError::MemoryLimit
-                    | RunError::Internal(_)
-                    | RunError::BridgeCallPayloadTooLarge
-                    | RunError::BridgeCallLimitExceeded
-                    | RunError::FunctionArgumentNotSupported
-            ),
-        };
+    // Taint verdict: a turn was interrupted mid-JS — and nothing else
+    // (E1 ruling 3, deliberately narrower than the old error-shape list).
+    // A fired guard means terminate_execution ripped arbitrary
+    // mid-execution state; a still-pending termination flag means something
+    // terminated without the clean paths' cancel (fatal bridge violations
+    // set it without a reason). Everything that ends a run BETWEEN turns —
+    // a boundary wall expiry, a socket death, a direct-abandon abort, an
+    // ordinary uncaught exception — leaves the instance trustworthy and
+    // reusable.
+    let tainted = core.reason.get().is_some() || core.isolate.is_execution_terminating();
 
     CallOutcome {
         result,
         tainted,
         heap_used_bytes: heap_used(&mut core.isolate),
     }
+}
+
+
+// ── The instance loop ────────────────────────────────────────────────────────
+
+/// One suspended run on the instance loop.
+struct LiveRun {
+    rs: RunState,
+    job: Box<CallJob>,
+    respond: Option<crossbeam_channel::Sender<CallOutcome>>,
+}
+
+/// Whether a turn was interrupted mid-JS — the instance-wide taint test
+/// (E1 ruling 3): a fired guard, or a termination flag still pending.
+fn instance_tainted(core: &mut InstanceCore) -> bool {
+    core.reason.get().is_some() || core.isolate.is_execution_terminating()
+}
+
+/// Finish one run: stamp its telemetry, close its streams, drop its table
+/// entry, and hand the outcome to whoever waits for it (the session
+/// completion hook and/or the blocking caller's channel).
+fn conclude_run(
+    isolate: &mut v8::OwnedIsolate,
+    run_table: &RunTable,
+    mut live: LiveRun,
+    mut result: Result<Output, FailureOutput>,
+    tainted: bool,
+) {
+    let cpu_time_ms = live.rs.cpu_budget.elapsed_ms_precise();
+    let records = live
+        .rs
+        .bridge_log
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .finalize(elapsed_ms(live.rs.start));
+    match &mut result {
+        Ok(output) => {
+            output.cpu_time_ms = cpu_time_ms;
+            output.bridge_calls = records;
+        }
+        Err(f) => {
+            f.cpu_time_ms = cpu_time_ms;
+            f.bridge_calls = records;
+        }
+    }
+    close_run_streams(live.rs.streams);
+    run_table.runs.borrow_mut().remove(&live.rs.token);
+    let outcome = CallOutcome {
+        result,
+        tainted,
+        heap_used_bytes: heap_used(isolate),
+    };
+    // The hook and the respond channel are mutually exclusive consumers
+    // (session jobs carry a hook; direct callers a channel) — whichever
+    // exists owns the outcome.
+    if let Some(complete) = live.job.complete.take() {
+        complete(outcome);
+    } else if let Some(respond) = live.respond {
+        respond.send(outcome).ok();
+    }
+}
+
+/// Serve jobs on one instance: the per-instance turn loop (#125). Selects
+/// over new jobs, frames routed to this instance's in-flight runs, and the
+/// nearest per-run deadline; each event is one turn. Any number of session
+/// runs can be suspended at once; a direct-fd job (tests, dark mode) blocks
+/// the loop for its duration — the pre-demux discipline where this thread
+/// is the fd's only reader.
+///
+/// Returns when the job channel disconnects and no runs are in flight, or
+/// when a turn is interrupted mid-JS — the taint path: the turn owner fails
+/// with its classified error and every other in-flight run fails with
+/// `ERR_INSTANCE_RESET` carrying the cause class and the culprit's wire run
+/// id (E1 rulings 3+4). The instance dies with the loop either way.
+pub fn serve_instance(
+    core: &mut InstanceCore,
+    prefix_globals: &[ipc::HostGlobalDef],
+    imports: &[ipc::ImportBinding],
+    first: JobMsg,
+    jobs: &crossbeam_channel::Receiver<JobMsg>,
+) {
+    let mut live: Vec<LiveRun> = Vec::new();
+    let mut jobs_open = true;
+
+    // The job that triggered instance creation, then the loop.
+    if dispatch_job(core, prefix_globals, imports, &mut live, first) {
+        taint_sweep(core, &mut live, jobs);
+        return;
+    }
+
+    loop {
+        if live.is_empty() && !jobs_open {
+            return;
+        }
+
+        // What the select decided, extracted as owned data so the receiver
+        // borrows into `live` end before anything is mutated.
+        enum Picked {
+            Job(Option<JobMsg>),
+            Run(u64, LoopEvent),
+            Deadline,
+        }
+        let picked = {
+            let mut sel = crossbeam_channel::Select::new();
+            let job_idx = jobs_open.then(|| sel.recv(jobs));
+            let mut run_idxs: Vec<(usize, usize)> = Vec::new(); // (select idx, live idx)
+            for (i, l) in live.iter().enumerate() {
+                if let Some(RunSource::Channel(rx)) = &l.rs.source {
+                    run_idxs.push((sel.recv(rx), i));
+                }
+            }
+            let timeout = live.iter().filter_map(|l| l.rs.next_timeout()).min();
+            let oper = match timeout {
+                Some(t) => sel.select_timeout(t).ok(),
+                None => {
+                    if job_idx.is_none() && run_idxs.is_empty() {
+                        // Nothing can ever wake us and nothing has a
+                        // deadline: only reachable with live fd-mode runs,
+                        // which never suspend — defensive exit.
+                        return;
+                    }
+                    Some(sel.select())
+                }
+            };
+            match oper {
+                None => Picked::Deadline,
+                Some(op) => {
+                    let idx = op.index();
+                    if Some(idx) == job_idx {
+                        Picked::Job(op.recv(jobs).ok())
+                    } else {
+                        let (_, li) = run_idxs
+                            .iter()
+                            .find(|(si, _)| *si == idx)
+                            .expect("selected index belongs to a live run");
+                        let l = &live[*li];
+                        let Some(RunSource::Channel(rx)) = &l.rs.source else {
+                            unreachable!("selected a non-channel run");
+                        };
+                        let event = match op.recv(rx) {
+                            Ok(RunEvent::Frame(frame)) => LoopEvent::Frame(frame),
+                            Ok(RunEvent::ConnLost(detail)) => {
+                                LoopEvent::SourceClosed(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    detail.unwrap_or_else(|| "connection closed".to_string()),
+                                ))
+                            }
+                            Err(_) => LoopEvent::SourceClosed(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "demux gone",
+                            )),
+                        };
+                        Picked::Run(l.rs.token, event)
+                    }
+                }
+            }
+        };
+
+        match picked {
+            Picked::Job(None) => {
+                jobs_open = false;
+            }
+            Picked::Job(Some(msg)) => {
+                if dispatch_job(core, prefix_globals, imports, &mut live, msg) {
+                    taint_sweep(core, &mut live, jobs);
+                    return;
+                }
+            }
+            Picked::Run(token, event) => {
+                let idx = live
+                    .iter()
+                    .position(|l| l.rs.token == token)
+                    .expect("event for a live run");
+                let mut l = live.swap_remove(idx);
+                LAST_CULPRIT_RUN_ID
+                    .with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
+                let outcome = {
+                    let facts = RunFacts {
+                        call: l.job.call.as_ref(),
+                        reason: &core.reason,
+                        guard: &core.guard,
+                        cancel_handle: &core.guard.handle,
+                    };
+                    handle_loop_event(&mut core.isolate, &core.context, &facts, &mut l.rs, event)
+                };
+                let tainted_now = instance_tainted(core);
+                match outcome {
+                    Some(result) => {
+                        conclude_run(&mut core.isolate, &core.run_table, l, result, tainted_now);
+                    }
+                    None => {
+                        if tainted_now {
+                            // Bare terminate mid-turn (a routed abort landed
+                            // while this run's own turn ran): the owner is
+                            // still live — classify and conclude it here.
+                            let error = match core.reason.get() {
+                                Some(TerminationReason::Wall) => RunError::WallTimeout,
+                                Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                                Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                                None => RunError::Aborted,
+                            };
+                            let failure = l.rs.fail(error);
+                            conclude_run(
+                                &mut core.isolate,
+                                &core.run_table,
+                                l,
+                                Err(failure),
+                                true,
+                            );
+                        } else {
+                            live.push(l);
+                        }
+                    }
+                }
+                if tainted_now {
+                    taint_sweep(core, &mut live, jobs);
+                    return;
+                }
+            }
+            Picked::Deadline => {
+                // Conclude every run whose boundary deadline passed. No JS
+                // runs on this path, so no taint can arise.
+                let mut i = 0;
+                while i < live.len() {
+                    if deadline_expired(&live[i].rs) {
+                        let mut l = live.swap_remove(i);
+                        let result = boundary_deadline(&mut l.rs);
+                        conclude_run(&mut core.isolate, &core.run_table, l, result, false);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Start one job on the instance. Returns whether the instance came out of
+/// the dispatch tainted (mid-JS interruption during the start turn).
+fn dispatch_job(
+    core: &mut InstanceCore,
+    prefix_globals: &[ipc::HostGlobalDef],
+    imports: &[ipc::ImportBinding],
+    live: &mut Vec<LiveRun>,
+    (mut job, respond): JobMsg,
+) -> bool {
+    if let Some(slot) = &job.ctl_slot {
+        slot.set(core.guard.ctl()).ok();
+    }
+
+    // Direct-fd jobs run inline to completion — this thread is the fd's
+    // only reader for the duration, the pre-demux discipline. They must
+    // never coexist with suspended session runs: an inline run would stall
+    // the suspended runs' frames AND their deadlines (their guard is
+    // unarmed while parked), and its unconditional reason-reset inside
+    // run_call_on_core assumes sole occupancy. Today this holds by
+    // construction (fd jobs come only from the direct API and tests, where
+    // the instance serves one caller); the assert keeps it that way.
+    if let RunIo::Fd(fd) = job.io {
+        debug_assert!(
+            live.is_empty(),
+            "a direct-fd job must not run while session runs are suspended on the instance"
+        );
+        set_run_epilogue_spec(job.epilogue);
+        let outcome = run_call_on_core(
+            core,
+            job.code.as_deref(),
+            job.filename.as_deref().unwrap_or("<iso4>"),
+            prefix_globals,
+            job.limits,
+            &job.globals,
+            imports,
+            Some(fd),
+            Arc::clone(&job.call_id_counter),
+            job.call.as_ref(),
+        );
+        if let Some(complete) = job.complete.take() {
+            complete(outcome);
+        } else if let Some(respond) = respond {
+            respond.send(outcome).ok();
+        }
+        return false; // run_call_on_core's caller judges taint via release
+    }
+
+    // Session (channel) jobs interleave. The reason cell may only be reset
+    // while nothing else is in flight; when runs are live it is guaranteed
+    // clear (a set reason ends the loop).
+    if live.is_empty() {
+        core.reason.reset();
+    }
+    let token = if job.token != 0 {
+        job.token
+    } else {
+        alloc_run_token()
+    };
+    LAST_CULPRIT_RUN_ID.with(|c| c.set(job.epilogue.map(|e| e.run_id).unwrap_or(0)));
+    let start = std::time::Instant::now();
+    let cpu_budget = Arc::new(CpuBudget::new());
+    let bridge_log: Arc<Mutex<BridgeCallLog>> = Arc::new(Mutex::new(BridgeCallLog::default()));
+
+    // The run's table entry (see run_call_on_core — the same prelude).
+    let entry = RunCallState::new(job.limits.max_stdout_bytes, job.limits.max_stderr_bytes);
+    if core.warmup_logs_pending {
+        core.warmup_logs_pending = false;
+        let mut setup = core.run_table.setup_logs.borrow_mut();
+        let mut logs = entry.logs.borrow_mut();
+        logs.stdout = std::mem::take(&mut setup.stdout);
+        logs.stderr = std::mem::take(&mut setup.stderr);
+        logs.stdout_bytes = std::mem::take(&mut setup.stdout_bytes);
+        logs.stderr_bytes = std::mem::take(&mut setup.stderr_bytes);
+    }
+    let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
+    let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
+    let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    core.run_table.runs.borrow_mut().insert(token, entry);
+    RUN_TABLE_PTR.with(|c| c.set(std::ptr::addr_of!(*core.run_table)));
+
+    // Guard up before anything touches the retained context.
+    core.guard.set_for(
+        GuardTarget {
+            budget: Arc::clone(&cpu_budget),
+            cpu_cap_ms: job.limits.cpu_time_ms,
+            wall_deadline: (job.limits.wall_time_ms > 0)
+                .then(|| start + Duration::from_millis(job.limits.wall_time_ms as u64)),
+        },
+        token,
+    );
+
+    let placeholder_result = {
+        v8::scope!(let scope, &mut core.isolate);
+        let context = v8::Local::new(scope, &core.context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        install_prefix_bridge_placeholders(scope, prefix_globals, imports)
+    };
+    let cancel_handle = core.guard.handle.clone();
+    let started = match placeholder_result {
+        Err(error) => {
+            core.guard.clear();
+            let f = failure(
+                termination_or(&core.reason, error),
+                &unsafe { &*logs_ptr }.borrow(),
+                start,
+            );
+            None.ok_or(f)
+        }
+        Ok(()) => {
+            let io = std::mem::replace(&mut job.io, RunIo::None);
+            let mut ctx = CallPhaseCtx {
+                token,
+                table: std::ptr::addr_of!(*core.run_table),
+                limits: &job.limits,
+                globals: &job.globals,
+                imports,
+                io,
+                call_id_counter: Arc::clone(&job.call_id_counter),
+                call: job.call.as_ref(),
+                start,
+                cpu_budget: &cpu_budget,
+                bridge_log: &bridge_log,
+                reason: &core.reason,
+                logs: logs_ptr,
+                pending: pending_ptr,
+                streams: streams_ptr,
+                epilogue: job.epilogue,
+                cancel_handle: &cancel_handle,
+            };
+            let InstanceCore {
+                isolate,
+                context,
+                prefix_module,
+                stub_slots,
+                guard,
+                ..
+            } = core;
+            Ok(begin_call(
+                isolate,
+                context,
+                prefix_module.as_ref(),
+                job.code.as_deref(),
+                job.filename.as_deref().unwrap_or("<iso4>"),
+                stub_slots,
+                guard,
+                &mut ctx,
+            ))
+        }
+    };
+
+    let tainted_now = instance_tainted(core);
+    match started {
+        Err(f) => {
+            let l = LiveRun {
+                rs: RunState {
+                    token,
+                    table: std::ptr::addr_of!(*core.run_table),
+                    limits: job.limits,
+                    start,
+                    epilogue: job.epilogue,
+                    source: None,
+                    sink: None,
+                    cpu_budget,
+                    bridge_log,
+                    bridge_error: Arc::new(OnceLock::new()),
+                    resolvers: Arc::new(Mutex::new(HashMap::new())),
+                    logs: logs_ptr,
+                    pending: pending_ptr,
+                    streams: streams_ptr,
+                    phase: RunPhase::Starting,
+                },
+                job,
+                respond,
+            };
+            conclude_run(&mut core.isolate, &core.run_table, l, Err(f), tainted_now);
+        }
+        Ok((rs, outcome)) => {
+            let l = LiveRun { rs, job, respond };
+            match outcome {
+                ScanOutcome::Finished(result) => {
+                    conclude_run(&mut core.isolate, &core.run_table, l, *result, tainted_now);
+                }
+                ScanOutcome::Continue => {
+                    if tainted_now {
+                        let error = match core.reason.get() {
+                            Some(TerminationReason::Wall) => RunError::WallTimeout,
+                            Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                            Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                            None => RunError::Aborted,
+                        };
+                        let f = l.rs.fail(error);
+                        conclude_run(&mut core.isolate, &core.run_table, l, Err(f), true);
+                    } else {
+                        live.push(l);
+                    }
+                }
+            }
+        }
+    }
+    tainted_now
+}
+
+/// The taint path: every other in-flight run on the instance fails with
+/// `ERR_INSTANCE_RESET` carrying the cause class and the culprit's wire run
+/// id (E1 ruling 4), and queued jobs that never started are failed loudly.
+/// The caller returns afterwards; the instance dies with its loop.
+fn taint_sweep(
+    core: &mut InstanceCore,
+    live: &mut Vec<LiveRun>,
+    jobs: &crossbeam_channel::Receiver<JobMsg>,
+) {
+    let cause = match core.reason.get() {
+        Some(TerminationReason::Cpu) => ResetCause::Cpu,
+        Some(TerminationReason::Memory) => ResetCause::Memory,
+        Some(TerminationReason::Wall) => ResetCause::Wall,
+        None => ResetCause::Abort,
+    };
+    // The culprit was concluded by the caller before the sweep; its wire id
+    // travels via the guard's last executing turn... the loop tracks it as
+    // the run it just processed. The sweep is only ever entered right after
+    // that conclusion, so the culprit is simply the one run NOT in `live`.
+    // Its wire id is recorded by the caller through `LAST_CULPRIT_RUN_ID`.
+    let culprit_run_id = LAST_CULPRIT_RUN_ID.with(|c| c.get());
+    for l in live.drain(..) {
+        let f = l.rs.fail(RunError::InstanceReset {
+            cause,
+            culprit_run_id,
+        });
+        conclude_run(&mut core.isolate, &core.run_table, l, Err(f), true);
+    }
+    // Jobs already queued but never started: answer them instead of letting
+    // their callers hang on a dropped channel.
+    while let Ok((mut job, respond)) = jobs.try_recv() {
+        let outcome = CallOutcome {
+            result: Err(failure(
+                RunError::InstanceReset {
+                    cause,
+                    culprit_run_id,
+                },
+                &LogBuffers::default(),
+                std::time::Instant::now(),
+            )),
+            tainted: true,
+            heap_used_bytes: 0,
+        };
+        if let Some(complete) = job.complete.take() {
+            complete(outcome);
+        } else if let Some(respond) = respond {
+            respond.send(outcome).ok();
+        }
+    }
+}
+
+thread_local! {
+    /// The wire run id of the turn owner most recently processed on this
+    /// thread — the culprit named in an `ERR_INSTANCE_RESET` sweep.
+    static LAST_CULPRIT_RUN_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn heap_used(isolate: &mut v8::OwnedIsolate) -> u64 {
@@ -2911,295 +4154,6 @@ fn close_run_streams(streams: *const StreamTable) {
             if stream.ended.is_none() && !stream.cancelled {
                 send_stream_cancel(&state, *id, "run ended");
             }
-        }
-    }
-    STREAM_TABLE_PTR.with(|c| c.set(std::ptr::null()));
-}
-
-struct SettleCtx<'a> {
-    /// Socket for BridgeResponse reads. `None` when no bridge stub exists.
-    stream_fd: Option<RawFd>,
-    limits: &'a Limits,
-    start: std::time::Instant,
-    reason: &'a Arc<ReasonCell>,
-    cpu_budget: &'a Arc<CpuBudget>,
-    bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
-    bridge_error: &'a Arc<OnceLock<RunError>>,
-    pending_resolvers: &'a PendingResolvers,
-    cancel_handle: &'a v8::IsolateHandle,
-    /// The run's streamed-body registry: chunk/end frames arriving between
-    /// bridge responses are delivered here.
-    streams: *const StreamTable,
-}
-
-/// Drive microtasks until `promise` settles, draining `BridgeResponse` frames
-/// and honouring `Terminate` in between — the poll loop.
-///
-/// With MicrotasksPolicy::Explicit, microtasks do not run automatically.
-/// After each BridgeResponse is resolved we call perform_microtask_checkpoint()
-/// to advance the await chains, handling sequential bridge calls, concurrent
-/// bridge calls (both frames sent before yielding; responses route by callId),
-/// and no bridge calls at all (the caller performs one checkpoint before this
-/// so already-resolvable promises settle without touching the socket).
-///
-/// Returns `Fulfilled`, or `Pending` when there is no session socket to wait
-/// on (an await that nothing in the isolate can ever resolve); every other
-/// outcome is the run's failure, returned as the `RunError` the caller wraps
-/// with `failure()`. Guards are NOT cancelled here — the caller decides when
-/// the run's JS is really over (a call may still follow the module promise);
-/// error paths rely on the `GuardCanceller` drop guard.
-fn settle_promise(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-    promise: v8::Local<v8::Promise>,
-    ctx: &SettleCtx<'_>,
-) -> Result<v8::PromiseState, RunError> {
-    loop {
-        match promise.state() {
-            v8::PromiseState::Fulfilled => return Ok(v8::PromiseState::Fulfilled),
-            v8::PromiseState::Rejected => {
-                let rejection = promise.result(scope);
-                // A rejection tagged as a host bridge error surfaces as
-                // ERR_HOST_BRIDGE with the handler's name/message/fields intact.
-                if let Some(err) = host_bridge_error_from_rejection(scope, rejection) {
-                    return Err(err);
-                }
-                if let Some(err) = ctx.bridge_error.get() {
-                    return Err(owned_bridge_error(err));
-                }
-                return Err(runtime_error_from_value(scope, rejection));
-            }
-            v8::PromiseState::Pending => {}
-        }
-
-        // A fatal bridge error set during a microtask checkpoint (bridge
-        // callbacks run inside checkpoints) has terminated execution: no
-        // further BridgeResponse will ever arrive, so bail out before
-        // blocking on the socket — otherwise this run would sit until the
-        // wall timeout and report the wrong error.
-        if let Some(err) = ctx.bridge_error.get() {
-            return Err(owned_bridge_error(err));
-        }
-
-        // ── Drain one BridgeResponse frame ──────────────────────────────────
-        //
-        // Peek at the socket: if a byte is available a full frame is likely
-        // ready (TS handlers write frames atomically).  If nothing is there
-        // yet we do a blocking wait respecting the remaining wall budget.
-        let frame_result: Result<ipc::TsToRustFrame, io::Error> = if let Some(fd) = ctx.stream_fd {
-            // SAFETY: same ManuallyDrop pattern as bridge_global_callback.
-            let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
-
-            // Blocking read — pause CPU budget so host-handler latency is not
-            // charged against the sandbox.  Set a read timeout equal to the
-            // remaining wall budget so a stalled handler is caught here.
-            let timeout = if ctx.limits.wall_time_ms > 0 {
-                let budget = Duration::from_millis(ctx.limits.wall_time_ms as u64);
-                let remaining = budget
-                    .saturating_sub(ctx.start.elapsed())
-                    .max(Duration::from_millis(1));
-                Some(remaining)
-            } else {
-                None
-            };
-            ctx.cpu_budget.leave();
-            if let Some(t) = timeout {
-                sock.set_read_timeout(Some(t)).ok();
-            }
-            // Cap BridgeResponse frame reads by the sandbox memory budget.
-            // memory_mb = 0 means the caller explicitly opted out of the memory
-            // cap (an explicit 0 on the wire; absent would have resolved to the
-            // default); fall back to the global framing cap as a parsing safety
-            // limit only in that case.
-            let bridge_frame_limit: u32 = if ctx.limits.memory_mb > 0 {
-                ctx.limits.memory_mb.saturating_mul(1024 * 1024)
-            } else {
-                ipc::DEFAULT_MAX_FRAME_LENGTH
-            };
-            let result = ipc::read_ts_to_rust_frame_with_limit(&mut *sock, bridge_frame_limit);
-            if ctx.limits.wall_time_ms > 0 {
-                sock.set_read_timeout(None).ok();
-            }
-            ctx.cpu_budget.enter();
-            result
-        } else {
-            // No bridge globals — Pending with no socket means an await that
-            // nothing can ever resolve; the caller surfaces the error.
-            return Ok(v8::PromiseState::Pending);
-        };
-
-        match frame_result {
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                // Wall budget exhausted during blocking wait.
-                ctx.reason.set(TerminationReason::Wall);
-                return Err(RunError::WallTimeout);
-            }
-            Err(e) => {
-                return Err(RunError::Internal(format!("poll loop socket read: {e}")));
-            }
-            Ok(frame) => {
-                // A frame arrived — the runtime holds control, so this is an
-                // observable I/O boundary: the frozen clock advances before
-                // anything of the frame is delivered into JS.
-                crate::webtypes::advance_frozen_clock(scope);
-                // ── Validate and decode the frame ────────────────────────
-                match frame.message_type {
-                    ipc::TsToRustMessageType::BridgeResponse => {}
-                    ipc::TsToRustMessageType::Terminate => {
-                        // Graceful abort. The TS host sends `Terminate`
-                        // (carrying the run ID) when its `AbortSignal` fires
-                        // while the sandbox is suspended awaiting a bridge
-                        // response — precisely the durable-isolates suspension
-                        // case, and precisely when the V8 thread is parked here
-                        // reading the socket and can observe the frame.
-                        //
-                        // Stop the run and return `Aborted`; `run_module` stamps
-                        // the CPU time and the bridge-call records gathered so
-                        // far onto the failure, so the aborted result carries
-                        // real telemetry instead of the synthesized zeros of the
-                        // socket-teardown fallback.
-                        //
-                        // NOT-IDEAL / DEFERRED: this only reaches a run that is
-                        // parked on this socket read. A purely CPU-bound run
-                        // (tight loop, no bridge call in flight) never returns
-                        // here, so a control-message `Terminate` cannot interrupt
-                        // it — that isolate is reclaimed only when the CPU guard
-                        // fires (bounded by `cpuTimeMs`), and the TS side falls
-                        // back to tearing the socket down. Promptly interrupting
-                        // a busy isolate is deliberately deferred; see
-                        // DESIGN.md §14.7.
-                        //
-                        // Only one run is ever in flight per connection, so the
-                        // run ID in the payload is redundant for routing; parse
-                        // it for validation/diagnostics only.
-                        match ipc::parse_terminate_payload(&frame.payload) {
-                            Ok(run_id) => {
-                                eprintln!("[iso4-v8] Terminate received for run {run_id} — aborting")
-                            }
-                            Err(e) => eprintln!(
-                                "[iso4-v8] Terminate received with malformed payload ({e}) — aborting"
-                            ),
-                        }
-                        ctx.cancel_handle.terminate_execution();
-                        return Err(RunError::Aborted);
-                    }
-                    ipc::TsToRustMessageType::StreamChunk
-                    | ipc::TsToRustMessageType::StreamEnd => {
-                        deliver_stream_frame(scope, ctx.streams, &frame)?;
-                        // Run the continuations the delivery may have resolved,
-                        // then keep polling — a stream frame settles no
-                        // bridge call and no promise state on its own.
-                        scope.perform_microtask_checkpoint();
-                        continue;
-                    }
-                    other => {
-                        return Err(RunError::Internal(format!(
-                            "poll loop: expected BridgeResponse or Terminate, got {other:?}"
-                        )));
-                    }
-                }
-                // Frame size is already bounded by bridge_frame_limit (= memoryMb
-                // or DEFAULT_MAX_FRAME_LENGTH) at the read_frame_with_limit call
-                // above, so no secondary payload length check is needed here.
-                match wire::parse_bridge_response_payload(&frame.payload) {
-                    Err(e) => {
-                        return Err(RunError::Internal(format!(
-                            "poll loop: response decode: {e}"
-                        )));
-                    }
-                    Ok((call_id, result)) => {
-                        // Settle the call's bridge record: round-trip time on
-                        // the run clock plus the response value's serialized
-                        // size (frame payload minus the callId + ok header).
-                        // Unknown callIds are ignored inside settle().
-                        let response_value_bytes = if result.is_ok() {
-                            frame.payload.len().saturating_sub(5) as u32
-                        } else {
-                            0
-                        };
-                        ctx.bridge_log
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .settle(
-                                call_id,
-                                elapsed_ms(ctx.start),
-                                result.is_ok(),
-                                response_value_bytes,
-                            );
-                        // Route to the matching resolver.  An unknown callId
-                        // means a stale frame from a previous run — discard.
-                        let entry = ctx
-                            .pending_resolvers
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .remove(&call_id);
-                        if let Some(PendingResolver(global_resolver)) = entry {
-                            let resolver = v8::Local::new(scope, global_resolver);
-                            match result {
-                                Ok(value_blob) => {
-                                    let decoded = match &value_blob {
-                                        // Absent value slot → the handler
-                                        // returned nothing.
-                                        None => Some(v8::undefined(scope).into()),
-                                        // Web-aware: a bridge handler may
-                                        // return a Request/Response.
-                                        Some(bytes) => {
-                                            blob::deserialize_value_with_web_types(scope, bytes)
-                                        }
-                                    };
-                                    if let Some(v8_val) = decoded {
-                                        resolver.resolve(scope, v8_val);
-                                    } else {
-                                        let detail = blob::take_codec_error()
-                                            .map(|e| e.message().to_string())
-                                            .unwrap_or_else(|| {
-                                                "failed to deserialize response value".to_string()
-                                            });
-                                        let msg = v8::String::new(
-                                            scope,
-                                            &format!("[iso4] bridge: {detail}"),
-                                        )
-                                        .unwrap();
-                                        resolver.reject(scope, msg.into());
-                                    }
-                                }
-                                Err(bridge_err) => {
-                                    // Reject with a real Error carrying the
-                                    // handler's name/message/fields, tagged
-                                    // a private symbol so the Rejected arm can
-                                    // classify an *uncaught* one as HostBridge.
-                                    // Sandbox code may catch it and continue —
-                                    // host handler errors are not run-fatal.
-                                    let error_obj = host_bridge_error_to_v8(scope, &bridge_err);
-                                    resolver.reject(scope, error_obj);
-                                }
-                            }
-                        }
-                        // Unknown callId → silently discard (cross-run contamination guard).
-                    }
-                }
-            }
-        }
-
-        // ── Advance all pending await chains ─────────────────────────────────
-        // This is the only place microtasks run (Explicit policy).  After
-        // resolving the Promise above, the microtask queued by the `await`
-        // resumes execution until the code hits its next `await` (sending
-        // another BridgeCall) or completes.
-        scope.perform_microtask_checkpoint();
-
-        // Check for errors set during the checkpoint (inside bridge callbacks).
-        if let Some(err) = ctx.bridge_error.get() {
-            return Err(owned_bridge_error(err));
-        }
-        // Check if a guard thread fired termination during the checkpoint.
-        if let Some(r) = ctx.reason.get() {
-            return Err(match r {
-                TerminationReason::Wall => RunError::WallTimeout,
-                TerminationReason::Cpu => RunError::CpuTimeout,
-                TerminationReason::Memory => RunError::MemoryLimit,
-            });
         }
     }
 }
@@ -3402,8 +4356,8 @@ fn evaluate_prefix_module(
     Ok(v8::Global::new(scope, module))
 }
 
-/// Validate prefix code in a throwaway regular isolate: compile + instantiate
-/// + evaluate exactly as a run will. Any failure (syntax error, unresolved
+/// Validate prefix code in a throwaway regular isolate: compile, instantiate
+/// and evaluate exactly as a run will. Any failure (syntax error, unresolved
 /// import, throwing top-level code) returns a clean error at `prepare()` time
 /// instead of on the first run.
 ///
@@ -3442,19 +4396,12 @@ fn validate_prefix_module(
 
     let warmup_budget = Arc::new(CpuBudget::new());
     let handle = isolate.thread_safe_handle();
-    let (cancel_wall, _wall_join) =
-        start_wall_guard(handle.clone(), Arc::clone(&reason), WARMUP_WALL_MS);
-    let (cancel_cpu, _cpu_join) = start_cpu_guard(
-        handle,
-        Arc::clone(&reason),
-        Arc::clone(&warmup_budget),
-        WARMUP_CPU_MS,
-    );
-    let _guard_canceller = GuardCanceller {
-        cancel_wall: &cancel_wall,
-        cancel_cpu: &cancel_cpu,
-        budget: &warmup_budget,
-    };
+    let guard = InstanceGuard::spawn(handle, Arc::clone(&reason));
+    guard.set(GuardTarget {
+        budget: Arc::clone(&warmup_budget),
+        cpu_cap_ms: WARMUP_CPU_MS,
+        wall_deadline: Some(start + Duration::from_millis(WARMUP_WALL_MS as u64)),
+    });
 
     v8::scope!(let scope, &mut isolate);
     let context = v8::Context::new(scope, Default::default());
@@ -3469,9 +4416,10 @@ fn validate_prefix_module(
         )
     })?;
     // Disarmed waitUntil for surface parity: `typeof waitUntil` matches run
-    // code; calling it here throws the catchable setup-time error.
-    let validation_pending = PendingWork::boxed();
-    install_wait_until(scope, &*validation_pending).map_err(|e| {
+    // code; calling it here throws the catchable setup-time error (no run
+    // entry exists in this throwaway table).
+    let validation_table = RunTable::boxed();
+    install_wait_until(scope, &*validation_table).map_err(|e| {
         failure(termination_or(&reason, e), &logs, start)
     })?;
     v8::tc_scope!(let scope, scope);
@@ -4019,87 +4967,142 @@ fn is_valid_export_identifier(name: &str) -> bool {
 /// signals the guard, and a guard whose deadline expired concurrently may
 /// still be about to set the reason and terminate — joining makes any fire
 /// visible to the taint check instead of landing on the next call.
-type GuardHandle = (crossbeam_channel::Sender<()>, Option<std::thread::JoinHandle<()>>);
-
-fn start_wall_guard(
-    handle: v8::IsolateHandle,
-    reason: Arc<ReasonCell>,
-    wall_time_ms: u32,
-) -> GuardHandle {
-    let (tx, rx) = crossbeam_channel::bounded::<()>(1);
-    let join = if wall_time_ms > 0 {
-        Some(std::thread::spawn(move || {
-            let timeout = Duration::from_millis(wall_time_ms as u64);
-            if let Err(crossbeam_channel::RecvTimeoutError::Timeout) = rx.recv_timeout(timeout) {
-                reason.set(TerminationReason::Wall); // first writer wins
-                handle.terminate_execution();
-            }
-            // Err(Disconnected) means cancel_guards() fired first - do nothing.
-        }))
-    } else {
-        None
-    };
-    (tx, join)
+/// What the instance guard enforces while a turn is executing.
+struct GuardTarget {
+    budget: Arc<CpuBudget>,
+    /// 0 = no CPU cap.
+    cpu_cap_ms: u32,
+    /// Absolute wall deadline, enforced mid-turn too, so a synchronous spin
+    /// under `cpuTimeMs: 0` still dies at the wall (E2 ruling closing the
+    /// boundary-only gap). `None` = no wall cap this turn.
+    wall_deadline: Option<std::time::Instant>,
 }
 
-/// Spawn a CPU-budget guard thread. Returns a cancel sender.
-/// Polls `budget.elapsed_ms()` every 10 ms; fires when it exceeds `cpu_time_ms`.
-/// Phase 4 hook: call `budget.leave()` before bridge calls and `budget.enter()`
-/// after to exclude host wait time from the measurement.
-fn start_cpu_guard(
+/// ONE guard thread per instance (E1 ruling 2), watching whatever turn is
+/// currently executing on it. The target is set at turn entry and cleared at
+/// turn exit UNDER THE LOCK, and the guard fires under the same lock, so a
+/// fire and a clear serialize: after `clear()` returns, no fire for that
+/// turn can happen anymore, and any fire that won the race is already
+/// visible in the reason cell — no thread join needed to observe it.
+/// Between turns the target is empty and the guard idles: a wall deadline
+/// passing while a run is parked is the loop's business (a clean boundary
+/// failure), never the guard's.
+pub struct InstanceGuard {
+    target: Arc<Mutex<Option<GuardTarget>>>,
+    /// The token of the run whose turn is executing right now (0 = none).
+    /// Written under the target lock, so it serializes with turn exit — the
+    /// session demux consults it to decide gentle-abandon vs mid-turn
+    /// terminate for a Terminate frame (E1 ruling 5's fallback).
+    executing: Arc<AtomicU64>,
     handle: v8::IsolateHandle,
-    reason: Arc<ReasonCell>,
-    budget: Arc<CpuBudget>,
-    cpu_time_ms: u32,
-) -> GuardHandle {
-    let (tx, rx) = crossbeam_channel::bounded::<()>(1);
-    let join = if cpu_time_ms > 0 {
-        Some(std::thread::spawn(move || loop {
-            match rx.recv_timeout(Duration::from_millis(10)) {
-                Ok(_) | Err(RecvTimeoutError::Disconnected) => break,
-                Err(RecvTimeoutError::Timeout) => {
-                    if budget.elapsed_ms() >= cpu_time_ms as u64 {
-                        reason.set(TerminationReason::Cpu); // first writer wins
-                        handle.terminate_execution();
-                        break;
+    /// Un-parks the guard thread when a turn arms it; dropping the sender
+    /// stops the thread.
+    wake: crossbeam_channel::Sender<()>,
+}
+
+/// The cross-thread face of an [`InstanceGuard`], handed to the session
+/// demux so a Terminate for a run that is mid-turn can terminate it.
+#[derive(Clone)]
+pub struct GuardCtl {
+    target: Arc<Mutex<Option<GuardTarget>>>,
+    executing: Arc<AtomicU64>,
+    handle: v8::IsolateHandle,
+}
+
+impl GuardCtl {
+    /// Terminate execution iff `token`'s turn is executing right now.
+    /// Serialized with turn exit under the target lock: a `true` return
+    /// means the kill landed mid-turn (the taint path); `false` means the
+    /// run is between turns and the routed Terminate frame will abandon it
+    /// cleanly.
+    pub fn abort_executing(&self, token: u64) -> bool {
+        let _lock = self.target.lock().unwrap_or_else(|p| p.into_inner());
+        if self.executing.load(Ordering::Relaxed) == token {
+            self.handle.terminate_execution();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl InstanceGuard {
+    fn spawn(handle: v8::IsolateHandle, reason: Arc<ReasonCell>) -> Self {
+        let target: Arc<Mutex<Option<GuardTarget>>> = Arc::new(Mutex::new(None));
+        // Doubles as the wake nudge and the stop signal: `set_for` sends a
+        // unit to un-park the thread; dropping the guard disconnects it.
+        let (wake, rx) = crossbeam_channel::bounded::<()>(1);
+        let watched = Arc::clone(&target);
+        let fire_handle = handle.clone();
+        std::thread::Builder::new()
+            .name("iso4-instance-guard".to_string())
+            .spawn(move || loop {
+                // Park while disarmed: an idle instance costs no wakeups at
+                // all (the old model had no guard thread on idle instances;
+                // this one exists but sleeps until a turn arms it).
+                let armed = watched
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some();
+                if !armed {
+                    match rx.recv() {
+                        Ok(_) => continue, // armed — fall into the poll cadence
+                        Err(_) => return,  // guard dropped
                     }
                 }
-            }
-        }))
-    } else {
-        None
-    };
-    (tx, join)
-}
+                match rx.recv_timeout(Duration::from_millis(10)) {
+                    // A nudge while already armed — re-check immediately.
+                    Ok(_) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+                let guard = watched.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(t) = guard.as_ref() else { continue };
+                if t.cpu_cap_ms > 0 && t.budget.elapsed_ms() >= t.cpu_cap_ms as u64 {
+                    reason.set(TerminationReason::Cpu); // first writer wins
+                    fire_handle.terminate_execution();
+                } else if t.wall_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    reason.set(TerminationReason::Wall); // first writer wins
+                    fire_handle.terminate_execution();
+                }
+            })
+            .expect("failed to spawn instance guard thread");
+        Self {
+            target,
+            executing: Arc::new(AtomicU64::new(0)),
+            handle,
+            wake,
+        }
+    }
 
-/// Cancel both guard threads and close the CPU epoch.
-///
-/// Idempotent: safe to call more than once on the same guard set.
-/// Must be called on every exit path from `run_module` after evaluation.
-fn cancel_guards(
-    cancel_wall: &crossbeam_channel::Sender<()>,
-    cancel_cpu: &crossbeam_channel::Sender<()>,
-    budget: &CpuBudget,
-) {
-    budget.leave();
-    let _ = cancel_wall.send(());
-    let _ = cancel_cpu.send(());
-}
+    pub fn ctl(&self) -> GuardCtl {
+        GuardCtl {
+            target: Arc::clone(&self.target),
+            executing: Arc::clone(&self.executing),
+            handle: self.handle.clone(),
+        }
+    }
 
-/// RAII guard that cancels limit-enforcement threads on drop.
-///
-/// Ensures guards exit promptly even when `run_module` returns early via `?`.
-/// All explicit `cancel_guards(...)` calls are kept for clarity and early
-/// cancellation; this struct is defence-in-depth for error-path returns.
-struct GuardCanceller<'a> {
-    cancel_wall: &'a crossbeam_channel::Sender<()>,
-    cancel_cpu: &'a crossbeam_channel::Sender<()>,
-    budget: &'a CpuBudget,
-}
+    fn set(&self, t: GuardTarget) {
+        self.set_for(t, 0)
+    }
 
-impl Drop for GuardCanceller<'_> {
-    fn drop(&mut self) {
-        cancel_guards(self.cancel_wall, self.cancel_cpu, self.budget);
+    /// Arm the target and mark `token`'s turn as the one executing (0 for
+    /// spans that are not a run's turn, e.g. warm-up).
+    fn set_for(&self, t: GuardTarget, token: u64) {
+        {
+            let mut guard = self.target.lock().unwrap_or_else(|p| p.into_inner());
+            self.executing.store(token, Ordering::Relaxed);
+            *guard = Some(t);
+        }
+        // Un-park the guard thread; a pending nudge is as good as a new one.
+        self.wake.try_send(()).ok();
+    }
+
+    fn clear(&self) {
+        let mut guard = self.target.lock().unwrap_or_else(|p| p.into_inner());
+        self.executing.store(0, Ordering::Relaxed);
+        *guard = None;
     }
 }
 
@@ -4107,21 +5110,19 @@ impl Drop for GuardCanceller<'_> {
 //
 // Every host-declared global (fetch, myTool, anything else) goes through the
 // same generic bridge callback. The callback:
-//   1. Serialises the JS arguments into one value blob (rejects function args).
-//   2. Calls cpu_budget.leave() to pause the CPU budget during host wait.
-//   3. Writes a BridgeCall frame on the session socket.
-//   4. Blocks reading a BridgeResponse frame (the V8 thread is already blocked
-//      in the host callback, so no V8 activity can happen during this wait).
-//   5. Calls cpu_budget.enter() to resume counting.
-//   6. On success: deserialises the response blob back to a V8 value.
-//   7. On handler error: rejects the pending Promise with a real Error
-//      carrying the handler's name/message/fields (tagged via a private
-//      symbol). Sandbox code may catch it and continue; uncaught it
-//      surfaces as ERR_HOST_BRIDGE. Only limit violations (maxBridgeCalls,
-//      payload too large, function args) store a RunError in the shared
-//      OnceLock and are fatal to the run: they call terminate_execution()
-//      so sandbox code cannot catch its way past a violation (see
-//      fatal_bridge_error).
+//   1. Resolves the CALLING run's binding by its attributed token (one stub
+//      Function serves every run that binds the name).
+//   2. Serialises the JS arguments into one value blob (rejects function args).
+//   3. Writes a BridgeCall frame through the run's sink and returns a pending
+//      Promise immediately — it never reads the socket; the instance loop
+//      delivers the BridgeResponse as a later turn and resolves the Promise.
+//   4. On handler error the loop rejects with a real Error carrying the
+//      handler's name/message/fields (tagged via a private symbol). Sandbox
+//      code may catch it and continue; uncaught it surfaces as
+//      ERR_HOST_BRIDGE. Only limit violations (maxBridgeCalls, payload too
+//      large, function args) store a RunError in the shared OnceLock and are
+//      fatal to the run: they call terminate_execution() so sandbox code
+//      cannot catch its way past a violation (see fatal_bridge_error).
 //
 // fetch is NOT special. It gets the same callback as every other global.
 // The host handler decides what the arguments mean and what to return.
@@ -4151,21 +5152,17 @@ type PendingResolvers = Arc<Mutex<HashMap<u32, PendingResolver>>>;
 /// The V8 `Function` a bridge stub installs holds a raw `External` pointer to
 /// its slot, and sandbox code can stash that function across calls on a warm
 /// instance (`globalThis.saved = fetch`) — so the pointee must outlive every
-/// call, not just the one that installed it. The slot lives in `InstanceCore`
-/// (or the one-off run's locals) and is re-pointed at fresh per-call state by
-/// `install_bridge_globals`; between calls it is disarmed (`None`), so a
-/// stashed stub throws a catchable error instead of dereferencing freed
-/// per-call state or writing to a stale socket fd.
-///
-/// Only the isolate's owner thread touches a slot — installs between calls,
-/// the callback during JS — so a `RefCell` suffices. Nested shared borrows
-/// (a bridge call made while another callback serializes) are fine; the only
-/// `borrow_mut` sites run from Rust between calls, never during JS.
+/// call, not just the one that installed it. The slot carries only identity:
+/// the stub name and the instance's run table. The per-run half (socket sink,
+/// counters, limits) lives in the calling run's [`RunCallState::stubs`] map,
+/// resolved per invocation by the attributed token — so one Function object
+/// serves every run that binds the name, each with its own state, and a run
+/// that did not bind it gets a catchable error instead of a stale dispatch.
 struct StubSlot {
-    /// The global-object key this slot serves — outside the `Option` so a
-    /// disarmed call can still name itself in its error message.
+    /// The global-object key this slot serves.
     stub_name: String,
-    data: RefCell<Option<GlobalCallbackData>>,
+    /// The instance's run table (instance-lifetime Box, like the slot).
+    table: *const RunTable,
 }
 
 /// Instance-lifetime slot table, keyed by stub name. Boxed so the addresses
@@ -4173,11 +5170,15 @@ struct StubSlot {
 #[allow(clippy::vec_box)]
 type StubSlots = HashMap<String, Box<StubSlot>>;
 
+#[derive(Clone)]
 struct GlobalCallbackData {
-    /// Raw file descriptor for the session socket.  The callback writes a
+    /// The owning run's wire id, leading every BridgeCall frame this stub
+    /// writes (0 = a direct-API run with no wire identity).
+    run_id: u32,
+    /// Outbound frame sink for the session socket.  The callback writes a
     /// BridgeCall frame here (non-blocking in practice) and returns immediately;
-    /// it never reads from the socket.  The fd remains owned by the session thread.
-    stream_fd: RawFd,
+    /// it never reads from the socket.
+    sink: ipc::FrameSink,
     /// Monotonic bridge call-ID counter, shared across all stubs in one run.
     call_id: Arc<AtomicU32>,
     /// First bridge error wins. Written once, read after evaluate() returns.
@@ -4282,11 +5283,23 @@ fn bridge_global_callback(
     // outlives every V8 callback of this isolate — including bridge stubs
     // stashed by sandbox code across calls on a warm instance.
     let slot = unsafe { &*slot };
-    let data_ref = slot.data.borrow();
-    let Some(data) = data_ref.as_ref() else {
-        // Disarmed: this Function was captured during an earlier call on
-        // this instance and is not bound for the current one. Catchable —
-        // exactly like the prepare()-time placeholders.
+    // SAFETY: the slot's table pointer is instance-lifetime like the slot.
+    let table = unsafe { &*slot.table };
+    let token = attributed_token(scope, table);
+    let state = table.state_ptr(token);
+    let data: Option<GlobalCallbackData> = if state.is_null() {
+        None
+    } else {
+        // Clone the binding out (cheap: names + Arcs) so no table borrow is
+        // held across the serialization below, which can run guest getters.
+        // SAFETY: entry pointers are valid for the remainder of the turn.
+        unsafe { &*state }.stubs.borrow().get(&slot.stub_name).cloned()
+    };
+    let Some(data) = data else {
+        // The calling run did not bind this name: the Function was captured
+        // during an earlier call on this warm instance (or by a co-resident
+        // run that declared it). Catchable — exactly like the
+        // prepare()-time placeholders.
         throw_v8_error(
             scope,
             &format!(
@@ -4297,6 +5310,7 @@ fn bridge_global_callback(
         );
         return;
     };
+    let data = &data;
 
     // Attempt timestamp on the run clock — recorded for every attempt,
     // including ones blocked below. Blocked import dispatches record under
@@ -4440,6 +5454,7 @@ fn bridge_global_callback(
         return;
     };
     let bridge_call_header = wire::encode_bridge_call_header(
+        data.run_id,
         call_id,
         target_kind,
         specifier,
@@ -4459,11 +5474,7 @@ fn bridge_global_callback(
     }
 
     // ── Write BridgeCall frame (non-blocking in practice) ─────────────────
-    // SAFETY: stream_fd is the live session socket owned by handle_client.
-    // ManuallyDrop prevents closing it here.
-    let mut stream = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(data.stream_fd) });
-    if let Err(e) = ipc::write_rust_to_ts_frame_parts(
-        &mut *stream,
+    if let Err(e) = data.sink.write_parts(
         ipc::RustToTsMessageType::BridgeCall,
         &bridge_call_header,
         &args_blob,
@@ -4540,7 +5551,10 @@ struct BridgeStubSpec {
 fn install_bridge_globals(
     scope: &mut v8::PinScope,
     stubs: &[BridgeStubSpec],
-    stream_fd: RawFd,
+    token: u64,
+    table: *const RunTable,
+    run_id: u32,
+    sink: ipc::FrameSink,
     call_id: Arc<AtomicU32>,
     bridge_error: Arc<OnceLock<RunError>>,
     max_bridge_call_bytes: u32,
@@ -4560,23 +5574,38 @@ fn install_bridge_globals(
         let slot = slots.entry(spec.stub_name.clone()).or_insert_with(|| {
             Box::new(StubSlot {
                 stub_name: spec.stub_name.clone(),
-                data: RefCell::new(None),
+                table,
             })
         });
-        *slot.data.borrow_mut() = Some(GlobalCallbackData {
-            stream_fd,
-            call_id: Arc::clone(&call_id),
-            bridge_error: Arc::clone(&bridge_error),
-            stub_name: spec.stub_name.clone(),
-            record_name: spec.record_name.clone(),
-            import_handles: spec.import_handles.clone(),
-            max_bridge_call_bytes,
-            bridge_call_count: Arc::clone(&bridge_call_count),
-            max_bridge_calls,
-            resolver_map: Arc::clone(&resolver_map),
-            run_start,
-            log: Arc::clone(&log),
-        });
+        // This run's binding for the name — the callback resolves it per
+        // invocation by the attributed token, so co-resident runs never see
+        // each other's sockets or counters.
+        {
+            // SAFETY: `table` is the instance-lifetime RunTable Box.
+            let table = unsafe { &*table };
+            let runs = table.runs.borrow();
+            let entry = runs
+                .get(&token)
+                .expect("install_bridge_globals: run entry exists for the whole call");
+            entry.stubs.borrow_mut().insert(
+                spec.stub_name.clone(),
+                GlobalCallbackData {
+                    run_id,
+                    sink: sink.clone(),
+                    call_id: Arc::clone(&call_id),
+                    bridge_error: Arc::clone(&bridge_error),
+                    stub_name: spec.stub_name.clone(),
+                    record_name: spec.record_name.clone(),
+                    import_handles: spec.import_handles.clone(),
+                    max_bridge_call_bytes,
+                    bridge_call_count: Arc::clone(&bridge_call_count),
+                    max_bridge_calls,
+                    resolver_map: Arc::clone(&resolver_map),
+                    run_start,
+                    log: Arc::clone(&log),
+                },
+            );
+        }
         // The slot Box's heap address is stable and instance-lifetime; the
         // Function built here (and any earlier call's Function for the same
         // name, however sandbox code kept it) dispatches through it.
@@ -5158,9 +6187,9 @@ pub fn make_body_stream<'s>(
 /// built around this instance's stream table and handed to the JS factory.
 fn install_web_runtime(
     scope: &mut v8::PinScope,
-    streams: *const StreamTable,
+    table: *const RunTable,
 ) -> Result<(), String> {
-    let data = v8::External::new(scope, streams.cast_mut().cast::<c_void>());
+    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
     let read = v8::Function::builder(stream_read_callback)
         .data(data.into())
         .build(scope)
@@ -5180,8 +6209,8 @@ fn stream_read_callback(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    // SAFETY: instance-lifetime StreamTable Box, same contract as PendingWork.
-    let table = unsafe { &*args.data().cast::<v8::External>().value().cast::<StreamTable>() };
+    // SAFETY: the External points at the instance-lifetime RunTable Box.
+    let run_table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         throw_v8_error(scope, "[iso4] stream read could not allocate");
         return;
@@ -5189,6 +6218,15 @@ fn stream_read_callback(
     rv.set(resolver.get_promise(scope).into());
     let stream_id = args.get(0).uint32_value(scope).unwrap_or(0);
 
+    let token = attributed_token(scope, run_table);
+    let state = run_table.state_ptr(token);
+    if state.is_null() {
+        let msg = v8_error_value(scope, "[iso4] streamed bodies are only readable during a run");
+        resolver.reject(scope, msg);
+        return;
+    }
+    // SAFETY: entry pointers are valid for the remainder of the turn.
+    let table = unsafe { &*state }.streams.as_ref();
     let mut slot = table.slot.borrow_mut();
     let Some(state) = slot.as_mut() else {
         drop(slot);
@@ -5257,7 +6295,16 @@ fn stream_cancel_callback(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let table = unsafe { &*args.data().cast::<v8::External>().value().cast::<StreamTable>() };
+    // SAFETY: the External points at the instance-lifetime RunTable Box.
+    let run_table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
+    let token = attributed_token(scope, run_table);
+    let state = run_table.state_ptr(token);
+    if state.is_null() {
+        rv.set_undefined();
+        return;
+    }
+    // SAFETY: entry pointers are valid for the remainder of the turn.
+    let table = unsafe { &*state }.streams.as_ref();
     let stream_id = args.get(0).uint32_value(scope).unwrap_or(0);
     let reason = args
         .get(1)
@@ -5314,8 +6361,8 @@ fn bytes_to_uint8array<'s>(
 /// argument into the run's [`PendingWork`] set. Installed non-enumerable like
 /// the web classes (convention), reserved as a name, and additionally
 /// stashed under a registry symbol for the `iso4:runtime` re-export.
-fn install_wait_until(scope: &mut v8::PinScope, pending: *const PendingWork) -> Result<(), RunError> {
-    let data = v8::External::new(scope, pending.cast_mut().cast::<c_void>());
+fn install_wait_until(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
+    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
     let function = v8::Function::builder(wait_until_callback)
         .data(data.into())
         .build(scope)
@@ -5353,11 +6400,20 @@ fn wait_until_callback(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    // SAFETY: the External points at the PendingWork Box owned by the
-    // instance core / run frame, alive for the isolate's lifetime — the same
-    // contract as the console's LogBuffers pointer.
-    let pending = unsafe { &*args.data().cast::<v8::External>().value().cast::<PendingWork>() };
-    let mut slot = pending.slot.borrow_mut();
+    // SAFETY: the External points at the instance-lifetime RunTable Box.
+    let table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
+    let token = attributed_token(scope, table);
+    let state = table.state_ptr(token);
+    if state.is_null() {
+        throw_v8_error(
+            scope,
+            "[iso4] waitUntil is only available to run code — setup evaluated at \
+             prepare() time must finish its work within the warm-up budget",
+        );
+        return;
+    }
+    // SAFETY: entry pointers are valid for the remainder of the turn.
+    let mut slot = unsafe { &*state }.pending.slot.borrow_mut();
     let Some(registered) = slot.as_mut() else {
         drop(slot);
         throw_v8_error(
@@ -5384,9 +6440,9 @@ fn wait_until_callback(
     rv.set_undefined();
 }
 
-fn install_console(scope: &mut v8::PinScope, buffers: *mut LogBuffers) -> Result<(), RunError> {
+fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
     let console = v8::Object::new(scope);
-    let data = v8::External::new(scope, buffers.cast::<c_void>());
+    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
 
     for name in ["log", "debug", "info"] {
         let key = v8::String::new(scope, name)
@@ -5449,8 +6505,8 @@ fn append_console_line(
     let Ok(external) = v8::Local::<v8::External>::try_from(data) else {
         return;
     };
-    let buffers = external.value().cast::<LogBuffers>();
-    if buffers.is_null() {
+    let table = external.value().cast::<RunTable>().cast_const();
+    if table.is_null() {
         return;
     }
 
@@ -5469,17 +6525,30 @@ fn append_console_line(
     }
 
     let line = parts.join(" ");
-    // SAFETY: `buffers` points to the `LogBuffers` stack value in run_module().
-    // The V8 context and every console callback are dropped before that stack
-    // value goes out of scope.
-    let buffers = unsafe { &mut *buffers };
+    // SAFETY: the External points at the instance-lifetime RunTable Box.
+    let table = unsafe { &*table };
+    let token = attributed_token(scope, table);
+    let state = table.state_ptr(token);
+    if state.is_null() {
+        // No run owns this line: prefix warm-up output, delivered on the
+        // cold-start call. (Uncapped — warm-up is host-authored code under
+        // its own fixed budget.)
+        append_capped_line(&mut table.setup_logs.borrow_mut(), stdout, line);
+        return;
+    }
+    // SAFETY: entry pointers are valid for the remainder of the turn.
+    append_capped_line(&mut unsafe { &*state }.logs.borrow_mut(), stdout, line);
+}
+
+/// Push one console line into `buffers`, honouring its byte caps. Lines that
+/// would push the total over the cap are silently dropped.
+fn append_capped_line(buffers: &mut LogBuffers, stdout: bool, line: String) {
     if stdout {
         let limit = buffers.max_stdout_bytes as usize;
         if limit == 0 || buffers.stdout_bytes + line.len() <= limit {
             buffers.stdout_bytes += line.len();
             buffers.stdout.push(line);
         }
-        // Lines that would push the total over the limit are silently dropped.
     } else {
         let limit = buffers.max_stderr_bytes as usize;
         if limit == 0 || buffers.stderr_bytes + line.len() <= limit {
@@ -5560,23 +6629,84 @@ const ASYNC_CONTEXT_FACTORY_SRC: &str = r#"
 const ASYNC_HOOKS_MODULE_SRC: &str = "export const AsyncLocalStorage = \
     globalThis[Symbol.for('iso4.async_hooks.AsyncLocalStorage')];\n";
 
-/// Native getter for the continuation-preserved embedder data slot.
+// ── The CPED rider ───────────────────────────────────────────────────────────
+//
+// The CPED slot no longer holds the AsyncLocalStorage frame directly: it
+// holds a rider `[token, frame]` — the owning run's token beside the guest
+// frame (celld's pattern). V8 saves and restores CPED per continuation, so a
+// continuation created by run A carries A's token even when it executes
+// during run B's turn, and console output, bridge-stub dispatch, waitUntil
+// registration and stream reads attribute to A. Guests never see the rider:
+// the native get/set below unwrap/wrap it, and raw CPED is not otherwise
+// reachable from JS.
+
+/// Build a rider `[token, inner]`.
+fn make_rider<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    token: u64,
+    inner: v8::Local<v8::Value>,
+) -> v8::Local<'s, v8::Array> {
+    let rider = v8::Array::new(scope, 2);
+    let token_val = v8::Number::new(scope, token as f64);
+    rider.set_index(scope, 0, token_val.into());
+    rider.set_index(scope, 1, inner);
+    rider
+}
+
+/// Split a CPED value into `(token, inner)` when it is a rider.
+fn rider_parts<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<v8::Value>,
+) -> Option<(u64, v8::Local<'s, v8::Value>)> {
+    let arr = v8::Local::<v8::Array>::try_from(value).ok()?;
+    if arr.length() != 2 {
+        return None;
+    }
+    let token = arr.get_index(scope, 0)?.number_value(scope)?;
+    let inner = arr.get_index(scope, 1)?;
+    Some((token as u64, inner))
+}
+
+/// Install this run's rider at turn entry: continuations created from here
+/// carry the token. The previous rider needs no restoring — turn exit clears
+/// [`CURRENT_RUN_TOKEN`] and the next turn overwrites the slot.
+fn install_cped_rider(scope: &mut v8::PinScope, token: u64) {
+    let undefined = v8::undefined(scope).into();
+    let rider = make_rider(scope, token, undefined);
+    scope.set_continuation_preserved_embedder_data(rider.into());
+}
+
+/// Native getter for the continuation-preserved embedder data slot: the
+/// guest-visible value is the rider's inner frame.
 fn async_context_get_callback(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
     let data = scope.get_continuation_preserved_embedder_data();
-    rv.set(data);
+    match rider_parts(scope, data) {
+        Some((_, inner)) => rv.set(inner),
+        None => rv.set_undefined(),
+    }
 }
 
-/// Native setter for the continuation-preserved embedder data slot.
+/// Native setter for the continuation-preserved embedder data slot: wraps the
+/// guest frame in a rider carrying the creating run's token (taken from the
+/// current rider, so a cross-run continuation keeps ITS run, not the turn
+/// owner's).
 fn async_context_set_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    scope.set_continuation_preserved_embedder_data(args.get(0));
+    let current = scope.get_continuation_preserved_embedder_data();
+    let token = match rider_parts(scope, current) {
+        Some((token, _)) => token,
+        None => CURRENT_RUN_TOKEN.with(|c| c.get()),
+    };
+    let frame = args.get(0);
+    let rider = make_rider(scope, token, frame);
+    scope.set_continuation_preserved_embedder_data(rider.into());
     rv.set_undefined();
 }
 
@@ -5860,8 +6990,10 @@ mod tests {
             limits,
             &[],
             &[],
-            None,
+            RunIo::None,
+            0,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
     }
@@ -5900,8 +7032,10 @@ mod tests {
             Limits::default(),
             &[],
             imports,
-            None,
+            RunIo::None,
+            0,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .map_err(|failure| failure.error)
@@ -8378,6 +9512,7 @@ mod tests {
             let _ = ipc::read_rust_to_ts_frame(&mut server).unwrap();
             std::thread::sleep(Duration::from_millis(100));
             let mut payload = Vec::new();
+            payload.extend_from_slice(&0u32.to_be_bytes()); // runId
             payload.extend_from_slice(&0u32.to_be_bytes()); // callId
             payload.push(1); // ok = true
             payload.push(1); // value present
@@ -8413,6 +9548,29 @@ mod tests {
     }
 
     #[test]
+    fn wall_limit_kills_a_sync_spin_even_with_cpu_uncapped() {
+        // The instance guard enforces min(remaining CPU, remaining wall)
+        // MID-turn (E2 ruling): with `cpuTimeMs: 0` the wall deadline is the
+        // only thing that can stop a synchronous spin, and it must not wait
+        // for a turn boundary that never comes.
+        let err = run_code(
+            "for (;;) {}",
+            "<test>",
+            Limits {
+                cpu_time_ms: 0,
+                wall_time_ms: 200,
+                ..Default::default()
+            },
+        )
+        .map_err(|f| f.error)
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::WallTimeout),
+            "expected WallTimeout, got {err:?}"
+        );
+    }
+
+    #[test]
     fn cpu_budget_does_count_tight_sync_loop() {
         let err = run_code(
             "let x = 0; while (true) x++;",
@@ -8444,9 +9602,11 @@ mod tests {
         out.extend_from_slice(&blob);
     }
 
-    /// Encode a successful BridgeResponse payload (callId, ok=1, value).
+    /// Encode a successful BridgeResponse payload (runId 0, callId, ok=1,
+    /// value). Direct-API runs have no wire identity, so fixtures echo 0.
     fn bridge_resp_ok(call_id: u32, value: &WireValue) -> Vec<u8> {
         let mut p = Vec::new();
+        p.extend_from_slice(&0u32.to_be_bytes()); // runId
         p.extend_from_slice(&call_id.to_be_bytes());
         p.push(1); // ok
         p.push(1); // value present
@@ -8462,6 +9622,7 @@ mod tests {
         fields: Option<&WireValue>,
     ) -> Vec<u8> {
         let mut p = Vec::new();
+        p.extend_from_slice(&0u32.to_be_bytes()); // runId
         p.extend_from_slice(&call_id.to_be_bytes());
         p.push(0); // ok = false
         for s in &["ERR_HOST_BRIDGE", name, message] {
@@ -9239,7 +10400,7 @@ mod tests {
             match ipc::read_rust_to_ts_frame(&mut server) {
                 Ok(frame) if frame.message_type == ipc::RustToTsMessageType::BridgeCall => {
                     // Parse call_id from the first 4 bytes of the payload.
-                    let call_id = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+                    let call_id = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
                     let resp = bridge_resp_ok(call_id, &value);
                     if ipc::write_ts_to_rust_frame(
                         &mut server,
@@ -9669,7 +10830,7 @@ mod tests {
             // Read the BridgeCall and reply with a deliberately wrong callId.
             let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
             assert_eq!(frame.message_type, ipc::RustToTsMessageType::BridgeCall);
-            let sent_call_id = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+            let sent_call_id = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
             // Respond with a callId that differs from the one Rust sent.
             let wrong_call_id = sent_call_id.wrapping_add(99);
             ipc::write_ts_to_rust_frame(
@@ -9722,7 +10883,7 @@ mod tests {
 
         let h1 = std::thread::spawn(move || {
             let frame = ipc::read_rust_to_ts_frame(&mut server1).unwrap();
-            let cid = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+            let cid = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
             ipc::write_ts_to_rust_frame(
                 &mut server1,
                 ipc::TsToRustMessageType::BridgeResponse,
@@ -9758,7 +10919,7 @@ mod tests {
 
         let h2 = std::thread::spawn(move || {
             let frame = ipc::read_rust_to_ts_frame(&mut server2).unwrap();
-            let cid = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+            let cid = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
             // Simulate a stale BridgeResponse from run 1 arriving here
             // (callId=0 instead of the expected callId for run 2).
             ipc::write_ts_to_rust_frame(
@@ -9815,9 +10976,9 @@ mod tests {
         let handle = std::thread::spawn(move || {
             // Read both BridgeCall frames (they arrive before V8 yields).
             let f1 = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            let cid1 = u32::from_be_bytes(f1.payload[..4].try_into().unwrap());
+            let cid1 = u32::from_be_bytes(f1.payload[4..8].try_into().unwrap());
             let f2 = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            let cid2 = u32::from_be_bytes(f2.payload[..4].try_into().unwrap());
+            let cid2 = u32::from_be_bytes(f2.payload[4..8].try_into().unwrap());
 
             // Respond in reverse order: second call gets 20, first gets 10.
             // The poll loop must route cid2 → toolB resolver (20)
@@ -9875,7 +11036,7 @@ mod tests {
             let mut call_ids = Vec::new();
             for _ in 0..3 {
                 let f = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-                let cid = u32::from_be_bytes(f.payload[..4].try_into().unwrap());
+                let cid = u32::from_be_bytes(f.payload[4..8].try_into().unwrap());
                 call_ids.push(cid);
             }
             // Respond in reverse.
@@ -10108,8 +11269,12 @@ mod tests {
     // like the bridge tests above.
 
     /// Parse a BridgeCall payload: (callId, targetKind, specifier, exportName, args).
+    /// The leading runId (0 for direct-API runs) is validated and skipped.
     fn parse_bridge_call(payload: &[u8]) -> (u32, u8, Option<String>, String, Vec<WireValue>) {
         let mut off = 0usize;
+        let run_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
+        assert_eq!(run_id, 0, "direct-API BridgeCall frames carry runId 0");
+        off += 4;
         let call_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
         off += 4;
         let target_kind = payload[off];
@@ -10578,9 +11743,11 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
+            0,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         )
         .map_err(|failure| failure.error)
     }
@@ -10876,9 +12043,11 @@ mod tests {
             },
             &[],
             &[],
-            None,
+            RunIo::None,
+            0,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::ExportTooLarge));
@@ -10951,9 +12120,11 @@ mod tests {
             },
             &[],
             &[],
-            None,
+            RunIo::None,
+            0,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::CpuTimeout));
@@ -10980,9 +12151,11 @@ mod tests {
                 limits,
                 &[],
                 &[],
-                None,
+                RunIo::None,
+                0,
                 Arc::new(AtomicU32::new(0)),
                 call.as_ref(),
+                None,
             );
             let _ = tx.send(result);
         });

@@ -23,6 +23,7 @@ import {
   encodeTsToRustFrame,
   decodeRunCompletePayload,
   peekBridgeCallId,
+  peekBridgeCallRunId,
   peekRunCompletionBackgroundPending,
   peekRunCompletionRunId,
   STREAM_CHUNK_MAX_BYTES,
@@ -937,6 +938,10 @@ export class RuntimeIpcClient {
         encodeTsToRustFrame(
           TsToRustMessageTypes.BridgeResponse,
           encodeBridgeResponsePayload(
+            // Echo the FRAME's run id — the response routes by it. The
+            // ambient run is only the fallback for a payload too short to
+            // carry one (unreachable past the callId peek above).
+            peekBridgeCallRunId(payload) ?? runId,
             callId,
             false,
             undefined,
@@ -958,6 +963,7 @@ export class RuntimeIpcClient {
         encodeTsToRustFrame(
           TsToRustMessageTypes.BridgeResponse,
           encodeBridgeResponsePayload(
+            call.runId,
             call.callId,
             false,
             undefined,
@@ -970,7 +976,10 @@ export class RuntimeIpcClient {
       // Do NOT await it — the loop reads the next frame immediately.
       // When the handler settles the response is written back.
       // If the run timed out by then, Rust ignores the late frame.
-      const { callId } = call
+      // Responses echo the frame's own run id, not the ambient run's: the
+      // demux routes by it, and under multiplexing (#127) grace-time and
+      // concurrent frames are not always for the run this loop drains.
+      const { runId: frameRunId, callId } = call
       dispatcher({
         targetKind: call.targetKind,
         specifier: call.specifier,
@@ -994,6 +1003,7 @@ export class RuntimeIpcClient {
               encodeTsToRustFrame(
                 TsToRustMessageTypes.BridgeResponse,
                 encodeBridgeResponsePayload(
+                  frameRunId,
                   callId,
                   false,
                   undefined,
@@ -1008,7 +1018,7 @@ export class RuntimeIpcClient {
           await this.write(
             encodeTsToRustFrame(
               TsToRustMessageTypes.BridgeResponse,
-              encodeBridgeResponsePayload(callId, true, encoded),
+              encodeBridgeResponsePayload(frameRunId, callId, true, encoded),
             ),
           )
           // The response carrying stream handles is on the wire; start their
@@ -1019,6 +1029,7 @@ export class RuntimeIpcClient {
           encodeTsToRustFrame(
             TsToRustMessageTypes.BridgeResponse,
             encodeBridgeResponsePayload(
+              frameRunId,
               callId,
               false,
               undefined,
@@ -1044,6 +1055,7 @@ export class RuntimeIpcClient {
             encodeTsToRustFrame(
               TsToRustMessageTypes.BridgeResponse,
               encodeBridgeResponsePayload(
+                frameRunId,
                 callId,
                 false,
                 undefined,

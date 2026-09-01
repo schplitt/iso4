@@ -586,12 +586,14 @@ describe('bridgeErrorPayloadFromUnknown', () => {
 describe('encodeBridgeResponsePayload error layout', () => {
   test('writes code, name, message, absent stack, and fields per §5.4', () => {
     const encodedFields = serializeValue({ code: 'E_FOO' })
-    const buf = encodeBridgeResponsePayload(7, false, undefined, {
+    const buf = encodeBridgeResponsePayload(3, 7, false, undefined, {
       name: 'WorkflowTimeout',
       message: 'took too long',
       encodedFields,
     })
     let off = 0
+    expect(readU32BE(buf, off)).toBe(3) // runId — echoed for demux routing
+    off += 4
     expect(readU32BE(buf, off)).toBe(7) // callId
     off += 4
     expect(buf[off]).toBe(0) // ok = false
