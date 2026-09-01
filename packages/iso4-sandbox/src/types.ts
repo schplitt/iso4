@@ -807,7 +807,8 @@ export interface PrecompileOptions<
  * fixed warm-up budget), later runs reuse it and skip isolate boot and
  * prefix re-evaluation. Warmth is a cache, never a guarantee — module-scope
  * state MAY survive between runs on one instance, but any instance can be
- * evicted at any moment (a fired limit, an abort, memory pressure,
+ * evicted at any moment (a CPU/memory limit firing mid-execution, an abort
+ * landing on running code, memory pressure,
  * `dispose()`), and concurrent runs of one prefix are served by separate
  * instances that share no state. Do not rely on carryover, and do not rely
  * on per-run isolation within a prefix either: keep durable state outside

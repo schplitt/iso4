@@ -616,9 +616,9 @@ When `call` is present the run's **result value is the called function's
 return value** (awaited first when it is a Promise) instead of the exports —
 never both. The completion payload is unchanged: it carries exactly one value
 blob either way, and the host knows which it asked for. `maxExportBytes`
-applies to the value blob; a sync return value skips the poll loop entirely,
-while an async one re-enters the same settle machinery as the module promise
-(bridge calls included).
+applies to the value blob; a sync return value completes inside the run's
+start turn, while an async one suspends on the same turn machinery as the
+module promise (bridge calls included).
 
 | Field        | Encoding    | Notes                                                                                                                                               |
 | ------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -816,12 +816,14 @@ wire are exactly as laid out above; the args blob is never copied into a second
 buffer, which would otherwise double the peak memory of every bridge call and
 place that allocation before the check meant to bound it.
 
-**BridgeResponse frame cap:** `BridgeResponse` frames are read with
-`read_frame_with_limit(memoryMb × 1 MiB)`. The sandbox cannot hold a response
-larger than its own memory budget, so `memoryMb` is the natural and only limit.
-When `memoryMb = 0` (unconstrained) the fallback is the global 64 MiB
-`DEFAULT_MAX_FRAME_LENGTH`. There is no separate per-response configuration
-field — to allow responses larger than 64 MiB, increase `memoryMb`.
+**BridgeResponse frame cap:** the sandbox cannot hold a response larger than
+its own memory budget, so `memoryMb × 1 MiB` is the natural and only limit.
+The session demux enforces it per run when routing the frame (the connection
+read ceiling is the largest in-flight allowance); a frame over its run's cap
+fails that run alone. When `memoryMb = 0` (unconstrained) the fallback is the
+global 64 MiB `DEFAULT_MAX_FRAME_LENGTH`. There is no separate per-response
+configuration field — to allow responses larger than 64 MiB, increase
+`memoryMb`.
 
 **`maxExportBytes` enforcement:** Rust copies the module namespace into a
 plain object, serializes it once, and checks the resulting **blob** length
