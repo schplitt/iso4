@@ -28,7 +28,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     // Concurrent precompiles on separate pool connections were exactly what
     // segfaulted the child under V8 14.7. prepare() no longer creates
     // snapshots; this pins that it stays safe to call concurrently.
-    await using sandbox = await createSandbox({ maxIsolates: 4 })
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 4 })
     for (let round = 0; round < 3; round++) {
       const prefixes = await Promise.all(
         Array.from({ length: 8 }, (_, i) =>
@@ -50,7 +50,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     // two slots. Every blown call must fail with its limit code, every
     // healthy call must succeed, and afterwards the prefix must still serve
     // a clean call — eviction of tainted instances never poisons neighbors.
-    await using sandbox = await createSandbox({ maxIsolates: 2 })
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
     await using prefix = await sandbox.prepare({
       code: `${COUNTER}\nexport function spin() { for (;;) {} }`,
     })
@@ -88,7 +88,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     // and eviction race constantly. Calls must still all succeed, and state
     // must never leak between the cold instances (contract: correctness
     // never depends on warmth).
-    await using pressured = await createSandbox({ maxIsolates: 2, memoryBudgetMb: 8 })
+    await using pressured = await createSandbox({ maxConcurrentRuns: 2, memoryBudgetMb: 8 })
     const prefixes = await Promise.all(
       Array.from({ length: 3 }, () => pressured.prepare({ code: COUNTER })),
     )
@@ -119,7 +119,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     // Saturation queues FIFO with no knobs; the guard is that a deep
     // queue drains completely — no starvation, no dropped calls — and that
     // stats() keeps answering from its control connection mid-saturation.
-    await using single = await createSandbox({ maxIsolates: 1 })
+    await using single = await createSandbox({ maxConcurrentRuns: 1 })
     await using prefix = await single.prepare({ code: COUNTER })
 
     const flood = Promise.all(

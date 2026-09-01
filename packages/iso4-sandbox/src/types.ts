@@ -501,24 +501,33 @@ export type RebindHostModule<T> = T extends HostExportFunction
 
 export interface SandboxOptions {
   /**
-   * Maximum number of isolates (UDS connection slots) running concurrently.
-   * The Sandbox maintains a pool of this many connections to the Rust process;
-   * each executes one run() at a time. Additional callers queue FIFO until a
-   * slot frees — a bounded wait in practice, since every run has wall/CPU
-   * limits.
+   * Maximum number of runs executing at once. Additional callers queue FIFO
+   * until a run finishes; a queued caller's `AbortSignal` is honoured while
+   * it waits, so `AbortSignal.timeout()` composes as a queue-wait bound —
+   * there is no separate timeout option.
    *
-   * Multiple MCP agents / concurrent callers each get their own slot and
-   * run in parallel up to this limit.
+   * This is an admission number, not a socket count: connections to the
+   * runtime process open on demand as runs need them and are reused for the
+   * process lifetime (`SandboxStats.openConnections` reports the live
+   * count). Multiple MCP agents / concurrent callers run in parallel up to
+   * this limit.
+   *
+   * Overridable in both directions: lowering it leaves cores to the host
+   * app; raising it above the core count pays only for workloads that spend
+   * their time suspended on host calls rather than computing.
    *
    * This caps *concurrent runs* only. How many isolates stay resident
    * (warm instances included) is the memory budget's job — see
    * `memoryBudgetMb`. There is no instance-count cap of any kind, so
-   * idle warm instances may outnumber the slots here, or fall below them
-   * under memory pressure.
+   * idle warm instances may outnumber the running count here, or fall below
+   * it under memory pressure.
+   *
+   * Must be an integer ≥ 1 — anything else throws at `createSandbox()`
+   * (`0` would queue every run forever).
    *
    * Defaults to `os.availableParallelism()`.
    */
-  maxIsolates?: number
+  maxConcurrentRuns?: number
 
   /**
    * Hard cap on memory each isolate can use, in megabytes. Covers the V8
@@ -548,7 +557,7 @@ export interface SandboxOptions {
    * Reusing an already-warm instance stays allowed under pressure; it adds
    * no memory. Correctness never depends on warmth; the only observable
    * cost of eviction is cold-start latency. There is no instance-count
-   * cap — concurrency is bounded by `maxIsolates`, memory by this mark.
+   * cap — concurrency is bounded by `maxConcurrentRuns`, memory by this mark.
    *
    * `0` disables the mark entirely (nothing bounds warmth then except
    * `dispose()`). Independent of `memoryMb`: RSS is measured, not derived
@@ -590,10 +599,21 @@ export interface SandboxStats {
    */
   activeRuns: number
   /**
-   * Callers queued for a free run slot (the `maxIsolates` pool is
-   * saturated).
+   * Callers queued for a free run slot (`maxConcurrentRuns` runs are
+   * already executing).
    */
   queueDepth: number
+  /**
+   * Host-side count of runtime connections as the pool tracks them, idle
+   * plus checked out (the dedicated `stats()` control connection not
+   * included). Connections open on demand and are kept for the process
+   * lifetime, so this rises to the concurrency high-water mark and stays
+   * there — capacity is `maxConcurrentRuns`, an admission number decoupled
+   * from sockets. It is a ledger, not a per-read socket probe: a
+   * connection that died while idle stays counted until the next run
+   * observes and replaces it.
+   */
+  openConnections: number
   /**
    * Resident warm instances — busy plus idle. Bounded by memory (the RSS
    * mark), not by a count.

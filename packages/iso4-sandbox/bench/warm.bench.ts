@@ -6,7 +6,7 @@
  * warm instance skips all three. Run once before and once after on the same
  * idle machine for the A/B.
  *
- * call latency — one `prefix.call()` per iteration, maxIsolates: 1:
+ * call latency — one `prefix.call()` per iteration, maxConcurrentRuns: 1:
  *   sync handler / empty prefix    — floor: the pure per-call tax.
  *   async handler / empty prefix   — adds the settle/poll machinery.
  *   sync handler / realistic prefix — adds prefix re-evaluation, the part
@@ -104,8 +104,8 @@ const BATCH = 64
 // reparented to init. The hook still earns its place for the normal path,
 // where the benches run and the file completes.
 
-const latencyRt: Sandbox = await createSandbox({ maxIsolates: 1 })
-const throughputRt: Sandbox = await createSandbox({ maxIsolates: SLOTS })
+const latencyRt: Sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+const throughputRt: Sandbox = await createSandbox({ maxConcurrentRuns: SLOTS })
 
 // `allSettled` in both places: one runtime failing to dispose must not skip
 // the other.

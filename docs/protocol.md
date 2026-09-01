@@ -1045,16 +1045,20 @@ snapshot answers even while every run slot is busy.
 ## 6. Session lifecycle
 
 Each connection handles one active run at a time. The TypeScript `Runtime`
-maintains a pool of connections, one per `maxIsolates` slot, plus one
-dedicated control connection used only for `Stats` — kept outside the
-pool so a snapshot answers even while every run slot is busy. `Stats` is
-legal on any authenticated connection (the runtime serves it in the
-top-level message loop), but the host never sends it on a pooled connection.
-Concurrency comes from multiple connections, not message-level
-multiplexing.
+admits runs through a slot pool (`maxConcurrentRuns`, an admission number
+decoupled from sockets) and opens connections lazily as admitted runs need
+them, reusing idle ones for the process lifetime — plus one dedicated
+control connection used only for `Stats`, kept outside the pool so a
+snapshot answers even while every run slot is busy. `Stats` is legal on any
+authenticated connection (the runtime serves it in the top-level message
+loop), but the host never sends it on a pooled connection. Concurrency
+still comes from multiple connections: the host routes every frame by the
+run id it leads with (both the runtime's demux and the host's router are
+per-run already), but production admission keeps one run per connection
+until message-level multiplexing is activated.
 
 ```txt
-TS (one connection slot)              Rust (one isolate thread)
+TS (one leased connection)            Rust (one isolate thread)
 │                                       │
 │──── Authenticate ────────────────────▶│  version + V8 format check
 │◀─── Hello ────────────────────────────│  handshake accepted (or refused)

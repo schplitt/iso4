@@ -1,8 +1,9 @@
 /**
  * Capacity manager acceptance tests.
  *
- * Two independent resources, two knobs: `maxIsolates` caps concurrent runs
- * (the connection pool, unchanged), `memoryBudgetMb` is the ONE memory
+ * Two independent resources, two knobs: `maxConcurrentRuns` caps runs
+ * executing at once (admission only — connections open on demand and are
+ * reused), `memoryBudgetMb` is the ONE memory
  * mark — the runtime watches its own process RSS against it; at/above the
  * mark it evicts idle instances by `heapUsed × idleTime` score AND stops
  * pooling new ones (prefix runs degrade to cold one-off isolates) until
@@ -44,7 +45,7 @@ describe('memory budget → live-isolate cap', () => {
     // One run slot, but the budget-derived live cap (machine memory minus
     // the safety net) keeps BOTH prefixes resident — the old slot model would
     // have evicted A to warm B.
-    await using single = await createSandbox({ maxIsolates: 1 })
+    await using single = await createSandbox({ maxConcurrentRuns: 1 })
     await using prefixA = await single.prepare({ code: COUNTER })
     await using prefixB = await single.prepare({ code: COUNTER })
 
@@ -66,7 +67,7 @@ describe('memory budget → live-isolate cap', () => {
     // far below the soft mark of a generous budget, warming a third prefix
     // evicts nothing — under the old count model (256 ÷ 128 = 2 slots) prefix
     // C would have displaced A here.
-    await using sandbox = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 4096 })
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 4096 })
     await using prefixA = await sandbox.prepare({ code: COUNTER })
     await using prefixB = await sandbox.prepare({ code: COUNTER })
     await using prefixC = await sandbox.prepare({ code: COUNTER })
@@ -95,7 +96,7 @@ describe('memory budget → live-isolate cap', () => {
     // between calls, and nothing sits idle. Correctness never depends on
     // warmth. (Do NOT assert RSS drops — freed heap returns to the OS
     // lazily; that is what the futility check is for.)
-    await using pressured = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 8 })
+    await using pressured = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 8 })
     await using prefix = await pressured.prepare({ code: COUNTER })
 
     const first = await prefix.call({ export: 'bump' })
@@ -146,7 +147,7 @@ describe('memory budget → live-isolate cap', () => {
       .spyOn(process, 'constrainedMemory')
       .mockReturnValue(256 * 1024 * 1024)
     try {
-      await using sandbox = await createSandbox({ maxIsolates: 1 })
+      await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
       const stats = await sandbox.stats()
       expect(stats.budgetBytes).toBe(64 * 1024 * 1024)
     } finally {
@@ -159,7 +160,7 @@ describe('memory budget → live-isolate cap', () => {
     // to exponential notation, which would kill the child at arg parsing
     // and surface as a socket timeout. The clamp keeps the spawn alive and
     // the mark at the JS safe-integer ceiling.
-    await using sandbox = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 1e15 })
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 1e15 })
     const stats = await sandbox.stats()
     expect(stats.budgetBytes).toBe(Number.MAX_SAFE_INTEGER)
   })
@@ -173,7 +174,7 @@ describe('memory budget → live-isolate cap', () => {
       .spyOn(process, 'constrainedMemory')
       .mockReturnValue(2 ** 63)
     try {
-      await using sandbox = await createSandbox({ maxIsolates: 2 })
+      await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
       const stats = await sandbox.stats()
       const totalMb = totalmem() / (1024 * 1024)
       // The default budget must be clamped to the host total, not the
@@ -194,7 +195,7 @@ describe('memory budget → live-isolate cap', () => {
       .spyOn(process, 'constrainedMemory')
       .mockReturnValue(2 * 1024 * 1024 * 1024)
     try {
-      await using sandbox = await createSandbox({ maxIsolates: 2 })
+      await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
       const stats = await sandbox.stats()
       expect(stats.budgetBytes).toBe(1536 * 1024 * 1024)
     } finally {
@@ -207,7 +208,7 @@ describe('saturation queues FIFO', () => {
   test('a queued call waits for the busy slot and then runs', async () => {
     // No queue knobs, deliberately: saturation always queues, and the wait
     // is bounded in practice because every run has wall/CPU limits.
-    await using single = await createSandbox({ maxIsolates: 1 })
+    await using single = await createSandbox({ maxConcurrentRuns: 1 })
     await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
 
     const busy = prefix.call({
@@ -226,9 +227,63 @@ describe('saturation queues FIFO', () => {
   })
 })
 
+describe('lazy connections', () => {
+  test('connections open on demand and are kept for reuse', async () => {
+    // createSandbox no longer opens one socket per capacity unit up front:
+    // only the stats control connection exists at creation (not counted in
+    // openConnections), so a fresh sandbox reports zero run connections
+    // however large the admission cap is.
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 8 })
+    expect((await sandbox.stats()).openConnections).toBe(0)
+
+    const first = await sandbox.run({ code: 'export default 1' })
+    expect(first.ok).toBe(true)
+    expect((await sandbox.stats()).openConnections).toBe(1)
+
+    // A second sequential run reuses the idle connection instead of
+    // opening another.
+    const second = await sandbox.run({ code: 'export default 2' })
+    expect(second.ok).toBe(true)
+    expect((await sandbox.stats()).openConnections).toBe(1)
+  })
+
+  test('the connection count follows concurrent demand, not the admission cap', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 4 })
+    await using prefix = await sandbox.prepare({ code: SLOW, globals: { hostSleep } })
+
+    // prepare() opened one connection and returned it; two overlapping calls
+    // reuse it and open exactly one more — demand, not the cap of 4.
+    const [a, b] = await Promise.all([
+      prefix.call({ export: 'slow', args: [150], limits: { cpuTimeMs: 5_000 } }),
+      prefix.call({ export: 'slow', args: [150], limits: { cpuTimeMs: 5_000 } }),
+    ])
+    expect(a.ok).toBe(true)
+    expect(b.ok).toBe(true)
+    expect((await sandbox.stats()).openConnections).toBe(2)
+  })
+
+  test('passing the removed maxIsolates knob throws with the replacement named', async () => {
+    await expect(
+
+      createSandbox({ maxIsolates: 2 } as any),
+    ).rejects.toThrow(/maxIsolates was removed.*maxConcurrentRuns/)
+  })
+
+  test('a nonsense maxConcurrentRuns is rejected instead of deadlocking', async () => {
+    // 0 or a negative value would queue every run forever, and a fractional
+    // value admits more runs than documented — all three throw before the
+    // child is even spawned.
+    for (const bad of [0, -1, 1.5]) {
+      await expect(
+        createSandbox({ maxConcurrentRuns: bad }),
+      ).rejects.toThrow(/maxConcurrentRuns must be an integer/)
+    }
+  })
+})
+
 describe('stats()', () => {
   test('reports idle warm instances and their measured heap', async () => {
-    await using sandbox = await createSandbox({ maxIsolates: 2 })
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
     await using prefix = await sandbox.prepare({ code: COUNTER })
     const warm = await prefix.call({ export: 'bump' })
     expect(warm.ok).toBe(true)
@@ -250,7 +305,7 @@ describe('stats()', () => {
   test('answers during saturation and sees the busy instance', async () => {
     // The control connection is not a pool slot: with the only slot held by
     // a running call, stats() must still answer — that is its whole point.
-    await using single = await createSandbox({ maxIsolates: 1 })
+    await using single = await createSandbox({ maxConcurrentRuns: 1 })
     await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
 
     const busy = prefix.call({
@@ -269,7 +324,7 @@ describe('stats()', () => {
   })
 
   test('counts a running one-off in activeRuns', async () => {
-    await using dual = await createSandbox({ maxIsolates: 2 })
+    await using dual = await createSandbox({ maxConcurrentRuns: 2 })
     const busy = dual.run({
       globals: { hostSleep },
       code: 'await hostSleep(500)\nexport default 1',

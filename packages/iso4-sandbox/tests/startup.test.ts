@@ -48,7 +48,7 @@ describe('createSandbox startup failures', () => {
     const binaryPath = await fakeRuntime('exits.mjs', 'process.exit(3)')
 
     const started = Date.now()
-    await expect(createSandbox({ binaryPath, maxIsolates: 2 })).rejects.toThrow(
+    await expect(createSandbox({ binaryPath, maxConcurrentRuns: 2 })).rejects.toThrow(
       /exited before its socket appeared \(exit code 3/,
     )
     // The socket wait is 5 s. Noticing the exit has to beat waiting it out,
@@ -71,7 +71,7 @@ describe('createSandbox startup failures', () => {
       })
     `)
 
-    await expect(createSandbox({ binaryPath, maxIsolates: 2 })).rejects.toThrow()
+    await expect(createSandbox({ binaryPath, maxConcurrentRuns: 2 })).rejects.toThrow()
 
     const pid = Number(await readFile(pidFile, 'utf8'))
     expect(Number.isInteger(pid)).toBe(true)
@@ -109,7 +109,7 @@ describe('createSandbox startup failures', () => {
       })
     `)
 
-    await expect(createSandbox({ binaryPath, maxIsolates: 1 })).rejects.toThrow()
+    await expect(createSandbox({ binaryPath, maxConcurrentRuns: 1 })).rejects.toThrow()
 
     const socketPath = await readFile(pathFile, 'utf8')
     expect(socketPath).toMatch(/iso4-v8-.*\.sock$/)
@@ -127,7 +127,7 @@ describe('socket placement', () => {
     const previousTmpdir = process.env.TMPDIR
     process.env.TMPDIR = outer
     try {
-      const sandbox = await createSandbox({ maxIsolates: 1 })
+      const sandbox = await createSandbox({ maxConcurrentRuns: 1 })
       try {
         const entries = await readdir(outer, { withFileTypes: true })
         expect(entries.length).toBe(1)

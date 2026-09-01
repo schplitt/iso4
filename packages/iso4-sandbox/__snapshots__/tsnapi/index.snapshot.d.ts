@@ -153,7 +153,7 @@ export interface Sandbox {
   readonly alive: boolean;
 }
 export interface SandboxOptions {
-  maxIsolates?: number;
+  maxConcurrentRuns?: number;
   memoryMb?: number;
   memoryBudgetMb?: number;
   binaryPath?: string;
@@ -161,6 +161,7 @@ export interface SandboxOptions {
 export interface SandboxStats {
   activeRuns: number;
   queueDepth: number;
+  openConnections: number;
   warmInstances: number;
   idleInstances: number;
   idleHeapBytes: number;

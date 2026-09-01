@@ -982,38 +982,49 @@ strings.
 
 ### 6.4 Session lifecycle and concurrency
 
-The `Runtime` maintains a **pool of connections** to the Rust process, one
-per concurrency slot. Each connection handles exactly one `Run` at a time;
+The `Runtime` admits runs through a **slot pool** and serves them over
+**lazily opened connections** to the Rust process — two separate concerns.
+A slot is a pure admission ticket: `maxConcurrentRuns` of them exist, and
+callers beyond that queue FIFO. Connections are opened on demand when an
+admitted run finds nothing idle to reuse, are kept for the process lifetime
+(`dispose()` closes them), and a broken one is dropped so the next run opens
+a replacement. Each connection still handles exactly one `Run` at a time;
 concurrency comes from having multiple connections, not from multiplexing
 messages on one connection.
 
 ```
 Runtime (TypeScript)
-  connection-pool[0]  ──UDS──▶  Rust process
-  connection-pool[1]  ──UDS──▶  (same process, different isolate threads)
-  connection-pool[2]  ──UDS──▶
-  ...up to maxIsolates
+  slot pool (admission, maxConcurrentRuns) ──▶ connection registry
+      connection ──UDS──▶  Rust process
+      connection ──UDS──▶  (same process, different isolate threads)
+      ...opened on demand, reused, count follows peak concurrency
 ```
 
 When `prefix.execute()` or `sandbox.run()` is called:
 
-1. Claim a free slot from the pool (or queue if all slots are busy).
-2. Send `Run` (one-off) or `PrefixRun` (prepared prefix) on that slot's
-   connection.
-3. Exchange `BridgeCall` / `BridgeResponse` frames until `Result` arrives.
-4. Resolve the caller's Promise and release the slot back to the pool.
+1. Take a run slot (or queue FIFO if `maxConcurrentRuns` are executing —
+   the caller's `AbortSignal` is honoured while queued).
+2. Borrow an idle connection, or open one; send `Run` (one-off) or
+   `PrefixRun` (prepared prefix) on it.
+3. The connection's frame router delivers `BridgeCall` / stream frames to
+   the run they name and settles the run at its `Result` — every frame in
+   both directions leads with the run id, so the routing structures already
+   support several runs per connection even though admission grants one.
+4. Resolve the caller's Promise and release connection and slot (a run with
+   pending `waitUntil` work holds both until its `RunComplete`).
 
 This means five agents calling `prefix.execute()` simultaneously each get
-their own connection slot and run truly in parallel on separate isolate
+their own run slot and run truly in parallel on separate isolate
 threads inside the Rust process — the fifth call does not wait on the first.
 
-`maxIsolates` in `SandboxOptions` controls the pool ceiling. Additional
-callers queue behind it (backpressure). The ceiling is the host's alone: the
-Rust process takes no concurrency flag and accepts every connection it is
-given, spawning one OS thread per active isolate. The runtime bounds
-*memory*, not connection count — see §13.2.1. Outside the pool the host keeps
-one dedicated control connection for `Stats`, so a snapshot answers while
-every run slot is busy.
+`maxConcurrentRuns` in `SandboxOptions` controls admission (default
+`os.availableParallelism()`). Additional callers queue behind it
+(backpressure). The ceiling is the host's alone: the Rust process takes no
+concurrency flag and accepts every connection it is given, spawning one OS
+thread per active isolate. The runtime bounds *memory*, not connection
+count — see §13.2.1. Outside the pool the host keeps one dedicated control
+connection for `Stats`, so a snapshot answers while every run slot is busy;
+`stats()` reports the host-side connection count as `openConnections`.
 
 `BridgeCall` / `BridgeResponse` pairs are sequential **within a single
 run** in v1: Rust sends one `BridgeCall`, waits for `BridgeResponse`,
@@ -1234,10 +1245,10 @@ These will be resolved in their own design pass, not retrofitted onto
 To be resolved as we build, not blocking the start:
 
 - **Single-isolate-per-process or multi-isolate?** Resolved: **multi-isolate
-  from the start**. The Runtime manages a connection pool; each slot has its
-  own UDS connection and its own isolate thread in the Rust process. Pool
-  size = `maxIsolates` (default: CPU count). This is required for MCP
-  multi-agent parallelism.
+  from the start**. The Runtime admits runs through a slot pool over
+  lazily opened UDS connections; each active run has its own isolate thread
+  in the Rust process. Admission = `maxConcurrentRuns` (default: CPU
+  count). This is required for MCP multi-agent parallelism.
 
 - ~~**How aggressive should the export validator be?**~~ **Resolved and
   shipped**: neither answer won. A value that cannot cross — a
@@ -1861,8 +1872,8 @@ ArrayBuffer usage accumulate across calls on an instance — hitting the cap
 taints it. Passing the old per-run field throws.
 
 **Capacity (v3): one RSS mark, scored eviction — celld's model,
-whole.** Two independent resources, two knobs. `maxIsolates` (the
-connection pool size) caps **concurrent runs**; the **memory budget**
+whole.** Two independent resources, two knobs. `maxConcurrentRuns` (the
+slot pool's admission number) caps **concurrent runs**; the **memory budget**
 (`memoryBudgetMb` on `createSandbox`, passed as `--warm-budget-bytes`,
 `0` = disabled) is the ONE memory mark, enforced by the runtime watching
 its **own process RSS** — ground truth, where summed heap numbers
@@ -2158,8 +2169,8 @@ remains as a last resort for a runtime that cannot answer at all (wedged
 process, dead demux): if no result arrives within `TERMINATE_GRACE_MS`
 (~100 ms), TS closes the frame reader and destroys the socket. The `run()`
 promise resolves as aborted immediately with synthesized zeros, and the
-connection is marked unusable and dropped by `ConnectionPool` — a capacity
-unit, so the next caller opens a fresh one.
+connection is marked unusable and dropped by the connection registry —
+capacity lives in the slot pool, so the next caller opens a fresh one.
 
 The `run()` promise resolves with `status: 'aborted'` (see §5.2) in all cases —
 carrying the value passed to `abort(reason)`, and retaining `error.code:

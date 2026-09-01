@@ -22,7 +22,7 @@ describe('warm instances', () => {
   let single: Sandbox
 
   beforeAll(async () => {
-    single = await createSandbox({ maxIsolates: 1 })
+    single = await createSandbox({ maxConcurrentRuns: 1 })
   })
 
   afterAll(async () => {
@@ -70,7 +70,7 @@ describe('warm instances', () => {
     // caused eviction churn). Even with a single run slot and watermarks
     // explicitly disabled, warming B leaves A resident; only RSS pressure
     // (capacity.test.ts) or dispose() evicts.
-    await using tiny = await createSandbox({ maxIsolates: 1, memoryBudgetMb: 0 })
+    await using tiny = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 0 })
     await using prefixA = await tiny.prepare({ code: COUNTER })
     await using prefixB = await tiny.prepare({ code: COUNTER })
 
@@ -217,7 +217,7 @@ describe('warm instances: concurrency', () => {
   let dual: Sandbox
 
   beforeAll(async () => {
-    dual = await createSandbox({ maxIsolates: 2 })
+    dual = await createSandbox({ maxConcurrentRuns: 2 })
   })
 
   afterAll(async () => {

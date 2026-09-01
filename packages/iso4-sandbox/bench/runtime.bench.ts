@@ -38,8 +38,8 @@ function assertOk(result: RunResult, what: string): void {
 //    Two separate runtimes so the benches don't queue behind each other
 //    on a shared pool slot when vitest runs them concurrently.
 
-const hotDirectRt: Runtime = await createRuntime({ maxIsolates: 1 })
-const hotPrefixRt: Runtime = await createRuntime({ maxIsolates: 1 })
+const hotDirectRt: Runtime = await createRuntime({ maxConcurrentRuns: 1 })
+const hotPrefixRt: Runtime = await createRuntime({ maxConcurrentRuns: 1 })
 const hotPrefix: DynamicPrefix = await hotPrefixRt.precompile({ code: '' })
 
 afterAll(async () => {
@@ -57,7 +57,7 @@ describe('cold start', () => {
   bench(
     'direct  (createRuntime → run → dispose)',
     async () => {
-      const rt = await createRuntime({ maxIsolates: 1 })
+      const rt = await createRuntime({ maxConcurrentRuns: 1 })
       assertOk(await rt.run({ code: SAMPLE_CODE }), 'bench cold direct run')
       await rt.dispose()
     },
@@ -67,7 +67,7 @@ describe('cold start', () => {
   bench(
     'prefix  (createRuntime → precompile → prefix.run → dispose)',
     async () => {
-      const rt = await createRuntime({ maxIsolates: 1 })
+      const rt = await createRuntime({ maxConcurrentRuns: 1 })
       const prefix = await rt.precompile({ code: '' })
       assertOk(await prefix.run({ code: SAMPLE_CODE }), 'bench cold prefix run')
       await rt.dispose()
