@@ -1642,7 +1642,7 @@ describe('resource limits', () => {
   test('memory limit is enforced — TypedArray', async () => {
     // The heap cap is per-Runtime (uniform across isolates, set at
     // createSandbox) — a dedicated small-cap sandbox exercises it.
-    const small = await createRuntime({ maxIsolates: 1, memoryMb: 32 })
+    const small = await createRuntime({ maxConcurrentRuns: 1, memoryMb: 32 })
     try {
       const result = await small.run({
         code: `
@@ -1666,8 +1666,8 @@ describe('resource limits', () => {
     // built a Result frame of ~140 MB, past the 64 MiB frame ceiling, so the
     // runtime could not write it, treated that as fatal, and closed the socket
     // with no frame at all. The host recycled the dead connection, so at
-    // maxIsolates: 1 the sandbox was finished — one line of guest code.
-    const small = await createRuntime({ maxIsolates: 1 })
+    // maxConcurrentRuns: 1 the sandbox was finished — one line of guest code.
+    const small = await createRuntime({ maxConcurrentRuns: 1 })
     try {
       const result = await small.run({
         code: `throw new Error('A'.repeat(70e6))`,
@@ -1689,7 +1689,7 @@ describe('resource limits', () => {
   }, 30_000)
 
   test('memory limit is enforced — logs emitted before OOM are preserved', async () => {
-    const small = await createRuntime({ maxIsolates: 1, memoryMb: 32 })
+    const small = await createRuntime({ maxConcurrentRuns: 1, memoryMb: 32 })
     try {
       const result = await small.run({
         code: `
@@ -2002,12 +2002,13 @@ describe('AbortSignal cancellation', () => {
     }
   }, 15_000)
 
-  test('single-isolate pool: a run after an in-flight abort still works (slot is reconnected)', async () => {
-    // maxIsolates: 1 means there is exactly ONE connection. If the aborted
-    // connection were not replaced, the pool would be permanently empty and
-    // this second run could never acquire a slot. Success here proves the
-    // dead slot was torn down and a fresh one reconnected in its place.
-    const solo = await createRuntime({ maxIsolates: 1 })
+  test('single-slot pool: a run after an in-flight abort still works (connection is replaced)', async () => {
+    // maxConcurrentRuns: 1 admits one run at a time, so both runs draw on the
+    // same connection registry. If the connection the abort tore down were
+    // handed back, the second run would fail on a dead socket. Success here
+    // proves the broken connection was dropped and a fresh one opened in its
+    // place.
+    const solo = await createRuntime({ maxConcurrentRuns: 1 })
     try {
       const controller = new AbortController()
       setTimeout(() => controller.abort(), 50)

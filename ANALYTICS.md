@@ -56,7 +56,7 @@ roughly 32× faster per call for any workload with more than one run.
   inference and tool I/O.
 - A cluster of multiple Rust processes _may_ become necessary at very high
   agent concurrency (hundreds of simultaneous runs), but a single binary with
-  `maxIsolates` equal to CPU count handles typical MCP multi-agent workloads
+  `maxConcurrentRuns` equal to CPU count handles typical MCP multi-agent workloads
   without any additional complexity.
 
 ### 2.2 Analytics / static transforms (@iso4/embed)

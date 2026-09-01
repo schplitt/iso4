@@ -33,7 +33,7 @@ import {
   encodeStreamChunkPayload,
   encodeStreamEndPayload,
 } from './ipc'
-import type { WireResourceLimits, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RuntimeStatsPayload } from './ipc'
+import type { WireResourceLimits, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
@@ -98,6 +98,12 @@ const TERMINATE_GRACE_MS = 100
 const HELLO_TIMEOUT_MS = 5_000
 
 /**
+ * Shared placeholder for `RunEntry` callbacks between wiring phases —
+ * allocating fresh `() => {}` closures per run is avoidable hot-path churn.
+ */
+function NOOP(): void {}
+
+/**
  * Thrown out of `createSandbox()` when the connection handshake fails.
  *
  * The common cause is a V8 serialization format-version mismatch between this
@@ -116,12 +122,12 @@ export class HandshakeError extends Error {
 /**
  * Thrown out of a run when its `AbortSignal` fires mid-flight and the graceful
  * `Terminate` path did not produce a Result within {@link TERMINATE_GRACE_MS}
- * (or when the pre-run abort race tears down before draining). The connection
- * is torn down (so the Rust isolate is reclaimed) before this propagates, and
- * the client is marked unusable so the pool replaces it rather than reusing a
- * half-dead slot. `index.ts` catches this and synthesizes the `ERR_ABORTED`
- * `RunResult`. When the graceful path succeeds instead, no error is thrown —
- * the real `ERR_ABORTED` Result flows back through `drainFrames`.
+ * (or when the pre-run abort race tears down before the run settles). The
+ * connection is torn down (so the Rust isolate is reclaimed) before this
+ * propagates, and the client is marked unusable so the pool replaces it rather
+ * than reusing a half-dead slot. `index.ts` catches this and synthesizes the
+ * `ERR_ABORTED` `RunResult`. When the graceful path succeeds instead, no error
+ * is thrown — the real `ERR_ABORTED` Result flows back through the router.
  */
 export class RunAbortedError extends Error {
   /**
@@ -136,15 +142,17 @@ export class RunAbortedError extends Error {
 }
 
 /**
- * Thrown when a frame arrives that cannot belong to the run in flight: a
- * `Result` carrying a different `runId`, or a frame type with no place in the
- * run protocol. Either way the two sides have lost frame alignment, so the run
- * this client is draining for is not the run the peer is answering.
+ * Thrown when a frame arrives that cannot belong to any run in flight on this
+ * connection: a `Result` or `RunComplete` carrying a run id nothing here is
+ * waiting on, or a frame type with no place in the protocol. Either way the
+ * two sides have lost agreement about what this connection is doing, so
+ * nothing it delivers from now on can be attributed with confidence.
  *
- * The connection is torn down before this propagates, because a peer that is
- * mid-run on someone else's frames must never be handed to the next caller.
- * `index.ts` catches this and synthesizes the `ERR_PROTOCOL_DESYNC` `RunResult`
- * — a displaced run never executed, so there is no partial telemetry to report.
+ * The connection is torn down before this propagates — every run in flight on
+ * it fails with this error — because a peer that is mid-run on someone else's
+ * frames must never be handed to the next caller. `index.ts` catches this and
+ * synthesizes the `ERR_PROTOCOL_DESYNC` `RunResult` — a displaced run never
+ * executed, so there is no partial telemetry to report.
  */
 export class ProtocolDesyncError extends Error {
   constructor(message: string) {
@@ -153,23 +161,86 @@ export class ProtocolDesyncError extends Error {
   }
 }
 
+/**
+ * Per-run routing state, keyed by `runId` in {@link RuntimeIpcClient.runs}.
+ * One entry exists from the moment the run's request frame is written until
+ * its final frame (`Result`, or `RunComplete` when `waitUntil` work ran)
+ * settles it — the router consults nothing else, so several runs can be in
+ * flight on one connection and every frame finds its owner by run id alone.
+ */
+interface RunEntry {
+  dispatcher: BridgeCallDispatcher | undefined
+  streams: StreamSourceRegistry | undefined
+  signal: AbortSignal | undefined
+  resolve: (result: RawRunResult) => void
+  reject: (error: Error) => void
+  /**
+   * Present once the run's Result reported pending `waitUntil` work: settles
+   * the epilogue promise handed to the caller. Its presence also marks the
+   * entry as grace-phase — a second `Result` for it is desync, and teardown
+   * resolves it `undefined` instead of rejecting (the run's value was already
+   * delivered, so nothing user-facing is allowed to fail).
+   */
+  epilogue?: (report: DecodedRunComplete | undefined) => void
+  /**
+   * Removes the abort wiring installed for the current phase (mid-run:
+   * Terminate + teardown fallback timer; grace phase: Terminate only).
+   * Called at every settle point, including connection teardown.
+   */
+  detachAbort: () => void
+}
+
+/**
+ * A pending `precompile()` or `stats()` request: both are answered by exactly
+ * one payload-only frame with no run id, so the router matches replies to
+ * requests in FIFO order per expected frame type.
+ */
+interface ControlWaiter {
+  expects: number
+  resolve: (payload: Uint8Array) => void
+  reject: (error: Error) => void
+}
+
 export class RuntimeIpcClient {
   private readonly socket: Socket
   private readonly reader: FrameReader
   private disposed = false
   /**
-   * Set when an in-flight abort tore this connection down. A broken client
-   * must not be returned to the pool's free list — `ConnectionPool.release`
-   * checks `usable` and replaces it with a fresh connection instead.
+   * Set when this connection was torn down (abort fallback, desync, peer
+   * close). A broken client must not be returned to the pool's idle list —
+   * the connection registry checks `usable` and drops it instead.
    */
   private broken = false
 
   /**
-   * Settles when the in-flight `waitUntil` epilogue ends. The pool
-   * defers reusing this connection until then — grace-time frames belong to
-   * the finished run, not the next one. `null` when no epilogue is running.
+   * Runs in flight on this connection, keyed by run id — the router's only
+   * routing table. Production admission still puts one run per connection;
+   * the structure does not care.
    */
-  pendingEpilogue: Promise<void> | null = null
+  private readonly runs = new Map<number, RunEntry>()
+
+  /**
+   * Pending `precompile()`/`stats()` requests, FIFO. See {@link ControlWaiter}.
+   */
+  private readonly controlWaiters: ControlWaiter[] = []
+
+  /**
+   * Unsettled `waitUntil` grace phases on this connection. The pool defers
+   * reusing the connection until they are done — grace-time frames belong to
+   * the finished runs, not the next one.
+   */
+  private readonly epilogueHolds = new Set<Promise<void>>()
+
+  /**
+   * Settles when every currently pending `waitUntil` epilogue on this
+   * connection has ended; `null` when none is running. The pool re-reads it
+   * until it is `null` before returning the connection to the idle list.
+   */
+  get pendingEpilogue(): Promise<void> | null {
+    if (this.epilogueHolds.size === 0)
+      return null
+    return Promise.all(this.epilogueHolds).then(() => {})
+  }
 
   /**
    * Session brand key for host-type descriptors written on this connection.
@@ -184,7 +255,8 @@ export class RuntimeIpcClient {
       this.reader.push(chunk)
     })
     // Every one of these is a connection that cannot serve another run, so each
-    // marks the client broken as well as closing the reader. Without that the
+    // marks the client broken as well as closing the reader — the router loop
+    // observes the close and fails everything in flight. Without the flag the
     // pool reads `usable === true` off a dead socket and recycles it forever
     // (the peer-close path never goes through `abortConnection`).
     socket.once('error', (error: Error) => {
@@ -203,8 +275,8 @@ export class RuntimeIpcClient {
 
   /**
    * A client is usable while its connection is intact. Once an in-flight abort
-   * (or a dispose) tears the socket down it becomes unusable and the pool must
-   * replace it.
+   * (or a dispose, or a desync) tears the socket down it becomes unusable and
+   * the pool must replace it.
    *
    * The socket is consulted directly as well as the `broken` flag: a socket can
    * be destroyed without either handler above having run yet (a synchronous
@@ -226,9 +298,11 @@ export class RuntimeIpcClient {
    * Values cross this socket as V8 serialization blobs, so both V8s must agree
    * on the serialization format version. Each side sends a probe (a serialized
    * `null`, whose second byte is the writer's format version) in the handshake
-   * and the mismatch is fatal here — at `createSandbox()` time, once per
-   * connection — rather than corrupting a value mid-run. The runtime answers
-   * with exactly one `Hello` frame; anything else tears the connection down.
+   * and the mismatch is fatal here — once per connection — rather than
+   * corrupting a value mid-run. The runtime answers with exactly one `Hello`
+   * frame; anything else tears the connection down. Once the handshake is
+   * done the connection's frame router starts and owns the reader for the
+   * connection's lifetime.
    * @param options
    */
   static async connect(options: RuntimeIpcClientOptions): Promise<RuntimeIpcClient> {
@@ -252,6 +326,7 @@ export class RuntimeIpcClient {
       throw error
     }
 
+    client.routeFrames()
     return client
   }
 
@@ -312,14 +387,6 @@ export class RuntimeIpcClient {
     }
   }
 
-  /**
-   * The run currently being drained, or `undefined` between runs. Bridge
-   * response handlers are fire-and-forget and can settle after their run has
-   * finished, so anything they do to the *connection* has to check that the
-   * connection is still theirs.
-   */
-  private inFlightRunId: number | undefined
-
   private nextRunId = 0
   private nextRunIdValue(): number {
     // Wraps at 2³²-1 back to 0. `>>> 0` and not `& 0xffffffff`: `&` coerces
@@ -327,16 +394,13 @@ export class RuntimeIpcClient {
     // `writeU32` then rejects with ERR_OUT_OF_RANGE — killing every subsequent
     // run on the connection for the next 2³¹ increments.
     //
-    // Safe in v1 because runs are sequential per connection — no two runs share
-    // a connection simultaneously, so a rolled-over ID can never collide with a
-    // live one, and `drainFrames` can treat the ID as proof a Result is ours.
-    // When D11 (concurrent async bridge) lands, add a
-    // `do { ... } while (inFlightRuns.has(id))` guard here.
-    this.nextRunId = (this.nextRunId + 1) >>> 0
-    // Run id 0 disables stream-frame run validation on both sides (it means
-    // "no epilogue spec" runtime-side), so skip it on wrap.
-    if (this.nextRunId === 0)
-      this.nextRunId = 1
+    // Run id 0 is skipped (it disables stream-frame run validation on both
+    // sides), and so is any id still routing in `runs` — after a wrap, a
+    // rolled-over id colliding with a live run would splice two runs' frames
+    // together.
+    do {
+      this.nextRunId = (this.nextRunId + 1) >>> 0
+    } while (this.nextRunId === 0 || this.runs.has(this.nextRunId))
     return this.nextRunId
   }
 
@@ -364,7 +428,8 @@ export class RuntimeIpcClient {
       throw new Error('runtime IPC client is disposed')
 
     const runId = this.nextRunIdValue()
-    await this.write(
+    return this.executeRun(
+      runId,
       encodeTsToRustFrame(
         TsToRustMessageTypes.Run,
         encodeRunPayload({
@@ -377,62 +442,10 @@ export class RuntimeIpcClient {
           call: options?.call,
         }),
       ),
-    )
-    // The frame carrying stream handles is on the wire; start their pumps.
-    this.activateStreams(options?.streams, runId)
-
-    return this.drainUntilResult(
       makeDispatcher(options?.dispatch ?? {}, options?.importDispatch),
-      runId,
       options?.signal,
       options?.streams,
     )
-  }
-
-  async precompile(
-    options: {
-      code: string
-      filename?: string
-      limits?: WireResourceLimits
-      globals?: readonly GlobalDefPayload[]
-      imports?: readonly ImportBindingPayload[]
-    },
-  ): Promise<Uint8Array> {
-    if (this.disposed)
-      throw new Error('runtime IPC client is disposed')
-
-    await this.write(
-      encodeTsToRustFrame(
-        TsToRustMessageTypes.Precompile,
-        encodePrecompilePayload({
-          code: options.code,
-          filename: options.filename,
-          limits: options.limits,
-          globals: options.globals,
-          imports: options.imports,
-        }),
-      ),
-    )
-
-    for await (const frame of this.reader) {
-      if (frame.messageType === RustToTsMessageTypes.PrecompileResult) {
-        return frame.payload
-      }
-      if (frame.messageType === RustToTsMessageTypes.Log)
-        continue
-      // Precompile is bridge-less, so only PrecompileResult and Log are
-      // legal here — anything else means the two sides desynced. Fail
-      // loudly instead of skipping (same contract as stats()), and tear the
-      // connection down: a misaligned stream stays misaligned, so leaving this
-      // one in the pool hands the offset to the next caller.
-      this.abortConnection()
-      throw new ProtocolDesyncError(
-        `unexpected frame type 0x${frame.messageType.toString(16).padStart(2, '0')} `
-        + 'while awaiting a PrecompileResult',
-      )
-    }
-
-    throw new Error('connection closed before receiving a PrecompileResult frame')
   }
 
   async prefixRun(
@@ -458,7 +471,8 @@ export class RuntimeIpcClient {
       throw new Error('runtime IPC client is disposed')
 
     const runId = this.nextRunIdValue()
-    await this.write(
+    return this.executeRun(
+      runId,
       encodeTsToRustFrame(
         TsToRustMessageTypes.PrefixRun,
         encodePrefixRunPayload({
@@ -472,14 +486,148 @@ export class RuntimeIpcClient {
           runId,
         }),
       ),
-    )
-    this.activateStreams(options.streams, runId)
-
-    return this.drainUntilResult(
       makeDispatcher(options.dispatch ?? {}, options.importDispatch),
-      runId,
       options.signal,
       options.streams,
+    )
+  }
+
+  /**
+   * Shared body of `runRawCode` and `prefixRun`: register the run with the
+   * router, write its request frame, start its stream pumps, and await its
+   * settlement. Registration happens *before* the write so the router can
+   * never see a frame for a run it does not know yet.
+   *
+   * ── In-flight abort (graceful terminate) ──────────────────────────────────
+   * When `signal` fires mid-run — including while a bridge call is in flight —
+   * we first ask Rust to stop gracefully: send a `Terminate` frame (carrying
+   * `runId`) and keep the connection routing. The runtime's demux consumes the
+   * frame and either abandons a suspended run or terminates a CPU-bound one
+   * mid-execution; both reply with a real `ERR_ABORTED` `Result` (carrying
+   * duration, CPU time, and the bridge records collected so far). That Result
+   * flows back through the router and the connection stays healthy for reuse.
+   *
+   * If no Result arrives within {@link TERMINATE_GRACE_MS} — the runtime
+   * cannot answer at all (wedged process) — we fall back to
+   * `abortConnection`: the reader is closed so the router fails every run in
+   * flight, and the socket is destroyed so Rust observes EOF (see DESIGN.md
+   * §14.7). This run then rejects `RunAbortedError`, which `index.ts` maps to
+   * a synthesized `ERR_ABORTED` `RunResult`. Any late `BridgeResponse` from an
+   * orphaned handler is harmless either way: on the graceful path the routed
+   * connection discards it runtime-side (stale callId), on the fallback path
+   * the socket is gone.
+   * @param runId
+   * @param frame the encoded `Run`/`PrefixRun` frame
+   * @param dispatcher
+   * @param signal
+   * @param streams
+   */
+  private async executeRun(
+    runId: number,
+    frame: Buffer,
+    dispatcher: BridgeCallDispatcher | undefined,
+    signal?: AbortSignal,
+    streams?: StreamSourceRegistry,
+  ): Promise<RawRunResult> {
+    const entry: RunEntry = {
+      dispatcher,
+      streams,
+      signal,
+      resolve: NOOP,
+      reject: NOOP,
+      detachAbort: NOOP,
+    }
+    const settled = new Promise<RawRunResult>((resolve, reject) => {
+      entry.resolve = resolve
+      entry.reject = reject
+    })
+    // A teardown can reject `settled` during the request write below, before
+    // the `await settled` handler is attached — keep that window from
+    // surfacing as an unhandled rejection (the real await still observes it).
+    settled.catch(() => {})
+    if (signal !== undefined && !signal.aborted) {
+      let graceTimer: ReturnType<typeof setTimeout> | undefined
+      const onAbort = (): void => {
+        // Ask Rust to stop and send a real ERR_ABORTED Result. Fire-and-forget:
+        // if the write fails the socket is already broken, and the fallback
+        // timer (or a reader error) resolves the run anyway.
+        this.write(
+          encodeTsToRustFrame(
+            TsToRustMessageTypes.Terminate,
+            encodeTerminatePayload(runId),
+          ),
+        ).catch(() => {
+          // Socket already gone — nothing to gracefully terminate.
+        })
+        graceTimer = setTimeout(() => {
+          this.abortConnection()
+        }, TERMINATE_GRACE_MS)
+        // Don't let the grace timer alone keep the event loop alive.
+        graceTimer.unref?.()
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      entry.detachAbort = () => {
+        signal.removeEventListener('abort', onAbort)
+        if (graceTimer !== undefined)
+          clearTimeout(graceTimer)
+      }
+    }
+    this.runs.set(runId, entry)
+
+    try {
+      await this.write(frame)
+      // The frame carrying stream handles is on the wire; start their pumps.
+      this.activateStreams(streams, runId)
+      // If the signal aborted between the run-entry check in index.ts and
+      // here, tear down: the request frame is already on the wire but the run
+      // has barely started (its route/guard may not exist yet), so the
+      // graceful path cannot reliably apply.
+      if (signal?.aborted)
+        this.abortConnection()
+    } catch (error) {
+      if (this.runs.delete(runId)) {
+        entry.detachAbort()
+        entry.reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+
+    try {
+      return await settled
+    } catch (error) {
+      // Teardown rejections arrive here as whatever closed the connection.
+      // Translate any error observed once the signal has fired into a
+      // distinguishable abort — carrying the abort reason — so the caller
+      // resolves an aborted RunResult.
+      if (signal?.aborted)
+        throw new RunAbortedError(signal.reason)
+      throw error
+    }
+  }
+
+  async precompile(
+    options: {
+      code: string
+      filename?: string
+      limits?: WireResourceLimits
+      globals?: readonly GlobalDefPayload[]
+      imports?: readonly ImportBindingPayload[]
+    },
+  ): Promise<Uint8Array> {
+    if (this.disposed)
+      throw new Error('runtime IPC client is disposed')
+
+    return this.controlRequest(
+      encodeTsToRustFrame(
+        TsToRustMessageTypes.Precompile,
+        encodePrecompilePayload({
+          code: options.code,
+          filename: options.filename,
+          limits: options.limits,
+          globals: options.globals,
+          imports: options.imports,
+        }),
+      ),
+      RustToTsMessageTypes.PrecompileResult,
     )
   }
 
@@ -492,28 +640,41 @@ export class RuntimeIpcClient {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
 
-    await this.write(
+    const payload = await this.controlRequest(
       encodeTsToRustFrame(TsToRustMessageTypes.Stats, new Uint8Array(0)),
+      RustToTsMessageTypes.StatsResult,
     )
+    return decodeStatsPayload(payload)
+  }
 
-    for await (const frame of this.reader) {
-      if (frame.messageType === RustToTsMessageTypes.StatsResult)
-        return decodeStatsPayload(frame.payload)
-      if (frame.messageType === RustToTsMessageTypes.Log)
-        continue
-      // Only StatsResult and Log are legal on the control connection —
-      // anything else means the two sides desynced. Fail loudly instead of
-      // skipping: silently waiting on would look like a hang. Tear the
-      // connection down too, so a later snapshot is not read off a stream
-      // still carrying the frame that displaced this one.
-      this.abortConnection()
-      throw new ProtocolDesyncError(
-        `unexpected frame type 0x${frame.messageType.toString(16).padStart(2, '0')} `
-        + 'while awaiting a StatsResult on the control connection',
-      )
+  /**
+   * Write a request answered by exactly one payload-only reply frame
+   * (`Precompile` → `PrecompileResult`, `Stats` → `StatsResult`) and await
+   * that reply through the router. Replies carry no correlation id, so the
+   * router matches them FIFO per expected frame type — a reply nobody is
+   * waiting on is a desync, the same contract the run path enforces.
+   * @param frame the encoded request frame
+   * @param expects the reply frame type
+   */
+  private async controlRequest(frame: Buffer, expects: number): Promise<Uint8Array> {
+    let waiter!: ControlWaiter
+    const reply = new Promise<Uint8Array>((resolve, reject) => {
+      waiter = { expects, resolve, reject }
+    })
+    // A teardown can reject the waiter while the request write below is
+    // still awaited — keep that window from surfacing as an unhandled
+    // rejection (the caller's await still observes it).
+    reply.catch(() => {})
+    this.controlWaiters.push(waiter)
+    try {
+      await this.write(frame)
+    } catch (error) {
+      const at = this.controlWaiters.indexOf(waiter)
+      if (at !== -1)
+        this.controlWaiters.splice(at, 1)
+      throw error
     }
-
-    throw new Error('connection closed before receiving a StatsResult frame')
+    return reply
   }
 
   async disposePrefix(prefixId: string): Promise<void> {
@@ -545,140 +706,277 @@ export class RuntimeIpcClient {
   }
 
   /**
-   * Read frames until the `Result` frame arrives, dispatching `BridgeCall`
-   * frames to the handler in the meantime.
-   *
-   * Dispatches are fire-and-forget — the loop does NOT await the handler.
-   * This means the loop continues reading frames immediately. When the Rust
-   * side fires a wall timeout it sends a `Result` frame; the loop reads it
-   * and returns without waiting for the handler.
-   *
-   * The handler promise is then **orphaned**: it has no listener and will be
-   * garbage-collected when it eventually settles. Any in-flight I/O or timers
-   * continue to completion. Rust silently ignores any late `BridgeResponse`
-   * that arrives after the run has completed (see session.rs).
-   *
-   * ── In-flight abort (graceful terminate) ──────────────────────────────────
-   * When `signal` fires mid-run — including while a bridge call is in flight —
-   * we first ask Rust to stop gracefully: send a `Terminate` frame (carrying
-   * `runId`) and keep draining, leaving the socket open. The runtime's demux
-   * consumes the frame and either abandons a suspended run or terminates a
-   * CPU-bound one mid-execution; both reply with a real `ERR_ABORTED`
-   * `Result` (carrying duration, CPU time, and the bridge records collected
-   * so far). That Result flows back through `drainFrames` and the connection
-   * stays healthy for reuse.
-   *
-   * If no Result arrives within {@link TERMINATE_GRACE_MS} — the runtime
-   * cannot answer at all (wedged process) — we fall back to
-   * `abortConnection`: the reader is closed so this loop throws, and the
-   * socket is destroyed so Rust observes EOF (see DESIGN.md §14.7). The loop
-   * then throws `RunAbortedError`, which `index.ts` maps to a synthesized
-   * `ERR_ABORTED` `RunResult`. Any late `BridgeResponse` from an orphaned
-   * handler is harmless either way: on the graceful path the reused connection
-   * discards it (stale callId), on the fallback path the socket is gone.
-   * @param dispatcher
-   * @param runId
-   * @param signal
-   * @param streams
+   * Tear down the connection in response to an in-flight abort the runtime
+   * did not answer. Idempotent. Marks the client `broken` (so the pool
+   * replaces it), closes the frame reader (which stops the router — it fails
+   * every run and control request still in flight), and destroys the socket
+   * (so the Rust session sees EOF and drops its isolates).
    */
-  private async drainUntilResult(
-    dispatcher: BridgeCallDispatcher | undefined,
-    runId: number,
-    signal?: AbortSignal,
-    streams?: StreamSourceRegistry,
-  ): Promise<RawRunResult> {
-    // If the signal aborted between the run-entry check in index.ts and here,
-    // tear down before we start reading frames. The Run frame is already on
-    // the wire but the run has barely started (its route/guard may not exist
-    // yet), so the graceful path cannot reliably apply here.
-    if (signal?.aborted) {
-      this.abortConnection()
-      throw new RunAbortedError(signal.reason)
+  private abortConnection(): void {
+    if (this.broken)
+      return
+    this.broken = true
+    this.reader.close(new Error(
+      '[@iso4/sandbox] connection torn down: an aborted run got no answer from the runtime',
+    ))
+    this.socket.destroy()
+  }
+
+  /**
+   * The connection's frame router — the single consumer of the frame reader
+   * for the connection's lifetime, started right after the handshake. Every
+   * run-tagged frame is routed to its run's entry by the run id it leads
+   * with; `Result`/`RunComplete` frames for a run id nothing here is waiting
+   * on are the desync signal ({@link ProtocolDesyncError}), while late
+   * `BridgeCall`/stream frames for an already-completed run are discarded the
+   * way the runtime discards late `BridgeResponse`s.
+   *
+   * The loop ends only when the reader closes (peer EOF, socket error,
+   * dispose, abort fallback) or a routing error is thrown (desync, a decode
+   * throw on guest-controlled bytes that cannot be answered inline). Either
+   * way the connection is done: framing or attribution is no longer
+   * trustworthy, so everything in flight fails now rather than waiting on
+   * frames that will never be delivered — and the connection never goes back
+   * to the pool.
+   */
+  private routeFrames(): void {
+    (async () => {
+      try {
+        for await (const frame of this.reader) {
+          // routeFrame is synchronous for every arm except a BridgeCall that
+          // needs an inline response write — await only when it says so, so
+          // the steady-state per-frame cost is a switch and a Map lookup,
+          // not a promise (the frame rate scales with multiplexing).
+          const pending = this.routeFrame(frame)
+          if (pending !== undefined)
+            await pending
+        }
+      } catch (error) {
+        this.broken = true
+        const failure = error instanceof Error ? error : new Error(String(error))
+        this.reader.close(failure)
+        this.socket.destroy()
+        for (const [, entry] of this.runs) {
+          entry.detachAbort()
+          // Nothing will pump these sources anymore. Grace-phase runs need
+          // this here: their caller already resolved at the Result, so no
+          // caller-side catch releases the registry, and an idle source
+          // would keep its host ReadableStream locked forever.
+          entry.streams?.releaseAll()
+          if (entry.epilogue !== undefined) {
+            // The run's value was already delivered; the caller synthesizes a
+            // truncated waitUntil report from `undefined`.
+            entry.epilogue(undefined)
+          } else {
+            entry.reject(failure)
+          }
+        }
+        this.runs.clear()
+        for (const waiter of this.controlWaiters.splice(0))
+          waiter.reject(failure)
+      }
+    })()
+  }
+
+  /**
+   * Dispatch one frame to its owner. Throws to end the connection (the
+   * router's catch fails everything in flight). Synchronous except for a
+   * BridgeCall that writes an inline response — that arm returns a promise
+   * for the loop to await; everything else returns `undefined` so routing a
+   * frame costs no promise.
+   * @param frame
+   */
+  private routeFrame(frame: RustToTsFrame): Promise<void> | undefined {
+    switch (frame.messageType) {
+      case RustToTsMessageTypes.Result:
+        this.routeResult(frame.payload)
+        return undefined
+
+      case RustToTsMessageTypes.RunComplete:
+        this.routeRunComplete(frame.payload)
+        return undefined
+
+      case RustToTsMessageTypes.Log:
+        return undefined
+
+      case RustToTsMessageTypes.PrecompileResult:
+      case RustToTsMessageTypes.StatsResult: {
+        const waiter = this.controlWaiters[0]
+        if (waiter === undefined || waiter.expects !== frame.messageType) {
+          throw new ProtocolDesyncError(
+            `unexpected frame type 0x${frame.messageType.toString(16).padStart(2, '0')} `
+            + 'with no matching request pending on this connection',
+          )
+        }
+        this.controlWaiters.shift()
+        waiter.resolve(frame.payload)
+        return undefined
+      }
+
+      case RustToTsMessageTypes.BridgeCall: {
+        const runId = peekBridgeCallRunId(frame.payload)
+        if (runId === undefined) {
+          throw new ProtocolDesyncError(
+            'BridgeCall payload too short to carry a run id',
+          )
+        }
+        const entry = this.runs.get(runId)
+        // No owner: the run completed while the frame was in flight. Discard,
+        // exactly as the runtime discards late BridgeResponses — the run is
+        // gone on both sides, so nobody is parked on an answer.
+        if (entry === undefined)
+          return undefined
+        return this.dispatchBridgeCallFrame(frame.payload, entry, runId)
+      }
+
+      case RustToTsMessageTypes.StreamPull: {
+        const pull = decodeStreamPullPayload(frame.payload)
+        const owner = this.streamOwner(pull.runId, pull.streamId)
+        if (owner === undefined)
+          return undefined
+        const source = owner.streams.sources.get(pull.streamId)
+        if (source === undefined)
+          return undefined
+        source.credit += pull.credit
+        this.pumpStream(owner.streams, owner.runId, pull.streamId)
+        return undefined
+      }
+
+      case RustToTsMessageTypes.StreamCancel: {
+        const cancel = decodeStreamCancelPayload(frame.payload)
+        const owner = this.streamOwner(cancel.runId, cancel.streamId)
+        if (owner === undefined)
+          return undefined
+        const source = owner.streams.sources.get(cancel.streamId)
+        if (source === undefined)
+          return undefined
+        source.done = true
+        source.reader.cancel(cancel.reason).catch(() => {})
+        owner.streams.sources.delete(cancel.streamId)
+        return undefined
+      }
+
+      default:
+        // Only the types above are legal after the handshake. Anything else
+        // means the two sides desynced — fail loudly rather than skipping the
+        // frame and reading on past it.
+        throw new ProtocolDesyncError(
+          `unexpected frame type 0x${frame.messageType.toString(16).padStart(2, '0')}`,
+        )
+    }
+  }
+
+  /**
+   * Route a `Result` frame: Rust echoes the `runId` of the payload it is
+   * answering onto every completion path (`session.rs` →
+   * `wire::encode_run_completion_payload`), so a `Result` for a run id nothing
+   * here is waiting on is proof the two sides disagree about what this
+   * connection is doing.
+   * @param payload
+   */
+  private routeResult(payload: Uint8Array): void {
+    const runId = peekRunCompletionRunId(payload)
+    const entry = runId === undefined ? undefined : this.runs.get(runId)
+    if (runId === undefined || entry === undefined || entry.epilogue !== undefined) {
+      throw new ProtocolDesyncError(
+        `Result frame carries runId ${runId ?? '(truncated payload)'} but no run `
+        + 'with that id is awaiting a Result on this connection — the runtime is '
+        + 'answering a run this client does not know',
+      )
+    }
+    entry.detachAbort()
+    entry.detachAbort = NOOP
+
+    if (!peekRunCompletionBackgroundPending(payload)) {
+      // The run is over: release any body source still registered
+      // (the runtime cancelled its side already).
+      this.runs.delete(runId)
+      entry.streams?.releaseAll()
+      entry.resolve({ result: payload })
+      return
     }
 
-    let graceTimer: ReturnType<typeof setTimeout> | undefined
-    const onAbort = (): void => {
-      // Ask Rust to stop and send a real ERR_ABORTED Result. Fire-and-forget:
-      // if the write fails the socket is already broken, and the fallback timer
-      // (or a reader error) resolves the run anyway.
+    // waitUntil: the value is delivered now; the run keeps going runtime-side.
+    // The entry stays in the routing table — grace-time bridge and stream
+    // frames keep finding it — until its RunComplete frame, and the connection
+    // is held out of the pool for the duration (pendingEpilogue).
+    let settleEpilogue!: (report: DecodedRunComplete | undefined) => void
+    const epilogue = new Promise<DecodedRunComplete | undefined>((resolve) => {
+      settleEpilogue = resolve
+    })
+    entry.epilogue = settleEpilogue
+
+    // Aborting during the epilogue cancels the background work gracefully:
+    // a Terminate frame truncates the grace phase runtime-side and the
+    // RunComplete still arrives (status `truncated`). No teardown fallback —
+    // the caller already has their value, and the grace wall bounds a
+    // runtime that cannot read the frame.
+    const signal = entry.signal
+    const cancelGrace = (): void => {
       this.write(
         encodeTsToRustFrame(
           TsToRustMessageTypes.Terminate,
           encodeTerminatePayload(runId),
         ),
       ).catch(() => {
-        // Socket already gone — nothing to gracefully terminate.
+        // Socket already gone — the epilogue resolves through the router.
       })
-      graceTimer = setTimeout(() => {
-        this.abortConnection()
-      }, TERMINATE_GRACE_MS)
-      // Don't let the grace timer alone keep the event loop alive.
-      graceTimer.unref?.()
     }
-    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) {
+      cancelGrace()
+    } else if (signal !== undefined) {
+      signal.addEventListener('abort', cancelGrace, { once: true })
+      entry.detachAbort = () => signal.removeEventListener('abort', cancelGrace)
+    }
 
-    this.inFlightRunId = runId
-    try {
-      return await this.drainFrames(dispatcher, runId, signal, streams)
-    } catch (error) {
-      // The fallback `abortConnection` closes the reader, which makes the frame
-      // loop reject. Translate that (or any error observed once the signal has
-      // fired) into a distinguishable abort — carrying the abort reason — so the
-      // caller resolves an aborted RunResult.
-      if (signal?.aborted)
-        throw new RunAbortedError(signal.reason)
-      throw error
-    } finally {
-      this.inFlightRunId = undefined
-      if (graceTimer !== undefined)
-        clearTimeout(graceTimer)
-      signal?.removeEventListener('abort', onAbort)
-    }
+    const hold = epilogue.then(() => {})
+    this.epilogueHolds.add(hold)
+    hold.then(() => this.epilogueHolds.delete(hold))
+
+    entry.resolve({ result: payload, epilogue })
   }
 
   /**
-   * Tear down the connection in response to an in-flight abort. Idempotent.
-   * Marks the client `broken` (so the pool replaces it), closes the frame
-   * reader (so `drainFrames` stops awaiting), and destroys the socket (so the
-   * Rust session sees EOF and drops the isolate).
+   * Route a `RunComplete` frame — the end of a run whose Result reported
+   * pending `waitUntil` work. One for a run id without a pending epilogue is
+   * the same desync signal as a stray `Result`.
+   * @param payload
    */
-  private abortConnection(): void {
-    if (this.broken)
-      return
-    this.broken = true
-    this.reader.close(new RunAbortedError())
-    this.socket.destroy()
+  private routeRunComplete(payload: Uint8Array): void {
+    const report = decodeRunCompletePayload(payload)
+    const entry = this.runs.get(report.runId)
+    if (entry === undefined || entry.epilogue === undefined) {
+      throw new ProtocolDesyncError(
+        `RunComplete frame carries runId ${report.runId} but no run with that id `
+        + 'is in its waitUntil grace phase on this connection',
+      )
+    }
+    this.runs.delete(report.runId)
+    entry.detachAbort()
+    entry.streams?.releaseAll()
+    entry.epilogue(report)
   }
 
   /**
-   * @param dispatcher
-   * @param runId
-   *   The `runId` written into this run's `Run`/`PrefixRun` frame. Every
-   *   `Result` is matched against it before being accepted: Rust echoes the
-   *   `runId` of the payload it is answering onto every completion path
-   *   (`session.rs` → `wire::encode_run_completion_payload`), so a mismatch is
-   *   proof that this connection is delivering someone else's run.
-   * @param signal
-   * @param streams
+   * Resolve which run's stream registry a stream frame addresses. Run id 0
+   * disables run validation on both sides, so a 0-tagged frame is matched by
+   * stream id across every run in flight instead.
+   * @param runId the frame's run id (0 = unvalidated)
+   * @param streamId the stream addressed
    */
-  private async drainFrames(
-    dispatcher: BridgeCallDispatcher | undefined,
+  private streamOwner(
     runId: number,
-    signal?: AbortSignal,
-    streams?: StreamSourceRegistry,
-  ): Promise<RawRunResult> {
-    try {
-      return await this.drainFramesInner(dispatcher, runId, signal, streams)
-    } catch (error) {
-      // Anything escaping the frame loop leaves the peer mid-run on a
-      // connection whose alignment we can no longer vouch for — most sharply a
-      // decode throw on guest-controlled bytes, which returns here without
-      // having answered the bridge call the peer is still parked on. Tearing
-      // down is what keeps the pool from handing this connection, and the
-      // Result frame the peer will still write, to the next caller.
-      this.abortConnection()
-      throw error
+    streamId: number,
+  ): { streams: StreamSourceRegistry, runId: number } | undefined {
+    if (runId !== 0) {
+      const streams = this.runs.get(runId)?.streams
+      return streams === undefined ? undefined : { streams, runId }
     }
+    for (const [id, entry] of this.runs) {
+      if (entry.streams?.sources.has(streamId))
+        return { streams: entry.streams, runId: id }
+    }
+    return undefined
   }
 
   /**
@@ -698,53 +996,6 @@ export class RuntimeIpcClient {
       source.credit = STREAM_CREDIT_WINDOW_BYTES
       this.pumpStream(streams, runId, id)
     }
-  }
-
-  /**
-   * Credit grant from the runtime: the sandbox consumed bytes, send more.
-   * @param payload the StreamPull frame payload
-   * @param streams the run's registry
-   * @param runId the in-flight run (frames for other runs are stale)
-   */
-  private handleStreamPull(
-    payload: Uint8Array,
-    streams: StreamSourceRegistry | undefined,
-    runId: number,
-  ): void {
-    if (streams === undefined)
-      return
-    const pull = decodeStreamPullPayload(payload)
-    if (pull.runId !== 0 && pull.runId !== runId)
-      return
-    const source = streams.sources.get(pull.streamId)
-    if (source === undefined)
-      return
-    source.credit += pull.credit
-    this.pumpStream(streams, runId, pull.streamId)
-  }
-
-  /**
-   * The sandbox is done with a stream: stop pumping, release the source.
-   * @param payload the StreamCancel frame payload
-   * @param streams the run's registry
-   * @param runId
-   */
-  private handleStreamCancel(
-    payload: Uint8Array,
-    streams: StreamSourceRegistry | undefined,
-    runId: number,
-  ): void {
-    if (streams === undefined)
-      return
-    const cancel = decodeStreamCancelPayload(payload)
-    if (cancel.runId !== 0 && cancel.runId !== runId)
-      return
-    const source = streams.sources.get(cancel.streamId)
-    if (source === undefined)
-      return
-    source.done = true
-    source.reader.cancel(cancel.reason).catch(() => {})
-    streams.sources.delete(cancel.streamId)
   }
 
   /**
@@ -816,116 +1067,33 @@ export class RuntimeIpcClient {
   }
 
   /**
-   * Keep draining this connection after an early Result until the run's
-   * `RunComplete` frame arrives, dispatching grace-time bridge calls exactly
-   * like the run's own loop. Never throws: a lost connection (or a desync)
-   * resolves `undefined` and the caller synthesizes a truncated report —
-   * the run's value was already delivered, so nothing user-facing can fail.
-   * @param dispatcher the run's bridge dispatcher
-   * @param runId the run being completed
-   * @param signal
-   * @param streams
-   */
-  private drainEpilogue(
-    dispatcher: BridgeCallDispatcher | undefined,
-    runId: number,
-    signal?: AbortSignal,
-    streams?: StreamSourceRegistry,
-  ): Promise<DecodedRunComplete | undefined> {
-    // Aborting during the epilogue cancels the background work gracefully:
-    // a Terminate frame truncates the grace phase runtime-side and the
-    // RunComplete still arrives (status `truncated`). No teardown fallback —
-    // the caller already has their value, and the grace wall bounds a
-    // runtime that cannot read the frame.
-    const cancelGrace = (): void => {
-      this.write(
-        encodeTsToRustFrame(
-          TsToRustMessageTypes.Terminate,
-          encodeTerminatePayload(runId),
-        ),
-      ).catch(() => {
-        // Socket already gone — the epilogue resolves through the reader.
-      })
-    }
-    if (signal?.aborted)
-      cancelGrace()
-    else
-      signal?.addEventListener('abort', cancelGrace, { once: true })
-
-    const epilogue = (async (): Promise<DecodedRunComplete | undefined> => {
-      try {
-        for await (const frame of this.reader) {
-          switch (frame.messageType) {
-            case RustToTsMessageTypes.RunComplete: {
-              const report = decodeRunCompletePayload(frame.payload)
-              if (report.runId !== runId) {
-                this.abortConnection()
-                return undefined
-              }
-              return report
-            }
-
-            case RustToTsMessageTypes.Log:
-              break
-
-            case RustToTsMessageTypes.BridgeCall:
-              await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId, streams)
-              break
-
-            case RustToTsMessageTypes.StreamPull:
-              this.handleStreamPull(frame.payload, streams, runId)
-              break
-
-            case RustToTsMessageTypes.StreamCancel:
-              this.handleStreamCancel(frame.payload, streams, runId)
-              break
-
-            default:
-              // Frame alignment lost mid-epilogue: never hand this
-              // connection to the next caller.
-              this.abortConnection()
-              return undefined
-          }
-        }
-        return undefined
-      } catch {
-        return undefined
-      }
-    })()
-    const hold = epilogue.then(
-      () => {},
-      () => {},
-    )
-    this.pendingEpilogue = hold
-    hold.then(() => {
-      if (this.pendingEpilogue === hold)
-        this.pendingEpilogue = null
-    })
-    return epilogue
-  }
-
-  /**
-   * Handle one `BridgeCall` frame: decode, dispatch to the host handler
-   * (fire-and-forget), and answer decode/dispatch failures inline. Shared by
-   * the run's frame loop and the `waitUntil` epilogue loop.
+   * Handle one `BridgeCall` frame: decode, dispatch to the owning run's
+   * handler (fire-and-forget), and answer decode/dispatch failures inline.
+   *
+   * Dispatches are fire-and-forget — the router does NOT await the handler,
+   * so it continues routing frames immediately. When the Rust side fires a
+   * wall timeout it sends a `Result` frame; the router delivers it without
+   * waiting for the handler. The handler promise is then **orphaned**: any
+   * in-flight I/O or timers continue to completion, and Rust silently ignores
+   * any late `BridgeResponse` that arrives after the run has completed (see
+   * session.rs).
    * @param payload the frame payload
-   * @param dispatcher the run's bridge dispatcher
-   * @param runId the run the frame belongs to
-   * @param streams
+   * @param entry the owning run's routing entry
+   * @param runId the run the frame belongs to (already peeked by the router)
    */
   private async dispatchBridgeCallFrame(
     payload: Uint8Array,
-    dispatcher: BridgeCallDispatcher | undefined,
+    entry: RunEntry,
     runId: number,
-    streams?: StreamSourceRegistry,
   ): Promise<void> {
+    const { dispatcher, streams } = entry
     // Guest-controlled bytes. A host type the sandbox accepted but this
     // Node refuses to reconstruct (a URL carrying credentials, say)
     // throws here, and the peer is parked waiting for our response — so
     // answer the call with the error instead of letting it escape and
     // cost the connection. `callId` is read before the value blob, so it
     // survives a failure in the blob itself; only a payload too damaged
-    // to yield one falls through to the teardown in `drainFrames`.
+    // to yield one falls through to the router's teardown.
     let call: ReturnType<typeof decodeBridgeCallPayload>
     try {
       call = decodeBridgeCallPayload(payload)
@@ -937,10 +1105,7 @@ export class RuntimeIpcClient {
         encodeTsToRustFrame(
           TsToRustMessageTypes.BridgeResponse,
           encodeBridgeResponsePayload(
-            // Echo the FRAME's run id — the response routes by it. The
-            // ambient run is only the fallback for a payload too short to
-            // carry one (unreachable past the callId peek above).
-            peekBridgeCallRunId(payload) ?? runId,
+            runId,
             callId,
             false,
             undefined,
@@ -972,12 +1137,10 @@ export class RuntimeIpcClient {
       )
     } else {
       // Fire-and-forget the handler.
-      // Do NOT await it — the loop reads the next frame immediately.
+      // Do NOT await it — the router reads the next frame immediately.
       // When the handler settles the response is written back.
       // If the run timed out by then, Rust ignores the late frame.
-      // Responses echo the frame's own run id, not the ambient run's: the
-      // demux routes by it, and under multiplexing (#127) grace-time and
-      // concurrent frames are not always for the run this loop drains.
+      // Responses echo the frame's own run id — the demux routes by it.
       const { runId: frameRunId, callId } = call
       dispatcher({
         targetKind: call.targetKind,
@@ -1065,83 +1228,15 @@ export class RuntimeIpcClient {
         } catch {
           // The connection cannot even carry the failure. Tear it down so
           // the run fails fast instead of waiting out the wall clock — but
-          // only while it is still OUR run: by now the slot may have been
-          // returned to the pool and be serving someone else, and killing
-          // a healthy connection under a different caller would turn this
-          // into the very cross-run fault this branch closes.
-          if (this.inFlightRunId === runId)
+          // only while the run is still routing here: by now it may have
+          // completed and the connection be serving someone else, and
+          // killing a healthy connection under a different caller would
+          // turn this into the very cross-run fault this branch closes.
+          if (this.runs.has(frameRunId))
             this.abortConnection()
         }
       })
     }
-  }
-
-  private async drainFramesInner(
-    dispatcher: BridgeCallDispatcher | undefined,
-    runId: number,
-    signal?: AbortSignal,
-    streams?: StreamSourceRegistry,
-  ): Promise<RawRunResult> {
-    for await (const frame of this.reader) {
-      switch (frame.messageType) {
-        case RustToTsMessageTypes.Result: {
-          const resultRunId = peekRunCompletionRunId(frame.payload)
-          if (resultRunId !== runId) {
-            throw new ProtocolDesyncError(
-              `Result frame carries runId ${resultRunId ?? '(truncated payload)'} `
-              + `but run ${runId} is in flight on this connection — the runtime is `
-              + 'answering a different run, so this run never executed',
-            )
-          }
-          if (!peekRunCompletionBackgroundPending(frame.payload)) {
-            // The run is over: release any body source still registered
-            // (the runtime cancelled its side already).
-            streams?.releaseAll()
-            return { result: frame.payload }
-          }
-          // waitUntil: the value is delivered now; the run
-          // keeps going runtime-side. Keep draining this connection —
-          // detached, bridge dispatch included — until its RunComplete frame,
-          // and hold the connection out of the pool for the duration. The
-          // stream registry rides along: grace-time reads keep their flow
-          // control, and grace-time bridge responses can stream too.
-          return {
-            result: frame.payload,
-            epilogue: this.drainEpilogue(dispatcher, runId, signal, streams),
-          }
-        }
-
-        case RustToTsMessageTypes.Log:
-          break
-
-        case RustToTsMessageTypes.BridgeCall: {
-          await this.dispatchBridgeCallFrame(frame.payload, dispatcher, runId, streams)
-          break
-        }
-
-        case RustToTsMessageTypes.StreamPull: {
-          this.handleStreamPull(frame.payload, streams, runId)
-          break
-        }
-
-        case RustToTsMessageTypes.StreamCancel: {
-          this.handleStreamCancel(frame.payload, streams, runId)
-          break
-        }
-
-        default:
-          // Only Result, Log and BridgeCall are legal during a run. Anything
-          // else means the two sides desynced — fail loudly rather than
-          // skipping the frame and reading on past it, the same contract
-          // `precompile()` and `stats()` enforce.
-          throw new ProtocolDesyncError(
-            `unexpected frame type 0x${frame.messageType.toString(16).padStart(2, '0')} `
-            + `while awaiting the Result for run ${runId}`,
-          )
-      }
-    }
-
-    throw new Error('connection closed before receiving a Result frame')
   }
 
   private async write(frame: Buffer): Promise<void> {
@@ -1163,7 +1258,7 @@ export class RuntimeIpcClient {
  * the runtime resolves import handle IDs before the frame is sent, so both
  * lookups are plain name-addressed.
  *
- * Returns `undefined` when both maps are empty so the loop short-circuits to
+ * Returns `undefined` when both maps are empty so the router short-circuits to
  * an "unconfigured bridge" error response.
  * @param globals
  * @param imports

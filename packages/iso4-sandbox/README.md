@@ -161,7 +161,8 @@ const sandbox = await createSandbox({
 The runtime watches its own process RSS. At or above `memoryBudgetMb` it
 evicts idle instances (largest heap × longest idle first) and stops adding new
 warm ones — prefix runs then execute on cold one-off isolates — until RSS falls
-back to 80 % of the mark. `maxIsolates` caps concurrent runs; this caps memory.
+back to 80 % of the mark. `maxConcurrentRuns` caps concurrent runs; this caps
+memory.
 The default is derived from the memory available to the process
 (container-aware), so most hosts never set it.
 
@@ -296,8 +297,11 @@ Thrown errors keep their identity across the bridge, in both directions:
 ## Architecture
 
 V8 runs in a separate Rust subprocess communicating over a Unix domain socket.
-A pool of connections (one per `maxIsolates` slot) provides concurrency —
-five concurrent `prefix.execute()` calls each get their own slot and execute in
+A slot pool admits up to `maxConcurrentRuns` runs at once (the rest queue
+FIFO — an `AbortSignal`, e.g. `AbortSignal.timeout()`, bounds the wait);
+connections to the subprocess open on demand and are reused, and `stats()`
+reports the live count as `openConnections`. Five concurrent
+`prefix.execute()` calls each get their own run slot and execute in
 parallel.
 
 ## License

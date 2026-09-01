@@ -1,8 +1,8 @@
 /**
  * \@iso4/sandbox - public entry point.
  *
- * Spawns the Rust V8 subprocess, manages a pool of UDS connections (one per
- * isolate slot), and exposes the `Sandbox` + `Prefix` API.
+ * Spawns the Rust V8 subprocess, admits runs through a slot pool over
+ * lazily opened UDS connections, and exposes the `Sandbox` + `Prefix` API.
  */
 
 import { access, mkdtemp, rm } from 'node:fs/promises'
@@ -17,7 +17,7 @@ import type { ChildProcess } from 'node:child_process'
 import { resolveRuntimeBinary } from './binary'
 import { ProtocolDesyncError, RunAbortedError, RuntimeIpcClient } from './client'
 
-import { ConnectionPool } from './pool'
+import { RunPool } from './pool'
 import {
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
@@ -105,8 +105,24 @@ export type {
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> {
+  if (options !== undefined && 'maxIsolates' in options) {
+    // Untyped callers would otherwise silently fall back to the default
+    // concurrency — the same removal contract as `limits.memoryMb`.
+    throw new TypeError(
+      '[@iso4/sandbox] maxIsolates was removed: capacity admits runs, not '
+      + 'connections — set maxConcurrentRuns instead (same default: '
+      + 'os.availableParallelism())',
+    )
+  }
   const binaryPath = resolveRuntimeBinary(options)
-  const maxIsolates = options?.maxIsolates ?? availableParallelism()
+  const maxConcurrentRuns = options?.maxConcurrentRuns ?? availableParallelism()
+  if (!Number.isInteger(maxConcurrentRuns) || maxConcurrentRuns < 1) {
+    // 0 or a negative value would queue every run forever (total deadlock),
+    // and a fractional value admits more runs than documented.
+    throw new TypeError(
+      '[@iso4/sandbox] maxConcurrentRuns must be an integer >= 1',
+    )
+  }
   const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb)
 
   // Access control on the socket is the directory it lives in: a fresh
@@ -125,7 +141,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
 
   // The runtime needs exactly one capacity fact: the warm budget in bytes,
   // the RSS mark it sheds against. Concurrency is bounded by this
-  // host's connection pool; there is no instance-count cap (celld's
+  // host's slot pool; there is no instance-count cap (celld's
   // stance — their resident ceiling defaults to unlimited).
   const proc = spawn(binaryPath, [
     '--socket',
@@ -156,46 +172,20 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   try {
     await waitForSocket(socketPath, proc)
 
-    // Open all pool connections in parallel. `allSettled`, not `all`: `all`
-    // rejects on the first failure while its siblings keep running, so the
-    // connections that did open are left with no owner. Killing the child
-    // below closes them anyway, but only after they have each held a thread in
-    // it, and only if the kill lands.
+    // Run connections open lazily, on demand, and are reused for the process
+    // lifetime — capacity is the slot pool's admission number
+    // (`maxConcurrentRuns`), not a set of sockets (see `pool.ts`). Nothing
+    // connects eagerly here except the control connection below.
     const connect = (): Promise<RuntimeIpcClient> =>
       RuntimeIpcClient.connect({ socketPath, descriptorToken })
-    const settled = await Promise.allSettled(
-      Array.from({ length: maxIsolates }, () => connect()),
-    )
-    const clients: RuntimeIpcClient[] = []
-    let firstFailure: { reason: unknown } | undefined
-    for (const outcome of settled) {
-      if (outcome.status === 'fulfilled')
-        clients.push(outcome.value)
-      else if (firstFailure === undefined)
-        firstFailure = { reason: outcome.reason }
-    }
-    if (firstFailure !== undefined) {
-      await Promise.all(clients.map((client) => client.dispose().catch(() => {})))
-      throw firstFailure.reason
-    }
-
-    // These connections set the pool's capacity. Within it the pool reuses
-    // idle connections and opens a replacement on demand for one that died,
-    // rather than holding a fixed set of slots (see `pool.ts`).
-    const pool = new ConnectionPool(clients, connect)
+    const pool = new RunPool(maxConcurrentRuns, connect)
 
     // Dedicated control connection for `stats()`: it never enters the
     // pool, so a capacity snapshot answers even while every run slot is busy —
-    // exactly when it is most wanted.
-    let statsClient: RuntimeIpcClient
-    try {
-      statsClient = await connect()
-    } catch (error) {
-      // The child is dealt with by the outer handler; the pool's connections
-      // are this block's to release.
-      await pool.dispose().catch(() => {})
-      throw error
-    }
+    // exactly when it is most wanted. Opened eagerly, it is also the one
+    // handshake `createSandbox` performs — a protocol or V8-format mismatch
+    // still fails here, at creation, instead of at the first run.
+    const statsClient = await connect()
 
     return new SandboxImpl(proc, pool, statsClient, socketPath, brandKey, options?.memoryMb)
   } catch (error) {
@@ -394,7 +384,7 @@ function abortedResult(reason?: unknown, from?: RunResult): RunResult {
 
 class SandboxImpl implements Sandbox {
   private readonly proc: ChildProcess
-  private readonly pool: ConnectionPool
+  private readonly pool: RunPool
   /**
    * Control connection for `stats()` — outside the pool so a snapshot
    * answers even when every run slot is busy.
@@ -424,7 +414,7 @@ class SandboxImpl implements Sandbox {
 
   constructor(
     proc: ChildProcess,
-    pool: ConnectionPool,
+    pool: RunPool,
     statsClient: RuntimeIpcClient,
     socketPath: string,
     brandKey: string,
@@ -549,6 +539,7 @@ class SandboxImpl implements Sandbox {
     return {
       activeRuns: raw.oneoffRunning + raw.warmBusy,
       queueDepth: this.pool.queueDepth,
+      openConnections: this.pool.openConnections,
       warmInstances: raw.warmBusy + raw.warmIdle,
       idleInstances: raw.warmIdle,
       idleHeapBytes: raw.idleHeapBytes,
@@ -679,7 +670,7 @@ class SandboxImpl implements Sandbox {
 class PrefixImpl<G extends HostGlobals = {}, M extends Imports = {}>
 implements Prefix<G, M> {
   readonly id: string
-  private readonly pool: ConnectionPool
+  private readonly pool: RunPool
   /**
    * Handlers declared at precompile time. Used as defaults for any run that
    * does not supply its own override, per DESIGN.md §11.4 "Rebinding rules":
@@ -711,7 +702,7 @@ implements Prefix<G, M> {
 
   constructor(
     id: string,
-    pool: ConnectionPool,
+    pool: RunPool,
     defaultGlobals: G,
     defaultImportHandlers: ImportHandlerMap,
     brandKey: string,

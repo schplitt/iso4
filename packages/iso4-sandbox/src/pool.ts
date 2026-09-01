@@ -1,24 +1,28 @@
 /**
- * Connection pool for RuntimeIpcClient slots.
+ * Run admission and connection reuse for the sandbox — two separate concerns:
  *
- * `maxIsolates` is a *capacity*, not a fixed set of objects: the pool holds at
- * most that many live connections, reuses idle ones, and opens a fresh one when
- * capacity is free and nothing idle is available. Callers beyond capacity queue
- * here rather than hammering the Rust process — the pool is the unit of
- * back-pressure.
+ * - {@link SlotPool} caps how many runs *execute* at once
+ *   (`maxConcurrentRuns`); callers beyond it queue FIFO. A slot is a pure
+ *   admission ticket — it says nothing about sockets.
+ * - {@link ConnectionRegistry} owns the connections: idle ones are reused,
+ *   a missing one is opened on demand (nothing connects eagerly), a broken
+ *   one is dropped and its replacement opened by whoever needs it next.
+ *   Idle connections are kept for the process lifetime; `dispose()` closes
+ *   them.
  *
- * A connection that comes back dead (in-flight abort, peer close, child crash)
- * is dropped, not replaced on the spot. Capacity is a number, so the drop frees
- * a unit of it and the next caller that needs a connection opens one. That is
- * why a failed connect fails a *run* rather than permanently costing the pool a
- * slot. Removing the fixed slot set entirely is a planned pool rework.
+ * {@link RunPool} composes the two: one slot plus one connection per run,
+ * both held until the run — including any `waitUntil` grace work — is over.
+ * Decoupling capacity from sockets is the point: the admission number is the
+ * back-pressure knob, while the connection count simply follows demand.
+ * Finer-grained slot release (a slot freed at Result while grace work rides
+ * the connection) is the multiplexing activation's job, not this pool's.
  */
 
 import { RunAbortedError } from './client'
 import type { RuntimeIpcClient } from './client'
 
-interface Waiter {
-  resolve: (client: RuntimeIpcClient) => void
+interface SlotWaiter {
+  resolve: () => void
   reject: (error: Error) => void
 }
 
@@ -28,28 +32,22 @@ interface Waiter {
  */
 export type ConnectFn = () => Promise<RuntimeIpcClient>
 
-export class ConnectionPool {
-  private readonly idle: RuntimeIpcClient[]
-  private readonly waiters: Waiter[] = []
-  private readonly connect: ConnectFn | undefined
-  /**
-   * Upper bound on live connections — `maxIsolates`.
-   */
+/**
+ * FIFO admission over a fixed number of run slots. Purely a counter — it
+ * never touches connections.
+ */
+export class SlotPool {
   private readonly capacity: number
-  /**
-   * Connections currently checked out by a caller.
-   */
-  private leased = 0
+  private active = 0
+  private readonly waiters: SlotWaiter[] = []
   private disposed = false
 
-  constructor(clients: RuntimeIpcClient[], connect?: ConnectFn) {
-    this.idle = [...clients]
-    this.capacity = clients.length
-    this.connect = connect
+  constructor(capacity: number) {
+    this.capacity = capacity
   }
 
   /**
-   * Callers currently queued for a connection — `stats()` reports this as
+   * Callers currently queued for a slot — `stats()` reports this as
    * `queueDepth`.
    */
   get queueDepth(): number {
@@ -57,85 +55,32 @@ export class ConnectionPool {
   }
 
   /**
-   * Borrow a client, run `fn`, then unconditionally return the client.
-   * If the pool is disposed while `fn` is running, the client is disposed
-   * on release rather than returned to the idle list.
-   * @param fn ran with the borrowed connection
+   * Take a slot, or queue FIFO until one frees.
    * @param signal
    *   The caller's abort signal, honoured *while queued*. Per-run
-   *   `wallTimeMs` / `cpuTimeMs` cannot bound that wait: the caller is upstream
-   *   of the runtime and its `Run` frame has not been sent yet.
+   *   `wallTimeMs` / `cpuTimeMs` cannot bound that wait: the caller is
+   *   upstream of the runtime and its `Run` frame has not been sent yet.
+   *   `AbortSignal.timeout()` composes as a queue-wait bound — there is no
+   *   separate timeout knob.
    */
-  async withClient<T>(
-    fn: (client: RuntimeIpcClient) => Promise<T>,
-    signal?: AbortSignal,
-  ): Promise<T> {
-    const client = await this.acquire(signal)
-    try {
-      return await fn(client)
-    } finally {
-      this.release(client)
-    }
-  }
-
-  async dispose(): Promise<void> {
-    if (this.disposed)
-      return
-    this.disposed = true
-
-    for (const { reject } of this.waiters.splice(0)) {
-      reject(new Error('runtime disposed'))
-    }
-
-    // In-flight connections are disposed when they are returned via release().
-    await Promise.all(this.idle.splice(0).map((c) => c.dispose()))
-  }
-
-  /**
-   * Live connections: idle plus checked out.
-   */
-  private get live(): number {
-    return this.idle.length + this.leased
-  }
-
-  private acquire(signal?: AbortSignal): Promise<RuntimeIpcClient> {
+  acquire(signal?: AbortSignal): Promise<void> {
     if (this.disposed)
       return Promise.reject(new Error('runtime is disposed'))
 
-    const reused = this.idle.pop()
-    if (reused !== undefined) {
-      this.leased++
-      return Promise.resolve(reused)
+    // A signal that fired before admission (during argument serialization,
+    // say) must reject here: `addEventListener` never fires for an
+    // already-aborted signal, so queueing would strand the caller until an
+    // unrelated run frees a slot.
+    if (signal?.aborted)
+      return Promise.reject(new RunAbortedError(signal.reason))
+
+    if (this.active < this.capacity) {
+      this.active++
+      return Promise.resolve()
     }
 
-    if (this.live < this.capacity)
-      return this.open()
-
-    return this.queue(signal)
-  }
-
-  /**
-   * Open a connection against free capacity. Counts the lease before awaiting,
-   * so concurrent acquires cannot both read the same free capacity and overshoot
-   * `maxIsolates`. A failure hands the error to this caller: the run fails and
-   * the next one tries again, rather than the pool quietly shrinking.
-   */
-  private open(): Promise<RuntimeIpcClient> {
-    if (this.connect === undefined) {
-      return Promise.reject(
-        new Error('[@iso4/sandbox] no runtime connection available'),
-      )
-    }
-    this.leased++
-    return this.connect().catch((error: unknown) => {
-      this.leased--
-      throw error
-    })
-  }
-
-  private queue(signal?: AbortSignal): Promise<RuntimeIpcClient> {
-    return new Promise<RuntimeIpcClient>((resolve, reject) => {
-      const waiter: Waiter = { resolve, reject }
+    return new Promise<void>((resolve, reject) => {
+      const waiter: SlotWaiter = { resolve, reject }
       if (signal === undefined) {
         this.waiters.push(waiter)
         return
@@ -150,9 +95,9 @@ export class ConnectionPool {
       signal.addEventListener('abort', onAbort, { once: true })
       const settle = (): void => signal.removeEventListener('abort', onAbort)
 
-      waiter.resolve = (client) => {
+      waiter.resolve = () => {
         settle()
-        resolve(client)
+        resolve()
       }
       waiter.reject = (error) => {
         settle()
@@ -162,56 +107,172 @@ export class ConnectionPool {
     })
   }
 
-  private release(client: RuntimeIpcClient): void {
-    // A run that ended with pending waitUntil work still owns its
-    // connection: grace-time bridge frames and the final RunComplete belong
-    // to it. Hold the slot until the epilogue settles, then release for real.
-    const hold = client.pendingEpilogue
-    if (hold) {
-      hold.then(() => {
-        client.pendingEpilogue = null
-        this.releaseNow(client)
-      })
-      return
-    }
-    this.releaseNow(client)
-  }
-
-  private releaseNow(client: RuntimeIpcClient): void {
-    this.leased--
-
-    if (this.disposed) {
-      client.dispose().catch(() => {})
-      return
-    }
-
-    if (!client.usable) {
-      // Dead: drop it and let the freed capacity be filled on demand.
-      client.dispose().catch(() => {})
-      this.fillWaiters()
-      return
-    }
-
+  /**
+   * Free a slot. The longest-queued caller takes it directly; only when
+   * nobody waits does the active count drop.
+   */
+  release(): void {
     const next = this.waiters.shift()
     if (next !== undefined) {
-      this.leased++
-      next.resolve(client)
-    } else {
-      this.idle.push(client)
+      next.resolve()
+      return
+    }
+    this.active--
+  }
+
+  dispose(): void {
+    if (this.disposed)
+      return
+    this.disposed = true
+    for (const { reject } of this.waiters.splice(0))
+      reject(new Error('runtime disposed'))
+  }
+}
+
+/**
+ * The sandbox's open connections: reused while usable, opened lazily when a
+ * caller needs one and nothing idle is available, dropped when broken. There
+ * is no connection cap — how many exist is bounded by how many are ever
+ * checked out at once, which the {@link SlotPool} already limits.
+ */
+export class ConnectionRegistry {
+  private readonly idle: RuntimeIpcClient[] = []
+  /**
+   * Connections currently checked out by a caller.
+   */
+  private leased = 0
+  private readonly connect: ConnectFn
+  private disposed = false
+
+  constructor(connect: ConnectFn) {
+    this.connect = connect
+  }
+
+  /**
+   * Connections as tracked: idle plus checked out — `stats()` reports this
+   * as `openConnections`. A connection that died while idle stays counted
+   * until the next `acquire()` observes and drops it, and one still mid-
+   * handshake is already counted — the number is the registry's ledger,
+   * not a per-read socket probe.
+   */
+  get openConnections(): number {
+    return this.idle.length + this.leased
+  }
+
+  /**
+   * Reuse an idle connection or open a fresh one. A connection that died
+   * while idle (child crash, peer close) is dropped here, not handed out —
+   * the drop costs nothing because capacity lives in the slot pool, so the
+   * next caller simply opens a replacement. A failed connect fails this
+   * caller's run; the registry never shrinks silently.
+   */
+  async acquire(): Promise<RuntimeIpcClient> {
+    if (this.disposed)
+      throw new Error('runtime is disposed')
+
+    for (let client = this.idle.pop(); client !== undefined; client = this.idle.pop()) {
+      if (client.usable) {
+        this.leased++
+        return client
+      }
+      client.dispose().catch(() => {})
+    }
+
+    this.leased++
+    try {
+      return await this.connect()
+    } catch (error) {
+      this.leased--
+      throw error
     }
   }
 
   /**
-   * Hand freed capacity to queued callers by opening connections for them. A
-   * failure rejects that caller instead of vanishing, so a dead child surfaces
-   * as failing runs rather than an unbounded queue.
+   * Return a connection. A usable one goes back to the idle list and is kept
+   * for the process lifetime; a broken one is disposed — its replacement is
+   * opened on demand by the next caller that needs it.
+   * @param client
    */
-  private fillWaiters(): void {
-    while (this.waiters.length > 0 && this.live < this.capacity) {
-      const waiter = this.waiters.shift()
-      if (waiter === undefined)
-        return
-      this.open().then(waiter.resolve, waiter.reject)
+  release(client: RuntimeIpcClient): void {
+    this.leased--
+    if (this.disposed || !client.usable) {
+      client.dispose().catch(() => {})
+      return
     }
+    this.idle.push(client)
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed)
+      return
+    this.disposed = true
+    // Checked-out connections are disposed when they come back via release().
+    await Promise.all(this.idle.splice(0).map((client) => client.dispose()))
+  }
+}
+
+/**
+ * What `createSandbox` hands to `SandboxImpl`: slot admission composed with
+ * connection reuse, exposed through the same borrow-run-return shape the
+ * old connection-capacity pool had.
+ */
+export class RunPool {
+  private readonly slots: SlotPool
+  private readonly connections: ConnectionRegistry
+
+  constructor(maxConcurrentRuns: number, connect: ConnectFn) {
+    this.slots = new SlotPool(maxConcurrentRuns)
+    this.connections = new ConnectionRegistry(connect)
+  }
+
+  get queueDepth(): number {
+    return this.slots.queueDepth
+  }
+
+  get openConnections(): number {
+    return this.connections.openConnections
+  }
+
+  /**
+   * Take a run slot (queueing FIFO when `maxConcurrentRuns` are executing),
+   * borrow a connection, run `fn`, then return both. The caller's promise
+   * settles when `fn` does; a run that ended with pending `waitUntil` work
+   * keeps its slot and its connection in the background until the grace
+   * phase settles — grace-time frames belong to the finished run, not the
+   * next one.
+   * @param fn ran with the borrowed connection
+   * @param signal the caller's abort signal, honoured while queued
+   */
+  async withClient<T>(
+    fn: (client: RuntimeIpcClient) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    await this.slots.acquire(signal)
+
+    let client: RuntimeIpcClient
+    try {
+      client = await this.connections.acquire()
+    } catch (error) {
+      this.slots.release()
+      throw error
+    }
+
+    try {
+      return await fn(client)
+    } finally {
+      (async () => {
+        // Re-read until clear: the hold snapshot only covers epilogues
+        // pending at read time.
+        for (let hold = client.pendingEpilogue; hold !== null; hold = client.pendingEpilogue)
+          await hold
+        this.connections.release(client)
+        this.slots.release()
+      })()
+    }
+  }
+
+  async dispose(): Promise<void> {
+    this.slots.dispose()
+    await this.connections.dispose()
   }
 }

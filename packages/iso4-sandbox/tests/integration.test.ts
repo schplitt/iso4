@@ -27,7 +27,7 @@ import type { Sandbox as Runtime } from '../src/types.js'
 let runtime: Runtime
 
 beforeAll(async () => {
-  runtime = await createRuntime({ maxIsolates: 4 })
+  runtime = await createRuntime({ maxConcurrentRuns: 4 })
 }, 20_000)
 
 afterAll(async () => {
@@ -1416,7 +1416,7 @@ describe('resource limits (Phase 3/8)', () => {
 
   test('heap limit kills memory hog via TypedArray', async () => {
     // Heap cap is per-Runtime — dedicated small-cap sandbox.
-    const small = await createRuntime({ maxIsolates: 1, memoryMb: 16 })
+    const small = await createRuntime({ maxConcurrentRuns: 1, memoryMb: 16 })
     try {
       const result = await small.run({
         code: 'const bufs = []; while(true) bufs.push(new Uint8Array(512*1024))',
