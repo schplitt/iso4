@@ -26,13 +26,13 @@ harness = false
 
 [dependencies]
 # Embedded V8 via the official rusty_v8 crate
-v8 = "147"
+v8 = "152.2"
 
 # ICU data (icudtl.dat) baked into the binary — the same file Deno embeds.
 # The prebuilt V8 is compiled with i18n support but carries no ICU data, so
 # the embedder must supply it. The crate's minor version tracks the ICU major
-# version and must match the `v8` crate's bundled ICU (147 → ICU 77).
-deno_core_icudata = "0.77.0"
+# version and must match the `v8` crate's bundled ICU (152 → ICU 78).
+deno_core_icudata = "0.78.0"
 
 # Lock-free channels between session, writer, and timeout threads
 crossbeam-channel = "0.5"

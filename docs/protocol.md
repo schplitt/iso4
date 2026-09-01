@@ -554,6 +554,16 @@ neither Node nor rusty_v8 exposes a way to pin what they write. The probe is
 a serialized `null`: byte 0 is the header tag `0xFF` and byte 1 is the
 writer's format version.
 
+**The runtime's read and write versions are split.** The runtime's V8
+natively writes format 16, which no released Node (22–26) can read — but
+below 4 GB (always true under the frame ceiling, §2) the version-16 byte
+stream is identical to version 15 except for the header's version byte. The
+runtime therefore relabels every blob it emits to **version 15** (the same
+mechanism Deno ships for `v8.serialize` interop), while accepting peer
+probes up to the version it **reads** (16). So the Hello probe advertises
+15, a host on Node 22–26 (writes 15) and a host on Node 27+ (writes 16)
+both pass the check, and one binary spans the bump.
+
 **The check is startup-only and hard-fails.** There is no per-frame
 negotiation and no fallback codec:
 
@@ -1084,7 +1094,7 @@ the connection in the background.
 validates the prefix (compile + instantiate + evaluate in a throwaway
 isolate, under the fixed warm-up budget) and stores the **source and declared
 shape** in the Rust process under a `PrefixId`. There is no runtime snapshot
-(V8 14.x cannot create startup snapshots safely in a live multi-isolate
+(V8 cannot create startup snapshots safely in a live multi-isolate
 process; see DESIGN.md on the removal).
 
 `PrefixRun` is served by **warm instances**: the runtime keeps a
@@ -1146,9 +1156,11 @@ Two independent versions are checked at handshake time (§5.1), both fatal:
    change incompatibly.
 2. **The V8 serialization format version** — carried in each side's probe.
    Not ours to bump: V8 changes it, and neither Node nor rusty_v8 lets an
-   embedder pin what it writes. The runtime accepts a host that writes a
-   format it can read (`hostVersion <= runtimeWriteVersion`), and the host
-   proves the reverse direction by deserializing the runtime's probe.
+   embedder pin what it writes — the runtime instead relabels its emitted
+   blobs' header to a Node-readable version (§5.1). The runtime accepts a
+   host that writes a format it can read (`hostVersion <=
+   runtimeReadVersion`), and the host proves the reverse direction by
+   deserializing the runtime's probe.
 
 `@iso4/sandbox` and every `@iso4/v8-*` package must be released together on
 an incompatible protocol change — and, because the V8 format version rides

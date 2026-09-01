@@ -1812,7 +1812,10 @@ eviction.
 
 **Threading.** rusty_v8 pins isolates to their creating thread
 (`OwnedIsolate` is `!Send`, `Drop` asserts current-thread ownership and
-reverse creation order, no `Locker` exposed — re-verified on v8 147.4.0).
+reverse creation order — re-verified on v8 152.2.0; the crate's opt-in
+cross-thread path, `unsafe try_into_shared()` into a lockable
+`SharedIsolate`, is a separate type this runtime deliberately does not use —
+see the #80 record).
 Each instance is therefore owned cradle-to-grave by a dedicated runtime
 thread running the per-instance turn loop: jobs arrive over the handle's
 channel, inbound frames arrive demux-routed per run, and any number of runs
