@@ -4,7 +4,8 @@
 //! evaluation, result extraction, console capture, and limit enforcement.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::ffi::c_void;
 use std::io;
 use std::mem::ManuallyDrop;
@@ -13,10 +14,8 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-
-use crossbeam_channel::RecvTimeoutError;
 
 use crate::blob;
 use crate::ipc;
@@ -89,7 +88,7 @@ pub struct Limits {
     pub grace_ms: u32,
 }
 
-/// Termination reason set by the first limit-guard thread to fire.
+/// Termination reason set by the first limit enforcer to fire.
 ///
 /// Stored in a [`ReasonCell`] - first write wins, subsequent writes are
 /// no-ops. Absence of a fired guard is represented naturally by
@@ -102,7 +101,7 @@ enum TerminationReason {
 }
 
 /// First-writer-wins slot for the run's termination reason, shared between
-/// the guard threads, the near-heap callback, the ArrayBuffer allocator, and
+/// the watchdog, the near-heap callback, the ArrayBuffer allocator, and
 /// the classification sites.
 ///
 /// Used to be a `OnceLock`, which cannot be re-armed. The allocator and the
@@ -1326,15 +1325,15 @@ fn run_module_inner(
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
 
     // ── The limit guard ──────────────────────────────────────────────────
-    // One guard thread per instance (E1 ruling 2) — a one-off run IS an
-    // instance of one call. It watches the turn currently executing; while
+    // The instance's watchdog registration (#145) — a one-off run IS an
+    // instance of one call. It covers the turn currently executing; while
     // the run is parked between turns the target is empty and boundary
     // deadlines are the loop's business. Armed here already so setup
     // (installs below) runs under the caller's budgets, exactly as the old
     // per-call guard threads covered it.
     let handle = isolate.thread_safe_handle();
     let cancel_handle = handle.clone(); // for cancel_terminate_execution on success
-    let guard = InstanceGuard::spawn(handle.clone(), Arc::clone(&reason));
+    let guard = InstanceGuard::new(handle.clone(), Arc::clone(&reason));
     if let Some(slot) = &ctl_slot {
         slot.set(guard.ctl()).ok();
     }
@@ -3142,8 +3141,8 @@ pub struct InstanceCore {
     /// stub `Function` ever created in this context. Per-run bindings live
     /// in the run table; these Boxes only carry the name + table pointer.
     stub_slots: StubSlots,
-    /// The instance's one guard thread (see [`InstanceGuard`]): warm-up and
-    /// every turn of every call publish their budgets to it.
+    /// The instance's watchdog registration (see [`InstanceGuard`]): warm-up
+    /// and every turn of every call publish their budgets through it.
     guard: InstanceGuard,
     /// True until the first call: warm-up console output (the prefix's
     /// `console.log`s) is sitting in the table's `setup_logs` and is
@@ -3246,9 +3245,9 @@ pub fn create_instance_core(
 
     let handle = isolate.thread_safe_handle();
     let warmup_budget = Arc::new(CpuBudget::new());
-    // The instance's ONE guard thread, reused by every later call. Warm-up
-    // runs under the fixed warm-up target.
-    let guard = InstanceGuard::spawn(handle.clone(), Arc::clone(&reason));
+    // The instance's watchdog registration, reused by every later call.
+    // Warm-up runs under the fixed warm-up target.
+    let guard = InstanceGuard::new(handle.clone(), Arc::clone(&reason));
     guard.set(GuardTarget {
         budget: Arc::clone(&warmup_budget),
         cpu_cap_ms: WARMUP_CPU_MS,
@@ -3428,8 +3427,8 @@ pub fn run_call_on_core(
     // invokes user accessors — but defence in depth: any path that can
     // execute sandbox-authored code on this thread must be under a budget,
     // or a hostile prefix/postfix could hang the owner thread forever.
-    // (One guard thread per instance; run_call_phase re-arms this target per
-    // turn and clears it while the run is parked.)
+    // (run_call_phase re-arms this target per turn and clears it while the
+    // run is parked.)
     let cancel_handle = core.isolate.thread_safe_handle();
     core.guard.set_for(
         GuardTarget {
@@ -3721,7 +3720,7 @@ pub fn serve_instance(
                         call: l.job.call.as_ref(),
                         reason: &core.reason,
                         guard: &core.guard,
-                        cancel_handle: &core.guard.handle,
+                        cancel_handle: core.guard.handle(),
                     };
                     handle_loop_event(&mut core.isolate, &core.context, &facts, &mut l.rs, event)
                 };
@@ -3874,7 +3873,7 @@ fn dispatch_job(
         let scope = &mut v8::ContextScope::new(scope, context);
         install_prefix_bridge_placeholders(scope, prefix_globals, imports)
     };
-    let cancel_handle = core.guard.handle.clone();
+    let cancel_handle = core.guard.handle().clone();
     let started = match placeholder_result {
         Err(error) => {
             core.guard.clear();
@@ -4414,7 +4413,7 @@ fn validate_prefix_module(
 
     let warmup_budget = Arc::new(CpuBudget::new());
     let handle = isolate.thread_safe_handle();
-    let guard = InstanceGuard::spawn(handle, Arc::clone(&reason));
+    let guard = InstanceGuard::new(handle, Arc::clone(&reason));
     guard.set(GuardTarget {
         budget: Arc::clone(&warmup_budget),
         cpu_cap_ms: WARMUP_CPU_MS,
@@ -4976,16 +4975,7 @@ fn is_valid_export_identifier(name: &str) -> bool {
 
 // ── Limit guard helpers ────────────────────────────────────────────────────
 
-/// Spawn a wall-clock guard thread. Returns a cancel sender.
-/// Sending anything on it (or dropping it) cancels the guard.
-/// If `wall_time_ms == 0`, no thread is spawned but a sender is still returned.
-/// The cancel sender plus the guard thread's join handle (`None` when the
-/// limit is 0 and no thread was spawned). Callers that reuse the isolate
-/// afterwards (warm instances) MUST join after cancelling: cancellation only
-/// signals the guard, and a guard whose deadline expired concurrently may
-/// still be about to set the reason and terminate — joining makes any fire
-/// visible to the taint check instead of landing on the next call.
-/// What the instance guard enforces while a turn is executing.
+/// What the watchdog enforces while a turn is executing.
 struct GuardTarget {
     budget: Arc<CpuBudget>,
     /// 0 = no CPU cap.
@@ -4996,35 +4986,49 @@ struct GuardTarget {
     wall_deadline: Option<std::time::Instant>,
 }
 
-/// ONE guard thread per instance (E1 ruling 2), watching whatever turn is
-/// currently executing on it. The target is set at turn entry and cleared at
-/// turn exit UNDER THE LOCK, and the guard fires under the same lock, so a
-/// fire and a clear serialize: after `clear()` returns, no fire for that
-/// turn can happen anymore, and any fire that won the race is already
-/// visible in the reason cell — no thread join needed to observe it.
-/// Between turns the target is empty and the guard idles: a wall deadline
-/// passing while a run is parked is the loop's business (a clean boundary
-/// failure), never the guard's.
-pub struct InstanceGuard {
-    target: Arc<Mutex<Option<GuardTarget>>>,
+/// State one instance shares with the process-global [`Watchdog`]: the armed
+/// target, the executing-turn token, and the arm generation its heap entries
+/// are validated against.
+struct GuardShared {
+    /// The armed target. Set at turn entry and cleared at turn exit UNDER
+    /// THE LOCK, and the watchdog fires under the same lock, so a fire and
+    /// a clear serialize: after `clear()` returns, no fire for that turn
+    /// can happen anymore, and any fire that won the race is already
+    /// visible in the reason cell. Between turns the target is empty: a
+    /// wall deadline passing while a run is parked is the loop's business
+    /// (a clean boundary failure), never the watchdog's.
+    target: Mutex<Option<GuardTarget>>,
     /// The token of the run whose turn is executing right now (0 = none).
     /// Written under the target lock, so it serializes with turn exit — the
     /// session demux consults it to decide gentle-abandon vs mid-turn
     /// terminate for a Terminate frame (E1 ruling 5's fallback).
-    executing: Arc<AtomicU64>,
+    executing: AtomicU64,
+    /// Arm generation, bumped under the target lock by every arm and clear.
+    /// A watchdog entry fires only when the generation it was pushed under
+    /// is still current — deregistration is this bump, nothing is removed
+    /// from the heap. Same stale-fire discipline as the per-turn run
+    /// tokens, applied to entries that pop after their turn ended.
+    generation: AtomicU64,
     handle: v8::IsolateHandle,
-    /// Un-parks the guard thread when a turn arms it; dropping the sender
-    /// stops the thread.
-    wake: crossbeam_channel::Sender<()>,
+    /// First-writer-wins verdict slot, written before terminating.
+    reason: Arc<ReasonCell>,
+}
+
+/// The per-instance face of the process-global [`Watchdog`] (#145, amending
+/// E1 ruling 2's "one guard thread per instance"): arming a turn registers
+/// its earliest deadline on the watchdog heap; clearing bumps the arm
+/// generation so the registered entry goes stale. An idle instance holds no
+/// live entry and costs no wakeups — and no thread: the owner thread is the
+/// only thread a warm instance keeps.
+pub struct InstanceGuard {
+    shared: Arc<GuardShared>,
 }
 
 /// The cross-thread face of an [`InstanceGuard`], handed to the session
 /// demux so a Terminate for a run that is mid-turn can terminate it.
 #[derive(Clone)]
 pub struct GuardCtl {
-    target: Arc<Mutex<Option<GuardTarget>>>,
-    executing: Arc<AtomicU64>,
-    handle: v8::IsolateHandle,
+    shared: Arc<GuardShared>,
 }
 
 impl GuardCtl {
@@ -5034,9 +5038,9 @@ impl GuardCtl {
     /// run is between turns and the routed Terminate frame will abandon it
     /// cleanly.
     pub fn abort_executing(&self, token: u64) -> bool {
-        let _lock = self.target.lock().unwrap_or_else(|p| p.into_inner());
-        if self.executing.load(Ordering::Relaxed) == token {
-            self.handle.terminate_execution();
+        let _lock = self.shared.target.lock().unwrap_or_else(|p| p.into_inner());
+        if self.shared.executing.load(Ordering::Relaxed) == token {
+            self.shared.handle.terminate_execution();
             true
         } else {
             false
@@ -5045,59 +5049,25 @@ impl GuardCtl {
 }
 
 impl InstanceGuard {
-    fn spawn(handle: v8::IsolateHandle, reason: Arc<ReasonCell>) -> Self {
-        let target: Arc<Mutex<Option<GuardTarget>>> = Arc::new(Mutex::new(None));
-        // Doubles as the wake nudge and the stop signal: `set_for` sends a
-        // unit to un-park the thread; dropping the guard disconnects it.
-        let (wake, rx) = crossbeam_channel::bounded::<()>(1);
-        let watched = Arc::clone(&target);
-        let fire_handle = handle.clone();
-        std::thread::Builder::new()
-            .name("iso4-instance-guard".to_string())
-            .spawn(move || loop {
-                // Park while disarmed: an idle instance costs no wakeups at
-                // all (the old model had no guard thread on idle instances;
-                // this one exists but sleeps until a turn arms it).
-                let armed = watched
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .is_some();
-                if !armed {
-                    match rx.recv() {
-                        Ok(_) => continue, // armed — fall into the poll cadence
-                        Err(_) => return,  // guard dropped
-                    }
-                }
-                match rx.recv_timeout(Duration::from_millis(10)) {
-                    // A nudge while already armed — re-check immediately.
-                    Ok(_) => continue,
-                    Err(RecvTimeoutError::Disconnected) => return,
-                    Err(RecvTimeoutError::Timeout) => {}
-                }
-                let guard = watched.lock().unwrap_or_else(|p| p.into_inner());
-                let Some(t) = guard.as_ref() else { continue };
-                if t.cpu_cap_ms > 0 && t.budget.elapsed_ms() >= t.cpu_cap_ms as u64 {
-                    reason.set(TerminationReason::Cpu); // first writer wins
-                    fire_handle.terminate_execution();
-                } else if t.wall_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                    reason.set(TerminationReason::Wall); // first writer wins
-                    fire_handle.terminate_execution();
-                }
-            })
-            .expect("failed to spawn instance guard thread");
+    fn new(handle: v8::IsolateHandle, reason: Arc<ReasonCell>) -> Self {
         Self {
-            target,
-            executing: Arc::new(AtomicU64::new(0)),
-            handle,
-            wake,
+            shared: Arc::new(GuardShared {
+                target: Mutex::new(None),
+                executing: AtomicU64::new(0),
+                generation: AtomicU64::new(0),
+                handle,
+                reason,
+            }),
         }
+    }
+
+    fn handle(&self) -> &v8::IsolateHandle {
+        &self.shared.handle
     }
 
     pub fn ctl(&self) -> GuardCtl {
         GuardCtl {
-            target: Arc::clone(&self.target),
-            executing: Arc::clone(&self.executing),
-            handle: self.handle.clone(),
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -5105,22 +5075,205 @@ impl InstanceGuard {
         self.set_for(t, 0)
     }
 
-    /// Arm the target and mark `token`'s turn as the one executing (0 for
-    /// spans that are not a run's turn, e.g. warm-up).
+    /// Arm the target, mark `token`'s turn as the one executing (0 for
+    /// spans that are not a run's turn, e.g. warm-up), and register the
+    /// turn's earliest deadline with the watchdog. An uncapped target
+    /// registers nothing — it is still armed so `abort_executing` can match
+    /// the turn.
     fn set_for(&self, t: GuardTarget, token: u64) {
+        let next_check = next_check_for(&t, std::time::Instant::now());
+        let generation;
         {
-            let mut guard = self.target.lock().unwrap_or_else(|p| p.into_inner());
-            self.executing.store(token, Ordering::Relaxed);
+            let mut guard = self.shared.target.lock().unwrap_or_else(|p| p.into_inner());
+            self.shared.executing.store(token, Ordering::Relaxed);
+            generation = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
             *guard = Some(t);
         }
-        // Un-park the guard thread; a pending nudge is as good as a new one.
-        self.wake.try_send(()).ok();
+        if let Some(next_check) = next_check {
+            watchdog().register(WatchEntry {
+                next_check,
+                generation,
+                shared: Arc::clone(&self.shared),
+            });
+        }
     }
 
     fn clear(&self) {
-        let mut guard = self.target.lock().unwrap_or_else(|p| p.into_inner());
-        self.executing.store(0, Ordering::Relaxed);
+        let mut guard = self.shared.target.lock().unwrap_or_else(|p| p.into_inner());
+        self.shared.executing.store(0, Ordering::Relaxed);
+        self.shared.generation.fetch_add(1, Ordering::Relaxed);
         *guard = None;
+    }
+}
+
+impl Drop for InstanceGuard {
+    /// Disarm on drop: early-return paths can tear an instance down with
+    /// the target still armed (warm-up/validation `?`s), and the watchdog
+    /// entry they leave behind must go stale rather than fire against a
+    /// disposed isolate. (The terminate itself would be a harmless no-op —
+    /// an `IsolateHandle` stays valid past teardown by construction — but
+    /// the shared reason cell must not be dirtied.)
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// One watchdog heap entry: re-read `shared`'s armed budgets at
+/// `next_check`. Ordered by deadline only — entries due at the same instant
+/// are interchangeable.
+struct WatchEntry {
+    next_check: std::time::Instant,
+    /// The arm generation this entry was pushed under (see [`GuardShared`]).
+    generation: u64,
+    shared: Arc<GuardShared>,
+}
+
+impl PartialEq for WatchEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.next_check == other.next_check
+    }
+}
+impl Eq for WatchEntry {}
+impl PartialOrd for WatchEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for WatchEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.next_check.cmp(&other.next_check)
+    }
+}
+
+/// The process-global CPU-budget watchdog (#145): ONE lazily-started thread
+/// owning a min-heap of armed turn deadlines, replacing the per-instance
+/// guard thread — so a warm instance holds one OS thread instead of two,
+/// which doubles warm residency under hard per-container thread quotas.
+/// isolated-vm's production model.
+///
+/// CPU budgets are polled, never slept-to: a [`CpuBudget`] only advances
+/// while its turn executes, so the heap holds the earliest *estimated*
+/// expiry and each pop re-reads the budget — re-arming when the estimate
+/// was optimistic, firing only on a genuinely exceeded cap. The heap's
+/// stale tail (lazily deregistered entries) is bounded by the arm rate
+/// times the deadline horizon; every entry costs one pop plus one atomic
+/// load to discard.
+struct Watchdog {
+    heap: Mutex<BinaryHeap<Reverse<WatchEntry>>>,
+    /// Wakes the thread when a pushed deadline preempts the current one.
+    wake: Condvar,
+}
+
+/// The process-global watchdog, started on the first armed deadline.
+fn watchdog() -> &'static Watchdog {
+    static WATCHDOG: OnceLock<Watchdog> = OnceLock::new();
+    static START: Once = Once::new();
+    let wd = WATCHDOG.get_or_init(|| Watchdog {
+        heap: Mutex::new(BinaryHeap::new()),
+        wake: Condvar::new(),
+    });
+    START.call_once(|| {
+        std::thread::Builder::new()
+            .name("iso4-watchdog".to_string())
+            .spawn(move || wd.run())
+            .expect("failed to spawn watchdog thread");
+    });
+    wd
+}
+
+impl Watchdog {
+    fn register(&self, entry: WatchEntry) {
+        let mut heap = self.heap.lock().unwrap_or_else(|p| p.into_inner());
+        let preempts = heap
+            .peek()
+            .is_none_or(|Reverse(top)| entry.next_check < top.next_check);
+        heap.push(Reverse(entry));
+        if preempts {
+            self.wake.notify_one();
+        }
+    }
+
+    fn run(&self) {
+        let mut heap = self.heap.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            let due = match heap.peek() {
+                None => {
+                    heap = self.wake.wait(heap).unwrap_or_else(|p| p.into_inner());
+                    continue;
+                }
+                Some(Reverse(top)) => {
+                    let now = std::time::Instant::now();
+                    if top.next_check > now {
+                        let wait = top.next_check - now;
+                        heap = self
+                            .wake
+                            .wait_timeout(heap, wait)
+                            .unwrap_or_else(|p| p.into_inner())
+                            .0;
+                        continue;
+                    }
+                    heap.pop().expect("peeked above").0
+                }
+            };
+            // Check with the heap unlocked: the deadline check takes the
+            // entry's target lock, and no thread ever holds both locks.
+            drop(heap);
+            if let Some(next_check) = check_deadline(&due) {
+                self.register(WatchEntry { next_check, ..due });
+            }
+            heap = self.heap.lock().unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+/// Re-read one popped entry's budgets. Fires (reason first, then terminate,
+/// under the target lock) on an exceeded cap; returns the next check time
+/// while the turn stays armed; `None` for a stale entry. A FIRED entry
+/// keeps re-firing on a 10 ms cadence until the turn disarms — exactly the
+/// old per-instance poll behavior: the export-extraction retry loop
+/// re-enters guest getters after the first termination unwinds, and each
+/// re-entered spin must be terminated again or extraction never finishes.
+fn check_deadline(entry: &WatchEntry) -> Option<std::time::Instant> {
+    let s = &entry.shared;
+    // Cheap staleness pre-check without the lock — the common case at high
+    // turn rates. Re-verified under the lock before anything fires.
+    if s.generation.load(Ordering::Relaxed) != entry.generation {
+        return None;
+    }
+    let guard = s.target.lock().unwrap_or_else(|p| p.into_inner());
+    if s.generation.load(Ordering::Relaxed) != entry.generation {
+        return None;
+    }
+    let t = guard.as_ref()?;
+    let now = std::time::Instant::now();
+    if t.cpu_cap_ms > 0 && t.budget.elapsed_ms() >= t.cpu_cap_ms as u64 {
+        s.reason.set(TerminationReason::Cpu); // first writer wins
+        s.handle.terminate_execution();
+        Some(now + Duration::from_millis(10))
+    } else if t.wall_deadline.is_some_and(|d| now >= d) {
+        s.reason.set(TerminationReason::Wall); // first writer wins
+        s.handle.terminate_execution();
+        Some(now + Duration::from_millis(10))
+    } else {
+        next_check_for(t, now)
+    }
+}
+
+/// The next moment worth re-reading `t`'s budgets: the earlier of the
+/// estimated CPU expiry (a [`CpuBudget`] advances at wall rate while its
+/// epoch is open, so cap-minus-elapsed from now is the earliest it can
+/// expire) and the wall deadline. `None` when the target caps nothing.
+/// Floored at 1 ms so a paused budget cannot spin the watchdog.
+fn next_check_for(t: &GuardTarget, now: std::time::Instant) -> Option<std::time::Instant> {
+    let floor = now + Duration::from_millis(1);
+    let cpu = (t.cpu_cap_ms > 0).then(|| {
+        let remaining = (t.cpu_cap_ms as u64).saturating_sub(t.budget.elapsed_ms());
+        (now + Duration::from_millis(remaining)).max(floor)
+    });
+    let wall = t.wall_deadline.map(|d| d.max(floor));
+    match (cpu, wall) {
+        (Some(c), Some(w)) => Some(c.min(w)),
+        (c, w) => c.or(w),
     }
 }
 
