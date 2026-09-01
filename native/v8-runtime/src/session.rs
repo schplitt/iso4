@@ -501,14 +501,20 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // anything newer than the reader knows. This is a byte comparison — the
     // probe for this binary was computed once at process start in a throwaway
     // isolate, so no isolate plumbing reaches the session layer.
+    //
+    // Read and write are split on purpose: peer probes are accepted up to the
+    // version this V8 READS (its native format), while every blob this binary
+    // emits — the Hello probe included — carries the relabelled WRITE version
+    // (see `blob::relabel_write_version`). One binary spans Node lines on
+    // either side of V8's 15→16 format bump.
     let host_version = crate::blob::probe_format_version(&auth.probe);
-    let own_version = crate::blob::write_format_version();
+    let read_version = crate::blob::read_format_version();
     match host_version {
-        Some(v) if v <= own_version => {}
+        Some(v) if v <= read_version => {}
         _ => {
             let message = format!(
                 "V8 serialization format mismatch between Node (writes format {}) and the \
-                 iso4-v8 binary (reads up to format {own_version}). \
+                 iso4-v8 binary (reads up to format {read_version}). \
                  Update @iso4/sandbox and @iso4/v8-* together — they are released in lockstep.",
                 host_version
                     .map(|v| v.to_string())
@@ -1384,6 +1390,32 @@ mod tests {
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
         assert_eq!(probe, crate::blob::probe());
         assert_eq!(message, "");
+    }
+
+    /// The read side of the read/write split: a host whose V8 natively writes
+    /// format 16 (Node 27+) is accepted, because this binary READS up to 16
+    /// even though it relabels its own writes to 15.
+    #[test]
+    fn a_format_16_probe_is_accepted() {
+        let mut probe = crate::blob::probe().to_vec();
+        probe[1] = 0x10;
+        let frame = handshake(authenticate(probe)).expect("expected a Hello frame");
+        let (status, _, message) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::Ok as u8);
+        assert_eq!(message, "");
+    }
+
+    /// The write side of the split: the Hello probe — like every blob this
+    /// binary emits — advertises the relabelled format 15, so Node 22–26 can
+    /// read it.
+    #[test]
+    fn the_hello_probe_advertises_write_format_15() {
+        let frame =
+            handshake(authenticate(crate::blob::probe().to_vec())).expect("expected a Hello frame");
+        let (status, probe, _) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::Ok as u8);
+        assert_eq!(probe[0], crate::blob::V8_BLOB_HEADER_TAG);
+        assert_eq!(probe[1], 0x0F);
     }
 
     #[test]

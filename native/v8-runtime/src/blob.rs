@@ -159,7 +159,9 @@ pub fn serialize_value(
     let serializer = v8::ValueSerializer::new(tc, Box::new(SerDelegate));
     serializer.write_header();
     if serializer.write_value(context, value) == Some(true) {
-        return Ok(serializer.release());
+        let mut bytes = serializer.release();
+        relabel_write_version(&mut bytes);
+        return Ok(bytes);
     }
     // A host-type refusal carries a better message than V8's generic one, and
     // the caller needs it to pick between ERR_TYPE_NOT_SERIALIZABLE and
@@ -236,33 +238,98 @@ pub fn deserialize_value<'s>(
     value
 }
 
+// ── Write-version relabel ────────────────────────────────────────────────────
+
+/// The format version this binary's V8 natively writes (and the newest it can
+/// read): 16 since V8 15.2.
+const NATIVE_FORMAT_VERSION: u8 = 0x10;
+
+/// The format version every blob leaves this process labelled with: 15, the
+/// newest version all supported Node lines (22–26) can read.
+const RELABELLED_FORMAT_VERSION: u8 = 0x0F;
+
+/// Relabel a freshly serialized blob's header from format 16 to format 15.
+///
+/// V8 15.2 bumped the ValueSerializer format from 15 to 16 for ArrayBuffers
+/// larger than 4 GB (buffer lengths became 64-bit varints), and no released
+/// Node can read format 16. Below 4 GB the two byte streams are **identical**
+/// except for the header's version byte — a varint encodes the same bytes for
+/// any value under 2³² regardless of declared width — so rewriting that one
+/// byte keeps every blob readable by Node 22–26 (and 27+, which read older
+/// versions). Same mechanism Deno ships (denoland/deno#35118). The size
+/// condition always holds here (frames are capped at 64 MiB), but is checked
+/// anyway so an impossible oversized blob would keep the only header it can
+/// satisfy rather than a corrupt version-15 label.
+fn relabel_write_version(bytes: &mut [u8]) {
+    if bytes.len() < 0x1_0000_0000
+        && bytes.first() == Some(&V8_BLOB_HEADER_TAG)
+        && bytes.get(1) == Some(&NATIVE_FORMAT_VERSION)
+    {
+        bytes[1] = RELABELLED_FORMAT_VERSION;
+    }
+}
+
 // ── Handshake probe ──────────────────────────────────────────────────────────
 
 /// V8 serialization header tag — the first byte of every blob.
 pub const V8_BLOB_HEADER_TAG: u8 = 0xFF;
 
-static PROBE: OnceLock<Vec<u8>> = OnceLock::new();
+/// `(probe, read_version)` — the relabelled probe this binary advertises, and
+/// the native format version its V8 can read up to.
+static PROBE: OnceLock<(Vec<u8>, u8)> = OnceLock::new();
 
-/// This binary's handshake probe: a serialized `null`.
-///
-/// Byte 0 is the header tag and byte 1 is the **format version** this V8
-/// writes. Computed exactly once, in a throwaway isolate, so the session layer
-/// never needs isolate plumbing: at handshake time it is a byte comparison.
-pub fn probe() -> &'static [u8] {
+fn probe_data() -> &'static (Vec<u8>, u8) {
     PROBE.get_or_init(|| {
         crate::v8::init_platform();
         let isolate = &mut v8::Isolate::new(Default::default());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        let null = v8::null(scope).into();
-        serialize_value(scope, null).expect("serializing null must never fail")
+        let null: v8::Local<v8::Value> = v8::null(scope).into();
+        // Serialize raw (no relabel): byte 1 of the native output is the
+        // format version this V8 writes — which is also the newest version
+        // its deserializer accepts, i.e. the read ceiling for peer probes.
+        let context_handle = scope.get_current_context();
+        let raw = {
+            v8::tc_scope!(let tc, scope);
+            let serializer = v8::ValueSerializer::new(tc, Box::new(SerDelegate));
+            serializer.write_header();
+            assert_eq!(
+                serializer.write_value(context_handle, null),
+                Some(true),
+                "serializing null must never fail"
+            );
+            serializer.release()
+        };
+        let read_version = raw[1];
+        let mut probe = raw;
+        relabel_write_version(&mut probe);
+        (probe, read_version)
     })
 }
 
-/// The V8 serialization format version this binary writes.
+/// This binary's handshake probe: a serialized `null`.
+///
+/// Byte 0 is the header tag and byte 1 is the **format version** this binary
+/// writes (after the relabel, like every other blob it emits). Computed
+/// exactly once, in a throwaway isolate, so the session layer never needs
+/// isolate plumbing: at handshake time it is a byte comparison.
+pub fn probe() -> &'static [u8] {
+    &probe_data().0
+}
+
+/// The V8 serialization format version this binary writes — the relabelled
+/// version carried by every emitted blob, not V8's native one.
 pub fn write_format_version() -> u8 {
     probe()[1]
+}
+
+/// The newest V8 serialization format version this binary can read. Peer
+/// probes up to this version are accepted at handshake, so a host whose V8
+/// already writes the native format (Node 27+) still connects while the
+/// relabel keeps our own blobs readable by older Node lines.
+pub fn read_format_version() -> u8 {
+    probe_data().1
 }
 
 /// Read the format version out of a peer's probe blob, or `None` when the
@@ -472,7 +539,84 @@ mod tests {
         with_scope(|scope| {
             let value = deserialize_value(scope, bytes).expect("probe deserializes");
             assert!(value.is_null());
+            // The probe must be exactly what `serialize_value` emits for null
+            // — the advertised write version is the relabelled one, not a
+            // separately computed byte that could drift from real blobs.
+            let null = v8::null(scope).into();
+            assert_eq!(serialize_value(scope, null).unwrap(), bytes);
         });
+    }
+
+    /// Pins the read/write split this binary's Node-range compatibility rests
+    /// on: V8 15.2 natively writes format 16, which no released Node reads, so
+    /// every emitted blob is relabelled to 15 (`relabel_write_version`) while
+    /// peer probes are accepted up to the native 16. If a V8 upgrade moves the
+    /// native version past 16, this fails on purpose: re-verify that the new
+    /// format is still byte-identical to 15 below 4 GB before re-pinning
+    /// (denoland/deno#35118 was the evidence for 16).
+    #[test]
+    fn write_version_is_15_and_read_version_is_16() {
+        assert_eq!(write_format_version(), 0x0F);
+        assert_eq!(read_format_version(), 0x10);
+    }
+
+    #[test]
+    fn every_emitted_blob_is_relabelled_to_format_15() {
+        with_scope(|scope| {
+            for expr in [
+                "null",
+                "42",
+                "'hello'",
+                "new Uint8Array([1, 2, 3]).buffer",
+                "new Map([['k', new ArrayBuffer(16)]])",
+                "2n ** 100n",
+            ] {
+                let value = eval(scope, expr);
+                let bytes = serialize_value(scope, value).expect("serialize");
+                assert_eq!(bytes[0], V8_BLOB_HEADER_TAG, "{expr}");
+                assert_eq!(bytes[1], RELABELLED_FORMAT_VERSION, "{expr}");
+                // This V8 still reads its own relabelled output.
+                assert!(deserialize_value(scope, &bytes).is_some(), "{expr}");
+            }
+        });
+    }
+
+    /// The point of the relabel, proven against the real consumer: Node's
+    /// `v8.deserialize` (format ceiling 15 on every released line) must read
+    /// what this binary writes. Exercises ArrayBuffer lengths — the one field
+    /// whose encoding the 15→16 bump changed. The e2e handshake proves this
+    /// empirically per connection; this pins it at unit level with a value
+    /// assertion, not just a successful decode.
+    #[test]
+    fn relabelled_blob_roundtrips_through_nodes_deserializer() {
+        let hex = with_scope(|scope| {
+            let value = eval(
+                scope,
+                "({ n: 42, buf: new Uint8Array([1, 2, 3]), big: 2n ** 100n, \
+                   m: new Map([['k', 'v']]) })",
+            );
+            let bytes = serialize_value(scope, value).expect("serialize");
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        });
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(
+                "const v8 = require('node:v8'); \
+                 const v = v8.deserialize(Buffer.from(process.argv[1], 'hex')); \
+                 console.log(JSON.stringify([v.n, [...v.buf], v.big.toString(), v.m.get('k')]))",
+            )
+            .arg(&hex)
+            .output()
+            .expect("node must be on PATH (pnpm drives cargo test)");
+        assert!(
+            output.status.success(),
+            "node rejected the blob: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            r#"[42,[1,2,3],"1267650600228229401496703205376","v"]"#
+        );
     }
 
     #[test]
