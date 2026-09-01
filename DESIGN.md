@@ -182,7 +182,7 @@ host hands it over by name.
   │      ├─ one OS thread per isolate — the turn loop       │    
   │      │     v8::Isolate (heap_limits + custom allocator) │    
   │      │     v8::Context with curated globals             │    
-  │      │     one guard thread (parked while idle)         │    
+  │      │     deadlines on the shared watchdog thread      │    
   │      │     per-run CPU budgets (enter/leave per turn)   │    
   │      └─ stock V8 snapshot for sub-ms isolate boot       │    
   └─────────────────────────────────────────────────────────┘    
@@ -1823,8 +1823,13 @@ can be suspended on the instance while it executes one turn at a time. The
 connection's demux thread is its only socket reader; every outbound frame
 goes through one serialized writer, so concurrent runs never interleave
 mid-frame. Session dispatch never parks — a job's completion hook writes
-the run's frames and releases the instance. Idle instances hold memory, not
-threads-in-use; their guard thread is parked and no clocks are armed.
+the run's frames and releases the instance. The owner thread is the *only*
+thread an instance holds: per-turn CPU/wall deadlines are enforced by one
+process-global watchdog thread (lazy-started, a deadline min-heap; turn
+entry registers, turn exit deregisters, and `terminate_execution` is
+thread-safe so the watchdog fires from outside the owner thread —
+isolated-vm's model). Idle instances hold memory, not threads-in-use; they
+have no watchdog deadline registered and no clocks are armed.
 
 **Warm-up budget.** Prefix evaluation (plus the per-instance runtime
 installs) runs under a fixed 1 s wall / 1 s CPU budget — isolate boot itself
