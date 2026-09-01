@@ -667,10 +667,16 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
             ipc::TsToRustMessageType::BridgeResponse
             | ipc::TsToRustMessageType::StreamChunk
             | ipc::TsToRustMessageType::StreamEnd => {
-                route_run_frame(&conn_runs, frame);
+                if let Err(e) = route_run_frame(&conn_runs, frame) {
+                    eprintln!("[iso4-v8] {e} — closing");
+                    break;
+                }
             }
             ipc::TsToRustMessageType::Terminate => {
-                route_terminate(&conn_runs, frame);
+                if let Err(e) = route_terminate(&conn_runs, frame) {
+                    eprintln!("[iso4-v8] {e} — closing");
+                    break;
+                }
             }
         }
     }
@@ -692,14 +698,16 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
 /// Route one run-tagged frame (BridgeResponse / stream frames) to its run.
 /// Every such payload leads with the wire run id. Unknown runs get the
 /// late-frame discard (the run completed while the frame was in flight);
-/// a frame over its run's inbound allowance fails that run alone.
-fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) {
+/// a frame over its run's inbound allowance fails that run alone. A payload
+/// too short to carry a run id is CORRUPT — `Err` closes the connection
+/// (the blast-radius rule: unparseable framing fails this connection's runs
+/// loudly rather than leaving one waiting forever).
+fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<(), String> {
     let Some(run_id) = peek_run_id(&frame.payload) else {
-        eprintln!(
-            "[iso4-v8] ignoring truncated {:?} frame (no run id)",
+        return Err(format!(
+            "truncated {:?} frame (no run id)",
             frame.message_type
-        );
-        return;
+        ));
     };
     let runs = conn_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(route) = runs.get(&run_id) else {
@@ -709,7 +717,7 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) {
             }
             _ => eprintln!("[iso4-v8] ignoring late stream frame (run already completed)"),
         }
-        return;
+        return Ok(());
     };
     // Per-run inbound cap — demux policy (the read itself is bounded by the
     // connection-wide ceiling; this enforces the RUN's own allowance).
@@ -722,38 +730,39 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) {
                 "frame length {frame_len} exceeds max frame length {cap}"
             ))))
             .ok();
-        return;
+        return Ok(());
     }
     route.frames.send(sandbox::RunEvent::Frame(frame)).ok();
+    Ok(())
 }
 
 /// Route a Terminate: if the target run's own turn is executing right now,
 /// terminate it mid-turn (the taint fallback — E1 ruling 5); otherwise the
 /// routed frame abandons the suspended run cleanly at its next event.
-fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) {
+fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<(), String> {
     let run_id = match ipc::parse_terminate_payload(&frame.payload) {
         Ok(id) => id,
-        Err(e) => {
-            eprintln!("[iso4-v8] ignoring stray Terminate with malformed payload: {e}");
-            return;
-        }
+        // A Terminate that cannot be parsed is corrupt framing — close the
+        // connection rather than leaving the (unidentifiable) target running.
+        Err(e) => return Err(format!("malformed Terminate payload: {e}")),
     };
     let runs = conn_runs.lock().unwrap_or_else(|p| p.into_inner());
     let Some(route) = runs.get(&run_id) else {
         // The run completed just before the abort landed — a benign race.
         // Discard and keep the connection healthy for its other runs.
         eprintln!("[iso4-v8] ignoring stray Terminate (run {run_id} already completed)");
-        return;
+        return Ok(());
     };
     if let Some(ctl) = route.ctl.get() {
         if ctl.abort_executing(route.token) {
             eprintln!("[iso4-v8] Terminate for run {run_id} landed mid-turn — terminating");
             // The loop classifies the kill and resets the instance; no
             // frame delivery needed (the run's channel dies with it).
-            return;
+            return Ok(());
         }
     }
     route.frames.send(sandbox::RunEvent::Frame(frame)).ok();
+    Ok(())
 }
 
 /// The leading `u32` of a run-tagged payload.
@@ -943,11 +952,12 @@ fn dispatch_precompile(
     brand_key: &str,
 ) {
     let shared = Arc::clone(shared);
-    let sink = sink.clone();
+    let worker_sink = sink.clone();
     let brand_key = brand_key.to_string();
     let spawned = std::thread::Builder::new()
         .name("iso4-precompile".to_string())
         .spawn(move || {
+            let sink = worker_sink;
             crate::webcodec::set_session_brand_key(brand_key);
             let result_payload = match sandbox::precompile(
                 &payload.code,
@@ -1012,6 +1022,15 @@ fn dispatch_precompile(
         });
     if let Err(e) = spawned {
         eprintln!("[iso4-v8] failed to spawn precompile worker: {e}");
+        let payload = wire::encode_precompile_result_payload(
+            None,
+            Some(&wire::run_error_to_payload(&sandbox::RunError::Internal(
+                format!("failed to spawn precompile worker: {e}"),
+            ))),
+        );
+        if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, &payload) {
+            eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
+        }
     }
 }
 

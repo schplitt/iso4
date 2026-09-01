@@ -775,10 +775,12 @@ attempt is recorded as `blocked`.
 | `value`  | `Optional<ValueBlob>`       | Present when `ok = true`; absent → `undefined`.                                                                                                                          |
 | `error`  | `Optional<RunErrorPayload>` | Present when `ok = false`.                                                                                                                                               |
 
-The `error` field uses the `RunErrorPayload` layout with `code` always
-`ERR_HOST_BRIDGE` and the `stack` slot always absent: the host stack never
-crosses into the sandbox because it can expose host file paths and
-infrastructure details. `name`, `message`, and `fields` (all own-enumerable
+The `error` field is the bridge-error **subset** of `RunErrorPayload`:
+`code` (always `ERR_HOST_BRIDGE`), `name`, `message`, the `stack` slot
+(always absent — the host stack never crosses into the sandbox because it
+can expose host file paths and infrastructure details), and `fields`. It
+ends at `fields`: the trailing `reset` slot exists only on run-completion
+errors (§5.6), never on bridge responses. `name`, `message`, and `fields` (all own-enumerable
 properties of the thrown error beyond the reserved `name`/`message`/`stack`)
 are carried — whatever a handler attaches to an error is the host's
 responsibility, same as a returned value. Thrown primitives normalise to

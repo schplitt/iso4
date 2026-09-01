@@ -1837,13 +1837,19 @@ Prefix output produced at `prepare()` validation is discarded (throwaway
 isolate, no result frame). Whether prefix logs should instead be dropped,
 tagged, or repeated is an open question — the text here records what ships today.
 
-**Taint-and-evict.** Any fired guard (CPU, wall, heap), an abort landing
-mid-call, a fatal bridge violation, or an internal failure discards the
-instance: `terminate_execution` rips arbitrary mid-execution state, so
-prefix coherence is unprovable afterwards. Ordinary uncaught exceptions are
-clean completions and do NOT taint. The next call pays a cold start; the
-misbehaving tenant pays, everyone else is unaffected. Never reuse a tainted
-instance; never evict a running one.
+**Taint-and-evict — narrowed to mid-execution interruption (epic #124).**
+An instance is discarded exactly when a turn was interrupted **while JS was
+executing**: a fired guard (CPU, heap, or a wall deadline hitting mid-turn)
+or a forced terminate — `terminate_execution` rips arbitrary mid-execution
+state, so prefix coherence is unprovable afterwards. Everything that ends a
+run **between** turns is a clean per-run failure and does NOT taint: a
+suspended run's wall expiry, its connection dying, or an abort (which simply
+abandons the run — its continuations never execute again). Ordinary uncaught
+exceptions are clean completions. When a reset does happen, the interrupted
+run fails with its own classified error and every co-resident run in flight
+fails with `ERR_INSTANCE_RESET` (cause class + culprit run id). The next
+call pays a cold start; never reuse a tainted instance; never evict a
+running one.
 
 **Uniform heap cap.** `memoryMb` moved from per-run `ResourceLimits` to
 `createSandbox()` (default 128 MB, workerd's number): the cap is baked into
@@ -1931,10 +1937,14 @@ now tracks.
 instances, because the same trigger fires concurrently: a call takes an
 idle instance or cold-starts another. Instances of one prefix share **no
 state** with each other (same contract as workerd instances across
-machines). **v1 concurrency: one call at a time per instance** —
-parallelism for one prefix = more instances. Async interleaving of multiple
-in-flight calls inside one isolate (the full workerd model) stays deferred:
-it needs multiplexed bridge calls and per-request context separation.
+machines). **Concurrency: a per-instance turn loop** (#125) — the owner
+thread selects over new jobs, frames routed to its in-flight runs, and the
+nearest per-run deadline; any number of runs can be suspended on one
+instance, each with its own budgets, console, streams, and bridge bindings
+(per-run state table + CPED-rider attribution). Wire multiplexing and
+attach-to-busy admission activate at #127; until then the host still
+dispatches one run per connection, so observable concurrency for one prefix
+= more instances.
 
 **One-off runs are untouched**: `sandbox.run()` always gets a fresh isolate
 with unchanged semantics.

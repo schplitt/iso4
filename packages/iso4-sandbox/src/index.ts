@@ -59,6 +59,7 @@ import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN, StreamSourceRegistry } from './
 
 export type {
   ResourceLimits,
+  ResetCause,
   HostGlobals,
   HostGlobalValue,
   DataGlobal,

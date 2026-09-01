@@ -1648,8 +1648,10 @@ function readResetInfo(
   reader: PayloadReader,
 ): { resetCause: ResetCause, culpritRunId: number } | undefined {
   const present = reader.readU8()
-  if (present !== 1)
+  if (present === 0)
     return undefined
+  if (present !== 1)
+    throw new PayloadDecodeError(`invalid reset-info presence byte: ${present}`)
   const causeByte = reader.readU8()
   const causes: readonly ResetCause[] = ['cpu', 'memory', 'abort', 'internal', 'wall']
   const resetCause = causes[causeByte]

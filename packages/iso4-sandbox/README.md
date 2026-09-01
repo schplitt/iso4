@@ -250,12 +250,20 @@ interface RunError {
   message: string
   stack?: string
   fields?: Record<string, unknown> // all other own-enumerable props of the thrown error
+  resetCause?: 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' // ERR_INSTANCE_RESET only
+  culpritRunId?: number // ERR_INSTANCE_RESET only: the run whose interruption reset the instance
 }
 ```
 
 `run()` never throws for sandboxed failures — only for infrastructure errors
 (subprocess crashed, binary not found). `ok: false` with an error code is the
 normal failure path.
+
+One code is about a _neighbor_, not your own run: `ERR_INSTANCE_RESET` means a
+run sharing the same warm instance had to be terminated mid-execution
+(`resetCause` says why, `culpritRunId` names it), so this run — in flight on
+the now-untrusted instance — was failed with its real partial telemetry. It is
+never retried automatically, because it may already have had side effects.
 
 Thrown errors keep their identity across the bridge, in both directions:
 

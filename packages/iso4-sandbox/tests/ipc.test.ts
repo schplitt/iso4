@@ -613,7 +613,7 @@ describe('encodeBridgeResponsePayload error layout', () => {
   })
 
   test('omits fields when the error has none', () => {
-    const buf = encodeBridgeResponsePayload(1, false, undefined, {
+    const buf = encodeBridgeResponsePayload(3, 1, false, undefined, {
       name: 'Error',
       message: 'plain failure',
     })

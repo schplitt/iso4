@@ -668,6 +668,7 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 ///
 /// Wire layout:
 /// ```text
+/// u32                runId       (the owning run — leads every run-scoped frame)
 /// u32                callId
 /// u8                 targetKind  (0 = global, 1 = import)
 /// Optional<String>   specifier   (present when targetKind = 1)
