@@ -604,13 +604,15 @@ export interface SandboxStats {
    */
   queueDepth: number
   /**
-   * Host-side count of runtime connections as the pool tracks them, idle
-   * plus checked out (the dedicated `stats()` control connection not
-   * included). Connections open on demand and are kept for the process
-   * lifetime, so this rises to the concurrency high-water mark and stays
-   * there — capacity is `maxConcurrentRuns`, an admission number decoupled
-   * from sockets. It is a ledger, not a per-read socket probe: a
-   * connection that died while idle stays counted until the next run
+   * Host-side count of runtime connections as the pool tracks them (the
+   * dedicated `stats()` control connection not included). Runs are
+   * multiplexed onto shared connections — several concurrent runs per
+   * connection, another opened only when all are at the internal
+   * per-connection cap — and connections are kept for the process lifetime,
+   * so this rises to roughly the concurrency high-water mark divided by the
+   * cap and stays there. Capacity is `maxConcurrentRuns`, an admission
+   * number decoupled from sockets. It is a ledger, not a per-read socket
+   * probe: a connection that died stays counted until the next run
    * observes and replaces it.
    */
   openConnections: number

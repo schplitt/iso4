@@ -640,13 +640,14 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 
 `PrecompilePayload`:
 
-| Field      | Encoding              | Notes                                                          |
-| ---------- | --------------------- | -------------------------------------------------------------- |
-| `code`     | `String`              | ESM prefix source.                                             |
-| `filename` | `Optional<String>`    | Used in stack traces.                                          |
-| `limits`   | `ResourceLimits`      | Currently unused at precompile (validation is unlimited).      |
-| `globals`  | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run. |
-| `imports`  | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.     |
+| Field       | Encoding              | Notes                                                                                                                                                                 |
+| ----------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`. Precompiles are answered on worker threads, so replies to a multiplexed connection can return out of request order. |
+| `code`      | `String`              | ESM prefix source.                                                                                                                                                    |
+| `filename`  | `Optional<String>`    | Used in stack traces.                                                                                                                                                 |
+| `limits`    | `ResourceLimits`      | Currently unused at precompile (validation is unlimited).                                                                                                             |
+| `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                                                                                        |
+| `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                                                                                            |
 
 `ResourceLimits`:
 
@@ -983,11 +984,12 @@ afterwards, so later calls report only their own lines.
 
 `PrecompileResultPayload`:
 
-| Field      | Encoding                    | Notes                      |
-| ---------- | --------------------------- | -------------------------- |
-| `ok`       | `bool`                      | Success or failure.        |
-| `prefixId` | `Optional<PrefixId>`        | Present when `ok = true`.  |
-| `error`    | `Optional<RunErrorPayload>` | Present when `ok = false`. |
+| Field       | Encoding                    | Notes                                      |
+| ----------- | --------------------------- | ------------------------------------------ |
+| `requestId` | `u32`                       | Echo of the `Precompile`'s correlation id. |
+| `ok`        | `bool`                      | Success or failure.                        |
+| `prefixId`  | `Optional<PrefixId>`        | Present when `ok = true`.                  |
+| `error`     | `Optional<RunErrorPayload>` | Present when `ok = false`.                 |
 
 ### 5.8 RunComplete payloads
 
@@ -1054,41 +1056,53 @@ snapshot answers even while every run slot is busy.
 
 ## 6. Session lifecycle
 
-Each connection handles one active run at a time. The TypeScript `Runtime`
-admits runs through a slot pool (`maxConcurrentRuns`, an admission number
-decoupled from sockets) and opens connections lazily as admitted runs need
-them, reusing idle ones for the process lifetime — plus one dedicated
-control connection used only for `Stats`, kept outside the pool so a
-snapshot answers even while every run slot is busy. `Stats` is legal on any
+Connections are **multiplexed**: any number of runs may be in flight on one
+connection at once, and every run-scoped frame in both directions leads
+with the wire run id it belongs to — the runtime's demux and the host's
+router both route by that id alone. The TypeScript `Runtime` admits runs
+through a slot pool (`maxConcurrentRuns`, an admission number decoupled
+from sockets) and shares connections up to an internal per-run-count cap,
+opening another lazily only when every open connection is at the cap and
+reusing them for the process lifetime — plus one dedicated control
+connection used only for `Stats`, kept outside the pool so a snapshot
+answers even while every run slot is busy. `Stats` is legal on any
 authenticated connection (the runtime serves it in the top-level message
-loop), but the host never sends it on a pooled connection. Concurrency
-still comes from multiple connections: the host routes every frame by the
-run id it leads with (both the runtime's demux and the host's router are
-per-run already), but production admission keeps one run per connection
-until message-level multiplexing is activated.
+loop), but the host never sends it on a run connection.
 
 ```txt
-TS (one leased connection)            Rust (one isolate thread)
+TS (one shared connection)            Rust (per-run isolate threads)
 │                                       │
 │──── Authenticate ────────────────────▶│  version + V8 format check
 │◀─── Hello ────────────────────────────│  handshake accepted (or refused)
 │                                       │
-│──── Run / PrefixRun ─────────────────▶│  create or restore isolate
+│──── Run (run 1) ─────────────────────▶│  create or restore isolate
+│──── PrefixRun (run 2) ───────────────▶│  concurrent — routed by run id
 │                                       │
-│◀─── BridgeCall ───────────────────────│  sandbox called configured host fn
-│──── BridgeResponse ──────────────────▶│  TS handler result/error
-│                                       │
-│◀─── Result ───────────────────────────│  final success/failure
-│                                       │
-│  next Run/PrefixRun may now begin     │
+│◀─── BridgeCall (run 2) ───────────────│  sandbox called configured host fn
+│◀─── BridgeCall (run 1) ───────────────│  frames interleave, never mid-frame
+│──── BridgeResponse (run 1) ──────────▶│  TS handler result/error
+│◀─── Result (run 1) ───────────────────│  run 1 over; run 2 unaffected
+│──── BridgeResponse (run 2) ──────────▶│
+│◀─── Result (run 2) ───────────────────│
 ```
 
-A run whose `Result` reports `backgroundPending = true` is not over:
-the connection stays bound to it while `waitUntil` background work runs —
-grace-time `BridgeCall`/`BridgeResponse` traffic included — until exactly one
-`RunComplete` frame ends the run and frees the slot. The host resolves the
-caller at the `Result` (that is the point of the feature) and keeps draining
-the connection in the background.
+A run whose `Result` reports `backgroundPending = true` is not over: it
+stays routed on its connection while `waitUntil` background work runs —
+grace-time `BridgeCall`/`BridgeResponse` traffic included — until exactly
+one `RunComplete` frame ends it. The host resolves the caller and frees the
+run's admission slot at the `Result` (that is the point of the feature);
+the grace-phase frames ride the shared connection beside other runs'.
+
+Sharing widens the failure unit from one run to one connection, by design
+and bounded by the per-connection cap: a corrupt or unattributable frame
+(protocol desync), a stalled outbound socket, or an aborted run whose
+`Terminate` the runtime failed to answer within the host's fallback window
+kills the CONNECTION — every run in flight on it fails with a clean
+connection-level error and its slot frees. Instances are never tainted by
+connection death (nothing was interrupted mid-JS), and other connections
+are unaffected. The fallback case is deliberate: the runtime answers a
+`Terminate` in well under the window unless the child is wedged, and a
+wedged child had already doomed every run on the connection.
 
 `Precompile` uses the same authenticated connection but is not a run. It
 validates the prefix (compile + instantiate + evaluate in a throwaway

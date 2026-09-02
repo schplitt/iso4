@@ -24,6 +24,7 @@ import {
   decodeRunCompletePayload,
   peekBridgeCallId,
   peekBridgeCallRunId,
+  peekPrecompileResultRequestId,
   peekRunCompletionBackgroundPending,
   peekRunCompletionRunId,
   STREAM_CHUNK_MAX_BYTES,
@@ -57,8 +58,8 @@ export interface RawRunResult {
   /**
    * Present when the Result reported pending `waitUntil` work: the run
    * continues runtime-side and this settles when its `RunComplete` frame
-   * arrives — `undefined` on connection loss. The pool defers reusing the
-   * connection until then ({@link RuntimeIpcClient.pendingEpilogue}).
+   * arrives — `undefined` on connection loss. The run's slot is already
+   * free; the grace frames ride the shared connection, routed by run id.
    */
   epilogue?: Promise<DecodedRunComplete | undefined>
 }
@@ -214,33 +215,41 @@ export class RuntimeIpcClient {
 
   /**
    * Runs in flight on this connection, keyed by run id — the router's only
-   * routing table. Production admission still puts one run per connection;
-   * the structure does not care.
+   * routing table. Several runs share one connection; every frame finds its
+   * owner by run id alone.
    */
   private readonly runs = new Map<number, RunEntry>()
 
   /**
-   * Pending `precompile()`/`stats()` requests, FIFO. See {@link ControlWaiter}.
+   * Everything routed on this connection that a connection-level failure
+   * would take down: runs (executing AND grace-phase — an entry lives until
+   * its final frame) plus in-flight control requests. The pool's
+   * per-connection cap reads this, so the blast-radius bound covers all of
+   * it. Both counts move synchronously from the call that adds them
+   * (`runRawCode`/`prefixRun`/`precompile`), which keeps the pool's
+   * same-tick load observation exact.
+   */
+  get load(): number {
+    return this.runs.size + this.precompileWaiters.size + this.controlWaiters.length
+  }
+
+  /**
+   * Pending `stats()` requests, FIFO — sound because the runtime answers
+   * `Stats` inline in its demux loop, so replies come back in request
+   * order. See {@link ControlWaiter}.
    */
   private readonly controlWaiters: ControlWaiter[] = []
 
   /**
-   * Unsettled `waitUntil` grace phases on this connection. The pool defers
-   * reusing the connection until they are done — grace-time frames belong to
-   * the finished runs, not the next one.
+   * Pending `precompile()` requests keyed by their wire `requestId`.
+   * Precompiles are answered on runtime worker threads, so with several in
+   * flight on one connection the replies can return out of request order —
+   * FIFO matching would cross-assign prefix ids between callers.
    */
-  private readonly epilogueHolds = new Set<Promise<void>>()
-
-  /**
-   * Settles when every currently pending `waitUntil` epilogue on this
-   * connection has ended; `null` when none is running. The pool re-reads it
-   * until it is `null` before returning the connection to the idle list.
-   */
-  get pendingEpilogue(): Promise<void> | null {
-    if (this.epilogueHolds.size === 0)
-      return null
-    return Promise.all(this.epilogueHolds).then(() => {})
-  }
+  private readonly precompileWaiters = new Map<number, {
+    resolve: (payload: Uint8Array) => void
+    reject: (error: Error) => void
+  }>()
 
   /**
    * Session brand key for host-type descriptors written on this connection.
@@ -545,29 +554,33 @@ export class RuntimeIpcClient {
     // the `await settled` handler is attached — keep that window from
     // surfacing as an unhandled rejection (the real await still observes it).
     settled.catch(() => {})
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+    // Ask Rust to stop and send a real ERR_ABORTED Result. Fire-and-forget:
+    // if the write fails the socket is already broken, and the fallback
+    // timer (or a reader error) resolves the run anyway. The fallback tears
+    // the whole connection down — with several runs multiplexed on it that
+    // is a documented blast radius, acceptable because the runtime answers
+    // a Terminate in well under the window unless the child is wedged, in
+    // which case every run on the connection is already lost.
+    const beginGracefulAbort = (): void => {
+      this.write(
+        encodeTsToRustFrame(
+          TsToRustMessageTypes.Terminate,
+          encodeTerminatePayload(runId),
+        ),
+      ).catch(() => {
+        // Socket already gone — nothing to gracefully terminate.
+      })
+      graceTimer = setTimeout(() => {
+        this.abortConnection()
+      }, TERMINATE_GRACE_MS)
+      // Don't let the grace timer alone keep the event loop alive.
+      graceTimer.unref?.()
+    }
     if (signal !== undefined && !signal.aborted) {
-      let graceTimer: ReturnType<typeof setTimeout> | undefined
-      const onAbort = (): void => {
-        // Ask Rust to stop and send a real ERR_ABORTED Result. Fire-and-forget:
-        // if the write fails the socket is already broken, and the fallback
-        // timer (or a reader error) resolves the run anyway.
-        this.write(
-          encodeTsToRustFrame(
-            TsToRustMessageTypes.Terminate,
-            encodeTerminatePayload(runId),
-          ),
-        ).catch(() => {
-          // Socket already gone — nothing to gracefully terminate.
-        })
-        graceTimer = setTimeout(() => {
-          this.abortConnection()
-        }, TERMINATE_GRACE_MS)
-        // Don't let the grace timer alone keep the event loop alive.
-        graceTimer.unref?.()
-      }
-      signal.addEventListener('abort', onAbort, { once: true })
+      signal.addEventListener('abort', beginGracefulAbort, { once: true })
       entry.detachAbort = () => {
-        signal.removeEventListener('abort', onAbort)
+        signal.removeEventListener('abort', beginGracefulAbort)
         if (graceTimer !== undefined)
           clearTimeout(graceTimer)
       }
@@ -579,11 +592,19 @@ export class RuntimeIpcClient {
       // The frame carrying stream handles is on the wire; start their pumps.
       this.activateStreams(streams, runId)
       // If the signal aborted between the run-entry check in index.ts and
-      // here, tear down: the request frame is already on the wire but the run
-      // has barely started (its route/guard may not exist yet), so the
-      // graceful path cannot reliably apply.
-      if (signal?.aborted)
-        this.abortConnection()
+      // here, the listener above never fired (it was attached to an
+      // un-aborted signal, or never attached): take the same graceful path.
+      // The runtime registers the run's route before dispatching it, so a
+      // Terminate sent right behind the request frame lands — tearing the
+      // whole connection down for this benign race would cost every
+      // co-resident run.
+      if (signal?.aborted && graceTimer === undefined) {
+        beginGracefulAbort()
+        entry.detachAbort = () => {
+          if (graceTimer !== undefined)
+            clearTimeout(graceTimer)
+        }
+      }
     } catch (error) {
       if (this.runs.delete(runId)) {
         entry.detachAbort()
@@ -604,6 +625,16 @@ export class RuntimeIpcClient {
     }
   }
 
+  private nextPrecompileId = 0
+  private nextPrecompileIdValue(): number {
+    // Same discipline as run ids: wrap unsigned, skip any id still in
+    // flight so a reply can never be matched to the wrong caller.
+    do {
+      this.nextPrecompileId = (this.nextPrecompileId + 1) >>> 0
+    } while (this.precompileWaiters.has(this.nextPrecompileId))
+    return this.nextPrecompileId
+  }
+
   async precompile(
     options: {
       code: string
@@ -616,19 +647,32 @@ export class RuntimeIpcClient {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
 
-    return this.controlRequest(
-      encodeTsToRustFrame(
-        TsToRustMessageTypes.Precompile,
-        encodePrecompilePayload({
-          code: options.code,
-          filename: options.filename,
-          limits: options.limits,
-          globals: options.globals,
-          imports: options.imports,
-        }),
-      ),
-      RustToTsMessageTypes.PrecompileResult,
+    const requestId = this.nextPrecompileIdValue()
+    const frame = encodeTsToRustFrame(
+      TsToRustMessageTypes.Precompile,
+      encodePrecompilePayload({
+        requestId,
+        code: options.code,
+        filename: options.filename,
+        limits: options.limits,
+        globals: options.globals,
+        imports: options.imports,
+      }),
     )
+    const reply = new Promise<Uint8Array>((resolve, reject) => {
+      this.precompileWaiters.set(requestId, { resolve, reject })
+    })
+    // A teardown can reject the waiter while the request write below is
+    // still awaited — keep that window from surfacing as an unhandled
+    // rejection (the caller's await still observes it).
+    reply.catch(NOOP)
+    try {
+      await this.write(frame)
+    } catch (error) {
+      this.precompileWaiters.delete(requestId)
+      throw error
+    }
+    return reply
   }
 
   /**
@@ -774,6 +818,9 @@ export class RuntimeIpcClient {
         this.runs.clear()
         for (const waiter of this.controlWaiters.splice(0))
           waiter.reject(failure)
+        for (const [, waiter] of this.precompileWaiters)
+          waiter.reject(failure)
+        this.precompileWaiters.clear()
       }
     })()
   }
@@ -799,7 +846,25 @@ export class RuntimeIpcClient {
       case RustToTsMessageTypes.Log:
         return undefined
 
-      case RustToTsMessageTypes.PrecompileResult:
+      case RustToTsMessageTypes.PrecompileResult: {
+        // Routed by the echoed requestId: precompile replies can return out
+        // of request order (worker threads runtime-side), so FIFO matching
+        // would cross-assign prefix ids between concurrent prepare() calls.
+        const requestId = peekPrecompileResultRequestId(frame.payload)
+        const waiter = requestId === undefined
+          ? undefined
+          : this.precompileWaiters.get(requestId)
+        if (requestId === undefined || waiter === undefined) {
+          throw new ProtocolDesyncError(
+            `PrecompileResult carries requestId ${requestId ?? '(truncated payload)'} `
+            + 'but no precompile with that id is pending on this connection',
+          )
+        }
+        this.precompileWaiters.delete(requestId)
+        waiter.resolve(frame.payload)
+        return undefined
+      }
+
       case RustToTsMessageTypes.StatsResult: {
         const waiter = this.controlWaiters[0]
         if (waiter === undefined || waiter.expects !== frame.messageType) {
@@ -896,10 +961,10 @@ export class RuntimeIpcClient {
       return
     }
 
-    // waitUntil: the value is delivered now; the run keeps going runtime-side.
-    // The entry stays in the routing table — grace-time bridge and stream
-    // frames keep finding it — until its RunComplete frame, and the connection
-    // is held out of the pool for the duration (pendingEpilogue).
+    // waitUntil: the value is delivered now (the caller's slot frees); the
+    // run keeps going runtime-side. The entry stays in the routing table —
+    // grace-time bridge and stream frames keep finding it by run id, beside
+    // whatever other runs share the connection — until its RunComplete.
     let settleEpilogue!: (report: DecodedRunComplete | undefined) => void
     const epilogue = new Promise<DecodedRunComplete | undefined>((resolve) => {
       settleEpilogue = resolve
@@ -928,10 +993,6 @@ export class RuntimeIpcClient {
       signal.addEventListener('abort', cancelGrace, { once: true })
       entry.detachAbort = () => signal.removeEventListener('abort', cancelGrace)
     }
-
-    const hold = epilogue.then(() => {})
-    this.epilogueHolds.add(hold)
-    hold.then(() => this.epilogueHolds.delete(hold))
 
     entry.resolve({ result: payload, epilogue })
   }
