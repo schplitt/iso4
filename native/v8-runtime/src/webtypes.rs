@@ -179,17 +179,24 @@ fn response_shell_ctor(
 /// codec's rehydration path in `v8.rs`.
 pub const BODY_STREAM_FACTORY_KEY: &str = "iso4::bodyStreamFactory";
 
-/// Private-symbol key on the global object holding the frozen-clock cell —
-/// the plain object whose `t` property backs every guest-visible clock
-/// (`Date`, no-arg `Intl.DateTimeFormat` formatting, `Temporal.Now`). The
-/// shims capture the cell in closures at install time; the Rust side advances
-/// it through this key, so guest code can neither reach the cell nor observe
-/// time passing while it executes.
-const FROZEN_CLOCK_KEY: &str = "iso4::frozenClock";
-
-fn clock_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
-    let name = v8::String::new(scope, FROZEN_CLOCK_KEY)?;
-    Some(v8::Private::for_api(scope, Some(name)))
+/// Per-isolate handles to the frozen-clock cell — the plain object whose `t`
+/// property backs every guest-visible clock (`Date`, no-arg
+/// `Intl.DateTimeFormat` formatting, `Temporal.Now`). The shims capture the
+/// cell in closures at install time, so guest code can neither reach the
+/// cell nor observe time passing while it executes; the Rust side advances
+/// it through these handles, stashed in an isolate slot at install (every
+/// isolate holds exactly one context, so the slot is 1:1 with the cell).
+///
+/// The handles exist so an advance costs no per-turn V8 allocations: the old
+/// path re-interned the key and property strings and re-resolved the private
+/// on EVERY turn (~1.5–2 µs, the E2 review's carried item 6).
+pub struct FrozenClock {
+    cell: v8::Global<v8::Object>,
+    prop: v8::Global<v8::String>,
+    /// The value last written to the cell. Only Rust ever writes it, so this
+    /// mirror lets an advance within the same wall millisecond return
+    /// without touching V8 at all.
+    prev: std::cell::Cell<f64>,
 }
 
 /// Wall clock in whole ms since the epoch — the value the frozen clock
@@ -202,32 +209,25 @@ fn wall_now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Advance the current context's frozen clock to `max(current, wall now)`.
+/// Advance the current isolate's frozen clock to `max(current, wall now)`.
 ///
 /// Called only where the runtime regains control from the socket — run entry
 /// and each received frame in the poll loop — never while guest code is on
-/// the stack. Monotone by construction; a context without the cell (a partly
-/// failed install) is left alone.
+/// the stack. Monotone by construction; an isolate without the slot (web
+/// runtime never installed) is left alone.
 pub fn advance_frozen_clock(scope: &mut v8::PinScope) {
-    let context = scope.get_current_context();
-    let global = context.global(scope);
-    let Some(key) = clock_key(scope) else { return };
-    let Some(cell) = global.get_private(scope, key) else {
+    let Some(clock) = scope.get_slot::<std::rc::Rc<FrozenClock>>().cloned() else {
         return;
     };
-    let Ok(cell) = v8::Local::<v8::Object>::try_from(cell) else {
-        return;
-    };
-    let Some(prop) = v8::String::new(scope, "t") else { return };
-    let prev = cell
-        .get(scope, prop.into())
-        .and_then(|v| v.number_value(scope))
-        .unwrap_or(0.0);
     let now = wall_now_ms();
-    if now > prev {
-        let value = v8::Number::new(scope, now);
-        cell.set(scope, prop.into(), value.into());
+    if now <= clock.prev.get() {
+        return;
     }
+    clock.prev.set(now);
+    let cell = v8::Local::new(scope, &clock.cell);
+    let prop = v8::Local::new(scope, &clock.prop);
+    let value = v8::Number::new(scope, now);
+    cell.set(scope, prop.into(), value.into());
 }
 
 /// Install the web globals into the current context, without streamed-body
@@ -284,14 +284,15 @@ pub fn install_with_streams(
     factory_args.push(stream_read);
     factory_args.push(stream_cancel);
 
-    // The frozen-clock cell (see FROZEN_CLOCK_KEY). Initialized to the wall
+    // The frozen-clock cell (see [`FrozenClock`]). Initialized to the wall
     // clock at context creation, so prefix evaluation runs on a frozen "now"
     // exactly like calls do.
+    let clock_init_ms = wall_now_ms();
     let clock_cell = v8::Object::new(scope);
     {
         let prop = v8::String::new(scope, "t")
             .ok_or_else(|| "intern frozen clock prop failed".to_string())?;
-        let value = v8::Number::new(scope, wall_now_ms());
+        let value = v8::Number::new(scope, clock_init_ms);
         clock_cell
             .set(scope, prop.into(), value.into())
             .ok_or_else(|| "init frozen clock failed".to_string())?;
@@ -369,13 +370,17 @@ pub fn install_with_streams(
         .set_private(tc, factory_key, factory_fn)
         .ok_or_else(|| "store body-stream factory failed".to_string())?;
 
-    // Keep the frozen-clock cell reachable for advance_frozen_clock. Private
-    // slot, same reasoning as the classes above.
-    let clock_key =
-        clock_key(tc).ok_or_else(|| "intern frozen clock key failed".to_string())?;
-    global
-        .set_private(tc, clock_key, clock_cell.into())
-        .ok_or_else(|| "store frozen clock cell failed".to_string())?;
+    // Hand the frozen-clock cell to advance_frozen_clock: persistent handles
+    // in an isolate slot, so an advance never re-interns strings or resolves
+    // a private (carried item 6). The Globals also keep the cell reachable.
+    let clock_prop = v8::String::new(tc, "t")
+        .ok_or_else(|| "intern frozen clock prop failed".to_string())?;
+    let clock = std::rc::Rc::new(FrozenClock {
+        cell: v8::Global::new(tc, clock_cell),
+        prop: v8::Global::new(tc, clock_prop),
+        prev: std::cell::Cell::new(clock_init_ms),
+    });
+    tc.set_slot(clock);
     Ok(())
 }
 
