@@ -7,8 +7,9 @@
 //! `Locker` is exposed), so the owner thread is the only place the isolate
 //! can be created, called into, and dropped. The owner thread runs the
 //! per-instance turn loop (`v8::serve_instance`): jobs arrive over the
-//! handle's channel, inbound frames arrive demux-routed per run, and any
-//! number of session runs can be suspended on one instance at once. Session
+//! handle's job channel, inbound frames arrive token-tagged on the handle's
+//! ONE event channel (demux-routed), and any number of session runs can be
+//! suspended on one instance at once. Session
 //! dispatch never blocks — a job's completion hook writes the run's frames
 //! through the connection's serialized writer and releases the instance;
 //! only the direct API (`InstanceHandle::call`, tests) waits on a respond
@@ -52,6 +53,10 @@ pub use crate::v8::CallJob;
 /// and disposes the isolate on the thread that created it.
 pub struct InstanceHandle {
     jobs: crossbeam_channel::Sender<sandbox::JobMsg>,
+    /// The instance's ONE run-event channel: the session demux tags every
+    /// routed event with the owning run's table token, and the owner loop
+    /// delivers by token — no per-run channel, no per-event select rebuild.
+    events: sandbox::RunEventSender,
     /// When this instance last finished a call — the idleTime factor of the
     /// eviction score.
     last_used: Instant,
@@ -77,6 +82,13 @@ impl InstanceHandle {
     /// the job is sent.
     pub fn sender(&self) -> crossbeam_channel::Sender<sandbox::JobMsg> {
         self.jobs.clone()
+    }
+
+    /// A clone of the instance's run-event sender, for the demux route of a
+    /// run dispatched to this instance (tag every event with the run's
+    /// token).
+    pub fn event_sender(&self) -> sandbox::RunEventSender {
+        self.events.clone()
     }
 }
 
@@ -111,12 +123,14 @@ pub fn spawn_instance(
     brand_key: String,
 ) -> InstanceHandle {
     let (tx, rx) = crossbeam_channel::unbounded::<sandbox::JobMsg>();
+    let (etx, erx) = crossbeam_channel::unbounded::<sandbox::RoutedEvent>();
     std::thread::Builder::new()
         .name("iso4-warm-instance".to_string())
-        .spawn(move || instance_main(prefix, memory_mb, brand_key, rx))
+        .spawn(move || instance_main(prefix, memory_mb, brand_key, rx, erx))
         .expect("failed to spawn warm instance thread");
     InstanceHandle {
         jobs: tx,
+        events: etx,
         last_used: Instant::now(),
         heap_used_bytes: 0,
     }
@@ -127,6 +141,7 @@ fn instance_main(
     memory_mb: u32,
     brand_key: String,
     jobs: crossbeam_channel::Receiver<sandbox::JobMsg>,
+    events: crossbeam_channel::Receiver<sandbox::RoutedEvent>,
 ) {
     // Host-type descriptors deserialized on this thread — call args, bridge
     // responses, and the cold-start replay of stored data globals — rehydrate
@@ -174,6 +189,7 @@ fn instance_main(
         &prefix.declared_imports,
         (first_job, first_respond),
         &jobs,
+        &events,
     );
     // The loop ended — the registry evicted this instance (taint, eviction,
     // dispose) or the process is shutting down. `core` drops here, on the
@@ -874,6 +890,8 @@ mod tests {
     // respond channels. One instance, several runs in flight.
 
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     fn interleave_prefix() -> Arc<PrefixData> {
         Arc::new(PrefixData {
@@ -881,7 +899,8 @@ mod tests {
                    export function bump() { return ++n }\n\
                    export async function viaTool(x) { console.log('run-' + x); const v = await tool(); return [x, v] }\n\
                    export async function hangBump() { n++; await tool(); return n }\n\
-                   export function spin() { for (;;) {} }"
+                   export function spin() { for (;;) {} }\n\
+                   export function busy(c) { let x = 0; for (let i = 0; i < c; i++) x = (x + i) & 1048575; return x }"
                 .to_string(),
             filename: None,
             globals: Vec::new(),
@@ -891,8 +910,19 @@ mod tests {
     }
 
     struct SessionRun {
-        events: crossbeam_channel::Sender<sandbox::RunEvent>,
+        /// The run's table token — events into the instance's shared channel
+        /// are tagged with it, exactly as the session demux tags them.
+        token: u64,
+        events: sandbox::RunEventSender,
         outcome: crossbeam_channel::Receiver<sandbox::CallOutcome>,
+    }
+
+    impl SessionRun {
+        fn send(&self, event: sandbox::RunEvent) {
+            self.events
+                .send(sandbox::RoutedEvent::new(self.token, event))
+                .unwrap();
+        }
     }
 
     /// Submit one channel-mode job calling `export_path(args)` with a live
@@ -907,15 +937,15 @@ mod tests {
         counter: &Arc<AtomicU32>,
         limits: sandbox::Limits,
     ) -> SessionRun {
-        let (ftx, frx) = crossbeam_channel::unbounded();
+        let token = sandbox::alloc_run_token();
         let (otx, orx) = crossbeam_channel::bounded(1);
         let job = Box::new(CallJob {
-            token: sandbox::alloc_run_token(),
+            token,
             code: None,
             filename: None,
             limits,
             globals: vec![crate::ipc::HostGlobalDef::bridge("tool")],
-            io: sandbox::RunIo::Session { events: frx, sink },
+            io: sandbox::RunIo::Instance { sink },
             call_id_counter: Arc::clone(counter),
             call: Some(crate::ipc::CallSpec {
                 export_path: export_path.to_string(),
@@ -933,7 +963,8 @@ mod tests {
             .send((job, Some(otx)))
             .expect("instance accepts the job");
         SessionRun {
-            events: ftx,
+            token,
+            events: handle.event_sender(),
             outcome: orx,
         }
     }
@@ -992,9 +1023,9 @@ mod tests {
 
         // Answer run 2 FIRST: routing must deliver each response to its own
         // run even though run 1 suspended earlier.
-        run2.events.send(bridge_response_event(102, c2, 20.0)).unwrap();
+        run2.send(bridge_response_event(102, c2, 20.0));
         let out2 = run2.outcome.recv().expect("run 2 completes");
-        run1.events.send(bridge_response_event(101, c1, 10.0)).unwrap();
+        run1.send(bridge_response_event(101, c1, 10.0));
         let out1 = run1.outcome.recv().expect("run 1 completes");
 
         let v1 = out1.result.expect("run 1 ok");
@@ -1075,12 +1106,10 @@ mod tests {
             sink.clone(), &counter, sandbox::Limits::default(),
         );
         let _ = read_bridge_call(&mut server);
-        run.events
-            .send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-                message_type: crate::ipc::TsToRustMessageType::Terminate,
-                payload: 5u32.to_be_bytes().to_vec(),
-            }))
-            .unwrap();
+        run.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+            message_type: crate::ipc::TsToRustMessageType::Terminate,
+            payload: 5u32.to_be_bytes().to_vec(),
+        }));
         let aborted = run.outcome.recv().expect("aborted run concludes");
         assert!(
             !aborted.tainted,
@@ -1130,6 +1159,171 @@ mod tests {
         let outcome = handle.call(bump_job());
         assert!(!outcome.tainted);
         assert_eq!(bump_value(&outcome), 2.0);
+    }
+
+    /// A benign frame for run 22: a StreamChunk for a stream it never opened
+    /// is ignored, but delivering it still costs a turn.
+    fn ignored_chunk_for_22() -> sandbox::RunEvent {
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&22u32.to_be_bytes()); // run id
+        chunk.extend_from_slice(&999u32.to_be_bytes()); // unknown stream id
+        chunk.extend_from_slice(&1u32.to_be_bytes()); // 1 data byte
+        chunk.push(0);
+        sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+            message_type: crate::ipc::TsToRustMessageType::StreamChunk,
+            payload: chunk,
+        })
+    }
+
+    #[test]
+    fn continuous_frame_traffic_does_not_starve_a_co_resident_deadline() {
+        // The E2 review's starvation hazard (carried item 8): the loop used
+        // to observe deadlines only when its select TIMED OUT, and a select
+        // with a non-empty event queue never times out — so traffic to one
+        // run could carry an expired co-resident arbitrarily far past its
+        // wall. Under the arrival-order rule the wall must fire as soon as
+        // the loop reaches the first event that arrived after it.
+        //
+        // Shape: suspend A (short wall) and B (no wall), then pump benign
+        // frames at B from a producer thread that far outruns the loop's
+        // drain rate. A must conclude WallTimeout while the queue is still
+        // non-empty — the old code could only conclude it on a drained-empty
+        // queue.
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let b = submit_session_job(
+            &handle, 22, "viaTool", vec![TestValue::Number(2.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let (b_run, b_call) = read_bridge_call(&mut server);
+        assert_eq!(b_run, 22);
+
+        let a = submit_session_job(
+            &handle, 21, "hangBump", vec![],
+            sink.clone(), &counter,
+            sandbox::Limits {
+                wall_time_ms: 50,
+                ..Default::default()
+            },
+        );
+        let (a_run, _a_call) = read_bridge_call(&mut server);
+        assert_eq!(a_run, 21);
+
+        // Pump until A concluded (or a cap: enqueueing is ~10× faster than a
+        // turn, so the cap lasts far past the wall at any plausible ratio).
+        // Assumes the feeder thread gets scheduled within A's 50 ms wall —
+        // it is runnable the whole time, so only a fully starved scheduler
+        // breaks that; revisit if this ever flakes on loaded CI.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feeder = {
+            let stop = Arc::clone(&stop);
+            let events = handle.event_sender();
+            let token = b.token;
+            std::thread::spawn(move || {
+                for _ in 0..600_000 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    events
+                        .send(sandbox::RoutedEvent::new(token, ignored_chunk_for_22()))
+                        .unwrap();
+                }
+            })
+        };
+
+        let out = a
+            .outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("run A concludes at its wall despite B's traffic");
+        let backlog_at_conclusion = !b.events.is_empty();
+        stop.store(true, Ordering::Relaxed);
+        feeder.join().unwrap();
+
+        assert!(matches!(
+            out.result.unwrap_err().error,
+            sandbox::RunError::WallTimeout
+        ));
+        assert!(!out.tainted, "boundary wall expiry must not taint");
+        assert!(
+            backlog_at_conclusion,
+            "A's wall fired only once B's traffic fully drained — deadline starvation"
+        );
+
+        // The instance stayed healthy throughout: settle B normally (its
+        // response queues behind the leftover traffic and drains through).
+        b.send(bridge_response_event(22, b_call, 20.0));
+        let out_b = b.outcome.recv().expect("run B completes");
+        assert!(!out_b.tainted);
+    }
+
+    #[test]
+    fn a_response_that_arrived_in_time_beats_the_wall_deadline() {
+        // The inverse guarantee of the arrival-order rule: a settling frame
+        // that reached the demux BEFORE the run's wall deadline must be
+        // delivered even when the loop only gets to it after the deadline
+        // has passed — a busy engine must not turn an answered run into a
+        // WallTimeout.
+        //
+        // Shape: suspend A on a bridge call (wall 150 ms), then occupy the
+        // loop with one long CPU turn (run C) and enqueue A's response
+        // while C spins — stamped well before A's wall. The loop resumes
+        // after A's wall has passed; A must still settle with its value.
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let started = Instant::now();
+        let a = submit_session_job(
+            &handle, 21, "hangBump", vec![],
+            sink.clone(), &counter,
+            sandbox::Limits {
+                wall_time_ms: 150,
+                ..Default::default()
+            },
+        );
+        let (a_run, a_call) = read_bridge_call(&mut server);
+        assert_eq!(a_run, 21);
+
+        // One long-running start turn. The busy count is calibrated far
+        // above the wall on any machine; the elapsed assert below fails
+        // loudly (rather than passing vacuously) if it ever gets too fast.
+        let c = submit_session_job(
+            &handle, 23, "busy", vec![TestValue::Number(1_500_000_000.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        // Give the loop a moment to dispatch C — its job is the only ready
+        // operation until the response below is enqueued.
+        std::thread::sleep(Duration::from_millis(10));
+        a.send(bridge_response_event(21, a_call, 10.0));
+
+        let out_c = c.outcome.recv_timeout(Duration::from_secs(30)).expect("C completes");
+        assert!(!out_c.tainted);
+        out_c.result.expect("busy() succeeds");
+        assert!(
+            started.elapsed() > Duration::from_millis(160),
+            "busy() finished before A's wall — raise its iteration count, \
+             the scenario no longer exercises the deadline boundary"
+        );
+
+        let out_a = a
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run A concludes");
+        let v = out_a.result.expect(
+            "A's response arrived before its wall deadline and must settle it — \
+             a busy loop must not turn an answered run into a WallTimeout",
+        );
+        assert_eq!(
+            testval::from_blob(&v.exports),
+            TestValue::Number(1.0)
+        );
+        assert!(!out_a.tainted);
     }
 
     #[test]

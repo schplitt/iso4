@@ -2,11 +2,13 @@
 //!
 //! `handle_client` is the entry point for one authenticated connection. It
 //! is the connection's DEMUX: the only socket reader, routing run-tagged
-//! frames (BridgeResponse, stream frames, Terminate) to the owning run's
-//! event channel by the leading run id. Runs execute on worker threads
-//! (one-off `Run`s) or warm instance threads (`PrefixRun`s) and write every
-//! outbound frame through ONE serialized writer, so frames from concurrent
-//! runs never interleave mid-frame.
+//! frames (BridgeResponse, stream frames, Terminate) by the leading run id
+//! to the owning run's event channel — a one-off run's private channel, or
+//! the owning warm instance's shared channel with the run's token as the
+//! tag. Runs execute on worker threads (one-off `Run`s) or warm instance
+//! threads (`PrefixRun`s) and write every outbound frame through ONE
+//! serialized writer, so frames from concurrent runs never interleave
+//! mid-frame.
 //!
 //! Blast radius: a corrupt or unparseable frame means framing can no longer
 //! be trusted — the demux stops, every run in flight on THIS connection
@@ -396,12 +398,16 @@ fn write_completion(
     }
 }
 
-/// Where the demux routes one in-flight run's inbound frames.
+/// Where the demux routes one in-flight run's inbound frames: a one-off
+/// run's private channel, or the owning warm instance's shared event
+/// channel. Every event is tagged with the run's `token` so the consumer
+/// delivers it to the right run.
 struct RunRoute {
-    frames: crossbeam_channel::Sender<sandbox::RunEvent>,
+    frames: sandbox::RunEventSender,
     /// Per-run inbound frame cap (the run's memory budget) — demux policy.
     frame_cap: u32,
-    /// The run's instance-local token, for mid-turn aborts.
+    /// The run's instance-local token: the event tag, and the mid-turn
+    /// abort target.
     token: u64,
     /// The owning instance guard's cross-thread face, filled once the
     /// isolate exists.
@@ -569,6 +575,35 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     let sink = ipc::FrameSink::Shared(writer);
     let conn_runs: ConnRuns = Arc::new(Mutex::new(HashMap::new()));
 
+    // ── Teardown guard ────────────────────────────────────────────────────
+    // When the demux ends — EOF, I/O error, protocol violation, or a panic
+    // unwinding this thread — framing can no longer be trusted: every run in
+    // flight on THIS connection fails cleanly and releases its slot;
+    // instances are NOT tainted (nothing was interrupted mid-JS) and other
+    // connections are unaffected — the epic's blast-radius bound. A Drop
+    // guard rather than code after the loop because a warm instance's event
+    // channel is shared and outlives any one connection, so a panicked demux
+    // dropping its routes would otherwise strand runs waiting on it forever.
+    struct FailRunsOnDrop(ConnRuns);
+    impl Drop for FailRunsOnDrop {
+        fn drop(&mut self) {
+            let routes: Vec<RunRoute> = {
+                let mut runs = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                runs.drain().map(|(_, r)| r).collect()
+            };
+            for route in routes {
+                route
+                    .frames
+                    .send(sandbox::RoutedEvent::new(
+                        route.token,
+                        sandbox::RunEvent::ConnLost(None),
+                    ))
+                    .ok();
+            }
+        }
+    }
+    let _teardown = FailRunsOnDrop(Arc::clone(&conn_runs));
+
     loop {
         let frame = match ipc::read_ts_to_rust_frame_with_limit(&mut stream, read_limit(&conn_runs))
         {
@@ -687,18 +722,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
         }
     }
 
-    // ── Teardown: the connection is gone (EOF, I/O error, or a protocol
-    // violation above). Framing can no longer be trusted, so every run in
-    // flight on THIS connection fails cleanly and releases its slot;
-    // instances are NOT tainted (nothing was interrupted mid-JS) and other
-    // connections are unaffected — the epic's blast-radius bound.
-    let routes: Vec<RunRoute> = {
-        let mut runs = conn_runs.lock().unwrap_or_else(|p| p.into_inner());
-        runs.drain().map(|(_, r)| r).collect()
-    };
-    for route in routes {
-        route.frames.send(sandbox::RunEvent::ConnLost(None)).ok();
-    }
+    // Teardown happens in `FailRunsOnDrop` above — shared by the normal exit
+    // here and a panic unwind.
 }
 
 /// Route one run-tagged frame (BridgeResponse / stream frames) to its run.
@@ -732,13 +757,22 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
         let cap = route.frame_cap;
         route
             .frames
-            .send(sandbox::RunEvent::ConnLost(Some(format!(
-                "frame length {frame_len} exceeds max frame length {cap}"
-            ))))
+            .send(sandbox::RoutedEvent::new(
+                route.token,
+                sandbox::RunEvent::ConnLost(Some(format!(
+                    "frame length {frame_len} exceeds max frame length {cap}"
+                ))),
+            ))
             .ok();
         return Ok(());
     }
-    route.frames.send(sandbox::RunEvent::Frame(frame)).ok();
+    route
+        .frames
+        .send(sandbox::RoutedEvent::new(
+            route.token,
+            sandbox::RunEvent::Frame(frame),
+        ))
+        .ok();
     Ok(())
 }
 
@@ -767,7 +801,13 @@ fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
             return Ok(());
         }
     }
-    route.frames.send(sandbox::RunEvent::Frame(frame)).ok();
+    route
+        .frames
+        .send(sandbox::RoutedEvent::new(
+            route.token,
+            sandbox::RunEvent::Frame(frame),
+        ))
+        .ok();
     Ok(())
 }
 
@@ -778,32 +818,40 @@ fn peek_run_id(payload: &[u8]) -> Option<u32> {
         .map(|b| u32::from_be_bytes(b.try_into().expect("4-byte slice")))
 }
 
-/// Register a run with the demux and hand back its event channel. `None` if
-/// the run id is already in flight on this connection: replacing the live
-/// route would strand the first run (its frames discarded as late) and
-/// misdeliver its completion cleanup — refuse the new run loudly instead.
-fn register_run(
+/// Whether a run id is already in flight on this connection. Replacing a
+/// live route would strand the first run (its frames discarded as late) and
+/// misdeliver its completion cleanup, so a duplicate is refused loudly
+/// BEFORE anything is acquired for the new run. The demux thread is this
+/// connection's only route inserter, so a clear check here stays true
+/// through the dispatch that follows.
+fn run_id_in_flight(conn_runs: &ConnRuns, run_id: u32) -> bool {
+    conn_runs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(&run_id)
+}
+
+/// Register a run with the demux: events route to `frames`, tagged with
+/// `token`. The caller checked [`run_id_in_flight`] first.
+fn insert_run_route(
     conn_runs: &ConnRuns,
     run_id: u32,
     token: u64,
     memory_mb: u32,
     ctl: Arc<std::sync::OnceLock<sandbox::GuardCtl>>,
-) -> Option<crossbeam_channel::Receiver<sandbox::RunEvent>> {
+    frames: sandbox::RunEventSender,
+) {
     let mut runs = conn_runs.lock().unwrap_or_else(|p| p.into_inner());
-    if runs.contains_key(&run_id) {
-        return None;
-    }
-    let (tx, rx) = crossbeam_channel::unbounded();
-    runs.insert(
+    let replaced = runs.insert(
         run_id,
         RunRoute {
-            frames: tx,
+            frames,
             frame_cap: frame_cap_for(memory_mb),
             token,
             ctl,
         },
     );
-    Some(rx)
+    debug_assert!(replaced.is_none(), "run id checked before dispatch");
 }
 
 /// Answer a run the demux refused before dispatch (duplicate run id).
@@ -861,14 +909,22 @@ fn dispatch_oneoff_run(
     );
 
     let run_id = payload.run_id;
-    let token = sandbox::alloc_run_token();
-    let ctl = Arc::new(std::sync::OnceLock::new());
-    let Some(events) =
-        register_run(conn_runs, run_id, token, payload.limits.memory_mb, Arc::clone(&ctl))
-    else {
+    if run_id_in_flight(conn_runs, run_id) {
         refuse_duplicate_run(sink, run_id);
         return;
-    };
+    }
+    let token = sandbox::alloc_run_token();
+    let ctl = Arc::new(std::sync::OnceLock::new());
+    // A one-off run gets a private event channel (it owns no instance loop).
+    let (events_tx, events) = crossbeam_channel::unbounded();
+    insert_run_route(
+        conn_runs,
+        run_id,
+        token,
+        payload.limits.memory_mb,
+        Arc::clone(&ctl),
+        events_tx,
+    );
 
     // One-off runs always get a fresh isolate (never the warm registry), but
     // they share the slot budget with warm instances.
@@ -1153,16 +1209,16 @@ fn dispatch_prefix_run(
             .unwrap_or("-"),
     );
 
-    // Register the route before anything is acquired: a duplicate run id is
-    // refused with nothing to release.
-    let token = sandbox::alloc_run_token();
-    let ctl = Arc::new(std::sync::OnceLock::new());
-    let Some(events) =
-        register_run(conn_runs, run_id, token, payload.limits.memory_mb, Arc::clone(&ctl))
-    else {
+    // Refuse a duplicate before anything is acquired — nothing to release.
+    // (The route itself is inserted after acquisition, because it points at
+    // the acquired instance's event channel; the demux thread is the only
+    // inserter, so the check holds through the dispatch below.)
+    if run_id_in_flight(conn_runs, run_id) {
         refuse_duplicate_run(sink, run_id);
         return;
-    };
+    }
+    let token = sandbox::alloc_run_token();
+    let ctl = Arc::new(std::sync::OnceLock::new());
 
     // ── Warm instance flow ───────────────────────────────────────────────
     // Reuse the warmest idle instance of this prefix, or take a slot
@@ -1189,6 +1245,17 @@ fn dispatch_prefix_run(
             false,
         ),
     };
+
+    // Route the run to the acquired instance's event channel; from here the
+    // demux can deliver frames, aborts and connection loss by token.
+    insert_run_route(
+        conn_runs,
+        run_id,
+        token,
+        payload.limits.memory_mb,
+        Arc::clone(&ctl),
+        handle.event_sender(),
+    );
 
     // The completion hook, run on the instance thread when the run finishes:
     // release the instance FIRST (so the host's next run on this prefix
@@ -1260,10 +1327,7 @@ fn dispatch_prefix_run(
             grace_ms: payload.limits.grace_ms,
         },
         globals: payload.globals,
-        io: sandbox::RunIo::Session {
-            events,
-            sink: sink.clone(),
-        },
+        io: sandbox::RunIo::Instance { sink: sink.clone() },
         call_id_counter: Arc::clone(call_id_counter),
         call: payload.call,
         epilogue: Some(sandbox::EpilogueSpec {
