@@ -831,7 +831,7 @@ export class RuntimeIpcClient {
 
       case RustToTsMessageTypes.StreamPull: {
         const pull = decodeStreamPullPayload(frame.payload)
-        const owner = this.streamOwner(pull.runId, pull.streamId)
+        const owner = this.streamOwner(pull.runId)
         if (owner === undefined)
           return undefined
         const source = owner.streams.sources.get(pull.streamId)
@@ -844,7 +844,7 @@ export class RuntimeIpcClient {
 
       case RustToTsMessageTypes.StreamCancel: {
         const cancel = decodeStreamCancelPayload(frame.payload)
-        const owner = this.streamOwner(cancel.runId, cancel.streamId)
+        const owner = this.streamOwner(cancel.runId)
         if (owner === undefined)
           return undefined
         const source = owner.streams.sources.get(cancel.streamId)
@@ -958,25 +958,27 @@ export class RuntimeIpcClient {
   }
 
   /**
-   * Resolve which run's stream registry a stream frame addresses. Run id 0
-   * disables run validation on both sides, so a 0-tagged frame is matched by
-   * stream id across every run in flight instead.
-   * @param runId the frame's run id (0 = unvalidated)
-   * @param streamId the stream addressed
+   * Resolve which run's stream registry a stream frame addresses. Stream ids
+   * are per-run, so the run id is the only safe routing key: with several
+   * runs in flight a match-by-stream-id fallback could credit or cancel the
+   * wrong run's source. The production runtime tags every stream frame with
+   * a real run id — run id 0 (the wire's "validation disabled" marker, used
+   * only by the direct-fd mode) arriving here means the two sides disagree
+   * about what this connection is doing, the same desync contract as a
+   * stray Result.
+   * @param runId the frame's run id
    */
   private streamOwner(
     runId: number,
-    streamId: number,
   ): { streams: StreamSourceRegistry, runId: number } | undefined {
-    if (runId !== 0) {
-      const streams = this.runs.get(runId)?.streams
-      return streams === undefined ? undefined : { streams, runId }
+    if (runId === 0) {
+      throw new ProtocolDesyncError(
+        'stream frame carries runId 0 — the runtime never leaves stream '
+        + 'frames unattributed on a session connection',
+      )
     }
-    for (const [id, entry] of this.runs) {
-      if (entry.streams?.sources.has(streamId))
-        return { streams: entry.streams, runId: id }
-    }
-    return undefined
+    const streams = this.runs.get(runId)?.streams
+    return streams === undefined ? undefined : { streams, runId }
   }
 
   /**
