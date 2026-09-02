@@ -895,6 +895,34 @@ describe('RuntimeIpcClient run router (multiplexed)', () => {
     await client.dispose()
   })
 
+  test('a stream frame carrying runId 0 is a desync', async () => {
+    // Stream ids are per-run; with several runs multiplexed on one
+    // connection an unattributed stream frame could only be routed by a
+    // match-by-stream-id guess across runs. The runtime always tags stream
+    // frames with a real run id, so 0 means the sides disagree — the same
+    // loud teardown as a stray Result, never a silent wrong-run credit.
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      await reader.readFrame() // Run 1
+
+      const pull = Buffer.alloc(12)
+      pull.writeUInt32BE(0, 0) // runId 0 — unattributed
+      pull.writeUInt32BE(1, 4) // streamId
+      pull.writeUInt32BE(65536, 8) // credit
+      socket.write(encodeRustToTsFrame(RustToTsMessageTypes.StreamPull, pull))
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    await expect(client.runRawCode('export default 1')).rejects.toThrow(
+      /stream frame carries runId 0/,
+    )
+    expect(client.usable).toBe(false)
+    await client.dispose()
+  })
+
   test('a RunComplete for a run without a pending epilogue is a desync', async () => {
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
