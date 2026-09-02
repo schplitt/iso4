@@ -1454,17 +1454,58 @@ pub enum RunEvent {
     ConnLost(Option<String>),
 }
 
+/// One event routed to a run, tagged with the run's table token and stamped
+/// with its arrival time at the demux.
+///
+/// The stamp decides deadline ordering in the multi-run loop: a run's
+/// boundary deadline concludes it only once every event that ARRIVED before
+/// that deadline has been delivered — so a settling frame that reached the
+/// demux in time is never beaten by the deadline just because the loop was
+/// busy — while events arriving after the deadline cannot delay it. (Two
+/// connections feeding one instance can interleave stamps out of order by
+/// the stamp-to-send race, a few µs — the same boundary blur any transport
+/// has; within one connection stamps are monotone.)
+pub struct RoutedEvent {
+    pub token: u64,
+    pub event: RunEvent,
+    pub at: std::time::Instant,
+}
+
+impl RoutedEvent {
+    /// Stamp `event` for `token` with the current time — called at the
+    /// routing site, so the stamp is the event's arrival.
+    pub fn new(token: u64, event: RunEvent) -> Self {
+        Self {
+            token,
+            event,
+            at: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Sender half of a run-event channel. A one-off run has a private channel
+/// (its token is the only one that ever appears); a warm instance has ONE
+/// channel for all of its runs, so its turn loop selects over a fixed
+/// two-channel set (jobs + events) instead of rebuilding a per-run receiver
+/// set on every event.
+pub type RunEventSender = crossbeam_channel::Sender<RoutedEvent>;
+
 /// Where a run's frames come from and where its frames go.
 pub enum RunIo {
     /// Direct fd (tests / direct API): reads and writes on the raw session
     /// socket, whose only user is this run — the pre-demux discipline.
     Fd(RawFd),
-    /// Session mode: the demux feeds events per run; writes go through the
-    /// connection's serialized writer.
+    /// Session mode with a private event channel (one-off runs): the demux
+    /// feeds this run's events; writes go through the connection's
+    /// serialized writer.
     Session {
-        events: crossbeam_channel::Receiver<RunEvent>,
+        events: crossbeam_channel::Receiver<RoutedEvent>,
         sink: ipc::FrameSink,
     },
+    /// Session mode on a warm instance: events arrive on the instance's
+    /// shared event channel (owned by its turn loop), so the run itself
+    /// carries only the sink.
+    Instance { sink: ipc::FrameSink },
     /// No I/O: a pure compute run (no bridge, no epilogue socket).
     None,
 }
@@ -1472,7 +1513,10 @@ pub enum RunIo {
 /// The read half of [`RunIo`], as the drive loops hold it.
 enum RunSource {
     Fd(RawFd),
-    Channel(crossbeam_channel::Receiver<RunEvent>),
+    Channel(crossbeam_channel::Receiver<RoutedEvent>),
+    /// Events arrive on the owning instance's shared channel — the run can
+    /// be woken (it is NOT sourceless), it just owns no receiver itself.
+    Instance,
 }
 
 // ── The turn loop ────────────────────────────────────────────────────────────
@@ -1660,10 +1704,15 @@ enum LoopEvent {
     SourceClosed(io::Error),
 }
 
-/// Wait for the next event from either source kind.
+/// Wait for the next event from either source kind. Only the single-run
+/// drive loop (`run_call_phase`) calls this; instance-channel runs are woken
+/// by their owner loop's select instead.
 fn wait_event(source: &RunSource, timeout: Option<Duration>, limit: u32) -> LoopEvent {
     match source {
         RunSource::Fd(fd) => wait_frame_on_fd(*fd, timeout, limit),
+        RunSource::Instance => {
+            unreachable!("instance-channel runs are driven by serve_instance, not wait_event")
+        }
         RunSource::Channel(rx) => {
             let received = match timeout {
                 Some(t) => rx.recv_timeout(t),
@@ -1671,12 +1720,17 @@ fn wait_event(source: &RunSource, timeout: Option<Duration>, limit: u32) -> Loop
                     .recv()
                     .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected),
             };
-            match received {
+            // The stamp is not consulted here: a single-run channel is
+            // already arrival-ordered against this run's own deadline (a
+            // queued event always beats the recv timeout).
+            match received.map(|routed| routed.event) {
                 Ok(RunEvent::Frame(frame)) => LoopEvent::Frame(frame),
-                Ok(RunEvent::ConnLost(detail)) => LoopEvent::SourceClosed(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    detail.unwrap_or_else(|| "connection closed".to_string()),
-                )),
+                Ok(RunEvent::ConnLost(detail)) => {
+                    LoopEvent::SourceClosed(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        detail.unwrap_or_else(|| "connection closed".to_string()),
+                    ))
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => LoopEvent::DeadlineHit,
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => LoopEvent::SourceClosed(
                     io::Error::new(io::ErrorKind::BrokenPipe, "demux gone"),
@@ -1792,6 +1846,7 @@ fn begin_call(
     let (source, sink) = match std::mem::replace(&mut ctx.io, RunIo::None) {
         RunIo::Fd(fd) => (Some(RunSource::Fd(fd)), Some(ipc::FrameSink::Fd(fd))),
         RunIo::Session { events, sink } => (Some(RunSource::Channel(events)), Some(sink)),
+        RunIo::Instance { sink } => (Some(RunSource::Instance), Some(sink)),
         RunIo::None => (None, None),
     };
     let mut rs = RunState {
@@ -1877,15 +1932,16 @@ fn boundary_close(rs: &mut RunState, e: io::Error) -> Result<Output, FailureOutp
     }
 }
 
-/// Whether this run's boundary deadline has passed (the multi-run loop's
-/// per-run check after a timed-out select).
-fn deadline_expired(rs: &RunState) -> bool {
+/// The absolute instant of this run's current boundary deadline, if it has
+/// one. Fixed per phase — the wall deadline is set at run start, the grace
+/// deadline at grace entry — so the multi-run loop's heap holds at most two
+/// entries per run over its life, and a heap entry is stale exactly when it
+/// no longer equals this value.
+fn deadline_instant(rs: &RunState) -> Option<std::time::Instant> {
     match &rs.phase {
-        RunPhase::Starting | RunPhase::Settling { .. } => {
-            rs.limits.wall_time_ms > 0
-                && rs.start.elapsed() >= Duration::from_millis(rs.limits.wall_time_ms as u64)
-        }
-        RunPhase::Grace(g) => std::time::Instant::now() >= g.deadline,
+        RunPhase::Starting | RunPhase::Settling { .. } => (rs.limits.wall_time_ms > 0)
+            .then(|| rs.start + Duration::from_millis(rs.limits.wall_time_ms as u64)),
+        RunPhase::Grace(g) => Some(g.deadline),
     }
 }
 
@@ -3601,12 +3657,78 @@ fn conclude_run(
     }
 }
 
+/// The multi-run loop's deadline heap: `(deadline, run token)`, nearest
+/// first. Entries are lazily deleted — an entry whose instant no longer
+/// equals its run's [`deadline_instant`] (the run concluded, or moved from
+/// wall to grace) is discarded when it surfaces. At most two entries exist
+/// per run over its life (one per phase with a deadline), so the heap never
+/// grows with frame traffic.
+type DeadlineHeap = std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>;
+
+/// The nearest live deadline, discarding stale heap tops on the way.
+fn peek_valid_deadline(
+    live: &[LiveRun],
+    deadlines: &mut DeadlineHeap,
+) -> Option<(std::time::Instant, u64)> {
+    loop {
+        let std::cmp::Reverse((at, token)) = *deadlines.peek()?;
+        let valid = live
+            .iter()
+            .find(|l| l.rs.token == token)
+            .is_some_and(|l| deadline_instant(&l.rs) == Some(at));
+        if valid {
+            return Some((at, token));
+        }
+        deadlines.pop();
+    }
+}
+
+/// Conclude every run whose boundary deadline lies at or before `cutoff`.
+/// No JS runs on this path, so no taint can arise.
+///
+/// The cutoff is what makes deadlines fire in ARRIVAL order rather than
+/// processing order: the event paths pass the event's demux arrival stamp,
+/// so a deadline concludes its run only once every event that arrived
+/// before it has been delivered — a settling frame that reached the demux
+/// in time is never beaten by the deadline just because the loop was busy —
+/// while events arriving after the deadline cannot delay it. The idle path
+/// (select timeout) passes `now`: the queue is empty at that moment, so
+/// nothing arrived-but-undelivered exists.
+fn sweep_expired_deadlines(
+    core: &mut InstanceCore,
+    live: &mut Vec<LiveRun>,
+    deadlines: &mut DeadlineHeap,
+    cutoff: std::time::Instant,
+) {
+    while let Some((at, token)) = peek_valid_deadline(live, deadlines) {
+        if at > cutoff {
+            break;
+        }
+        deadlines.pop();
+        let idx = live
+            .iter()
+            .position(|l| l.rs.token == token)
+            .expect("peek_valid_deadline checked liveness");
+        let mut l = live.swap_remove(idx);
+        let result = boundary_deadline(&mut l.rs);
+        conclude_run(&mut core.isolate, &core.run_table, l, result, false);
+    }
+}
+
 /// Serve jobs on one instance: the per-instance turn loop (#125). Selects
-/// over new jobs, frames routed to this instance's in-flight runs, and the
-/// nearest per-run deadline; each event is one turn. Any number of session
-/// runs can be suspended at once; a direct-fd job (tests, dark mode) blocks
-/// the loop for its duration — the pre-demux discipline where this thread
-/// is the fd's only reader.
+/// over new jobs and the instance's ONE event channel (`events` — the demux
+/// tags each event with the owning run's token and its arrival stamp),
+/// bounded by the nearest per-run deadline from a heap; each event is one
+/// turn. Any number of session runs can be suspended at once; a direct-fd
+/// job (tests, dark mode) blocks the loop for its duration — the pre-demux
+/// discipline where this thread is the fd's only reader.
+///
+/// Deadlines fire in ARRIVAL order, not processing order (see
+/// [`sweep_expired_deadlines`]): each delivered event first concludes the
+/// deadlines that expired before it arrived, and an idle select timing out
+/// concludes everything expired as of now. So a backlog of frames that
+/// arrived after a run's wall cannot starve that deadline, and a settling
+/// frame that arrived in time is never beaten by it.
 ///
 /// Returns when the job channel disconnects and no runs are in flight, or
 /// when a turn is interrupted mid-JS — the taint path: the turn owner fails
@@ -3619,12 +3741,14 @@ pub fn serve_instance(
     imports: &[ipc::ImportBinding],
     first: JobMsg,
     jobs: &crossbeam_channel::Receiver<JobMsg>,
+    events: &crossbeam_channel::Receiver<RoutedEvent>,
 ) {
     let mut live: Vec<LiveRun> = Vec::new();
+    let mut deadlines = DeadlineHeap::new();
     let mut jobs_open = true;
 
     // The job that triggered instance creation, then the loop.
-    if dispatch_job(core, prefix_globals, imports, &mut live, first) {
+    if dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, first) {
         taint_sweep(core, &mut live, jobs);
         return;
     }
@@ -3634,87 +3758,95 @@ pub fn serve_instance(
             return;
         }
 
-        // What the select decided, extracted as owned data so the receiver
-        // borrows into `live` end before anything is mutated.
+        // What the select decided, extracted as owned data before anything
+        // is mutated. The select set is fixed: jobs (while open) + the one
+        // event channel — never rebuilt per run.
         enum Picked {
             Job(Option<JobMsg>),
-            Run(u64, LoopEvent),
+            Event(Option<RoutedEvent>),
             Deadline,
         }
         let picked = {
+            let timeout = peek_valid_deadline(&live, &mut deadlines)
+                .map(|(at, _)| at.saturating_duration_since(std::time::Instant::now()));
             let mut sel = crossbeam_channel::Select::new();
             let job_idx = jobs_open.then(|| sel.recv(jobs));
-            let mut run_idxs: Vec<(usize, usize)> = Vec::new(); // (select idx, live idx)
-            for (i, l) in live.iter().enumerate() {
-                if let Some(RunSource::Channel(rx)) = &l.rs.source {
-                    run_idxs.push((sel.recv(rx), i));
-                }
-            }
-            let timeout = live.iter().filter_map(|l| l.rs.next_timeout()).min();
+            let _event_idx = sel.recv(events);
             let oper = match timeout {
                 Some(t) => sel.select_timeout(t).ok(),
-                None => {
-                    if job_idx.is_none() && run_idxs.is_empty() {
-                        // Nothing can ever wake us and nothing has a
-                        // deadline: only reachable with live fd-mode runs,
-                        // which never suspend — defensive exit.
-                        return;
-                    }
-                    Some(sel.select())
-                }
+                None => Some(sel.select()),
             };
             match oper {
                 None => Picked::Deadline,
-                Some(op) => {
-                    let idx = op.index();
-                    if Some(idx) == job_idx {
-                        Picked::Job(op.recv(jobs).ok())
-                    } else {
-                        let (_, li) = run_idxs
-                            .iter()
-                            .find(|(si, _)| *si == idx)
-                            .expect("selected index belongs to a live run");
-                        let l = &live[*li];
-                        let Some(RunSource::Channel(rx)) = &l.rs.source else {
-                            unreachable!("selected a non-channel run");
-                        };
-                        let event = match op.recv(rx) {
-                            Ok(RunEvent::Frame(frame)) => LoopEvent::Frame(frame),
-                            Ok(RunEvent::ConnLost(detail)) => {
-                                LoopEvent::SourceClosed(io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    detail.unwrap_or_else(|| "connection closed".to_string()),
-                                ))
-                            }
-                            Err(_) => LoopEvent::SourceClosed(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "demux gone",
-                            )),
-                        };
-                        Picked::Run(l.rs.token, event)
-                    }
-                }
+                Some(op) if Some(op.index()) == job_idx => Picked::Job(op.recv(jobs).ok()),
+                Some(op) => Picked::Event(op.recv(events).ok()),
             }
         };
 
         match picked {
+            Picked::Deadline => {
+                // The select timed out: the event queue was empty for the
+                // whole window, so nothing arrived-but-undelivered can beat
+                // the due deadline.
+                sweep_expired_deadlines(
+                    core,
+                    &mut live,
+                    &mut deadlines,
+                    std::time::Instant::now(),
+                );
+            }
             Picked::Job(None) => {
                 jobs_open = false;
             }
             Picked::Job(Some(msg)) => {
-                if dispatch_job(core, prefix_globals, imports, &mut live, msg) {
+                // No deadline sweep on this arm: jobs carry no arrival
+                // stamp, and sweeping at `now` could wrongly conclude a run
+                // whose settling frame is still queued. A job burst can
+                // therefore delay a due deadline by its start turns at most
+                // — the next event or idle timeout sweeps it.
+                if dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, msg) {
                     taint_sweep(core, &mut live, jobs);
                     return;
                 }
             }
-            Picked::Run(token, event) => {
-                let idx = live
-                    .iter()
-                    .position(|l| l.rs.token == token)
-                    .expect("event for a live run");
+            Picked::Event(None) => {
+                // Every event sender is gone — the registry handle and all
+                // routes dropped without the usual ConnLost delivery (a
+                // panicked feeder). Nothing can ever wake the remaining
+                // runs: fail them cleanly now instead of stranding them.
+                while let Some(mut l) = live.pop() {
+                    let result = boundary_close(
+                        &mut l.rs,
+                        io::Error::new(io::ErrorKind::BrokenPipe, "demux gone"),
+                    );
+                    conclude_run(&mut core.isolate, &core.run_table, l, result, false);
+                }
+            }
+            Picked::Event(Some(RoutedEvent { token, event, at })) => {
+                // Deadlines that expired BEFORE this event arrived precede
+                // it; anything later must not delay it (or be delayed by
+                // it).
+                sweep_expired_deadlines(core, &mut live, &mut deadlines, at);
+                let Some(idx) = live.iter().position(|l| l.rs.token == token) else {
+                    // The run concluded (deadline, taintless failure, the
+                    // sweep above) while this event sat in the shared queue
+                    // — the same benign race as a late frame at the demux.
+                    // Discard.
+                    continue;
+                };
                 let mut l = live.swap_remove(idx);
+                let event = match event {
+                    RunEvent::Frame(frame) => LoopEvent::Frame(frame),
+                    RunEvent::ConnLost(detail) => LoopEvent::SourceClosed(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        detail.unwrap_or_else(|| "connection closed".to_string()),
+                    )),
+                };
                 LAST_CULPRIT_RUN_ID
                     .with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
+                // The deadline as the heap knows it; a phase change during
+                // this turn (settle → grace) re-queues below.
+                let queued_deadline = deadline_instant(&l.rs);
                 let outcome = {
                     let facts = RunFacts {
                         call: l.job.call.as_ref(),
@@ -3749,6 +3881,12 @@ pub fn serve_instance(
                                 true,
                             );
                         } else {
+                            let current = deadline_instant(&l.rs);
+                            if current != queued_deadline {
+                                if let Some(at) = current {
+                                    deadlines.push(std::cmp::Reverse((at, token)));
+                                }
+                            }
                             live.push(l);
                         }
                     }
@@ -3758,31 +3896,20 @@ pub fn serve_instance(
                     return;
                 }
             }
-            Picked::Deadline => {
-                // Conclude every run whose boundary deadline passed. No JS
-                // runs on this path, so no taint can arise.
-                let mut i = 0;
-                while i < live.len() {
-                    if deadline_expired(&live[i].rs) {
-                        let mut l = live.swap_remove(i);
-                        let result = boundary_deadline(&mut l.rs);
-                        conclude_run(&mut core.isolate, &core.run_table, l, result, false);
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
         }
     }
 }
 
 /// Start one job on the instance. Returns whether the instance came out of
-/// the dispatch tainted (mid-JS interruption during the start turn).
+/// the dispatch tainted (mid-JS interruption during the start turn). A job
+/// that suspends is pushed onto `live` with its boundary deadline (if any)
+/// queued on `deadlines`.
 fn dispatch_job(
     core: &mut InstanceCore,
     prefix_globals: &[ipc::HostGlobalDef],
     imports: &[ipc::ImportBinding],
     live: &mut Vec<LiveRun>,
+    deadlines: &mut DeadlineHeap,
     (mut job, respond): JobMsg,
 ) -> bool {
     if let Some(slot) = &job.ctl_slot {
@@ -3969,6 +4096,11 @@ fn dispatch_job(
                         let f = l.rs.fail(error);
                         conclude_run(&mut core.isolate, &core.run_table, l, Err(f), true);
                     } else {
+                        // Covers both a settling run's wall deadline and a
+                        // run that entered grace within its start turn.
+                        if let Some(at) = deadline_instant(&l.rs) {
+                            deadlines.push(std::cmp::Reverse((at, l.rs.token)));
+                        }
                         live.push(l);
                     }
                 }
