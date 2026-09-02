@@ -1231,24 +1231,43 @@ fn dispatch_prefix_run(
     // cold-start a fresh one on its own owner thread. At the hard watermark
     // the fresh instance is CreateCold: it serves this run and is dropped,
     // never pooled — correctness never depends on warmth.
-    let (handle, pooled) = match shared.warm.acquire(&payload.prefix_id) {
-        crate::warm::Acquired::Reused(h) => (h, true),
-        crate::warm::Acquired::CreateNew => (
-            crate::warm::spawn_instance(
-                Arc::clone(&prefix_data),
-                payload.limits.memory_mb,
-                brand_key.to_string(),
-            ),
-            true,
-        ),
-        crate::warm::Acquired::CreateCold => (
-            crate::warm::spawn_instance(
-                Arc::clone(&prefix_data),
-                payload.limits.memory_mb,
-                brand_key.to_string(),
-            ),
-            false,
-        ),
+    let spawn = |pooled: bool| {
+        crate::warm::spawn_instance(
+            Arc::clone(&prefix_data),
+            payload.limits.memory_mb,
+            brand_key.to_string(),
+        )
+        .map(|h| (h, pooled))
+    };
+    let spawned = match shared.warm.acquire(&payload.prefix_id) {
+        crate::warm::Acquired::Reused(h) => Ok((h, true)),
+        crate::warm::Acquired::CreateNew => {
+            spawn(true).inspect_err(|_| shared.warm.abandon_new(&payload.prefix_id))
+        }
+        crate::warm::Acquired::CreateCold => {
+            spawn(false).inspect_err(|_| shared.warm.release_oneoff())
+        }
+    };
+    let (handle, pooled) = match spawned {
+        Ok(acquired) => acquired,
+        Err(e) => {
+            // Thread spawn failed (process resource exhaustion): answer this
+            // run and keep the connection serving — the registry accounting
+            // was undone above and no route was inserted yet.
+            eprintln!("[iso4-v8] PrefixRun {run_id} — failed to spawn instance thread: {e}");
+            let failure = sandbox::FailureOutput {
+                error: sandbox::RunError::Internal(format!(
+                    "failed to spawn instance thread: {e}"
+                )),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                duration_ms: 0.0,
+                cpu_time_ms: 0.0,
+                bridge_calls: Vec::new(),
+            };
+            write_completion(sink, run_id, &Err(failure), None);
+            return;
+        }
     };
 
     // Route the run to the acquired instance's event channel; from here the
