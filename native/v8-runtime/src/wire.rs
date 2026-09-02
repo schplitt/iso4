@@ -469,10 +469,12 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
 ///   RunErrorPayload  error
 /// ```
 pub fn encode_precompile_result_payload(
+    request_id: u32,
     prefix_id: Option<&str>,
     error: Option<&RunErrorPayload>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    out.extend_from_slice(&request_id.to_be_bytes());
     match (prefix_id, error) {
         (Some(id), _) => {
             encode_bool(true, &mut out);

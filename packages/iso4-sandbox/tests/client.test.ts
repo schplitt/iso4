@@ -12,6 +12,7 @@ import {
   RustToTsMessageTypes,
   TsToRustMessageTypes,
   decodeAuthenticatePayload,
+  decodePrecompileResultPayload,
   encodeHelloPayload,
   encodeRustToTsFrame,
 } from '../src/ipc'
@@ -237,6 +238,52 @@ describe('RuntimeIpcClient', () => {
     await expect(client.precompile({ code: 'export const x = 1' }))
       .rejects
       .toThrow(/Result frame carries runId/)
+    await client.dispose()
+  })
+
+  test('concurrent precompiles match replies by requestId, not arrival order', async () => {
+    // Precompiles are answered on runtime worker threads, so replies can
+    // return out of request order on a shared connection. The router must
+    // match by the echoed requestId — FIFO matching would hand caller A
+    // caller B's prefix id.
+    const successPayload = (requestId: number, prefixId: string): Buffer => {
+      const head = Buffer.alloc(6)
+      head.writeUInt32BE(requestId, 0)
+      head[4] = 1 // ok
+      head[5] = 1 // prefixId present
+      const id = Buffer.from(prefixId, 'utf8')
+      const idLen = Buffer.alloc(4)
+      idLen.writeUInt32BE(id.byteLength, 0)
+      return Buffer.concat([head, idLen, id, Buffer.from([0])])
+    }
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const idOf = (frame: { payload: Uint8Array }): number =>
+        Buffer.from(frame.payload.buffer, frame.payload.byteOffset, 4).readUInt32BE(0)
+      const first = idOf(await reader.readFrame())
+      const second = idOf(await reader.readFrame())
+
+      // Answer the SECOND request first.
+      socket.write(encodeRustToTsFrame(
+        RustToTsMessageTypes.PrecompileResult,
+        successPayload(second, 'prefix-of-second'),
+      ))
+      socket.write(encodeRustToTsFrame(
+        RustToTsMessageTypes.PrecompileResult,
+        successPayload(first, 'prefix-of-first'),
+      ))
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    const [a, b] = await Promise.all([
+      client.precompile({ code: 'export const a = 1' }),
+      client.precompile({ code: 'export const b = 2' }),
+    ])
+    expect(decodePrecompileResultPayload(a)).toMatchObject({ ok: true, prefixId: 'prefix-of-first' })
+    expect(decodePrecompileResultPayload(b)).toMatchObject({ ok: true, prefixId: 'prefix-of-second' })
     await client.dispose()
   })
 
@@ -675,10 +722,9 @@ describe('RuntimeIpcClient', () => {
 })
 
 describe('RuntimeIpcClient run router (multiplexed)', () => {
-  // Production admission still puts one run per connection; these drive the
-  // router the way the multiplexing activation will, proving the routing
-  // structures are already per-run: N concurrent runs over ONE connection,
-  // with bridge traffic, aborts, and waitUntil epilogues interleaved.
+  // The shipped model since #127: N concurrent runs over ONE connection,
+  // with bridge traffic, aborts, and waitUntil epilogues interleaved —
+  // every frame routed by the run id it leads with.
 
   /**
    * Read a frame and return its payload as a Buffer view.

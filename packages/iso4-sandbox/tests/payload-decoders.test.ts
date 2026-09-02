@@ -534,12 +534,19 @@ describe('decodeRunCompletionPayload — errors', () => {
 // ── decodePrecompileResultPayload ──────────────────────────────────────────
 
 describe('decodePrecompileResultPayload', () => {
-  function encodeSuccess(prefixId: string): Buffer {
-    return Buffer.concat([Buffer.from([1, 1]), str(prefixId), Buffer.from([0])])
+  function requestId(id: number): Buffer {
+    const b = Buffer.alloc(4)
+    b.writeUInt32BE(id, 0)
+    return b
+  }
+
+  function encodeSuccess(prefixId: string, id = 7): Buffer {
+    return Buffer.concat([requestId(id), Buffer.from([1, 1]), str(prefixId), Buffer.from([0])])
   }
 
   function encodeFailure(code: string, message: string, stack?: string): Buffer {
     return Buffer.concat([
+      requestId(7),
       Buffer.from([0, 0, 1]),
       str(code),
       str('SyntaxError'),
@@ -550,9 +557,10 @@ describe('decodePrecompileResultPayload', () => {
     ])
   }
 
-  test('success decodes prefixId', () => {
-    const result = decodePrecompileResultPayload(encodeSuccess('42'))
+  test('success decodes requestId and prefixId', () => {
+    const result = decodePrecompileResultPayload(encodeSuccess('42', 9))
     expect(result.ok).toBe(true)
+    expect(result.requestId).toBe(9)
     if (!result.ok)
       return
     expect(result.prefixId).toBe('42')

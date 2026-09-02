@@ -1,33 +1,33 @@
 /**
- * Run admission and connection reuse, as two separate concerns:
+ * Run admission and connection sharing, as two separate concerns:
  *
  * - `SlotPool` caps runs executing at once and queues the rest FIFO —
- *   capacity is an admission number, never a set of objects.
- * - `ConnectionRegistry` opens connections lazily on demand, reuses idle
- *   ones, and drops broken ones so the next caller opens a replacement —
- *   a transient connect failure fails one run instead of permanently
- *   costing capacity.
- * - `RunPool` composes them: one slot plus one connection per run, both
- *   held until the run (waitUntil grace work included) is over.
+ *   capacity is an admission number, never a set of objects. The slot frees
+ *   at the run's Result; waitUntil grace work holds none.
+ * - `ConnectionRegistry` shares connections up to `RUNS_PER_CONNECTION`
+ *   concurrent runs each, opens another lazily when all are full, and drops
+ *   broken ones so the next caller opens a replacement — a transient connect
+ *   failure fails one run instead of permanently costing capacity.
+ * - `RunPool` composes them: a slot plus a shared connection per run.
  */
 
 import { describe, expect, test, vi } from 'vitest'
 
-import { ConnectionRegistry, RunPool, SlotPool } from '../src/pool'
+import { ConnectionRegistry, RUNS_PER_CONNECTION, RunPool, SlotPool } from '../src/pool'
 import { RunAbortedError } from '../src/client'
 import type { RuntimeIpcClient } from '../src/client'
 
 /**
- * Minimal stand-in for a pooled connection: `usable` and `pendingEpilogue`
- * are the only things the pool reads, and `dispose` the only thing it calls.
+ * Minimal stand-in for a shared connection: `usable` and `load` are
+ * the only things the pool reads, and `dispose` the only thing it calls.
  * @param usable whether the fake reports itself as reusable
  */
-function fakeClient(usable = true): RuntimeIpcClient {
+function fakeClient(usable = true): RuntimeIpcClient & { usable: boolean, load: number } {
   return {
     usable,
-    pendingEpilogue: null,
+    load: 0,
     dispose: vi.fn(async () => {}),
-  } as unknown as RuntimeIpcClient
+  } as unknown as RuntimeIpcClient & { usable: boolean, load: number }
 }
 
 /**
@@ -145,83 +145,86 @@ describe('SlotPool admission', () => {
 })
 
 describe('ConnectionRegistry', () => {
-  test('opens lazily, reuses the returned connection, and counts both states', async () => {
-    const fresh = fakeClient()
-    const connect = vi.fn().mockResolvedValue(fresh)
+  test('shares one connection up to the run cap, then reports full', async () => {
+    const shared = fakeClient()
+    const connect = vi.fn().mockResolvedValue(shared)
     const registry = new ConnectionRegistry(connect)
     expect(registry.openConnections).toBe(0)
+    expect(registry.tryAcquire()).toBeUndefined()
 
-    const first = await registry.acquire()
-    expect(first).toBe(fresh)
+    await expect(registry.open()).resolves.toBe(shared)
+    expect(registry.openConnections).toBe(1)
+
+    // Below the cap the same connection serves every caller.
+    for (let load = 0; load < RUNS_PER_CONNECTION; load++) {
+      shared.load = load
+      expect(registry.tryAcquire()).toBe(shared)
+    }
+
+    // At the cap the registry reports full — the caller opens another.
+    shared.load = RUNS_PER_CONNECTION
+    expect(registry.tryAcquire()).toBeUndefined()
     expect(connect).toHaveBeenCalledTimes(1)
-    expect(registry.openConnections).toBe(1)
-
-    registry.release(first)
-    expect(registry.openConnections).toBe(1)
-
-    // Reused, not reopened.
-    await expect(registry.acquire()).resolves.toBe(fresh)
-    expect(connect).toHaveBeenCalledTimes(1)
   })
 
-  test('drops a connection that died while idle and opens a fresh one', async () => {
-    const dying = fakeClient(true)
+  test('counts a connect in flight, and a failed one leaves the ledger intact', async () => {
     const fresh = fakeClient()
-    const connect = vi.fn()
-      .mockResolvedValueOnce(dying)
-      .mockResolvedValueOnce(fresh)
-    const registry = new ConnectionRegistry(connect)
-
-    registry.release(await registry.acquire())
-    ;(dying as { usable: boolean }).usable = false
-
-    await expect(registry.acquire()).resolves.toBe(fresh)
-    expect(dying.dispose).toHaveBeenCalled()
-    expect(registry.openConnections).toBe(1)
-  })
-
-  test('a connection returned broken is disposed, not pooled', async () => {
-    const broken = fakeClient(false)
-    const registry = new ConnectionRegistry(vi.fn().mockResolvedValue(broken))
-
-    const client = await registry.acquire()
-    registry.release(client)
-
-    expect(broken.dispose).toHaveBeenCalled()
-    expect(registry.openConnections).toBe(0)
-  })
-
-  test('a failed connect fails that caller and leaves the count intact', async () => {
-    const fresh = fakeClient()
+    let settle: (c: RuntimeIpcClient) => void = () => {}
     const connect = vi.fn()
       .mockRejectedValueOnce(new Error('ECONNREFUSED'))
-      .mockResolvedValueOnce(fresh)
+      .mockImplementationOnce(() => new Promise<RuntimeIpcClient>((r) => {
+        settle = r
+      }))
     const registry = new ConnectionRegistry(connect)
 
-    await expect(registry.acquire()).rejects.toThrow(/ECONNREFUSED/)
+    await expect(registry.open()).rejects.toThrow(/ECONNREFUSED/)
     expect(registry.openConnections).toBe(0)
-    await expect(registry.acquire()).resolves.toBe(fresh)
+
+    const opening = registry.open()
+    expect(registry.openConnections).toBe(1) // in flight, already visible
+    settle(fresh)
+    await expect(opening).resolves.toBe(fresh)
+    expect(registry.openConnections).toBe(1)
   })
 
-  test('dispose closes idle connections and disposes later returns', async () => {
-    const idle = fakeClient()
-    const leased = fakeClient()
-    const connect = vi.fn()
-      .mockResolvedValueOnce(idle)
-      .mockResolvedValueOnce(leased)
+  test('drops a connection observed dead; the caller opens a replacement', async () => {
+    const dying = fakeClient(true)
+    const connect = vi.fn().mockResolvedValueOnce(dying)
     const registry = new ConnectionRegistry(connect)
 
-    registry.release(await registry.acquire())
-    const inFlight = await registry.acquire() // takes `idle` back out
-    const second = await registry.acquire() // opens `leased`
-    registry.release(inFlight)
+    await registry.open()
+    dying.usable = false
+
+    expect(registry.tryAcquire()).toBeUndefined()
+    expect(dying.dispose).toHaveBeenCalled()
+    expect(registry.openConnections).toBe(0)
+  })
+
+  test('dispose closes tracked connections and refuses new callers', async () => {
+    const open = fakeClient()
+    const registry = new ConnectionRegistry(vi.fn().mockResolvedValue(open))
+    await registry.open()
 
     await registry.dispose()
-    expect(inFlight.dispose).toHaveBeenCalled()
+    expect(open.dispose).toHaveBeenCalled()
+    expect(() => registry.tryAcquire()).toThrow(/runtime is disposed/)
+    await expect(registry.open()).rejects.toThrow(/runtime is disposed/)
+  })
 
-    registry.release(second)
-    expect(second.dispose).toHaveBeenCalled()
-    await expect(registry.acquire()).rejects.toThrow(/runtime is disposed/)
+  test('a connect resolving after dispose is closed, not tracked', async () => {
+    let settle: (c: RuntimeIpcClient) => void = () => {}
+    const late = fakeClient()
+    const registry = new ConnectionRegistry(vi.fn().mockImplementation(
+      () => new Promise<RuntimeIpcClient>((r) => {
+        settle = r
+      }),
+    ))
+
+    const opening = registry.open()
+    await registry.dispose()
+    settle(late)
+    await expect(opening).rejects.toThrow(/runtime is disposed/)
+    expect(late.dispose).toHaveBeenCalled()
   })
 })
 
@@ -243,28 +246,50 @@ describe('RunPool composition', () => {
     expect(peak).toBeLessThanOrEqual(2)
   })
 
-  test('slots admit runs while connections follow demand', async () => {
-    const clients = [fakeClient(), fakeClient()]
-    const connect = vi.fn(async () => clients[connect.mock.calls.length - 1] ?? fakeClient())
+  test('concurrent runs below the cap share one connection', async () => {
+    // The fakes never report load, so every run packs onto the first
+    // connection — multiplexing, not one socket per run.
+    const connect = vi.fn(async () => fakeClient())
     const pool = new RunPool(2, connect)
     expect(pool.openConnections).toBe(0)
 
-    // Two concurrent runs open two connections; both are kept afterwards.
     const first = hold(pool)
-    const second = hold(pool)
     await first.started
+    const second = hold(pool)
     await second.started
-    expect(pool.openConnections).toBe(2)
+    expect(pool.openConnections).toBe(1)
 
     first.release()
     second.release()
     await first.done
     await second.done
-    expect(pool.openConnections).toBe(2)
 
-    // A later run reuses an idle connection instead of opening a third.
+    // Kept for the process lifetime; a later run reuses it.
     await pool.withClient(async () => {})
-    expect(connect).toHaveBeenCalledTimes(2)
+    expect(connect).toHaveBeenCalledTimes(1)
+    expect(pool.openConnections).toBe(1)
+  })
+
+  test('a connection at the run cap sends the next run to a fresh one', async () => {
+    const full = fakeClient()
+    const fresh = fakeClient()
+    const connect = vi.fn()
+      .mockResolvedValueOnce(full)
+      .mockResolvedValueOnce(fresh)
+    const pool = new RunPool(8, connect)
+
+    const seen: RuntimeIpcClient[] = []
+    await pool.withClient(async (c) => {
+      seen.push(c)
+      // The first connection reports itself at the cap from now on.
+      full.load = RUNS_PER_CONNECTION
+    })
+    await pool.withClient(async (c) => {
+      seen.push(c)
+    })
+
+    expect(seen).toEqual([full, fresh])
+    expect(pool.openConnections).toBe(2)
   })
 
   test('a connect failure fails that run and frees its slot for the next', async () => {
@@ -288,7 +313,7 @@ describe('RunPool composition', () => {
     const pool = new RunPool(1, connect)
 
     const held = hold(pool, () => {
-      ;(dying as { usable: boolean }).usable = false
+      dying.usable = false
     })
     await held.started
 
@@ -301,32 +326,22 @@ describe('RunPool composition', () => {
     expect(dying.dispose).toHaveBeenCalled()
   })
 
-  test('a run with pending waitUntil work holds its slot and connection until the grace phase ends', async () => {
+  test('the slot frees at the Result: grace-phase work admits the next caller', async () => {
+    // A run whose Result reported pending waitUntil work settles its caller
+    // (fn returns) while the run keeps going runtime-side. The slot must
+    // free right there — admission caps foreground execution, and the grace
+    // frames ride the shared connection without holding capacity (#127).
     const client = fakeClient()
-    let settleEpilogue: () => void = () => {}
-    let epilogueHold: Promise<void> | null = new Promise<void>((r) => {
-      settleEpilogue = () => {
-        epilogueHold = null
-        r()
-      }
-    })
-    Object.defineProperty(client, 'pendingEpilogue', {
-      get: () => epilogueHold,
-    })
     const pool = new RunPool(1, vi.fn().mockResolvedValue(client))
 
-    // The run itself returns immediately — the value was delivered — but the
-    // slot must not admit the queued caller until the epilogue settles.
-    await pool.withClient(async () => {})
-    const queued = pool.withClient(async (c) => c)
-
-    await new Promise((r) => {
-      setTimeout(r, 10)
+    // Simulate the grace phase: the run is still routed on the connection
+    // after its caller resolved.
+    await pool.withClient(async () => {
+      client.load = 1
     })
-    expect(pool.queueDepth).toBe(1)
-
-    settleEpilogue()
+    const queued = pool.withClient(async (c) => c)
     await expect(queued).resolves.toBe(client)
+    expect(pool.queueDepth).toBe(0)
   })
 
   test('dispose rejects queued callers', async () => {

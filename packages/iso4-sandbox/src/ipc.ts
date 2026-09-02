@@ -1024,6 +1024,13 @@ export function encodeRunPayload(options: RunPayloadOptions): Buffer {
 // ── PrecompilePayload ──────────────────────────────────────────
 
 export interface PrecompilePayloadOptions {
+  /**
+   * Correlation id echoed on the `PrecompileResult`: precompiles are
+   * answered on runtime worker threads, so with several in flight on one
+   * multiplexed connection the replies can return out of request order —
+   * the router matches them by this id (the run frames' leading-id pattern).
+   */
+  requestId: number
   code: string
   filename?: string
   limits?: ResourceLimits
@@ -1038,6 +1045,7 @@ export interface PrecompilePayloadOptions {
  */
 export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buffer {
   return new PayloadWriter()
+    .writeU32(options.requestId)
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
@@ -1707,14 +1715,28 @@ function exportsBlobToExports(raw: unknown): SandboxExports {
 // ── PrecompileResultPayload decoder ────────────────────────────────────────
 
 export type PrecompileResult
-  = | { ok: true, prefixId: string }
-    | { ok: false, error: { code: string, name: string, message: string, stack?: string } }
+  = | { ok: true, requestId: number, prefixId: string }
+    | { ok: false, requestId: number, error: { code: string, name: string, message: string, stack?: string } }
+
+/**
+ * The leading `u32 requestId` of a `PrecompileResult` payload — how the
+ * router matches a reply to its in-flight `precompile()` (replies can
+ * return out of request order; see `PrecompilePayloadOptions.requestId`).
+ * `undefined` when the payload is too short to carry one.
+ * @param buf
+ */
+export function peekPrecompileResultRequestId(buf: Uint8Array): number | undefined {
+  if (buf.byteLength < 4)
+    return undefined
+  return Buffer.from(buf.buffer, buf.byteOffset, 4).readUInt32BE(0)
+}
 
 /**
  * Decode a `PrecompileResultPayload` from a `PrecompileResult` frame.
  *
- * Wire layout per `docs/protocol.md` §5.6:
+ * Wire layout per `docs/protocol.md` §5.7:
  * ```
+ * u32   requestId          (echo of the Precompile's)
  * u8    ok
  * u8    prefixIdPresent   (1 when ok = true)
  *   String  prefixId
@@ -1725,6 +1747,7 @@ export type PrecompileResult
  */
 export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult {
   const reader = new PayloadReader(buf)
+  const requestId = reader.readU32()
   const ok = reader.readBool()
 
   if (ok) {
@@ -1734,7 +1757,7 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
     const prefixId = reader.readString()
     reader.readU8() // errorPresent = 0
     reader.assertDone()
-    return { ok: true, prefixId }
+    return { ok: true, requestId, prefixId }
   }
 
   reader.readU8() // prefixIdPresent = 0
@@ -1749,7 +1772,7 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   reader.readOptionalValueBlob() // consume; precompile errors never carry fields
   readResetInfo(reader) // consume; precompile errors never carry one
   reader.assertDone()
-  return { ok: false, error: { code, name, message, stack } }
+  return { ok: false, requestId, error: { code, name, message, stack } }
 }
 
 /**

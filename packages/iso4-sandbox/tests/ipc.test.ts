@@ -336,12 +336,14 @@ describe('payload encoders', () => {
     expect(fn).toBe('agent')
   })
 
-  test('encodePrecompilePayload has no runId prefix', () => {
+  test('encodePrecompilePayload leads with its requestId', () => {
     const runBuf = encodeRunPayload({ runId: 0, code: 'x' })
-    const preBuf = encodePrecompilePayload({ code: 'x' })
-    // PrecompilePayload is 5 bytes shorter (no runId, no optional-call byte)
-    expect(preBuf.byteLength).toBe(runBuf.byteLength - 5)
-    const { value: code } = readString(preBuf, 0)
+    const preBuf = encodePrecompilePayload({ requestId: 12, code: 'x' })
+    // Same leading-id layout as Run; only the trailing optional-call byte
+    // differs.
+    expect(preBuf.byteLength).toBe(runBuf.byteLength - 1)
+    expect(readU32BE(preBuf, 0)).toBe(12)
+    const { value: code } = readString(preBuf, 4)
     expect(code).toBe('x')
   })
 

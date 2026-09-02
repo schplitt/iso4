@@ -1021,6 +1021,7 @@ fn dispatch_precompile(
     let shared = Arc::clone(shared);
     let worker_sink = sink.clone();
     let brand_key = brand_key.to_string();
+    let request_id = payload.request_id;
     let spawned = std::thread::Builder::new()
         .name("iso4-precompile".to_string())
         .spawn(move || {
@@ -1069,7 +1070,7 @@ fn dispatch_precompile(
                                 declared_imports: payload.imports,
                             }),
                         );
-                    wire::encode_precompile_result_payload(Some(&prefix_id), None)
+                    wire::encode_precompile_result_payload(request_id, Some(&prefix_id), None)
                 }
                 Err(failure) => {
                     eprintln!(
@@ -1077,6 +1078,7 @@ fn dispatch_precompile(
                         failure.duration_ms, failure.error
                     );
                     wire::encode_precompile_result_payload(
+                        request_id,
                         None,
                         Some(&wire::run_error_to_payload(&failure.error)),
                     )
@@ -1090,6 +1092,7 @@ fn dispatch_precompile(
     if let Err(e) = spawned {
         eprintln!("[iso4-v8] failed to spawn precompile worker: {e}");
         let payload = wire::encode_precompile_result_payload(
+            request_id,
             None,
             Some(&wire::run_error_to_payload(&sandbox::RunError::Internal(
                 format!("failed to spawn precompile worker: {e}"),

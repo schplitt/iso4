@@ -1,25 +1,35 @@
 /**
- * Run admission and connection reuse for the sandbox — two separate concerns:
+ * Run admission and connection sharing for the sandbox — two separate
+ * concerns:
  *
  * - {@link SlotPool} caps how many runs *execute* at once
  *   (`maxConcurrentRuns`); callers beyond it queue FIFO. A slot is a pure
- *   admission ticket — it says nothing about sockets.
- * - {@link ConnectionRegistry} owns the connections: idle ones are reused,
- *   a missing one is opened on demand (nothing connects eagerly), a broken
- *   one is dropped and its replacement opened by whoever needs it next.
- *   Idle connections are kept for the process lifetime; `dispose()` closes
- *   them.
+ *   admission ticket, held from admission until the run's Result — a run
+ *   whose Result reported pending `waitUntil` work releases its slot there,
+ *   and the grace work rides the connection in the background: admission
+ *   caps foreground execution, not epilogues.
+ * - {@link ConnectionRegistry} shares connections: frames are multiplexed by
+ *   run id, so one connection carries up to {@link RUNS_PER_CONNECTION}
+ *   concurrent runs, and a new one opens only when every open connection is
+ *   at the cap. The cap bounds the blast radius of a connection-level death
+ *   (protocol desync, outbound stall, socket error) to that many runs.
+ *   Connections are kept for the process lifetime; `dispose()` closes them.
  *
- * {@link RunPool} composes the two: one slot plus one connection per run,
- * both held until the run — including any `waitUntil` grace work — is over.
- * Decoupling capacity from sockets is the point: the admission number is the
- * back-pressure knob, while the connection count simply follows demand.
- * Finer-grained slot release (a slot freed at Result while grace work rides
- * the connection) is the multiplexing activation's job, not this pool's.
+ * {@link RunPool} composes the two: a slot plus a shared connection per run.
+ * Decoupling capacity from sockets is the point — the admission number is
+ * the back-pressure knob, while the connection count follows demand at
+ * roughly ceil(concurrent runs / cap).
  */
 
 import { RunAbortedError } from './client'
 import type { RuntimeIpcClient } from './client'
+
+/**
+ * How many concurrent runs one connection carries before another is opened.
+ * Internal for now — the #127 bench matrix picks the shipped default; 1
+ * reproduces the pre-multiplexing one-run-per-connection topology exactly.
+ */
+export const RUNS_PER_CONNECTION = 4
 
 interface SlotWaiter {
   resolve: () => void
@@ -130,17 +140,24 @@ export class SlotPool {
 }
 
 /**
- * The sandbox's open connections: reused while usable, opened lazily when a
- * caller needs one and nothing idle is available, dropped when broken. There
- * is no connection cap — how many exist is bounded by how many are ever
- * checked out at once, which the {@link SlotPool} already limits.
+ * The sandbox's open connections, shared by run id multiplexing: each
+ * carries up to {@link RUNS_PER_CONNECTION} concurrent runs, one is opened
+ * lazily when every open connection is at the cap, and a broken one is
+ * dropped when observed so the next caller opens a replacement.
  */
 export class ConnectionRegistry {
-  private readonly idle: RuntimeIpcClient[] = []
   /**
-   * Connections currently checked out by a caller.
+   * Every open connection — `stats()` reports this (plus in-flight opens)
+   * as `openConnections`. A connection that died stays counted until the
+   * next `tryAcquire()` observes and drops it — the number is the
+   * registry's ledger, not a per-read socket probe.
    */
-  private leased = 0
+  private readonly connections: RuntimeIpcClient[] = []
+  /**
+   * Connects in flight — counted in the ledger so a burst of opens is
+   * visible, not a blind spot.
+   */
+  private opening = 0
   private readonly connect: ConnectFn
   private disposed = false
 
@@ -148,73 +165,76 @@ export class ConnectionRegistry {
     this.connect = connect
   }
 
-  /**
-   * Connections as tracked: idle plus checked out — `stats()` reports this
-   * as `openConnections`. A connection that died while idle stays counted
-   * until the next `acquire()` observes and drops it, and one still mid-
-   * handshake is already counted — the number is the registry's ledger,
-   * not a per-read socket probe.
-   */
   get openConnections(): number {
-    return this.idle.length + this.leased
+    return this.connections.length + this.opening
   }
 
   /**
-   * Reuse an idle connection or open a fresh one. A connection that died
-   * while idle (child crash, peer close) is dropped here, not handed out —
-   * the drop costs nothing because capacity lives in the slot pool, so the
-   * next caller simply opens a replacement. A failed connect fails this
-   * caller's run; the registry never shrinks silently.
+   * A usable connection below the per-connection run cap, or `undefined`
+   * when every one is full (the caller opens a fresh one via {@link open}).
+   *
+   * Synchronous on purpose: the caller starts its run in the same tick, and
+   * run registration in the client is synchronous from that call — so the
+   * load this observed cannot go stale under it, and the cap is exact
+   * rather than best-effort. First-fit keeps packing deterministic:
+   * connection count settles at ceil(active runs / cap). A connection that
+   * died is dropped here, not handed out.
    */
-  async acquire(): Promise<RuntimeIpcClient> {
+  tryAcquire(): RuntimeIpcClient | undefined {
     if (this.disposed)
       throw new Error('runtime is disposed')
-
-    for (let client = this.idle.pop(); client !== undefined; client = this.idle.pop()) {
-      if (client.usable) {
-        this.leased++
-        return client
+    for (let i = 0; i < this.connections.length; i++) {
+      const client = this.connections[i]!
+      if (!client.usable) {
+        client.dispose().catch(() => {})
+        this.connections.splice(i, 1)
+        i--
+        continue
       }
-      client.dispose().catch(() => {})
+      if (client.load < RUNS_PER_CONNECTION)
+        return client
     }
-
-    this.leased++
-    try {
-      return await this.connect()
-    } catch (error) {
-      this.leased--
-      throw error
-    }
+    return undefined
   }
 
   /**
-   * Return a connection. A usable one goes back to the idle list and is kept
-   * for the process lifetime; a broken one is disposed — its replacement is
-   * opened on demand by the next caller that needs it.
-   * @param client
+   * Open a fresh connection and add it to the shared set. Concurrent
+   * callers that all found the set full each open one — a cold burst can
+   * briefly open more connections than the steady-state packing needs;
+   * they are kept and reused, so the count follows demand from then on. A
+   * failed connect fails this caller's run; the registry never shrinks
+   * silently.
    */
-  release(client: RuntimeIpcClient): void {
-    this.leased--
-    if (this.disposed || !client.usable) {
-      client.dispose().catch(() => {})
-      return
+  async open(): Promise<RuntimeIpcClient> {
+    if (this.disposed)
+      throw new Error('runtime is disposed')
+    this.opening++
+    try {
+      const client = await this.connect()
+      if (this.disposed) {
+        client.dispose().catch(() => {})
+        throw new Error('runtime is disposed')
+      }
+      this.connections.push(client)
+      return client
+    } finally {
+      this.opening--
     }
-    this.idle.push(client)
   }
 
   async dispose(): Promise<void> {
     if (this.disposed)
       return
     this.disposed = true
-    // Checked-out connections are disposed when they come back via release().
-    await Promise.all(this.idle.splice(0).map((client) => client.dispose()))
+    // Abrupt by design: the sandbox kills the child right after, so there
+    // is nothing to drain for.
+    await Promise.all(this.connections.splice(0).map((client) => client.dispose()))
   }
 }
 
 /**
  * What `createSandbox` hands to `SandboxImpl`: slot admission composed with
- * connection reuse, exposed through the same borrow-run-return shape the
- * old connection-capacity pool had.
+ * connection sharing, exposed through the same borrow-run shape as before.
  */
 export class RunPool {
   private readonly slots: SlotPool
@@ -235,12 +255,11 @@ export class RunPool {
 
   /**
    * Take a run slot (queueing FIFO when `maxConcurrentRuns` are executing),
-   * borrow a connection, run `fn`, then return both. The caller's promise
-   * settles when `fn` does; a run that ended with pending `waitUntil` work
-   * keeps its slot and its connection in the background until the grace
-   * phase settles — grace-time frames belong to the finished run, not the
-   * next one.
-   * @param fn ran with the borrowed connection
+   * pick a shared connection, run `fn`, then release the slot when `fn`
+   * settles — which is at the run's Result. A run that ended with pending
+   * `waitUntil` work holds no slot during its grace phase: the grace frames
+   * ride the shared connection, routed by run id, until its RunComplete.
+   * @param fn ran with the shared connection
    * @param signal the caller's abort signal, honoured while queued
    */
   async withClient<T>(
@@ -251,7 +270,7 @@ export class RunPool {
 
     let client: RuntimeIpcClient
     try {
-      client = await this.connections.acquire()
+      client = this.connections.tryAcquire() ?? await this.connections.open()
     } catch (error) {
       this.slots.release()
       throw error
@@ -260,14 +279,7 @@ export class RunPool {
     try {
       return await fn(client)
     } finally {
-      (async () => {
-        // Re-read until clear: the hold snapshot only covers epilogues
-        // pending at read time.
-        for (let hold = client.pendingEpilogue; hold !== null; hold = client.pendingEpilogue)
-          await hold
-        this.connections.release(client)
-        this.slots.release()
-      })()
+      this.slots.release()
     }
   }
 

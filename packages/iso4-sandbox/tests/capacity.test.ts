@@ -247,19 +247,65 @@ describe('lazy connections', () => {
     expect((await sandbox.stats()).openConnections).toBe(1)
   })
 
-  test('the connection count follows concurrent demand, not the admission cap', async () => {
-    await using sandbox = await createSandbox({ maxConcurrentRuns: 4 })
+  test('concurrent runs multiplex on one connection until its run cap', async () => {
+    // The #124 activation shape: frames route by run id, so concurrent runs
+    // share a connection instead of opening one each — 4 overlapping calls
+    // (the per-connection cap) ride the single connection prepare() opened.
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 8 })
     await using prefix = await sandbox.prepare({ code: SLOW, globals: { hostSleep } })
 
-    // prepare() opened one connection and returned it; two overlapping calls
-    // reuse it and open exactly one more — demand, not the cap of 4.
-    const [a, b] = await Promise.all([
-      prefix.call({ export: 'slow', args: [150], limits: { cpuTimeMs: 5_000 } }),
-      prefix.call({ export: 'slow', args: [150], limits: { cpuTimeMs: 5_000 } }),
-    ])
-    expect(a.ok).toBe(true)
-    expect(b.ok).toBe(true)
+    const four = await Promise.all(Array.from({ length: 4 }, () =>
+      prefix.call({ export: 'slow', args: [150], limits: { cpuTimeMs: 5_000 } })))
+    for (const r of four)
+      expect(r.ok).toBe(true)
+    expect((await sandbox.stats()).openConnections).toBe(1)
+
+    // One past the cap opens exactly one more connection — demand over the
+    // cap, never one socket per run and never the admission cap of 8.
+    const five = await Promise.all(Array.from({ length: 5 }, () =>
+      prefix.call({ export: 'slow', args: [150], limits: { cpuTimeMs: 5_000 } })))
+    for (const r of five)
+      expect(r.ok).toBe(true)
     expect((await sandbox.stats()).openConnections).toBe(2)
+  })
+
+  test('a run with pending waitUntil work frees its slot at the Result', async () => {
+    // The #127 acceptance: background grace work must not hold admission
+    // capacity. With ONE slot, run B can only execute while A's waitUntil
+    // work is still parked if A's slot freed at its Result.
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+
+    let releaseAudit: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      releaseAudit = resolve
+    })
+    let auditDone = false
+
+    const a = await sandbox.run({
+      code: `
+        waitUntil((async () => { await audit() })())
+        export default 'a'
+      `,
+      globals: {
+        audit: async () => {
+          await gate
+          auditDone = true
+        },
+      },
+    })
+    expect(a.ok).toBe(true)
+
+    // A's grace work is still parked on the gated handler; B must run.
+    const b = await sandbox.run({ code: 'export default "b"' })
+    expect(b.ok).toBe(true)
+    expect(auditDone).toBe(false)
+
+    releaseAudit()
+    if (a.ok) {
+      const report = await a.waitUntil!
+      expect(report.status).toBe('settled')
+    }
+    expect(auditDone).toBe(true)
   })
 
   test('passing the removed maxIsolates knob throws with the replacement named', async () => {

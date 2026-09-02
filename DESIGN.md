@@ -983,35 +983,37 @@ strings.
 ### 6.4 Session lifecycle and concurrency
 
 The `Runtime` admits runs through a **slot pool** and serves them over
-**lazily opened connections** to the Rust process — two separate concerns.
-A slot is a pure admission ticket: `maxConcurrentRuns` of them exist, and
-callers beyond that queue FIFO. Connections are opened on demand when an
-admitted run finds nothing idle to reuse, are kept for the process lifetime
-(`dispose()` closes them), and a broken one is dropped so the next run opens
-a replacement. Each connection still handles exactly one `Run` at a time;
-concurrency comes from having multiple connections, not from multiplexing
-messages on one connection.
+**shared, lazily opened connections** to the Rust process — two separate
+concerns. A slot is a pure admission ticket: `maxConcurrentRuns` of them
+exist, and callers beyond that queue FIFO. Connections multiplex runs by
+run id: each carries several concurrent runs (an internal per-connection
+cap bounds how many, which also bounds the blast radius of a
+connection-level failure), one more is opened only when every open
+connection is at the cap, all are kept for the process lifetime
+(`dispose()` closes them), and a broken one is dropped so the next run
+opens a replacement.
 
 ```
 Runtime (TypeScript)
   slot pool (admission, maxConcurrentRuns) ──▶ connection registry
-      connection ──UDS──▶  Rust process
-      connection ──UDS──▶  (same process, different isolate threads)
-      ...opened on demand, reused, count follows peak concurrency
+      connection ──UDS──▶  Rust process     (≤ cap runs multiplexed,
+      connection ──UDS──▶  same process,     routed by run id)
+      ...opened when all are at the cap; count ≈ peak concurrency / cap
 ```
 
 When `prefix.execute()` or `sandbox.run()` is called:
 
 1. Take a run slot (or queue FIFO if `maxConcurrentRuns` are executing —
    the caller's `AbortSignal` is honoured while queued).
-2. Borrow an idle connection, or open one; send `Run` (one-off) or
-   `PrefixRun` (prepared prefix) on it.
+2. Pick a shared connection below the run cap, or open one; send `Run`
+   (one-off) or `PrefixRun` (prepared prefix) on it.
 3. The connection's frame router delivers `BridgeCall` / stream frames to
    the run they name and settles the run at its `Result` — every frame in
-   both directions leads with the run id, so the routing structures already
-   support several runs per connection even though admission grants one.
-4. Resolve the caller's Promise and release connection and slot (a run with
-   pending `waitUntil` work holds both until its `RunComplete`).
+   both directions leads with the run id.
+4. Resolve the caller's Promise and release the slot at the `Result`. A run
+   with pending `waitUntil` work holds no slot during its grace phase: the
+   grace frames ride the shared connection, routed by run id, until its
+   `RunComplete`.
 
 This means five agents calling `prefix.execute()` simultaneously each get
 their own run slot and run truly in parallel on separate isolate
