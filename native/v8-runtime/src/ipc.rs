@@ -359,27 +359,53 @@ pub fn write_rust_to_ts_frame(
 /// legitimately large Result can never deadlock its own connection.
 pub const OUTBOX_CAP_BYTES: usize = 16 * 1024 * 1024;
 
-/// How long the writer tolerates one socket write making no progress, and
-/// how long a producer waits for queue space, before the connection is
-/// declared dead. The host drains its socket continuously in normal
-/// operation; sitting at either bound for this long means it stopped.
-/// Tests use a short bound so the suite does not wait on it.
+/// How long the outbox tolerates zero write progress — a producer waiting
+/// for queue space, or the writer thread retrying a jammed socket — before
+/// the connection is declared dead. The host drains its socket continuously
+/// in normal operation; sitting at this bound means it stopped. Tests use a
+/// short bound so the suite does not wait on it.
 #[cfg(not(test))]
 const OUTBOX_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const OUTBOX_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// One queued outbound frame: envelope fields plus the payload pieces,
-/// exactly as the producer handed them over (no concatenation copy).
-struct OutFrame {
-    message_type: RustToTsMessageType,
-    head: Vec<u8>,
-    tail: Vec<u8>,
+/// Per-attempt socket write timeout (`SO_SNDTIMEO`, set once — it is a
+/// socket option, shared by every clone of the fd). Bounds how long the
+/// INLINE fast path can block a producer on first contact with a jammed
+/// socket before handing the remainder to the writer thread; the writer
+/// accumulates attempts up to [`OUTBOX_STALL_TIMEOUT`].
+const OUTBOX_WRITE_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// One queued outbound unit.
+enum OutFrame {
+    /// A whole frame: envelope fields plus the payload pieces, exactly as
+    /// the producer handed them over (no concatenation copy).
+    Frame {
+        message_type: RustToTsMessageType,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+    },
+    /// The unwritten remainder of a frame whose INLINE write hit a jammed
+    /// socket: raw bytes, mid-frame, no envelope. Always at the queue
+    /// front, and must reach the socket before anything else — framing
+    /// integrity depends on it.
+    Remainder(Vec<u8>),
+}
+
+impl OutFrame {
+    fn len(&self) -> usize {
+        match self {
+            OutFrame::Frame { head, tail, .. } => head.len() + tail.len(),
+            OutFrame::Remainder(bytes) => bytes.len(),
+        }
+    }
 }
 
 struct OutboxState {
     queue: std::collections::VecDeque<OutFrame>,
-    /// Payload bytes queued (envelope bytes ignored — 5 per frame).
+    /// Bytes queued: payload bytes for whole frames (their 5 envelope bytes
+    /// ignored), raw remaining bytes for a `Remainder` (which may include
+    /// unwritten envelope bytes). Symmetric with `OutFrame::len`.
     bytes: usize,
     /// Set once the connection can no longer carry frames (socket write
     /// failed or stalled, or a producer gave up waiting). Every later send
@@ -391,11 +417,20 @@ struct OutboxState {
     /// AFTER the demux tore down still gets its final frame out, the same
     /// lifetime the direct-write socket clone used to have.
     producers: usize,
+    /// The socket token: exactly one party writes at a time — the writer
+    /// thread, or a producer on the inline fast path. Guards byte-level
+    /// framing integrity; queue order still decides frame order (inline is
+    /// only taken when the queue is empty, so nothing is bypassed).
+    writing: bool,
 }
 
 struct OutboxShared {
     state: Mutex<OutboxState>,
     not_full: std::sync::Condvar,
+    /// The WRITER THREAD is this condvar's only waiter — several notify
+    /// sites use `notify_one` on that assumption. A second waiter would
+    /// silently break them; use `notify_all` everywhere if one is ever
+    /// added.
     not_empty: std::sync::Condvar,
     /// For unblocking both socket halves when the outbox dies: the writer
     /// may be parked in `write_all` and the session demux in its read.
@@ -415,21 +450,31 @@ impl OutboxShared {
     }
 }
 
-/// One connection's serialized outbound writer, decoupled from its
-/// producers by a bounded queue.
+/// One connection's outbound path: an inline fast path over a bounded queue
+/// with a writer thread behind it.
 ///
 /// Session runs share their connection, and a socket write blocks when the
 /// peer stops draining — under the old direct-write lock that stalled the
 /// writing instance mid-turn AND every other instance sharing the
-/// connection. Now producers enqueue (bounded by [`OUTBOX_CAP_BYTES`]) and
-/// ONE writer thread per connection owns the socket: a stalled peer parks
-/// the writer, producers fill the queue, and whoever cannot enqueue within
+/// connection, unboundedly. The queue + writer thread bound that: a stalled
+/// peer parks the WRITER, producers fill the queue (bounded by
+/// [`OUTBOX_CAP_BYTES`]), and whoever cannot make progress within
 /// [`OUTBOX_STALL_TIMEOUT`] declares the connection dead — every run on it
-/// then fails cleanly (no instance taint), which is the connection-death
-/// blast radius the epic fixed (#124).
+/// then fails cleanly (no instance taint), the connection-death blast
+/// radius the epic fixed (#124).
+///
+/// The fast path exists because the queue is empty and the socket free in
+/// nearly every send: waking the writer thread costs ~4 µs per frame, a
+/// measurable flat tax on short-call workloads (#127 bench). A producer
+/// that finds the queue empty and nobody writing takes the socket token and
+/// writes INLINE — no thread interaction at all. On first contact with a
+/// jammed socket the inline attempt stops after at most
+/// [`OUTBOX_WRITE_ATTEMPT`] and hands the frame's unwritten remainder to
+/// the writer thread, which owns all patient retrying.
 ///
 /// Frames from concurrent runs interleave on the stream but never
-/// mid-frame: queue order is write order.
+/// mid-frame: the socket token serializes bytes, and inline is only taken
+/// when the queue is empty, so queue order is still write order.
 pub struct Outbox {
     inner: Arc<OutboxShared>,
 }
@@ -460,17 +505,19 @@ impl Outbox {
     /// Spawn the writer thread for `stream` and hand back the producer face.
     pub fn spawn(stream: &UnixStream) -> io::Result<Outbox> {
         let writer_stream = stream.try_clone()?;
-        // A stalled single write is the host gone: bound it so the writer
-        // (and with it every producer) cannot park forever. `write_all`
-        // loops over partial writes, so a slow-but-draining peer only
-        // restarts the clock with real progress.
-        writer_stream.set_write_timeout(Some(OUTBOX_STALL_TIMEOUT))?;
+        // Per-ATTEMPT write bound. SO_SNDTIMEO is a socket option shared by
+        // every fd clone, so this also bounds the inline fast path's first
+        // contact with a jammed socket. The writer accumulates attempts up
+        // to OUTBOX_STALL_TIMEOUT; a slow-but-draining peer resets the
+        // clock with real progress.
+        writer_stream.set_write_timeout(Some(OUTBOX_WRITE_ATTEMPT))?;
         let inner = Arc::new(OutboxShared {
             state: Mutex::new(OutboxState {
                 queue: std::collections::VecDeque::new(),
                 bytes: 0,
                 dead: None,
                 producers: 1,
+                writing: false,
             }),
             not_full: std::sync::Condvar::new(),
             not_empty: std::sync::Condvar::new(),
@@ -513,11 +560,61 @@ impl Outbox {
             if let Some(reason) = &state.dead {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, reason.clone()));
             }
+
+            // ── Inline fast path ──────────────────────────────────────
+            // Queue empty, nobody writing: take the socket token and write
+            // from this thread — the near-universal case, and it skips the
+            // writer-thread wakeup entirely (a flat ~4 µs per frame that
+            // dominates short calls; see the #127 bench).
+            if state.queue.is_empty() && !state.writing {
+                state.writing = true;
+                drop(state);
+                let mut envelope = [0u8; 5];
+                envelope[..4].copy_from_slice(&payload_len.to_be_bytes());
+                envelope[4] = message_type as u8;
+                let mut progress = FrameProgress::new(&envelope, &head, &tail);
+                // Bounded exposure: one attempt window in total. Worst case
+                // mid-turn on a jammed or dripping socket is ~2× the attempt
+                // timeout, once — later sends see the queue and skip inline.
+                // (Revisit if even that pause matters: Jakob, 2026-09-02.)
+                let deadline = std::time::Instant::now() + OUTBOX_WRITE_ATTEMPT;
+                let outcome = progress.write_some(&mut &self.inner.stream, Some(deadline));
+                let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.writing = false;
+                match outcome {
+                    Ok(true) => {
+                        // Done. Anything enqueued while we held the token
+                        // is the writer thread's to drain.
+                        if !state.queue.is_empty() {
+                            self.inner.not_empty.notify_one();
+                        }
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        // Jammed mid-frame: the unwritten remainder goes to
+                        // the queue FRONT (framing integrity), and the
+                        // writer thread takes over the patient retrying.
+                        // The frame is accepted — same contract as enqueue.
+                        let remainder = progress.remainder();
+                        state.bytes += remainder.len();
+                        state.queue.push_front(OutFrame::Remainder(remainder));
+                        self.inner.not_empty.notify_one();
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let reason = format!("socket write failed: {e}");
+                        self.inner.kill(&mut state, reason.clone());
+                        return Err(io::Error::new(io::ErrorKind::BrokenPipe, reason));
+                    }
+                }
+            }
+
+            // ── Queue path ────────────────────────────────────────────
             // An empty queue admits any frame — a frame larger than the
             // whole budget must never deadlock waiting for space that
             // cannot exist.
             if state.queue.is_empty() || state.bytes + len <= OUTBOX_CAP_BYTES {
-                state.queue.push_back(OutFrame {
+                state.queue.push_back(OutFrame::Frame {
                     message_type,
                     head,
                     tail,
@@ -534,7 +631,8 @@ impl Outbox {
             state = guard;
             if wait.timed_out()
                 && state.dead.is_none()
-                && !(state.queue.is_empty() || state.bytes + len <= OUTBOX_CAP_BYTES)
+                && !state.queue.is_empty()
+                && state.bytes + len > OUTBOX_CAP_BYTES
             {
                 let reason = format!(
                     "outbound queue stalled for {OUTBOX_STALL_TIMEOUT:?} — the host \
@@ -545,12 +643,97 @@ impl Outbox {
             }
         }
     }
-
 }
 
-/// The connection's one socket writer: pop, write, repeat. Ends when the
-/// outbox dies (socket error/stall) or the queue is drained and the last
-/// producer handle has dropped.
+/// Resumable vectored write of one frame (envelope + payload pieces),
+/// tracking progress across bounded attempts so a jammed socket can hand
+/// the remainder over mid-frame.
+struct FrameProgress<'a> {
+    parts: [&'a [u8]; 3],
+    written: usize,
+}
+
+impl<'a> FrameProgress<'a> {
+    fn new(envelope: &'a [u8], head: &'a [u8], tail: &'a [u8]) -> Self {
+        Self {
+            parts: [envelope, head, tail],
+            written: 0,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.parts.iter().map(|p| p.len()).sum()
+    }
+
+    /// One bounded write pass: keeps writing while the socket accepts bytes,
+    /// stops at the first attempt that makes no progress within the socket's
+    /// `SO_SNDTIMEO` — or, when `deadline` is set, as soon as it has passed
+    /// (checked between attempts; a slow-DRIPPING peer makes progress every
+    /// attempt and would otherwise hold the caller for a whole frame). The
+    /// clean path — everything accepted in one attempt — never reads the
+    /// clock. `Ok(true)` = frame fully written, `Ok(false)` = stopped with a
+    /// remainder left, `Err` = the socket is broken.
+    fn write_some(
+        &mut self,
+        stream: &mut impl Write,
+        deadline: Option<std::time::Instant>,
+    ) -> io::Result<bool> {
+        let mut attempted = false;
+        while self.written < self.total() {
+            if attempted {
+                if let Some(deadline) = deadline {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                }
+            }
+            attempted = true;
+            let mut offset = self.written;
+            let mut bufs = Vec::with_capacity(3);
+            for part in self.parts {
+                if offset >= part.len() {
+                    offset -= part.len();
+                    continue;
+                }
+                bufs.push(io::IoSlice::new(&part[offset..]));
+                offset = 0;
+            }
+            match stream.write_vectored(&bufs) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => self.written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// The unwritten bytes, as one owned buffer (jam-only path).
+    fn remainder(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.total() - self.written);
+        let mut offset = self.written;
+        for part in self.parts {
+            if offset >= part.len() {
+                offset -= part.len();
+                continue;
+            }
+            out.extend_from_slice(&part[offset..]);
+            offset = 0;
+        }
+        out
+    }
+}
+
+/// The connection's writer thread: pop under the socket token, write with
+/// patient bounded attempts, repeat. Only drains what the inline fast path
+/// could not take — an empty queue parks it. Ends when the outbox dies
+/// (socket error/stall) or the queue is drained and the last producer
+/// handle has dropped.
 fn writer_loop(mut stream: UnixStream, inner: &OutboxShared) {
     loop {
         let frame = {
@@ -559,13 +742,19 @@ fn writer_loop(mut stream: UnixStream, inner: &OutboxShared) {
                 if state.dead.is_some() {
                     return;
                 }
-                if let Some(frame) = state.queue.pop_front() {
-                    state.bytes -= frame.head.len() + frame.tail.len();
-                    inner.not_full.notify_all();
-                    break frame;
-                }
-                if state.producers == 0 {
-                    return;
+                // An inline producer holds the socket token: wait for it to
+                // finish (it clears the flag and notifies) before touching
+                // the socket — bytes from two writers must never interleave.
+                if !state.writing {
+                    if let Some(frame) = state.queue.pop_front() {
+                        state.bytes -= frame.len();
+                        state.writing = true;
+                        inner.not_full.notify_all();
+                        break frame;
+                    }
+                    if state.producers == 0 {
+                        return;
+                    }
                 }
                 state = inner
                     .not_empty
@@ -573,21 +762,56 @@ fn writer_loop(mut stream: UnixStream, inner: &OutboxShared) {
                     .unwrap_or_else(|p| p.into_inner());
             }
         };
-        if let Err(e) =
-            write_rust_to_ts_frame_parts(&mut stream, frame.message_type, &frame.head, &frame.tail)
-        {
-            let reason = if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
-            {
-                format!(
-                    "socket write made no progress for {OUTBOX_STALL_TIMEOUT:?} — the host \
-                     stopped draining the connection"
-                )
-            } else {
-                format!("socket write failed: {e}")
-            };
-            let mut state = inner.state.lock().unwrap_or_else(|p| p.into_inner());
-            inner.kill(&mut state, reason);
-            return;
+
+        let mut envelope = [0u8; 5];
+        let (envelope_slice, head, tail): (&[u8], &[u8], &[u8]) = match &frame {
+            OutFrame::Frame {
+                message_type,
+                head,
+                tail,
+            } => {
+                let length = (head.len() + tail.len() + 1) as u32;
+                envelope[..4].copy_from_slice(&length.to_be_bytes());
+                envelope[4] = *message_type as u8;
+                (&envelope, head, tail)
+            }
+            // Mid-frame remainder from a jammed inline write: raw bytes,
+            // the envelope already went out.
+            OutFrame::Remainder(bytes) => (&[], bytes, &[]),
+        };
+        let mut progress = FrameProgress::new(envelope_slice, head, tail);
+        let mut last_progress = std::time::Instant::now();
+        let result = loop {
+            let before = progress.written;
+            match progress.write_some(&mut stream, None) {
+                Ok(true) => break Ok(()),
+                Ok(false) => {
+                    let now = std::time::Instant::now();
+                    if progress.written > before {
+                        last_progress = now;
+                    } else if now.duration_since(last_progress) >= OUTBOX_STALL_TIMEOUT {
+                        break Err(format!(
+                            "socket write made no progress for {OUTBOX_STALL_TIMEOUT:?} — \
+                             the host stopped draining the connection"
+                        ));
+                    }
+                }
+                Err(e) => break Err(format!("socket write failed: {e}")),
+            }
+        };
+
+        let mut state = inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.writing = false;
+        match result {
+            Ok(()) => {
+                // Wake an inline producer? None ever waits on the token —
+                // they enqueue instead. Nothing to notify beyond capacity.
+                drop(state);
+            }
+            Err(reason) => {
+                inner.kill(&mut state, reason);
+                return;
+            }
         }
     }
 }
@@ -2556,6 +2780,104 @@ mod tests {
         assert_eq!(e2.kind(), io::ErrorKind::BrokenPipe);
         assert!(start.elapsed() < OUTBOX_STALL_TIMEOUT);
         drop(host);
+    }
+
+    #[test]
+    fn outbox_stitches_a_frame_jammed_mid_inline_write() {
+        // The inline fast path can hit a full kernel buffer partway through
+        // a frame; the unwritten remainder is handed to the writer thread.
+        // When the peer resumes draining, every frame must arrive intact
+        // and in order — framing integrity across the handoff.
+        let (mut host, runtime) = UnixStream::pair().unwrap();
+        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        drop(runtime);
+
+        // Nobody reads yet: pump patterned frames until the kernel buffer
+        // jams an inline write mid-frame (64 KiB each, far past any UDS
+        // buffer). Stay under the queue budget so no send blocks long.
+        let frames = 64;
+        for i in 0..frames {
+            let mut head = vec![0u8; 4];
+            head[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            let tail = vec![i as u8; 65536];
+            sink.write_parts(RustToTsMessageType::Log, head, tail).unwrap();
+        }
+        drop(sink);
+
+        // Drain: every frame intact, in order, correctly framed.
+        for i in 0..frames {
+            let frame = read_rust_to_ts_frame(&mut host).expect("frame survives the handoff");
+            assert_eq!(frame.message_type, RustToTsMessageType::Log);
+            assert_eq!(frame.payload.len(), 4 + 65536);
+            assert_eq!(
+                u32::from_be_bytes(frame.payload[..4].try_into().unwrap()),
+                i as u32
+            );
+            assert!(
+                frame.payload[4..].iter().all(|b| *b == i as u8),
+                "frame {i} payload corrupted across the inline/writer handoff"
+            );
+        }
+        assert!(read_rust_to_ts_frame(&mut host).is_err(), "clean EOF after drain");
+    }
+
+    #[test]
+    fn outbox_keeps_framing_and_per_producer_order_under_contention() {
+        // The socket token under fire: several producer threads race the
+        // inline fast path against each other and the writer thread, with a
+        // reader draining concurrently (so the path flips between inline
+        // and queued as the kernel buffer fills and empties). Every frame
+        // must arrive correctly framed, and each producer's own frames in
+        // its send order — the invariants the token discipline exists for.
+        const PRODUCERS: usize = 4;
+        const FRAMES: u32 = 500;
+        let (mut host, runtime) = UnixStream::pair().unwrap();
+        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        drop(runtime);
+
+        let reader = std::thread::spawn(move || {
+            let mut next_per_producer = [0u32; PRODUCERS];
+            for _ in 0..(PRODUCERS as u32 * FRAMES) {
+                let frame = read_rust_to_ts_frame(&mut host).expect("well-framed under contention");
+                assert_eq!(frame.message_type, RustToTsMessageType::Log);
+                let producer = u32::from_be_bytes(frame.payload[..4].try_into().unwrap()) as usize;
+                let seq = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
+                assert_eq!(
+                    seq, next_per_producer[producer],
+                    "producer {producer} frames reordered"
+                );
+                next_per_producer[producer] += 1;
+                // Sizes vary per frame; check the fill byte end to end.
+                assert!(
+                    frame.payload[8..].iter().all(|b| *b == producer as u8),
+                    "payload corrupted under contention"
+                );
+            }
+            assert!(read_rust_to_ts_frame(&mut host).is_err(), "clean EOF");
+        });
+
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|p| {
+                let sink = sink.clone();
+                std::thread::spawn(move || {
+                    for seq in 0..FRAMES {
+                        let mut head = Vec::with_capacity(8);
+                        head.extend_from_slice(&(p as u32).to_be_bytes());
+                        head.extend_from_slice(&seq.to_be_bytes());
+                        // Varying sizes cross the kernel-buffer boundary at
+                        // varying offsets — mid-frame handoffs included.
+                        let tail = vec![p as u8; 1 + ((seq as usize * 7919) % 8192)];
+                        sink.write_parts(RustToTsMessageType::Log, head, tail)
+                            .expect("send under contention");
+                    }
+                })
+            })
+            .collect();
+        for t in producers {
+            t.join().unwrap();
+        }
+        drop(sink);
+        reader.join().unwrap();
     }
 
     #[test]
