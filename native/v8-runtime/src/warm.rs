@@ -998,7 +998,7 @@ mod tests {
     fn one_instance_interleaves_two_runs_with_correct_attribution() {
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
         let counter = Arc::new(AtomicU32::new(0));
 
@@ -1049,7 +1049,7 @@ mod tests {
     fn a_mid_turn_kill_resets_innocent_co_resident_runs() {
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
         let counter = Arc::new(AtomicU32::new(0));
 
@@ -1096,7 +1096,7 @@ mod tests {
     fn an_abort_abandons_the_run_and_the_instance_survives() {
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
         let counter = Arc::new(AtomicU32::new(0));
 
@@ -1135,7 +1135,7 @@ mod tests {
         // deliberately narrows the old taint-on-WallTimeout).
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
         let counter = Arc::new(AtomicU32::new(0));
 
@@ -1191,7 +1191,7 @@ mod tests {
         // queue.
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
         let counter = Arc::new(AtomicU32::new(0));
 
@@ -1274,7 +1274,7 @@ mod tests {
         // after A's wall has passed; A must still settle with its value.
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(Arc::new(Mutex::new(client)));
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key());
         let counter = Arc::new(AtomicU32::new(0));
 

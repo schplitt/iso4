@@ -275,7 +275,7 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
 /// and the run can be answered properly. Only a genuine I/O failure (a
 /// different `ErrorKind`) may have written a partial frame, and that stays
 /// fatal (the demux observes the dead socket on its next read).
-fn write_result_frame(sink: &ipc::FrameSink, run_id: u32, payload: &[u8]) -> std::io::Result<()> {
+fn write_result_frame(sink: &ipc::FrameSink, run_id: u32, payload: Vec<u8>) -> std::io::Result<()> {
     match sink.write(ipc::RustToTsMessageType::Result, payload) {
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
             eprintln!(
@@ -307,7 +307,7 @@ fn write_result_frame(sink: &ipc::FrameSink, run_id: u32, payload: &[u8]) -> std
                     heap_used_bytes: None,
                 }),
             );
-            sink.write(ipc::RustToTsMessageType::Result, &replacement)
+            sink.write(ipc::RustToTsMessageType::Result, replacement)
         }
         other => other,
     }
@@ -321,17 +321,19 @@ fn write_result_frame(sink: &ipc::FrameSink, run_id: u32, payload: &[u8]) -> std
 fn write_run_complete_frame(
     sink: &ipc::FrameSink,
     run_id: u32,
-    payload: &[u8],
+    payload: Vec<u8>,
 ) -> std::io::Result<()> {
+    // Captured before the payload moves into the send — the substitute path
+    // below needs it after a refused write.
+    let status_byte = payload.get(4).copied().unwrap_or(1);
     match sink.write(ipc::RustToTsMessageType::RunComplete, payload) {
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
             eprintln!(
                 "[iso4-v8] RunComplete frame for run {run_id} too large to send ({e}) — \
                  substituting a minimal report"
             );
-            let status_byte = payload.get(4).copied().unwrap_or(1);
             let minimal = wire::encode_minimal_run_complete(run_id, status_byte);
-            sink.write(ipc::RustToTsMessageType::RunComplete, &minimal)
+            sink.write(ipc::RustToTsMessageType::RunComplete, minimal)
         }
         other => other,
     }
@@ -389,9 +391,9 @@ fn write_completion(
         ),
     };
     let write_outcome = if frame_is_run_complete {
-        write_run_complete_frame(sink, run_id, &payload)
+        write_run_complete_frame(sink, run_id, payload)
     } else {
-        write_result_frame(sink, run_id, &payload)
+        write_result_frame(sink, run_id, payload)
     };
     if let Err(e) = write_outcome {
         eprintln!("[iso4-v8] failed to write completion frame for run {run_id}: {e}");
@@ -565,14 +567,14 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // concurrent runs never interleave mid-frame. Control frames
     // (Precompile, DisposePrefix, Stats) are handled here or on short-lived
     // workers.
-    let writer = match stream.try_clone() {
-        Ok(w) => Arc::new(Mutex::new(w)),
+    let outbox = match ipc::Outbox::spawn(&stream) {
+        Ok(o) => o,
         Err(e) => {
-            eprintln!("[iso4-v8] failed to clone the session socket for writing: {e} — closing");
+            eprintln!("[iso4-v8] failed to start the connection writer: {e} — closing");
             return;
         }
     };
-    let sink = ipc::FrameSink::Shared(writer);
+    let sink = ipc::FrameSink::Shared(outbox);
     let conn_runs: ConnRuns = Arc::new(Mutex::new(HashMap::new()));
 
     // ── Teardown guard ────────────────────────────────────────────────────
@@ -584,6 +586,9 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // guard rather than code after the loop because a warm instance's event
     // channel is shared and outlives any one connection, so a panicked demux
     // dropping its routes would otherwise strand runs waiting on it forever.
+    // The outbox needs no explicit close: it drains and exits when the last
+    // sink clone drops — a run concluding after this teardown still gets its
+    // failure Result out, exactly like the old direct-write socket clone.
     struct FailRunsOnDrop(ConnRuns);
     impl Drop for FailRunsOnDrop {
         fn drop(&mut self) {
@@ -699,7 +704,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 let stats = shared.warm.stats();
                 if let Err(e) = sink.write(
                     ipc::RustToTsMessageType::StatsResult,
-                    &wire::encode_stats_payload(&stats),
+                    wire::encode_stats_payload(&stats),
                 ) {
                     eprintln!("[iso4-v8] failed to write StatsResult frame: {e}");
                     break;
@@ -881,7 +886,7 @@ fn refuse_duplicate_run(sink: &ipc::FrameSink, run_id: u32) {
             heap_used_bytes: None,
         }),
     );
-    if let Err(e) = write_result_frame(sink, run_id, &payload) {
+    if let Err(e) = write_result_frame(sink, run_id, payload) {
         eprintln!("[iso4-v8] failed to write completion frame: {e}");
     }
 }
@@ -1077,7 +1082,7 @@ fn dispatch_precompile(
                     )
                 }
             };
-            if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, &result_payload)
+            if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, result_payload)
             {
                 eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
             }
@@ -1090,7 +1095,7 @@ fn dispatch_precompile(
                 format!("failed to spawn precompile worker: {e}"),
             ))),
         );
-        if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, &payload) {
+        if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, payload) {
             eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
         }
     }
@@ -1145,7 +1150,7 @@ fn dispatch_prefix_run(
                 heap_used_bytes: None,
             }),
         );
-        if let Err(e) = write_result_frame(sink, run_id, &payload) {
+        if let Err(e) = write_result_frame(sink, run_id, payload) {
             eprintln!("[iso4-v8] failed to write completion frame: {e}");
         }
         return;
@@ -1189,7 +1194,7 @@ fn dispatch_prefix_run(
                 heap_used_bytes: None,
             }),
         );
-        if let Err(e) = write_result_frame(sink, run_id, &payload) {
+        if let Err(e) = write_result_frame(sink, run_id, payload) {
             eprintln!("[iso4-v8] failed to write completion frame: {e}");
         }
         return;

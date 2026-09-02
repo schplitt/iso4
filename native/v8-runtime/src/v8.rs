@@ -850,14 +850,14 @@ fn send_stream_credit(state: &StreamTableState, stream_id: u32, credit: u32) {
         return;
     }
     let payload = ipc::encode_stream_pull_payload(state.run_id, stream_id, credit);
-    let _ = sink.write(ipc::RustToTsMessageType::StreamPull, &payload);
+    let _ = sink.write(ipc::RustToTsMessageType::StreamPull, payload);
 }
 
 /// Write a `StreamCancel` so the host stops pumping and releases the source.
 fn send_stream_cancel(state: &StreamTableState, stream_id: u32, reason: &str) {
     let Some(sink) = &state.sink else { return };
     let payload = ipc::encode_stream_cancel_payload(state.run_id, stream_id, reason);
-    let _ = sink.write(ipc::RustToTsMessageType::StreamCancel, &payload);
+    let _ = sink.write(ipc::RustToTsMessageType::StreamCancel, payload);
 }
 
 /// The result of a failed JavaScript execution.
@@ -2919,7 +2919,7 @@ fn build_output_and_maybe_grace(
                     background_pending: true,
                 }),
             );
-            match sink.write(ipc::RustToTsMessageType::Result, &payload) {
+            match sink.write(ipc::RustToTsMessageType::Result, payload) {
                 Ok(()) => true,
                 Err(e) => {
                     // Fall back to hold mode: the session writes the Result
@@ -5776,11 +5776,12 @@ fn bridge_global_callback(
         return;
     }
 
-    // ── Write BridgeCall frame (non-blocking in practice) ─────────────────
+    // ── Write BridgeCall frame (queued; blocks only if the host stopped
+    // draining the connection, bounded by the outbox stall timeout) ────────
     if let Err(e) = data.sink.write_parts(
         ipc::RustToTsMessageType::BridgeCall,
-        &bridge_call_header,
-        &args_blob,
+        bridge_call_header,
+        args_blob,
     ) {
         record_blocked(u32::try_from(payload_len).unwrap_or(u32::MAX));
         fatal_bridge_error(

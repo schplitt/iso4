@@ -354,6 +354,244 @@ pub fn write_rust_to_ts_frame(
 
 // ── Outbound frame sink ──────────────────────────────────────────────────────
 
+/// Byte budget of one connection's outbound queue. A single frame larger
+/// than the budget is still admitted when the queue is empty, so a
+/// legitimately large Result can never deadlock its own connection.
+pub const OUTBOX_CAP_BYTES: usize = 16 * 1024 * 1024;
+
+/// How long the writer tolerates one socket write making no progress, and
+/// how long a producer waits for queue space, before the connection is
+/// declared dead. The host drains its socket continuously in normal
+/// operation; sitting at either bound for this long means it stopped.
+/// Tests use a short bound so the suite does not wait on it.
+#[cfg(not(test))]
+const OUTBOX_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const OUTBOX_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// One queued outbound frame: envelope fields plus the payload pieces,
+/// exactly as the producer handed them over (no concatenation copy).
+struct OutFrame {
+    message_type: RustToTsMessageType,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+struct OutboxState {
+    queue: std::collections::VecDeque<OutFrame>,
+    /// Payload bytes queued (envelope bytes ignored — 5 per frame).
+    bytes: usize,
+    /// Set once the connection can no longer carry frames (socket write
+    /// failed or stalled, or a producer gave up waiting). Every later send
+    /// fails with this reason.
+    dead: Option<String>,
+    /// Live [`Outbox`] handles. The writer drains and exits when this hits
+    /// zero: the outbox lives exactly as long as something can still write
+    /// — the demux, a run state, a completion hook — so a run concluding
+    /// AFTER the demux tore down still gets its final frame out, the same
+    /// lifetime the direct-write socket clone used to have.
+    producers: usize,
+}
+
+struct OutboxShared {
+    state: Mutex<OutboxState>,
+    not_full: std::sync::Condvar,
+    not_empty: std::sync::Condvar,
+    /// For unblocking both socket halves when the outbox dies: the writer
+    /// may be parked in `write_all` and the session demux in its read.
+    stream: UnixStream,
+}
+
+impl OutboxShared {
+    /// Mark the outbox dead and wake everything parked on it. Idempotent —
+    /// the first reason wins.
+    fn kill(&self, state: &mut OutboxState, reason: String) {
+        if state.dead.is_none() {
+            state.dead = Some(reason);
+            self.stream.shutdown(std::net::Shutdown::Both).ok();
+        }
+        self.not_full.notify_all();
+        self.not_empty.notify_all();
+    }
+}
+
+/// One connection's serialized outbound writer, decoupled from its
+/// producers by a bounded queue.
+///
+/// Session runs share their connection, and a socket write blocks when the
+/// peer stops draining — under the old direct-write lock that stalled the
+/// writing instance mid-turn AND every other instance sharing the
+/// connection. Now producers enqueue (bounded by [`OUTBOX_CAP_BYTES`]) and
+/// ONE writer thread per connection owns the socket: a stalled peer parks
+/// the writer, producers fill the queue, and whoever cannot enqueue within
+/// [`OUTBOX_STALL_TIMEOUT`] declares the connection dead — every run on it
+/// then fails cleanly (no instance taint), which is the connection-death
+/// blast radius the epic fixed (#124).
+///
+/// Frames from concurrent runs interleave on the stream but never
+/// mid-frame: queue order is write order.
+pub struct Outbox {
+    inner: Arc<OutboxShared>,
+}
+
+impl Clone for Outbox {
+    fn clone(&self) -> Self {
+        let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.producers += 1;
+        drop(state);
+        Outbox {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for Outbox {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.producers -= 1;
+        if state.producers == 0 {
+            // Wake the writer so it can observe the drained-and-done state.
+            self.inner.not_empty.notify_all();
+        }
+    }
+}
+
+impl Outbox {
+    /// Spawn the writer thread for `stream` and hand back the producer face.
+    pub fn spawn(stream: &UnixStream) -> io::Result<Outbox> {
+        let writer_stream = stream.try_clone()?;
+        // A stalled single write is the host gone: bound it so the writer
+        // (and with it every producer) cannot park forever. `write_all`
+        // loops over partial writes, so a slow-but-draining peer only
+        // restarts the clock with real progress.
+        writer_stream.set_write_timeout(Some(OUTBOX_STALL_TIMEOUT))?;
+        let inner = Arc::new(OutboxShared {
+            state: Mutex::new(OutboxState {
+                queue: std::collections::VecDeque::new(),
+                bytes: 0,
+                dead: None,
+                producers: 1,
+            }),
+            not_full: std::sync::Condvar::new(),
+            not_empty: std::sync::Condvar::new(),
+            stream: stream.try_clone()?,
+        });
+        let writer_inner = Arc::clone(&inner);
+        std::thread::Builder::new()
+            .name("iso4-conn-writer".to_string())
+            .spawn(move || writer_loop(writer_stream, &writer_inner))?;
+        Ok(Outbox { inner })
+    }
+
+    /// Enqueue one frame. Fails synchronously with `InvalidInput` when the
+    /// frame exceeds the protocol ceiling (the caller's cue to substitute a
+    /// smaller one), with `BrokenPipe` when the connection is dead, and
+    /// with `TimedOut` when the queue stays full past the stall bound —
+    /// which also declares the connection dead.
+    fn send(&self, message_type: RustToTsMessageType, head: Vec<u8>, tail: Vec<u8>) -> io::Result<()> {
+        // The same ceiling check the direct writer does, kept synchronous so
+        // callers can react (write_result_frame substitutes a minimal
+        // Result for an oversized one).
+        let payload_len = head
+            .len()
+            .checked_add(tail.len())
+            .and_then(|total| u32::try_from(total).ok())
+            .and_then(|total| total.checked_add(1))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
+        if payload_len > DEFAULT_MAX_FRAME_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "frame length {payload_len} exceeds max frame length {DEFAULT_MAX_FRAME_LENGTH}"
+                ),
+            ));
+        }
+
+        let len = head.len() + tail.len();
+        let mut state = self.inner.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(reason) = &state.dead {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, reason.clone()));
+            }
+            // An empty queue admits any frame — a frame larger than the
+            // whole budget must never deadlock waiting for space that
+            // cannot exist.
+            if state.queue.is_empty() || state.bytes + len <= OUTBOX_CAP_BYTES {
+                state.queue.push_back(OutFrame {
+                    message_type,
+                    head,
+                    tail,
+                });
+                state.bytes += len;
+                self.inner.not_empty.notify_one();
+                return Ok(());
+            }
+            let (guard, wait) = self
+                .inner
+                .not_full
+                .wait_timeout(state, OUTBOX_STALL_TIMEOUT)
+                .unwrap_or_else(|p| p.into_inner());
+            state = guard;
+            if wait.timed_out()
+                && state.dead.is_none()
+                && !(state.queue.is_empty() || state.bytes + len <= OUTBOX_CAP_BYTES)
+            {
+                let reason = format!(
+                    "outbound queue stalled for {OUTBOX_STALL_TIMEOUT:?} — the host \
+                     stopped draining the connection"
+                );
+                self.inner.kill(&mut state, reason.clone());
+                return Err(io::Error::new(io::ErrorKind::TimedOut, reason));
+            }
+        }
+    }
+
+}
+
+/// The connection's one socket writer: pop, write, repeat. Ends when the
+/// outbox dies (socket error/stall) or the queue is drained and the last
+/// producer handle has dropped.
+fn writer_loop(mut stream: UnixStream, inner: &OutboxShared) {
+    loop {
+        let frame = {
+            let mut state = inner.state.lock().unwrap_or_else(|p| p.into_inner());
+            loop {
+                if state.dead.is_some() {
+                    return;
+                }
+                if let Some(frame) = state.queue.pop_front() {
+                    state.bytes -= frame.head.len() + frame.tail.len();
+                    inner.not_full.notify_all();
+                    break frame;
+                }
+                if state.producers == 0 {
+                    return;
+                }
+                state = inner
+                    .not_empty
+                    .wait(state)
+                    .unwrap_or_else(|p| p.into_inner());
+            }
+        };
+        if let Err(e) =
+            write_rust_to_ts_frame_parts(&mut stream, frame.message_type, &frame.head, &frame.tail)
+        {
+            let reason = if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+            {
+                format!(
+                    "socket write made no progress for {OUTBOX_STALL_TIMEOUT:?} — the host \
+                     stopped draining the connection"
+                )
+            } else {
+                format!("socket write failed: {e}")
+            };
+            let mut state = inner.state.lock().unwrap_or_else(|p| p.into_inner());
+            inner.kill(&mut state, reason);
+            return;
+        }
+    }
+}
+
 /// Where a run's outbound frames (BridgeCall, early Result, stream credit,
 /// RunComplete, …) go.
 ///
@@ -363,42 +601,39 @@ pub fn write_rust_to_ts_frame(
 ///   one run per socket by construction, so the writing thread is the fd's
 ///   only user (the `ManuallyDrop` discipline the bridge callbacks have always
 ///   used: the fd stays owned by whoever opened the socket).
-/// - `Shared`: one serialized per-connection writer. Session runs share their
-///   connection with other runs, so every outbound frame takes the lock for
-///   exactly one frame write — frames from concurrent runs interleave on the
-///   stream but never mid-frame.
+/// - `Shared`: the connection's [`Outbox`] — a bounded queue in front of one
+///   writer thread, so session runs sharing the connection never block on
+///   the socket itself.
 #[derive(Clone)]
 pub enum FrameSink {
     Fd(RawFd),
-    Shared(Arc<Mutex<UnixStream>>),
+    Shared(Outbox),
 }
 
 impl FrameSink {
     /// Write one frame whose payload is already in two pieces (the
-    /// `BridgeCall` shape: small header + large blob nothing has copied).
+    /// `BridgeCall` shape: small header + large blob nothing has copied —
+    /// ownership moves into the queue, so nothing is copied here either).
     /// `write(ty, payload)` is the one-piece special case.
     pub fn write_parts(
         &self,
         message_type: RustToTsMessageType,
-        head: &[u8],
-        tail: &[u8],
+        head: Vec<u8>,
+        tail: Vec<u8>,
     ) -> io::Result<()> {
         match self {
             FrameSink::Fd(fd) => {
                 // SAFETY: the fd is the live session socket owned by the
                 // caller of the run; ManuallyDrop prevents closing it here.
                 let mut stream = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(*fd) });
-                write_rust_to_ts_frame_parts(&mut *stream, message_type, head, tail)
+                write_rust_to_ts_frame_parts(&mut *stream, message_type, &head, &tail)
             }
-            FrameSink::Shared(writer) => {
-                let mut stream = writer.lock().unwrap_or_else(|p| p.into_inner());
-                write_rust_to_ts_frame_parts(&mut *stream, message_type, head, tail)
-            }
+            FrameSink::Shared(outbox) => outbox.send(message_type, head, tail),
         }
     }
 
-    pub fn write(&self, message_type: RustToTsMessageType, payload: &[u8]) -> io::Result<()> {
-        self.write_parts(message_type, payload, &[])
+    pub fn write(&self, message_type: RustToTsMessageType, payload: Vec<u8>) -> io::Result<()> {
+        self.write_parts(message_type, payload, Vec::new())
     }
 }
 
@@ -2228,5 +2463,112 @@ mod tests {
             parse_run_payload(&bytes).unwrap_err().kind(),
             io::ErrorKind::InvalidData,
         );
+    }
+
+    // ── Outbox ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn outbox_writes_frames_in_queue_order_and_drains_on_last_drop() {
+        let (mut host, runtime) = UnixStream::pair().unwrap();
+        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        drop(runtime);
+        for i in 0..100u8 {
+            sink.write_parts(RustToTsMessageType::Log, vec![i], vec![i, i])
+                .unwrap();
+        }
+        drop(sink);
+        for i in 0..100u8 {
+            let frame = read_rust_to_ts_frame(&mut host).expect("frame arrives in order");
+            assert_eq!(frame.message_type, RustToTsMessageType::Log);
+            assert_eq!(frame.payload, vec![i, i, i]);
+        }
+        // Last producer gone and queue drained: the writer exits and the
+        // runtime side of the socket closes.
+        assert!(read_rust_to_ts_frame(&mut host).is_err());
+    }
+
+    #[test]
+    fn outbox_admits_one_frame_larger_than_its_byte_budget() {
+        // A frame bigger than the whole queue budget must never deadlock
+        // waiting for space that cannot exist: an empty queue admits it.
+        let (mut host, runtime) = UnixStream::pair().unwrap();
+        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        drop(runtime);
+        let reader = std::thread::spawn(move || read_rust_to_ts_frame(&mut host).unwrap());
+        sink.write(RustToTsMessageType::Log, vec![7u8; OUTBOX_CAP_BYTES + 1024])
+            .unwrap();
+        drop(sink);
+        let frame = reader.join().unwrap();
+        assert_eq!(frame.payload.len(), OUTBOX_CAP_BYTES + 1024);
+    }
+
+    #[test]
+    fn outbox_refuses_a_frame_over_the_protocol_ceiling_synchronously() {
+        // The ceiling error must surface at the send (the substitute-frame
+        // recovery in session.rs keys on it) and must not poison the
+        // connection.
+        let (_host, runtime) = UnixStream::pair().unwrap();
+        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let e = sink
+            .write(
+                RustToTsMessageType::Result,
+                vec![0u8; DEFAULT_MAX_FRAME_LENGTH as usize],
+            )
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        sink.write(RustToTsMessageType::Log, vec![1]).unwrap();
+    }
+
+    #[test]
+    fn outbox_declares_the_connection_dead_when_the_peer_stops_draining() {
+        // Nobody reads `host`: the kernel buffer fills, the writer stalls,
+        // the queue fills, and the next producer times out — which latches
+        // the outbox dead and shuts the socket down.
+        let (host, runtime) = UnixStream::pair().unwrap();
+        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        drop(runtime);
+        let chunk = vec![0u8; 1024 * 1024];
+        let mut stall_error = None;
+        for _ in 0..(OUTBOX_CAP_BYTES / chunk.len()) * 4 {
+            if let Err(e) = sink.write(RustToTsMessageType::Log, chunk.clone()) {
+                stall_error = Some(e);
+                break;
+            }
+        }
+        let e = stall_error.expect("a peer that stops draining must fail producers");
+        assert!(
+            matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::BrokenPipe),
+            "unexpected error kind: {e}"
+        );
+        // Latched: the next write fails immediately, without waiting.
+        let start = std::time::Instant::now();
+        let e2 = sink
+            .write(RustToTsMessageType::Log, vec![0])
+            .unwrap_err();
+        assert_eq!(e2.kind(), io::ErrorKind::BrokenPipe);
+        assert!(start.elapsed() < OUTBOX_STALL_TIMEOUT);
+        drop(host);
+    }
+
+    #[test]
+    fn outbox_fails_producers_after_the_peer_closes() {
+        let (host, runtime) = UnixStream::pair().unwrap();
+        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        drop(runtime);
+        drop(host);
+        // The writer hits EPIPE on its next write; the failure reaches
+        // producers on the send after that at the latest.
+        let mut failed = false;
+        for _ in 0..50 {
+            if sink
+                .write(RustToTsMessageType::Log, vec![0u8; 65536])
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(failed, "writes must fail once the peer is gone");
     }
 }
