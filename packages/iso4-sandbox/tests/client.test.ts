@@ -941,6 +941,73 @@ describe('RuntimeIpcClient run router (multiplexed)', () => {
     await client.dispose()
   })
 
+  test('a handler settling after its run completed releases its late-registered streams', async () => {
+    // The run's registry is released at its final frame — but an orphaned
+    // handler that settles afterwards serializes its return value into that
+    // same registry. The runtime discards the late response, so nothing
+    // would ever pump or cancel a stream registered there: without the
+    // post-write liveness check the host-side reader stays locked forever.
+    let releaseHandler: () => void = () => {}
+    const gate = new Promise<void>((r) => {
+      releaseHandler = r
+    })
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const runFrame = await reader.readFrame()
+      const runId = payloadOf(runFrame).readUInt32BE(0)
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.BridgeCall, bridgeCallPayload(runId, 1, 'tool')),
+      )
+      // Complete the run while the handler is still parked on the gate.
+      socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, resultPayload(runId, 'payload')))
+      await new Promise((r) => {
+        setTimeout(r, 20)
+      })
+      releaseHandler()
+    })
+
+    const cancelled: unknown[] = []
+    // Two chunks past the inline probe and never closed — serialization must
+    // register it as a stream handle, not buffer it inline.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(65536))
+        controller.enqueue(new Uint8Array(65536))
+      },
+      cancel(reason) {
+        cancelled.push(reason ?? null)
+      },
+    })
+    const streams = new StreamSourceRegistry()
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    const raw = await client.runRawCode('export default await tool()', {
+      dispatch: {
+        tool: async () => {
+          await gate
+          return new Response(body)
+        },
+      },
+      streams,
+    })
+    expect(raw.epilogue).toBeUndefined() // the run resolved normally
+
+    // The handler settles late; its just-registered source must be released.
+    const deadline = Date.now() + 2_000
+    while (cancelled.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => {
+        setTimeout(r, 5)
+      })
+    }
+    expect(cancelled.length).toBe(1)
+    expect(streams.sources.size).toBe(0)
+    // No teardown involved — the connection keeps serving.
+    expect(client.usable).toBe(true)
+    await client.dispose()
+  })
+
   test('a stream frame carrying runId 0 is a desync', async () => {
     // Stream ids are per-run; with several runs multiplexed on one
     // connection an unattributed stream frame could only be routed by a

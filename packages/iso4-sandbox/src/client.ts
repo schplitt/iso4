@@ -1246,9 +1246,18 @@ export class RuntimeIpcClient {
               encodeBridgeResponsePayload(frameRunId, callId, true, encoded),
             ),
           )
-          // The response carrying stream handles is on the wire; start their
-          // pumps.
-          this.activateStreams(streams, runId)
+          if (this.runs.has(frameRunId)) {
+            // The response carrying stream handles is on the wire; start
+            // their pumps.
+            this.activateStreams(streams, runId)
+          } else {
+            // The run completed while this handler was in flight: its
+            // registry was already released at the final frame, so anything
+            // the serialization above just registered would sit locked
+            // forever — the runtime discards the late response, and nothing
+            // will ever pump or cancel the source. Release it now.
+            streams?.releaseAll()
+          }
         },
         (err: unknown) => this.write(
           encodeTsToRustFrame(
