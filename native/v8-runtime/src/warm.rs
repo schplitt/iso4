@@ -1363,6 +1363,81 @@ mod tests {
     }
 
     #[test]
+    fn a_terminate_that_races_ahead_of_its_job_still_aborts_the_run() {
+        // On the shared event channel a Terminate can be picked up before
+        // the run's job is dispatched (select order between the two queues
+        // is arbitrary). The loop must remember it and answer the job on
+        // arrival — a per-run channel used to hold such events implicitly.
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // Park the loop on a first run so it is live and selecting.
+        let first = submit_session_job(
+            &handle, 31, "viaTool", vec![TestValue::Number(1.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let (_, c1) = read_bridge_call(&mut server);
+
+        // The Terminate for a run whose job has NOT been sent yet: the loop
+        // is parked with an empty jobs queue, so this event is processed
+        // first, deterministically.
+        let token = sandbox::alloc_run_token();
+        handle
+            .event_sender()
+            .send(sandbox::RoutedEvent::new(
+                token,
+                sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+                    message_type: crate::ipc::TsToRustMessageType::Terminate,
+                    payload: 32u32.to_be_bytes().to_vec(),
+                }),
+            ))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Now the job arrives — it must conclude Aborted without running
+        // (the counter export would observe a bump otherwise).
+        let (otx, orx) = crossbeam_channel::bounded(1);
+        let job = Box::new(CallJob {
+            token,
+            code: None,
+            filename: None,
+            limits: sandbox::Limits::default(),
+            globals: vec![crate::ipc::HostGlobalDef::bridge("tool")],
+            io: sandbox::RunIo::Instance { sink: sink.clone() },
+            call_id_counter: Arc::clone(&counter),
+            call: Some(crate::ipc::CallSpec {
+                export_path: "bump".to_string(),
+                args_blob: testval::to_blob(&TestValue::Array(vec![])),
+            }),
+            epilogue: Some(sandbox::EpilogueSpec {
+                run_id: 32,
+                report_heap: false,
+            }),
+            complete: None,
+            ctl_slot: None,
+        });
+        handle.sender().send((job, Some(otx))).unwrap();
+        let out = orx.recv_timeout(Duration::from_secs(5)).expect("job answered");
+        assert!(!out.tainted, "a pre-start abandon must not taint");
+        assert!(matches!(
+            out.result.unwrap_err().error,
+            sandbox::RunError::Aborted
+        ));
+
+        // The instance is healthy and the aborted run never executed: bump
+        // starts from the untouched counter (first's hangs never bumped).
+        first.send(bridge_response_event(31, c1, 10.0));
+        let out_first = first.outcome.recv().expect("first run completes");
+        assert!(!out_first.tainted);
+        let outcome = handle.call(bump_job());
+        assert!(!outcome.tainted);
+        assert_eq!(bump_value(&outcome), 1.0, "the abandoned run never ran bump");
+    }
+
+    #[test]
     fn dead_instance_thread_reports_a_tainted_internal_failure() {
         sandbox::init_platform();
         // A prefix that cannot warm up: the owner thread responds with the

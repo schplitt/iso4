@@ -3673,6 +3673,28 @@ fn conclude_run(
     }
 }
 
+/// A terminal event that raced ahead of its run's job on the shared event
+/// channel: the demux routed it after registering the run, but the loop's
+/// select picked it up before dispatching the job, so the run is not live
+/// yet. Remembered until the job arrives and answered there — a per-run
+/// channel used to hold such events implicitly. Only terminal events are
+/// remembered; a racing frame for a not-yet-started run cannot exist (the
+/// host answers bridge calls, and a run makes none before it starts).
+enum PendingAbandon {
+    /// Terminate raced the job: direct abandon before the run starts
+    /// (ruling 5 as amended) — no JS runs, no telemetry exists.
+    Abort,
+    /// The connection died before the job was dispatched: fail the run on
+    /// arrival instead of executing it for a peer that is gone.
+    ConnLost(Option<String>),
+}
+
+/// Cap on remembered pre-dispatch abandons. Entries persist only when their
+/// job never arrives (a Terminate already in flight when its run completed),
+/// so growth needs pathological racing; past the cap a raced abort loses its
+/// fast path and the host's terminate fallback bounds it instead.
+const MAX_PENDING_ABANDONS: usize = 256;
+
 /// The multi-run loop's deadline heap: `(deadline, run token)`, nearest
 /// first. Entries are lazily deleted — an entry whose instant no longer
 /// equals its run's [`deadline_instant`] (the run concluded, or moved from
@@ -3761,10 +3783,19 @@ pub fn serve_instance(
 ) {
     let mut live: Vec<LiveRun> = Vec::new();
     let mut deadlines = DeadlineHeap::new();
+    let mut pending_abandons: HashMap<u64, PendingAbandon> = HashMap::new();
     let mut jobs_open = true;
 
     // The job that triggered instance creation, then the loop.
-    if dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, first) {
+    if dispatch_job(
+        core,
+        prefix_globals,
+        imports,
+        &mut live,
+        &mut deadlines,
+        &mut pending_abandons,
+        first,
+    ) {
         taint_sweep(core, &mut live, jobs);
         return;
     }
@@ -3820,7 +3851,15 @@ pub fn serve_instance(
                 // whose settling frame is still queued. A job burst can
                 // therefore delay a due deadline by its start turns at most
                 // — the next event or idle timeout sweeps it.
-                if dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, msg) {
+                if dispatch_job(
+                    core,
+                    prefix_globals,
+                    imports,
+                    &mut live,
+                    &mut deadlines,
+                    &mut pending_abandons,
+                    msg,
+                ) {
                     taint_sweep(core, &mut live, jobs);
                     return;
                 }
@@ -3844,10 +3883,28 @@ pub fn serve_instance(
                 // it).
                 sweep_expired_deadlines(core, &mut live, &mut deadlines, at);
                 let Some(idx) = live.iter().position(|l| l.rs.token == token) else {
-                    // The run concluded (deadline, taintless failure, the
-                    // sweep above) while this event sat in the shared queue
-                    // — the same benign race as a late frame at the demux.
-                    // Discard.
+                    // No live run owns this event. Either the run concluded
+                    // while it sat in the shared queue (a benign late frame,
+                    // discarded like at the demux), or a TERMINAL event
+                    // raced ahead of its run's job — remember that one and
+                    // answer the job on arrival, as the run's own channel
+                    // used to do implicitly.
+                    let abandon = match &event {
+                        RunEvent::Frame(f)
+                            if f.message_type == ipc::TsToRustMessageType::Terminate =>
+                        {
+                            Some(PendingAbandon::Abort)
+                        }
+                        RunEvent::ConnLost(detail) => {
+                            Some(PendingAbandon::ConnLost(detail.clone()))
+                        }
+                        RunEvent::Frame(_) => None,
+                    };
+                    if let Some(abandon) = abandon {
+                        if pending_abandons.len() < MAX_PENDING_ABANDONS {
+                            pending_abandons.insert(token, abandon);
+                        }
+                    }
                     continue;
                 };
                 let mut l = live.swap_remove(idx);
@@ -3926,10 +3983,39 @@ fn dispatch_job(
     imports: &[ipc::ImportBinding],
     live: &mut Vec<LiveRun>,
     deadlines: &mut DeadlineHeap,
+    pending_abandons: &mut HashMap<u64, PendingAbandon>,
     (mut job, respond): JobMsg,
 ) -> bool {
     if let Some(slot) = &job.ctl_slot {
         slot.set(core.guard.ctl()).ok();
+    }
+
+    // A terminal event raced ahead of this job on the event channel: answer
+    // the run without starting it. (Direct callers use token 0, which never
+    // appears in the map.)
+    if let Some(abandon) = pending_abandons.remove(&job.token) {
+        let error = match abandon {
+            PendingAbandon::Abort => RunError::Aborted,
+            PendingAbandon::ConnLost(detail) => RunError::Internal(format!(
+                "poll loop socket read: {}",
+                detail.unwrap_or_else(|| "connection closed".to_string())
+            )),
+        };
+        let outcome = CallOutcome {
+            result: Err(failure(
+                error,
+                &LogBuffers::default(),
+                std::time::Instant::now(),
+            )),
+            tainted: false,
+            heap_used_bytes: 0,
+        };
+        if let Some(complete) = job.complete.take() {
+            complete(outcome);
+        } else if let Some(respond) = respond {
+            respond.send(outcome).ok();
+        }
+        return false;
     }
 
     // Direct-fd jobs run inline to completion — this thread is the fd's
