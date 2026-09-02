@@ -420,17 +420,15 @@ struct RunRoute {
 /// completion hooks (which remove their run when it finishes).
 type ConnRuns = Arc<Mutex<HashMap<u32, RunRoute>>>;
 
-/// The read cap for the next inbound frame: every in-flight run may receive
-/// frames, so the ceiling is the largest per-run allowance (control frames
-/// ride under the protocol default either way).
-fn read_limit(conn_runs: &ConnRuns) -> u32 {
-    let runs = conn_runs.lock().unwrap_or_else(|p| p.into_inner());
-    runs.values()
-        .map(|r| r.frame_cap)
-        .fold(ipc::DEFAULT_MAX_FRAME_LENGTH, u32::max)
-}
-
-/// The per-run inbound frame allowance (mirrors the run-side computation).
+/// The per-run inbound frame allowance, enforced during routing (a frame
+/// over it fails that run alone). The DEMUX read itself uses the flat
+/// protocol ceiling instead: the host's encoder refuses to emit any frame
+/// over `DEFAULT_MAX_FRAME_LENGTH`, so an allowance above it is
+/// unreachable, and recomputing a max over live runs per inbound frame
+/// (with a lock) bought nothing. The constant ceiling also never shrinks
+/// under an in-flight frame, so a late big frame for a just-completed run
+/// reads fine and is discarded as late — only a frame the host could never
+/// have sent kills the connection.
 fn frame_cap_for(memory_mb: u32) -> u32 {
     if memory_mb > 0 {
         memory_mb.saturating_mul(1024 * 1024)
@@ -610,8 +608,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     let _teardown = FailRunsOnDrop(Arc::clone(&conn_runs));
 
     loop {
-        let frame = match ipc::read_ts_to_rust_frame_with_limit(&mut stream, read_limit(&conn_runs))
-        {
+        let frame = match ipc::read_ts_to_rust_frame_with_limit(
+            &mut stream,
+            ipc::DEFAULT_MAX_FRAME_LENGTH,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("[iso4-v8] connection closed or error: {e}");
@@ -1532,15 +1532,27 @@ mod tests {
     }
 
     /// A minimal `Run` payload: one bridge global "tool", explicit wall and
-    /// (optionally) CPU, everything else at the runtime defaults.
-    fn run_payload_with_cpu(run_id: u32, code: &str, cpu_ms: Option<u32>, wall_ms: u32) -> Vec<u8> {
+    /// (optionally) CPU and memory, everything else at the runtime defaults.
+    fn run_payload_full(
+        run_id: u32,
+        code: &str,
+        memory_mb: Option<u32>,
+        cpu_ms: Option<u32>,
+        wall_ms: u32,
+    ) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&run_id.to_be_bytes());
         pstr(&mut p, code);
         p.push(0); // filename absent
         // limits: memory, cpu, wall, export, stdout, stderr, bridgeBytes,
         // bridgeCalls, grace — each an Optional<u32>.
-        p.push(0);
+        match memory_mb {
+            Some(v) => {
+                p.push(1);
+                p.extend_from_slice(&v.to_be_bytes());
+            }
+            None => p.push(0),
+        }
         match cpu_ms {
             Some(v) => {
                 p.push(1);
@@ -1564,8 +1576,12 @@ mod tests {
         p
     }
 
+    fn run_payload_with_cpu(run_id: u32, code: &str, cpu_ms: Option<u32>, wall_ms: u32) -> Vec<u8> {
+        run_payload_full(run_id, code, None, cpu_ms, wall_ms)
+    }
+
     fn run_payload(run_id: u32, code: &str, wall_ms: u32) -> Vec<u8> {
-        run_payload_with_cpu(run_id, code, None, wall_ms)
+        run_payload_full(run_id, code, None, None, wall_ms)
     }
 
     /// A successful BridgeResponse payload: runId, callId, ok, number value.
@@ -1686,6 +1702,68 @@ mod tests {
             exports_of(results.remove(&2).expect("run 2 result")),
             TestValue::Number(22.0)
         );
+    }
+
+    #[test]
+    fn a_frame_over_a_runs_allowance_fails_that_run_alone() {
+        // Item (4)'s narrowed rule: only a frame the host could never have
+        // sent (over the flat protocol ceiling) kills the connection. A
+        // frame within the ceiling but over ONE run's own inbound allowance
+        // (its memoryMb budget) fails that run cleanly — the connection and
+        // its other runs keep going.
+        sandbox::init_platform();
+        let (mut host, _done) = open_session();
+
+        let code = "export default await tool()";
+        // Run 1: 8 MB memory budget → 8 MiB inbound allowance.
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::Run,
+            &run_payload_full(1, code, Some(8), None, 10_000),
+        )
+        .unwrap();
+        // Run 2: no memory budget (protocol-default allowance).
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::Run,
+            &run_payload(2, code, 10_000),
+        )
+        .unwrap();
+        let mut calls = std::collections::HashMap::from([
+            read_bridge_call(&mut host),
+            read_bridge_call(&mut host),
+        ]);
+        let c1 = calls.remove(&1).expect("run 1 sent a call");
+        let c2 = calls.remove(&2).expect("run 2 sent a call");
+
+        // A 9 MiB response for run 1: inside the wire ceiling, over run 1's
+        // allowance.
+        let mut oversized = bridge_response(1, c1, 1.0);
+        oversized.resize(9 * 1024 * 1024, 0);
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::BridgeResponse,
+            &oversized,
+        )
+        .unwrap();
+
+        // Run 1 fails; the connection survives and run 2 completes.
+        let failure = ipc::read_rust_to_ts_frame(&mut host).expect("run 1's failure Result");
+        assert_eq!(failure.message_type, ipc::RustToTsMessageType::Result);
+        assert_eq!(
+            u32::from_be_bytes(failure.payload[0..4].try_into().unwrap()),
+            1
+        );
+        assert_eq!(failure.payload[4], 0, "run 1 must fail on its allowance");
+
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::BridgeResponse,
+            &bridge_response(2, c2, 22.0),
+        )
+        .unwrap();
+        let (run_id, _exports) = read_success_result(&mut host);
+        assert_eq!(run_id, 2, "the co-resident run completes normally");
     }
 
     #[test]
