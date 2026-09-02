@@ -742,7 +742,11 @@ struct RunCallState {
     /// Per-stub bridge bindings for THIS run — the per-call half of what a
     /// stub `Function` needs; the instance-lifetime half is the
     /// [`StubSlot`] its External points at.
-    stubs: RefCell<HashMap<String, GlobalCallbackData>>,
+    /// Rc'd so the bridge callback can take a per-invocation handle with one
+    /// refcount bump instead of cloning the whole binding (two Strings and a
+    /// fistful of Arcs — and since the outbox rework a sink clone also costs
+    /// a producer-count lock).
+    stubs: RefCell<HashMap<String, std::rc::Rc<GlobalCallbackData>>>,
 }
 
 impl RunCallState {
@@ -789,23 +793,35 @@ impl RunTable {
     }
 }
 
-/// The token native callbacks attribute to: the CPED rider's creator token
+/// The run native callbacks attribute to: the CPED rider's creator token
 /// when the running continuation carries one AND that run is still live,
 /// else the current turn owner. (A stale continuation of a finished run —
 /// driven during a later run's checkpoint on a warm instance — attributes
 /// to the turn owner, exactly the pre-table behavior of the shared buffers.)
-fn attributed_token(scope: &mut v8::PinScope, table: &RunTable) -> u64 {
+///
+/// Returns the run's state pointer (null when the attributed run has no
+/// live entry — setup code, or a stale continuation whose turn owner
+/// already concluded), resolved in ONE table borrow: the old
+/// token-then-`state_ptr` pair cost a second hash lookup per bridge call
+/// and console line.
+///
+/// The pointer is valid for the remainder of the current turn (entries are
+/// only removed between turns); callers must not hold it longer.
+fn attributed_state(scope: &mut v8::PinScope, table: &RunTable) -> *const RunCallState {
     let current = CURRENT_RUN_TOKEN.with(|c| c.get());
     let cped = scope.get_continuation_preserved_embedder_data();
-    if let Some((token, _)) = rider_parts(scope, cped) {
-        if token != current && table.runs.borrow().contains_key(&token) {
-            return token;
-        }
-        if token == current {
-            return current;
+    let rider = rider_parts(scope, cped).map(|(token, _)| token);
+    let runs = table.runs.borrow();
+    if let Some(token) = rider {
+        if token != current {
+            // A live rider run wins; a stale rider falls back to the owner.
+            if let Some(entry) = runs.get(&token) {
+                return std::ptr::addr_of!(**entry);
+            }
         }
     }
-    current
+    runs.get(&current)
+        .map_or(std::ptr::null(), |b| std::ptr::addr_of!(**b))
 }
 
 /// Register a hydrated stream in the executing run's table. Returns false
@@ -5473,7 +5489,9 @@ struct StubSlot {
 #[allow(clippy::vec_box)]
 type StubSlots = HashMap<String, Box<StubSlot>>;
 
-#[derive(Clone)]
+// Deliberately NOT Clone: bindings live behind an Rc in the run's stub map,
+// and a per-invocation deep clone (two Strings, several Arcs, a sink whose
+// clone takes the outbox producer lock) is the cost this shape removed.
 struct GlobalCallbackData {
     /// The owning run's wire id, leading every BridgeCall frame this stub
     /// writes (0 = a direct-API run with no wire identity).
@@ -5588,13 +5606,12 @@ fn bridge_global_callback(
     let slot = unsafe { &*slot };
     // SAFETY: the slot's table pointer is instance-lifetime like the slot.
     let table = unsafe { &*slot.table };
-    let token = attributed_token(scope, table);
-    let state = table.state_ptr(token);
-    let data: Option<GlobalCallbackData> = if state.is_null() {
+    let state = attributed_state(scope, table);
+    let data: Option<std::rc::Rc<GlobalCallbackData>> = if state.is_null() {
         None
     } else {
-        // Clone the binding out (cheap: names + Arcs) so no table borrow is
-        // held across the serialization below, which can run guest getters.
+        // Take an Rc handle (one refcount bump) so no table borrow is held
+        // across the serialization below, which can run guest getters.
         // SAFETY: entry pointers are valid for the remainder of the turn.
         unsafe { &*state }.stubs.borrow().get(&slot.stub_name).cloned()
     };
@@ -5893,7 +5910,7 @@ fn install_bridge_globals(
                 .expect("install_bridge_globals: run entry exists for the whole call");
             entry.stubs.borrow_mut().insert(
                 spec.stub_name.clone(),
-                GlobalCallbackData {
+                std::rc::Rc::new(GlobalCallbackData {
                     run_id,
                     sink: sink.clone(),
                     call_id: Arc::clone(&call_id),
@@ -5907,7 +5924,7 @@ fn install_bridge_globals(
                     resolver_map: Arc::clone(&resolver_map),
                     run_start,
                     log: Arc::clone(&log),
-                },
+                }),
             );
         }
         // The slot Box's heap address is stable and instance-lifetime; the
@@ -6522,8 +6539,7 @@ fn stream_read_callback(
     rv.set(resolver.get_promise(scope).into());
     let stream_id = args.get(0).uint32_value(scope).unwrap_or(0);
 
-    let token = attributed_token(scope, run_table);
-    let state = run_table.state_ptr(token);
+    let state = attributed_state(scope, run_table);
     if state.is_null() {
         let msg = v8_error_value(scope, "[iso4] streamed bodies are only readable during a run");
         resolver.reject(scope, msg);
@@ -6601,8 +6617,7 @@ fn stream_cancel_callback(
 ) {
     // SAFETY: the External points at the instance-lifetime RunTable Box.
     let run_table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
-    let token = attributed_token(scope, run_table);
-    let state = run_table.state_ptr(token);
+    let state = attributed_state(scope, run_table);
     if state.is_null() {
         rv.set_undefined();
         return;
@@ -6706,8 +6721,7 @@ fn wait_until_callback(
 ) {
     // SAFETY: the External points at the instance-lifetime RunTable Box.
     let table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
-    let token = attributed_token(scope, table);
-    let state = table.state_ptr(token);
+    let state = attributed_state(scope, table);
     if state.is_null() {
         throw_v8_error(
             scope,
@@ -6831,8 +6845,7 @@ fn append_console_line(
     let line = parts.join(" ");
     // SAFETY: the External points at the instance-lifetime RunTable Box.
     let table = unsafe { &*table };
-    let token = attributed_token(scope, table);
-    let state = table.state_ptr(token);
+    let state = attributed_state(scope, table);
     if state.is_null() {
         // No run owns this line: prefix warm-up output, delivered on the
         // cold-start call. (Uncapped — warm-up is host-authored code under
