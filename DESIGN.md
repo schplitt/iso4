@@ -201,7 +201,10 @@ the host process. Out-of-process is the only architecture that:
 
 - Lets us pick our own V8 version independent of the host.
 - Gives crash isolation: a V8 bug, OOM, or stack overflow takes down the
-  Rust process, not the host.
+  Rust process, not the host. On Linux the child also raises its own
+  `oom_score_adj` at startup, so a *container-level* OOM kill
+  deterministically takes the runtime child (failed runs, respawnable
+  sandbox) and never the Node host.
 - Works under any host runtime (Node, Bun, Deno, browsers via WS bridge).
 
 The IPC overhead is ~30–100 μs per bridge call. That's invisible compared to

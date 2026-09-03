@@ -7,6 +7,7 @@
 
 pub mod blob;
 pub mod ipc;
+pub mod oom;
 pub mod policy;
 pub mod rss;
 pub mod session;

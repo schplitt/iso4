@@ -3,12 +3,16 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, rss, session};
+use iso4_v8_runtime::{blob, oom, rss, session};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
+    // Before anything can allocate: if the container ever OOMs, the kernel
+    // must take this process, not the Node host.
+    oom::prefer_this_process_as_victim();
+
     let (socket_path, warm_budget_bytes) = parse_args();
 
     // The warm budget is enforced by comparing this process's own resident
