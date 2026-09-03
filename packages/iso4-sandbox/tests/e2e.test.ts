@@ -3094,6 +3094,108 @@ describe('native timers', () => {
     }
   })
 
+  // ── Decided CPU/real-time semantics (ruled 2026-09-03, workerd parity) ──
+  //
+  // The delay is anchored to the FROZEN clock, which syncs at turn entry
+  // (run start, each bridge response) and never during CPU work. Three
+  // consequences, each pinned here in real time:
+  //   1. after a bridge call, a sleep waits its full length (the clock just
+  //      synced — the codemode idiom is honest);
+  //   2. CPU burned in the same turn before `setTimeout` eats into the
+  //      delay — and it makes no difference whether the timer was armed
+  //      before or after the burn (the anchor is the last clock sync, not
+  //      the call site);
+  //   3. the callback itself is guest JS billed to the run's CPU budget.
+
+  test('a sleep after a bridge call waits its full delay in real time', async () => {
+    let tPost = 0
+    let tGet = 0
+    const result = await runtime.run({
+      code: `
+        await post()
+        await new Promise(r => setTimeout(r, 200))
+        await get()
+        export default 'ok'
+      `,
+      globals: {
+        post: async () => {
+          tPost = performance.now()
+          return 1
+        },
+        get: async () => {
+          tGet = performance.now()
+          return 1
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    // Host-side measurement between the two bridge calls: the clock synced
+    // when post()'s response arrived, so the 200 ms sleep is full-length
+    // (minus sub-ms sync lag + whole-ms truncation — hence the 190 floor).
+    expect(tGet - tPost).toBeGreaterThanOrEqual(190)
+  })
+
+  test('CPU burned before arming a timer eats into its delay', async () => {
+    // The burn takes well over the 200 ms delay on any machine, so the
+    // timer is already due when the run suspends: total duration must be
+    // ~the CPU time, NOT cpu + 200. (A real-anchored implementation would
+    // add the full 200 and fail the tail assertion.)
+    const result = await runtime.run({
+      code: `
+        let x = 0
+        for (let i = 0; i < 2e8; i++) x = (x + i) % 97
+        await new Promise(r => setTimeout(r, 200))
+        export default x
+      `,
+      limits: { cpuTimeMs: 15_000, wallTimeMs: 20_000 },
+    })
+    expect(result.ok, result.ok ? undefined : JSON.stringify(result.error)).toBe(true)
+    if (!result.ok)
+      return
+    // Vacuity guard: the burn really exceeded the delay.
+    expect(result.cpuTimeMs).toBeGreaterThan(200)
+    // The sleep added (nearly) nothing on top of the CPU time.
+    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(150)
+  }, 25_000)
+
+  test('the rule is identical when the timer is armed before the burn', async () => {
+    const result = await runtime.run({
+      code: `
+        const armed = new Promise(r => setTimeout(r, 200))
+        let x = 0
+        for (let i = 0; i < 2e8; i++) x = (x + i) % 97
+        await armed
+        export default x
+      `,
+      limits: { cpuTimeMs: 15_000, wallTimeMs: 20_000 },
+    })
+    expect(result.ok, result.ok ? undefined : JSON.stringify(result.error)).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.cpuTimeMs).toBeGreaterThan(200)
+    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(150)
+  }, 25_000)
+
+  test('CPU burned inside a timer callback bills the run\'s budget', async () => {
+    // The callback is guest JS running under the owner's CPU budget — a
+    // heavy callback under a tight cap dies as CPU timeout, not wall.
+    const result = await runtime.run({
+      code: `
+        await new Promise(r => setTimeout(() => {
+          let x = 0
+          for (let i = 0; i < 2e9; i++) x = (x + i) % 97
+          r(x)
+        }, 10))
+        export default 'unreachable'
+      `,
+      limits: { cpuTimeMs: 150, wallTimeMs: 30_000 },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_CPU_TIMEOUT')
+  }, 35_000)
+
   test('a settled run\'s pending timer never fires into the next run', async () => {
     const prefix = await runtime.prepare({
       code: 'globalThis.hit = \'untouched\'',
