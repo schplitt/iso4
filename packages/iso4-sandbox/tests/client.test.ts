@@ -193,8 +193,8 @@ describe('RuntimeIpcClient', () => {
   test('stats() decodes a StatsResult and rejects unexpected frame types', async () => {
     // StatsPayload: all-zero counters, a 7-byte budget mark, zero
     // RSS/usage/hard-line, latch off, no prefixes (§5.9 layout).
-    const statsPayload = Buffer.alloc(4 * 3 + 8 * 5 + 1 + 4)
-    statsPayload.writeBigUInt64BE(7n, 4 + 4 + 4 + 8)
+    const statsPayload = Buffer.alloc(4 * 4 + 8 * 5 + 1 + 4)
+    statsPayload.writeBigUInt64BE(7n, 4 * 4 + 8)
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
       socket.on('data', (chunk) => reader.push(chunk))

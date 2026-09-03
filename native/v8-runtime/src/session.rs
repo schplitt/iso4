@@ -1247,40 +1247,30 @@ fn dispatch_prefix_run(
     let ctl = Arc::new(std::sync::OnceLock::new());
 
     // ── Warm instance flow ───────────────────────────────────────────────
-    // Reuse the warmest idle instance of this prefix, or take a slot
-    // (shedding scored victims if the RSS watermark demands it) and
-    // cold-start a fresh one on its own owner thread. At the hard watermark
-    // the fresh instance is CreateCold: it serves this run and is dropped,
-    // never pooled — correctness never depends on warmth.
-    let spawn = |pooled: bool| {
+    // The registry decides (#77): reuse idle, join a busy instance, or
+    // spawn — Cold = shedding with nothing to join; Refused = the
+    // admission line.
+    let spawn = || {
         crate::warm::spawn_instance(
             Arc::clone(&prefix_data),
             payload.limits.memory_mb,
             brand_key.to_string(),
         )
-        .map(|h| (h, pooled))
     };
     let run_cap_bytes = u64::from(payload.limits.memory_mb) * 1024 * 1024;
-    let spawned = match shared.warm.acquire(&payload.prefix_id, run_cap_bytes) {
-        crate::warm::Acquired::Reused(h) => Ok((h, true)),
-        crate::warm::Acquired::CreateNew => {
-            spawn(true).inspect_err(|_| shared.warm.abandon_new(&payload.prefix_id))
-        }
-        crate::warm::Acquired::CreateCold => {
-            spawn(false).inspect_err(|_| shared.warm.release_oneoff())
-        }
+    enum Taken {
+        Pooled(crate::warm::AttachedInstance),
+        Cold(crate::warm::InstanceHandle),
+    }
+    let taken = match shared.warm.acquire(&payload.prefix_id, run_cap_bytes, &spawn) {
+        crate::warm::Acquired::Attached(att) => Taken::Pooled(att),
+        crate::warm::Acquired::Cold(handle) => Taken::Cold(handle),
         crate::warm::Acquired::Refused(refusal) => {
             // No registry state taken, no route inserted — just answer.
             write_completion(sink, run_id, &Err(capacity_failure(refusal)), None);
             return;
         }
-    };
-    let (handle, pooled) = match spawned {
-        Ok(acquired) => acquired,
-        Err(e) => {
-            // Thread spawn failed (process resource exhaustion): answer this
-            // run and keep the connection serving — the registry accounting
-            // was undone above and no route was inserted yet.
+        crate::warm::Acquired::SpawnFailed(e) => {
             eprintln!("[iso4-v8] PrefixRun {run_id} — failed to spawn instance thread: {e}");
             let failure = sandbox::FailureOutput {
                 error: sandbox::RunError::Internal(format!(
@@ -1296,6 +1286,10 @@ fn dispatch_prefix_run(
             return;
         }
     };
+    let (jobs_tx, events_tx) = match &taken {
+        Taken::Pooled(att) => (att.sender(), att.event_sender()),
+        Taken::Cold(handle) => (handle.sender(), handle.event_sender()),
+    };
 
     // Route the run to the acquired instance's event channel; from here the
     // demux can deliver frames, aborts and connection loss by token.
@@ -1305,7 +1299,7 @@ fn dispatch_prefix_run(
         token,
         payload.limits.memory_mb,
         Arc::clone(&ctl),
-        handle.event_sender(),
+        events_tx,
     );
 
     // The completion hook, run on the instance thread when the run finishes:
@@ -1314,7 +1308,6 @@ fn dispatch_prefix_run(
     // An instance of a since-disposed prefix must not return to the pool:
     // the aliveness check and the release are atomic w.r.t. DisposePrefix
     // under the prefix_store lock (lock order prefix_store → warm).
-    let jobs_tx = handle.sender();
     let complete: sandbox::CompletionHook = {
         let shared = Arc::clone(shared);
         let conn_runs = Arc::clone(conn_runs);
@@ -1325,25 +1318,32 @@ fn dispatch_prefix_run(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&run_id);
-            if pooled {
-                let store = shared
-                    .prefix_store
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner());
-                let prefix_alive = store.contains_key(&prefix_id);
-                shared.warm.release(
-                    &prefix_id,
-                    handle,
-                    outcome.tainted,
-                    outcome.heap_used_bytes,
-                    prefix_alive,
-                );
-            } else {
-                // A CreateCold instance never entered a pool: drop the
-                // handle (the owner thread exits and disposes the isolate)
-                // and give back the one-off slot.
-                drop(handle);
-                shared.warm.release_oneoff();
+            match taken {
+                Taken::Pooled(att) => {
+                    let store = shared
+                        .prefix_store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let prefix_alive = store.contains_key(&prefix_id);
+                    let cpu_time_ms = match &outcome.result {
+                        Ok(output) => output.cpu_time_ms,
+                        Err(failure) => failure.cpu_time_ms,
+                    };
+                    shared.warm.release(
+                        &prefix_id,
+                        att.id,
+                        outcome.tainted,
+                        outcome.heap_used_bytes,
+                        cpu_time_ms,
+                        prefix_alive,
+                    );
+                }
+                Taken::Cold(handle) => {
+                    // Never pooled: drop the handle (the owner thread exits
+                    // and disposes the isolate), give back the one-off slot.
+                    drop(handle);
+                    shared.warm.release_oneoff();
+                }
             }
             match &outcome.result {
                 Ok(output) => trace!(

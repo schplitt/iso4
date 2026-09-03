@@ -600,7 +600,7 @@ class SandboxImpl implements Sandbox {
   async stats(): Promise<SandboxStats> {
     const raw = await this.statsClient.stats()
     return {
-      activeRuns: raw.oneoffRunning + raw.warmBusy,
+      activeRuns: raw.oneoffRunning + raw.warmRuns,
       queueDepth: this.pool.queueDepth,
       openConnections: this.pool.openConnections,
       warmInstances: raw.warmBusy + raw.warmIdle,

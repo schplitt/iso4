@@ -1971,6 +1971,30 @@ prefix-aware acquire policy uses):
   `memory.current` latch; ours sits lower and folds the run's own cap into
   the check.)
 
+**Prefix-aware acquire (#77): join or spawn.** A run whose prefix has an
+idle instance reuses the warmest one, as always. With no idle instance the
+registry decides between JOINING a busy instance (the turn loop interleaves
+any number of runs) and OPENING another isolate, from two per-prefix fading
+averages fed at release: CPU ms/run and arrivals/s. Their product is the
+prefix's CPU demand in thread-seconds per second; a spawn happens when it
+exceeds what the live instances absorb at an 80% utilization target —
+compute-heavy traffic scales out (response time), waiting-heavy traffic
+stacks (memory). An unmeasured prefix spawns (the pre-#77 behavior) until
+its first completion. Routing packs: the fullest instance whose thread is
+not currently saturated (a per-instance utilization window the owner loop
+publishes) takes the join; all saturated spills over to a spawn, and if
+memory refuses that, the least-utilized instance takes it anyway. Joins are
+never gated by memory or the shedding latch — they add no isolate; spawns
+are gated by both, plus a per-prefix ceiling at the core count (more
+instances can never execute in parallel). Attach refuses only what #81
+ruled: dead (tainted/retiring) instances and a `memoryMb` mismatch.
+Admission for a further instance of a recurring prefix uses its *measured*
+mean heap instead of the theoretical cap (seeded with the cap until data
+exists), so small-footprint prefixes scale further under the same line.
+Neither reference runtime scales out on one node (celld: one instance per
+cell, 64 stacked requests; workerd OSS: one isolate per script, unlimited
+stacking) — this policy is iso4's own, prior-art-informed shape.
+
 There is deliberately **no instance-count cap** (the earlier
 `--max-live-isolates` is gone): celld defaults its resident ceiling to
 unlimited after a default count cap caused eviction churn, and a count

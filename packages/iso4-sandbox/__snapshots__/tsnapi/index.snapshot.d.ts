@@ -154,6 +154,7 @@ export interface Sandbox {
 }
 export interface SandboxOptions {
   maxConcurrentRuns?: number;
+  maxQueuedRuns?: number;
   memoryMb?: number;
   memoryBudgetMb?: number;
   binaryPath?: string;
@@ -167,6 +168,8 @@ export interface SandboxStats {
   idleHeapBytes: number;
   budgetBytes: number;
   rssBytes: number;
+  usageBytes: number;
+  hardLineBytes: number;
   underPressure: boolean;
   prefixes: Record<string, {
     idle: number;
@@ -208,7 +211,7 @@ export type RebindHostModule<T> = T extends HostExportFunction ? T : T extends H
 export type RebindImports<M extends Record<string, ImportValue>> = Record<string, ImportValue> extends M ? Record<string, never> : { [K in keyof M as M[K] extends string ? never : K]?: M[K] extends HostModuleObject ? RebindHostModule<M[K]> : never };
 export type RebindValue<V extends HostGlobalValue> = V extends BridgeWithShim<infer H> ? H : V extends BridgeGlobal<infer H> ? H : V extends HostExportFunction ? V : never;
 export type ResetCause = "cpu" | "memory" | "wall" | "abort" | "internal";
-export type RunErrorCode = "ERR_USER_CODE" | "ERR_MEMORY_LIMIT" | "ERR_CPU_TIMEOUT" | "ERR_WALL_TIMEOUT" | "ERR_ABORTED" | "ERR_MODULE_NOT_FOUND" | "ERR_COMPILE" | "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED" | "ERR_EXPORT_NOT_SERIALIZABLE" | "ERR_TYPE_NOT_SERIALIZABLE" | "ERR_EXPORT_TOO_LARGE" | "ERR_CALL_TARGET_NOT_FOUND" | "ERR_HOST_BRIDGE" | "ERR_BRIDGE_PAYLOAD_TOO_LARGE" | "ERR_BRIDGE_CALL_LIMIT_EXCEEDED" | "ERR_INSTANCE_RESET" | "ERR_UNDECLARED_BINDING" | "ERR_PREFIX_DID_NOT_SETTLE" | "ERR_PREFIX_BRIDGE_CALL" | "ERR_WARMUP_LIMIT" | "ERR_PREFIX_DISPOSED" | "ERR_PROTOCOL_DESYNC" | "ERR_INTERNAL";
+export type RunErrorCode = "ERR_USER_CODE" | "ERR_MEMORY_LIMIT" | "ERR_CPU_TIMEOUT" | "ERR_WALL_TIMEOUT" | "ERR_ABORTED" | "ERR_MODULE_NOT_FOUND" | "ERR_COMPILE" | "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED" | "ERR_EXPORT_NOT_SERIALIZABLE" | "ERR_TYPE_NOT_SERIALIZABLE" | "ERR_EXPORT_TOO_LARGE" | "ERR_CALL_TARGET_NOT_FOUND" | "ERR_HOST_BRIDGE" | "ERR_BRIDGE_PAYLOAD_TOO_LARGE" | "ERR_BRIDGE_CALL_LIMIT_EXCEEDED" | "ERR_INSTANCE_RESET" | "ERR_CAPACITY" | "ERR_QUEUE_FULL" | "ERR_UNDECLARED_BINDING" | "ERR_PREFIX_DID_NOT_SETTLE" | "ERR_PREFIX_BRIDGE_CALL" | "ERR_WARMUP_LIMIT" | "ERR_PREFIX_DISPOSED" | "ERR_PROTOCOL_DESYNC" | "ERR_INTERNAL";
 export type RunResult = RunSuccess | RunFailure | RunAborted;
 export type SandboxExports = {
   default: unknown;
