@@ -617,6 +617,7 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
                 crate::v8::WARMUP_CPU_MS,
             ),
         ),
+        RunError::Capacity(msg) => plain("ERR_CAPACITY", "Error", msg.clone()),
         RunError::Internal(msg) => plain("ERR_INTERNAL", "Error", msg.clone()),
     }
 }
@@ -654,6 +655,8 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
     encode_u64(stats.idle_heap_bytes, &mut out);
     encode_u64(stats.warm_budget_bytes, &mut out);
     encode_u64(stats.rss_bytes, &mut out);
+    encode_u64(stats.usage_bytes, &mut out);
+    encode_u64(stats.hard_line_bytes, &mut out);
     out.push(u8::from(stats.under_pressure));
     encode_count(stats.per_prefix.len(), &mut out);
     for (prefix_id, idle, busy) in &stats.per_prefix {

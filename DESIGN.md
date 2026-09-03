@@ -1920,19 +1920,28 @@ impossible, and a uniform cap keeps capacity math `slots × cap`. Heap and
 ArrayBuffer usage accumulate across calls on an instance — hitting the cap
 taints it. Passing the old per-run field throws.
 
-**Capacity (v3): one RSS mark, scored eviction — celld's model,
-whole.** Two independent resources, two knobs. `maxConcurrentRuns` (the
-slot pool's admission number) caps **concurrent runs**; the **memory budget**
-(`memoryBudgetMb` on `createSandbox`, passed as `--warm-budget-bytes`,
-`0` = disabled) is the ONE memory mark, enforced by the runtime watching
-its **own process RSS** — ground truth, where summed heap numbers
-undercount (external ArrayBuffers, V8 overhead, allocator fragmentation,
-later SQLite), and the number the container OOM killer actually acts on.
-Sampled per registry event (~0.4 µs `task_info` / `statm` read — no
-polling timers), folded through pure decision functions (`policy.rs`, the
-same replaceable-rule style a prefix-aware acquire policy will use):
+**Capacity (v4): global-memory marks, scored eviction — celld's model,
+adapted.** Two independent resources. `maxConcurrentRuns` (the slot pool's
+admission number) caps **concurrent runs** — its default is the core
+count, bounded by memory (`min(cores, budget / memoryMb)`) so the default
+never promises more concurrent heaps than the budget holds — with
+`maxQueuedRuns` (default 100 × slots) bounding the waiter queue behind it:
+past the bound, runs fail with `ERR_QUEUE_FULL` instead of growing an
+unbounded queue (each waiter holds memory — overload must shed, not
+accumulate). The **memory budget** (`memoryBudgetMb` on `createSandbox`,
+passed as `--warm-budget-bytes`, `0` = disabled) is the shedding mark,
+enforced against **measured GLOBAL container memory** — the cgroup working
+set (`memory.current − inactive_file`), Node host included, the number the
+container OOM killer actually acts on; where no cgroup exists (macOS, bare
+metal) it falls back to the runtime child's own RSS. Summed heap numbers
+are not used — they undercount (external ArrayBuffers, V8 overhead,
+allocator fragmentation, later SQLite). Sampled per registry event (the
+cgroup read is TTL-cached at 100 ms; the RSS fallback is a ~0.4 µs
+`task_info` / `statm` read — no polling timers), folded through pure
+decision functions (`policy.rs`, the same replaceable-rule style the
+prefix-aware acquire policy uses):
 
-- **RSS at/above the budget latches shedding**: evict idle instances by
+- **Usage at/above the budget latches shedding**: evict idle instances by
   `heapUsed × idleTime` score — highest first, ties to the longest-idle —
   a tenth of the idle population per pass, AND stop pooling NEW instances:
   a `PrefixRun` without an idle instance runs on a cold one-off isolate
@@ -1947,36 +1956,47 @@ same replaceable-rule style a prefix-aware acquire policy will use):
 - **The latch releases at 4/5 of the budget** — the hysteresis gap that
   stops evict/admit flapping (celld's ratio).
 - **Futility check**: freed heap returns to the OS lazily, so a pass that
-  left RSS flat (within 5 %) stops the walk instead of evicting the world;
-  the latch holds, and a sample that moves either way re-arms it.
+  left usage flat (within 5 %) stops the walk instead of evicting the
+  world; the latch holds, and a sample that moves either way re-arms it.
+- **The hard admission line (#77)**: above the budget, at 90 % of
+  (container limit − 256 MB host reserve, computed by the runtime at
+  startup), sits the one refusal rule — a NEW isolate is never created
+  when measured usage plus the run's own `memoryMb` would cross it, so the
+  newest admission always leaves at least one worst-case isolate of
+  headroom below the OOM kill. Refused runs fail with `ERR_CAPACITY`,
+  deliberately unqueued: a queue is more memory exactly when there is
+  none. Uncapped runs (`memoryMb: 0`) are refused already from the budget
+  mark — their worst case has no arithmetic. Reuse of an existing warm
+  instance is never refused; it adds no memory. (celld's analog is a 95 %
+  `memory.current` latch; ours sits lower and folds the run's own cap into
+  the check.)
 
 There is deliberately **no instance-count cap** (the earlier
 `--max-live-isolates` is gone): celld defaults its resident ceiling to
 unlimited after a default count cap caused eviction churn, and a count
 answers a question ("how many?") that memory pressure — the thing that
 actually kills the process — cannot be read from. Concurrency is bounded
-by the host pool, memory by the mark; running instances are never
-evicted. The budget default is container-aware:
+by the host pool, memory by the marks; running instances are never
+evicted. The budget default mirrors the line's base: 80 % of
+(container limit − 256 MB host reserve), container-aware via
 `process.constrainedMemory()` (falling back to `os.totalmem()`, which lies
-in containers) minus a safety net of max(512 MB, 25 %) for the Node host,
-the Rust runtime, and the embedding service's own per-isolate state — the
-mark then compares the Rust process's own RSS against its own budget, so
-no extra leniency is needed (celld's default ceiling of 80 % of total
-plays the same headroom role). Independent of `memoryMb`: RSS is
-measured, not derived from per-isolate caps. One-off runs never touch the
-warm pools but share the same ledger and pressure checks; they are never
-refused — transient work gives its memory back on its own.
+in containers). Independent of `memoryMb`: usage is measured, not derived
+from per-isolate caps. One-off runs never touch the warm pools but share
+the same ledger and pressure checks; shedding never refuses them —
+transient work gives its memory back on its own — but the admission line
+gates them like any other isolate creation.
 
 **A budget that cannot be measured is refused at startup.** The mark is
-enforced by reading the runtime's own RSS, so an environment where that
-read fails (a container without a readable `/proc` is the realistic case)
-would leave the budget declared but never applied: nothing evicted, warm
-instances accumulating for the life of the process, and `stats()`
-reporting `rssBytes: 0, underPressure: false` throughout, which reads
-exactly like a healthy idle runtime. The runtime therefore samples once at
-startup and exits with a diagnostic if a non-zero budget has no reading
-behind it, so the deployment fails on the first `createSandbox()` rather
-than silently running without the ceiling. `memoryBudgetMb: 0` disables
+enforced by reading measured memory (cgroup, else the child's RSS), so an
+environment where both reads fail (a container with neither a readable
+cgroup filesystem nor `/proc` is the realistic case) would leave the
+budget declared but never applied: nothing evicted, warm instances
+accumulating for the life of the process, and `stats()` reporting
+`usageBytes: 0, underPressure: false` throughout, which reads exactly like
+a healthy idle runtime. The runtime therefore samples once at startup and
+exits with a diagnostic if a non-zero budget has no reading behind it, so
+the deployment fails on the first `createSandbox()` rather than silently
+running without the ceiling. `memoryBudgetMb: 0` disables
 the watermarks by request and skips the check with them.
 
 **Saturation and stats.** Saturated run slots always queue FIFO —

@@ -37,6 +37,18 @@ interface SlotWaiter {
 }
 
 /**
+ * The waiter queue is at `maxQueuedRuns`: the run is shed as a failed
+ * result with `error.code: 'ERR_QUEUE_FULL'` instead of growing an
+ * unbounded, memory-holding queue.
+ */
+export class QueueFullError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'QueueFullError'
+  }
+}
+
+/**
  * Opens a fresh connection. Supplied by `createSandbox`, which holds the socket
  * path.
  */
@@ -48,12 +60,14 @@ export type ConnectFn = () => Promise<RuntimeIpcClient>
  */
 export class SlotPool {
   private readonly capacity: number
+  private readonly maxQueued: number
   private active = 0
   private readonly waiters: SlotWaiter[] = []
   private disposed = false
 
-  constructor(capacity: number) {
+  constructor(capacity: number, maxQueued: number) {
     this.capacity = capacity
+    this.maxQueued = maxQueued
   }
 
   /**
@@ -87,6 +101,14 @@ export class SlotPool {
     if (this.active < this.capacity) {
       this.active++
       return Promise.resolve()
+    }
+
+    if (this.waiters.length >= this.maxQueued) {
+      return Promise.reject(new QueueFullError(
+        `run queue is full (${this.waiters.length} queued behind `
+        + `${this.capacity} executing runs, maxQueuedRuns: ${this.maxQueued}); `
+        + 'the sandbox is overloaded — retry later, or raise maxQueuedRuns',
+      ))
     }
 
     return new Promise<void>((resolve, reject) => {
@@ -240,8 +262,8 @@ export class RunPool {
   private readonly slots: SlotPool
   private readonly connections: ConnectionRegistry
 
-  constructor(maxConcurrentRuns: number, connect: ConnectFn) {
-    this.slots = new SlotPool(maxConcurrentRuns)
+  constructor(maxConcurrentRuns: number, maxQueuedRuns: number, connect: ConnectFn) {
+    this.slots = new SlotPool(maxConcurrentRuns, maxQueuedRuns)
     this.connections = new ConnectionRegistry(connect)
   }
 

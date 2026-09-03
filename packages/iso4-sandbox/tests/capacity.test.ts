@@ -178,8 +178,9 @@ describe('memory budget → live-isolate cap', () => {
       const stats = await sandbox.stats()
       const totalMb = totalmem() / (1024 * 1024)
       // The default budget must be clamped to the host total, not the
-      // sentinel; stats reports it in bytes.
-      const expected = Math.floor(totalMb - Math.max(512, totalMb * 0.25)) * 1024 * 1024
+      // sentinel; stats reports it in bytes. 80% of (total − the 256 MB
+      // host reserve).
+      const expected = Math.floor((totalMb - 256) * 0.8) * 1024 * 1024
       expect(stats.budgetBytes).toBe(expected)
     } finally {
       constrained.mockRestore()
@@ -188,16 +189,16 @@ describe('memory budget → live-isolate cap', () => {
 
   test('the default budget respects a container memory constraint', async () => {
     // Pretend the process runs in a 2 GB container: constrainedMemory()
-    // reports the cgroup limit os.totalmem() cannot see. Budget = 2048 minus
-    // the max(512 MB, 25 %) safety net = 1536 MB — the RSS mark the runtime
-    // sheds against.
+    // reports the cgroup limit os.totalmem() cannot see. Budget = 80% of
+    // (2048 − the 256 MB host reserve) = 1433 MB — the shedding mark the
+    // runtime holds against global container memory.
     const constrained = vi
       .spyOn(process, 'constrainedMemory')
       .mockReturnValue(2 * 1024 * 1024 * 1024)
     try {
       await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
       const stats = await sandbox.stats()
-      expect(stats.budgetBytes).toBe(1536 * 1024 * 1024)
+      expect(stats.budgetBytes).toBe(Math.floor((2048 - 256) * 0.8) * 1024 * 1024)
     } finally {
       constrained.mockRestore()
     }
@@ -224,6 +225,40 @@ describe('saturation queues FIFO', () => {
 
     const first = await busy
     expect(first.ok).toBe(true)
+  })
+
+  test('past maxQueuedRuns a run is shed with ERR_QUEUE_FULL, not queued', async () => {
+    // Queue bound 0: the one slot is busy, so the next caller is refused
+    // immediately as a failed result — nothing ran, telemetry is zero.
+    await using single = await createSandbox({ maxConcurrentRuns: 1, maxQueuedRuns: 0 })
+    await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
+
+    const busy = prefix.call({
+      export: 'slow',
+      args: [300],
+      limits: { cpuTimeMs: 5_000 },
+    })
+    await sleep(50)
+
+    const shed = await prefix.call({ export: 'slow', args: [0] })
+    expect(shed.ok).toBe(false)
+    if (!shed.ok) {
+      expect(shed.status).toBe('failed')
+      expect(shed.error.code).toBe('ERR_QUEUE_FULL')
+      expect(shed.error.message).toContain('maxQueuedRuns')
+      expect(shed.durationMs).toBe(0)
+    }
+
+    // The busy run is untouched, and a freed slot admits again.
+    const first = await busy
+    expect(first.ok).toBe(true)
+    const after = await prefix.call({ export: 'slow', args: [0] })
+    expect(after.ok).toBe(true)
+  })
+
+  test('maxQueuedRuns rejects a fractional or negative bound', async () => {
+    await expect(createSandbox({ maxQueuedRuns: 1.5 })).rejects.toThrow(/maxQueuedRuns/)
+    await expect(createSandbox({ maxQueuedRuns: -1 })).rejects.toThrow(/maxQueuedRuns/)
   })
 })
 

@@ -13,7 +13,7 @@
 
 import { describe, expect, test, vi } from 'vitest'
 
-import { ConnectionRegistry, RUNS_PER_CONNECTION, RunPool, SlotPool } from '../src/pool'
+import { ConnectionRegistry, QueueFullError, RUNS_PER_CONNECTION, RunPool, SlotPool } from '../src/pool'
 import { RunAbortedError } from '../src/client'
 import type { RuntimeIpcClient } from '../src/client'
 
@@ -59,7 +59,7 @@ function hold(pool: RunPool, onRelease?: () => void): {
 
 describe('SlotPool admission', () => {
   test('admits up to capacity and queues the rest FIFO', async () => {
-    const slots = new SlotPool(2)
+    const slots = new SlotPool(2, 1000)
     await slots.acquire()
     await slots.acquire()
     expect(slots.queueDepth).toBe(0)
@@ -83,7 +83,7 @@ describe('SlotPool admission', () => {
     // without the entry check a pre-aborted caller (its AbortSignal.timeout
     // expired during argument serialization, say) would sit queued until an
     // unrelated run freed a slot.
-    const slots = new SlotPool(1)
+    const slots = new SlotPool(1, 1000)
     const controller = new AbortController()
     controller.abort(new Error('expired before admission'))
 
@@ -95,7 +95,7 @@ describe('SlotPool admission', () => {
   })
 
   test('a queued caller is released by its AbortSignal', async () => {
-    const slots = new SlotPool(1)
+    const slots = new SlotPool(1, 1000)
     await slots.acquire()
     const controller = new AbortController()
 
@@ -106,7 +106,7 @@ describe('SlotPool admission', () => {
   })
 
   test('an aborted waiter leaves the queue, so the slot goes to the next caller', async () => {
-    const slots = new SlotPool(1)
+    const slots = new SlotPool(1, 1000)
     await slots.acquire()
     const controller = new AbortController()
 
@@ -121,7 +121,7 @@ describe('SlotPool admission', () => {
   })
 
   test('queueDepth counts only callers still waiting', async () => {
-    const slots = new SlotPool(1)
+    const slots = new SlotPool(1, 1000)
     await slots.acquire()
     const controller = new AbortController()
 
@@ -134,13 +134,46 @@ describe('SlotPool admission', () => {
   })
 
   test('dispose rejects queued callers and refuses new ones', async () => {
-    const slots = new SlotPool(1)
+    const slots = new SlotPool(1, 1000)
     await slots.acquire()
     const queued = slots.acquire()
 
     slots.dispose()
     await expect(queued).rejects.toThrow(/runtime disposed/)
     await expect(slots.acquire()).rejects.toThrow(/runtime is disposed/)
+  })
+
+  test('sheds callers past the queue bound with a QueueFullError', async () => {
+    const slots = new SlotPool(1, 2)
+    await slots.acquire()
+    const q1 = slots.acquire()
+    const q2 = slots.acquire()
+    expect(slots.queueDepth).toBe(2)
+
+    // The bound: the third waiter is shed immediately, queue untouched.
+    await expect(slots.acquire()).rejects.toBeInstanceOf(QueueFullError)
+    await expect(slots.acquire()).rejects.toThrow(/maxQueuedRuns: 2/)
+    expect(slots.queueDepth).toBe(2)
+
+    // Shedding is depth-based, not permanent: a freed slot drains the
+    // queue and admission resumes.
+    slots.release()
+    await q1
+    expect(slots.queueDepth).toBe(1)
+    const q3 = slots.acquire()
+    expect(slots.queueDepth).toBe(2)
+    slots.release()
+    await q2
+    slots.release()
+    await q3
+  })
+
+  test('a zero queue bound fails every caller past the slots immediately', async () => {
+    const slots = new SlotPool(1, 0)
+    await slots.acquire()
+    await expect(slots.acquire()).rejects.toBeInstanceOf(QueueFullError)
+    slots.release()
+    await slots.acquire() // free slot: admitted without queueing
   })
 })
 
@@ -230,7 +263,7 @@ describe('ConnectionRegistry', () => {
 
 describe('RunPool composition', () => {
   test('never runs more than the slot capacity, even when acquires race', async () => {
-    const pool = new RunPool(2, async () => fakeClient())
+    const pool = new RunPool(2, 1000, async () => fakeClient())
 
     let peak = 0
     let open = 0
@@ -250,7 +283,7 @@ describe('RunPool composition', () => {
     // The fakes never report load, so every run packs onto the first
     // connection — multiplexing, not one socket per run.
     const connect = vi.fn(async () => fakeClient())
-    const pool = new RunPool(2, connect)
+    const pool = new RunPool(2, 1000, connect)
     expect(pool.openConnections).toBe(0)
 
     const first = hold(pool)
@@ -276,7 +309,7 @@ describe('RunPool composition', () => {
     const connect = vi.fn()
       .mockResolvedValueOnce(full)
       .mockResolvedValueOnce(fresh)
-    const pool = new RunPool(8, connect)
+    const pool = new RunPool(8, 1000, connect)
 
     const seen: RuntimeIpcClient[] = []
     await pool.withClient(async (c) => {
@@ -297,7 +330,7 @@ describe('RunPool composition', () => {
     const connect = vi.fn()
       .mockRejectedValueOnce(new Error('child is gone'))
       .mockResolvedValueOnce(fresh)
-    const pool = new RunPool(1, connect)
+    const pool = new RunPool(1, 1000, connect)
 
     await expect(pool.withClient(async (c) => c)).rejects.toThrow(/child is gone/)
     // The slot was given back, so the next call is not stuck behind the failure.
@@ -310,7 +343,7 @@ describe('RunPool composition', () => {
     const connect = vi.fn()
       .mockResolvedValueOnce(dying)
       .mockResolvedValueOnce(fresh)
-    const pool = new RunPool(1, connect)
+    const pool = new RunPool(1, 1000, connect)
 
     const held = hold(pool, () => {
       dying.usable = false
@@ -332,7 +365,7 @@ describe('RunPool composition', () => {
     // free right there — admission caps foreground execution, and the grace
     // frames ride the shared connection without holding capacity (#127).
     const client = fakeClient()
-    const pool = new RunPool(1, vi.fn().mockResolvedValue(client))
+    const pool = new RunPool(1, 1000, vi.fn().mockResolvedValue(client))
 
     // Simulate the grace phase: the run is still routed on the connection
     // after its caller resolved.
@@ -345,7 +378,7 @@ describe('RunPool composition', () => {
   })
 
   test('dispose rejects queued callers', async () => {
-    const pool = new RunPool(1, async () => fakeClient())
+    const pool = new RunPool(1, 1000, async () => fakeClient())
     const held = hold(pool)
     await held.started
     const queued = pool.withClient(async (c) => c)

@@ -526,9 +526,33 @@ export interface SandboxOptions {
    * Must be an integer ≥ 1 — anything else throws at `createSandbox()`
    * (`0` would queue every run forever).
    *
-   * Defaults to `os.availableParallelism()`.
+   * Defaults to `os.availableParallelism()`, bounded by memory: when that
+   * many worst-case heaps (`memoryMb` each) would not fit inside the
+   * memory budget, the default becomes `budget / memoryMb` instead (at
+   * least 1) — the cores default must not promise more concurrent heaps
+   * than the container can hold. With `memoryMb: 0` or `memoryBudgetMb: 0`
+   * there is nothing to bound with and the default stays the core count.
    */
   maxConcurrentRuns?: number
+
+  /**
+   * How many callers may wait for a run slot before new ones are shed.
+   * Past the bound, a run fails immediately with `ERR_QUEUE_FULL` instead
+   * of joining the queue: every queued caller holds memory (its serialized
+   * arguments included), so an unbounded queue turns sustained overload
+   * into a host out-of-memory crash. A hammered sandbox should fail some
+   * requests cleanly and keep answering the rest.
+   *
+   * `0` is valid: no queue at all — every run past `maxConcurrentRuns`
+   * fails immediately. Must be an integer ≥ 0.
+   *
+   * This bounds queue *depth*; the wait *time* of an individual queued
+   * caller is still bounded only by its own `AbortSignal`
+   * (`AbortSignal.timeout()` composes — there is no timeout knob).
+   *
+   * Defaults to `100 × maxConcurrentRuns`.
+   */
+  maxQueuedRuns?: number
 
   /**
    * Hard cap on memory each isolate can use, in megabytes. Covers the V8
@@ -549,26 +573,36 @@ export interface SandboxOptions {
   memoryMb?: number
 
   /**
-   * The runtime's memory mark, in megabytes (celld's model, one
-   * mark). The runtime watches its own process RSS against it: at/above
-   * the mark it evicts idle warm instances by `heapUsed × idleTime` score
-   * (highest first) AND stops pooling new instances — prefix runs without
-   * an idle instance execute on cold one-off isolates — until RSS falls
-   * back to 80 % of the mark (hysteresis, so eviction doesn't flap).
-   * Reusing an already-warm instance stays allowed under pressure; it adds
-   * no memory. Correctness never depends on warmth; the only observable
-   * cost of eviction is cold-start latency. There is no instance-count
-   * cap — concurrency is bounded by `maxConcurrentRuns`, memory by this mark.
+   * The runtime's memory budget (the shedding mark), in megabytes. The
+   * runtime watches measured GLOBAL container memory against it — the
+   * cgroup's working set, Node host included, the number the container's
+   * OOM killer acts on (where no cgroup exists, e.g. macOS, it falls back
+   * to the runtime child's own RSS). At/above the mark it evicts idle warm
+   * instances by `heapUsed × idleTime` score (highest first) AND stops
+   * pooling new instances — prefix runs without an idle instance execute
+   * on cold one-off isolates — until usage falls back to 80 % of the mark
+   * (hysteresis, so eviction doesn't flap). Reusing an already-warm
+   * instance stays allowed under pressure; it adds no memory. Correctness
+   * never depends on warmth; the only observable cost of eviction is
+   * cold-start latency. There is no instance-count cap — concurrency is
+   * bounded by `maxConcurrentRuns`, memory by this mark.
    *
-   * `0` disables the mark entirely (nothing bounds warmth then except
-   * `dispose()`). Independent of `memoryMb`: RSS is measured, not derived
-   * from per-isolate caps.
+   * Above the budget sits one more, non-configurable line: the runtime
+   * never CREATES an isolate when measured usage plus the run's own
+   * `memoryMb` would cross 90 % of the container limit (minus a 256 MB
+   * host reserve) — such a run fails with `ERR_CAPACITY` instead, so the
+   * newest admission can never be what tips the container into an OOM
+   * kill. Runs with `memoryMb: 0` (uncapped) are refused already from the
+   * budget mark — their worst case has no arithmetic.
    *
-   * Default: the memory available to this process — container/cgroup-aware
-   * via `process.constrainedMemory()`, falling back to `os.totalmem()` —
-   * minus a safety net of max(512 MB, 25 %) for the Node host, the Rust
-   * runtime, and whatever the embedding service keeps in memory per isolate.
-   * Services with a large per-isolate host cache should set this lower.
+   * `0` disables the budget entirely (nothing bounds warmth then except
+   * `dispose()`, and uncapped runs are never refused). Independent of
+   * `memoryMb`: usage is measured, not derived from per-isolate caps.
+   *
+   * Default: 80 % of what remains of the container limit after a 256 MB
+   * reserve for the Node host — container/cgroup-aware via
+   * `process.constrainedMemory()`, falling back to `os.totalmem()`.
+   * Services with a large host-side footprint should set this lower.
    * On a host too small for that subtraction the default floors at 64 MB
    * (with a warning on stderr) rather than reaching 0 and disabling the
    * mark: memory-starved hosts get aggressive eviction, never no protection.
@@ -634,16 +668,31 @@ export interface SandboxStats {
   /**
    * The memory mark the runtime sheds against, in bytes —
    * `memoryBudgetMb` as the runtime received it. 0 = watermarks disabled.
-   * Utilization is `rssBytes / budgetBytes`.
+   * Utilization is `usageBytes / budgetBytes`.
    */
   budgetBytes: number
   /**
-   * The runtime process's resident set size in bytes at snapshot time —
-   * the signal the mark acts on. 0 when the platform offers no reader.
+   * The runtime process's own resident set size in bytes at snapshot time
+   * — the child's share of the container, for diagnostics. 0 when the
+   * platform offers no reader.
    */
   rssBytes: number
   /**
-   * True while the runtime is shedding: RSS reached the budget and
+   * Measured global container memory in bytes at snapshot time — the
+   * signal both capacity lines act on (cgroup working set including the
+   * Node host; equals the child's RSS where no cgroup exists; 0 when
+   * neither is readable).
+   */
+  usageBytes: number
+  /**
+   * The isolate admission line in bytes: 90 % of the container limit minus
+   * the host reserve. A run needing a new isolate whose `memoryMb` would
+   * not fit under it fails with `ERR_CAPACITY`. 0 = no container limit
+   * readable, line disabled.
+   */
+  hardLineBytes: number
+  /**
+   * True while the runtime is shedding: usage reached the budget and
    * has not yet fallen back to 80 % of it. While shedding, idle instances
    * are evicted by score and new warm admissions stop (prefix runs without
    * an idle instance degrade to cold one-off isolates).
@@ -1379,6 +1428,21 @@ export type RunErrorCode
      * automatically — the victim may have had side effects.
      */
     | 'ERR_INSTANCE_RESET'
+    /**
+     * The runtime's memory admission refused this run: it needed a NEW
+     * isolate, and measured container memory plus its `memoryMb` would
+     * cross 90% of what the container can hold — or the run is uncapped
+     * (`memoryMb: 0`) while memory is already at the budget. The message
+     * carries the measured numbers. Nothing ran; retrying after memory
+     * frees is safe. (Queue overload is `ERR_QUEUE_FULL`, not this.)
+     */
+    | 'ERR_CAPACITY'
+    /**
+     * Shed at the host-side queue bound: `maxQueuedRuns` callers were
+     * already waiting for a run slot. Never reached the runtime; telemetry
+     * is zero. Retry when load falls, or raise `maxQueuedRuns`.
+     */
+    | 'ERR_QUEUE_FULL'
     | 'ERR_UNDECLARED_BINDING'
     /**
      * Prefix top-level evaluation never settled — nothing in the isolate

@@ -727,6 +727,8 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     idleHeapBytes: number
     warmBudgetBytes: number
     rssBytes: number
+    usageBytes: number
+    hardLineBytes: number
     underPressure: boolean
     prefixes: { prefixId: string, idle: number, busy: number }[]
   }): Buffer {
@@ -737,6 +739,8 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       u64(stats.idleHeapBytes),
       u64(stats.warmBudgetBytes),
       u64(stats.rssBytes),
+      u64(stats.usageBytes),
+      u64(stats.hardLineBytes),
       Buffer.from([stats.underPressure ? 1 : 0]),
       u32(stats.prefixes.length),
       ...stats.prefixes.map((p) => Buffer.concat([str(p.prefixId), u32(p.idle), u32(p.busy)])),
@@ -751,6 +755,8 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       idleHeapBytes: 5_000_000_000, // above u32 — exercises the u64 read
       warmBudgetBytes: 7_000_000_000, // also above u32
       rssBytes: 6_000_000_000, // also above u32
+      usageBytes: 8_000_000_000,
+      hardLineBytes: 9_000_000_000,
       underPressure: true,
       prefixes: [
         { prefixId: '0', idle: 2, busy: 1 },
@@ -768,6 +774,8 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       idleHeapBytes: 0,
       warmBudgetBytes: 0,
       rssBytes: 0,
+      usageBytes: 0,
+      hardLineBytes: 0,
       underPressure: false,
       prefixes: [],
     }
@@ -782,6 +790,8 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       idleHeapBytes: 42,
       warmBudgetBytes: 42,
       rssBytes: 42,
+      usageBytes: 42,
+      hardLineBytes: 42,
       underPressure: false,
       prefixes: [{ prefixId: '0', idle: 1, busy: 0 }],
     })
@@ -799,14 +809,16 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       idleHeapBytes: 0,
       warmBudgetBytes: 0,
       rssBytes: 0,
+      usageBytes: 0,
+      hardLineBytes: 0,
       underPressure: false,
       prefixes: [],
     })
-    // underPressure sits after 3×u32 + 3×u64 = offset 36. Any byte other
+    // underPressure sits after 3×u32 + 5×u64 = offset 52. Any byte other
     // than 0/1 there means the frame is misaligned — must fail loudly, not
     // decode as `false`.
     const badLatch = Buffer.from(good)
-    badLatch[3 * 4 + 3 * 8] = 2
+    badLatch[3 * 4 + 5 * 8] = 2
     expect(() => decodeStatsPayload(badLatch)).toThrow(PayloadDecodeError)
 
     // A u64 above 2^53-1 is no real byte count; Number() would silently

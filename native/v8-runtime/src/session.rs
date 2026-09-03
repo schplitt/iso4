@@ -191,14 +191,15 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// `warm_budget_bytes` is the RSS mark the registry sheds against
-    /// — the memory control; 0 disables it. Concurrency is bounded
-    /// by the host pool; there is no instance-count cap.
-    pub fn new(warm_budget_bytes: u64) -> Self {
+    /// `warm_budget_bytes` is the mark the registry sheds against (global
+    /// container usage; 0 disables it); `hard_line_bytes` is the isolate
+    /// admission line (0 = no container limit readable). Concurrency is
+    /// bounded by the host pool; there is no instance-count cap.
+    pub fn new(warm_budget_bytes: u64, hard_line_bytes: u64) -> Self {
         Self {
             prefix_store: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),
-            warm: crate::warm::WarmRegistry::new(warm_budget_bytes),
+            warm: crate::warm::WarmRegistry::new(warm_budget_bytes, hard_line_bytes),
         }
     }
 }
@@ -336,6 +337,19 @@ fn write_run_complete_frame(
             sink.write(ipc::RustToTsMessageType::RunComplete, minimal)
         }
         other => other,
+    }
+}
+
+/// The failure a run refused by the memory admission reports: nothing ran,
+/// so every telemetry field is genuinely zero.
+fn capacity_failure(refusal: String) -> sandbox::FailureOutput {
+    sandbox::FailureOutput {
+        error: sandbox::RunError::Capacity(refusal),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        duration_ms: 0.0,
+        cpu_time_ms: 0.0,
+        bridge_calls: Vec::new(),
     }
 }
 
@@ -918,6 +932,14 @@ fn dispatch_oneoff_run(
         refuse_duplicate_run(sink, run_id);
         return;
     }
+    // Fresh isolate per one-off, shared ledger; admission-checked before
+    // the route exists so a refusal leaves nothing to unwind.
+    let run_cap_bytes = u64::from(payload.limits.memory_mb) * 1024 * 1024;
+    if let Err(refusal) = shared.warm.reserve_oneoff(run_cap_bytes) {
+        write_completion(sink, run_id, &Err(capacity_failure(refusal)), None);
+        return;
+    }
+
     let token = sandbox::alloc_run_token();
     let ctl = Arc::new(std::sync::OnceLock::new());
     // A one-off run gets a private event channel (it owns no instance loop).
@@ -930,10 +952,6 @@ fn dispatch_oneoff_run(
         Arc::clone(&ctl),
         events_tx,
     );
-
-    // One-off runs always get a fresh isolate (never the warm registry), but
-    // they share the slot budget with warm instances.
-    shared.warm.reserve_oneoff();
 
     let worker_shared = Arc::clone(shared);
     let worker_sink = sink.clone();
@@ -1242,13 +1260,19 @@ fn dispatch_prefix_run(
         )
         .map(|h| (h, pooled))
     };
-    let spawned = match shared.warm.acquire(&payload.prefix_id) {
+    let run_cap_bytes = u64::from(payload.limits.memory_mb) * 1024 * 1024;
+    let spawned = match shared.warm.acquire(&payload.prefix_id, run_cap_bytes) {
         crate::warm::Acquired::Reused(h) => Ok((h, true)),
         crate::warm::Acquired::CreateNew => {
             spawn(true).inspect_err(|_| shared.warm.abandon_new(&payload.prefix_id))
         }
         crate::warm::Acquired::CreateCold => {
             spawn(false).inspect_err(|_| shared.warm.release_oneoff())
+        }
+        crate::warm::Acquired::Refused(refusal) => {
+            // No registry state taken, no route inserted — just answer.
+            write_completion(sink, run_id, &Err(capacity_failure(refusal)), None);
+            return;
         }
     };
     let (handle, pooled) = match spawned {
@@ -1387,7 +1411,7 @@ mod tests {
     /// payload and return the first frame it writes back (if any).
     fn handshake(payload: Vec<u8>) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(0));
+        let shared = Arc::new(SharedState::new(0, 0));
         let server = std::thread::spawn(move || handle_client(runtime, shared));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)
@@ -1405,7 +1429,7 @@ mod tests {
     /// hanging the suite.
     fn spawn_session() -> (UnixStream, crossbeam_channel::Receiver<()>) {
         let (host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(0));
+        let shared = Arc::new(SharedState::new(0, 0));
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
             handle_client(runtime, shared);

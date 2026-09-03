@@ -1033,16 +1033,18 @@ snapshot answers even while every run slot is busy.
 
 `StatsPayload`:
 
-| Field             | Encoding            | Notes                                                                                                  |
-| ----------------- | ------------------- | ------------------------------------------------------------------------------------------------------ |
-| `oneoffRunning`   | `u32`               | Running one-off isolates (`Run` frames in flight).                                                     |
-| `warmBusy`        | `u32`               | Warm instances currently serving a call.                                                               |
-| `warmIdle`        | `u32`               | Idle warm instances ready for reuse.                                                                   |
-| `idleHeapBytes`   | `u64`               | Summed `used_heap_size` of the idle instances, each measured after its last call.                      |
-| `warmBudgetBytes` | `u64`               | The RSS mark the registry sheds against (`--warm-budget-bytes`). 0 = watermarks disabled.              |
-| `rssBytes`        | `u64`               | The runtime process's resident set size at snapshot time; the signal the mark acts on. 0 = unreadable. |
-| `underPressure`   | `u8`                | 1 while the shedding latch is held: RSS reached the budget, not yet back at 4/5 of it.                 |
-| `prefixes`        | `List<PrefixStats>` | Per-prefix instance counts, sorted by prefix id.                                                       |
+| Field             | Encoding            | Notes                                                                                                                                                                 |
+| ----------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `oneoffRunning`   | `u32`               | Running one-off isolates (`Run` frames in flight).                                                                                                                    |
+| `warmBusy`        | `u32`               | Warm instances currently serving a call.                                                                                                                              |
+| `warmIdle`        | `u32`               | Idle warm instances ready for reuse.                                                                                                                                  |
+| `idleHeapBytes`   | `u64`               | Summed `used_heap_size` of the idle instances, each measured after its last call.                                                                                     |
+| `warmBudgetBytes` | `u64`               | The mark the registry sheds against (`--warm-budget-bytes`). 0 = watermarks disabled.                                                                                 |
+| `rssBytes`        | `u64`               | The runtime process's own resident set size at snapshot time — its share of the container. 0 = unreadable.                                                            |
+| `usageBytes`      | `u64`               | Measured global container memory (cgroup working set incl. the host; child RSS where no cgroup exists) — the signal both capacity lines act on. 0 = neither readable. |
+| `hardLineBytes`   | `u64`               | The isolate admission line: 90% of (container limit − host reserve). 0 = no container limit readable, line disabled.                                                  |
+| `underPressure`   | `u8`                | 1 while the shedding latch is held: usage reached the budget, not yet back at 4/5 of it.                                                                              |
+| `prefixes`        | `List<PrefixStats>` | Per-prefix instance counts, sorted by prefix id.                                                                                                                      |
 
 `PrefixStats`:
 
@@ -1157,6 +1159,8 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `ERR_INSTANCE_RESET`                  | The run was an innocent victim: a co-resident run on the same shared instance was interrupted mid-execution (a CPU/memory/wall guard fired, or a forced abort landed on running code), so the instance could no longer be trusted and every run in flight on it failed. Carries `ResetInfo` (§5.6): the cause class and the culprit's wire run id. Telemetry fields are this run's real partial values. Never retried automatically — the victim may have had side effects. |
 | `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.7.                                                                                                                          |
+| `ERR_CAPACITY`                        | The memory admission refused the run: it needed a NEW isolate and measured global container memory plus the run's own `memoryMb` would cross the admission line (90% of container limit − host reserve) — or the run is uncapped (`memoryMb: 0`) while usage is at/above the budget. Nothing ran, telemetry is zero; retry when memory frees. Reuse of an existing warm instance is never refused for capacity.                                                             |
+| `ERR_QUEUE_FULL`                      | **Host-detected, never sent by the runtime.** The run was shed at the host's `maxQueuedRuns` bound — that many callers were already waiting for a run slot. Never reached the runtime; telemetry is zero.                                                                                                                                                                                                                                                                   |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 ---

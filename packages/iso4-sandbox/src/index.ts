@@ -17,7 +17,7 @@ import type { ChildProcess } from 'node:child_process'
 import { resolveRuntimeBinary } from './binary'
 import { ProtocolDesyncError, RunAbortedError, RuntimeIpcClient } from './client'
 
-import { RunPool } from './pool'
+import { QueueFullError, RunPool } from './pool'
 import {
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
@@ -115,7 +115,9 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     )
   }
   const binaryPath = resolveRuntimeBinary(options)
-  const maxConcurrentRuns = options?.maxConcurrentRuns ?? availableParallelism()
+  const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb)
+  const maxConcurrentRuns = options?.maxConcurrentRuns
+    ?? defaultMaxConcurrentRuns(warmBudgetBytes, options?.memoryMb)
   if (!Number.isInteger(maxConcurrentRuns) || maxConcurrentRuns < 1) {
     // 0 or a negative value would queue every run forever (total deadlock),
     // and a fractional value admits more runs than documented.
@@ -123,7 +125,14 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
       '[@iso4/sandbox] maxConcurrentRuns must be an integer >= 1',
     )
   }
-  const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb)
+  const maxQueuedRuns = options?.maxQueuedRuns ?? 100 * maxConcurrentRuns
+  if (!Number.isInteger(maxQueuedRuns) || maxQueuedRuns < 0) {
+    // 0 is valid (no queue: slots full = fail immediately); fractional or
+    // negative bounds are nonsense.
+    throw new TypeError(
+      '[@iso4/sandbox] maxQueuedRuns must be an integer >= 0',
+    )
+  }
 
   // Access control on the socket is the directory it lives in: a fresh
   // owner-only (0700) directory per sandbox, so the kernel refuses any other
@@ -140,9 +149,11 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const brandKey = brandKeyForToken(descriptorToken)
 
   // The runtime needs exactly one capacity fact: the warm budget in bytes,
-  // the RSS mark it sheds against. Concurrency is bounded by this
-  // host's slot pool; there is no instance-count cap (celld's
-  // stance — their resident ceiling defaults to unlimited).
+  // the shedding mark it holds against measured global container memory.
+  // (Its hard admission line is derived runtime-side from the same
+  // container limit.) Concurrency is bounded by this host's slot pool;
+  // there is no instance-count cap (celld's stance — their resident
+  // ceiling defaults to unlimited).
   const proc = spawn(binaryPath, [
     '--socket',
     socketPath,
@@ -178,7 +189,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     // connects eagerly here except the control connection below.
     const connect = (): Promise<RuntimeIpcClient> =>
       RuntimeIpcClient.connect({ socketPath, descriptorToken })
-    const pool = new RunPool(maxConcurrentRuns, connect)
+    const pool = new RunPool(maxConcurrentRuns, maxQueuedRuns, connect)
 
     // Dedicated control connection for `stats()`: it never enters the
     // pool, so a capacity snapshot answers even while every run slot is busy —
@@ -228,18 +239,28 @@ function resolveWarmBudgetBytes(memoryBudgetMb: number | undefined): number {
 }
 
 /**
- * Default memory budget: what this process may use — container/cgroup-aware
- * via `process.constrainedMemory()` (`os.totalmem()` lies inside containers;
- * the fallback covers bare metal, where constrainedMemory reports 0) — minus
- * a safety net of max(512 MB, 25 %) for the Node host, the Rust runtime, and
- * the embedding service's own per-isolate state.
+ * The Node-host reserve subtracted from the container limit before any
+ * capacity line is drawn. Mirrors the runtime's `container.rs`
+ * `NODE_RESERVE_BYTES` — change both together. A measured reserve replaces
+ * this constant later (#165).
+ */
+const NODE_RESERVE_MB = 256
+
+/**
+ * Default memory budget (the 80% shedding mark): 80% of what remains of the
+ * container limit after the Node-host reserve — container/cgroup-aware via
+ * `process.constrainedMemory()` (`os.totalmem()` lies inside containers;
+ * the fallback covers bare metal, where constrainedMemory reports 0). The
+ * runtime compares it against measured GLOBAL container memory (the same
+ * limit's usage), and derives its own hard admission line at 90% of the
+ * identical base.
  *
- * Floored at 64 MB: on a host at or below the 512 MB safety net the
- * subtraction goes to zero or negative, and a zero DEFAULT would silently
- * disable the watermarks on exactly the memory-starved machines that need
- * them most (`memoryBudgetMb: 0` stays the only deliberate opt-out). The
- * floor makes such a host shed warmth aggressively instead — degraded,
- * never unprotected — and says so on stderr.
+ * Floored at 64 MB: on a host at or below the reserve the subtraction goes
+ * to zero or negative, and a zero DEFAULT would silently disable the
+ * watermarks on exactly the memory-starved machines that need them most
+ * (`memoryBudgetMb: 0` stays the only deliberate opt-out). The floor makes
+ * such a host shed warmth aggressively instead — degraded, never
+ * unprotected — and says so on stderr.
  */
 function defaultMemoryBudgetMb(): number {
   // constrainedMemory() reports 0/undefined when there is no cgroup limit —
@@ -250,17 +271,37 @@ function defaultMemoryBudgetMb(): number {
   const constrained = process.constrainedMemory?.() || Number.POSITIVE_INFINITY
   const totalBytes = Math.min(constrained, totalmem())
   const totalMb = totalBytes / (1024 * 1024)
-  const budgetMb = Math.floor(totalMb - Math.max(512, totalMb * 0.25))
+  const budgetMb = Math.floor((totalMb - NODE_RESERVE_MB) * 0.8)
   if (budgetMb < 64) {
     process.stderr.write(
       `[@iso4/sandbox] host memory (${Math.floor(totalMb)} MB) leaves no room `
-      + `for a warm budget after the ${Math.max(512, Math.floor(totalMb * 0.25))} MB `
-      + `safety net — flooring the budget at 64 MB (expect aggressive eviction); `
+      + `for a warm budget after the ${NODE_RESERVE_MB} MB host reserve — `
+      + `flooring the budget at 64 MB (expect aggressive eviction); `
       + `set memoryBudgetMb explicitly to tune or 0 to disable\n`,
     )
     return 64
   }
   return budgetMb
+}
+
+/**
+ * Default `maxConcurrentRuns`: the core count, unless that many worst-case
+ * heaps (`memoryMb` each) could not fit inside the memory budget — then the
+ * budget bounds it (`min(cores, budget / memoryMb)`, at least 1). With an
+ * uncapped heap (`memoryMb: 0`) or a disabled budget there is nothing to
+ * bound with, so the default stays the core count.
+ * @param warmBudgetBytes
+ * @param memoryMb
+ */
+function defaultMaxConcurrentRuns(warmBudgetBytes: number, memoryMb: number | undefined): number {
+  const cores = availableParallelism()
+  // Mirrors the runtime's frame-decode default (ipc.rs DEFAULT_MEMORY_MB):
+  // an unset memoryMb reaches the child as 128.
+  const capMb = memoryMb ?? 128
+  if (capMb <= 0 || warmBudgetBytes <= 0)
+    return cores
+  const fitting = Math.floor(warmBudgetBytes / (capMb * 1024 * 1024))
+  return Math.max(1, Math.min(cores, fitting))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -347,6 +388,26 @@ function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilR
   if (report.error !== undefined)
     out.error = report.error
   return out
+}
+
+/**
+ * The failed result for a run shed at the host-side queue bound
+ * (`maxQueuedRuns`). Nothing reached the runtime, so telemetry is genuinely
+ * zero. Distinct from `ERR_CAPACITY` (the runtime's memory admission):
+ * this wall is queue depth, that one is memory.
+ * @param error the pool's refusal, carrying the bound in its message
+ */
+function queueFullResult(error: QueueFullError): RunResult {
+  return {
+    status: 'failed',
+    ok: false,
+    error: { code: 'ERR_QUEUE_FULL', name: 'Error', message: error.message },
+    stdout: [],
+    stderr: [],
+    durationMs: 0,
+    cpuTimeMs: 0,
+    bridgeCalls: [],
+  }
 }
 
 function desyncResult(error: ProtocolDesyncError): RunResult {
@@ -524,6 +585,8 @@ class SandboxImpl implements Sandbox {
       streams.releaseAll()
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
+      if (error instanceof QueueFullError)
+        return queueFullResult(error)
       if (error instanceof ProtocolDesyncError)
         return desyncResult(error)
       throw error
@@ -545,6 +608,8 @@ class SandboxImpl implements Sandbox {
       idleHeapBytes: raw.idleHeapBytes,
       budgetBytes: raw.warmBudgetBytes,
       rssBytes: raw.rssBytes,
+      usageBytes: raw.usageBytes,
+      hardLineBytes: raw.hardLineBytes,
       underPressure: raw.underPressure,
       prefixes: Object.fromEntries(
         raw.prefixes.map((p) => [p.prefixId, { idle: p.idle, busy: p.busy }]),
@@ -877,6 +942,8 @@ implements Prefix<G, M> {
       streams.releaseAll()
       if (error instanceof RunAbortedError)
         return abortedResult(error.reason)
+      if (error instanceof QueueFullError)
+        return queueFullResult(error)
       if (error instanceof ProtocolDesyncError)
         return desyncResult(error)
       throw error

@@ -1062,6 +1062,12 @@ pub enum RunError {
     /// the caller's limits are not armed during warm-up, and the budget is
     /// deliberately not configurable (Cloudflare's script-startup model).
     WarmupLimit,
+    /// The run needed a new isolate and the memory admission refused one:
+    /// measured container usage + the run's own `memoryMb` would cross the
+    /// hard line (or the run is uncapped while usage is at the budget).
+    /// The message carries the measured numbers. Failed cleanly, never
+    /// queued — the caller may retry when load falls.
+    Capacity(String),
     /// A requested host → sandbox call's export path does not resolve against
     /// the module's exports, or resolves to something that is not callable
     ///. The message says which, and names the path.

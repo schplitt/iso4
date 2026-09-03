@@ -1803,13 +1803,25 @@ export interface RuntimeStatsPayload {
    */
   warmBudgetBytes: number
   /**
-   * The runtime process's resident set size in bytes at snapshot time
-   * (0 when unreadable) — the signal the RSS mark acts on.
+   * The runtime process's own resident set size in bytes at snapshot time
+   * (0 when unreadable) — the child's share of the container, diagnostics.
    */
   rssBytes: number
   /**
-   * True while the shedding latch is held: RSS reached the budget and has
-   * not yet fallen back to 4/5 of it.
+   * Measured global container memory at snapshot time — the signal both
+   * capacity lines act on (cgroup working set incl. the Node host; falls
+   * back to the child's RSS where no cgroup exists; 0 when neither is
+   * readable).
+   */
+  usageBytes: number
+  /**
+   * The isolate admission line in bytes (90% of container limit − host
+   * reserve); 0 = no container limit readable, line disabled.
+   */
+  hardLineBytes: number
+  /**
+   * True while the shedding latch is held: usage reached the budget and
+   * has not yet fallen back to 4/5 of it.
    */
   underPressure: boolean
   /**
@@ -1845,6 +1857,8 @@ export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
   const idleHeapBytes = reader.readU64()
   const warmBudgetBytes = reader.readU64()
   const rssBytes = reader.readU64()
+  const usageBytes = reader.readU64()
+  const hardLineBytes = reader.readU64()
   // readBool, not readU8: any byte other than 0/1 here means the frame is
   // misaligned — fail loudly (strict frame handling on the control path).
   const underPressure = reader.readBool()
@@ -1857,7 +1871,7 @@ export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
     prefixes.push({ prefixId, idle, busy })
   }
   reader.assertDone()
-  return { oneoffRunning, warmBusy, warmIdle, idleHeapBytes, warmBudgetBytes, rssBytes, underPressure, prefixes }
+  return { oneoffRunning, warmBusy, warmIdle, idleHeapBytes, warmBudgetBytes, rssBytes, usageBytes, hardLineBytes, underPressure, prefixes }
 }
 
 export function parseTsToRustMessageType(

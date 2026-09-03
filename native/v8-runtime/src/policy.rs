@@ -10,7 +10,7 @@
 //!
 //! The pressure model is celld's, whole (decided 2026-08-14): ONE mark.
 //! The warm budget (`memoryBudgetMb` → `--warm-budget-bytes`, celld's
-//! `CELLD_MAX_RSS_MB` shape, 0 disables) is the ceiling: RSS at/above it
+//! `CELLD_MAX_RSS_MB` shape, 0 disables) is the ceiling: usage at/above it
 //! latches shedding — evict idle instances by score AND stop pooling new
 //! ones (a run without an idle instance goes cold one-off; reuse stays
 //! allowed, it adds no memory) — and the latch releases at 4/5 of the
@@ -20,6 +20,12 @@
 //! churn) and no grace period after last use — the `heapUsed × idleTime`
 //! score already sends a just-used instance to the back of every pass
 //! (celld sheds in plain LRU order for the same reason).
+//!
+//! Above the budget sits ONE more line (#77): the hard admission line at
+//! 90% of (container limit − Node reserve). [`admit_isolate`] refuses to
+//! CREATE an isolate that could tip the container into an OOM kill; it
+//! never gates reuse. Both rules read measured GLOBAL container memory —
+//! see `container.rs`.
 
 use std::time::Instant;
 
@@ -64,23 +70,24 @@ fn score(fact: &VictimFact, now: Instant) -> u128 {
 }
 
 /// What the last completed shed pass measured — the futility check compares
-/// the next RSS sample against this. Passes are synchronous (victims are
+/// the next usage sample against this. Passes are synchronous (victims are
 /// dropped under the registry lock), so a recorded pass has always "landed";
 /// only the OS's lazy page reclaim lags behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PassOutcome {
-    /// The RSS sample the pass acted on.
-    pub rss_at_pass: u64,
+    /// The usage sample the pass acted on.
+    pub usage_at_pass: u64,
 }
 
 /// Everything the watermark decision reads. Gathered under the registry
 /// lock so the counts are consistent with each other.
 #[derive(Clone, Copy, Debug)]
 pub struct PressureFacts {
-    /// The runtime process's RSS — ground truth, not summed heap numbers
-    /// (those undercount: external ArrayBuffers, V8 overhead, allocator
-    /// fragmentation, later SQLite).
-    pub rss_bytes: u64,
+    /// Measured GLOBAL container memory (cgroup working set, Node host
+    /// included — the number the OOM killer charges; child RSS where no
+    /// cgroup exists). Not summed heap numbers — those undercount:
+    /// external ArrayBuffers, V8 overhead, allocator fragmentation.
+    pub usage_bytes: u64,
     /// The warm budget: the one mark. Shedding latches at/above it and
     /// releases at 4/5 of it. `0` disables watermarks entirely.
     pub budget_bytes: u64,
@@ -131,13 +138,13 @@ pub fn watermark_action(facts: &PressureFacts) -> PressureVerdict {
         };
     }
     let release = facts.budget_bytes / 5 * 4;
-    let shedding = facts.rss_bytes >= facts.budget_bytes
-        || (facts.was_shedding && facts.rss_bytes > release);
+    let shedding = facts.usage_bytes >= facts.budget_bytes
+        || (facts.was_shedding && facts.usage_bytes > release);
     if !shedding || facts.idle_count == 0 {
         return PressureVerdict { shedding, evict: 0 };
     }
     if let Some(last) = facts.last_pass {
-        let flat = facts.rss_bytes.abs_diff(last.rss_at_pass) <= last.rss_at_pass / 20;
+        let flat = facts.usage_bytes.abs_diff(last.usage_at_pass) <= last.usage_at_pass / 20;
         if flat {
             return PressureVerdict { shedding, evict: 0 };
         }
@@ -149,10 +156,45 @@ pub fn watermark_action(facts: &PressureFacts) -> PressureVerdict {
 }
 
 /// A tenth of the idle population per pass, at least one. A proportion of
-/// what was just measured, because an eviction's effect on RSS is not
-/// visible until a later sample — one-at-a-time feedback would stall.
+/// what was just measured, because an eviction's effect on the sample is
+/// not visible until a later one — one-at-a-time feedback would stall.
 fn shed_target(idle_count: usize) -> usize {
     (idle_count / 10).max(1)
+}
+
+/// Everything the isolate-admission decision reads.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmitFacts {
+    /// Measured global container usage (same meter as [`PressureFacts`]).
+    pub usage_bytes: u64,
+    /// The run's own heap cap (`memoryMb`) in bytes. `0` = uncapped.
+    pub run_cap_bytes: u64,
+    /// The hard admission line — `container::admission_line_bytes()`.
+    /// `0` = no container limit readable, the line is disabled.
+    pub hard_line_bytes: u64,
+    /// The warm budget (the 80% mark) — the refusal line for UNCAPPED
+    /// runs, whose worst case no arithmetic can bound. `0` = disabled.
+    pub budget_bytes: u64,
+}
+
+/// May a NEW isolate be created for this run? (#77 ruling: never create an
+/// isolate whose own cap could tip the container over the hard line — the
+/// newest admission always leaves one worst-case isolate of headroom.)
+///
+/// - Capped run: admit iff `usage + cap` stays at or below the hard line.
+/// - Uncapped run (`memoryMb: 0`): the sum is meaningless, so the budget
+///   mark is the refusal line instead — the riskiest heap is not admitted
+///   once memory is already tight (ruled 2026-09-03). Budget disabled ⇒
+///   the caller opted out of protection ⇒ admit.
+///
+/// Reuse/join is deliberately NOT gated here: an existing isolate adds no
+/// memory.
+pub fn admit_isolate(facts: &AdmitFacts) -> bool {
+    if facts.run_cap_bytes == 0 {
+        return facts.budget_bytes == 0 || facts.usage_bytes < facts.budget_bytes;
+    }
+    facts.hard_line_bytes == 0
+        || facts.usage_bytes.saturating_add(facts.run_cap_bytes) <= facts.hard_line_bytes
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -232,7 +274,7 @@ mod tests {
         idle_count: usize,
     ) -> PressureFacts {
         PressureFacts {
-            rss_bytes: rss_mb * MB,
+            usage_bytes: rss_mb * MB,
             budget_bytes: budget_mb * MB,
             was_shedding,
             last_pass,
@@ -309,7 +351,7 @@ mod tests {
         // the OS has not returned the freed pages, so keep the latch (RSS
         // genuinely is over the mark) but stop evicting.
         let last = Some(PassOutcome {
-            rss_at_pass: 100 * MB,
+            usage_at_pass: 100 * MB,
         });
         let v = watermark_action(&facts(102, 100, true, last, 18));
         assert!(v.shedding);
@@ -319,7 +361,7 @@ mod tests {
     #[test]
     fn a_moved_sample_rearms_the_walk() {
         let last = Some(PassOutcome {
-            rss_at_pass: 100 * MB,
+            usage_at_pass: 100 * MB,
         });
         // Moved up well past the 5 % band: evict again.
         let up = watermark_action(&facts(110, 100, true, last, 18));
@@ -341,5 +383,49 @@ mod tests {
                 evict: 0
             }
         );
+    }
+
+    fn admit(usage_mb: u64, cap_mb: u64, line_mb: u64, budget_mb: u64) -> bool {
+        admit_isolate(&AdmitFacts {
+            usage_bytes: usage_mb * MB,
+            run_cap_bytes: cap_mb * MB,
+            hard_line_bytes: line_mb * MB,
+            budget_bytes: budget_mb * MB,
+        })
+    }
+
+    // Line 900 MB, budget 800 MB — the shipped 90/80 shape.
+
+    #[test]
+    fn a_capped_run_is_admitted_while_it_fits_under_the_line() {
+        assert!(admit(700, 128, 900, 800));
+        // Landing exactly ON the line still leaves the promised headroom.
+        assert!(admit(772, 128, 900, 800));
+    }
+
+    #[test]
+    fn a_capped_run_that_could_tip_the_container_is_refused() {
+        assert!(!admit(773, 128, 900, 800));
+        // Small runs stay admissible when big ones are not (#77 comment).
+        assert!(admit(773, 64, 900, 800));
+        assert!(!admit(2000, 1, 900, 800), "already over the line");
+    }
+
+    #[test]
+    fn no_readable_limit_disables_the_line_for_capped_runs() {
+        assert!(admit(u64::MAX / MB / 2, 128, 0, 800));
+    }
+
+    #[test]
+    fn an_uncapped_run_is_refused_once_usage_reaches_the_budget() {
+        assert!(admit(799, 0, 900, 800), "below the budget: admissible");
+        assert!(!admit(800, 0, 900, 800), "at the budget: refused");
+        assert!(!admit(850, 0, 900, 800), "above: refused even under the line");
+    }
+
+    #[test]
+    fn an_uncapped_run_with_watermarks_disabled_is_admitted() {
+        // budget 0 = the embedder opted out of memory protection entirely.
+        assert!(admit(10_000, 0, 900, 0));
     }
 }

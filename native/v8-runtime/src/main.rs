@@ -3,36 +3,36 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, oom, rss, session};
+use iso4_v8_runtime::{blob, container, oom, rss, session};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
 fn main() {
-    // Before anything can allocate: if the container ever OOMs, the kernel
-    // must take this process, not the Node host.
+    // If the container ever OOMs, the kernel must take this process, not
+    // the Node host.
     oom::prefer_this_process_as_victim();
 
     let (socket_path, warm_budget_bytes) = parse_args();
 
-    // The warm budget is enforced by comparing this process's own resident
-    // memory against it, so a budget with no way to read that memory is not a
-    // budget at all: nothing would ever be evicted, warm instances would
-    // accumulate for as long as the process lived, and `stats()` would report
-    // a healthy idle runtime throughout. Refusing to start says so at the
-    // first call instead — the host reports this exit immediately, and the
-    // line below is on its stderr. A budget of 0 means watermarks are off by
-    // request, so nothing is read and nothing is checked.
-    if warm_budget_bytes > 0 && rss::process_rss_bytes().is_none() {
+    // A budget with no readable meter would silently never be enforced —
+    // fail at startup instead (rationale: DESIGN.md §13.2.1).
+    if warm_budget_bytes > 0
+        && container::usage_bytes().is_none()
+        && rss::process_rss_bytes().is_none()
+    {
         eprintln!(
-            "[iso4-v8] cannot read this process's resident memory, so the \
-             {warm_budget_bytes}-byte memory budget could never be enforced. \
-             This usually means /proc is not mounted or is not readable in \
-             this environment. Mount it, or pass memoryBudgetMb: 0 to run \
-             without a budget."
+            "[iso4-v8] cannot read container memory or this process's \
+             resident memory, so the {warm_budget_bytes}-byte memory budget \
+             could never be enforced. This usually means neither the cgroup \
+             filesystem nor /proc is readable in this environment. Mount \
+             one, or pass memoryBudgetMb: 0 to run without a budget."
         );
         std::process::exit(1);
     }
+
+    // 0 when no container limit is readable (line disabled).
+    let hard_line_bytes = container::admission_line_bytes();
 
     // Compute the V8 serialization probe (and with it this binary's write
     // format version) once, in a throwaway isolate, before any connection
@@ -58,7 +58,10 @@ fn main() {
     // counter used to generate unique PrefixIds. Access control is the
     // owner-only directory the host created the socket path in — the kernel
     // checks it on every connect, so no application-level secret is needed.
-    let shared = Arc::new(session::SharedState::new(warm_budget_bytes));
+    let shared = Arc::new(session::SharedState::new(
+        warm_budget_bytes,
+        hard_line_bytes,
+    ));
 
     for stream in listener.incoming() {
         match stream {

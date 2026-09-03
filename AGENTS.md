@@ -330,9 +330,23 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   because they don't know V8's type system. They can only wrap V8 bytes as
   opaque `Data` blobs — net overhead, not savings. The current
   length-prefixed frame format is already appropriately minimal.
+- **Memory watermarks measure GLOBAL container memory.** Every
+  capacity/pressure comparison (the eviction budget, the admission
+  headroom check) is against the whole container's usage — cgroup
+  `memory.current`, which includes the Node host — not the runtime
+  child's own RSS. That is the number the container OOM killer acts on.
+  Where no cgroup exists (macOS, bare metal), fall back to child RSS.
+  When a design note or issue says "memory" with no qualifier, read it
+  as global container memory; verify against this rule before wiring a
+  meter to a process-local number.
 
 ### Common Mistakes to Avoid
 
+- Do not write multi-sentence narrative comment blocks in code. A comment
+  states the one constraint the code cannot show — one or two short lines.
+  Rationale essays belong in DESIGN.md, the commit message, or the PR, not
+  above the statement. (The codebase still carries old blocks like this;
+  do not add more, and shorten them when you touch one anyway.)
 - Do not use `pnpm test` in automation.
 - Do not create tiny helper/utility functions or `parse*`/`normalize*`
   wrappers for trivial one-off logic.

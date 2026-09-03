@@ -6,6 +6,7 @@
 //! API stability guarantees — nothing outside this repository links it.
 
 pub mod blob;
+pub mod container;
 pub mod ipc;
 pub mod oom;
 pub mod policy;

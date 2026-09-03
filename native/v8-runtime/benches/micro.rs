@@ -502,11 +502,11 @@ fn bench_policy(c: &mut Criterion) {
     }
 
     let facts = PressureFacts {
-        rss_bytes: 900 * 1024 * 1024,
+        usage_bytes: 900 * 1024 * 1024,
         budget_bytes: 1024 * 1024 * 1024,
         was_shedding: true,
         last_pass: Some(PassOutcome {
-            rss_at_pass: 950 * 1024 * 1024,
+            usage_at_pass: 950 * 1024 * 1024,
         }),
         idle_count: 256,
     };
