@@ -262,6 +262,56 @@ describe('saturation queues FIFO', () => {
   })
 })
 
+describe('per-workload heap caps (#77)', () => {
+  const HOARD = `export function hoard(mb) {
+    const arrays = []
+    for (let i = 0; i < mb; i++) arrays.push(new Uint8Array(1024 * 1024).fill(1))
+    return arrays.length
+  }`
+
+  test('a per-prefix cap binds that prefix; siblings keep the default', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
+    await using tight = await sandbox.prepare({ code: HOARD, memoryMb: 32 })
+    await using roomy = await sandbox.prepare({ code: HOARD })
+
+    const blown = await tight.call({ export: 'hoard', args: [64] })
+    expect(blown.ok).toBe(false)
+    if (!blown.ok && blown.status === 'failed')
+      expect(blown.error.code).toBe('ERR_MEMORY_LIMIT')
+
+    // Same allocation under the sandbox default (128 MB): fine.
+    const fits = await roomy.call({ export: 'hoard', args: [64] })
+    expect(fits.ok).toBe(true)
+  })
+
+  test('a one-off run may cap its own fresh isolate', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+    const blown = await sandbox.run({
+      code: `const a = []; for (let i = 0; i < 64; i++) a.push(new Uint8Array(1024 * 1024).fill(1))`,
+      limits: { memoryMb: 32, wallTimeMs: 10_000, cpuTimeMs: 10_000 },
+    })
+    expect(blown.ok).toBe(false)
+    if (!blown.ok && blown.status === 'failed')
+      expect(blown.error.code).toBe('ERR_MEMORY_LIMIT')
+
+    const fits = await sandbox.run({
+      code: `const a = []; for (let i = 0; i < 64; i++) a.push(new Uint8Array(1024 * 1024).fill(1)); export default a.length`,
+      limits: { wallTimeMs: 10_000, cpuTimeMs: 10_000 },
+    })
+    expect(fits.ok).toBe(true)
+  })
+
+  test('prefix runs still reject a per-run memoryMb; bad caps throw', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+    await using prefix = await sandbox.prepare({ code: COUNTER })
+    await expect(async () =>
+      prefix.call({ export: 'bump', limits: { memoryMb: 64 } as never }),
+    ).rejects.toThrow(/prepare\(\{ memoryMb \}\)/)
+    await expect(sandbox.prepare({ code: COUNTER, memoryMb: 1.5 })).rejects.toThrow(/memoryMb/)
+    await expect(sandbox.run({ code: '1', limits: { memoryMb: -1 } })).rejects.toThrow(/memoryMb/)
+  })
+})
+
 describe('prefix-aware acquire (#77)', () => {
   test('waiting-heavy concurrent runs share one instance', async () => {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 4 })

@@ -46,8 +46,12 @@ export interface GlobalOptions {
 export interface HostModuleObject {
   [name: string]: HostModuleValue;
 }
+export interface OneOffResourceLimits extends ResourceLimits {
+  memoryMb?: number;
+}
 export interface PrecompileOptions<G extends HostGlobals, M extends Imports> {
   code: string;
+  memoryMb?: number;
   globals?: G;
   imports?: M;
   limits?: ResourceLimits;
@@ -120,7 +124,7 @@ export interface RunFailure {
 }
 export interface RunOptions {
   code: string;
-  limits?: ResourceLimits;
+  limits?: OneOffResourceLimits;
   globals?: HostGlobals;
   imports?: Imports;
   signal?: AbortSignal;

@@ -27,7 +27,7 @@ npm i @iso4/fetch
 import { createSandbox } from '@iso4/sandbox'
 import { createSafeFetch } from '@iso4/fetch'
 
-const sandbox = await createSandbox({ memoryMb: 128 }) // uniform heap cap per isolate
+const sandbox = await createSandbox({ memoryMb: 128 }) // default heap cap per isolate
 
 // Validate and prepare host setup once
 const prefix = await sandbox.prepare({
@@ -46,7 +46,7 @@ const result = await prefix.execute({
     const res = await fetch(config.apiBase + '/users')
     export default { count: res.length }
   `,
-  limits: { cpuTimeMs: 200, wallTimeMs: 5_000 }, // memoryMb is a createSandbox option
+  limits: { cpuTimeMs: 200, wallTimeMs: 5_000 }, // heap cap: prepare({ memoryMb }) or the sandbox default
 })
 
 if (result.ok) {
@@ -104,8 +104,9 @@ prefix.execute({
   limits: {
     cpuTimeMs: 200, // active JS execution only (await time excluded)
     wallTimeMs: 5_000, // hard cap including async waits
-    // memoryMb is uniform per isolate and set on createSandbox({ memoryMb }),
-    // not per run (#64) — the heap cap is baked into the isolate at creation.
+    // memoryMb: per prefix via prepare({ memoryMb }) or the sandbox default —
+    // never per prefix-run, the cap is baked into the shared warm isolates.
+    // One-off sandbox.run() may set limits.memoryMb (fresh isolate anyway).
     maxBridgeCalls: 10, // max host-bridge calls per run (0 = unlimited)
     maxBridgeCallBytes: 0, // max bytes per bridge call (0 = 64 MiB framing cap)
     maxExportBytes: 0, // max bytes of encoded exports (0 = unlimited)
@@ -153,7 +154,7 @@ Residency is bounded by memory, not by a count:
 
 ```ts
 const sandbox = await createSandbox({
-  memoryMb: 128, // heap cap per isolate
+  memoryMb: 128, // default heap cap per isolate (override per prefix at prepare())
   memoryBudgetMb: 2048, // RSS mark for the whole runtime process (0 = off)
 })
 ```

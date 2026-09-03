@@ -1913,12 +1913,19 @@ fails with `ERR_INSTANCE_RESET` (cause class + culprit run id). The next
 call pays a cold start; never reuse a tainted instance; never evict a
 running one.
 
-**Uniform heap cap.** `memoryMb` moved from per-run `ResourceLimits` to
-`createSandbox()` (default 128 MB, workerd's number): the cap is baked into
-`Isolate::new` and instances are reused, so a per-run value is structurally
-impossible, and a uniform cap keeps capacity math `slots × cap`. Heap and
-ArrayBuffer usage accumulate across calls on an instance — hitting the cap
-taints it. Passing the old per-run field throws.
+**Heap caps: per prefix, per one-off, sandbox default (#77).**
+`createSandbox({ memoryMb })` (default 128 MB, workerd's number) is the
+default; `prepare({ memoryMb })` overrides it per prefix (256 MB edge
+functions beside 32 MB codemode functions in one sandbox — the wire already
+carries the cap per run, instances of a prefix are created with its cap,
+and attach refuses a mismatch per the #81 ruling), and one-off `run()`
+takes `limits.memoryMb` since its isolate is fresh anyway. What stays
+structurally impossible is a per-run value on a WARM instance: the cap is
+baked into `Isolate::new` and instances are shared across a prefix's runs,
+so prefix `execute()`/`call()` limits reject it. Heap and ArrayBuffer usage
+accumulate across calls on an instance — hitting the cap taints it. The
+old uniform-cap rationale ("capacity math `slots × cap`") is gone: capacity
+is measured, not multiplied (see below).
 
 **Capacity (v4): global-memory marks, scored eviction — celld's model,
 adapted.** Two independent resources. `maxConcurrentRuns` (the slot pool's

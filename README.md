@@ -28,7 +28,7 @@ executes the postfix and gets a result. The host wants:
 import { createSandbox } from '@iso4/sandbox'
 import { createSafeFetch } from '@iso4/fetch'
 
-const sandbox = await createSandbox({ memoryMb: 128 }) // uniform heap cap per isolate
+const sandbox = await createSandbox({ memoryMb: 128 }) // default heap cap per isolate
 
 const prefix = await sandbox.precompile({
   code: `
