@@ -629,8 +629,9 @@ export interface SandboxOptions {
  */
 export interface SandboxStats {
   /**
-   * Isolates executing right now: one-off `run()`s plus prefix runs on warm
-   * instances.
+   * Runs executing right now: one-off `run()`s plus prefix runs on warm
+   * instances. Since #77 several prefix runs may share one instance, so
+   * this can exceed the busy-instance count.
    */
   activeRuns: number
   /**

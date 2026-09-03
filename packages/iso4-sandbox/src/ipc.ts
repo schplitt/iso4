@@ -1786,9 +1786,13 @@ export interface RuntimeStatsPayload {
    */
   oneoffRunning: number
   /**
-   * Warm instances currently serving a call.
+   * Warm instances currently serving at least one run.
    */
   warmBusy: number
+  /**
+   * Runs in flight on warm instances — several may share one instance.
+   */
+  warmRuns: number
   /**
    * Idle warm instances ready for reuse.
    */
@@ -1853,6 +1857,7 @@ export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
   const reader = new PayloadReader(buf)
   const oneoffRunning = reader.readU32()
   const warmBusy = reader.readU32()
+  const warmRuns = reader.readU32()
   const warmIdle = reader.readU32()
   const idleHeapBytes = reader.readU64()
   const warmBudgetBytes = reader.readU64()
@@ -1871,7 +1876,7 @@ export function decodeStatsPayload(buf: Uint8Array): RuntimeStatsPayload {
     prefixes.push({ prefixId, idle, busy })
   }
   reader.assertDone()
-  return { oneoffRunning, warmBusy, warmIdle, idleHeapBytes, warmBudgetBytes, rssBytes, usageBytes, hardLineBytes, underPressure, prefixes }
+  return { oneoffRunning, warmBusy, warmRuns, warmIdle, idleHeapBytes, warmBudgetBytes, rssBytes, usageBytes, hardLineBytes, underPressure, prefixes }
 }
 
 export function parseTsToRustMessageType(

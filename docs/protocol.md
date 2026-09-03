@@ -1036,7 +1036,8 @@ snapshot answers even while every run slot is busy.
 | Field             | Encoding            | Notes                                                                                                                                                                 |
 | ----------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `oneoffRunning`   | `u32`               | Running one-off isolates (`Run` frames in flight).                                                                                                                    |
-| `warmBusy`        | `u32`               | Warm instances currently serving a call.                                                                                                                              |
+| `warmBusy`        | `u32`               | Warm instances currently serving at least one run.                                                                                                                    |
+| `warmRuns`        | `u32`               | Runs in flight on warm instances — several may share one instance (#77).                                                                                              |
 | `warmIdle`        | `u32`               | Idle warm instances ready for reuse.                                                                                                                                  |
 | `idleHeapBytes`   | `u64`               | Summed `used_heap_size` of the idle instances, each measured after its last call.                                                                                     |
 | `warmBudgetBytes` | `u64`               | The mark the registry sheds against (`--warm-budget-bytes`). 0 = watermarks disabled.                                                                                 |

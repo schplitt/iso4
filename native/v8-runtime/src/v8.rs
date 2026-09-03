@@ -788,6 +788,58 @@ thread_local! {
 /// the wire-facing side but allocated globally so no two live runs anywhere
 /// share one (wire run ids can collide across connections; tokens cannot).
 /// Starts at 1 — 0 means "no run".
+/// Per-instance thread-load signal, shared between the owner loop (writer)
+/// and the warm registry (reader) for join routing.
+pub struct InstanceLoad {
+    /// Thread utilization over the last closed window, per-mille.
+    util_permille: std::sync::atomic::AtomicU32,
+    /// When that window closed (ms since [`load_now_ms`]'s epoch). A stale
+    /// window means the loop is parked — utilization is genuinely ~0.
+    closed_at_ms: std::sync::atomic::AtomicU64,
+}
+
+/// Utilization windows: closed every 100 ms of wall time; a reading older
+/// than 500 ms reports 0 (parked loop).
+const LOAD_WINDOW_MS: u64 = 100;
+const LOAD_STALE_MS: u64 = 500;
+
+/// Milliseconds on the process-wide load epoch (cross-thread comparable).
+pub fn load_now_ms() -> u64 {
+    static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
+    ANCHOR.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+impl InstanceLoad {
+    pub fn new() -> Self {
+        Self {
+            util_permille: std::sync::atomic::AtomicU32::new(0),
+            closed_at_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn close_window(&self, permille: u32) {
+        self.util_permille
+            .store(permille, std::sync::atomic::Ordering::Release);
+        self.closed_at_ms
+            .store(load_now_ms(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// Recent utilization for routing; 0 when the last window is stale.
+    pub fn current_util_permille(&self) -> u32 {
+        let at = self.closed_at_ms.load(std::sync::atomic::Ordering::Acquire);
+        if load_now_ms().saturating_sub(at) > LOAD_STALE_MS {
+            return 0;
+        }
+        self.util_permille.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for InstanceLoad {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn alloc_run_token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -4099,11 +4151,16 @@ pub fn serve_instance(
     first: JobMsg,
     jobs: &crossbeam_channel::Receiver<JobMsg>,
     events: &crossbeam_channel::Receiver<RoutedEvent>,
+    load: &InstanceLoad,
 ) {
     let mut live: Vec<LiveRun> = Vec::new();
     let mut deadlines = DeadlineHeap::new();
     let mut pending_abandons: HashMap<u64, PendingAbandon> = HashMap::new();
     let mut jobs_open = true;
+    // Utilization bookkeeping: busy time per wall window, published for the
+    // registry's join routing.
+    let mut window_start = std::time::Instant::now();
+    let mut busy_nanos: u64 = 0;
 
     // The job that triggered instance creation, then the loop.
     if dispatch_job(
@@ -4149,6 +4206,7 @@ pub fn serve_instance(
             }
         };
 
+        let turn_started = std::time::Instant::now();
         match picked {
             Picked::Deadline => {
                 // The select timed out: the event queue was empty for the
@@ -4283,6 +4341,17 @@ pub fn serve_instance(
                     return;
                 }
             }
+        }
+
+        busy_nanos += turn_started.elapsed().as_nanos() as u64;
+        let window = window_start.elapsed();
+        if window.as_millis() as u64 >= LOAD_WINDOW_MS {
+            let permille = (busy_nanos.saturating_mul(1000)
+                / (window.as_nanos() as u64).max(1))
+            .min(1000) as u32;
+            load.close_window(permille);
+            window_start = std::time::Instant::now();
+            busy_nanos = 0;
         }
     }
 }

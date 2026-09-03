@@ -723,6 +723,7 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
   function encodeStatsPayload(stats: {
     oneoffRunning: number
     warmBusy: number
+    warmRuns: number
     warmIdle: number
     idleHeapBytes: number
     warmBudgetBytes: number
@@ -735,6 +736,7 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     return Buffer.concat([
       u32(stats.oneoffRunning),
       u32(stats.warmBusy),
+      u32(stats.warmRuns),
       u32(stats.warmIdle),
       u64(stats.idleHeapBytes),
       u64(stats.warmBudgetBytes),
@@ -751,6 +753,7 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     const snapshot = {
       oneoffRunning: 1,
       warmBusy: 2,
+      warmRuns: 2,
       warmIdle: 3,
       idleHeapBytes: 5_000_000_000, // above u32 — exercises the u64 read
       warmBudgetBytes: 7_000_000_000, // also above u32
@@ -770,6 +773,7 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     const snapshot = {
       oneoffRunning: 0,
       warmBusy: 0,
+      warmRuns: 0,
       warmIdle: 0,
       idleHeapBytes: 0,
       warmBudgetBytes: 0,
@@ -786,6 +790,7 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     const good = encodeStatsPayload({
       oneoffRunning: 0,
       warmBusy: 0,
+      warmRuns: 0,
       warmIdle: 1,
       idleHeapBytes: 42,
       warmBudgetBytes: 42,
@@ -805,6 +810,7 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
     const good = encodeStatsPayload({
       oneoffRunning: 0,
       warmBusy: 0,
+      warmRuns: 0,
       warmIdle: 0,
       idleHeapBytes: 0,
       warmBudgetBytes: 0,
@@ -814,17 +820,17 @@ describe('decodeStatsPayload (protocol.md §5.7)', () => {
       underPressure: false,
       prefixes: [],
     })
-    // underPressure sits after 3×u32 + 5×u64 = offset 52. Any byte other
+    // underPressure sits after 4×u32 + 5×u64 = offset 56. Any byte other
     // than 0/1 there means the frame is misaligned — must fail loudly, not
     // decode as `false`.
     const badLatch = Buffer.from(good)
-    badLatch[3 * 4 + 5 * 8] = 2
+    badLatch[4 * 4 + 5 * 8] = 2
     expect(() => decodeStatsPayload(badLatch)).toThrow(PayloadDecodeError)
 
     // A u64 above 2^53-1 is no real byte count; Number() would silently
-    // round it. rssBytes sits at offset 28.
+    // round it. rssBytes sits after 4×u32 + 2×u64.
     const badU64 = Buffer.from(good)
-    badU64.writeBigUInt64BE(2n ** 60n, 3 * 4 + 2 * 8)
+    badU64.writeBigUInt64BE(2n ** 60n, 4 * 4 + 2 * 8)
     expect(() => decodeStatsPayload(badU64)).toThrow(PayloadDecodeError)
   })
 })

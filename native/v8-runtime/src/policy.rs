@@ -177,6 +177,78 @@ pub struct AdmitFacts {
     pub budget_bytes: u64,
 }
 
+/// Thread-utilization line, per-mille: a spawn is justified when a
+/// prefix's CPU demand exceeds its instances × this, and a join skips
+/// instances hotter than this (pack-with-spillover).
+pub const UTILIZATION_TARGET_PERMILLE: u32 = 800;
+
+/// Everything the join-or-spawn decision reads about one prefix.
+#[derive(Clone, Copy, Debug)]
+pub struct SpawnFacts {
+    /// Arrival-rate EWMA (runs/second).
+    pub arrivals_per_sec: f64,
+    /// Mean CPU per run (EWMA, ms). `None` = no run of this prefix has
+    /// completed yet.
+    pub cpu_ms_per_run: Option<f64>,
+    /// Live (non-dead) instances of the prefix.
+    pub live_instances: usize,
+    /// CPU cores — the per-prefix instance ceiling (more can never
+    /// execute in parallel).
+    pub cores: usize,
+}
+
+/// Open another instance for this prefix, or join a busy one?
+///
+/// Spawn when CPU demand — arrivals/s × CPU/run, i.e. thread-seconds per
+/// second — exceeds what the live instances absorb at the utilization
+/// target. Unknown CPU (nothing completed yet) spawns: today's
+/// one-instance-per-run behavior until data exists, so a compute-heavy
+/// prefix is never serialized by a wrong guess.
+pub fn should_spawn(f: &SpawnFacts) -> bool {
+    if f.live_instances >= f.cores {
+        return false;
+    }
+    let Some(cpu_ms) = f.cpu_ms_per_run else {
+        return true;
+    };
+    let demand_threads = f.arrivals_per_sec * cpu_ms / 1000.0;
+    let absorbed = f.live_instances as f64 * f64::from(UTILIZATION_TARGET_PERMILLE) / 1000.0;
+    demand_threads > absorbed
+}
+
+/// What join routing knows about one live instance. Dead (tainted /
+/// retiring / cap-mismatched) instances must not appear in the slice.
+#[derive(Clone, Copy, Debug)]
+pub struct JoinFact {
+    /// Runs currently attached (parked ones included).
+    pub in_flight: usize,
+    /// Recent thread utilization, per-mille (0 = idle or parked).
+    pub util_permille: u32,
+}
+
+/// Pack: the FULLEST instance whose thread is not saturated — joins
+/// concentrate so surplus instances drain to idle and become evictable.
+/// `None` = every instance is saturated (the caller spills over to a spawn,
+/// then to [`join_fallback`]).
+pub fn pick_join_target(instances: &[JoinFact]) -> Option<usize> {
+    instances
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.util_permille < UTILIZATION_TARGET_PERMILLE)
+        .max_by_key(|(_, f)| f.in_flight)
+        .map(|(i, _)| i)
+}
+
+/// Everything is saturated and no spawn is possible: the least-utilized
+/// instance takes the run anyway — degraded latency, correct behavior.
+pub fn join_fallback(instances: &[JoinFact]) -> Option<usize> {
+    instances
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, f)| (f.util_permille, f.in_flight))
+        .map(|(i, _)| i)
+}
+
 /// May a NEW isolate be created for this run? (#77 ruling: never create an
 /// isolate whose own cap could tip the container over the hard line — the
 /// newest admission always leaves one worst-case isolate of headroom.)
@@ -427,5 +499,58 @@ mod tests {
     fn an_uncapped_run_with_watermarks_disabled_is_admitted() {
         // budget 0 = the embedder opted out of memory protection entirely.
         assert!(admit(10_000, 0, 900, 0));
+    }
+
+    fn spawn_facts(rate: f64, cpu: Option<f64>, live: usize) -> SpawnFacts {
+        SpawnFacts {
+            arrivals_per_sec: rate,
+            cpu_ms_per_run: cpu,
+            live_instances: live,
+            cores: 8,
+        }
+    }
+
+    #[test]
+    fn compute_demand_beyond_the_instances_spawns() {
+        // 100 runs/s × 20 ms CPU = 2.0 threads of demand: one instance
+        // (0.8 absorbed) spawns, three (2.4) join.
+        assert!(should_spawn(&spawn_facts(100.0, Some(20.0), 1)));
+        assert!(!should_spawn(&spawn_facts(100.0, Some(20.0), 3)));
+    }
+
+    #[test]
+    fn waiting_heavy_traffic_joins() {
+        // 100 runs/s × 1 ms CPU = 0.1 threads — one instance absorbs it.
+        assert!(!should_spawn(&spawn_facts(100.0, Some(1.0), 1)));
+    }
+
+    #[test]
+    fn unknown_cpu_spawns_until_data_exists() {
+        assert!(should_spawn(&spawn_facts(0.5, None, 3)));
+    }
+
+    #[test]
+    fn the_cores_ceiling_stops_spawning_regardless_of_demand() {
+        assert!(!should_spawn(&spawn_facts(10_000.0, Some(1_000.0), 8)));
+        assert!(!should_spawn(&spawn_facts(1.0, None, 8)));
+    }
+
+    fn jf(in_flight: usize, util: u32) -> JoinFact {
+        JoinFact { in_flight, util_permille: util }
+    }
+
+    #[test]
+    fn joins_pack_onto_the_fullest_unsaturated_instance() {
+        // 5 runs but saturated → skipped; the 2-run instance beats the 1-run.
+        let facts = [jf(5, 950), jf(2, 100), jf(1, 50)];
+        assert_eq!(pick_join_target(&facts), Some(1));
+    }
+
+    #[test]
+    fn all_saturated_spills_over() {
+        let facts = [jf(5, 950), jf(2, 900)];
+        assert_eq!(pick_join_target(&facts), None);
+        // Fallback (no spawn possible): least-utilized takes it.
+        assert_eq!(join_fallback(&facts), Some(1));
     }
 }

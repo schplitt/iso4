@@ -45,11 +45,14 @@ describe('stress smoke: execution model under concurrent load', () => {
     }
   })
 
-  test('taint/evict under concurrent load: blown calls fail alone, the rest succeed', async () => {
+  test('taint/evict under concurrent load: blown calls fail with their code, co-residents reset cleanly', async () => {
     // Interleave limit-blowing calls with healthy ones on one prefix across
-    // two slots. Every blown call must fail with its limit code, every
-    // healthy call must succeed, and afterwards the prefix must still serve
-    // a clean call — eviction of tainted instances never poisons neighbors.
+    // two slots. Every blown call must fail with its limit code. A healthy
+    // call either succeeds or — since #77 lets runs JOIN a busy instance —
+    // was co-resident with a culprit when the guard fired mid-JS and fails
+    // as the #81-ruled innocent victim: ERR_INSTANCE_RESET carrying the
+    // cause and the culprit's run id, never a hang or a wrong value.
+    // Afterwards the prefix must still serve a clean call.
     await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
     await using prefix = await sandbox.prepare({
       code: `${COUNTER}\nexport function spin() { for (;;) {} }`,
@@ -73,8 +76,13 @@ describe('stress smoke: execution model under concurrent load', () => {
         expect(['ERR_CPU_TIMEOUT', 'ERR_WALL_TIMEOUT']).toContain(
           result.error.code,
         )
-      } else {
-        expect(result.ok).toBe(true)
+      } else if (!result.ok) {
+        expect(result.status).toBe('failed')
+        if (result.status !== 'failed')
+          continue
+        expect(result.error.code).toBe('ERR_INSTANCE_RESET')
+        expect(result.error.resetCause).toBe('cpu')
+        expect(result.error.culpritRunId).toBeTypeOf('number')
       }
     }
 

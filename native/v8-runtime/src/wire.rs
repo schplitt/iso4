@@ -651,6 +651,7 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
     let mut out = Vec::new();
     encode_count(stats.oneoff_running, &mut out);
     encode_count(stats.warm_busy, &mut out);
+    encode_count(stats.warm_runs, &mut out);
     encode_count(stats.warm_idle, &mut out);
     encode_u64(stats.idle_heap_bytes, &mut out);
     encode_u64(stats.warm_budget_bytes, &mut out);

@@ -262,6 +262,34 @@ describe('saturation queues FIFO', () => {
   })
 })
 
+describe('prefix-aware acquire (#77)', () => {
+  test('waiting-heavy concurrent runs share one instance', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 4 })
+    await using prefix = await sandbox.prepare({ code: SLOW, globals: { hostSleep } })
+
+    // Seed the prefix's demand averages: one completed run whose CPU share
+    // is tiny (it parks on the host sleep). Until this completes, concurrent
+    // runs would spawn their own isolates (unmeasured = pre-#77 behavior).
+    const seed = await prefix.call({ export: 'slow', args: [20] })
+    expect(seed.ok).toBe(true)
+
+    // Three concurrent waiting-heavy runs: measured CPU demand is far under
+    // one thread (sub-ms CPU × tens of arrivals/s), so they must all JOIN
+    // the one warm instance instead of opening three isolates.
+    const batch = [1, 2, 3].map(() =>
+      prefix.call({ export: 'slow', args: [400], limits: { cpuTimeMs: 5_000 } }))
+    await sleep(150)
+    const stats = await sandbox.stats()
+    expect(stats.activeRuns).toBe(3)
+    const perPrefix = Object.values(stats.prefixes)[0]
+    expect(perPrefix?.busy).toBe(1)
+    expect(stats.warmInstances).toBe(1)
+
+    for (const result of await Promise.all(batch))
+      expect(result.ok).toBe(true)
+  })
+})
+
 describe('lazy connections', () => {
   test('connections open on demand and are kept for reuse', async () => {
     // createSandbox no longer opens one socket per capacity unit up front:
