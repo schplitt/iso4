@@ -123,9 +123,10 @@ export interface ResourceLimits {
  * permitted. Each value becomes a bridge stub in the sandbox global object.
  *
  * Reserved names (rejected with `ERR_UNDECLARED_BINDING`): `console`,
- * `waitUntil`, `Headers`, `Request`, `Response`, `TextEncoder`,
- * `TextDecoder`, `URL`, `URLSearchParams`. These are owned by the runtime;
- * shadowing `Response` would silently break serialization.
+ * `waitUntil`, `setTimeout`, `clearTimeout`, `Headers`, `Request`,
+ * `Response`, `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`. These
+ * are owned by the runtime; shadowing `Response` would silently break
+ * serialization.
  *
  * Common usage:
  * ```ts

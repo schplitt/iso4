@@ -1721,8 +1721,9 @@ describe('resource limits', () => {
   })
 
   test('wall guard fires before cpu guard (tight loop)', async () => {
-    // Pure async hang (await neverResolvingPromise) requires Phase 4 bridge.
-    // Instead: tight loop with wallTimeMs << cpuTimeMs so wall fires first.
+    // Deliberately a SYNCHRONOUS spin (the async variant lives in the CPU
+    // budget section as a native sleep): the wall guard must kill mid-JS
+    // when wallTimeMs << cpuTimeMs.
     const result = await runtime.run({
       code: 'let i = 0; while (true) { i++; }',
       limits: { wallTimeMs: 200, cpuTimeMs: 30_000 },
@@ -2926,30 +2927,22 @@ describe('CPU budget vs wall time', () => {
     await runtime?.dispose()
   })
 
-  test.skip('time waiting on bridge does not consume CPU budget', async () => {
-    // cpuTimeMs is tight (100ms) but the bridge call takes 300ms.
-    // The run must succeed because bridge-wait time is excluded from CPU budget.
+  test('time waiting on a native sleep does not consume CPU budget', async () => {
+    // cpuTimeMs is tight (100ms) but the sleep takes 300ms. The run must
+    // succeed because a sleep parks the loop outside the CPU budget —
+    // waiting is not computing. (#79: no bridge involved at all.)
     const result = await runtime.run({
       code: `
-        import { sleep } from 'host:time'
-        await sleep(300)
+        await new Promise(r => setTimeout(r, 300))
         export default 'done'
       `,
       limits: { cpuTimeMs: 100, wallTimeMs: 5000 },
-      imports: {
-
-        'host:time': {
-          sleep: (ms: unknown) =>
-            new Promise((r) => {
-              setTimeout(r, Number(ms))
-            }),
-        },
-      },
     })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
     expect(result.exports.default).toBe('done')
+    expect(result.cpuTimeMs).toBeLessThan(100)
   })
 
   test('tight synchronous loop hits ERR_CPU_TIMEOUT not ERR_WALL_TIMEOUT', async () => {
@@ -2966,13 +2959,11 @@ describe('CPU budget vs wall time', () => {
   })
 
   test('slow async run with no CPU work hits ERR_WALL_TIMEOUT', async () => {
-    // wallTimeMs is tight; cpuTimeMs is generous.
-    // A tight loop with wall_time_ms < cpu_time_ms should hit the wall clock
-    // before the CPU budget fires.
-    // Note: setTimeout is not available without bridge (Phase 4). Using a tight
-    // loop instead — wall guard fires first because wallTimeMs << cpuTimeMs.
+    // wallTimeMs is tight; cpuTimeMs is generous. A sleep burns no CPU at
+    // all, so only the wall guard can end this run — and it must, or
+    // `setTimeout(f, 1e9)` would be an unkillable run.
     const result = await runtime.run({
-      code: 'let i = 0; while (true) { i++; }',
+      code: 'await new Promise(r => setTimeout(r, 60_000)); export default 1',
       limits: { cpuTimeMs: 30_000, wallTimeMs: 200 },
     })
     expect(result.ok).toBe(false)
@@ -2980,6 +2971,158 @@ describe('CPU budget vs wall time', () => {
       return
     expect(result.error.code).toBe('ERR_WALL_TIMEOUT')
   }, 5_000)
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 15b. Native timers (#79): setTimeout/clearTimeout as loop deadlines
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('native timers', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('the reported idiom works between two bridge calls', async () => {
+    // The codemode motivation: POST, wait for eventual consistency, GET.
+    const calls: string[] = []
+    const result = await runtime.run({
+      code: `
+        await post()
+        await new Promise(r => setTimeout(r, 100))
+        const got = await get()
+        export default got
+      `,
+      globals: {
+        post: async () => {
+          calls.push('post')
+          return 'created'
+        },
+        get: async () => {
+          calls.push('get')
+          return 'found'
+        },
+      },
+    })
+    expect(result.ok, result.ok ? undefined : JSON.stringify(result.error)).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('found')
+    expect(calls).toEqual(['post', 'get'])
+  })
+
+  test('clearTimeout cancels; ids are per-run numbers; ordering holds', async () => {
+    const result = await runtime.run({
+      code: `
+        const seen = []
+        setTimeout(() => seen.push('late'), 60)
+        const dead = setTimeout(() => seen.push('never'), 10)
+        setTimeout(() => seen.push('early'), 20)
+        clearTimeout(dead)
+        await new Promise(r => setTimeout(r, 90))
+        export default { seen, deadIsNumber: typeof dead === 'number' }
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toEqual({
+      seen: ['early', 'late'],
+      deadIsNumber: true,
+    })
+  })
+
+  test('setTimeout cannot be shadowed by a host global', async () => {
+    const result = await runtime.run({
+      code: 'export default 1',
+      globals: { setTimeout: async () => 'impostor' },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.message).toMatch(/reserved/)
+  })
+
+  test('setTimeout at prefix top level fails prepare() with a clear error', async () => {
+    // No loop exists while a prefix evaluates — the call throws instead of
+    // hanging (workerd's explicit route). Uncaught, it fails prepare().
+    await expect(
+      runtime.prepare({ code: 'setTimeout(() => {}, 5)' }),
+    ).rejects.toThrow(/only available to run code/)
+  })
+
+  test('timers work on warm prefix runs, and grace work may sleep', async () => {
+    const prefix = await runtime.prepare({
+      code: 'globalThis.sleep = ms => new Promise(r => setTimeout(r, ms))',
+    })
+    try {
+      // Run A: registers grace work that sleeps — the run's value ships at
+      // Result while the timer is still pending on the instance loop.
+      const a = await prefix.run({
+        code: `
+          waitUntil((async () => { await sleep(120); console.log('grace woke') })())
+          export default 'early'
+        `,
+        limits: { graceMs: 5_000 },
+      })
+      expect(a.ok).toBe(true)
+      if (!a.ok)
+        return
+      expect(a.exports.default).toBe('early')
+
+      // Run B lands while A's grace timer is pending — the instance loop
+      // serves both (slot freed at Result since #127).
+      const b = await prefix.run({
+        code: 'await sleep(30); export default \'b done\'',
+      })
+      expect(b.ok).toBe(true)
+      if (!b.ok)
+        return
+      expect(b.exports.default).toBe('b done')
+
+      const report = await a.waitUntil!
+      expect(report.status).toBe('settled')
+      expect(report.stdout).toContain('grace woke')
+    } finally {
+      await prefix.dispose()
+    }
+  })
+
+  test('a settled run\'s pending timer never fires into the next run', async () => {
+    const prefix = await runtime.prepare({
+      code: 'globalThis.hit = \'untouched\'',
+    })
+    try {
+      const armed = await prefix.run({
+        code: `
+          setTimeout(() => { globalThis.hit = 'FIRED' }, 20)
+          export default 'armed'
+        `,
+      })
+      expect(armed.ok).toBe(true)
+      await new Promise<void>((r) => {
+        setTimeout(r, 60)
+      })
+      const later = await prefix.run({
+        code: `
+          await new Promise(r => setTimeout(r, 30))
+          export default globalThis.hit
+        `,
+      })
+      expect(later.ok).toBe(true)
+      if (!later.ok)
+        return
+      expect(later.exports.default).toBe('untouched')
+    } finally {
+      await prefix.dispose()
+    }
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

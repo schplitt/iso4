@@ -304,9 +304,11 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 - **`iso4` has no HTTP client and no network policy.** Mechanical hygiene
   (header validation, URL parsing, body cap) lives in `iso4`. Real fetch
   behavior + policy lives in `@iso4/fetch` or in host code.
-- **No callbacks across the boundary** in v1. No `setTimeout`, no
-  event listeners on host objects. Functions passed as host-import
-  arguments are rejected with `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`.
+- **No callbacks across the boundary** in v1. No host-shipped callbacks,
+  no event listeners on host objects. Functions passed as host-import
+  arguments are rejected with `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED`. (The
+  native `setTimeout`/`clearTimeout` globals are runtime-internal — their
+  callbacks never cross the boundary; DESIGN.md §7 item 8.)
 - **One execution model in this product.** `@iso4/sandbox` ships one API
   shape: independent runs against a prepared prefix (`prefix.execute()` /
   `prefix.call()`, plus one-off `sandbox.run()`). Warm instances make those

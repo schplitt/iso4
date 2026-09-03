@@ -202,7 +202,7 @@ pub struct FrozenClock {
 /// Wall clock in whole ms since the epoch — the value the frozen clock
 /// advances to. Truncation to ms is deliberate: the guest never sees sub-ms
 /// resolution even at an advance boundary.
-fn wall_now_ms() -> f64 {
+pub(crate) fn wall_now_ms() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
@@ -227,6 +227,39 @@ pub fn advance_frozen_clock(scope: &mut v8::PinScope) {
     let cell = v8::Local::new(scope, &clock.cell);
     let prop = v8::Local::new(scope, &clock.prop);
     let value = v8::Number::new(scope, now);
+    cell.set(scope, prop.into(), value.into());
+}
+
+/// The current isolate's frozen-clock value (epoch ms), or `None` when the
+/// web runtime was never installed. Timer registration reads it: a
+/// `setTimeout` deadline is scheduled FROM this value (workerd's model), so
+/// the delay the guest asked for and the clock it observes tell one story.
+pub fn frozen_now_ms(scope: &mut v8::PinScope) -> Option<f64> {
+    scope
+        .get_slot::<std::rc::Rc<FrozenClock>>()
+        .map(|clock| clock.prev.get())
+}
+
+/// Advance the current isolate's frozen clock to `max(current, target_ms)`.
+///
+/// The timer-turn advance: a firing timer moves the clock to its SCHEDULED
+/// time (frozen-at-registration + delay), never to the real wall — a timer
+/// that revealed real elapsed time would undo the session-0 freeze. The
+/// target never exceeds the real wall at fire time by construction (the
+/// timer fires exactly when the wall reaches its scheduled epoch-ms value,
+/// or later), so monotonicity against real-wall advances is preserved.
+pub fn advance_frozen_clock_to(scope: &mut v8::PinScope, target_ms: f64) {
+    let Some(clock) = scope.get_slot::<std::rc::Rc<FrozenClock>>().cloned() else {
+        return;
+    };
+    let target = target_ms.trunc();
+    if target <= clock.prev.get() {
+        return;
+    }
+    clock.prev.set(target);
+    let cell = v8::Local::new(scope, &clock.cell);
+    let prop = v8::Local::new(scope, &clock.prop);
+    let value = v8::Number::new(scope, target);
     cell.set(scope, prop.into(), value.into());
 }
 

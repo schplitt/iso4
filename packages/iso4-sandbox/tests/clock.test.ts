@@ -1,8 +1,9 @@
 /**
  * Timing posture pins (DESIGN.md §1.2): the sandbox clock is frozen while
  * guest code executes and advances only when the runtime regains control at
- * a socket frame — run entry, bridge responses, stream frames. All
- * guest-visible clocks (Date, no-arg Intl.DateTimeFormat formatting,
+ * an event — run entry, bridge responses, stream frames (to real wall
+ * time), and native timer fires (to the timer's SCHEDULED time only, #79).
+ * All guest-visible clocks (Date, no-arg Intl.DateTimeFormat formatting,
  * Temporal.Now) read the same frozen value; SharedArrayBuffer is removed and
  * Atomics.wait is disabled, so no replacement timer can be built.
  *
@@ -183,6 +184,74 @@ describe('frozen clock — warm prefix path', () => {
       return
     expect((second.exports.default as number) - one.now).toBeGreaterThanOrEqual(20)
     await prefix.dispose()
+  })
+})
+
+describe('frozen clock — native timers (#79)', () => {
+  // Timers virtualize onto the frozen clock, the workerd model: the delay
+  // is scheduled FROM the frozen value and the fire advances the clock TO
+  // exactly the scheduled value. A timer therefore never reveals real
+  // elapsed wall time — the pins below are exact equalities on purpose.
+
+  test('Date.now() advances by exactly the requested delay across a sleep', async () => {
+    const delta = await evalDefault(`
+      const a = Date.now()
+      await new Promise(r => setTimeout(r, 120))
+      export default Date.now() - a
+    `)
+    expect(delta).toBe(120)
+  })
+
+  test('a zero-delay timer after a CPU burn reveals no elapsed time', async () => {
+    // The setTimeout(0) probe: the burn is real wall time the freeze hides,
+    // and the timer fire must keep hiding it.
+    const delta = await evalDefault(`
+      const a = Date.now()
+      let x = 0
+      for (let i = 0; i < 5e6; i++) x = (x + i) % 97
+      await new Promise(r => setTimeout(r, 0))
+      export default Date.now() - a
+    `)
+    expect(delta).toBe(0)
+  })
+
+  test('chained sleeps accumulate exactly and stay monotone', async () => {
+    const out = await evalDefault(`
+      const a = Date.now()
+      await new Promise(r => setTimeout(r, 30))
+      const b = Date.now()
+      await new Promise(r => setTimeout(r, 40))
+      const c = Date.now()
+      export default { first: b - a, second: c - b }
+    `)
+    expect(out).toEqual({ first: 30, second: 40 })
+  })
+
+  test('the clock stays constant within a timer callback turn', async () => {
+    const ok = await evalDefault(`
+      const inside = await new Promise(r => setTimeout(() => {
+        const t1 = Date.now()
+        let x = 0
+        for (let i = 0; i < 2e6; i++) x += i
+        r(Date.now() === t1)
+      }, 10))
+      export default inside
+    `)
+    expect(ok).toBe(true)
+  })
+
+  test('a bridge advance past a timer\'s scheduled time cannot run the clock backwards', async () => {
+    // The host response advances the clock to real wall; a timer scheduled
+    // earlier (but fired later) must clamp to max(prev, scheduled).
+    const ok = await evalDefault(`
+      const stamps = [Date.now()]
+      await new Promise(r => setTimeout(r, 5))
+      stamps.push(Date.now())
+      await new Promise(r => setTimeout(r, 5))
+      stamps.push(Date.now())
+      export default stamps[1] >= stamps[0] && stamps[2] >= stamps[1]
+    `)
+    expect(ok).toBe(true)
   })
 })
 
