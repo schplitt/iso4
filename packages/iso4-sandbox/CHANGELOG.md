@@ -1,5 +1,314 @@
 # @iso4/sandbox
 
+## 0.5.0
+
+### Minor Changes
+
+- 2f90212: feat: runs share connections, and a run's slot frees at its Result (#127)
+
+  Concurrent runs are multiplexed onto shared connections (several per
+  socket, routed by run id) instead of opening one connection each, and a run
+  with pending `waitUntil` work no longer holds admission capacity during its
+  background grace phase. `maxConcurrentRuns` semantics are unchanged;
+  `SandboxStats.openConnections` now tracks roughly peak concurrency divided
+  by the per-connection share instead of peak concurrency.
+
+- c6c7d13: chore: bump the v8 crate 130 → 147 (V8 13.0 → 14.7)
+
+  The serialization format is unchanged, so `@iso4/sandbox` and `@iso4/v8-*`
+  still pair exactly as before. Most native paths are 10–47 % faster.
+
+- 344d259: feat: capacity manager — memory budget and `sandbox.stats()` (#65)
+
+  New `memoryBudgetMb` decides how many isolates stay alive, container-aware by
+  default, while `maxIsolates` still caps concurrent runs. `sandbox.stats()`
+  returns a capacity snapshot over a control connection outside the run pool.
+
+- 16cce13: feat: memory capacity rails — global-container metering, a hard admission line, and bounded queueing (#77)
+
+  Memory watermarks now measure the whole container (cgroup working set,
+  Node host included) instead of the runtime child alone, the budget default
+  becomes 80% of the container limit minus a 256 MB host reserve, and a new
+  isolate is never created when measured usage plus the run's `memoryMb`
+  would cross 90% of that base — such runs fail with the new `ERR_CAPACITY`
+  code instead of queueing. `maxConcurrentRuns`' automatic default is now
+  memory-bounded, and the new `maxQueuedRuns` (default 100 × slots) sheds
+  callers past the queue bound with the new `ERR_QUEUE_FULL` code.
+
+- a5a6739: fix: connection integrity and result correlation (#73)
+
+  Every `Result` is matched against the run that asked for it, and a connection
+  whose frame alignment is in doubt is replaced rather than reused. `maxIsolates`
+  is now a capacity rather than a fixed set of connections, and there is a new
+  host-detected error code `ERR_PROTOCOL_DESYNC`.
+
+- e074119: feat: RSS watermark + scored eviction — `heapUsed × idleTime` (#66)
+
+  The memory budget is enforced against the runtime's own process RSS: at the
+  mark, idle warm instances are evicted by score and new warm admissions stop
+  until RSS falls back to 80 % of it. `sandbox.stats()` gains `budgetBytes`,
+  `rssBytes` and `underPressure`; the instance-count cap is gone.
+
+- f962a14: Freeze the sandbox clock during execution, workerd-style. `Date.now()`, no-arg `new Date()`/`Date()`, no-arg `Intl.DateTimeFormat` formatting, and `Temporal.Now.*` all read one per-context value that advances — monotone, whole milliseconds — only when the runtime regains control at run entry, a bridge response, or a stream frame. Sandboxed code can no longer observe its own elapsed execution time, closing the timing side-channel between co-resident isolates. Explicit-argument `Date`/`Temporal`/`Intl` computation is untouched. Alongside it, `SharedArrayBuffer` is removed from the sandbox global (as in non-cross-origin-isolated browsers; `Atomics` on plain buffers keeps working) and `Atomics.wait` now throws, matching workerd.
+- b45658c: feat: host → sandbox function calls — `prefix.call({ export, args })` and `run({ code, call })` (#58)
+
+  Call a function that already lives in the sandbox, addressed by export path,
+  with arguments crossing as one V8 blob. An export that cannot cross no longer
+  fails a plain run — it is reported in the new `skippedExports` instead.
+
+- 71b3f26: feat: native `setTimeout`/`clearTimeout` in run code (#79)
+
+  Timers run natively in the runtime's event loop: a sleep costs no CPU budget but counts against the wall budget, `Date.now()` advances by exactly the requested delay, and a run's pending timers die with it. Both names are now reserved global names; `setInterval` is deliberately not provided.
+
+- ec9e042: feat: per-prefix and per-one-off heap caps (#77)
+
+  `prepare({ memoryMb })` caps every isolate serving that prefix, and one-off
+  `run()` accepts `limits.memoryMb` again for its fresh isolate — the
+  sandbox-level `memoryMb` becomes the default for both. Prefix
+  `execute()`/`call()` still reject a per-run value: warm isolates are shared
+  and their cap is fixed at creation.
+
+- f49f2b2: feat: prefix runs join busy instances; instances scale with measured CPU demand (#77)
+
+  A prefix run with no idle instance now joins a busy one (the engine
+  interleaves runs) instead of always cold-starting, and another isolate is
+  opened only when the prefix's measured CPU demand justifies it — so
+  waiting-heavy traffic stops piling up isolates while compute-heavy traffic
+  still scales out for response time. `SandboxStats.activeRuns` now counts
+  runs (several can share one instance); `warmInstances` counts instances as
+  before.
+
+- 911a82d: refactor: remove runtime V8 snapshot creation — prefixes are validated source, re-evaluated per run (#60, #61, #62)
+
+  The public API and the wire protocol are unchanged, but per-run latency now
+  includes prefix evaluation, and a nondeterministic prefix produces per-run
+  values. Closes the intermittent child-process crash under concurrent
+  `prepare()`.
+
+- bbcd205: feat: run-slot admission, lazy connections, and a per-run frame router (#126)
+
+  Breaking: `maxIsolates` is replaced by `maxConcurrentRuns` (same default) — it caps runs executing at once, the rest queue FIFO, and `AbortSignal.timeout()` bounds the wait. Connections to the runtime now open on demand instead of all at `createSandbox()`, and `stats()` gains `openConnections`.
+
+- 139386b: feat: session demux and per-instance turn loop (#125)
+
+  Runs no longer hold a thread while suspended on host calls, and a waiting
+  run's abort or timeout now fails that run alone instead of evicting its
+  warm instance. New error code
+  `ERR_INSTANCE_RESET` (with `resetCause` and `culpritRunId` on the error)
+  reports runs that were in flight on a shared instance when a co-resident run
+  had to be terminated mid-execution.
+
+- cf851bf: feat: sandbox web runtime — `Headers`, `Request`, `Response`, `URL`, `TextEncoder` and friends
+
+  `Request`, `Response` and `Headers` cross the boundary as real instances rather
+  than flattening to plain objects. New error code `ERR_TYPE_NOT_SERIALIZABLE`
+  for values that cannot cross; streams are deliberately unsupported.
+
+- e1b10fc: feat: upgrade to V8 15.2 and span Node 22–27 with one binary (#80)
+
+  The runtime picks up five V8 release lines of security fixes and performance
+  work. Serialized values keep the format every shipping Node reads, while the
+  handshake now also accepts hosts on newer Node lines that write V8's
+  next serialization format — so Node 22 through 27 pair with the same binary.
+
+- 467479f: feat!: replace the WireValue codec with V8 serialization blobs
+
+  Protocol version 1 → 2, so `@iso4/sandbox` and `@iso4/v8-*` must be updated
+  together and a mismatch now fails at `createSandbox()`. `Date`, `Map`, `Set`,
+  `RegExp`, `Error`, typed arrays and cycles round-trip as real instances, and
+  dense payloads are ~5.9× faster.
+
+- b2a19f8: feat: warm isolate registry — prefix runs reuse resident isolates (#64)
+
+  Warmth is a cache and never a guarantee: module-scope state may survive between
+  runs on an instance and may be evicted at any time. Breaking — `limits.memoryMb`
+  moves to `createSandbox({ memoryMb })` with the default raised to 128 MB; new
+  `ERR_WARMUP_LIMIT` and a new `heapUsedBytes` result field.
+
+- ea8937f: feat: widen `HostExportData` to everything V8 serialization carries
+
+  `Date`, `RegExp`, `Error`, `Map`, `Set`, `ArrayBuffer`, typed arrays, `DataView`
+  and cycles now cross as real instances. Host-module data leaves are no longer
+  inspected at registration, so an unsupported value fails with the serializer's
+  own error rather than one naming the exact leaf path.
+
+### Patch Changes
+
+- fd462aa: perf: cheaper per-call attribution for bridge calls and console output (#127)
+
+  Native callbacks resolve the owning run in one table lookup and take a
+  reference-counted handle to the stub binding instead of cloning it per
+  invocation. Attribution semantics are unchanged.
+
+- f1a2e24: fix: Request/Response clone() no longer shares its body buffer
+
+  A cloned Request or Response now gets its own copy of a buffer body, so
+  mutating one side's bytes no longer reaches through to the other.
+
+- 17a87e7: feat: disable eval and new Function in run code
+
+  Code generation from strings is now a prepare()-time capability: setup code can still compile functions from strings, but per-run code calling `eval` or `new Function` gets a catchable `EvalError` and the run continues.
+
+- f6cddb7: fix: a host that stops draining a connection can no longer stall sandbox execution (#127)
+
+  Outbound frames now go through a bounded per-connection queue with a
+  dedicated writer thread; a peer that stops reading fails that connection's
+  runs cleanly after a bounded wait instead of freezing every instance that
+  shares it.
+
+- 61e420c: Embed ICU data in the runtime binary. Locale-aware calls in sandboxed code (`toLocaleString`, `Intl.*`, `localeCompare`) previously aborted the whole V8 runtime process with "Fatal process out of memory: DateTimePatternGeneratorCache::CreateGenerator", leaving the sandbox unreachable for every subsequent run. They now return correctly localized output.
+- 8871645: fix: inbound frames are read against the flat protocol ceiling (#127)
+
+  Per-run frame allowances are still enforced per run, but the connection's
+  read ceiling is now a constant — it can no longer shrink under an in-flight
+  frame, so a large late frame for a just-completed run is discarded instead
+  of costing the connection.
+
+- 5ca5ab9: perf: receive large results without stalling the host
+
+  Incoming chunks are joined once per frame instead of re-concatenated per
+  chunk. A 15 MB result now takes ~19 ms rather than ~1.2 s.
+
+- f186aec: perf: the frozen-clock advance no longer allocates V8 state per turn (#127)
+
+  Clock handles are cached per isolate at install time; a turn within the
+  same wall millisecond now skips V8 entirely. Clock semantics are unchanged.
+
+- 5a5cfbe: fix: reject a supplied-but-malformed per-run global override
+
+  A per-run `globals` override that is present but not a function (e.g. a tenant
+  handler that resolves to `undefined`) now throws instead of silently falling
+  back to the precompile-time default, matching the imports side.
+
+- 03b9e46: perf: one shared watchdog thread now enforces all CPU/wall budgets (#145)
+
+  Warm instances hold one OS thread instead of two, so deployments with hard
+  per-container thread limits can keep roughly twice as many instances warm.
+  Budget and timeout semantics are unchanged.
+
+- dbd1caf: perf: instance turn loops route run events through one channel and a deadline heap (#127)
+
+  Frame routing on a busy instance no longer scales with the number of
+  in-flight runs, and boundary deadlines fire in arrival order: co-resident
+  frame traffic can neither starve a run's wall timeout nor turn a run whose
+  answer arrived in time into one.
+
+- 768d839: fix: install runtime-internal globals non-enumerable
+
+  The `__iso4_*` plumbing no longer appears in `Object.keys(globalThis)` or `for...in`; host-declared globals stay enumerable like browser globals. Sandbox code that enumerates its environment no longer trips over runtime internals.
+
+- 5ca5ab9: fix: stop the runtime when the host exits without `dispose()`
+
+  A last-resort `exit` hook now ends it. `dispose()` is still the only complete
+  answer, since a host killed by a signal runs no JavaScript.
+
+- f6b13f8: fix: a bridge handler settling after its run completed releases its streams (#127)
+
+  A streamed body returned by a handler whose run already finished no longer
+  leaves its host-side reader locked; the source is released since nothing
+  will ever pump it.
+
+- 3637971: fix: WHATWG-compliant URL in the sandbox
+
+  The sandbox `URL` is now backed natively by the ada parser (the one Node.js
+  uses) and passes the WPT URL test suite, including IDNA, relative resolution
+  and non-special schemes. `URL.parse`, `URL.canParse` and the previously
+  missing component setters are now available.
+
+- 926a690: feat: the runtime child marks itself as the preferred OOM victim (#77)
+
+  On Linux the spawned runtime raises its own `oom_score_adj` at startup, so
+  a container out-of-memory kill takes the sandbox child (failed runs, a
+  respawnable sandbox) instead of the Node host.
+
+- 7aec3d4: perf: outbound frames skip the writer thread when the socket is free (#127)
+
+  Removes the flat per-call overhead the bounded outbound queue introduced
+  for short, frequent calls; the writer thread still takes over whenever the
+  socket backs up, so stall isolation is unchanged.
+
+- a1f6e4a: feat: per-global opt-out of enumerability
+
+  The object global forms accept `enumerable: false` to keep an injected global out of `for...in` / `Object.keys` while staying callable, and new `{ kind: 'bridge', handler }` / `{ kind: 'string', expr }` object forms carry the option for what the shorthands declare. Shorthand globals stay enumerable.
+
+- 2e6fb0f: fix: an abort that arrives before its run starts still lands gracefully (#127)
+
+  A Terminate (or connection loss) racing ahead of the run's dispatch is now
+  remembered and answered when the run arrives, instead of falling back to
+  the host-side teardown timeout.
+
+- 1925209: fix: top-level `await` in prefix code no longer fails `prepare()` (#55)
+
+  The runtime now drains the microtask queue until the prefix's evaluation
+  promise settles. Two new error codes state the remaining limits:
+  `ERR_PREFIX_BRIDGE_CALL` and `ERR_PREFIX_DID_NOT_SETTLE`.
+
+- 1ed87b3: fix: identify runtime web types by an internal construction-time tag
+
+  Serializing a `Headers`, `Request` or `Response` no longer depends on the classes being intact on `globalThis`, and overriding `Symbol.hasInstance` can no longer change how an instance crosses the boundary.
+
+- c0de1ab: fix: preserve an own `__proto__` key crossing into the sandbox
+
+  Rebuilding a host-supplied plain object no longer triggers the prototype setter,
+  so an own-enumerable `__proto__` key (e.g. from `JSON.parse`) crosses as data
+  instead of being silently dropped.
+
+- cf037f8: perf: cut fixed per-run overhead — ~4 % hot-run latency, ~6 % throughput
+
+  Per-run trace logs are off by default; set `ISO4_V8_TRACE=1` to restore them.
+  Prefix snapshots are shared by handle instead of copied twice per run.
+
+- 9819e84: fix: reject URL credentials and control-char statusText in the sandbox
+
+  `new Request(url)` now throws when the URL includes credentials (fetch spec),
+  and `new Response` rejects a `statusText` containing control characters
+  (mirroring workerd) — so these fail on the user's line rather than host-side.
+
+- 51e824d: fix: keep resource limits armed through result serialization
+
+  Serializing a run's result executes guest getters, so it now stays under the
+  run's CPU, wall and memory budgets; serialization time counts against
+  `cpuTimeMs`/`wallTimeMs`.
+
+- 6c8c0da: fix: rehydrate only host-emitted host-type descriptors, stamped per session
+
+  Host-to-sandbox `Headers`/`Request`/`Response` descriptors now carry a random per-sandbox stamp negotiated at connection setup, and the runtime rebuilds only stamped descriptors. Structured data passed into a run can no longer be reinterpreted as a host type, and no property name is reserved anymore.
+
+- 343da7a: fix: replace the argv auth token with a kernel-enforced private socket directory
+
+  The runtime socket now lives in a fresh owner-only (0700) per-sandbox directory, so access is enforced by the kernel at connect time. The token is gone from the spawn args and the wire handshake (`@iso4/sandbox` and `@iso4/v8-*` are released in lockstep).
+
+- 3504569: fix: an instance thread that fails to spawn fails only its own run (#127)
+
+  Under process resource exhaustion the affected run now reports
+  ERR_INTERNAL and the connection keeps serving, instead of the runtime
+  panicking the connection's demux.
+
+- 5ca5ab9: fix: clean up the runtime process when `createSandbox()` fails
+
+  A failed startup left the runtime running with no `Sandbox` to dispose it. A
+  runtime that exits during startup is now reported with its exit code instead
+  of a socket timeout.
+
+- 985e9b6: fix: stream frames must carry a real run id (#127)
+
+  An unattributed stream frame (run id 0) now tears the connection down as a
+  protocol desync instead of being matched to a run by stream id — with
+  several runs on one connection that guess could credit or cancel the wrong
+  run's body stream. The production runtime always tags stream frames.
+
+- 6cb167b: feat: stream large Request/Response bodies into the sandbox
+
+  A host body that outgrows a 64 KiB probe now crosses as a stream pumped under flow control instead of being buffered whole: lower memory, and the sandbox starts reading on the first chunk via `.body` or the body helpers. Small bodies keep the buffered path unchanged; returning a streamed body to the host still requires reading it first.
+
+- ba357d0: fix: identify runtime web types independently of one another during serialization
+
+  Serializing a `Headers`, `Request` or `Response` no longer fails just because sandbox code removed or shadowed one of the other classes on `globalThis`.
+
+- 3586fcd: feat: `waitUntil()` lets a run finish background work after its result
+
+  Sandbox code can register background work with the new `waitUntil(promise)` global (also importable from `iso4:runtime`); the caller gets the result immediately and the work keeps running up to a configurable grace budget (`limits.graceMs`, default 30 s). The outcome arrives as `result.waitUntil`, a never-rejecting promise with status and telemetry.
+
 ## 0.4.1
 
 ### Patch Changes
