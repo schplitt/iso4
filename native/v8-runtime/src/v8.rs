@@ -694,6 +694,67 @@ impl StreamTable {
     }
 }
 
+// ── Guest timers (#79) ───────────────────────────────────────────────────────
+
+/// Cap on pending timers per run (workerd's number). The entries live
+/// outside the isolate heap, where `memoryMb` cannot see them.
+const MAX_PENDING_TIMERS: usize = 10_000;
+
+/// Delay cap (workerd's "100 years") — bounds the `Instant` arithmetic.
+const MAX_TIMER_DELAY_MS: f64 = 3_153_600_000_000.0;
+
+/// One armed `setTimeout` registration.
+struct TimerEntry {
+    callback: v8::Global<v8::Function>,
+    /// Extra `setTimeout(fn, ms, ...args)` arguments.
+    args: Vec<v8::Global<v8::Value>>,
+    /// Real instant the loop waits on: when the wall reaches `virtual_ms`.
+    deadline: std::time::Instant,
+    /// What the clock advances to at fire (frozen-at-registration + delay):
+    /// the callback sees the scheduled time, never real wall (S0 freeze).
+    virtual_ms: f64,
+}
+
+/// A run's pending timers: id map + fire-order heap (deadline, then `seq`
+/// = creation order). Lazily deleted — `clearTimeout` removes only the map
+/// entry.
+#[derive(Default)]
+pub struct TimerTable {
+    /// Ids start at 1; wrapping needs 2^32 registrations in one run.
+    last_id: u32,
+    next_seq: u64,
+    entries: HashMap<u32, TimerEntry>,
+    order: BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64, u32)>>,
+}
+
+impl TimerTable {
+    fn boxed() -> Box<RefCell<Self>> {
+        Box::new(RefCell::new(Self::default()))
+    }
+
+    /// The earliest pending deadline, discarding cleared heap tops (the
+    /// deadline match also guards id reuse).
+    fn peek_deadline(&mut self) -> Option<std::time::Instant> {
+        loop {
+            let std::cmp::Reverse((at, _, id)) = *self.order.peek()?;
+            if self.entries.get(&id).is_some_and(|e| e.deadline == at) {
+                return Some(at);
+            }
+            self.order.pop();
+        }
+    }
+
+    /// Remove and return the earliest pending timer (a fire).
+    fn pop_earliest(&mut self) -> Option<TimerEntry> {
+        loop {
+            let std::cmp::Reverse((at, _, id)) = self.order.pop()?;
+            if self.entries.get(&id).is_some_and(|e| e.deadline == at) {
+                return self.entries.remove(&id);
+            }
+        }
+    }
+}
+
 // ── Per-run state table ──────────────────────────────────────────────────────
 //
 // One instance serves several in-flight runs (the #124 interleaving model),
@@ -716,6 +777,11 @@ thread_local! {
     /// rehydration walk). Null outside turns.
     static RUN_TABLE_PTR: std::cell::Cell<*const RunTable> =
         const { std::cell::Cell::new(std::ptr::null()) };
+
+    /// Runs whose timer set changed during the current turn: a CPED-rider
+    /// continuation can arm a CO-RESIDENT's timer, invisible to the
+    /// owner-only post-turn re-queue — the loop drains this after each turn.
+    static TIMERS_TOUCHED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Process-wide run-token allocator. Tokens are instance-local identities on
@@ -739,6 +805,9 @@ struct RunCallState {
     pending: Box<PendingWork>,
     /// Streamed-body registry (armed per run).
     streams: Box<StreamTable>,
+    /// Pending `setTimeout` registrations; dropped with the entry, so a
+    /// settled run's timer can never fire into a later run.
+    timers: Box<RefCell<TimerTable>>,
     /// Per-stub bridge bindings for THIS run — the per-call half of what a
     /// stub `Function` needs; the instance-lifetime half is the
     /// [`StubSlot`] its External points at.
@@ -759,6 +828,7 @@ impl RunCallState {
             })),
             pending: PendingWork::boxed(),
             streams: StreamTable::boxed(),
+            timers: TimerTable::boxed(),
             stubs: RefCell::new(HashMap::new()),
         })
     }
@@ -808,6 +878,14 @@ impl RunTable {
 /// The pointer is valid for the remainder of the current turn (entries are
 /// only removed between turns); callers must not hold it longer.
 fn attributed_state(scope: &mut v8::PinScope, table: &RunTable) -> *const RunCallState {
+    attributed_token_and_state(scope, table).1
+}
+
+/// [`attributed_state`] plus the run's token, in the same table borrow.
+fn attributed_token_and_state(
+    scope: &mut v8::PinScope,
+    table: &RunTable,
+) -> (u64, *const RunCallState) {
     let current = CURRENT_RUN_TOKEN.with(|c| c.get());
     let cped = scope.get_continuation_preserved_embedder_data();
     let rider = rider_parts(scope, cped).map(|(token, _)| token);
@@ -816,12 +894,15 @@ fn attributed_state(scope: &mut v8::PinScope, table: &RunTable) -> *const RunCal
         if token != current {
             // A live rider run wins; a stale rider falls back to the owner.
             if let Some(entry) = runs.get(&token) {
-                return std::ptr::addr_of!(**entry);
+                return (token, std::ptr::addr_of!(**entry));
             }
         }
     }
-    runs.get(&current)
-        .map_or(std::ptr::null(), |b| std::ptr::addr_of!(**b))
+    (
+        current,
+        runs.get(&current)
+            .map_or(std::ptr::null(), |b| std::ptr::addr_of!(**b)),
+    )
 }
 
 /// Register a hydrated stream in the executing run's table. Returns false
@@ -1258,6 +1339,7 @@ fn run_module_inner(
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    let timers_ptr: *const RefCell<TimerTable> = std::ptr::addr_of!(*entry.timers);
     run_table.runs.borrow_mut().insert(token, entry);
     CURRENT_RUN_TOKEN.with(|c| c.set(token));
     RUN_TABLE_PTR.with(|c| c.set(std::ptr::addr_of!(*run_table)));
@@ -1412,6 +1494,15 @@ fn run_module_inner(
     install_wait_until(scope, table_ptr)
         .map_err(|error| failure(termination_or(&reason, error), &unsafe { &*logs_ptr }.borrow(), start))?;
 
+        // setTimeout/clearTimeout over the attributed run's timer table.
+        install_timers(scope, table_ptr).map_err(|error| {
+            failure(
+                termination_or(&reason, error),
+                &unsafe { &*logs_ptr }.borrow(),
+                start,
+            )
+        })?;
+
         v8::Global::new(scope, context)
     };
 
@@ -1446,6 +1537,7 @@ fn run_module_inner(
             logs: logs_ptr,
             pending: pending_ptr,
             streams: streams_ptr,
+            timers: timers_ptr,
             epilogue: take_epilogue_spec(),
             cancel_handle: &cancel_handle,
         },
@@ -1573,6 +1665,8 @@ struct CallPhaseCtx<'a> {
     pending: *const PendingWork,
     /// The run's streamed-body registry — in its table entry.
     streams: *const StreamTable,
+    /// The run's pending timers — in its table entry.
+    timers: *const RefCell<TimerTable>,
     /// Per-run identity for the early Result frame; `None` = hold mode.
     epilogue: Option<EpilogueSpec>,
     cancel_handle: &'a v8::IsolateHandle,
@@ -1622,6 +1716,7 @@ struct RunState {
     logs: *const RefCell<LogBuffers>,
     pending: *const PendingWork,
     streams: *const StreamTable,
+    timers: *const RefCell<TimerTable>,
     phase: RunPhase,
 }
 
@@ -1665,11 +1760,11 @@ impl RunState {
         }
     }
 
-    /// How long the loop may wait before this run has a boundary deadline:
-    /// the wall budget while settling (None = uncapped), the grace budget
-    /// during grace.
+    /// How long the loop may wait for this run: wall budget while settling
+    /// (None = uncapped), grace budget in grace, or its earliest timer —
+    /// whichever is sooner.
     fn next_timeout(&self) -> Option<Duration> {
-        match &self.phase {
+        let boundary = match &self.phase {
             RunPhase::Starting | RunPhase::Settling { .. } => {
                 if self.limits.wall_time_ms > 0 {
                     let budget = Duration::from_millis(self.limits.wall_time_ms as u64);
@@ -1687,6 +1782,14 @@ impl RunState {
                     .saturating_duration_since(std::time::Instant::now())
                     .max(Duration::from_millis(1)),
             ),
+        };
+        let timer = earliest_timer(self).map(|at| {
+            at.saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_millis(1))
+        });
+        match (boundary, timer) {
+            (Some(b), Some(t)) => Some(b.min(t)),
+            (b, t) => b.or(t),
         }
     }
 }
@@ -1820,10 +1923,28 @@ fn run_call_phase(
 
     // The run is suspended: drive it on events until it finishes.
     loop {
+        // Deadlines are recomputed each pass; the touched-run stamps are
+        // an instance-loop concern.
+        TIMERS_TOUCHED.with(|v| v.borrow_mut().clear());
         if rs.source.is_none() {
-            // Nothing can ever deliver an event to this run. `scan` fails a
-            // sourceless pending run, so only hold-mode grace gets here:
-            // whatever is still registered can never settle.
+            if earliest_timer(&rs).is_some() {
+                // No socket, but timers are internal events: park to the
+                // next deadline (outside any budget epoch — a sleep costs
+                // no CPU) and serve it.
+                if let Some(at) = next_deadline(&rs) {
+                    let now = std::time::Instant::now();
+                    if at > now {
+                        std::thread::sleep(at - now);
+                    }
+                }
+                if let Some(result) = deadline_hit(isolate, context, &facts, &mut rs) {
+                    return result;
+                }
+                continue;
+            }
+            // Nothing can ever deliver an event to this run. `scan` fails
+            // a sourceless pending run without timers, so only hold-mode
+            // grace gets here.
             return Ok(finish_grace(&mut rs, GraceStatus::Truncated));
         }
         let timeout = rs.next_timeout();
@@ -1880,6 +2001,7 @@ fn begin_call(
         logs: ctx.logs,
         pending: ctx.pending,
         streams: ctx.streams,
+        timers: ctx.timers,
         phase: RunPhase::Starting,
     };
     let start_outcome = start_turn(
@@ -1911,8 +2033,32 @@ fn handle_loop_event(
             ScanOutcome::Finished(result) => Some(*result),
             ScanOutcome::Continue => None,
         },
-        LoopEvent::DeadlineHit => Some(boundary_deadline(rs)),
+        LoopEvent::DeadlineHit => deadline_hit(isolate, context, facts, rs),
         LoopEvent::SourceClosed(e) => Some(boundary_close(rs, e)),
+    }
+}
+
+/// The single-run wait timed out: fire every due timer, then conclude the
+/// boundary if it too is due (a due timer beats the wall). `None` = still
+/// in flight; the caller re-waits.
+fn deadline_hit(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+) -> Option<Result<Output, FailureOutput>> {
+    loop {
+        let now = std::time::Instant::now();
+        if earliest_timer(rs).is_some_and(|t| t <= now) {
+            match timer_turn(isolate, context, facts, rs) {
+                ScanOutcome::Finished(result) => return Some(*result),
+                ScanOutcome::Continue => continue,
+            }
+        }
+        if deadline_instant(rs).is_some_and(|b| b <= now) {
+            return Some(boundary_deadline(rs));
+        }
+        return None;
     }
 }
 
@@ -1958,6 +2104,24 @@ fn deadline_instant(rs: &RunState) -> Option<std::time::Instant> {
         RunPhase::Starting | RunPhase::Settling { .. } => (rs.limits.wall_time_ms > 0)
             .then(|| rs.start + Duration::from_millis(rs.limits.wall_time_ms as u64)),
         RunPhase::Grace(g) => Some(g.deadline),
+    }
+}
+
+/// The run's earliest pending-timer deadline, if any. Lazily prunes cleared
+/// heap tops on the way.
+fn earliest_timer(rs: &RunState) -> Option<std::time::Instant> {
+    // SAFETY: `timers` points into the run's live table entry.
+    unsafe { &*rs.timers }.borrow_mut().peek_deadline()
+}
+
+/// The instant the loop must next wake for this run: phase boundary or
+/// earliest timer, whichever is sooner (timers participate in grace too —
+/// `graceMs` caps them). Heap validity in the multi-run loop is defined
+/// against THIS value.
+fn next_deadline(rs: &RunState) -> Option<std::time::Instant> {
+    match (deadline_instant(rs), earliest_timer(rs)) {
+        (Some(b), Some(t)) => Some(b.min(t)),
+        (b, t) => b.or(t),
     }
 }
 
@@ -2513,8 +2677,18 @@ fn frame_turn(
     // hits its next await (sending another BridgeCall) or completes.
     scope.perform_microtask_checkpoint();
 
-    // Check for errors set during the checkpoint (inside bridge callbacks),
-    // then for a guard that fired during it — both win over the scan.
+    finish_turn(scope, facts, rs, in_grace)
+}
+
+/// Shared turn tail (frame and timer turns): check for errors set during
+/// the checkpoint (inside bridge callbacks), then for a guard that fired
+/// during it — both win over the scan.
+fn finish_turn(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+    in_grace: bool,
+) -> ScanOutcome {
     if let Some(err) = rs.bridge_error.get() {
         if in_grace {
             let msg = format!("{err:?}");
@@ -2545,6 +2719,73 @@ fn frame_turn(
     scan(scope, facts, rs)
 }
 
+/// One timer-driven turn: fire the run's earliest pending timer,
+/// checkpoint, scan. The clock advances to the timer's SCHEDULED time,
+/// never real wall (a timer must not reveal real elapsed time — S0).
+fn timer_turn(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+) -> ScanOutcome {
+    // SAFETY: `timers` points into the run's live table entry.
+    let Some(entry) = unsafe { &*rs.timers }.borrow_mut().pop_earliest() else {
+        return ScanOutcome::Continue; // cleared in the meantime
+    };
+    let in_grace = matches!(rs.phase, RunPhase::Grace(_));
+
+    // The callback is guest JS billed to the run that armed the timer.
+    let _turn = TurnGuard::begin(facts.guard, rs);
+    let _epoch = BudgetEpoch::enter(rs.active_budget());
+
+    v8::scope!(let scope, isolate);
+    let context_local = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context_local);
+
+    crate::webtypes::advance_frozen_clock_to(scope, entry.virtual_ms);
+    CURRENT_RUN_TOKEN.with(|c| c.set(rs.token));
+    RUN_TABLE_PTR.with(|c| c.set(rs.table));
+    install_cped_rider(scope, rs.token);
+
+    v8::tc_scope!(let scope, scope);
+    let callback = v8::Local::new(scope, &entry.callback);
+    let recv = v8::undefined(scope).into();
+    let call_args: Vec<v8::Local<v8::Value>> = entry
+        .args
+        .iter()
+        .map(|a| v8::Local::new(scope, a))
+        .collect();
+    if callback.call(scope, recv, &call_args).is_none() {
+        // A kill leaves reason/termination for the shared tail; a plain
+        // uncaught throw fails the run.
+        if facts.reason.get().is_none() && !scope.is_execution_terminating() {
+            let err = match scope.exception() {
+                Some(exception) => runtime_error_from_value(scope, exception),
+                None => {
+                    RunError::Internal("timer callback failed without an exception".to_string())
+                }
+            };
+            if in_grace {
+                let (name, message) = match &err {
+                    RunError::RuntimeError(d) => (d.name.clone(), d.message.clone()),
+                    other => ("Error".to_string(), format!("{other:?}")),
+                };
+                if let RunPhase::Grace(g) = &mut rs.phase {
+                    if g.error.is_none() {
+                        g.error = Some(capped_grace_error(name, message));
+                    }
+                }
+                return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+            }
+            return finished(Err(rs.fail(err)));
+        }
+    }
+
+    scope.perform_microtask_checkpoint();
+
+    finish_turn(scope, facts, rs, in_grace)
+}
+
 /// Look at the run's root promise (or grace set) and advance it as far as it
 /// will go inside this turn.
 fn scan(
@@ -2572,9 +2813,9 @@ fn scan(
                 if let Some(err) = rs.bridge_error.get() {
                     return finished(Err(rs.fail(owned_bridge_error(err))));
                 }
-                if rs.source.is_none() {
-                    // Pending with no socket to wait on — an un-awaited
-                    // promise that nothing in the isolate can ever resolve.
+                if rs.source.is_none() && earliest_timer(rs).is_none() {
+                    // Pending with no socket and no pending timer —
+                    // nothing in the isolate can ever resolve it.
                     let error = match facts.reason.get() {
                         Some(TerminationReason::Wall) => RunError::WallTimeout,
                         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
@@ -3042,8 +3283,9 @@ fn grace_scan(
     if g.grace_start.elapsed() >= Duration::from_millis(rs.limits.grace_ms as u64) {
         return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
     }
-    if rs.source.is_none() {
-        // No event source and nothing can resolve the rest.
+    if rs.source.is_none() && earliest_timer(rs).is_none() {
+        // No event source, no pending timer: nothing can resolve the
+        // rest.
         return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
     }
     ScanOutcome::Continue
@@ -3335,8 +3577,10 @@ pub fn create_instance_core(
         install_web_runtime(scope, table_ptr).map_err(RunError::Internal)?;
         install_async_context(scope)?;
         // No run entry exists during prefix evaluation: a setup-time
-        // waitUntil throws, and warm-up console output lands in setup_logs.
+        // waitUntil or setTimeout throws, and warm-up console output lands
+        // in setup_logs.
         install_wait_until(scope, table_ptr)?;
+        install_timers(scope, table_ptr)?;
         let mut prefix_module: Option<v8::Global<v8::Module>> = None;
         if let Some(prefix) = &prefix {
             // Enter the CPU meter for compile + evaluate only — isolate boot
@@ -3490,6 +3734,7 @@ pub fn run_call_on_core(
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    let timers_ptr: *const RefCell<TimerTable> = std::ptr::addr_of!(*entry.timers);
     core.run_table.runs.borrow_mut().insert(token, entry);
     CURRENT_RUN_TOKEN.with(|c| c.set(token));
     RUN_TABLE_PTR.with(|c| c.set(std::ptr::addr_of!(*core.run_table)));
@@ -3553,6 +3798,7 @@ pub fn run_call_on_core(
                 logs: logs_ptr,
                 pending: pending_ptr,
                 streams: streams_ptr,
+                timers: timers_ptr,
                 epilogue: take_epilogue_spec(),
                 cancel_handle: &cancel_handle,
             },
@@ -3696,11 +3942,10 @@ enum PendingAbandon {
 const MAX_PENDING_ABANDONS: usize = 256;
 
 /// The multi-run loop's deadline heap: `(deadline, run token)`, nearest
-/// first. Entries are lazily deleted — an entry whose instant no longer
-/// equals its run's [`deadline_instant`] (the run concluded, or moved from
-/// wall to grace) is discarded when it surfaces. At most two entries exist
-/// per run over its life (one per phase with a deadline), so the heap never
-/// grows with frame traffic.
+/// first. Lazily deleted — an entry is stale when it no longer equals its
+/// run's [`next_deadline`]. Each turn re-queues at most one entry per
+/// touched run, so the heap grows with turns, never with pending-timer
+/// count.
 type DeadlineHeap = std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>;
 
 /// The nearest live deadline, discarding stale heap tops on the way.
@@ -3713,7 +3958,7 @@ fn peek_valid_deadline(
         let valid = live
             .iter()
             .find(|l| l.rs.token == token)
-            .is_some_and(|l| deadline_instant(&l.rs) == Some(at));
+            .is_some_and(|l| next_deadline(&l.rs) == Some(at));
         if valid {
             return Some((at, token));
         }
@@ -3721,8 +3966,35 @@ fn peek_valid_deadline(
     }
 }
 
-/// Conclude every run whose boundary deadline lies at or before `cutoff`.
-/// No JS runs on this path, so no taint can arise.
+/// Re-queue deadlines for runs whose timer set changed during the last
+/// turn (see [`TIMERS_TOUCHED`]); duplicates are harmless (lazy deletion).
+fn drain_touched_timers(live: &[LiveRun], deadlines: &mut DeadlineHeap) {
+    TIMERS_TOUCHED.with(|v| {
+        for token in v.borrow_mut().drain(..) {
+            if let Some(l) = live.iter().find(|l| l.rs.token == token) {
+                if let Some(at) = next_deadline(&l.rs) {
+                    deadlines.push(std::cmp::Reverse((at, token)));
+                }
+            }
+        }
+    });
+}
+
+/// The per-run failure for a bare mid-turn termination (a routed abort or
+/// a guard fire observed by the caller, not by the turn itself).
+fn reason_error(reason: &ReasonCell) -> RunError {
+    match reason.get() {
+        Some(TerminationReason::Wall) => RunError::WallTimeout,
+        Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+        Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        None => RunError::Aborted,
+    }
+}
+
+/// Serve every deadline at or before `cutoff`: due TIMERS fire (a real
+/// turn — guest JS, so taint can arise; `true` = tainted, caller sweeps
+/// and returns), expired BOUNDARIES conclude their runs (no JS). A timer
+/// tying with its run's boundary fires first.
 ///
 /// The cutoff is what makes deadlines fire in ARRIVAL order rather than
 /// processing order: the event paths pass the event's demux arrival stamp,
@@ -3732,12 +4004,13 @@ fn peek_valid_deadline(
 /// while events arriving after the deadline cannot delay it. The idle path
 /// (select timeout) passes `now`: the queue is empty at that moment, so
 /// nothing arrived-but-undelivered exists.
+#[must_use]
 fn sweep_expired_deadlines(
     core: &mut InstanceCore,
     live: &mut Vec<LiveRun>,
     deadlines: &mut DeadlineHeap,
     cutoff: std::time::Instant,
-) {
+) -> bool {
     while let Some((at, token)) = peek_valid_deadline(live, deadlines) {
         if at > cutoff {
             break;
@@ -3747,10 +4020,50 @@ fn sweep_expired_deadlines(
             .iter()
             .position(|l| l.rs.token == token)
             .expect("peek_valid_deadline checked liveness");
+        // Which deadline surfaced: the run's earliest timer, or its
+        // phase boundary.
+        if earliest_timer(&live[idx].rs) == Some(at) {
+            let mut l = live.swap_remove(idx);
+            LAST_CULPRIT_RUN_ID.with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
+            let outcome = {
+                let facts = RunFacts {
+                    call: l.job.call.as_ref(),
+                    reason: &core.reason,
+                    guard: &core.guard,
+                    cancel_handle: core.guard.handle(),
+                };
+                timer_turn(&mut core.isolate, &core.context, &facts, &mut l.rs)
+            };
+            let tainted_now = instance_tainted(core);
+            match outcome {
+                ScanOutcome::Finished(result) => {
+                    conclude_run(&mut core.isolate, &core.run_table, l, *result, tainted_now);
+                }
+                ScanOutcome::Continue => {
+                    if tainted_now {
+                        // Bare terminate mid-turn: classify and conclude
+                        // here (the event arm's rule).
+                        let failure = l.rs.fail(reason_error(&core.reason));
+                        conclude_run(&mut core.isolate, &core.run_table, l, Err(failure), true);
+                    } else {
+                        if let Some(next) = next_deadline(&l.rs) {
+                            deadlines.push(std::cmp::Reverse((next, token)));
+                        }
+                        live.push(l);
+                    }
+                }
+            }
+            drain_touched_timers(live, deadlines);
+            if tainted_now {
+                return true;
+            }
+            continue;
+        }
         let mut l = live.swap_remove(idx);
         let result = boundary_deadline(&mut l.rs);
         conclude_run(&mut core.isolate, &core.run_table, l, result, false);
     }
+    false
 }
 
 /// Serve jobs on one instance: the per-instance turn loop (#125). Selects
@@ -3835,12 +4148,15 @@ pub fn serve_instance(
                 // The select timed out: the event queue was empty for the
                 // whole window, so nothing arrived-but-undelivered can beat
                 // the due deadline.
-                sweep_expired_deadlines(
+                if sweep_expired_deadlines(
                     core,
                     &mut live,
                     &mut deadlines,
                     std::time::Instant::now(),
-                );
+                ) {
+                    taint_sweep(core, &mut live, jobs);
+                    return;
+                }
             }
             Picked::Job(None) => {
                 jobs_open = false;
@@ -3881,7 +4197,10 @@ pub fn serve_instance(
                 // Deadlines that expired BEFORE this event arrived precede
                 // it; anything later must not delay it (or be delayed by
                 // it).
-                sweep_expired_deadlines(core, &mut live, &mut deadlines, at);
+                if sweep_expired_deadlines(core, &mut live, &mut deadlines, at) {
+                    taint_sweep(core, &mut live, jobs);
+                    return;
+                }
                 let Some(idx) = live.iter().position(|l| l.rs.token == token) else {
                     // No live run owns this event. Either the run concluded
                     // while it sat in the shared queue (a benign late frame,
@@ -3915,11 +4234,11 @@ pub fn serve_instance(
                         detail.unwrap_or_else(|| "connection closed".to_string()),
                     )),
                 };
-                LAST_CULPRIT_RUN_ID
-                    .with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
-                // The deadline as the heap knows it; a phase change during
-                // this turn (settle → grace) re-queues below.
-                let queued_deadline = deadline_instant(&l.rs);
+                LAST_CULPRIT_RUN_ID.with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
+                // The deadline as the heap knows it; a change during this
+                // turn (settle → grace, a timer armed/fired/cleared)
+                // re-queues below.
+                let queued_deadline = next_deadline(&l.rs);
                 let outcome = {
                     let facts = RunFacts {
                         call: l.job.call.as_ref(),
@@ -3939,22 +4258,10 @@ pub fn serve_instance(
                             // Bare terminate mid-turn (a routed abort landed
                             // while this run's own turn ran): the owner is
                             // still live — classify and conclude it here.
-                            let error = match core.reason.get() {
-                                Some(TerminationReason::Wall) => RunError::WallTimeout,
-                                Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-                                Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                                None => RunError::Aborted,
-                            };
-                            let failure = l.rs.fail(error);
-                            conclude_run(
-                                &mut core.isolate,
-                                &core.run_table,
-                                l,
-                                Err(failure),
-                                true,
-                            );
+                            let failure = l.rs.fail(reason_error(&core.reason));
+                            conclude_run(&mut core.isolate, &core.run_table, l, Err(failure), true);
                         } else {
-                            let current = deadline_instant(&l.rs);
+                            let current = next_deadline(&l.rs);
                             if current != queued_deadline {
                                 if let Some(at) = current {
                                     deadlines.push(std::cmp::Reverse((at, token)));
@@ -3964,6 +4271,7 @@ pub fn serve_instance(
                         }
                     }
                 }
+                drain_touched_timers(&live, &mut deadlines);
                 if tainted_now {
                     taint_sweep(core, &mut live, jobs);
                     return;
@@ -4082,6 +4390,7 @@ fn dispatch_job(
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    let timers_ptr: *const RefCell<TimerTable> = std::ptr::addr_of!(*entry.timers);
     core.run_table.runs.borrow_mut().insert(token, entry);
     RUN_TABLE_PTR.with(|c| c.set(std::ptr::addr_of!(*core.run_table)));
 
@@ -4131,6 +4440,7 @@ fn dispatch_job(
                 logs: logs_ptr,
                 pending: pending_ptr,
                 streams: streams_ptr,
+                timers: timers_ptr,
                 epilogue: job.epilogue,
                 cancel_handle: &cancel_handle,
             };
@@ -4174,6 +4484,7 @@ fn dispatch_job(
                     logs: logs_ptr,
                     pending: pending_ptr,
                     streams: streams_ptr,
+                    timers: timers_ptr,
                     phase: RunPhase::Starting,
                 },
                 job,
@@ -4189,18 +4500,13 @@ fn dispatch_job(
                 }
                 ScanOutcome::Continue => {
                     if tainted_now {
-                        let error = match core.reason.get() {
-                            Some(TerminationReason::Wall) => RunError::WallTimeout,
-                            Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-                            Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                            None => RunError::Aborted,
-                        };
-                        let f = l.rs.fail(error);
+                        let f = l.rs.fail(reason_error(&core.reason));
                         conclude_run(&mut core.isolate, &core.run_table, l, Err(f), true);
                     } else {
-                        // Covers both a settling run's wall deadline and a
-                        // run that entered grace within its start turn.
-                        if let Some(at) = deadline_instant(&l.rs) {
+                        // Covers a settling run's wall deadline, a run that
+                        // entered grace within its start turn, and any
+                        // timer the start turn armed.
+                        if let Some(at) = next_deadline(&l.rs) {
                             deadlines.push(std::cmp::Reverse((at, l.rs.token)));
                         }
                         live.push(l);
@@ -4209,6 +4515,8 @@ fn dispatch_job(
             }
         }
     }
+    // A start turn can touch a co-resident's timers like any other turn.
+    drain_touched_timers(live, deadlines);
     tainted_now
 }
 
@@ -4671,6 +4979,12 @@ fn validate_prefix_module(
     // entry exists in this throwaway table).
     let validation_table = RunTable::boxed();
     install_wait_until(scope, &*validation_table).map_err(|e| {
+        failure(termination_or(&reason, e), &logs, start)
+    })?;
+    // Disarmed timers for the same surface parity: `typeof setTimeout`
+    // matches run code; calling it at prefix top level throws the catchable
+    // setup-time error.
+    install_timers(scope, &*validation_table).map_err(|e| {
         failure(termination_or(&reason, e), &logs, start)
     })?;
     v8::tc_scope!(let scope, scope);
@@ -6081,6 +6395,8 @@ const PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC: &str = r#"(name, kind) => (...args)
 pub const RESERVED_GLOBAL_NAMES: &[&str] = &[
     "console",
     "waitUntil",
+    "setTimeout",
+    "clearTimeout",
     "Headers",
     "Request",
     "Response",
@@ -6842,6 +7158,152 @@ fn wait_until_callback(
     };
     registered.push(v8::Global::new(scope, promise));
     rv.set_undefined();
+}
+
+/// Install `setTimeout`/`clearTimeout`: natives over the attributed run's
+/// [`TimerTable`] (the `waitUntil` pattern). Outside run code `setTimeout`
+/// throws a catchable error (workerd's explicit route).
+fn install_timers(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
+    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
+    for (name, builder) in [
+        ("setTimeout", v8::Function::builder(set_timeout_callback)),
+        (
+            "clearTimeout",
+            v8::Function::builder(clear_timeout_callback),
+        ),
+    ] {
+        let function = builder
+            .data(data.into())
+            .build(scope)
+            .ok_or_else(|| RunError::Internal(format!("failed to create {name}")))?;
+        define_global(scope, name, function.into(), false)?;
+    }
+    Ok(())
+}
+
+/// `setTimeout(callback, delay, ...args)` — arm a timer on the attributed
+/// run; returns a per-run numeric id. Scheduled from the frozen clock, so
+/// the guest-visible story is exactly "delay ms passed" (workerd model).
+fn set_timeout_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    // SAFETY: the External points at the instance-lifetime RunTable Box.
+    let table = unsafe {
+        &*args
+            .data()
+            .cast::<v8::External>()
+            .value()
+            .cast::<RunTable>()
+    };
+    let (token, state) = attributed_token_and_state(scope, table);
+    if state.is_null() {
+        throw_v8_error(
+            scope,
+            "[iso4] setTimeout is only available to run code — setup evaluated at \
+             prepare() time must finish its work within the warm-up budget",
+        );
+        return;
+    }
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        let message = v8::String::new(
+            scope,
+            "[iso4] setTimeout requires a function callback (string callbacks are not \
+             supported)",
+        )
+        .unwrap_or_else(|| v8::String::empty(scope));
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+    };
+    // NaN/negative → 0, capped at 100 years, whole ms.
+    let mut delay = args
+        .get(1)
+        .number_value(scope)
+        .filter(|d| d.is_finite())
+        .unwrap_or(0.0);
+    delay = delay.trunc().clamp(0.0, MAX_TIMER_DELAY_MS);
+    let extra: Vec<v8::Global<v8::Value>> = (2..args.length())
+        .map(|i| v8::Global::new(scope, args.get(i)))
+        .collect();
+
+    // Fires at the wall instant where the clock would reach `virtual_ms`;
+    // `lead` shrinks by the clock's lag and floors at zero (due now).
+    let wall = crate::webtypes::wall_now_ms();
+    let frozen = crate::webtypes::frozen_now_ms(scope).unwrap_or(wall);
+    let virtual_ms = frozen + delay;
+    let lead = (virtual_ms - wall).max(0.0);
+    let deadline = std::time::Instant::now() + Duration::from_millis(lead as u64);
+
+    // SAFETY: entry pointers are valid for the remainder of the turn.
+    let mut timers = unsafe { &*state }.timers.borrow_mut();
+    if timers.entries.len() >= MAX_PENDING_TIMERS {
+        drop(timers);
+        throw_v8_error(
+            scope,
+            "[iso4] too many active timers: at most 10000 may be pending per run",
+        );
+        return;
+    }
+    timers.last_id = timers.last_id.wrapping_add(1).max(1);
+    let id = timers.last_id;
+    let seq = timers.next_seq;
+    timers.next_seq += 1;
+    timers.entries.insert(
+        id,
+        TimerEntry {
+            callback: v8::Global::new(scope, callback),
+            args: extra,
+            deadline,
+            virtual_ms,
+        },
+    );
+    timers.order.push(std::cmp::Reverse((deadline, seq, id)));
+    drop(timers);
+    TIMERS_TOUCHED.with(|v| v.borrow_mut().push(token));
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// `clearTimeout(id)` — disarm one of the attributed run's own timers.
+/// Everything else (unknown/foreign ids, garbage, outside run code) is a
+/// silent no-op, web semantics.
+fn clear_timeout_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set_undefined();
+    // SAFETY: the External points at the instance-lifetime RunTable Box.
+    let table = unsafe {
+        &*args
+            .data()
+            .cast::<v8::External>()
+            .value()
+            .cast::<RunTable>()
+    };
+    let (token, state) = attributed_token_and_state(scope, table);
+    if state.is_null() {
+        return;
+    }
+    let Some(id) = args
+        .get(0)
+        .number_value(scope)
+        .filter(|n| n.is_finite() && *n >= 1.0 && *n <= u32::MAX as f64 && n.fract() == 0.0)
+    else {
+        return;
+    };
+    // SAFETY: entry pointers are valid for the remainder of the turn.
+    let removed = unsafe { &*state }
+        .timers
+        .borrow_mut()
+        .entries
+        .remove(&(id as u32))
+        .is_some();
+    if removed {
+        // The next deadline may have moved later; let the loop re-queue.
+        TIMERS_TOUCHED.with(|v| v.borrow_mut().push(token));
+    }
 }
 
 fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
@@ -13183,5 +13645,374 @@ mod tests {
             "run 1's continuation ran during run 2 and observed run 2's state \
              (cross-run confused-deputy)"
         );
+    }
+
+    // ── Guest timers (#79) ───────────────────────────────────────────────────
+
+    #[test]
+    fn sleep_resolves_without_a_socket() {
+        // The reported idiom, in a run with no bridge at all: the drive loop
+        // parks the thread to the timer deadline instead of failing the
+        // pending root.
+        let out = run_ok("await new Promise(r => setTimeout(r, 30))\nexport default 'woke'");
+        assert_eq!(get_default(&out).as_deref(), Some("woke"));
+    }
+
+    #[test]
+    fn sleep_costs_no_cpu_budget() {
+        // A 100 ms sleep under a 50 ms CPU cap: waiting is not computing.
+        let out = run_code(
+            "await new Promise(r => setTimeout(r, 100))\nexport default 'ok'",
+            "<iso4>",
+            Limits {
+                cpu_time_ms: 50,
+                ..Limits::default()
+            },
+        )
+        .expect("sleep does not bill CPU");
+        assert_eq!(get_default(&out).as_deref(), Some("ok"));
+        assert!(
+            out.cpu_time_ms < 50.0,
+            "cpu_time_ms {} should exclude the sleep",
+            out.cpu_time_ms
+        );
+    }
+
+    #[test]
+    fn sleep_counts_against_the_wall_budget() {
+        let err = run_code(
+            "await new Promise(r => setTimeout(r, 5000))\nexport default 'nope'",
+            "<iso4>",
+            Limits {
+                wall_time_ms: 80,
+                ..Limits::default()
+            },
+        )
+        .expect_err("an over-long sleep dies at the wall");
+        assert!(matches!(err.error, RunError::WallTimeout));
+    }
+
+    #[test]
+    fn timer_due_before_the_wall_fires_first() {
+        // Timer at 30 ms, wall at 300 ms: the timer must win, not be
+        // swallowed by a premature wall conclusion.
+        let out = run_code(
+            "await new Promise(r => setTimeout(r, 30))\nexport default 'made it'",
+            "<iso4>",
+            Limits {
+                wall_time_ms: 300,
+                ..Limits::default()
+            },
+        )
+        .expect("a timer inside the wall budget fires");
+        assert_eq!(get_default(&out).as_deref(), Some("made it"));
+    }
+
+    #[test]
+    fn clear_timeout_prevents_the_callback() {
+        let out = run_ok(
+            "let fired = false\n\
+             const id = setTimeout(() => { fired = true }, 10)\n\
+             clearTimeout(id)\n\
+             await new Promise(r => setTimeout(r, 60))\n\
+             export default String(fired)",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn clear_timeout_ignores_unknown_and_garbage_ids() {
+        let out = run_ok(
+            "clearTimeout(9999)\nclearTimeout(undefined)\nclearTimeout('x')\n\
+             clearTimeout(-1)\nclearTimeout(1.5)\nexport default 'ok'",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn timers_fire_in_deadline_order_then_creation_order() {
+        let out = run_ok(
+            "const seen = []\n\
+             setTimeout(() => seen.push('late'), 50)\n\
+             setTimeout(() => seen.push('early'), 10)\n\
+             setTimeout(() => seen.push('tie1'), 25)\n\
+             setTimeout(() => seen.push('tie2'), 25)\n\
+             await new Promise(r => setTimeout(r, 80))\n\
+             export default seen.join(',')",
+        );
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("early,tie1,tie2,late"),
+            "deadline order, creation order on equal deadlines"
+        );
+    }
+
+    #[test]
+    fn set_timeout_returns_numeric_ids_from_one() {
+        let out = run_ok(
+            "const a = setTimeout(() => {}, 1000)\n\
+             const b = setTimeout(() => {}, 1000)\n\
+             export default [typeof a, a, typeof b, b].join('|')",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("number|1|number|2"));
+    }
+
+    #[test]
+    fn set_timeout_passes_extra_arguments() {
+        let out = run_ok(
+            "const got = await new Promise(r => setTimeout((x, y) => r(x + y), 5, 'a', 'b'))\n\
+             export default got",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn set_timeout_rejects_non_function_callbacks() {
+        // No string-eval form (codegen is denied per-run anyway): a
+        // TypeError, catchable.
+        let out = run_ok(
+            "let caught = 'none'\n\
+             try { setTimeout('globalThis.x = 1', 5) } catch (e) { caught = e.constructor.name }\n\
+             let caught2 = 'none'\n\
+             try { setTimeout(undefined) } catch (e) { caught2 = e.constructor.name }\n\
+             export default [caught, caught2].join('|')",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("TypeError|TypeError"));
+    }
+
+    #[test]
+    fn nan_and_negative_delays_fire_immediately() {
+        let out = run_ok(
+            "const a = await new Promise(r => setTimeout(() => r('nan'), NaN))\n\
+             const b = await new Promise(r => setTimeout(() => r('neg'), -50))\n\
+             export default [a, b].join('|')",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("nan|neg"));
+    }
+
+    #[test]
+    fn pending_timer_cap_throws_past_ten_thousand() {
+        let out = run_ok(
+            "const cb = () => {}\n\
+             for (let i = 0; i < 10000; i++) setTimeout(cb, 60000)\n\
+             let caught = 'none'\n\
+             try { setTimeout(cb, 60000) } catch (e) { caught = e.message }\n\
+             clearTimeout(1) // free a slot: the cap is on PENDING timers\n\
+             const again = typeof setTimeout(cb, 60000)\n\
+             export default [caught.includes('10000'), again].join('|')",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("true|number"));
+    }
+
+    #[test]
+    fn uncaught_throw_in_a_timer_callback_fails_the_run() {
+        let err = run_err(
+            "setTimeout(() => { throw new Error('boom in timer') }, 10)\n\
+             await new Promise(r => setTimeout(r, 60))\n\
+             export default 'unreachable'",
+        );
+        match err {
+            RunError::RuntimeError(data) => {
+                assert!(data.message.contains("boom in timer"), "{}", data.message)
+            }
+            other => panic!("expected RuntimeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timer_callback_sees_exactly_the_scheduled_time() {
+        // The workerd model, pinned: the clock advances by the REQUESTED
+        // delay, so the delta is exact regardless of overshoot.
+        let out = run_ok(
+            "const t0 = Date.now()\n\
+             await new Promise(r => setTimeout(r, 120))\n\
+             export default String(Date.now() - t0)",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("120"));
+    }
+
+    #[test]
+    fn zero_delay_timer_after_cpu_burn_reveals_no_elapsed_time() {
+        // The point of virtualizing: a setTimeout(0) probe after a CPU
+        // burn must not read real elapsed wall time back (S0 freeze).
+        let out = run_ok(
+            "const t0 = Date.now()\n\
+             let acc = 0\n\
+             for (let i = 0; i < 5_000_000; i++) acc = (acc + i) % 97\n\
+             await new Promise(r => setTimeout(r, 0))\n\
+             export default String(Date.now() - t0)",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn timers_work_during_grace_and_grace_ms_caps_them() {
+        // A short sleep inside waitUntil completes within grace...
+        let out = execute(
+            "waitUntil((async () => { await new Promise(r => setTimeout(r, 20)); console.log('bg woke') })())\n\
+             export default 'early'",
+            None,
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("early"));
+        let bg = out.background.expect("grace phase ran");
+        assert_eq!(bg.status, GraceStatus::Settled);
+        assert_eq!(bg.stdout, vec!["bg woke".to_string()]);
+
+        // ...and one longer than graceMs is truncated with the phase.
+        let out = execute(
+            "waitUntil(new Promise(r => setTimeout(r, 60000)))\nexport default 'early'",
+            None,
+            Limits {
+                grace_ms: 60,
+                ..Limits::default()
+            },
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("early"));
+        assert_eq!(
+            out.background.expect("grace phase ran").status,
+            GraceStatus::Truncated
+        );
+    }
+
+    #[test]
+    fn a_settled_runs_pending_timer_never_fires_into_the_next_run() {
+        // Run 1 settles with a timer pending; the heap drops with its
+        // table entry, so the callback can never fire into run 2.
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "globalThis.hit = 'untouched'",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up");
+        let run1 = run_call_on_core(
+            &mut core,
+            Some("setTimeout(() => { globalThis.hit = 'FIRED' }, 20)\nexport default 'armed'"),
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        );
+        assert!(!run1.tainted);
+        assert_eq!(
+            get_default(&run1.result.expect("run 1 succeeds")).as_deref(),
+            Some("armed")
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        let run2 = run_call_on_core(
+            &mut core,
+            Some(
+                "await new Promise(r => setTimeout(r, 30))\n\
+                 export default globalThis.hit",
+            ),
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        );
+        assert_eq!(
+            get_default(&run2.result.expect("run 2 succeeds")).as_deref(),
+            Some("untouched"),
+            "run 1's pending timer must not fire on run 2's turns"
+        );
+    }
+
+    #[test]
+    fn set_timeout_at_prefix_top_level_throws_a_catchable_setup_error() {
+        // workerd's explicit route for the analogous case: no loop exists
+        // while a prefix evaluates, so the error is thrown, not a hang.
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "let msg = 'no error'\n\
+                       try { setTimeout(() => {}, 5) } catch (e) { msg = e.message }\n\
+                       globalThis.prefixTimerError = msg",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up despite the refused setTimeout");
+        let out = run_call_on_core(
+            &mut core,
+            Some("export default globalThis.prefixTimerError"),
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .result
+        .expect("run succeeds");
+        let msg = get_default(&out).unwrap_or_default();
+        assert!(
+            msg.contains("only available to run code"),
+            "prefix-time setTimeout must throw the setup-time error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_prefix_defined_sleep_helper_works_during_a_run() {
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "globalThis.sleep = (ms) => new Promise(r => setTimeout(r, ms))",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up");
+        let out = run_call_on_core(
+            &mut core,
+            Some("await sleep(20)\nexport default 'slept'"),
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .result
+        .expect("run succeeds");
+        assert_eq!(get_default(&out).as_deref(), Some("slept"));
+    }
+
+    #[test]
+    fn set_timeout_and_clear_timeout_are_reserved_global_names() {
+        assert!(RESERVED_GLOBAL_NAMES.contains(&"setTimeout"));
+        assert!(RESERVED_GLOBAL_NAMES.contains(&"clearTimeout"));
     }
 }

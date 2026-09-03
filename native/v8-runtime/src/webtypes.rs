@@ -202,7 +202,7 @@ pub struct FrozenClock {
 /// Wall clock in whole ms since the epoch — the value the frozen clock
 /// advances to. Truncation to ms is deliberate: the guest never sees sub-ms
 /// resolution even at an advance boundary.
-fn wall_now_ms() -> f64 {
+pub(crate) fn wall_now_ms() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as f64)
@@ -227,6 +227,33 @@ pub fn advance_frozen_clock(scope: &mut v8::PinScope) {
     let cell = v8::Local::new(scope, &clock.cell);
     let prop = v8::Local::new(scope, &clock.prop);
     let value = v8::Number::new(scope, now);
+    cell.set(scope, prop.into(), value.into());
+}
+
+/// The current isolate's frozen-clock value (epoch ms), or `None` when the
+/// web runtime was never installed. `setTimeout` schedules FROM this value.
+pub fn frozen_now_ms(scope: &mut v8::PinScope) -> Option<f64> {
+    scope
+        .get_slot::<std::rc::Rc<FrozenClock>>()
+        .map(|clock| clock.prev.get())
+}
+
+/// Advance the current isolate's frozen clock to `max(current, target_ms)`
+/// — the timer-turn advance: a firing timer moves the clock to its
+/// SCHEDULED time, never the real wall (which would undo the S0 freeze).
+/// The target never exceeds the real wall at fire time by construction.
+pub fn advance_frozen_clock_to(scope: &mut v8::PinScope, target_ms: f64) {
+    let Some(clock) = scope.get_slot::<std::rc::Rc<FrozenClock>>().cloned() else {
+        return;
+    };
+    let target = target_ms.trunc();
+    if target <= clock.prev.get() {
+        return;
+    }
+    clock.prev.set(target);
+    let cell = v8::Local::new(scope, &clock.cell);
+    let prop = v8::Local::new(scope, &clock.prop);
+    let value = v8::Number::new(scope, target);
     cell.set(scope, prop.into(), value.into());
 }
 

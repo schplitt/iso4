@@ -90,7 +90,9 @@ Spectre-class attacks read memory across a boundary by measuring
 nanosecond cache-timing differences, and a precise clock is the
 measurement tool. So the sandbox clock is **frozen during execution and
 advances only at observable I/O** (run entry and received socket frames,
-clamped monotone to whole ms) — the same model workerd documents, applied
+clamped monotone to whole ms; a native timer firing advances it to the
+timer's *scheduled* time only, §7 item 8) — the same model workerd
+documents, applied
 to every guest-visible clock; §7.11 lists the exact surfaces and the
 `SharedArrayBuffer`/`Atomics.wait` consequences. Process isolation
 remains the escape hatch for a prefix that must not share a process with
@@ -382,6 +384,12 @@ Globals are _not_ a free-for-all. The runtime owns a fixed set of reserved
 names that the host must not shadow:
 
 - `console` — owned by the runtime for output capture.
+- `waitUntil` — the grace-phase registration function (§14).
+- `setTimeout` / `clearTimeout` — native timers on the instance loop's
+  deadline heap (§7 item 8): no bridge, no host involvement, virtualized
+  onto the frozen clock. `setInterval` does not exist and is not reserved —
+  it is incoherent for run-scoped code (an interval never settles), a
+  closed question rather than a pending tier.
 - The web runtime the runtime installs: `Headers`, `Request`, `Response`,
   `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`.
 
@@ -466,7 +474,8 @@ be neither forged nor destroyed by a run.
 - No `Blob` or `FormData`, so no `blob()`/`formData()` and neither works as a
   body initializer.
 - No `crypto`, `AbortController`, `AbortSignal`, `Event`, `structuredClone`,
-  `setTimeout`, `queueMicrotask`.
+  `queueMicrotask`. (`setTimeout`/`clearTimeout` exist as native runtime
+  globals — §7 item 8.)
 
 `URL` is not on this list: parsing and every component setter run natively on
 ada (the parser Node.js uses, vendored into the runtime binary via the
@@ -1048,10 +1057,11 @@ Documented up front so we don't drift into rebuilding secure-exec:
    `AsyncLocalStorage` (run/postfix code only). See §16. A host-declared
    import of the same specifier takes precedence over the built-in.
 
-2. **No callbacks across the boundary.** No `setTimeout`, no event
-   listeners on host objects, no `array.forEach` style host callbacks. Pure
-   data in, pure data out. (Future tier-2 may add a callback handle table.
-   Not v1.)
+2. **No callbacks across the boundary.** No host-shipped callbacks, no
+   event listeners on host objects, no `array.forEach` style host
+   callbacks. Pure data in, pure data out. (The native `setTimeout` global
+   is not a counterexample: its callback never crosses the boundary — see
+   item 8. Future tier-2 may add a callback handle table. Not v1.)
 
 3. **Streaming is inbound-only.** A host → sandbox `Request`/`Response`
    body that outgrows a 64 KiB probe crosses as a stream handle pumped under
@@ -1090,8 +1100,31 @@ Documented up front so we don't drift into rebuilding secure-exec:
 7. **No filesystem.** No FS module is provided. If host code wants to expose
    read-only files, it does so via a custom import.
 
-8. **No timers.** `setTimeout` and `setInterval` are not provided as globals
-   in v1. (They require callback support. See limitation 2.) Tier 2.
+8. **Timers are native and virtualized; no `setInterval`.** `setTimeout`
+   and `clearTimeout` are runtime globals implemented entirely inside the
+   instance loop (a per-run timer heap feeding the loop's deadline
+   arithmetic — no bridge, no IPC, no thread per timer). Semantics:
+   ids are per-run numbers; `clearTimeout` can only reach the calling
+   run's own timers; extra `setTimeout(fn, ms, ...args)` arguments are
+   passed through; a non-function callback throws `TypeError` (no
+   string-eval form); NaN/negative delays fire immediately; equal
+   deadlines fire in creation order; at most 10 000 timers may be pending
+   per run (their bookkeeping lives outside the isolate heap, so the cap —
+   workerd's number — bounds what `memoryMb` cannot see). A sleep costs no
+   CPU budget but counts against the wall budget, so `setTimeout(f, 1e9)`
+   dies as `ERR_WALL_TIMEOUT`. Timers work during the `waitUntil` grace
+   phase and `graceMs` caps them. A run that settles with timers pending
+   drops them — they never fire into a later run. At prefix top level
+   `setTimeout` throws a catchable error (no loop exists at prepare()
+   time; workerd rejects the analogous case the same way); functions the
+   prefix *defines* may use it freely when called from run code. The
+   clock interaction is deliberate (limitation 11): delays are scheduled
+   from the frozen clock and a firing timer advances the clock to exactly
+   its scheduled time, so `Date.now()` across `await sleep(500)` moves by
+   exactly 500 — never by real elapsed wall time. `setInterval` is **not
+   deferred — it is incoherent** for run-scoped code (an interval never
+   settles, so it either does nothing or runs until the wall kills it)
+   and will not be added.
 
 9. **Functions on host-import return values are stripped.** If
    `imports["foo"].bar()` returns `{ data: 1, fn: () => {} }`, the sandbox
@@ -1104,9 +1137,12 @@ Documented up front so we don't drift into rebuilding secure-exec:
     no-arg `new Date()` / `Date()`, no-arg `Intl.DateTimeFormat`
     `format()`/`formatToParts()`, and `Temporal.Now.*` all read one frozen
     per-context value that advances — monotone, whole milliseconds — only
-    when the runtime regains control at a socket frame: run entry, each
-    bridge response, each stream frame. Sandbox code can never observe its
-    own elapsed execution time (§1.2 explains why). Consequences:
+    when the runtime regains control at an event: run entry, each bridge
+    response, each stream frame (all to real wall time), and each native
+    timer fire (to the timer's *scheduled* time only — item 8 — so a
+    `setTimeout(0)` probe after a CPU burn reads back nothing). Sandbox
+    code can never observe its own elapsed execution time (§1.2 explains
+    why). Consequences:
     `SharedArrayBuffer` is removed from the global (a shared counter is the
     canonical replacement timer; browsers hide it the same way outside
     cross-origin isolation), `Atomics.wait` throws (blocking sleep;
