@@ -28,6 +28,22 @@
  * A field set to `0` is not the same as leaving it unset: `0` explicitly
  * disables that limit, whereas unset yields the runtime default.
  */
+/**
+ * Limits for a one-off `sandbox.run()`, which always gets a fresh isolate —
+ * so unlike prefix runs (whose isolates are shared and reused, cap set at
+ * `prepare({ memoryMb })` or the sandbox default) it may cap its own heap.
+ */
+export interface OneOffResourceLimits extends ResourceLimits {
+  /**
+   * Hard cap on this run's isolate memory, in megabytes — V8 heap plus
+   * external `ArrayBuffer`s. `0` = uncapped (admitted against the memory
+   * budget instead of the 90% line — see `memoryBudgetMb`). Must be an
+   * integer ≥ 0.
+   * @default the sandbox-level `memoryMb` (128)
+   */
+  memoryMb?: number
+}
+
 export interface ResourceLimits {
   /**
    * Maximum *active* execution time in milliseconds. Time spent waiting on
@@ -555,19 +571,21 @@ export interface SandboxOptions {
   maxQueuedRuns?: number
 
   /**
-   * Hard cap on memory each isolate can use, in megabytes. Covers the V8
-   * heap and all external `ArrayBuffer` allocations; also determines the
-   * BridgeResponse frame read cap (the sandbox cannot receive a response
-   * larger than its own memory budget).
+   * Default hard cap on memory each isolate can use, in megabytes. Covers
+   * the V8 heap and all external `ArrayBuffer` allocations; also determines
+   * the BridgeResponse frame read cap (the sandbox cannot receive a
+   * response larger than its own memory budget).
    *
-   * Uniform across ALL isolates of this Sandbox and settable only here —
-   * never per run or per prefix. The cap is baked into the isolate at
-   * creation, and prefix runs reuse warm isolates, so a per-run value is
-   * structurally impossible; a uniform cap also keeps capacity math simple
-   * (slots × cap). Memory accumulates across calls on a warm instance —
+   * This is the DEFAULT: `prepare({ memoryMb })` overrides it per prefix,
+   * and `run({ limits: { memoryMb } })` per one-off run (fresh isolate).
+   * What stays impossible is a per-run value on a warm instance — the cap
+   * is baked into the isolate at creation and instances are shared across
+   * runs of their prefix, which is why prefix `execute()`/`call()` limits
+   * reject it. Memory accumulates across calls on a warm instance —
    * hitting the cap taints the instance and the next call cold-starts.
    *
-   * Zero means no cap.
+   * Zero means no cap (such runs are admitted against the memory budget
+   * instead of the 90% admission line). Must be an integer ≥ 0.
    * @default 128
    */
   memoryMb?: number
@@ -826,6 +844,19 @@ export interface PrecompileOptions<
   code: string
 
   /**
+   * Hard cap on isolate memory for THIS prefix, in megabytes — V8 heap plus
+   * external `ArrayBuffer`s, baked into every instance serving it (e.g.
+   * 256 MB edge functions beside 32 MB codemode functions in one sandbox).
+   * Per-prefix and per-one-off are the only granularities: a per-run value
+   * on a warm instance stays impossible — the cap is fixed at isolate
+   * creation and instances are shared across runs. `0` = uncapped (admitted
+   * against the memory budget instead of the 90% line). Must be an integer
+   * ≥ 0.
+   * @default the sandbox-level `memoryMb` (128)
+   */
+  memoryMb?: number
+
+  /**
    * Declares the globals that sandbox code will be able to call.
    *
    * This defines the **bridge surface shape** — the full set of names the
@@ -1045,7 +1076,7 @@ export interface CallTarget {
 
 export interface RunOptions {
   code: string
-  limits?: ResourceLimits
+  limits?: OneOffResourceLimits
   globals?: HostGlobals
   imports?: Imports
   signal?: AbortSignal

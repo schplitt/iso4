@@ -1709,15 +1709,14 @@ describe('resource limits', () => {
     }
   }, 15_000)
 
-  test('per-run memoryMb is rejected loudly', async () => {
-    // Removed deliberately: the cap is baked into each isolate at creation and
-    // prefix runs reuse warm isolates, so a per-run value is impossible.
-    await expect(
-      runtime.run({
-        code: 'export default 1',
-        limits: { memoryMb: 32 } as never,
-      }),
-    ).rejects.toThrow(/memoryMb was removed/)
+  test('a one-off run honors its own memoryMb (#77)', async () => {
+    // One-off isolates are fresh, so run() takes a per-run cap again; the
+    // prefix-run rejection is pinned in capacity.test.ts.
+    const result = await runtime.run({
+      code: 'export default 1',
+      limits: { memoryMb: 32 },
+    })
+    expect(result.ok).toBe(true)
   })
 
   test('wall guard fires before cpu guard (tight loop)', async () => {

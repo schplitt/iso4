@@ -59,6 +59,7 @@ import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN, StreamSourceRegistry } from './
 
 export type {
   ResourceLimits,
+  OneOffResourceLimits,
   ResetCause,
   HostGlobals,
   HostGlobalValue,
@@ -115,6 +116,7 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     )
   }
   const binaryPath = resolveRuntimeBinary(options)
+  validateMemoryMb(options?.memoryMb, 'memoryMb')
   const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb)
   const maxConcurrentRuns = options?.maxConcurrentRuns
     ?? defaultMaxConcurrentRuns(warmBudgetBytes, options?.memoryMb)
@@ -391,6 +393,21 @@ function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilR
 }
 
 /**
+ * A heap cap must be an integer number of megabytes ≥ 0 (0 = uncapped):
+ * the wire carries it as a u32, and a fractional or negative value would
+ * silently misencode instead of capping.
+ * @param value the candidate cap
+ * @param where the option name for the error message
+ */
+function validateMemoryMb(value: number | undefined, where: string): void {
+  if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+    throw new TypeError(
+      `[@iso4/sandbox] ${where} must be an integer >= 0 (megabytes; 0 = uncapped)`,
+    )
+  }
+}
+
+/**
  * The failed result for a run shed at the host-side queue bound
  * (`maxQueuedRuns`). Nothing reached the runtime, so telemetry is genuinely
  * zero. Distinct from `ERR_CAPACITY` (the runtime's memory admission):
@@ -519,13 +536,11 @@ class SandboxImpl implements Sandbox {
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
     }
-    if (options.limits !== undefined && 'memoryMb' in options.limits) {
-      throw new TypeError(
-        '[@iso4/sandbox] limits.memoryMb was removed: the heap cap is uniform '
-        + 'per Runtime and baked into each isolate at creation — set it '
-        + 'once via createSandbox({ memoryMb }) instead',
-      )
-    }
+    // A one-off run always gets a fresh isolate, so its own cap is legal
+    // (#77): per-run, per-prefix and the sandbox default are the three
+    // granularities; only per-run-on-a-warm-instance stays impossible.
+    validateMemoryMb(options.limits?.memoryMb, 'limits.memoryMb')
+    const runMemoryMb = options.limits?.memoryMb ?? this.memoryMb
     const { defs, dispatch } = processGlobals(options.globals ?? {})
     // Drain any Request/Response body before the payload encoder, which is
     // synchronous. See materializeHostTypesInGlobals.
@@ -552,7 +567,7 @@ class SandboxImpl implements Sandbox {
         // always starts at line 1.
         const raw = await client.runRawCode(options.code, {
           filename: options.filename,
-          limits: { ...options.limits, memoryMb: this.memoryMb },
+          limits: { ...options.limits, memoryMb: runMemoryMb },
           globals: defs,
           dispatch,
           imports: bindings,
@@ -672,6 +687,11 @@ class SandboxImpl implements Sandbox {
   >(
     options: PrecompileOptions<G, M>,
   ): Promise<Prefix<G, M>> {
+    validateMemoryMb(options.memoryMb, 'memoryMb')
+    // Per-prefix heap cap (#77): baked into every instance serving this
+    // prefix; every run frame for it carries this value, so warm instances
+    // are created with it and attach cap-matching holds by construction.
+    const prefixMemoryMb = options.memoryMb ?? this.memoryMb
     return this.pool.withClient(async (client) => {
       const rawGlobals = options.globals ?? {} as G
       const { defs } = processGlobals(rawGlobals)
@@ -684,7 +704,7 @@ class SandboxImpl implements Sandbox {
       const raw = await client.precompile({
         code: options.code,
         filename: options.filename,
-        limits: { ...options.limits, memoryMb: this.memoryMb },
+        limits: { ...options.limits, memoryMb: prefixMemoryMb },
         globals: defs,
         imports: bindings,
       })
@@ -703,7 +723,7 @@ class SandboxImpl implements Sandbox {
         throw err
       }
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers, this.brandKey, this.memoryMb)
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers, this.brandKey, prefixMemoryMb)
     })
   }
 
@@ -754,9 +774,10 @@ implements Prefix<G, M> {
    */
   private readonly defaultImportHandlers: ImportHandlerMap
   /**
-   * The sandbox-level uniform heap cap — see `SandboxImpl.memoryMb`. Warm
-   * instances are created with this cap; per-run values no longer
-   * exist (the cap is baked into the isolate at creation).
+   * THIS prefix's heap cap (`prepare({ memoryMb })`, falling back to the
+   * sandbox default). Warm instances serving the prefix are created with
+   * it; a per-run value stays impossible — the cap is baked into the
+   * isolate at creation and instances are shared.
    */
   private readonly memoryMb: number | undefined
   /**
@@ -868,9 +889,10 @@ implements Prefix<G, M> {
     }
     if (options.limits !== undefined && 'memoryMb' in options.limits) {
       throw new TypeError(
-        '[@iso4/sandbox] limits.memoryMb was removed: the heap cap is uniform '
-        + 'per Runtime and baked into each isolate at creation — set it '
-        + 'once via createSandbox({ memoryMb }) instead',
+        '[@iso4/sandbox] limits.memoryMb is not a per-run option for prefix '
+        + 'runs: the cap is baked into the shared warm isolates at creation '
+        + '— set it per prefix via prepare({ memoryMb }), or the sandbox '
+        + 'default via createSandbox({ memoryMb })',
       )
     }
     // Extract bridge globals, routing shimmed overrides to their private keys.
