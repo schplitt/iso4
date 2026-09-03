@@ -696,43 +696,31 @@ impl StreamTable {
 
 // ── Guest timers (#79) ───────────────────────────────────────────────────────
 
-/// Cap on concurrently pending timers per run (workerd's `MAX_TIMEOUTS`).
-/// The entries live OUTSIDE the isolate heap — `v8::Global` handles, args,
-/// heap/map bookkeeping — so a run's `memoryMb` limit cannot see them; this
-/// cap is what bounds that memory.
+/// Cap on pending timers per run (workerd's number). The entries live
+/// outside the isolate heap, where `memoryMb` cannot see them.
 const MAX_PENDING_TIMERS: usize = 10_000;
 
-/// Cap on a single delay, workerd's number ("100 years max should be plenty
-/// safe") — bounds the `Instant` arithmetic, nothing more.
+/// Delay cap (workerd's "100 years") — bounds the `Instant` arithmetic.
 const MAX_TIMER_DELAY_MS: f64 = 3_153_600_000_000.0;
 
 /// One armed `setTimeout` registration.
 struct TimerEntry {
     callback: v8::Global<v8::Function>,
-    /// Extra `setTimeout(fn, ms, ...args)` arguments, passed at fire.
+    /// Extra `setTimeout(fn, ms, ...args)` arguments.
     args: Vec<v8::Global<v8::Value>>,
-    /// The real instant the loop waits on. Scheduled from the FROZEN clock
-    /// (workerd's model): the wall instant at which the clock's epoch-ms
-    /// value reaches `virtual_ms` — so CPU burned since the last clock sync
-    /// counts toward the delay, and the delay the guest asked for and the
-    /// clock it observes tell one consistent story.
+    /// Real instant the loop waits on: when the wall reaches `virtual_ms`.
     deadline: std::time::Instant,
-    /// What the frozen clock advances to when this fires: frozen-now at
-    /// registration + delay, whole ms. The callback sees exactly the
-    /// scheduled time, never real elapsed wall (which would undo the S0
-    /// freeze — see LIMITATIONS.md).
+    /// What the clock advances to at fire (frozen-at-registration + delay):
+    /// the callback sees the scheduled time, never real wall (S0 freeze).
     virtual_ms: f64,
 }
 
-/// A run's pending timers: id map + fire-order heap. Ordering is deadline,
-/// then registration order for equal deadlines (the `seq`). Heap entries
-/// are lazily deleted — `clearTimeout` removes only the map entry, and a
-/// surfacing heap entry whose id is gone is discarded.
+/// A run's pending timers: id map + fire-order heap (deadline, then `seq`
+/// = creation order). Lazily deleted — `clearTimeout` removes only the map
+/// entry.
 #[derive(Default)]
 pub struct TimerTable {
-    /// Last id handed out; ids start at 1 (0 is never returned, HTML-spec
-    /// convention). Wrapping is theoretical: reuse needs 2^32 registrations
-    /// within one run against a 10k pending cap.
+    /// Ids start at 1; wrapping needs 2^32 registrations in one run.
     last_id: u32,
     next_seq: u64,
     entries: HashMap<u32, TimerEntry>,
@@ -744,9 +732,8 @@ impl TimerTable {
         Box::new(RefCell::new(Self::default()))
     }
 
-    /// The earliest pending deadline, discarding cleared heap tops. A top
-    /// is live only when its id still maps to an entry AT ITS DEADLINE —
-    /// the deadline match guards the (theoretical) id-reuse case.
+    /// The earliest pending deadline, discarding cleared heap tops (the
+    /// deadline match also guards id reuse).
     fn peek_deadline(&mut self) -> Option<std::time::Instant> {
         loop {
             let std::cmp::Reverse((at, _, id)) = *self.order.peek()?;
@@ -791,11 +778,9 @@ thread_local! {
     static RUN_TABLE_PTR: std::cell::Cell<*const RunTable> =
         const { std::cell::Cell::new(std::ptr::null()) };
 
-    /// Runs whose timer set changed during the current turn. A continuation
-    /// carrying another run's identity (the CPED rider) can arm or clear a
-    /// CO-RESIDENT's timer mid-turn; the owner-only post-turn re-queue
-    /// cannot see that, so the loop drains this list after every turn and
-    /// re-queues the touched runs' deadlines.
+    /// Runs whose timer set changed during the current turn: a CPED-rider
+    /// continuation can arm a CO-RESIDENT's timer, invisible to the
+    /// owner-only post-turn re-queue — the loop drains this after each turn.
     static TIMERS_TOUCHED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -820,9 +805,8 @@ struct RunCallState {
     pending: Box<PendingWork>,
     /// Streamed-body registry (armed per run).
     streams: Box<StreamTable>,
-    /// Pending `setTimeout` registrations. Dropped with the entry, on every
-    /// exit path — the Globals go with it, so a settled/abandoned run's
-    /// timer can never fire into a later run on the same instance.
+    /// Pending `setTimeout` registrations; dropped with the entry, so a
+    /// settled run's timer can never fire into a later run.
     timers: Box<RefCell<TimerTable>>,
     /// Per-stub bridge bindings for THIS run — the per-call half of what a
     /// stub `Function` needs; the instance-lifetime half is the
@@ -897,9 +881,7 @@ fn attributed_state(scope: &mut v8::PinScope, table: &RunTable) -> *const RunCal
     attributed_token_and_state(scope, table).1
 }
 
-/// [`attributed_state`] plus the attributed run's token — for callbacks
-/// that key side state by run (the timer natives push the token onto
-/// [`TIMERS_TOUCHED`]). Same single table borrow.
+/// [`attributed_state`] plus the run's token, in the same table borrow.
 fn attributed_token_and_state(
     scope: &mut v8::PinScope,
     table: &RunTable,
@@ -1778,9 +1760,9 @@ impl RunState {
         }
     }
 
-    /// How long the loop may wait before this run has a deadline to serve:
-    /// the wall budget while settling (None = uncapped), the grace budget
-    /// during grace, or its earliest pending timer — whichever is sooner.
+    /// How long the loop may wait for this run: wall budget while settling
+    /// (None = uncapped), grace budget in grace, or its earliest timer —
+    /// whichever is sooner.
     fn next_timeout(&self) -> Option<Duration> {
         let boundary = match &self.phase {
             RunPhase::Starting | RunPhase::Settling { .. } => {
@@ -1941,16 +1923,14 @@ fn run_call_phase(
 
     // The run is suspended: drive it on events until it finishes.
     loop {
-        // Single-run drive: deadlines are recomputed from the run's state
-        // each pass, so the touched-run stamps (an instance-loop concern)
-        // are dropped rather than accumulated.
+        // Deadlines are recomputed each pass; the touched-run stamps are
+        // an instance-loop concern.
         TIMERS_TOUCHED.with(|v| v.borrow_mut().clear());
         if rs.source.is_none() {
             if earliest_timer(&rs).is_some() {
-                // No socket, but timers are internal events: park the
-                // thread to the next deadline (outside any budget epoch —
-                // a sleep costs no CPU) and serve it. This is what lets a
-                // run with no imports `await` a sleep.
+                // No socket, but timers are internal events: park to the
+                // next deadline (outside any budget epoch — a sleep costs
+                // no CPU) and serve it.
                 if let Some(at) = next_deadline(&rs) {
                     let now = std::time::Instant::now();
                     if at > now {
@@ -1962,10 +1942,9 @@ fn run_call_phase(
                 }
                 continue;
             }
-            // Nothing can ever deliver an event to this run. `scan` fails a
-            // sourceless pending run without timers, so only hold-mode
-            // grace gets here: whatever is still registered can never
-            // settle.
+            // Nothing can ever deliver an event to this run. `scan` fails
+            // a sourceless pending run without timers, so only hold-mode
+            // grace gets here.
             return Ok(finish_grace(&mut rs, GraceStatus::Truncated));
         }
         let timeout = rs.next_timeout();
@@ -2059,11 +2038,9 @@ fn handle_loop_event(
     }
 }
 
-/// The single-run wait timed out: fire every due timer (each one a turn),
-/// then conclude the boundary if it too is due — a timer due before (or at)
-/// the wall is an input "in by T" and fires first. `None` = the run is
-/// still in flight (the wait raced its own rounding, or a timer turn left
-/// the run pending); the caller re-waits on the recomputed timeout.
+/// The single-run wait timed out: fire every due timer, then conclude the
+/// boundary if it too is due (a due timer beats the wall). `None` = still
+/// in flight; the caller re-waits.
 fn deadline_hit(
     isolate: &mut v8::OwnedIsolate,
     context: &v8::Global<v8::Context>,
@@ -2137,14 +2114,10 @@ fn earliest_timer(rs: &RunState) -> Option<std::time::Instant> {
     unsafe { &*rs.timers }.borrow_mut().peek_deadline()
 }
 
-/// The instant the loop must next wake for this run: its phase boundary or
-/// its earliest timer, whichever is sooner. Timers participate in grace too
-/// (the grace deadline stays the boundary, so `graceMs` caps them). The
-/// multi-run heap's lazy-deletion validity is defined against THIS value —
-/// an entry is stale exactly when it no longer equals it. Unlike the old
-/// phase-only deadline this value moves (timers arm, fire, clear), but each
-/// turn re-queues at most one entry per touched run, so the heap still
-/// grows with turns, never with pending-timer count.
+/// The instant the loop must next wake for this run: phase boundary or
+/// earliest timer, whichever is sooner (timers participate in grace too —
+/// `graceMs` caps them). Heap validity in the multi-run loop is defined
+/// against THIS value.
 fn next_deadline(rs: &RunState) -> Option<std::time::Instant> {
     match (deadline_instant(rs), earliest_timer(rs)) {
         (Some(b), Some(t)) => Some(b.min(t)),
@@ -2746,10 +2719,9 @@ fn finish_turn(
     scan(scope, facts, rs)
 }
 
-/// One timer-driven turn: fire the run's earliest pending timer callback,
-/// checkpoint, scan. The clock advances to the timer's SCHEDULED time
-/// (frozen-at-registration + delay), never to the real wall — the workerd
-/// model: a timer must not reveal real elapsed time (LIMITATIONS.md, S0).
+/// One timer-driven turn: fire the run's earliest pending timer,
+/// checkpoint, scan. The clock advances to the timer's SCHEDULED time,
+/// never real wall (a timer must not reveal real elapsed time — S0).
 fn timer_turn(
     isolate: &mut v8::OwnedIsolate,
     context: &v8::Global<v8::Context>,
@@ -2758,13 +2730,11 @@ fn timer_turn(
 ) -> ScanOutcome {
     // SAFETY: `timers` points into the run's live table entry.
     let Some(entry) = unsafe { &*rs.timers }.borrow_mut().pop_earliest() else {
-        // Cleared between queueing and firing — a spurious wake, not a turn.
-        return ScanOutcome::Continue;
+        return ScanOutcome::Continue; // cleared in the meantime
     };
     let in_grace = matches!(rs.phase, RunPhase::Grace(_));
 
-    // Re-arm the guard and the phase budget: the callback is guest JS and
-    // bills to the run that armed the timer. Both release on every exit.
+    // The callback is guest JS billed to the run that armed the timer.
     let _turn = TurnGuard::begin(facts.guard, rs);
     let _epoch = BudgetEpoch::enter(rs.active_budget());
 
@@ -2786,10 +2756,8 @@ fn timer_turn(
         .map(|a| v8::Local::new(scope, a))
         .collect();
     if callback.call(scope, recv, &call_args).is_none() {
-        // The callback threw — or a guard ripped it mid-execution. A kill
-        // leaves the reason/termination flag for the shared tail and the
-        // caller's taint verdict; a plain uncaught throw fails the run
-        // (same contract as an uncaught rejection of the root).
+        // A kill leaves reason/termination for the shared tail; a plain
+        // uncaught throw fails the run.
         if facts.reason.get().is_none() && !scope.is_execution_terminating() {
             let err = match scope.exception() {
                 Some(exception) => runtime_error_from_value(scope, exception),
@@ -2846,11 +2814,8 @@ fn scan(
                     return finished(Err(rs.fail(owned_bridge_error(err))));
                 }
                 if rs.source.is_none() && earliest_timer(rs).is_none() {
-                    // Pending with no socket to wait on and no pending
-                    // timer — an un-awaited promise that nothing in the
-                    // isolate can ever resolve. (With a timer pending the
-                    // run stays in flight: the drive loop parks to the
-                    // deadline and the timer may resolve the root.)
+                    // Pending with no socket and no pending timer —
+                    // nothing in the isolate can ever resolve it.
                     let error = match facts.reason.get() {
                         Some(TerminationReason::Wall) => RunError::WallTimeout,
                         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
@@ -3319,9 +3284,8 @@ fn grace_scan(
         return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
     }
     if rs.source.is_none() && earliest_timer(rs).is_none() {
-        // No event source, no pending timer: nothing can resolve the rest.
-        // (With a timer pending the drive loop parks to its deadline — a
-        // timer is an internal event that may settle the set.)
+        // No event source, no pending timer: nothing can resolve the
+        // rest.
         return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
     }
     ScanOutcome::Continue
@@ -3978,12 +3942,10 @@ enum PendingAbandon {
 const MAX_PENDING_ABANDONS: usize = 256;
 
 /// The multi-run loop's deadline heap: `(deadline, run token)`, nearest
-/// first. Entries are lazily deleted — an entry whose instant no longer
-/// equals its run's [`next_deadline`] (the run concluded, moved from wall
-/// to grace, or its timer set changed) is discarded when it surfaces. Each
-/// turn re-queues at most one entry per touched run, so the heap grows
-/// with turns — never with frame traffic it doesn't process, and never
-/// with pending-timer count.
+/// first. Lazily deleted — an entry is stale when it no longer equals its
+/// run's [`next_deadline`]. Each turn re-queues at most one entry per
+/// touched run, so the heap grows with turns, never with pending-timer
+/// count.
 type DeadlineHeap = std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>;
 
 /// The nearest live deadline, discarding stale heap tops on the way.
@@ -4004,12 +3966,8 @@ fn peek_valid_deadline(
     }
 }
 
-/// Re-queue heap entries for runs whose timer set changed during the last
-/// turn. The turn owner's own changes are also covered by the owner
-/// re-queue; the list exists for CO-RESIDENTS — a continuation carrying
-/// another run's identity (the CPED rider) can arm or clear that run's
-/// timers mid-turn, which no owner-side check can see. Duplicate entries
-/// are harmless (lazy deletion).
+/// Re-queue deadlines for runs whose timer set changed during the last
+/// turn (see [`TIMERS_TOUCHED`]); duplicates are harmless (lazy deletion).
 fn drain_touched_timers(live: &[LiveRun], deadlines: &mut DeadlineHeap) {
     TIMERS_TOUCHED.with(|v| {
         for token in v.borrow_mut().drain(..) {
@@ -4033,12 +3991,10 @@ fn reason_error(reason: &ReasonCell) -> RunError {
     }
 }
 
-/// Serve every deadline that lies at or before `cutoff`: fire due TIMERS
-/// (each one a real turn — guest JS runs, so taint can arise; `true` means
-/// the instance came out tainted and the caller must sweep and return),
-/// and conclude runs whose BOUNDARY deadline expired (no JS on that path).
-/// A timer due at the same instant as its run's boundary fires first — an
-/// input "in by T" — and the boundary concludes on the next iteration.
+/// Serve every deadline at or before `cutoff`: due TIMERS fire (a real
+/// turn — guest JS, so taint can arise; `true` = tainted, caller sweeps
+/// and returns), expired BOUNDARIES conclude their runs (no JS). A timer
+/// tying with its run's boundary fires first.
 ///
 /// The cutoff is what makes deadlines fire in ARRIVAL order rather than
 /// processing order: the event paths pass the event's demux arrival stamp,
@@ -4064,9 +4020,8 @@ fn sweep_expired_deadlines(
             .iter()
             .position(|l| l.rs.token == token)
             .expect("peek_valid_deadline checked liveness");
-        // Which deadline surfaced: the run's earliest timer, or its phase
-        // boundary. (`at == next_deadline`, so a timer matching `at` is
-        // the earliest due thing this run has.)
+        // Which deadline surfaced: the run's earliest timer, or its
+        // phase boundary.
         if earliest_timer(&live[idx].rs) == Some(at) {
             let mut l = live.swap_remove(idx);
             LAST_CULPRIT_RUN_ID.with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
@@ -4086,9 +4041,8 @@ fn sweep_expired_deadlines(
                 }
                 ScanOutcome::Continue => {
                     if tainted_now {
-                        // Bare terminate mid-turn: the owner is still live —
-                        // classify and conclude it here (the event arm's
-                        // rule).
+                        // Bare terminate mid-turn: classify and conclude
+                        // here (the event arm's rule).
                         let failure = l.rs.fail(reason_error(&core.reason));
                         conclude_run(&mut core.isolate, &core.run_table, l, Err(failure), true);
                     } else {
@@ -4561,8 +4515,7 @@ fn dispatch_job(
             }
         }
     }
-    // A start-turn continuation can touch a co-resident's timers exactly
-    // like an event turn's can.
+    // A start turn can touch a co-resident's timers like any other turn.
     drain_touched_timers(live, deadlines);
     tainted_now
 }
@@ -7207,12 +7160,9 @@ fn wait_until_callback(
     rv.set_undefined();
 }
 
-/// Install the `setTimeout`/`clearTimeout` globals: native functions over
-/// the attributed run's [`TimerTable`] (the `waitUntil` pattern — permanent
-/// on the context, per-run by attribution). Outside run code — prefix
-/// top-level, warm-up — `setTimeout` throws a catchable error (workerd's
-/// explicit route for the same case) rather than arming a timer no loop
-/// would ever fire.
+/// Install `setTimeout`/`clearTimeout`: natives over the attributed run's
+/// [`TimerTable`] (the `waitUntil` pattern). Outside run code `setTimeout`
+/// throws a catchable error (workerd's explicit route).
 fn install_timers(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
     let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
     for (name, builder) in [
@@ -7232,10 +7182,8 @@ fn install_timers(scope: &mut v8::PinScope, table: *const RunTable) -> Result<()
 }
 
 /// `setTimeout(callback, delay, ...args)` — arm a timer on the attributed
-/// run. Returns a numeric id (per-run, starting at 1). The deadline is
-/// scheduled FROM the frozen clock and the fire advances the clock TO that
-/// scheduled value, so the guest-visible story is exactly "delay ms passed"
-/// — never real elapsed wall (the workerd model; see LIMITATIONS.md).
+/// run; returns a per-run numeric id. Scheduled from the frozen clock, so
+/// the guest-visible story is exactly "delay ms passed" (workerd model).
 fn set_timeout_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -7269,8 +7217,7 @@ fn set_timeout_callback(
         scope.throw_exception(exception);
         return;
     };
-    // Delay: coerce to number; NaN/negative → 0, capped at workerd's 100
-    // years, whole ms (the clock never shows sub-ms).
+    // NaN/negative → 0, capped at 100 years, whole ms.
     let mut delay = args
         .get(1)
         .number_value(scope)
@@ -7281,10 +7228,8 @@ fn set_timeout_callback(
         .map(|i| v8::Global::new(scope, args.get(i)))
         .collect();
 
-    // Scheduled from the frozen clock: the timer fires at the wall instant
-    // where the clock's epoch-ms value reaches `virtual_ms`. `lead` shrinks
-    // by however much the clock lags the wall (CPU burned this turn) and
-    // floors at zero — due immediately.
+    // Fires at the wall instant where the clock would reach `virtual_ms`;
+    // `lead` shrinks by the clock's lag and floors at zero (due now).
     let wall = crate::webtypes::wall_now_ms();
     let frozen = crate::webtypes::frozen_now_ms(scope).unwrap_or(wall);
     let virtual_ms = frozen + delay;
@@ -7321,9 +7266,8 @@ fn set_timeout_callback(
 }
 
 /// `clearTimeout(id)` — disarm one of the attributed run's own timers.
-/// Everything else is a silent no-op (web semantics): unknown ids, foreign
-/// runs' ids (unreachable by construction — the lookup is scoped to the
-/// caller's run), non-numeric arguments, and calls outside run code.
+/// Everything else (unknown/foreign ids, garbage, outside run code) is a
+/// silent no-op, web semantics.
 fn clear_timeout_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -7357,8 +7301,7 @@ fn clear_timeout_callback(
         .remove(&(id as u32))
         .is_some();
     if removed {
-        // The run's next deadline may have moved later; let the loop
-        // re-queue it (the stale heap entry is lazily discarded).
+        // The next deadline may have moved later; let the loop re-queue.
         TIMERS_TOUCHED.with(|v| v.borrow_mut().push(token));
     }
 }
@@ -13878,9 +13821,8 @@ mod tests {
 
     #[test]
     fn timer_callback_sees_exactly_the_scheduled_time() {
-        // The workerd model, pinned: the frozen clock advances BY THE
-        // REQUESTED DELAY, never to the real wall — so the delta is exact,
-        // regardless of scheduling overshoot.
+        // The workerd model, pinned: the clock advances by the REQUESTED
+        // delay, so the delta is exact regardless of overshoot.
         let out = run_ok(
             "const t0 = Date.now()\n\
              await new Promise(r => setTimeout(r, 120))\n\
@@ -13891,10 +13833,8 @@ mod tests {
 
     #[test]
     fn zero_delay_timer_after_cpu_burn_reveals_no_elapsed_time() {
-        // The reason timers virtualize at all: a setTimeout(0) probe after
-        // a CPU burn must NOT read real elapsed wall time back (that would
-        // undo the S0 freeze). The burn is real compute the frozen clock
-        // hides; the timer fire must keep hiding it.
+        // The point of virtualizing: a setTimeout(0) probe after a CPU
+        // burn must not read real elapsed wall time back (S0 freeze).
         let out = run_ok(
             "const t0 = Date.now()\n\
              let acc = 0\n\
@@ -13949,9 +13889,8 @@ mod tests {
 
     #[test]
     fn a_settled_runs_pending_timer_never_fires_into_the_next_run() {
-        // Warm isolate: run 1 arms a timer and settles with it pending; the
-        // heap is dropped with the run's table entry, so the callback can
-        // never fire into run 2 — even after the deadline has really passed.
+        // Run 1 settles with a timer pending; the heap drops with its
+        // table entry, so the callback can never fire into run 2.
         init_platform();
         let mut core = create_instance_core(
             Some(PrefixSpec {
