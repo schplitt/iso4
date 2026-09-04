@@ -460,6 +460,10 @@ export type HostExportData
  * Use specific function types for your handlers and let TypeScript infer
  * them through `HostGlobals`, `RebindGlobals<G>`, and `RebindImports<M>`.
  */
+// TODO: hand bridge handlers the run's AbortSignal (a context argument) so a
+// host handler can cancel its own IO when the run is aborted — today an
+// aborted run's in-flight handler finishes unaware and its response is
+// dropped.
 export type HostExportFunction = (...args: unknown[]) => unknown
 
 /**
@@ -1012,7 +1016,28 @@ export interface PrefixRunOptions<
   imports?: RebindImports<M>
 
   limits?: ResourceLimits
+  /**
+   * Abort the run. Firing this is always SOFT: while queued the caller is
+   * dequeued; a running run is abandoned at its next execution boundary —
+   * nothing is interrupted mid-execution, the warm instance survives, and
+   * co-resident runs are untouched. The result resolves with
+   * `status: 'aborted'` carrying the runtime's real partial telemetry.
+   *
+   * A soft abort cannot reach code that never yields: a synchronous loop
+   * with no `cpuTimeMs` cap keeps its thread until a hard abort
+   * ({@link hardAbortSignal}) or dispose. Bound such code with `cpuTimeMs`.
+   */
   signal?: AbortSignal
+  /**
+   * HARD abort — the opt-in escalation. Firing this interrupts the run
+   * wherever it is: executing JS is terminated immediately, and when that
+   * lands mid-execution the shared instance is discarded and co-resident
+   * runs fail with `ERR_INSTANCE_RESET` (cause `abort`). On a run that is
+   * queued or suspended it degrades to the same clean abandon as `signal`,
+   * so firing it is never worse than a soft abort. Typical use: fire
+   * `signal` first, then this after your own patience runs out.
+   */
+  hardAbortSignal?: AbortSignal
   filename?: string
 }
 
@@ -1036,7 +1061,28 @@ export interface PrefixCallOptions<
    */
   imports?: RebindImports<M>
   limits?: ResourceLimits
+  /**
+   * Abort the run. Firing this is always SOFT: while queued the caller is
+   * dequeued; a running run is abandoned at its next execution boundary —
+   * nothing is interrupted mid-execution, the warm instance survives, and
+   * co-resident runs are untouched. The result resolves with
+   * `status: 'aborted'` carrying the runtime's real partial telemetry.
+   *
+   * A soft abort cannot reach code that never yields: a synchronous loop
+   * with no `cpuTimeMs` cap keeps its thread until a hard abort
+   * ({@link hardAbortSignal}) or dispose. Bound such code with `cpuTimeMs`.
+   */
   signal?: AbortSignal
+  /**
+   * HARD abort — the opt-in escalation. Firing this interrupts the run
+   * wherever it is: executing JS is terminated immediately, and when that
+   * lands mid-execution the shared instance is discarded and co-resident
+   * runs fail with `ERR_INSTANCE_RESET` (cause `abort`). On a run that is
+   * queued or suspended it degrades to the same clean abandon as `signal`,
+   * so firing it is never worse than a soft abort. Typical use: fire
+   * `signal` first, then this after your own patience runs out.
+   */
+  hardAbortSignal?: AbortSignal
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1079,7 +1125,28 @@ export interface RunOptions {
   limits?: OneOffResourceLimits
   globals?: HostGlobals
   imports?: Imports
+  /**
+   * Abort the run. Firing this is always SOFT: while queued the caller is
+   * dequeued; a running run is abandoned at its next execution boundary —
+   * nothing is interrupted mid-execution, the warm instance survives, and
+   * co-resident runs are untouched. The result resolves with
+   * `status: 'aborted'` carrying the runtime's real partial telemetry.
+   *
+   * A soft abort cannot reach code that never yields: a synchronous loop
+   * with no `cpuTimeMs` cap keeps its thread until a hard abort
+   * ({@link hardAbortSignal}) or dispose. Bound such code with `cpuTimeMs`.
+   */
   signal?: AbortSignal
+  /**
+   * HARD abort — the opt-in escalation. Firing this interrupts the run
+   * wherever it is: executing JS is terminated immediately, and when that
+   * lands mid-execution the shared instance is discarded and co-resident
+   * runs fail with `ERR_INSTANCE_RESET` (cause `abort`). On a run that is
+   * queued or suspended it degrades to the same clean abandon as `signal`,
+   * so firing it is never worse than a soft abort. Typical use: fire
+   * `signal` first, then this after your own patience runs out.
+   */
+  hardAbortSignal?: AbortSignal
   filename?: string
 }
 

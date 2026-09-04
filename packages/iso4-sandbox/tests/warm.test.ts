@@ -154,16 +154,16 @@ describe('warm instances', () => {
     expect(fresh.value).toBe(3)
   })
 
-  test('aborting a CPU-bound run kills it mid-execution with real telemetry', async () => {
-    // A synchronous spin never reads the socket, so the Terminate frame
-    // alone could not stop it — the runtime now terminates the executing
-    // turn directly. The proof it was the graceful path and not the old
-    // connection-teardown fallback: the result carries REAL telemetry
+  test('hard-aborting a CPU-bound run kills it mid-execution with real telemetry', async () => {
+    // A synchronous spin never reads the socket, so a soft (routed)
+    // Terminate could not stop it — only the HARD abort terminates the
+    // executing turn directly. The proof it was the graceful path and not
+    // the connection-teardown fallback: the result carries REAL telemetry
     // (the teardown fallback synthesizes zeros).
     const controller = new AbortController()
     const pending = single.run({
       code: 'for (;;) {}',
-      signal: controller.signal,
+      hardAbortSignal: controller.signal,
       limits: { cpuTimeMs: 30_000, wallTimeMs: 30_000 },
     })
     setTimeout(() => controller.abort('cancelled'), 200)

@@ -81,13 +81,16 @@ export type BridgeCallDispatcher = (call: {
 export type { ResourceLimits }
 
 /**
- * How long TS waits for Rust's graceful `ERR_ABORTED` Result after sending a
- * `Terminate` frame, before falling back to tearing the connection down.
+ * How long TS waits for Rust's `ERR_ABORTED` Result after sending a HARD
+ * `Terminate`, before falling back to tearing the connection down.
  *
- * The runtime's session demux always consumes the frame: a suspended run is
- * abandoned on the spot, and a CPU-bound run is terminated mid-execution —
- * both answer with a real Result in well under this window. The fallback
- * only bites when the runtime cannot answer at all (wedged process).
+ * Hard aborts always answer promptly (a suspended run is abandoned on the
+ * spot, executing JS is interrupted mid-turn), so no answer within this
+ * window means the runtime cannot answer at all (wedged process). SOFT
+ * aborts arm no fallback: a run spinning with no `cpuTimeMs` cap
+ * legitimately cannot answer one until its own limits end the turn, and
+ * tearing the connection down for that would fail every co-resident run of
+ * a healthy runtime.
  */
 const TERMINATE_GRACE_MS = 100
 
@@ -121,9 +124,9 @@ export class HandshakeError extends Error {
 }
 
 /**
- * Thrown out of a run when its `AbortSignal` fires mid-flight and the graceful
- * `Terminate` path did not produce a Result within {@link TERMINATE_GRACE_MS}
- * (or when the pre-run abort race tears down before the run settles). The
+ * Thrown out of a run when a hard abort did not produce a Result within
+ * {@link TERMINATE_GRACE_MS} (or when the pre-run abort race tears down
+ * before the run settles). The
  * connection is torn down (so the Rust isolate is reclaimed) before this
  * propagates, and the client is marked unusable so the pool replaces it rather
  * than reusing a half-dead slot. `index.ts` catches this and synthesizes the
@@ -173,6 +176,7 @@ interface RunEntry {
   dispatcher: BridgeCallDispatcher | undefined
   streams: StreamSourceRegistry | undefined
   signal: AbortSignal | undefined
+  hardAbortSignal: AbortSignal | undefined
   resolve: (result: RawRunResult) => void
   reject: (error: Error) => void
   /**
@@ -429,6 +433,7 @@ export class RuntimeIpcClient {
       imports?: readonly ImportBindingPayload[]
       importDispatch?: ImportHandlerMap
       signal?: AbortSignal
+      hardAbortSignal?: AbortSignal
       call?: CallPayload
       streams?: StreamSourceRegistry
     },
@@ -453,6 +458,7 @@ export class RuntimeIpcClient {
       ),
       makeDispatcher(options?.dispatch ?? {}, options?.importDispatch),
       options?.signal,
+      options?.hardAbortSignal,
       options?.streams,
     )
   }
@@ -472,6 +478,7 @@ export class RuntimeIpcClient {
       importRebinds?: readonly ImportRebindPayload[]
       importDispatch?: ImportHandlerMap
       signal?: AbortSignal
+      hardAbortSignal?: AbortSignal
       call?: CallPayload
       streams?: StreamSourceRegistry
     },
@@ -497,6 +504,7 @@ export class RuntimeIpcClient {
       ),
       makeDispatcher(options.dispatch ?? {}, options.importDispatch),
       options.signal,
+      options.hardAbortSignal,
       options.streams,
     )
   }
@@ -507,28 +515,35 @@ export class RuntimeIpcClient {
    * settlement. Registration happens *before* the write so the router can
    * never see a frame for a run it does not know yet.
    *
-   * ── In-flight abort (graceful terminate) ──────────────────────────────────
+   * ── In-flight abort (soft and hard) ────────────────────────────────────────
    * When `signal` fires mid-run — including while a bridge call is in flight —
-   * we first ask Rust to stop gracefully: send a `Terminate` frame (carrying
-   * `runId`) and keep the connection routing. The runtime's demux consumes the
-   * frame and either abandons a suspended run or terminates a CPU-bound one
-   * mid-execution; both reply with a real `ERR_ABORTED` `Result` (carrying
-   * duration, CPU time, and the bridge records collected so far). That Result
-   * flows back through the router and the connection stays healthy for reuse.
+   * we send a SOFT `Terminate` frame (runId + mode 0) and keep the connection
+   * routing. The runtime abandons the run at its next turn boundary: nothing
+   * is interrupted mid-execution, the instance survives, and a real
+   * `ERR_ABORTED` `Result` (carrying duration, CPU time, and the bridge
+   * records collected so far) flows back through the router. No fallback
+   * timer: a run spinning synchronously with no `cpuTimeMs` cap legitimately
+   * cannot answer a soft abort until its own limits end the turn — that is
+   * the documented soft-abort contract, and tearing the connection down for
+   * it would fail every co-resident run for a healthy runtime.
    *
-   * If no Result arrives within {@link TERMINATE_GRACE_MS} — the runtime
-   * cannot answer at all (wedged process) — we fall back to
-   * `abortConnection`: the reader is closed so the router fails every run in
-   * flight, and the socket is destroyed so Rust observes EOF (see DESIGN.md
-   * §14.7). This run then rejects `RunAbortedError`, which `index.ts` maps to
-   * a synthesized `ERR_ABORTED` `RunResult`. Any late `BridgeResponse` from an
-   * orphaned handler is harmless either way: on the graceful path the routed
-   * connection discards it runtime-side (stale callId), on the fallback path
-   * the socket is gone.
+   * When `hardAbortSignal` fires, we send a HARD `Terminate` (mode 1): the
+   * runtime interrupts executing JS immediately (tainting the instance when
+   * the kill lands mid-turn) or abandons a suspended run exactly like soft.
+   * Hard always answers promptly, so it keeps the {@link TERMINATE_GRACE_MS}
+   * fallback: no Result within the window means the runtime cannot answer at
+   * all (wedged process) and `abortConnection` tears the connection down —
+   * the reader closes, every run in flight fails, and Rust observes EOF (see
+   * DESIGN.md §14.7). This run then rejects `RunAbortedError`, which
+   * `index.ts` maps to a synthesized `ERR_ABORTED` `RunResult`. Any late
+   * `BridgeResponse` from an orphaned handler is harmless on every path:
+   * routed connections discard it runtime-side (stale callId), a torn-down
+   * socket is gone.
    * @param runId
    * @param frame the encoded `Run`/`PrefixRun` frame
    * @param dispatcher
    * @param signal
+   * @param hardAbortSignal
    * @param streams
    */
   private async executeRun(
@@ -536,12 +551,14 @@ export class RuntimeIpcClient {
     frame: Buffer,
     dispatcher: BridgeCallDispatcher | undefined,
     signal?: AbortSignal,
+    hardAbortSignal?: AbortSignal,
     streams?: StreamSourceRegistry,
   ): Promise<RawRunResult> {
     const entry: RunEntry = {
       dispatcher,
       streams,
       signal,
+      hardAbortSignal,
       resolve: NOOP,
       reject: NOOP,
       detachAbort: NOOP,
@@ -556,31 +573,43 @@ export class RuntimeIpcClient {
     settled.catch(() => {})
     let graceTimer: ReturnType<typeof setTimeout> | undefined
     // Ask Rust to stop and send a real ERR_ABORTED Result. Fire-and-forget:
-    // if the write fails the socket is already broken, and the fallback
-    // timer (or a reader error) resolves the run anyway. The fallback tears
-    // the whole connection down — with several runs multiplexed on it that
-    // is a documented blast radius, acceptable because the runtime answers
-    // a Terminate in well under the window unless the child is wedged, in
-    // which case every run on the connection is already lost.
-    const beginGracefulAbort = (): void => {
+    // if the write fails the socket is already broken and a reader error
+    // resolves the run anyway.
+    const beginSoftAbort = (): void => {
       this.write(
         encodeTsToRustFrame(
           TsToRustMessageTypes.Terminate,
-          encodeTerminatePayload(runId),
+          encodeTerminatePayload(runId, false),
         ),
       ).catch(() => {
-        // Socket already gone — nothing to gracefully terminate.
+        // Socket already gone — nothing to terminate.
       })
-      graceTimer = setTimeout(() => {
-        this.abortConnection()
-      }, TERMINATE_GRACE_MS)
-      // Don't let the grace timer alone keep the event loop alive.
-      graceTimer.unref?.()
     }
-    if (signal !== undefined && !signal.aborted) {
-      signal.addEventListener('abort', beginGracefulAbort, { once: true })
+    const beginHardAbort = (): void => {
+      this.write(
+        encodeTsToRustFrame(
+          TsToRustMessageTypes.Terminate,
+          encodeTerminatePayload(runId, true),
+        ),
+      ).catch(() => {
+        // Socket already gone — nothing to terminate.
+      })
+      if (graceTimer === undefined) {
+        graceTimer = setTimeout(() => {
+          this.abortConnection()
+        }, TERMINATE_GRACE_MS)
+        // Don't let the grace timer alone keep the event loop alive.
+        graceTimer.unref?.()
+      }
+    }
+    if (signal !== undefined || hardAbortSignal !== undefined) {
+      if (signal !== undefined && !signal.aborted)
+        signal.addEventListener('abort', beginSoftAbort, { once: true })
+      if (hardAbortSignal !== undefined && !hardAbortSignal.aborted)
+        hardAbortSignal.addEventListener('abort', beginHardAbort, { once: true })
       entry.detachAbort = () => {
-        signal.removeEventListener('abort', beginGracefulAbort)
+        signal?.removeEventListener('abort', beginSoftAbort)
+        hardAbortSignal?.removeEventListener('abort', beginHardAbort)
         if (graceTimer !== undefined)
           clearTimeout(graceTimer)
       }
@@ -591,20 +620,15 @@ export class RuntimeIpcClient {
       await this.write(frame)
       // The frame carrying stream handles is on the wire; start their pumps.
       this.activateStreams(streams, runId)
-      // If the signal aborted between the run-entry check in index.ts and
-      // here, the listener above never fired (it was attached to an
-      // un-aborted signal, or never attached): take the same graceful path.
-      // The runtime registers the run's route before dispatching it, so a
-      // Terminate sent right behind the request frame lands — tearing the
-      // whole connection down for this benign race would cost every
-      // co-resident run.
-      if (signal?.aborted && graceTimer === undefined) {
-        beginGracefulAbort()
-        entry.detachAbort = () => {
-          if (graceTimer !== undefined)
-            clearTimeout(graceTimer)
-        }
-      }
+      // If a signal aborted between the run-entry check in index.ts and
+      // here, its listener above never fired (it was attached to an
+      // un-aborted signal, or never attached): take the same paths. The
+      // runtime registers the run's route before dispatching it, so a
+      // Terminate sent right behind the request frame lands.
+      if (hardAbortSignal?.aborted)
+        beginHardAbort()
+      else if (signal?.aborted)
+        beginSoftAbort()
     } catch (error) {
       if (this.runs.delete(runId)) {
         entry.detachAbort()
@@ -616,11 +640,13 @@ export class RuntimeIpcClient {
       return await settled
     } catch (error) {
       // Teardown rejections arrive here as whatever closed the connection.
-      // Translate any error observed once the signal has fired into a
+      // Translate any error observed once a signal has fired into a
       // distinguishable abort — carrying the abort reason — so the caller
       // resolves an aborted RunResult.
       if (signal?.aborted)
         throw new RunAbortedError(signal.reason)
+      if (hardAbortSignal?.aborted)
+        throw new RunAbortedError(hardAbortSignal.reason)
       throw error
     }
   }
@@ -973,25 +999,34 @@ export class RuntimeIpcClient {
 
     // Aborting during the epilogue cancels the background work gracefully:
     // a Terminate frame truncates the grace phase runtime-side and the
-    // RunComplete still arrives (status `truncated`). No teardown fallback —
-    // the caller already has their value, and the grace wall bounds a
-    // runtime that cannot read the frame.
+    // RunComplete still arrives (status `truncated`). Soft and hard both
+    // truncate; hard can additionally interrupt a grace turn mid-JS. No
+    // teardown fallback for either — the caller already has their value,
+    // and the grace wall bounds a runtime that cannot read the frame.
     const signal = entry.signal
-    const cancelGrace = (): void => {
+    const hardAbortSignal = entry.hardAbortSignal
+    const cancelGrace = (hard: boolean) => (): void => {
       this.write(
         encodeTsToRustFrame(
           TsToRustMessageTypes.Terminate,
-          encodeTerminatePayload(runId),
+          encodeTerminatePayload(runId, hard),
         ),
       ).catch(() => {
         // Socket already gone — the epilogue resolves through the router.
       })
     }
-    if (signal?.aborted) {
-      cancelGrace()
-    } else if (signal !== undefined) {
-      signal.addEventListener('abort', cancelGrace, { once: true })
-      entry.detachAbort = () => signal.removeEventListener('abort', cancelGrace)
+    const cancelSoft = cancelGrace(false)
+    const cancelHard = cancelGrace(true)
+    if (hardAbortSignal?.aborted || signal?.aborted) {
+      (hardAbortSignal?.aborted ? cancelHard : cancelSoft)()
+      entry.detachAbort = NOOP
+    } else {
+      signal?.addEventListener('abort', cancelSoft, { once: true })
+      hardAbortSignal?.addEventListener('abort', cancelHard, { once: true })
+      entry.detachAbort = () => {
+        signal?.removeEventListener('abort', cancelSoft)
+        hardAbortSignal?.removeEventListener('abort', cancelHard)
+      }
     }
 
     entry.resolve({ result: payload, epilogue })

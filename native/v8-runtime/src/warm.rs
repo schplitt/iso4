@@ -899,6 +899,13 @@ mod tests {
         crate::webcodec::brand_key_for_token(&[0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN])
     }
 
+    /// A soft Terminate payload: `u32 runId, u8 mode = 0`.
+    fn terminate_payload(run_id: u32) -> Vec<u8> {
+        let mut p = run_id.to_be_bytes().to_vec();
+        p.push(0);
+        p
+    }
+
     fn bump_job() -> CallJob {
         CallJob {
             token: 0,
@@ -1400,6 +1407,7 @@ mod tests {
                    export async function viaTool(x) { console.log('run-' + x); const v = await tool(); return [x, v] }\n\
                    export async function hangBump() { n++; await tool(); return n }\n\
                    export function spin() { for (;;) {} }\n\
+                   export async function spinAfterTool() { await tool(); for (;;) {} }\n\
                    export function busy(c) { let x = 0; for (let i = 0; i < c; i++) x = (x + i) & 1048575; return x }"
                 .to_string(),
             filename: None,
@@ -1437,6 +1445,22 @@ mod tests {
         counter: &Arc<AtomicU32>,
         limits: sandbox::Limits,
     ) -> SessionRun {
+        submit_session_job_with_ctl(handle, run_id, export_path, args, sink, counter, limits, None)
+    }
+
+    /// [`submit_session_job`] plus the demux's guard-ctl slot, for tests
+    /// that drive the hard abort's mid-turn kill.
+    #[allow(clippy::too_many_arguments)]
+    fn submit_session_job_with_ctl(
+        handle: &InstanceHandle,
+        run_id: u32,
+        export_path: &str,
+        args: Vec<TestValue>,
+        sink: crate::ipc::FrameSink,
+        counter: &Arc<AtomicU32>,
+        limits: sandbox::Limits,
+        ctl_slot: Option<Arc<std::sync::OnceLock<sandbox::GuardCtl>>>,
+    ) -> SessionRun {
         let token = sandbox::alloc_run_token();
         let (otx, orx) = crossbeam_channel::bounded(1);
         let job = Box::new(CallJob {
@@ -1456,7 +1480,7 @@ mod tests {
                 report_heap: false,
             }),
             complete: None,
-            ctl_slot: None,
+            ctl_slot,
         });
         handle
             .sender()
@@ -1593,6 +1617,69 @@ mod tests {
     }
 
     #[test]
+    fn a_hard_abort_mid_turn_taints_and_resets_co_residents() {
+        // The hard abort's kill lands inside a microtask-checkpoint
+        // continuation — the spot where V8's terminate flag used to be
+        // consumed silently, leaving the run parked forever (#75 re-check).
+        // The reason cell written by `abort_executing` makes the outcome
+        // deterministic: culprit ERR_ABORTED + taint, innocents reset with
+        // cause `abort` and the culprit's wire id.
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // The innocent victim: suspended awaiting a bridge response.
+        let victim = submit_session_job(
+            &handle, 12, "viaTool", vec![TestValue::Number(1.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let _ = read_bridge_call(&mut server);
+
+        // The culprit: its continuation after the bridge response spins.
+        let ctl_slot = Arc::new(std::sync::OnceLock::new());
+        let culprit = submit_session_job_with_ctl(
+            &handle, 11, "spinAfterTool", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+            Some(Arc::clone(&ctl_slot)),
+        );
+        let (run_id, call_id) = read_bridge_call(&mut server);
+        culprit.send(bridge_response_event(run_id, call_id, 1.0));
+
+        // Kill the culprit once its turn is really executing (the spin).
+        let ctl = ctl_slot.get().expect("dispatch filled the ctl slot").clone();
+        let mut killed = false;
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(10));
+            if ctl.abort_executing(culprit.token) {
+                killed = true;
+                break;
+            }
+        }
+        assert!(killed, "the spin never showed up as an executing turn");
+
+        let culprit_out = culprit.outcome.recv().expect("culprit concludes");
+        assert!(culprit_out.tainted, "a mid-JS kill taints");
+        assert!(matches!(
+            culprit_out.result.unwrap_err().error,
+            sandbox::RunError::Aborted
+        ));
+
+        let victim_out = victim.outcome.recv().expect("victim concludes");
+        match victim_out.result.unwrap_err().error {
+            sandbox::RunError::InstanceReset {
+                cause,
+                culprit_run_id,
+            } => {
+                assert_eq!(cause, sandbox::ResetCause::Abort);
+                assert_eq!(culprit_run_id, 11, "the culprit's wire run id is named");
+            }
+            other => panic!("expected InstanceReset, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn an_abort_abandons_the_run_and_the_instance_survives() {
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
@@ -1608,7 +1695,7 @@ mod tests {
         let _ = read_bridge_call(&mut server);
         run.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
             message_type: crate::ipc::TsToRustMessageType::Terminate,
-            payload: 5u32.to_be_bytes().to_vec(),
+            payload: terminate_payload(5),
         }));
         let aborted = run.outcome.recv().expect("aborted run concludes");
         assert!(
@@ -1855,7 +1942,7 @@ mod tests {
                 token,
                 sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
                     message_type: crate::ipc::TsToRustMessageType::Terminate,
-                    payload: 32u32.to_be_bytes().to_vec(),
+                    payload: terminate_payload(32),
                 }),
             ))
             .unwrap();

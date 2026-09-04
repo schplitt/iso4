@@ -86,8 +86,12 @@ export class SlotPool {
    *   upstream of the runtime and its `Run` frame has not been sent yet.
    *   `AbortSignal.timeout()` composes as a queue-wait bound — there is no
    *   separate timeout knob.
+   * @param hardAbortSignal
+   *   The caller's hard-abort signal. Soft and hard only differ once a run
+   *   is executing; while queued, either firing dequeues the caller the
+   *   same way.
    */
-  acquire(signal?: AbortSignal): Promise<void> {
+  acquire(signal?: AbortSignal, hardAbortSignal?: AbortSignal): Promise<void> {
     if (this.disposed)
       return Promise.reject(new Error('runtime is disposed'))
 
@@ -97,6 +101,8 @@ export class SlotPool {
     // unrelated run frees a slot.
     if (signal?.aborted)
       return Promise.reject(new RunAbortedError(signal.reason))
+    if (hardAbortSignal?.aborted)
+      return Promise.reject(new RunAbortedError(hardAbortSignal.reason))
 
     if (this.active < this.capacity) {
       this.active++
@@ -113,19 +119,25 @@ export class SlotPool {
 
     return new Promise<void>((resolve, reject) => {
       const waiter: SlotWaiter = { resolve, reject }
-      if (signal === undefined) {
+      if (signal === undefined && hardAbortSignal === undefined) {
         this.waiters.push(waiter)
         return
       }
 
-      const onAbort = (): void => {
+      const dequeue = (reason: unknown): void => {
         const at = this.waiters.indexOf(waiter)
         if (at !== -1)
           this.waiters.splice(at, 1)
-        reject(new RunAbortedError(signal.reason))
+        reject(new RunAbortedError(reason))
       }
-      signal.addEventListener('abort', onAbort, { once: true })
-      const settle = (): void => signal.removeEventListener('abort', onAbort)
+      const onAbort = (): void => dequeue(signal?.reason)
+      const onHardAbort = (): void => dequeue(hardAbortSignal?.reason)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      hardAbortSignal?.addEventListener('abort', onHardAbort, { once: true })
+      const settle = (): void => {
+        signal?.removeEventListener('abort', onAbort)
+        hardAbortSignal?.removeEventListener('abort', onHardAbort)
+      }
 
       waiter.resolve = () => {
         settle()
@@ -283,12 +295,15 @@ export class RunPool {
    * ride the shared connection, routed by run id, until its RunComplete.
    * @param fn ran with the shared connection
    * @param signal the caller's abort signal, honoured while queued
+   * @param hardAbortSignal the caller's hard-abort signal — while queued it
+   * dequeues exactly like `signal`
    */
   async withClient<T>(
     fn: (client: RuntimeIpcClient) => Promise<T>,
     signal?: AbortSignal,
+    hardAbortSignal?: AbortSignal,
   ): Promise<T> {
-    await this.slots.acquire(signal)
+    await this.slots.acquire(signal, hardAbortSignal)
 
     let client: RuntimeIpcClient
     try {

@@ -57,18 +57,18 @@ this version, and the handshake hard-fails otherwise (§8).
 
 ### 2.1 TS → Rust
 
-|   Byte | Name             | Payload                 | Response                                                                                                                                  |
-| -----: | ---------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a malformed payload Rust closes the socket without replying                                                       |
-| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`; when it reports pending background work: more `BridgeCall`s, then one `RunComplete` |
-| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                            |
-| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | same as `Run`                                                                                                                             |
-| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                                      |
-| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                                   |
-| `0x07` | `Terminate`      | `RunId`                 | Rust sends one `Result` with `ERR_ABORTED` (graceful abort); a CPU-bound run not reading frames is instead reclaimed by teardown          |
-| `0x08` | `Stats`          | empty                   | exactly one `StatsResult`                                                                                                                 |
-| `0x09` | `StreamChunk`    | `StreamChunkPayload`    | one chunk of a streamed body (§5.5), inside the granted credit window; no reply                                                           |
-| `0x0A` | `StreamEnd`      | `StreamEndPayload`      | end of a streamed body: clean EOF or a source failure; no reply                                                                           |
+|   Byte | Name             | Payload                 | Response                                                                                                                                                          |
+| -----: | ---------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `Authenticate`   | `AuthenticatePayload`   | exactly one `Hello`; on a malformed payload Rust closes the socket without replying                                                                               |
+| `0x02` | `Run`            | `RunPayload`            | zero or more `BridgeCall`, then exactly one `Result`; when it reports pending background work: more `BridgeCall`s, then one `RunComplete`                         |
+| `0x03` | `Precompile`     | `PrecompilePayload`     | exactly one `PrecompileResult`                                                                                                                                    |
+| `0x04` | `PrefixRun`      | `PrefixRunPayload`      | same as `Run`                                                                                                                                                     |
+| `0x05` | `DisposePrefix`  | `PrefixId`              | no frame; idempotent                                                                                                                                              |
+| `0x06` | `BridgeResponse` | `BridgeResponsePayload` | resumes the waiting sandbox bridge call                                                                                                                           |
+| `0x07` | `Terminate`      | `TerminatePayload`      | `u32 runId, u8 mode` — `0` soft: abandon at the run's next turn boundary; `1` hard: interrupt executing JS now. Rust answers one `Result` with `ERR_ABORTED` (§6) |
+| `0x08` | `Stats`          | empty                   | exactly one `StatsResult`                                                                                                                                         |
+| `0x09` | `StreamChunk`    | `StreamChunkPayload`    | one chunk of a streamed body (§5.5), inside the granted credit window; no reply                                                                                   |
+| `0x0A` | `StreamEnd`      | `StreamEndPayload`      | end of a streamed body: clean EOF or a source failure; no reply                                                                                                   |
 
 ### 2.2 Rust → TS
 
@@ -1098,14 +1098,33 @@ the grace-phase frames ride the shared connection beside other runs'.
 
 Sharing widens the failure unit from one run to one connection, by design
 and bounded by the per-connection cap: a corrupt or unattributable frame
-(protocol desync), a stalled outbound socket, or an aborted run whose
+(protocol desync), a stalled outbound socket, or a HARD-aborted run whose
 `Terminate` the runtime failed to answer within the host's fallback window
 kills the CONNECTION — every run in flight on it fails with a clean
 connection-level error and its slot frees. Instances are never tainted by
 connection death (nothing was interrupted mid-JS), and other connections
 are unaffected. The fallback case is deliberate: the runtime answers a
-`Terminate` in well under the window unless the child is wedged, and a
-wedged child had already doomed every run on the connection.
+hard `Terminate` in well under the window unless the child is wedged, and a
+wedged child had already doomed every run on the connection. SOFT
+`Terminate`s arm no fallback: a soft abort is a request delivered at the
+run's next turn boundary, and a run executing a synchronous stretch with no
+`cpuTimeMs` cap legitimately cannot answer one until its own limits end the
+turn — tearing the connection down for that would fail co-resident runs of
+a healthy runtime.
+
+`Terminate` semantics (`mode` byte): **soft** (`0`, the default abort) is
+routed to the run like any other frame and lands at a turn boundary — a
+suspended or queued run is abandoned on the spot, an executing turn
+finishes first. Nothing is ever interrupted mid-JS, so the instance is
+never tainted and co-residents are untouched; the abandoned run's
+continuations are simply never driven again and its `Result` carries
+`ERR_ABORTED` with the real telemetry collected so far. **Hard** (`1`, the
+opt-in escalation) additionally terminates the run's turn if it is
+executing at that moment: the kill records its reason before interrupting,
+the culprit's `Result` is `ERR_ABORTED`, and the mid-JS interruption taints
+the instance — co-resident runs fail with `ERR_INSTANCE_RESET` (cause
+`abort`, the culprit's run id). A hard `Terminate` for a run that is not
+executing degrades to the soft abandon.
 
 `Precompile` uses the same authenticated connection but is not a run. It
 validates the prefix (compile + instantiate + evaluate in a throwaway
@@ -1120,8 +1139,8 @@ thread. The first run cold-starts an instance (prefix evaluated under the
 warm-up budget, never billed to the triggering run); later runs reuse it and
 skip isolate boot and prefix evaluation entirely. This is invisible on the
 wire — the frames are identical warm or cold; only `heapUsedBytes` on the
-Result reports it. Instances are discarded on taint (any fired guard, abort
-mid-call, fatal bridge error), on `DisposePrefix`, and by scored eviction
+Result reports it. Instances are discarded on taint (any fired guard, a hard abort's
+mid-turn kill, fatal bridge error), on `DisposePrefix`, and by scored eviction
 under memory pressure: there is no instance-count cap, only the RSS mark
 (`--warm-budget-bytes`). At/above the mark the runtime evicts idle
 instances by `heapUsed × idleTime` and stops admitting new warmth until RSS

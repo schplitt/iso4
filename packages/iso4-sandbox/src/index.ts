@@ -536,6 +536,9 @@ class SandboxImpl implements Sandbox {
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
     }
+    if (options.hardAbortSignal?.aborted) {
+      return abortedResult(options.hardAbortSignal.reason)
+    }
     // A one-off run always gets a fresh isolate, so its own cap is legal
     // (#77): per-run, per-prefix and the sandbox default are the three
     // granularities; only per-run-on-a-warm-instance stays impossible.
@@ -573,6 +576,7 @@ class SandboxImpl implements Sandbox {
           imports: bindings,
           importDispatch: handlers,
           signal: options.signal,
+          hardAbortSignal: options.hardAbortSignal,
           call,
           streams,
         })
@@ -589,10 +593,14 @@ class SandboxImpl implements Sandbox {
         // Result carries ERR_ABORTED is a deliberate abort, not a failure —
         // remap to `status: 'aborted'` with the abort reason, keeping the real
         // telemetry Rust reported.
-        if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')
-          return abortedResult(options.signal.reason, decoded)
+        if (decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED') {
+          if (options.signal?.aborted)
+            return abortedResult(options.signal.reason, decoded)
+          if (options.hardAbortSignal?.aborted)
+            return abortedResult(options.hardAbortSignal.reason, decoded)
+        }
         return decoded
-      }, options.signal)
+      }, options.signal, options.hardAbortSignal)
     } catch (error) {
       // Failure before or during the exchange: nothing will pump these
       // sources anymore; release them (idempotent with the client's own
@@ -853,6 +861,7 @@ implements Prefix<G, M> {
    * @param options.imports
    * @param options.limits
    * @param options.signal
+   * @param options.hardAbortSignal
    * @param options.filename
    * @param payload
    */
@@ -862,6 +871,7 @@ implements Prefix<G, M> {
       imports?: RebindImports<M>
       limits?: ResourceLimits
       signal?: AbortSignal
+      hardAbortSignal?: AbortSignal
       filename?: string
     },
     payload: { code: string, call?: undefined, streams?: StreamSourceRegistry }
@@ -886,6 +896,9 @@ implements Prefix<G, M> {
 
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
+    }
+    if (options.hardAbortSignal?.aborted) {
+      return abortedResult(options.hardAbortSignal.reason)
     }
     if (options.limits !== undefined && 'memoryMb' in options.limits) {
       throw new TypeError(
@@ -943,6 +956,7 @@ implements Prefix<G, M> {
           importRebinds: merged.rebinds,
           importDispatch: merged.handlers,
           signal: options.signal,
+          hardAbortSignal: options.hardAbortSignal,
           call: payload.call,
           streams,
         })
@@ -956,10 +970,14 @@ implements Prefix<G, M> {
           decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
         // See the note in SandboxImpl.run — remap a graceful ERR_ABORTED Result
         // to `status: 'aborted'`, preserving the runtime's telemetry.
-        if (options.signal?.aborted && decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED')
-          return abortedResult(options.signal.reason, decoded)
+        if (decoded.status === 'failed' && decoded.error.code === 'ERR_ABORTED') {
+          if (options.signal?.aborted)
+            return abortedResult(options.signal.reason, decoded)
+          if (options.hardAbortSignal?.aborted)
+            return abortedResult(options.hardAbortSignal.reason, decoded)
+        }
         return decoded
-      }, options.signal)
+      }, options.signal, options.hardAbortSignal)
     } catch (error) {
       streams.releaseAll()
       if (error instanceof RunAbortedError)

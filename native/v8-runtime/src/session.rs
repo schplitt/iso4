@@ -795,12 +795,16 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
     Ok(())
 }
 
-/// Route a Terminate: if the target run's own turn is executing right now,
-/// terminate it mid-turn (the taint fallback — E1 ruling 5); otherwise the
-/// routed frame abandons the suspended run cleanly at its next event.
+/// Route a Terminate. SOFT (the default abort): always deliver as a routed
+/// frame — if the target's turn is executing, the frame waits in its queue
+/// and the abandon lands at the turn boundary; nothing is ever interrupted
+/// mid-JS, the instance survives, co-residents are untouched. HARD (opt-in
+/// sledgehammer): if the target's own turn is executing right now,
+/// terminate it mid-turn — the kill records its reason and taints the
+/// instance; otherwise hard degrades to the same clean routed abandon.
 fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<(), String> {
-    let run_id = match ipc::parse_terminate_payload(&frame.payload) {
-        Ok(id) => id,
+    let (run_id, mode) = match ipc::parse_terminate_payload(&frame.payload) {
+        Ok(parsed) => parsed,
         // A Terminate that cannot be parsed is corrupt framing — close the
         // connection rather than leaving the (unidentifiable) target running.
         Err(e) => return Err(format!("malformed Terminate payload: {e}")),
@@ -812,12 +816,14 @@ fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
         eprintln!("[iso4-v8] ignoring stray Terminate (run {run_id} already completed)");
         return Ok(());
     };
-    if let Some(ctl) = route.ctl.get() {
-        if ctl.abort_executing(route.token) {
-            eprintln!("[iso4-v8] Terminate for run {run_id} landed mid-turn — terminating");
-            // The loop classifies the kill and resets the instance; no
-            // frame delivery needed (the run's channel dies with it).
-            return Ok(());
+    if mode == ipc::TerminateMode::Hard {
+        if let Some(ctl) = route.ctl.get() {
+            if ctl.abort_executing(route.token) {
+                eprintln!("[iso4-v8] hard Terminate for run {run_id} landed mid-turn — terminating");
+                // The loop classifies the kill and resets the instance; no
+                // frame delivery needed (the run's channel dies with it).
+                return Ok(());
+            }
         }
     }
     route
@@ -1813,12 +1819,12 @@ mod tests {
     }
 
     #[test]
-    fn terminate_kills_a_cpu_bound_oneoff_mid_turn() {
+    fn hard_terminate_kills_a_cpu_bound_oneoff_mid_turn() {
         // A synchronous spin with `cpuTimeMs: 0` can only be stopped by the
-        // demux's mid-turn kill (`GuardCtl::abort_executing`) — the routed
-        // Terminate frame would sit unread forever, and the wall here is 10 s.
-        // The prompt ERR_ABORTED (not ERR_WALL_TIMEOUT, not a hang) proves
-        // the route's token reaches the one-off's guard.
+        // HARD abort's mid-turn kill (`GuardCtl::abort_executing`) — a soft
+        // (routed) Terminate would sit unread forever, and the wall here is
+        // 10 s. The prompt ERR_ABORTED (not ERR_WALL_TIMEOUT, not a hang)
+        // proves the route's token reaches the one-off's guard.
         sandbox::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
@@ -1829,12 +1835,10 @@ mod tests {
         .unwrap();
         // Give the worker time to boot its isolate and enter the spin.
         std::thread::sleep(Duration::from_millis(300));
-        ipc::write_ts_to_rust_frame(
-            &mut host,
-            ipc::TsToRustMessageType::Terminate,
-            &1u32.to_be_bytes(),
-        )
-        .unwrap();
+        let mut terminate = 1u32.to_be_bytes().to_vec();
+        terminate.push(1); // hard
+        ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Terminate, &terminate)
+            .unwrap();
 
         let started = std::time::Instant::now();
         let frame = ipc::read_rust_to_ts_frame(&mut host).expect("a Result frame");
@@ -1847,6 +1851,102 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the abort must land mid-turn, not at the wall"
+        );
+    }
+
+    #[test]
+    fn hard_terminate_mid_continuation_concludes_promptly() {
+        // The kill lands inside a microtask-checkpoint continuation — the
+        // landing spot where V8's terminate flag used to be consumed
+        // silently, leaving the run parked with no Result until its wall
+        // (#75 re-check). The reason cell written by the kill makes the
+        // classification deterministic: prompt ERR_ABORTED, never a hang.
+        sandbox::init_platform();
+        let (mut host, _done) = open_session();
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::Run,
+            &run_payload_with_cpu(
+                1,
+                "export default await tool().then(() => { for (;;) {} })",
+                Some(0),
+                10_000,
+            ),
+        )
+        .unwrap();
+        let (run_id, call_id) = read_bridge_call(&mut host);
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::BridgeResponse,
+            &bridge_response(run_id, call_id, 1.0),
+        )
+        .unwrap();
+        // Give the response turn time to enter the spinning continuation.
+        std::thread::sleep(Duration::from_millis(300));
+        let mut terminate = 1u32.to_be_bytes().to_vec();
+        terminate.push(1); // hard
+        ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Terminate, &terminate)
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let frame = ipc::read_rust_to_ts_frame(&mut host).expect("a Result frame");
+        assert_eq!(frame.message_type, ipc::RustToTsMessageType::Result);
+        let p = &frame.payload;
+        assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
+        assert_eq!(p[4], 0, "the aborted run must fail");
+        let text = String::from_utf8_lossy(p);
+        assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the hard abort must conclude promptly, not hang to the wall"
+        );
+    }
+
+    #[test]
+    fn soft_terminate_mid_turn_abandons_at_the_boundary() {
+        // A soft Terminate arriving while the run's turn is executing is
+        // NOT delivered mid-JS: it queues and lands once the turn yields.
+        // The continuation here burns briefly and then suspends forever on
+        // a fresh promise — the abort must land right after that turn, as
+        // a clean abandon, not hang and not interrupt.
+        sandbox::init_platform();
+        let (mut host, _done) = open_session();
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::Run,
+            &run_payload(
+                1,
+                "export default await tool().then(() => new Promise(() => {}))",
+                10_000,
+            ),
+        )
+        .unwrap();
+        let (run_id, call_id) = read_bridge_call(&mut host);
+        // Response first, soft Terminate right behind it: the demux routes
+        // both in order, so the abort is queued while the response turn
+        // runs and abandons the run at its boundary.
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::BridgeResponse,
+            &bridge_response(run_id, call_id, 1.0),
+        )
+        .unwrap();
+        let mut terminate = 1u32.to_be_bytes().to_vec();
+        terminate.push(0); // soft
+        ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Terminate, &terminate)
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let frame = ipc::read_rust_to_ts_frame(&mut host).expect("a Result frame");
+        assert_eq!(frame.message_type, ipc::RustToTsMessageType::Result);
+        let p = &frame.payload;
+        assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
+        assert_eq!(p[4], 0, "the aborted run must fail");
+        let text = String::from_utf8_lossy(p);
+        assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the soft abort must land at the turn boundary, not the wall"
         );
     }
 
