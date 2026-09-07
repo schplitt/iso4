@@ -229,17 +229,38 @@ fn check_body(body: v8::Local<v8::Value>) -> Codec<v8::Local<v8::Value>> {
     }
 }
 
+/// Encode a body slot. A stream body (a stamped `Iso4BodyStream` — the
+/// pass-through of an inbound stream, or an async-iterable wrapped at
+/// Request/Response construction) is legal only on the RESULT leg of a
+/// session run: it registers in the run's outbound table and the returned
+/// stream id rides in the descriptor's extras; the inline body is written
+/// as null. On every other leg (bridge arguments, exports, hold-mode runs)
+/// a stream body keeps the cannot-cross error.
 fn encode_body(
     scope: &mut v8::PinScope,
     helper: &dyn ValueSerializerHelper,
     body: v8::Local<v8::Value>,
-) -> Codec<()> {
-    if crate::v8::body_stream_id_of(scope, body).is_some() {
-        return Err(CodecError::Unsupported(
-            "a streamed body cannot be returned to the host yet — read it first \
-             (await res.arrayBuffer()) and return the bytes"
-                .to_string(),
-        ));
+) -> Codec<Option<u32>> {
+    if crate::v8::is_stream_body(scope, body) {
+        let Ok(obj) = v8::Local::<v8::Object>::try_from(body) else {
+            return malformed("stream body is not an object");
+        };
+        return match crate::v8::register_out_stream(scope, obj) {
+            Some(stream_id) => {
+                let null = v8::null(scope).into();
+                let context = scope.get_current_context();
+                match helper.write_value(context, null) {
+                    Some(true) => Ok(Some(stream_id)),
+                    _ => malformed("could not write the body"),
+                }
+            }
+            None => Err(CodecError::Unsupported(
+                "a stream body can only be returned as a session call's result — \
+                 on this leg, read it first (await res.arrayBuffer()) and pass \
+                 the bytes"
+                    .to_string(),
+            )),
+        };
     }
     let body = check_body(body)?;
     // V8 writes the bytes once, straight out of the backing store. Framing it
@@ -247,8 +268,37 @@ fn encode_body(
     // serializer.
     let context = scope.get_current_context();
     match helper.write_value(context, body) {
-        Some(true) => Ok(()),
+        Some(true) => Ok(None),
         _ => malformed("could not write the body"),
+    }
+}
+
+/// Write the extras blob: empty, or `{ bodyStream: id }` when the body slot
+/// carries an outbound stream handle — the forward-compatible field slot,
+/// so the host reader change stays isolated (§4.4.4).
+fn write_extras(
+    scope: &mut v8::PinScope,
+    helper: &dyn ValueSerializerHelper,
+    body_stream: Option<u32>,
+) -> Codec<()> {
+    let Some(stream_id) = body_stream else {
+        write_no_extras(helper);
+        return Ok(());
+    };
+    let obj = v8::Object::new(scope);
+    let Some(key) = v8::String::new(scope, "bodyStream") else {
+        return malformed("could not intern extras key");
+    };
+    let value = v8::Number::new(scope, f64::from(stream_id));
+    if obj.set(scope, key.into(), value.into()).is_none() {
+        return malformed("could not build extras object");
+    }
+    match crate::blob::serialize_value(scope, obj.into()) {
+        Ok(bytes) => {
+            write_bytes(helper, &bytes);
+            Ok(())
+        }
+        Err(_) => malformed("could not serialize extras"),
     }
 }
 
@@ -294,8 +344,8 @@ fn encode_request(
     write_v8_string(scope, helper, view.url)?;
     write_v8_string(scope, helper, view.method)?;
     encode_headers(scope, helper, view.headers)?;
-    encode_body(scope, helper, view.body)?;
-    write_no_extras(helper);
+    let body_stream = encode_body(scope, helper, view.body)?;
+    write_extras(scope, helper, body_stream)?;
     Ok(())
 }
 
@@ -329,8 +379,8 @@ fn encode_response(
     helper.write_uint32(view.status);
     write_v8_string(scope, helper, view.status_text)?;
     encode_headers(scope, helper, view.headers)?;
-    encode_body(scope, helper, view.body)?;
-    write_no_extras(helper);
+    let body_stream = encode_body(scope, helper, view.body)?;
+    write_extras(scope, helper, body_stream)?;
     Ok(())
 }
 

@@ -1417,6 +1417,39 @@ mod tests {
         })
     }
 
+    fn stream_prefix() -> Arc<PrefixData> {
+        Arc::new(PrefixData {
+            code: "let n = 0\n\
+                   export function bump() { return ++n }\n\
+                   export async function streamSmall() {\n\
+                     async function* g() { yield new Uint8Array([1, 2, 3]); yield 'abc' }\n\
+                     return new Response(g())\n\
+                   }\n\
+                   export async function streamBig(total) {\n\
+                     async function* g() { yield new Uint8Array(total) }\n\
+                     return new Response(g())\n\
+                   }\n\
+                   export async function streamBad() {\n\
+                     async function* g() { yield 42 }\n\
+                     return new Response(g())\n\
+                   }\n\
+                   export async function streamHang() {\n\
+                     async function* g() { try { yield new Uint8Array(300000); yield new Uint8Array(1) } finally { n = 100 } }\n\
+                     return new Response(g())\n\
+                   }"
+                .to_string(),
+            filename: None,
+            globals: Vec::new(),
+            declared_globals: vec!["tool".to_string()],
+            declared_imports: Vec::new(),
+        })
+    }
+
+    /// Read one frame off the writer socket.
+    fn read_frame(server: &mut UnixStream) -> crate::ipc::RustToTsFrame {
+        crate::ipc::read_rust_to_ts_frame(server).expect("a frame")
+    }
+
     struct SessionRun {
         /// The run's table token — events into the instance's shared channel
         /// are tagged with it, exactly as the session demux tags them.
@@ -1614,6 +1647,226 @@ mod tests {
             }
             other => panic!("expected InstanceReset, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_outbound_stream_body_streams_eagerly_and_completes() {
+        // A call returning `new Response(asyncGenerator)` ships an early
+        // Result carrying the stream handle, then the chunks under the
+        // implicit initial credit window — no host frame needed — then a
+        // clean StreamEnd, and the run concludes.
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let run = submit_session_job(
+            &handle, 40, "streamSmall", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+
+        let result = read_frame(&mut server);
+        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+        assert_eq!(u32::from_be_bytes(result.payload[0..4].try_into().unwrap()), 40);
+        assert_eq!(result.payload[4], 1, "the run succeeds");
+
+        let c1 = read_frame(&mut server);
+        assert_eq!(c1.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
+        let c1 = crate::ipc::parse_stream_chunk_payload(&c1.payload).unwrap();
+        assert_eq!((c1.run_id, c1.stream_id, c1.data), (40, 1, &[1u8, 2, 3][..]));
+
+        let c2 = read_frame(&mut server);
+        let c2 = crate::ipc::parse_stream_chunk_payload(&c2.payload).unwrap();
+        assert_eq!(c2.data, b"abc");
+
+        let end = read_frame(&mut server);
+        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
+        let end = crate::ipc::parse_stream_end_payload(&end.payload).unwrap();
+        assert!(end.ok, "clean EOF");
+
+        let out = run.outcome.recv().expect("run concludes after the stream drains");
+        assert!(!out.tainted);
+        let output = out.result.unwrap();
+        let report = output.background.expect("post-Result phase reports");
+        assert!(report.early_result_sent);
+        assert!(matches!(report.status, sandbox::GraceStatus::Settled));
+    }
+
+    #[test]
+    fn an_outbound_stream_waits_for_credit_past_the_initial_window() {
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        const TOTAL: usize = 300_000;
+        let run = submit_session_job(
+            &handle, 41, "streamBig", vec![TestValue::Number(TOTAL as f64)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+
+        let result = read_frame(&mut server);
+        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+
+        // Exactly the initial window arrives eagerly, in max-size chunks.
+        let mut received = 0usize;
+        while received < crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize {
+            let frame = read_frame(&mut server);
+            assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
+            let chunk = crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap();
+            assert!(chunk.data.len() <= crate::ipc::STREAM_CHUNK_MAX_BYTES as usize);
+            received += chunk.data.len();
+        }
+        assert_eq!(received, crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize);
+
+        // Nothing more until credit is granted.
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        assert!(
+            crate::ipc::read_rust_to_ts_frame(&mut server).is_err(),
+            "production must stall at the window"
+        );
+        server.set_read_timeout(None).unwrap();
+
+        run.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+            message_type: crate::ipc::TsToRustMessageType::StreamPull,
+            payload: crate::ipc::encode_stream_pull_payload(41, 1, 100_000),
+        }));
+
+        let frame = read_frame(&mut server);
+        let chunk = crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap();
+        assert_eq!(chunk.data.len(), TOTAL - crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize);
+
+        let end = read_frame(&mut server);
+        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
+        assert!(crate::ipc::parse_stream_end_payload(&end.payload).unwrap().ok);
+
+        let out = run.outcome.recv().expect("run concludes");
+        assert!(out.result.is_ok());
+    }
+
+    #[test]
+    fn an_invalid_chunk_fails_the_stream_not_the_run() {
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let run = submit_session_job(
+            &handle, 44, "streamBad", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let result = read_frame(&mut server);
+        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+        assert_eq!(result.payload[4], 1, "the run itself succeeded");
+
+        let end = read_frame(&mut server);
+        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
+        let end = crate::ipc::parse_stream_end_payload(&end.payload).unwrap();
+        assert!(!end.ok);
+        assert!(end.error.unwrap().contains("Uint8Array or string"));
+
+        let out = run.outcome.recv().expect("run concludes");
+        assert!(!out.tainted);
+        assert!(out.result.is_ok(), "a body error is a stream event, not a run failure");
+    }
+
+    #[test]
+    fn a_host_cancel_runs_the_generators_finally_and_frees_the_run() {
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let run = submit_session_job(
+            &handle, 42, "streamHang", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let result = read_frame(&mut server);
+        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+        // Drain the eager window; the generator is now parked AT ITS YIELD
+        // (44 KB backlog, no credit) — the state where `.return()` can run
+        // its `finally` (a generator blocked mid-await queues the return
+        // instead, exactly like Node).
+        let mut received = 0usize;
+        while received < crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize {
+            let frame = read_frame(&mut server);
+            assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
+            received += crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap().data.len();
+        }
+
+        run.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+            message_type: crate::ipc::TsToRustMessageType::StreamCancel,
+            payload: crate::ipc::encode_stream_cancel_payload(42, 1, "consumer cancelled"),
+        }));
+
+        let out = run.outcome.recv().expect("run concludes after cancel");
+        assert!(!out.tainted, "a stream cancel never taints");
+        assert!(out.result.is_ok());
+
+        // web-streams semantics: `.return()` ran the generator's `finally`
+        // (n = 100), and the instance keeps serving warm.
+        let outcome = handle.call(bump_job());
+        let value = testval::from_blob(&outcome.result.unwrap().exports);
+        assert_eq!(value, TestValue::Number(101.0));
+    }
+
+    #[test]
+    fn an_abandoned_stream_hits_the_idle_deadline_and_cleans_up() {
+        sandbox::init_platform();
+        sandbox::OUT_IDLE_OVERRIDE_MS.store(300, Ordering::Relaxed);
+        let _reset = scopeguard(|| sandbox::OUT_IDLE_OVERRIDE_MS.store(0, Ordering::Relaxed));
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let run = submit_session_job(
+            &handle, 43, "streamHang", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let result = read_frame(&mut server);
+        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+        let mut received = 0usize;
+        while received < crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize {
+            let frame = read_frame(&mut server);
+            received += crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap().data.len();
+        }
+
+        // Neither read nor cancelled: the idle deadline ends the stream with
+        // an error naming the timeout, guest cleanup runs, run concludes.
+        let end = read_frame(&mut server);
+        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
+        let end = crate::ipc::parse_stream_end_payload(&end.payload).unwrap();
+        assert!(!end.ok);
+        assert!(end.error.unwrap().contains("stream idle timeout"));
+
+        let out = run
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run concludes at the idle deadline");
+        assert!(!out.tainted);
+        assert!(out.result.is_ok());
+
+        let outcome = handle.call(bump_job());
+        let value = testval::from_blob(&outcome.result.unwrap().exports);
+        assert_eq!(value, TestValue::Number(101.0), "finally ran via the cancel path");
+    }
+
+    /// Tiny drop guard for test-global overrides.
+    fn scopeguard<F: FnMut()>(f: F) -> impl Drop {
+        struct G<F: FnMut()>(F);
+        impl<F: FnMut()> Drop for G<F> {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        G(f)
     }
 
     #[test]

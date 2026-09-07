@@ -16,7 +16,7 @@
 // parser (url.rs), and the URL class below is only the object surface. Like
 // the shells, they are never exposed on globalThis.
 
-(function (HeadersShell, RequestShell, ResponseShell, urlParse, urlSet, streamRead, streamCancel, frozenClock) {
+(function (HeadersShell, RequestShell, ResponseShell, urlParse, urlSet, streamRead, streamCancel, stampStreamBody, frozenClock) {
   'use strict'
 
   const def = (target, name, value) =>
@@ -691,11 +691,26 @@
       return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength))
     if (body instanceof ArrayBuffer)
       return new Uint8Array(body.slice(0))
-    if (body instanceof Iso4BodyStream) {
-      throw new TypeError(
-        'A streamed body cannot be re-wrapped in a new Request/Response — read '
-        + 'it first (await res.arrayBuffer()) and construct from the bytes',
-      )
+    // A hydrated body stream passes through as-is — the proxy pattern
+    // (`new Response(request.body)`); serialization turns it into an
+    // outbound stream handle (#128).
+    if (body instanceof Iso4BodyStream)
+      return body
+    // An async iterable of Uint8Array/string chunks (Node accepts these as
+    // bodies too): wrapped in a body stream pulling the iterator — early
+    // termination calls `.return()`, so `finally` cleanup runs.
+    if (typeof body === 'object' && typeof body[Symbol.asyncIterator] === 'function') {
+      const iter = body[Symbol.asyncIterator]()
+      return new Iso4BodyStream({
+        pull: async () => {
+          const { done, value } = await iter.next()
+          return done ? null : value
+        },
+        cancel: (reason) => {
+          if (typeof iter.return === 'function')
+            iter.return(reason)
+        },
+      })
     }
     if (typeof body === 'object' && typeof body.getReader === 'function') {
       throw new TypeError(
@@ -718,6 +733,9 @@
     // `source` is either a numeric stream id (native-backed, hydrated by the
     // runtime) or a { pull, cancel } pair (a tee branch — see teeBodyStream).
     constructor(source) {
+      // Construction-time private stamp: the codec recognizes stream bodies
+      // by it, never by prototype or shape.
+      stampStreamBody(this)
       def(this, '_src', source)
       def(this, '_locked', false)
       def(this, '_done', false)

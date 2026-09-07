@@ -79,6 +79,12 @@ pub enum TsToRustMessageType {
     /// End of a streamed body: clean EOF, or a source failure carrying a
     /// message the pending sandbox read rejects with.
     StreamEnd = 0x0A,
+    /// Credit grant for an OUTBOUND (sandbox → host) streamed body: the
+    /// host consumed bytes, the runtime may send that many more (§5.5).
+    StreamPull = 0x0B,
+    /// The host cancelled an outbound streamed body (consumer cancel, idle
+    /// deadline, dispose); the runtime cancels the guest source.
+    StreamCancel = 0x0C,
 }
 
 /// Message types sent from Rust to the TypeScript host.
@@ -112,6 +118,12 @@ pub enum RustToTsMessageType {
     /// The sandbox cancelled a streamed body (`reader.cancel()`, instance
     /// teardown); the host must stop pumping and release the source.
     StreamCancel = 0x09,
+    /// One chunk of an OUTBOUND (sandbox → host) streamed body, inside the
+    /// host-granted credit window (§5.5).
+    StreamChunk = 0x0A,
+    /// End of an outbound streamed body: clean EOF, or a guest source
+    /// failure carrying a message the host's pending read rejects with.
+    StreamEnd = 0x0B,
 }
 
 /// Handshake status reported on a `Hello` frame.
@@ -1729,6 +1741,83 @@ pub fn encode_stream_cancel_payload(run_id: u32, stream_id: u32, reason: &str) -
     out
 }
 
+/// Encode a `StreamChunk` payload for an outbound stream:
+/// `u32 runId, u32 streamId, Bytes data` — the inbound twin's exact layout.
+pub fn encode_stream_chunk_payload(run_id: u32, stream_id: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + data.len());
+    out.extend_from_slice(&run_id.to_be_bytes());
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
+/// Encode a `StreamEnd` payload for an outbound stream:
+/// `u32 runId, u32 streamId, bool ok, Optional<String> error`.
+pub fn encode_stream_end_payload(
+    run_id: u32,
+    stream_id: u32,
+    error: Option<&str>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10 + error.map_or(0, |e| 5 + e.len()));
+    out.extend_from_slice(&run_id.to_be_bytes());
+    out.extend_from_slice(&stream_id.to_be_bytes());
+    match error {
+        None => out.push(1), // ok = true; no optional follows
+        Some(message) => {
+            out.push(0); // ok = false
+            out.push(1); // optional present
+            out.extend_from_slice(&(message.len() as u32).to_be_bytes());
+            out.extend_from_slice(message.as_bytes());
+        }
+    }
+    out
+}
+
+/// Parsed `StreamPull` payload (host-granted outbound credit):
+/// `u32 runId, u32 streamId, u32 credit`.
+pub struct StreamPullPayload {
+    pub run_id: u32,
+    pub stream_id: u32,
+    pub credit: u32,
+}
+
+/// Parse a `StreamPull` frame payload.
+pub fn parse_stream_pull_payload(payload: &[u8]) -> io::Result<StreamPullPayload> {
+    let mut r = PayloadReader::new(payload);
+    let run_id = r.read_u32()?;
+    let stream_id = r.read_u32()?;
+    let credit = r.read_u32()?;
+    r.assert_done()?;
+    Ok(StreamPullPayload {
+        run_id,
+        stream_id,
+        credit,
+    })
+}
+
+/// Parsed `StreamCancel` payload (host cancelled an outbound stream):
+/// `u32 runId, u32 streamId, String reason`.
+pub struct StreamCancelPayload {
+    pub run_id: u32,
+    pub stream_id: u32,
+    pub reason: String,
+}
+
+/// Parse a `StreamCancel` frame payload.
+pub fn parse_stream_cancel_payload(payload: &[u8]) -> io::Result<StreamCancelPayload> {
+    let mut r = PayloadReader::new(payload);
+    let run_id = r.read_u32()?;
+    let stream_id = r.read_u32()?;
+    let reason = r.read_string()?;
+    r.assert_done()?;
+    Ok(StreamCancelPayload {
+        run_id,
+        stream_id,
+        reason,
+    })
+}
+
 pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType> {
     match byte {
         0x01 => Ok(TsToRustMessageType::Authenticate),
@@ -1741,6 +1830,8 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
         0x08 => Ok(TsToRustMessageType::Stats),
         0x09 => Ok(TsToRustMessageType::StreamChunk),
         0x0A => Ok(TsToRustMessageType::StreamEnd),
+        0x0B => Ok(TsToRustMessageType::StreamPull),
+        0x0C => Ok(TsToRustMessageType::StreamCancel),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown TS->Rust message type: {byte:#04x}"),
@@ -1762,6 +1853,8 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
         0x07 => Ok(RustToTsMessageType::RunComplete),
         0x08 => Ok(RustToTsMessageType::StreamPull),
         0x09 => Ok(RustToTsMessageType::StreamCancel),
+        0x0A => Ok(RustToTsMessageType::StreamChunk),
+        0x0B => Ok(RustToTsMessageType::StreamEnd),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown Rust->TS message type: {byte:#04x}"),

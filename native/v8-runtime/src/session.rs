@@ -383,7 +383,7 @@ fn write_completion(
                         cpu_time_ms: output.cpu_time_ms,
                         bridge_calls: output.bridge_calls.clone(),
                         heap_used_bytes,
-                        background_pending: false,
+                        background_flags: 0,
                     }),
                 ),
             ),
@@ -726,7 +726,9 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
             }
             ipc::TsToRustMessageType::BridgeResponse
             | ipc::TsToRustMessageType::StreamChunk
-            | ipc::TsToRustMessageType::StreamEnd => {
+            | ipc::TsToRustMessageType::StreamEnd
+            | ipc::TsToRustMessageType::StreamPull
+            | ipc::TsToRustMessageType::StreamCancel => {
                 if let Err(e) = route_run_frame(&conn_runs, frame) {
                     eprintln!("[iso4-v8] {e} — closing");
                     break;
