@@ -46,6 +46,16 @@ export const TsToRustMessageTypes = {
    * End of a streamed body: clean EOF or a source failure.
    */
   StreamEnd: 0x0A,
+  /**
+   * Credit grant for an OUTBOUND (sandbox → host) streamed body: the
+   * consumer read bytes, the runtime may send that many more (§5.5).
+   */
+  StreamPull: 0x0B,
+  /**
+   * The host dropped an outbound streamed body (consumer cancel, dispose);
+   * the runtime cancels the guest source.
+   */
+  StreamCancel: 0x0C,
 } as const
 
 export type TsToRustMessageType
@@ -80,6 +90,16 @@ export const RustToTsMessageTypes = {
    * The sandbox cancelled a streamed body; stop pumping, release the source.
    */
   StreamCancel: 0x09,
+  /**
+   * One chunk of an OUTBOUND (sandbox → host) streamed body, inside the
+   * host-granted credit window (§5.5).
+   */
+  StreamChunk: 0x0A,
+  /**
+   * End of an outbound streamed body: clean EOF, or a guest source failure
+   * whose message the pending consumer read rejects with.
+   */
+  StreamEnd: 0x0B,
 } as const
 
 export type RustToTsMessageType
@@ -1342,11 +1362,11 @@ export interface DecodedRunCompletion {
   runId: number
   result: RunResult
   /**
-   * True when `waitUntil` background work is still running runtime-side
-   *: a `RunComplete` frame follows on this connection. Always false on
-   * failures.
+   * Post-Result flags: bit 0 = `waitUntil` background work still running,
+   * bit 1 = outbound stream bodies open. Nonzero means a `RunComplete`
+   * frame follows on this connection. Always 0 on failures.
    */
-  backgroundPending: boolean
+  backgroundFlags: number
 }
 
 /**
@@ -1358,9 +1378,9 @@ export interface DecodedCallCompletion {
   runId: number
   result: CallResult
   /**
-   * See {@link DecodedRunCompletion.backgroundPending}.
+   * See {@link DecodedRunCompletion.backgroundFlags}.
    */
-  backgroundPending: boolean
+  backgroundFlags: number
 }
 
 /**
@@ -1478,18 +1498,84 @@ export function decodeStreamCancelPayload(payload: Uint8Array): { runId: number,
 }
 
 /**
- * Read just the `backgroundPending` flag off a `Result` frame payload,
- * without decoding the rest. Both encoders write strict layouts with no
- * trailing bytes, so on a success payload the flag is the second-to-last byte
- * (followed only by the `failurePresent = 0` byte); failures never carry
- * pending work.
+ * Decode a `StreamChunk` payload (outbound direction — runtime → host):
+ * `u32 runId, u32 streamId, Bytes data`.
+ * @param payload the frame payload
+ */
+export function decodeStreamChunkPayload(payload: Uint8Array): { runId: number, streamId: number, data: Uint8Array } {
+  const reader = new PayloadReader(payload)
+  const runId = reader.readU32()
+  const streamId = reader.readU32()
+  const data = reader.readRawBytes(reader.readU32())
+  reader.assertDone()
+  return { runId, streamId, data }
+}
+
+/**
+ * Decode a `StreamEnd` payload (outbound direction): `u32 runId,
+ * u32 streamId, bool ok, Optional<String> error`.
+ * @param payload the frame payload
+ */
+export function decodeStreamEndPayload(payload: Uint8Array): { runId: number, streamId: number, error?: string } {
+  const reader = new PayloadReader(payload)
+  const runId = reader.readU32()
+  const streamId = reader.readU32()
+  const ok = reader.readU8() === 1
+  let error: string | undefined
+  if (!ok)
+    error = reader.readU8() === 1 ? reader.readString() : 'the sandbox body source failed'
+  reader.assertDone()
+  const out: { runId: number, streamId: number, error?: string } = { runId, streamId }
+  if (error !== undefined)
+    out.error = error
+  return out
+}
+
+/**
+ * Encode a `StreamPull` payload for an outbound stream: `u32 runId,
+ * u32 streamId, u32 credit` — the consumer read `credit` bytes, the runtime
+ * may send that many more.
+ * @param runId the run
+ * @param streamId the stream
+ * @param credit consumed byte count
+ */
+export function encodeStreamPullPayload(runId: number, streamId: number, credit: number): Buffer {
+  const writer = new PayloadWriter()
+  writer.writeU32(runId)
+  writer.writeU32(streamId)
+  writer.writeU32(credit)
+  return Buffer.concat(writer.parts)
+}
+
+/**
+ * Encode a `StreamCancel` payload for an outbound stream: `u32 runId,
+ * u32 streamId, String reason` — the consumer dropped the body.
+ * @param runId the run
+ * @param streamId the stream
+ * @param reason forwarded to the guest source's cancel path
+ */
+export function encodeStreamCancelPayload(runId: number, streamId: number, reason: string): Buffer {
+  const writer = new PayloadWriter()
+  writer.writeU32(runId)
+  writer.writeU32(streamId)
+  writer.writeString(reason)
+  return Buffer.concat(writer.parts)
+}
+
+/**
+ * Read just the post-Result flags byte off a `Result` frame payload,
+ * without decoding the rest: bit 0 = `waitUntil` work pending, bit 1 =
+ * outbound stream bodies open; nonzero = a `RunComplete` frame follows.
+ * Both encoders write strict layouts with no trailing bytes, so on a
+ * success payload the byte is second-to-last (followed only by the
+ * `failurePresent = 0` byte); failures never carry post-Result work.
  * @param payload the raw Result frame payload
  */
-export function peekRunCompletionBackgroundPending(payload: Uint8Array): boolean {
+export function peekRunCompletionBackgroundFlags(payload: Uint8Array): number {
   if (payload.byteLength < 7)
-    return false
+    return 0
   const ok = payload[4] === 1
-  return ok && payload[payload.byteLength - 2] === 1
+  return ok ? payload[payload.byteLength - 2]! : 0
 }
 
 /**
@@ -1574,14 +1660,14 @@ export function decodeRunCompletionPayload(
     const cpuTimeMs = reader.readF64()
     const bridgeCalls = readBridgeCallRecords(reader)
     const heapUsedBytes = reader.readOptionalU64()
-    const backgroundPending = reader.readBool()
+    const backgroundFlags = reader.readU8()
     reader.readU8() // failurePresent = 0; consumed for forward-compat
 
     reader.assertDone()
     if (resultKind === 'call') {
       return {
         runId,
-        backgroundPending,
+        backgroundFlags,
         result: {
           status: 'completed',
           ok: true,
@@ -1597,7 +1683,7 @@ export function decodeRunCompletionPayload(
     }
     return {
       runId,
-      backgroundPending,
+      backgroundFlags,
       result: {
         status: 'completed',
         ok: true,
@@ -1637,7 +1723,7 @@ export function decodeRunCompletionPayload(
   reader.assertDone()
   return {
     runId,
-    backgroundPending: false,
+    backgroundFlags: 0,
     result: {
       status: 'failed',
       ok: false,
@@ -1894,6 +1980,8 @@ export function parseTsToRustMessageType(
     case TsToRustMessageTypes.BridgeResponse:
     case TsToRustMessageTypes.Terminate:
     case TsToRustMessageTypes.Stats:
+    case TsToRustMessageTypes.StreamPull:
+    case TsToRustMessageTypes.StreamCancel:
       return byte
     default:
       throw new Error(`unknown TS->Rust message type: ${formatByte(byte)}`)
@@ -1913,6 +2001,8 @@ export function parseRustToTsMessageType(
     case RustToTsMessageTypes.RunComplete:
     case RustToTsMessageTypes.StreamPull:
     case RustToTsMessageTypes.StreamCancel:
+    case RustToTsMessageTypes.StreamChunk:
+    case RustToTsMessageTypes.StreamEnd:
       return byte
     default:
       throw new Error(`unknown Rust->TS message type: ${formatByte(byte)}`)

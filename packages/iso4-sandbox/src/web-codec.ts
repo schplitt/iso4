@@ -160,6 +160,140 @@ export class StreamSourceRegistry {
   }
 }
 
+// ── Outbound streams (sandbox → host, #128) ──────────────────────────────────
+
+/**
+ * How the registry talks back to the runtime: credit grants as the consumer
+ * reads, cancels when it drops the body. Injected by the client (the frame
+ * writer lives there).
+ */
+export interface OutboundStreamTransport {
+  pull: (streamId: number, credit: number) => void
+  cancel: (streamId: number, reason: string) => void
+}
+
+interface OutboundState {
+  buffered: Uint8Array[]
+  ended?: { error?: string }
+  cancelled: boolean
+  failed?: Error
+  /**
+   * Wakes the pending consumer pull when a chunk/end/failure arrives.
+   */
+  waiter?: () => void
+}
+
+/**
+ * Per-run registry of OUTBOUND streamed bodies — result bodies the sandbox
+ * produces and the consumer reads as a `ReadableStream`. Chunks arriving
+ * before the Result is decoded (the runtime's eager initial window) buffer
+ * here, bounded by the credit window; the consumer's reads replenish the
+ * runtime's credit chunk by chunk, so a slow reader stops production at
+ * the guest source.
+ */
+export class OutboundStreamRegistry {
+  private readonly states = new Map<number, OutboundState>()
+  private readonly transport: OutboundStreamTransport
+
+  constructor(transport: OutboundStreamTransport) {
+    this.transport = transport
+  }
+
+  private state(streamId: number): OutboundState {
+    let st = this.states.get(streamId)
+    if (st === undefined) {
+      st = { buffered: [], cancelled: false }
+      this.states.set(streamId, st)
+    }
+    return st
+  }
+
+  /**
+   * A `StreamChunk` frame arrived for this run.
+   * @param streamId
+   * @param data
+   */
+  deliverChunk(streamId: number, data: Uint8Array): void {
+    const st = this.state(streamId)
+    if (st.cancelled)
+      return
+    st.buffered.push(data)
+    st.waiter?.()
+  }
+
+  /**
+   * A `StreamEnd` frame arrived: clean EOF, or a guest source failure.
+   * @param streamId
+   * @param error
+   */
+  deliverEnd(streamId: number, error?: string): void {
+    const st = this.state(streamId)
+    st.ended = error === undefined ? {} : { error }
+    st.waiter?.()
+  }
+
+  /**
+   * Connection-level failure (teardown, desync) or the run ending with a
+   * stream never terminated: error every stream that has no outcome yet,
+   * so no consumer read hangs.
+   * @param error
+   */
+  failAll(error: Error): void {
+    for (const st of this.states.values()) {
+      if (st.ended === undefined && !st.cancelled && st.failed === undefined) {
+        st.failed = error
+        st.waiter?.()
+      }
+    }
+  }
+
+  /**
+   * Hydrate one stream handle into the consumer-facing `ReadableStream`.
+   * Called during Result decode (via the body-stream binder).
+   * @param streamId
+   */
+  attach(streamId: number): ReadableStream<Uint8Array> {
+    const st = this.state(streamId)
+    const serve = (controller: ReadableStreamDefaultController<Uint8Array>): void | Promise<void> => {
+      const chunk = st.buffered.shift()
+      if (chunk !== undefined) {
+        controller.enqueue(chunk)
+        // Replenish exactly what the consumer took — the runtime's credit
+        // ledger mirrors the inbound protocol with the roles swapped.
+        this.transport.pull(streamId, chunk.byteLength)
+        return
+      }
+      if (st.failed !== undefined) {
+        controller.error(st.failed)
+        return
+      }
+      if (st.ended !== undefined) {
+        if (st.ended.error !== undefined) {
+          controller.error(new Error(`[iso4] body stream failed: ${st.ended.error}`))
+        } else {
+          controller.close()
+        }
+        return
+      }
+      return new Promise<void>((resolve) => {
+        st.waiter = () => {
+          st.waiter = undefined
+          resolve()
+        }
+      }).then(() => serve(controller))
+    }
+    return new ReadableStream<Uint8Array>({
+      pull: (controller) => serve(controller),
+      cancel: (reason) => {
+        st.cancelled = true
+        st.buffered = []
+        if (st.ended === undefined && st.failed === undefined)
+          this.transport.cancel(streamId, String(reason ?? 'cancelled'))
+      },
+    })
+  }
+}
+
 // ── Materialized form ────────────────────────────────────────────────────────
 
 /**
@@ -459,10 +593,60 @@ function readBody(des: DeserializerInternals): Uint8Array | string | null {
   )
 }
 
-function skipExtras(des: DeserializerInternals): void {
+/**
+ * Binder resolving an outbound stream handle (from a descriptor's extras)
+ * into the consumer-facing `ReadableStream`. Installed around a Result
+ * decode by {@link withBodyStreamBinder}; module-level because the
+ * deserializer hook chain has no context parameter — safe, the decode is
+ * synchronous.
+ */
+let currentBodyStreamBinder: ((streamId: number) => ReadableStream<Uint8Array>) | undefined
+
+/**
+ * Run `fn` with `binder` resolving outbound body-stream handles.
+ * @param binder
+ * @param fn
+ */
+export function withBodyStreamBinder<T>(
+  binder: (streamId: number) => ReadableStream<Uint8Array>,
+  fn: () => T,
+): T {
+  currentBodyStreamBinder = binder
+  try {
+    return fn()
+  } finally {
+    currentBodyStreamBinder = undefined
+  }
+}
+
+/**
+ * Read the extras blob and resolve an outbound body-stream handle when one
+ * rides in it (#128). Extras is a self-contained V8 blob holding a plain
+ * object — the forward-compatible field slot (§4.4.4).
+ * @param des
+ */
+function readExtras(des: DeserializerInternals): { bodyStream?: ReadableStream<Uint8Array> } {
   const len = des.readUint32()
-  if (len > 0)
-    des.readRawBytes(len)
+  if (len === 0)
+    return {}
+  const bytes = des.readRawBytes(len)
+  let extras: unknown
+  try {
+    extras = v8.deserialize(bytes)
+  } catch {
+    throw new HostTypeError('[iso4] descriptor extras blob is malformed')
+  }
+  const streamId = (extras !== null && typeof extras === 'object')
+    ? (extras as Record<string, unknown>)['bodyStream']
+    : undefined
+  if (typeof streamId !== 'number')
+    return {}
+  if (currentBodyStreamBinder === undefined) {
+    throw new HostTypeError(
+      '[iso4] a stream body arrived on a leg that cannot carry one',
+    )
+  }
+  return { bodyStream: currentBodyStreamBinder(streamId) }
 }
 
 /**
@@ -488,13 +672,24 @@ export function readHostType(des: DeserializerInternals): object {
       const method = readStr(des)
       const headers = readHeaders(des)
       const body = readBody(des)
-      skipExtras(des)
+      const { bodyStream } = readExtras(des)
       // Structural rather than the DOM `RequestInit`: this package targets
-      // Node without the DOM lib, and only these three fields are set.
-      const init: { method: string, headers: [string, string][], body?: Uint8Array | string }
-        = { method, headers }
-      if (body !== null && !BODYLESS_METHODS.has(method.toUpperCase()))
-        init.body = body
+      // Node without the DOM lib, and only these fields are set. A stream
+      // body needs `duplex` per Node's fetch rules.
+      const init: {
+        method: string
+        headers: [string, string][]
+        body?: Uint8Array | string | ReadableStream<Uint8Array>
+        duplex?: 'half'
+      } = { method, headers }
+      if (!BODYLESS_METHODS.has(method.toUpperCase())) {
+        if (bodyStream !== undefined) {
+          init.body = bodyStream
+          init.duplex = 'half'
+        } else if (body !== null) {
+          init.body = body
+        }
+      }
       return new globalThis.Request(url, init)
     }
 
@@ -503,14 +698,14 @@ export function readHostType(des: DeserializerInternals): object {
       const statusText = readStr(des)
       const headers = readHeaders(des)
       const body = readBody(des)
-      skipExtras(des)
+      const { bodyStream } = readExtras(des)
       // Status 0 means Response.error(); `new Response(null, {status: 0})`
       // throws in Node, so it has to be built the same way it was in the
       // sandbox. Headers stay an array of pairs rather than a Record — a Record
       // cannot represent duplicate set-cookie.
       if (status === 0)
         return globalThis.Response.error()
-      return new globalThis.Response(body, { status, statusText, headers })
+      return new globalThis.Response(bodyStream ?? body, { status, statusText, headers })
     }
 
     case TAG_INVALID:
