@@ -1441,8 +1441,11 @@ sees is exactly what the prefix produces deterministically:
     depends on the stage: at `prepare()` validation the output is discarded
     (that isolate is a throwaway and `prepare()` returns no streams), while
     the output of the evaluation that warms an instance is delivered once, on
-    the result of the call that paid for the cold start (§13.2.1). Whether
-    that is the right contract is an open question; the behavior above is what ships
+    the result of the call that paid for the cold start (§13.2.1). The console
+    *surface* is identical at both stages — the validation isolate installs the
+    same shim — so a prefix cannot validate against a method a run lacks
+    (`docs/conformance.md`). Whether discarding is the right contract for the
+    `prepare()` stage is an open question; the behavior above is what ships
     today.
   - A nondeterministic prefix (`Math.random()`, `Date.now()`) produces
     per-run state that differs between runs — validated once, evaluated
@@ -1916,6 +1919,11 @@ appeared on every result; the one-off delivery is the closest equivalent.
 Prefix output produced at `prepare()` validation is discarded (throwaway
 isolate, no result frame). Whether prefix logs should instead be dropped,
 tagged, or repeated is an open question — the text here records what ships today.
+
+The shim wraps five methods on V8's own `console` object rather than replacing
+it, so the rest of V8's console surface survives as callable no-ops — a
+dependency calling `console.table` on a debug path should not fail the run.
+`docs/conformance.md` carries the per-method table.
 
 **Taint-and-evict — narrowed to mid-execution interruption (epic #124).**
 An instance is discarded exactly when a turn was interrupted **while JS was

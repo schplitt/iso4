@@ -5837,10 +5837,15 @@ fn validate_prefix_module(
             start,
         )
     })?;
+    let validation_table = RunTable::boxed();
+    // Same console as a run, for surface parity. Lines land in this throwaway
+    // table and die with it — `prepare()` has no result frame to carry them.
+    install_console(scope, &*validation_table).map_err(|e| {
+        failure(termination_or(&reason, e), &logs, start)
+    })?;
     // Disarmed waitUntil for surface parity: `typeof waitUntil` matches run
     // code; calling it here throws the catchable setup-time error (no run
     // entry exists in this throwaway table).
-    let validation_table = RunTable::boxed();
     install_wait_until(scope, &*validation_table).map_err(|e| {
         failure(termination_or(&reason, e), &logs, start)
     })?;
@@ -8212,8 +8217,17 @@ fn clear_timeout_callback(
     }
 }
 
+/// Wrap five methods on V8's own `console` — replacing the object would delete
+/// 18 others. Unwrapped ones no-op: no `ConsoleDelegate` is registered.
+/// Table in `docs/conformance.md`.
 fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
-    let console = v8::Object::new(scope);
+    let global = scope.get_current_context().global(scope);
+    let console_key = v8::String::new(scope, "console")
+        .ok_or_else(|| RunError::Internal("failed to intern console".to_string()))?;
+    let console: v8::Local<v8::Object> = global
+        .get(scope, console_key.into())
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| RunError::Internal("V8 console object is missing".to_string()))?;
     let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
 
     for name in ["log", "debug", "info"] {
@@ -8240,13 +8254,6 @@ fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(
             .ok_or_else(|| RunError::Internal(format!("failed to install console.{name}")))?;
     }
 
-    let global = scope.get_current_context().global(scope);
-    let console_key = v8::String::new(scope, "console")
-        .ok_or_else(|| RunError::Internal("failed to intern console".to_string()))?;
-    global
-        .set(scope, console_key.into(), console.into())
-        .ok_or_else(|| RunError::Internal("failed to install console".to_string()))?;
-
     Ok(())
 }
 
@@ -8268,6 +8275,115 @@ fn console_stderr_callback(
     rv.set_undefined();
 }
 
+/// Render every argument and join with spaces. One TryCatch for the whole
+/// line — rendering reads guest properties (`toJSON`, `stack`) that may throw,
+/// and the reset between args stops one from leaking into the next.
+fn render_console_line(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+) -> String {
+    v8::tc_scope!(let tc, scope);
+    let mut parts = Vec::with_capacity(args.length() as usize);
+    for i in 0..args.length() {
+        parts.push(render_console_arg(tc, args.get(i)));
+        tc.reset();
+    }
+    parts.join(" ")
+}
+
+/// One console argument as text: JSON for plain data, `String(v)` otherwise.
+/// Strings stay unquoted and errors carry their stack. Never throws — a
+/// hostile getter degrades to a placeholder. See `docs/conformance.md`.
+fn render_console_arg(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Local<v8::Value>,
+) -> String {
+    if value.is_undefined() {
+        return "undefined".to_string();
+    }
+    if value.is_null() {
+        return "null".to_string();
+    }
+    // The common case: a logged string must not gain quotes.
+    if let Ok(text) = v8::Local::<v8::String>::try_from(value) {
+        return text.to_rust_string_lossy(scope);
+    }
+    if value.is_native_error() {
+        return render_error_arg(scope, value);
+    }
+    if is_json_renderable(value) {
+        if let Some(text) = render_json_arg(scope, value) {
+            if text != "{}" {
+                return text;
+            }
+            // JSON said nothing. `String(v)` names a Map, a Promise or a
+            // RegExp; for a genuinely empty object it says less than `{}`.
+            let named = display_string(scope, value);
+            return if named == "[object Object]" { text } else { named };
+        }
+        scope.reset();
+    }
+    display_string(scope, value)
+}
+
+/// Plain data only: primitives, arrays, `{}`-shaped objects, and anything that
+/// opts in with a `toJSON` method. A `Promise`, a `Map`, or a class instance
+/// serializes to `{}`, so those take the `String(v)` path instead.
+fn is_json_renderable(value: v8::Local<v8::Value>) -> bool {
+    if value.is_number() || value.is_boolean() || value.is_array() {
+        return true;
+    }
+    // Binary data serializes to a per-byte object — huge and less readable
+    // than `String(v)`, which gives the element list.
+    value.is_object() && !value.is_array_buffer() && !value.is_array_buffer_view()
+}
+
+/// `JSON.stringify(value)`, or `None` when it throws (a cycle) or yields
+/// `undefined` (a function, a symbol) — both fall back to `String(v)`.
+fn render_json_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>, value: v8::Local<v8::Value>) -> Option<String> {
+    if scope.has_terminated() {
+        return None;
+    }
+    let text = v8::json::stringify(scope, value)?.to_rust_string_lossy(scope);
+    (text != "undefined").then_some(text)
+}
+
+/// The stack is the useful part of a logged error; `Name: message` when it is
+/// absent or throws.
+fn render_error_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>, value: v8::Local<v8::Value>) -> String {
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(value) {
+        if let Some(key) = v8::String::new(scope, "stack") {
+            if let Some(stack) = object.get(scope, key.into()) {
+                if let Ok(text) = v8::Local::<v8::String>::try_from(stack) {
+                    return text.to_rust_string_lossy(scope);
+                }
+            }
+        }
+        scope.reset();
+    }
+    display_string(scope, value)
+}
+
+/// `String(value)`, or a placeholder when even that throws.
+fn display_string(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>, value: v8::Local<v8::Value>) -> String {
+    if scope.has_terminated() {
+        return "[unprintable]".to_string();
+    }
+    // `String(symbol)` throws by spec; ToDetailString renders `Symbol(desc)`.
+    if value.is_symbol() {
+        let rendered = value
+            .to_detail_string(scope)
+            .map(|text| text.to_rust_string_lossy(scope));
+        scope.reset();
+        return rendered.unwrap_or_else(|| "[unprintable]".to_string());
+    }
+    let rendered = value
+        .to_string(scope)
+        .map(|text| text.to_rust_string_lossy(scope));
+    scope.reset();
+    rendered.unwrap_or_else(|| "[unprintable]".to_string())
+}
+
 fn append_console_line(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -8282,21 +8398,7 @@ fn append_console_line(
         return;
     }
 
-    let mut parts = Vec::new();
-    for i in 0..args.length() {
-        let value = args.get(i);
-        let rendered = if value.is_undefined() {
-            "undefined".to_string()
-        } else {
-            value
-                .to_string(scope)
-                .map(|s| s.to_rust_string_lossy(scope))
-                .unwrap_or_else(|| "[unprintable]".to_string())
-        };
-        parts.push(rendered);
-    }
-
-    let line = parts.join(" ");
+    let line = render_console_line(scope, &args);
     // SAFETY: the External points at the instance-lifetime RunTable Box.
     let table = unsafe { &*table };
     let state = attributed_state(scope, table);
@@ -9123,6 +9225,179 @@ mod tests {
         assert!(has_line(&out.stdout, "a"));
         assert!(has_line(&out.stdout, "b"));
         assert!(has_line(&out.stdout, "c"));
+    }
+
+    /// One `console.log(<expr>)` line, rendered.
+    fn logged(expr: &str) -> String {
+        let out = run_ok(&format!("console.log({expr}); export default 1"));
+        assert_eq!(out.stdout.len(), 1, "expected one line, got {:?}", out.stdout);
+        out.stdout.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn plain_data_logs_as_json() {
+        assert_eq!(logged("{ user: 'bob', tries: 3 }"), r#"{"user":"bob","tries":3}"#);
+        assert_eq!(logged("[1, 2, 3]"), "[1,2,3]");
+        assert_eq!(logged("{ nested: { deep: [1] } }"), r#"{"nested":{"deep":[1]}}"#);
+        assert_eq!(logged("{}"), "{}");
+    }
+
+    #[test]
+    fn a_class_instance_logs_its_own_fields() {
+        assert_eq!(
+            logged("new (class Bar { constructor() { this.a = 1 } })()"),
+            r#"{"a":1}"#
+        );
+    }
+
+    #[test]
+    fn to_json_is_honoured() {
+        assert_eq!(
+            logged("{ toJSON() { return { via: 'toJSON' } } }"),
+            r#"{"via":"toJSON"}"#
+        );
+    }
+
+    /// JSON renders a Map, a Promise and a RegExp as `{}` — useless. Those
+    /// fall back to `String(v)`, which at least names the type.
+    #[test]
+    fn types_json_cannot_describe_fall_back_to_their_name() {
+        assert_eq!(logged("new Map([['k', 1]])"), "[object Map]");
+        assert_eq!(logged("new Set([1])"), "[object Set]");
+        assert_eq!(logged("Promise.resolve(1)"), "[object Promise]");
+        assert_eq!(logged("/re/g"), "/re/g");
+    }
+
+    #[test]
+    fn strings_are_not_quoted_and_primitives_read_plainly() {
+        assert_eq!(logged("'plain'"), "plain");
+        assert_eq!(logged("null, undefined, 42, true"), "null undefined 42 true");
+        assert_eq!(logged("() => 1"), "() => 1");
+        assert_eq!(logged("Symbol('s')"), "Symbol(s)");
+    }
+
+    /// The stack is the point of logging an error.
+    #[test]
+    fn an_error_logs_its_stack() {
+        let line = logged("new Error('boom')");
+        assert!(line.starts_with("Error: boom"), "got {line}");
+        assert!(line.contains("at "), "expected stack frames, got {line}");
+    }
+
+    /// Binary data would JSON-serialize to one entry per byte.
+    #[test]
+    fn typed_arrays_do_not_serialize_per_byte() {
+        assert_eq!(logged("new Uint8Array([1, 2, 3])"), "1,2,3");
+    }
+
+    /// Rendering reads guest properties, so it must survive hostile ones.
+    /// Both degrade to `String(v)`; neither may fail the run.
+    #[test]
+    fn unrenderable_arguments_never_fail_the_run() {
+        let out = run_ok(
+            "const cyc = { a: 1 }; cyc.self = cyc\n\
+             console.log(cyc)\n\
+             console.log({ get boom() { throw new Error('getter') } })\n\
+             console.log('still running')\n\
+             export default 'survived'",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("survived"));
+        assert_eq!(out.stdout.len(), 3, "got {:?}", out.stdout);
+        assert_eq!(out.stdout[2], "still running");
+    }
+
+    /// The five `install_console` wraps.
+    const WRAPPED_CONSOLE_METHODS: &[&str] = &["log", "debug", "info", "warn", "error"];
+
+    const CONSOLE_SURFACE: &str = "Object.getOwnPropertyNames(console).sort().join(' ')";
+
+    /// Present but unwrapped: V8 builtins that no-op with no ConsoleDelegate.
+    const INERT_CONSOLE_METHODS: &[&str] = &[
+        "assert",
+        "clear",
+        "count",
+        "dir",
+        "group",
+        "groupEnd",
+        "profile",
+        "profileEnd",
+        "table",
+        "time",
+        "timeEnd",
+        "timeLog",
+        "timeStamp",
+        "trace",
+    ];
+
+    #[test]
+    fn the_console_keeps_v8s_full_method_set() {
+        let out = run_ok(&format!("export default {CONSOLE_SURFACE}"));
+        let surface = get_default(&out).expect("console surface");
+        let present: Vec<&str> = surface.split(' ').collect();
+        for name in WRAPPED_CONSOLE_METHODS.iter().chain(INERT_CONSOLE_METHODS) {
+            assert!(
+                present.contains(name),
+                "console.{name} missing from {surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn unwrapped_console_methods_are_callable_and_silent() {
+        let out = run_ok(
+            r#"
+            console.table([{ a: 1 }]); console.group('g'); console.groupEnd()
+            console.count('c'); console.assert(false, 'nope'); console.dir({})
+            console.trace('t'); console.time('t'); console.timeEnd('t')
+            export default 'survived'
+            "#,
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("survived"));
+        assert!(
+            out.stdout.is_empty(),
+            "unwrapped methods emit nothing, got {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "unwrapped methods emit nothing, got {:?}",
+            out.stderr
+        );
+    }
+
+    /// The validation isolate installs the same console as a run, so a prefix
+    /// cannot pass `prepare()` on a method that is missing at run time.
+    #[test]
+    fn the_console_surface_is_identical_at_prepare_and_at_run() {
+        let at_run = get_default(&run_ok(&format!("export default {CONSOLE_SURFACE}")))
+            .expect("run surface");
+        let err = precompile(
+            &format!("throw new Error({CONSOLE_SURFACE})"),
+            None,
+            &[],
+            &[],
+            0,
+        )
+        .unwrap_err();
+        let RunError::RuntimeError(data) = &err.error else {
+            panic!("expected the probe to throw, got {:?}", err.error);
+        };
+        assert_eq!(data.message, at_run);
+    }
+
+    /// The unpinned third stage (GH #86): `prepare()` has no result frame, so
+    /// prefix console output is captured into the throwaway table and dropped.
+    /// Validation still succeeds — logging is not a prefix error.
+    #[test]
+    fn prefix_console_output_at_prepare_is_discarded() {
+        precompile(
+            r#"console.log("validation noise"); console.error("more noise")"#,
+            None,
+            &[],
+            &[],
+            0,
+        )
+        .expect("logging in a prefix must not fail validation");
     }
 
     // ── Error handling ────────────────────────────────────────────────────

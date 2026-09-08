@@ -11,7 +11,7 @@ validated source and evaluated per isolate — there is no runtime V8 snapshot
 that skip that evaluation on reuse (DESIGN.md §13.2.1).
 
 The project is a pnpm monorepo. Architecture and rationale are documented
-exhaustively in three files:
+exhaustively in four files:
 
 - **`DESIGN.md`** — architecture, execution model, limits, security model,
   phased build plan. The design contract. Read this first for any non-trivial
@@ -19,6 +19,10 @@ exhaustively in three files:
   packages.
 - **`docs/protocol.md`** — the canonical wire reference: frame table, payload
   layouts, error codes, versioning. Authoritative for anything on the socket.
+- **`docs/conformance.md`** — what the sandbox actually exposes, per API, with
+  support markers and known deviations. Measured against the shipped runtime,
+  so it wins over DESIGN.md on questions of fact. Update it in the same commit
+  as any change to the guest-visible surface.
 - **`packages/iso4-sandbox/src/types.ts`** — canonical public API surface for
   `@iso4/sandbox`. Changes here are API changes and must align with DESIGN.md.
 
