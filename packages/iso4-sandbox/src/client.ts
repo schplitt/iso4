@@ -25,14 +25,18 @@ import {
   peekBridgeCallId,
   peekBridgeCallRunId,
   peekPrecompileResultRequestId,
-  peekRunCompletionBackgroundPending,
+  peekRunCompletionBackgroundFlags,
   peekRunCompletionRunId,
   STREAM_CHUNK_MAX_BYTES,
   STREAM_CREDIT_WINDOW_BYTES,
   decodeStreamCancelPayload,
+  decodeStreamChunkPayload,
+  decodeStreamEndPayload,
   decodeStreamPullPayload,
+  encodeStreamCancelPayload,
   encodeStreamChunkPayload,
   encodeStreamEndPayload,
+  encodeStreamPullPayload,
 } from './ipc'
 import type { WireResourceLimits, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
@@ -40,7 +44,7 @@ import type { ImportHandlerMap } from './imports.js'
 import { importHandlerKey } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
 import type { StreamSourceRegistry } from './web-codec.js'
-import { brandKeyForToken } from './web-codec.js'
+import { OutboundStreamRegistry, brandKeyForToken } from './web-codec.js'
 
 export interface RuntimeIpcClientOptions {
   socketPath: string
@@ -56,12 +60,23 @@ export interface RuntimeIpcClientOptions {
 export interface RawRunResult {
   result: Uint8Array
   /**
-   * Present when the Result reported pending `waitUntil` work: the run
-   * continues runtime-side and this settles when its `RunComplete` frame
-   * arrives — `undefined` on connection loss. The run's slot is already
-   * free; the grace frames ride the shared connection, routed by run id.
+   * Present when the Result reported post-Result work (`waitUntil` grace
+   * and/or outbound streams): the run continues runtime-side and this
+   * settles when its `RunComplete` frame arrives — `undefined` on
+   * connection loss. The run's slot is already free; the post-Result
+   * frames ride the shared connection, routed by run id.
    */
   epilogue?: Promise<DecodedRunComplete | undefined>
+  /**
+   * Whether the flags carried the `waitUntil` bit — the caller exposes
+   * `result.waitUntil` only then (a streaming-only epilogue is invisible).
+   */
+  graceWork: boolean
+  /**
+   * The run's outbound-stream registry: Result decode binds `bodyStream`
+   * handles to `ReadableStream`s through it.
+   */
+  outStreams: OutboundStreamRegistry
 }
 
 /**
@@ -175,6 +190,10 @@ export class ProtocolDesyncError extends Error {
 interface RunEntry {
   dispatcher: BridgeCallDispatcher | undefined
   streams: StreamSourceRegistry | undefined
+  /**
+   * Outbound (sandbox → host) streamed result bodies (#128).
+   */
+  outStreams: OutboundStreamRegistry
   signal: AbortSignal | undefined
   hardAbortSignal: AbortSignal | undefined
   resolve: (result: RawRunResult) => void
@@ -557,6 +576,20 @@ export class RuntimeIpcClient {
     const entry: RunEntry = {
       dispatcher,
       streams,
+      outStreams: new OutboundStreamRegistry({
+        pull: (streamId, credit) => {
+          this.write(encodeTsToRustFrame(
+            TsToRustMessageTypes.StreamPull,
+            encodeStreamPullPayload(runId, streamId, credit),
+          )).catch(() => {})
+        },
+        cancel: (streamId, reason) => {
+          this.write(encodeTsToRustFrame(
+            TsToRustMessageTypes.StreamCancel,
+            encodeStreamCancelPayload(runId, streamId, reason),
+          )).catch(() => {})
+        },
+      }),
       signal,
       hardAbortSignal,
       resolve: NOOP,
@@ -833,6 +866,9 @@ export class RuntimeIpcClient {
           // caller-side catch releases the registry, and an idle source
           // would keep its host ReadableStream locked forever.
           entry.streams?.releaseAll()
+          // And nothing will deliver outbound chunks: error any consumer
+          // still reading a streamed result body.
+          entry.outStreams.failAll(failure)
           if (entry.epilogue !== undefined) {
             // The run's value was already delivered; the caller synthesizes a
             // truncated waitUntil report from `undefined`.
@@ -920,6 +956,19 @@ export class RuntimeIpcClient {
         return this.dispatchBridgeCallFrame(frame.payload, entry, runId)
       }
 
+      case RustToTsMessageTypes.StreamChunk: {
+        const chunk = decodeStreamChunkPayload(frame.payload)
+        // Late frames for a completed run are discarded like BridgeCalls.
+        this.runs.get(chunk.runId)?.outStreams.deliverChunk(chunk.streamId, chunk.data)
+        return undefined
+      }
+
+      case RustToTsMessageTypes.StreamEnd: {
+        const end = decodeStreamEndPayload(frame.payload)
+        this.runs.get(end.runId)?.outStreams.deliverEnd(end.streamId, end.error)
+        return undefined
+      }
+
       case RustToTsMessageTypes.StreamPull: {
         const pull = decodeStreamPullPayload(frame.payload)
         const owner = this.streamOwner(pull.runId)
@@ -978,12 +1027,13 @@ export class RuntimeIpcClient {
     entry.detachAbort()
     entry.detachAbort = NOOP
 
-    if (!peekRunCompletionBackgroundPending(payload)) {
+    const flags = peekRunCompletionBackgroundFlags(payload)
+    if (flags === 0) {
       // The run is over: release any body source still registered
       // (the runtime cancelled its side already).
       this.runs.delete(runId)
       entry.streams?.releaseAll()
-      entry.resolve({ result: payload })
+      entry.resolve({ result: payload, graceWork: false, outStreams: entry.outStreams })
       return
     }
 
@@ -1029,7 +1079,12 @@ export class RuntimeIpcClient {
       }
     }
 
-    entry.resolve({ result: payload, epilogue })
+    entry.resolve({
+      result: payload,
+      epilogue,
+      graceWork: (flags & 1) !== 0,
+      outStreams: entry.outStreams,
+    })
   }
 
   /**
@@ -1050,6 +1105,11 @@ export class RuntimeIpcClient {
     this.runs.delete(report.runId)
     entry.detachAbort()
     entry.streams?.releaseAll()
+    // The runtime ends every outbound stream before its RunComplete; a
+    // stream without an outcome here would hang its consumer — error it.
+    entry.outStreams.failAll(new Error(
+      '[@iso4/sandbox] the run completed before its body stream terminated',
+    ))
     entry.epilogue(report)
   }
 

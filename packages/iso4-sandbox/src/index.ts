@@ -55,7 +55,7 @@ import {
 } from './imports.js'
 import type { ImportHandlerMap } from './imports.js'
 import { materializeHostTypesInGlobals, serializeHostValue } from './v8-codec.js'
-import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN, StreamSourceRegistry } from './web-codec.js'
+import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN, StreamSourceRegistry, withBodyStreamBinder } from './web-codec.js'
 
 export type {
   ResourceLimits,
@@ -581,13 +581,19 @@ class SandboxImpl implements Sandbox {
           streams,
         })
         // `call` present ⇒ the value blob is the function's return value;
-        // absent ⇒ the exports object. Never both.
-        const decoded = call === undefined
-          ? decodeRunCompletionPayload(raw.result).result
-          : decodeRunCompletionPayload(raw.result, 'call').result
+        // absent ⇒ the exports object. Never both. A result body that
+        // streamed (#128) hydrates through the run's outbound registry into
+        // a real ReadableStream.
+        const decoded = withBodyStreamBinder(
+          (id) => raw.outStreams.attach(id),
+          () => call === undefined
+            ? decodeRunCompletionPayload(raw.result).result
+            : decodeRunCompletionPayload(raw.result, 'call').result,
+        )
         // waitUntil: the value arrived early; hand the caller the grace
-        // outcome as a never-rejecting promise.
-        if (raw.epilogue !== undefined && decoded.ok)
+        // outcome as a never-rejecting promise. A streaming-only epilogue
+        // carries no waitUntil work and stays invisible.
+        if (raw.epilogue !== undefined && raw.graceWork && decoded.ok)
           decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
         // Graceful terminate: a run whose signal aborted and whose Rust
         // Result carries ERR_ABORTED is a deliberate abort, not a failure —
@@ -961,12 +967,16 @@ implements Prefix<G, M> {
           streams,
         })
         // `call` present ⇒ the value blob is the function's return value;
-        // absent ⇒ the exports object. Never both.
-        const decoded = payload.call === undefined
-          ? decodeRunCompletionPayload(raw.result).result
-          : decodeRunCompletionPayload(raw.result, 'call').result
+        // absent ⇒ the exports object. Never both. Streamed result bodies
+        // hydrate through the run's outbound registry (#128).
+        const decoded = withBodyStreamBinder(
+          (id) => raw.outStreams.attach(id),
+          () => payload.call === undefined
+            ? decodeRunCompletionPayload(raw.result).result
+            : decodeRunCompletionPayload(raw.result, 'call').result,
+        )
         // waitUntil — see the note in SandboxImpl.run.
-        if (raw.epilogue !== undefined && decoded.ok)
+        if (raw.epilogue !== undefined && raw.graceWork && decoded.ok)
           decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
         // See the note in SandboxImpl.run — remap a graceful ERR_ABORTED Result
         // to `status: 'aborted'`, preserving the runtime's telemetry.
