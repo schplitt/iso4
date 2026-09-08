@@ -1873,9 +1873,12 @@ cross-thread path, `unsafe try_into_shared()` into a lockable
 `SharedIsolate`, is a separate type this runtime deliberately does not use —
 see the #80 record).
 Each instance is therefore owned cradle-to-grave by a dedicated runtime
-thread running the per-instance turn loop: jobs arrive over the handle's
-channel, inbound frames arrive demux-routed per run, and any number of runs
-can be suspended on the instance while it executes one turn at a time. The
+thread running the per-instance turn loop: jobs, demux-routed per-run
+frames, and the registry's retire signal all arrive on the instance's ONE
+ordered channel — a run's job always precedes its frames, so an event for
+a run the loop does not know is late, never early (#170) — and any number
+of runs can be suspended on the instance while it executes one turn at a
+time. The
 connection's demux thread is its only socket reader; every outbound frame
 goes through one serialized writer, so concurrent runs never interleave
 mid-frame. Session dispatch never parks — a job's completion hook writes
@@ -2068,10 +2071,11 @@ instances, because the same trigger fires concurrently: a call takes an
 idle instance or cold-starts another. Instances of one prefix share **no
 state** with each other (same contract as workerd instances across
 machines). **Concurrency: a per-instance turn loop** (#125) — the owner
-thread selects over new jobs, frames routed to its in-flight runs, and the
-nearest per-run deadline; any number of runs can be suspended on one
-instance, each with its own budgets, console, streams, and bridge bindings
-(per-run state table + CPED-rider attribution). Wire multiplexing and
+thread receives new jobs and the frames routed to its in-flight runs from
+one ordered channel (#170), bounded by the nearest per-run deadline; any
+number of runs can be suspended on one instance, each with its own budgets,
+console, streams, and bridge bindings (per-run state table + CPED-rider
+attribution). Wire multiplexing and
 attach-to-busy admission activate at #127; until then the host still
 dispatches one run per connection, so observable concurrency for one prefix
 = more instances.
