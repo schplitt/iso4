@@ -5886,10 +5886,15 @@ fn validate_prefix_module(
             start,
         )
     })?;
+    let validation_table = RunTable::boxed();
+    // Same console as a run, for surface parity. Lines land in this throwaway
+    // table and die with it — `prepare()` has no result frame to carry them.
+    install_console(scope, &*validation_table).map_err(|e| {
+        failure(termination_or(&reason, e), &logs, start)
+    })?;
     // Disarmed waitUntil for surface parity: `typeof waitUntil` matches run
     // code; calling it here throws the catchable setup-time error (no run
     // entry exists in this throwaway table).
-    let validation_table = RunTable::boxed();
     install_wait_until(scope, &*validation_table).map_err(|e| {
         failure(termination_or(&reason, e), &logs, start)
     })?;
@@ -8261,8 +8266,17 @@ fn clear_timeout_callback(
     }
 }
 
+/// Wrap five methods on V8's own `console` — replacing the object would delete
+/// 18 others. Unwrapped ones no-op: no `ConsoleDelegate` is registered.
+/// Table in `docs/conformance.md`.
 fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
-    let console = v8::Object::new(scope);
+    let global = scope.get_current_context().global(scope);
+    let console_key = v8::String::new(scope, "console")
+        .ok_or_else(|| RunError::Internal("failed to intern console".to_string()))?;
+    let console: v8::Local<v8::Object> = global
+        .get(scope, console_key.into())
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| RunError::Internal("V8 console object is missing".to_string()))?;
     let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
 
     for name in ["log", "debug", "info"] {
@@ -8288,13 +8302,6 @@ fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(
             .set(scope, key.into(), function.into())
             .ok_or_else(|| RunError::Internal(format!("failed to install console.{name}")))?;
     }
-
-    let global = scope.get_current_context().global(scope);
-    let console_key = v8::String::new(scope, "console")
-        .ok_or_else(|| RunError::Internal("failed to intern console".to_string()))?;
-    global
-        .set(scope, console_key.into(), console.into())
-        .ok_or_else(|| RunError::Internal("failed to install console".to_string()))?;
 
     Ok(())
 }
@@ -9172,6 +9179,100 @@ mod tests {
         assert!(has_line(&out.stdout, "a"));
         assert!(has_line(&out.stdout, "b"));
         assert!(has_line(&out.stdout, "c"));
+    }
+
+    /// The five `install_console` wraps.
+    const WRAPPED_CONSOLE_METHODS: &[&str] = &["log", "debug", "info", "warn", "error"];
+
+    const CONSOLE_SURFACE: &str = "Object.getOwnPropertyNames(console).sort().join(' ')";
+
+    /// Present but unwrapped: V8 builtins that no-op with no ConsoleDelegate.
+    const INERT_CONSOLE_METHODS: &[&str] = &[
+        "assert",
+        "clear",
+        "count",
+        "dir",
+        "group",
+        "groupEnd",
+        "profile",
+        "profileEnd",
+        "table",
+        "time",
+        "timeEnd",
+        "timeLog",
+        "timeStamp",
+        "trace",
+    ];
+
+    #[test]
+    fn the_console_keeps_v8s_full_method_set() {
+        let out = run_ok(&format!("export default {CONSOLE_SURFACE}"));
+        let surface = get_default(&out).expect("console surface");
+        let present: Vec<&str> = surface.split(' ').collect();
+        for name in WRAPPED_CONSOLE_METHODS.iter().chain(INERT_CONSOLE_METHODS) {
+            assert!(
+                present.contains(name),
+                "console.{name} missing from {surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn unwrapped_console_methods_are_callable_and_silent() {
+        let out = run_ok(
+            r#"
+            console.table([{ a: 1 }]); console.group('g'); console.groupEnd()
+            console.count('c'); console.assert(false, 'nope'); console.dir({})
+            console.trace('t'); console.time('t'); console.timeEnd('t')
+            export default 'survived'
+            "#,
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("survived"));
+        assert!(
+            out.stdout.is_empty(),
+            "unwrapped methods emit nothing, got {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "unwrapped methods emit nothing, got {:?}",
+            out.stderr
+        );
+    }
+
+    /// The validation isolate installs the same console as a run, so a prefix
+    /// cannot pass `prepare()` on a method that is missing at run time.
+    #[test]
+    fn the_console_surface_is_identical_at_prepare_and_at_run() {
+        let at_run = get_default(&run_ok(&format!("export default {CONSOLE_SURFACE}")))
+            .expect("run surface");
+        let err = precompile(
+            &format!("throw new Error({CONSOLE_SURFACE})"),
+            None,
+            &[],
+            &[],
+            0,
+        )
+        .unwrap_err();
+        let RunError::RuntimeError(data) = &err.error else {
+            panic!("expected the probe to throw, got {:?}", err.error);
+        };
+        assert_eq!(data.message, at_run);
+    }
+
+    /// The unpinned third stage (GH #86): `prepare()` has no result frame, so
+    /// prefix console output is captured into the throwaway table and dropped.
+    /// Validation still succeeds — logging is not a prefix error.
+    #[test]
+    fn prefix_console_output_at_prepare_is_discarded() {
+        precompile(
+            r#"console.log("validation noise"); console.error("more noise")"#,
+            None,
+            &[],
+            &[],
+            0,
+        )
+        .expect("logging in a prefix must not fail validation");
     }
 
     // ── Error handling ────────────────────────────────────────────────────

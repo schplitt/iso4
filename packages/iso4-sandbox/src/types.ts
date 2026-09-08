@@ -1368,6 +1368,10 @@ export interface RunSuccess {
    * `limits.maxStdoutBytes`. Prefix code shares the same console: when a run
    * cold-starts a warm instance, what the prefix logged while evaluating
    * arrives here once, on that run's result, ahead of the run's own lines.
+   *
+   * Only `log`/`debug`/`info`/`warn`/`error` are captured. The rest of the
+   * sandbox's `console` is callable but emits nothing — see
+   * `docs/conformance.md`.
    */
   stdout: string[]
   /**

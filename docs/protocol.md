@@ -934,7 +934,9 @@ phase (§5.8) streams flow like bridge traffic.
 | `message` | `String`                                               |
 
 Sandbox `console.log`, `console.debug`, and `console.info` map to stdout.
-`console.warn` and `console.error` map to stderr.
+`console.warn` and `console.error` map to stderr. These five are the only
+console methods the runtime wraps; the rest of V8's console surface is
+callable and emits nothing (`docs/conformance.md`).
 
 Prefix code shares that console. Output written while a warm instance
 evaluates its prefix is carried on the completion of the call that

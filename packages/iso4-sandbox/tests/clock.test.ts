@@ -146,11 +146,29 @@ describe('frozen clock — the other clock surfaces', () => {
     expect(ok).toBe(true)
   })
 
-  test('performance and console.time stay absent', async () => {
-    const ok = await evalDefault(`
-      export default typeof performance === 'undefined' && typeof console.time === 'undefined'
-    `)
+  test('performance stays absent', async () => {
+    const ok = await evalDefault(`export default typeof performance === 'undefined'`)
     expect(ok).toBe(true)
+  })
+
+  // console.time/timeEnd are V8 builtins we deliberately leave unwrapped
+  // (docs/conformance.md): present so libraries can call them, inert because
+  // no ConsoleDelegate is registered — so they read no clock and emit nothing.
+  test('console timing methods exist but report nothing', async () => {
+    const result = await runtime.run({
+      code: `
+        console.time('t')
+        console.timeEnd('t')
+        console.timeStamp('t')
+        export default [typeof console.time, typeof console.timeEnd].join(',')
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('function,function')
+    expect(result.stdout).toEqual([])
+    expect(result.stderr).toEqual([])
   })
 })
 
