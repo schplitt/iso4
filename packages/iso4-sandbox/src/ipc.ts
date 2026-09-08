@@ -980,8 +980,9 @@ export type ImportBindingPayload
  * One host-import function-leaf rebinding for a `PrefixRun` payload. Only the
  * location crosses the wire — the replacement handler stays in the client's
  * dispatch map. The runtime validates it against the shape declared at
- * precompile time (`ERR_UNDECLARED_BINDING` otherwise), unifying enforcement
- * with the Rust-side check for undeclared globals.
+ * precompile time (`ERR_UNDECLARED_BINDING` for undeclared locations,
+ * `ERR_FROZEN_BINDING` for frozen ones), unifying enforcement with the
+ * Rust-side check for undeclared globals.
  */
 export interface ImportRebindPayload {
   specifier: string

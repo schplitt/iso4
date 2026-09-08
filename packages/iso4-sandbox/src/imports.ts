@@ -25,9 +25,10 @@
  *   - Host-module function leaves can be rebound by passing a new function at
  *     the same path; data leaves cannot (frozen at declaration).
  *   - Declared-shape enforcement lives in the Rust runtime: `prefix.run()`
- *     sends the rebind locations and the runtime rejects anything that was
- *     not declared as a function leaf with `ERR_UNDECLARED_BINDING`, the same
- *     enforcement point that guards undeclared globals.
+ *     sends the rebind locations and the runtime rejects undeclared locations
+ *     with `ERR_UNDECLARED_BINDING` (the same enforcement point that guards
+ *     undeclared globals) and frozen ones (source module, data leaf) with
+ *     `ERR_FROZEN_BINDING`.
  */
 
 import type { HostModuleNodePayload, ImportBindingPayload, ImportRebindPayload } from './ipc.js'
@@ -96,16 +97,17 @@ export interface ProcessedRebinds {
 
 /**
  * Thrown when the host's import configuration is structurally invalid in a
- * way only the client can see (a non-function rebind value, a source-module
- * rebind attempt). `PrefixImpl.run` converts it into an
- * `ERR_UNDECLARED_BINDING` `RunResult`, matching the runtime-side enforcement
- * for undeclared locations.
+ * way only the client can see. `PrefixImpl.run` converts it into a failed
+ * `RunResult` carrying `code`: `ERR_FROZEN_BINDING` for a rebind of a frozen
+ * location (a source module), `ERR_INVALID_REBIND` for a non-function rebind
+ * value. Matches the runtime-side enforcement for locations only Rust can see.
  */
-export class UndeclaredImportBindingError extends Error {
-  readonly code = 'ERR_UNDECLARED_BINDING'
-  constructor(message: string) {
+export class ImportRebindError extends Error {
+  readonly code: 'ERR_FROZEN_BINDING' | 'ERR_INVALID_REBIND'
+  constructor(code: 'ERR_FROZEN_BINDING' | 'ERR_INVALID_REBIND', message: string) {
     super(message)
-    this.name = 'UndeclaredImportBindingError'
+    this.name = 'ImportRebindError'
+    this.code = code
   }
 }
 
@@ -210,7 +212,8 @@ function lowerNode(
  * modules are frozen; a non-function leaf value — there is nothing to
  * dispatch to). Whether each location was actually declared as a function
  * leaf at precompile time is enforced by the Rust runtime against the stored
- * prefix shape, which rejects violations with `ERR_UNDECLARED_BINDING`.
+ * prefix shape (`ERR_UNDECLARED_BINDING` for undeclared locations,
+ * `ERR_FROZEN_BINDING` for frozen ones).
  *
  * @param runImports
  * @param defaults handler map captured at precompile time
@@ -227,7 +230,8 @@ export function mergeRebindImports(
 
   for (const [specifier, value] of Object.entries(runImports)) {
     if (typeof value === 'string') {
-      throw new UndeclaredImportBindingError(
+      throw new ImportRebindError(
+        'ERR_FROZEN_BINDING',
         `import '${specifier}' is a source module — source imports are frozen `
         + `with the prefix and cannot be rebound at prefix.run() time`,
       )
@@ -265,7 +269,8 @@ function walkRebind(
       walkRebind(specifier, value, newPath, handlers, rebinds)
       continue
     }
-    throw new UndeclaredImportBindingError(
+    throw new ImportRebindError(
+      'ERR_INVALID_REBIND',
       `import '${specifier}'.${newPath.join('.')} can only be rebound with a `
       + `function; got ${describeKind(value)}`,
     )

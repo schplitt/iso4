@@ -240,7 +240,7 @@ describe('refusals', () => {
     })
     expect(result.ok).toBe(false)
     if (!result.ok)
-      expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+      expect(result.error.code).toBe('ERR_RESERVED_NAME')
   })
 })
 

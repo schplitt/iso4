@@ -82,45 +82,45 @@ fn has_function_leaf(entries: &[(String, ipc::HostModuleNode)]) -> bool {
 }
 
 /// Validate the host-import rebinds a `PrefixRun` requested against the shape
-/// declared at `Precompile`. Returns the first violation, phrased like the
-/// undeclared-globals check: only declared host-module *function leaves* may
-/// be re-pointed at a new host handler; source modules and data leaves are
-/// frozen with the snapshot.
+/// declared at `Precompile`. Only declared host-module *function leaves* may
+/// be re-pointed at a new host handler. An unknown specifier or path is
+/// `UndeclaredBinding`; a source module or data leaf is declared but frozen
+/// with the prefix — `FrozenBinding`.
 fn validate_import_rebinds(
     rebinds: &[ipc::ImportRebind],
     declared: &[ipc::ImportBinding],
-) -> Result<(), String> {
+) -> Result<(), sandbox::RunError> {
     for rb in rebinds {
         let Some(binding) = declared.iter().find(|b| b.specifier == rb.specifier) else {
-            return Err(format!(
+            return Err(sandbox::RunError::UndeclaredBinding(format!(
                 "import '{}' was not declared at precompile time",
                 rb.specifier
-            ));
+            )));
         };
         let exports = match &binding.module {
             ipc::ImportModule::Source(_) => {
-                return Err(format!(
+                return Err(sandbox::RunError::FrozenBinding(format!(
                     "import '{}' is a source module — source imports are frozen \
                      in the snapshot and cannot be rebound at prefix.run() time",
                     rb.specifier
-                ))
+                )))
             }
             ipc::ImportModule::Host(exports) => exports,
         };
         match find_host_node(exports, &rb.path) {
             Some(ipc::HostModuleNode::Function) => {}
             Some(ipc::HostModuleNode::Data(_)) => {
-                return Err(format!(
+                return Err(sandbox::RunError::FrozenBinding(format!(
                     "import '{}'.{} is a data leaf, not a function — data leaves \
                      cannot be rebound",
                     rb.specifier, rb.path
-                ))
+                )))
             }
             _ => {
-                return Err(format!(
+                return Err(sandbox::RunError::UndeclaredBinding(format!(
                     "import '{}'.{} was not declared at precompile time",
                     rb.specifier, rb.path
-                ))
+                )))
             }
         }
     }
@@ -1185,36 +1185,38 @@ fn dispatch_prefix_run(
         return;
     };
 
-    // ── ERR_UNDECLARED_BINDING check ─────────────────────────────────────
+    // ── Binding checks ───────────────────────────────────────────────────
     // Every global in payload.globals must have been declared at precompile
-    // time; the same rule covers host-import rebinds.
+    // time (ERR_UNDECLARED_BINDING); host-import rebinds must additionally
+    // target function leaves, not frozen locations (ERR_FROZEN_BINDING).
     let declared_set: std::collections::HashSet<&str> = prefix_data
         .declared_globals
         .iter()
         .map(String::as_str)
         .collect();
-    let violation: Option<String> = payload
+    let violation: Option<sandbox::RunError> = payload
         .globals
         .iter()
         .filter_map(|g| g.bridge_stub_name())
         .find(|name| !declared_set.contains(name))
-        .map(|name| format!("global '{name}' was not declared at precompile time"))
+        .map(|name| {
+            sandbox::RunError::UndeclaredBinding(format!(
+                "global '{name}' was not declared at precompile time"
+            ))
+        })
         .or_else(|| {
             validate_import_rebinds(&payload.import_rebinds, &prefix_data.declared_imports).err()
         });
-    if let Some(msg) = violation {
-        eprintln!("[iso4-v8] PrefixRun {run_id} — ERR_UNDECLARED_BINDING: {msg}");
+    if let Some(error) = violation {
+        let error = wire::run_error_to_payload(&error);
+        eprintln!(
+            "[iso4-v8] PrefixRun {run_id} — {}: {}",
+            error.code, error.message
+        );
         let payload = wire::encode_run_completion_payload(
             run_id,
             wire::RunCompletion::Failure(wire::RunFailurePayload {
-                error: wire::RunErrorPayload {
-                    code: "ERR_UNDECLARED_BINDING".to_string(),
-                    name: "Error".to_string(),
-                    message: msg,
-                    stack: None,
-                    fields: None,
-                    reset: None,
-                },
+                error,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 duration_ms: 0.0,

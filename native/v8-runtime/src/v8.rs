@@ -1243,10 +1243,16 @@ pub enum RunError {
     /// sandbox did not catch it. Carries the handler error's `name`,
     /// `message`, and own-enumerable `fields` (never the host stack).
     HostBridge(Box<BridgeErrorPayload>),
-    /// PrefixRun attempted to bind a global not declared by Precompile.
-    /// Raised in session.rs when a PrefixRun global was not declared in Precompile.
-    #[allow(dead_code)]
+    /// PrefixRun attempted to bind a global or import location that was
+    /// never declared by Precompile.
     UndeclaredBinding(String),
+    /// A host global (or bridge stub) uses a name the runtime owns
+    /// ([`RESERVED_GLOBAL_NAMES`]). Shaped to also cover runtime-owned
+    /// module specifiers if one ever becomes non-overridable.
+    ReservedName(String),
+    /// A PrefixRun rebind targets a declared location that is frozen with
+    /// the prefix: a source module or a data leaf.
+    FrozenBinding(String),
     /// Prefix top-level evaluation stayed pending after draining the
     /// microtask queue — it awaits something that can never resolve at
     /// precompile time (a never-settling promise).
@@ -7279,7 +7285,7 @@ pub const RESERVED_GLOBAL_NAMES: &[&str] = &[
 
 fn check_not_reserved(name: &str) -> Result<(), RunError> {
     if RESERVED_GLOBAL_NAMES.contains(&name) {
-        return Err(RunError::UndeclaredBinding(format!(
+        return Err(RunError::ReservedName(format!(
             "global '{name}' is reserved by the runtime and cannot be provided by the host"
         )));
     }

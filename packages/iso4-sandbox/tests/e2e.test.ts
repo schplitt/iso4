@@ -3154,7 +3154,7 @@ describe('native timers', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.code).toBe('ERR_RESERVED_NAME')
     expect(result.error.message).toMatch(/reserved/)
   })
 

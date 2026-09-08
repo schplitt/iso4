@@ -398,7 +398,7 @@ names that the host must not shadow:
   `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`.
 
 These are **enforced**, not merely documented: a host global using one of these
-names is rejected with `ERR_UNDECLARED_BINDING`. Allowing a host to shadow
+names is rejected with `ERR_RESERVED_NAME`. Allowing a host to shadow
 `Response` would leave user code building objects the codec cannot recognise.
 
 > **Correction (this section previously claimed otherwise).** These were
@@ -592,9 +592,10 @@ same signature. TypeScript enforces this via `RebindImports<I>` at compile
 time; at run time the client sends the rebind **locations**
 (`specifier` + leaf path) on the `PrefixRun` payload and the Rust runtime
 validates them against the shape stored with the prefix, returning
-`ERR_UNDECLARED_BINDING` for anything else — one enforcement point,
-shared with the undeclared-globals check, that a non-TS client cannot
-skip.
+`ERR_UNDECLARED_BINDING` for locations never declared and
+`ERR_FROZEN_BINDING` for declared-but-frozen ones (source modules, data
+leaves) — one enforcement point, shared with the undeclared-globals
+check, that a non-TS client cannot skip.
 
 #### Implementation note: how host modules are built (shape-as-data)
 
@@ -1458,7 +1459,8 @@ handlers stay on the TS side — bridge dispatch is name-addressed, so a
 rebind just re-points the per-run dispatch entry (global name, or
 host-import `specifier` + leaf path). The Rust runtime validates every
 rebound name/location against the shape stored with the prefix. Source
-modules cannot be rebound — their code is frozen at declaration.
+modules cannot be rebound — their code is frozen at declaration
+(`ERR_FROZEN_BINDING`, likewise for data leaves).
 
 If `prefix.run()` passes a name that wasn't declared at `precompile()`
 time, the run fails fast with `ERR_UNDECLARED_BINDING`. This is intentional:

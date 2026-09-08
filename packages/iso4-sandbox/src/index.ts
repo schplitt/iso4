@@ -49,7 +49,7 @@ import type {
 
 import { extractBridgeGlobals, processGlobals } from './globals.js'
 import {
-  UndeclaredImportBindingError,
+  ImportRebindError,
   mergeRebindImports,
   processImports,
 } from './imports.js'
@@ -783,8 +783,8 @@ implements Prefix<G, M> {
    * `prefix.run()` may override a subset of function leaves; everything else
    * falls back to these. Source modules and data leaves are frozen in the
    * declared prefix state and not represented here. The declared shape itself lives with
-   * the prefix in the Rust runtime, which enforces `ERR_UNDECLARED_BINDING`
-   * for rebind attempts outside it.
+   * the prefix in the Rust runtime, which rejects rebind attempts outside it
+   * (`ERR_UNDECLARED_BINDING`) or at frozen locations (`ERR_FROZEN_BINDING`).
    */
   private readonly defaultImportHandlers: ImportHandlerMap
   /**
@@ -924,8 +924,7 @@ implements Prefix<G, M> {
     // Merge run-time handler overrides over the precompile defaults and
     // collect the rebind locations for the wire. Declared-shape enforcement
     // happens in the Rust runtime against the stored prefix shape (the same
-    // ERR_UNDECLARED_BINDING check that guards globals); only client-visible
-    // shape problems throw here.
+    // check that guards globals); only client-visible shape problems throw here.
     let merged: ReturnType<typeof mergeRebindImports>
     try {
       merged = mergeRebindImports(
@@ -933,13 +932,13 @@ implements Prefix<G, M> {
         this.defaultImportHandlers,
       )
     } catch (e) {
-      if (e instanceof UndeclaredImportBindingError) {
-        // Symmetric with the Rust-side ERR_UNDECLARED_BINDING path:
-        // surface the error as a RunResult failure rather than a thrown promise.
+      if (e instanceof ImportRebindError) {
+        // Symmetric with the Rust-side rebind validation: surface the error
+        // as a RunResult failure rather than a thrown promise.
         return {
           status: 'failed',
           ok: false,
-          error: { code: 'ERR_UNDECLARED_BINDING', name: 'Error', message: e.message },
+          error: { code: e.code, name: 'Error', message: e.message },
           stdout: [],
           stderr: [],
           durationMs: 0,

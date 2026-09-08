@@ -8,7 +8,7 @@
  *    unsupported data values, non-function rebind values). Declared-shape
  *    enforcement (undeclared specifiers/paths, data-leaf and source-module
  *    rebinds) lives in the Rust runtime and is covered end-to-end in
- *    `e2e.test.ts` under "ERR_UNDECLARED_BINDING".
+ *    `integration.test.ts` under "imports rebinding enforcement".
  *
  * End-to-end resolver / host-module behaviour (the sandbox actually importing
  * from these bindings) is covered in `integration.test.ts` and `e2e.test.ts`
@@ -17,7 +17,7 @@
 
 import { describe, expect, it } from 'vitest'
 import {
-  UndeclaredImportBindingError,
+  ImportRebindError,
   importHandlerKey,
   mergeRebindImports,
   processImports,
@@ -339,20 +339,30 @@ describe('mergeRebindImports', () => {
 // mergeRebindImports — client-visible rejections
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('mergeRebindImports — UndeclaredImportBindingError', () => {
+describe('mergeRebindImports — ImportRebindError', () => {
   it('refuses to rebind a specifier with a string (source-module form)', () => {
     expect(() =>
       mergeRebindImports({ 'lib:math': 'export const x = 2' }, new Map()),
     ).toThrow(/source imports are frozen/)
   })
 
-  it('UndeclaredImportBindingError carries the ERR_UNDECLARED_BINDING code', () => {
+  it('a source-module rebind carries the ERR_FROZEN_BINDING code', () => {
     try {
       mergeRebindImports({ 'lib:math': 'export const x = 2' }, new Map())
       throw new Error('should have thrown')
     } catch (e) {
-      expect(e).toBeInstanceOf(UndeclaredImportBindingError)
-      expect((e as UndeclaredImportBindingError).code).toBe('ERR_UNDECLARED_BINDING')
+      expect(e).toBeInstanceOf(ImportRebindError)
+      expect((e as ImportRebindError).code).toBe('ERR_FROZEN_BINDING')
+    }
+  })
+
+  it('a non-function rebind value carries the ERR_INVALID_REBIND code', () => {
+    try {
+      mergeRebindImports({ 'host:cfg': { version: '2.0.0' } } as never, new Map())
+      throw new Error('should have thrown')
+    } catch (e) {
+      expect(e).toBeInstanceOf(ImportRebindError)
+      expect((e as ImportRebindError).code).toBe('ERR_INVALID_REBIND')
     }
   })
 
