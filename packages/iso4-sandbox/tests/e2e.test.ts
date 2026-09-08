@@ -4812,6 +4812,46 @@ describe('streaming bodies', () => {
     await prefix.dispose()
   })
 
+  test('concurrent streamed bodies joined on one warm instance arrive byte-exact (#170)', async () => {
+    const size = 2 * 1024 * 1024
+    const prefix = await runtime.prepare({
+      code: `export default {
+        async fetch(request) {
+          const bytes = new Uint8Array(await request.arrayBuffer())
+          let sum = 0
+          for (let i = 0; i < bytes.length; i++) sum = (sum + bytes[i]) % 65536
+          return Response.json({ length: bytes.length, sum })
+        },
+      }`,
+    })
+    const expected = (() => {
+      const body = patternBytes(size)
+      let sum = 0
+      for (let i = 0; i < body.length; i++) sum = (sum + body[i]!) % 65536
+      return sum
+    })()
+    const callOnce = async () => {
+      const result = await prefix.call({
+        export: 'default.fetch',
+        args: [new Request('https://example.com/upload', { method: 'POST', body: patternBytes(size) })],
+      })
+      expect(result.ok).toBe(true)
+      if (!result.ok)
+        return
+      const report = await (result.value as Response).json() as { length: number, sum: number }
+      expect(report.length).toBe(size)
+      expect(report.sum).toBe(expected)
+    }
+    // Warm-up seeds the prefix demand averages (CPU-light profile) and
+    // leaves a warm instance, so the concurrent calls below JOIN it.
+    await callOnce()
+    const worker = async () => {
+      for (let i = 0; i < 3; i++) await callOnce()
+    }
+    await Promise.all([worker(), worker()])
+    await prefix.dispose()
+  })
+
   test('a large bridge-response body streams and is readable incrementally', async () => {
     const size = 512 * 1024
     const result = await runtime.run({

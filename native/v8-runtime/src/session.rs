@@ -1294,20 +1294,22 @@ fn dispatch_prefix_run(
             return;
         }
     };
-    let (jobs_tx, events_tx) = match &taken {
-        Taken::Pooled(att) => (att.sender(), att.event_sender()),
-        Taken::Cold(handle) => (handle.sender(), handle.event_sender()),
+    let msgs_tx = match &taken {
+        Taken::Pooled(att) => att.sender(),
+        Taken::Cold(handle) => handle.sender(),
     };
 
-    // Route the run to the acquired instance's event channel; from here the
-    // demux can deliver frames, aborts and connection loss by token.
+    // Route the run to the acquired instance's channel; from here the demux
+    // can deliver frames, aborts and connection loss by token. The job is
+    // sent below on the SAME channel, before this demux thread can route
+    // any frame — FIFO makes the job precede every event of its run (#170).
     insert_run_route(
         conn_runs,
         run_id,
         token,
         payload.limits.memory_mb,
         Arc::clone(&ctl),
-        events_tx,
+        msgs_tx.clone(),
     );
 
     // The completion hook, run on the instance thread when the run finishes:
@@ -1397,13 +1399,16 @@ fn dispatch_prefix_run(
         ctl_slot: Some(ctl),
     });
 
-    if let Err((mut job, _)) = jobs_tx.send((job, None)).map_err(|e| e.0) {
+    let msg = sandbox::RoutedEvent::new(token, sandbox::RunEvent::Job((job, None)));
+    if let Err(e) = msgs_tx.send(msg) {
         // The instance thread died before accepting the job: answer the run
         // through the completion hook, which also releases the registry
         // state it captured.
         eprintln!("[iso4-v8] PrefixRun {run_id} — instance thread dead before dispatch");
-        if let Some(complete) = job.complete.take() {
-            complete(crate::warm::dead_instance_outcome());
+        if let sandbox::RunEvent::Job((mut job, _)) = e.0.event {
+            if let Some(complete) = job.complete.take() {
+                complete(crate::warm::dead_instance_outcome());
+            }
         }
     }
 }

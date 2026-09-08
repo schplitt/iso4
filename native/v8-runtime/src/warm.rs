@@ -6,9 +6,10 @@
 //! (`OwnedIsolate` is `!Send`, `Drop` asserts current-thread ownership, no
 //! `Locker` is exposed), so the owner thread is the only place the isolate
 //! can be created, called into, and dropped. The owner thread runs the
-//! per-instance turn loop (`v8::serve_instance`): jobs arrive over the
-//! handle's job channel, inbound frames arrive token-tagged on the handle's
-//! ONE event channel (demux-routed), and any number of session runs can be
+//! per-instance turn loop (`v8::serve_instance`): jobs, token-tagged inbound
+//! frames (demux-routed) and the registry's Retire all arrive on the
+//! handle's ONE ordered channel — a run's job always precedes its frames
+//! (#170) — and any number of session runs can be
 //! suspended on one instance at once. Session
 //! dispatch never blocks — a job's completion hook writes the run's frames
 //! through the connection's serialized writer and releases the instance;
@@ -43,15 +44,14 @@ use crate::v8 as sandbox;
 pub use crate::v8::CallJob;
 
 /// A live warm instance as the registry sees it: the channel to its owner
-/// thread plus the metadata eviction needs. Dropping the handle disconnects
-/// the channel; the owner thread then exits (once its in-flight runs drain)
-/// and disposes the isolate on the thread that created it.
+/// thread plus the metadata eviction needs. Dropping the handle sends a
+/// Retire message; the owner thread then exits (once its in-flight runs
+/// drain) and disposes the isolate on the thread that created it.
 pub struct InstanceHandle {
-    jobs: crossbeam_channel::Sender<sandbox::JobMsg>,
-    /// The instance's ONE run-event channel: the session demux tags every
-    /// routed event with the owning run's table token, and the owner loop
-    /// delivers by token — no per-run channel, no per-event select rebuild.
-    events: sandbox::RunEventSender,
+    /// The instance's ONE channel: jobs and run-tagged events share it, so
+    /// a run's job always precedes its frames (FIFO, #170). The demux tags
+    /// every routed event with the owning run's table token.
+    msgs: sandbox::RunEventSender,
     /// When this instance last finished a call — the idleTime factor of the
     /// eviction score.
     last_used: Instant,
@@ -63,23 +63,18 @@ pub struct InstanceHandle {
     load: Arc<sandbox::InstanceLoad>,
 }
 
-/// What a run holds while attached to a pooled instance: the channels plus
+/// What a run holds while attached to a pooled instance: the channel plus
 /// the registry id `release` needs. The registry keeps the owning
 /// [`InstanceHandle`]; several runs may hold attachments to one instance at
 /// once (the loop interleaves them).
 pub struct AttachedInstance {
     pub id: u64,
-    jobs: crossbeam_channel::Sender<sandbox::JobMsg>,
-    events: sandbox::RunEventSender,
+    msgs: sandbox::RunEventSender,
 }
 
 impl AttachedInstance {
-    pub fn sender(&self) -> crossbeam_channel::Sender<sandbox::JobMsg> {
-        self.jobs.clone()
-    }
-
-    pub fn event_sender(&self) -> sandbox::RunEventSender {
-        self.events.clone()
+    pub fn sender(&self) -> sandbox::RunEventSender {
+        self.msgs.clone()
     }
 }
 
@@ -89,24 +84,30 @@ impl InstanceHandle {
     /// `tainted: true`, so the caller evicts it like any other taint.
     pub fn call(&self, job: CallJob) -> sandbox::CallOutcome {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        if self.jobs.send((Box::new(job), Some(tx))).is_err() {
+        let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job((Box::new(job), Some(tx))));
+        if self.msgs.send(msg).is_err() {
             return dead_instance_outcome();
         }
         rx.recv().unwrap_or_else(|_| dead_instance_outcome())
     }
 
-    /// A clone of the job channel's sender, for the session dispatch path
+    /// A clone of the instance's one sender, for the session dispatch path
     /// where the handle itself moves into the job's completion hook before
-    /// the job is sent.
-    pub fn sender(&self) -> crossbeam_channel::Sender<sandbox::JobMsg> {
-        self.jobs.clone()
+    /// the job is sent, and for the demux route of a run dispatched to this
+    /// instance.
+    pub fn sender(&self) -> sandbox::RunEventSender {
+        self.msgs.clone()
     }
+}
 
-    /// A clone of the instance's run-event sender, for the demux route of a
-    /// run dispatched to this instance (tag every event with the run's
-    /// token).
-    pub fn event_sender(&self) -> sandbox::RunEventSender {
-        self.events.clone()
+impl Drop for InstanceHandle {
+    /// Retirement signal: the loop stops accepting work and exits once its
+    /// in-flight runs drain. An explicit message rather than sender-count
+    /// disconnect, so a leaked sender clone can never strand the thread.
+    fn drop(&mut self) {
+        self.msgs
+            .send(sandbox::RoutedEvent::new(0, sandbox::RunEvent::Retire))
+            .ok();
     }
 }
 
@@ -144,16 +145,14 @@ pub fn spawn_instance(
     memory_mb: u32,
     brand_key: String,
 ) -> std::io::Result<InstanceHandle> {
-    let (tx, rx) = crossbeam_channel::unbounded::<sandbox::JobMsg>();
-    let (etx, erx) = crossbeam_channel::unbounded::<sandbox::RoutedEvent>();
+    let (tx, rx) = crossbeam_channel::unbounded::<sandbox::RoutedEvent>();
     let load = Arc::new(sandbox::InstanceLoad::new());
     let thread_load = Arc::clone(&load);
     std::thread::Builder::new()
         .name("iso4-warm-instance".to_string())
-        .spawn(move || instance_main(prefix, memory_mb, brand_key, rx, erx, thread_load))?;
+        .spawn(move || instance_main(prefix, memory_mb, brand_key, rx, thread_load))?;
     Ok(InstanceHandle {
-        jobs: tx,
-        events: etx,
+        msgs: tx,
         last_used: Instant::now(),
         heap_used_bytes: 0,
         load,
@@ -164,7 +163,6 @@ fn instance_main(
     prefix: Arc<PrefixData>,
     memory_mb: u32,
     brand_key: String,
-    jobs: crossbeam_channel::Receiver<sandbox::JobMsg>,
     events: crossbeam_channel::Receiver<sandbox::RoutedEvent>,
     load: Arc<sandbox::InstanceLoad>,
 ) {
@@ -174,9 +172,20 @@ fn instance_main(
     crate::webcodec::set_session_brand_key(brand_key);
 
     // The isolate is created lazily on the first job so a creation failure
-    // surfaces as that call's result.
-    let Ok((mut first_job, first_respond)) = jobs.recv() else {
-        return; // evicted before ever serving
+    // surfaces as that call's result. The first message is always a job:
+    // the dispatcher enqueues a run's job before any of its events can
+    // route, and Retire only means eviction before ever serving.
+    let (mut first_job, first_respond) = loop {
+        match events.recv() {
+            Ok(routed) => match routed.event {
+                sandbox::RunEvent::Job(msg) => break msg,
+                sandbox::RunEvent::Retire => return,
+                _ => {
+                    debug_assert!(false, "instance event before its first job");
+                }
+            },
+            Err(_) => return, // evicted before ever serving
+        }
     };
     let spec = sandbox::PrefixSpec {
         code: &prefix.code,
@@ -213,7 +222,6 @@ fn instance_main(
         &prefix.globals,
         &prefix.declared_imports,
         (first_job, first_respond),
-        &jobs,
         &events,
         &load,
     );
@@ -838,8 +846,7 @@ impl WarmRegistry {
 fn attachment(inst: &Instance) -> AttachedInstance {
     AttachedInstance {
         id: inst.id,
-        jobs: inst.handle.jobs.clone(),
-        events: inst.handle.events.clone(),
+        msgs: inst.handle.msgs.clone(),
     }
 }
 
@@ -967,7 +974,10 @@ mod tests {
     fn call_via(a: &AttachedInstance, job: CallJob) -> sandbox::CallOutcome {
         let (tx, rx) = crossbeam_channel::bounded(1);
         a.sender()
-            .send((Box::new(job), Some(tx)))
+            .send(sandbox::RoutedEvent::new(
+                0,
+                sandbox::RunEvent::Job((Box::new(job), Some(tx))),
+            ))
             .expect("instance accepts the job");
         rx.recv().expect("instance answers")
     }
@@ -1517,11 +1527,14 @@ mod tests {
         });
         handle
             .sender()
-            .send((job, Some(otx)))
+            .send(sandbox::RoutedEvent::new(
+                token,
+                sandbox::RunEvent::Job((job, Some(otx))),
+            ))
             .expect("instance accepts the job");
         SessionRun {
             token,
-            events: handle.event_sender(),
+            events: handle.sender(),
             outcome: orx,
         }
     }
@@ -2061,7 +2074,7 @@ mod tests {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let feeder = {
             let stop = Arc::clone(&stop);
-            let events = handle.event_sender();
+            let events = handle.sender();
             let token = b.token;
             std::thread::spawn(move || {
                 for _ in 0..600_000 {
@@ -2167,78 +2180,133 @@ mod tests {
     }
 
     #[test]
-    fn a_terminate_that_races_ahead_of_its_job_still_aborts_the_run() {
-        // On the shared event channel a Terminate can be picked up before
-        // the run's job is dispatched (select order between the two queues
-        // is arbitrary). The loop must remember it and answer the job on
-        // arrival — a per-run channel used to hold such events implicitly.
+    fn a_terminate_queued_behind_its_job_lands_at_the_first_boundary() {
+        // One ordered channel (#170): a Terminate can never overtake its
+        // run's job — FIFO delivers the job first, the run starts, and the
+        // abort lands at the next turn boundary as a clean abandon. Queue
+        // both while the loop is inside another run's turn so they are
+        // dequeued back to back.
         sandbox::init_platform();
         let (mut server, client) = UnixStream::pair().unwrap();
         let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
-        // Park the loop on a first run so it is live and selecting.
+        // Park the loop on a first run so the instance is live.
         let first = submit_session_job(
             &handle, 31, "viaTool", vec![TestValue::Number(1.0)],
             sink.clone(), &counter, sandbox::Limits::default(),
         );
         let (_, c1) = read_bridge_call(&mut server);
 
-        // The Terminate for a run whose job has NOT been sent yet: the loop
-        // is parked with an empty jobs queue, so this event is processed
-        // first, deterministically.
-        let token = sandbox::alloc_run_token();
-        handle
-            .event_sender()
-            .send(sandbox::RoutedEvent::new(
-                token,
-                sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-                    message_type: crate::ipc::TsToRustMessageType::Terminate,
-                    payload: terminate_payload(32),
-                }),
-            ))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        // hangBump bumps the counter, then suspends on tool() — so the run
+        // observably STARTS before the queued Terminate reaches it.
+        let b = submit_session_job(
+            &handle, 32, "hangBump", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        b.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+            message_type: crate::ipc::TsToRustMessageType::Terminate,
+            payload: terminate_payload(32),
+        }));
 
-        // Now the job arrives — it must conclude Aborted without running
-        // (the counter export would observe a bump otherwise).
-        let (otx, orx) = crossbeam_channel::bounded(1);
-        let job = Box::new(CallJob {
-            token,
-            code: None,
-            filename: None,
-            limits: sandbox::Limits::default(),
-            globals: vec![crate::ipc::HostGlobalDef::bridge("tool")],
-            io: sandbox::RunIo::Instance { sink: sink.clone() },
-            call_id_counter: Arc::clone(&counter),
-            call: Some(crate::ipc::CallSpec {
-                export_path: "bump".to_string(),
-                args_blob: testval::to_blob(&TestValue::Array(vec![])),
-            }),
-            epilogue: Some(sandbox::EpilogueSpec {
-                run_id: 32,
-                report_heap: false,
-            }),
-            complete: None,
-            ctl_slot: None,
-        });
-        handle.sender().send((job, Some(otx))).unwrap();
-        let out = orx.recv_timeout(Duration::from_secs(5)).expect("job answered");
-        assert!(!out.tainted, "a pre-start abandon must not taint");
+        let out = b.outcome.recv_timeout(Duration::from_secs(5)).expect("job answered");
+        assert!(!out.tainted, "a boundary abandon must not taint");
         assert!(matches!(
             out.result.unwrap_err().error,
             sandbox::RunError::Aborted
         ));
 
-        // The instance is healthy and the aborted run never executed: bump
-        // starts from the untouched counter (first's hangs never bumped).
+        // The instance stayed healthy and the co-resident is untouched; the
+        // aborted run's start turn really ran (its bump is visible).
         first.send(bridge_response_event(31, c1, 10.0));
         let out_first = first.outcome.recv().expect("first run completes");
         assert!(!out_first.tainted);
         let outcome = handle.call(bump_job());
         assert!(!outcome.tainted);
-        assert_eq!(bump_value(&outcome), 1.0, "the abandoned run never ran bump");
+        assert_eq!(
+            bump_value(&outcome),
+            2.0,
+            "hangBump's start turn ran before the queued Terminate landed"
+        );
+    }
+
+    #[test]
+    fn a_terminate_for_a_run_that_never_arrives_is_discarded() {
+        // An event whose token never becomes live is LATE by the channel
+        // invariant (its run concluded); the loop discards it loudly and
+        // stays healthy — nothing is remembered, nothing leaks.
+        sandbox::init_platform();
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let outcome = handle.call(bump_job());
+        assert_eq!(bump_value(&outcome), 1.0);
+
+        handle
+            .sender()
+            .send(sandbox::RoutedEvent::new(
+                sandbox::alloc_run_token(),
+                sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
+                    message_type: crate::ipc::TsToRustMessageType::Terminate,
+                    payload: terminate_payload(99),
+                }),
+            ))
+            .unwrap();
+
+        let outcome = handle.call(bump_job());
+        assert!(!outcome.tainted);
+        assert_eq!(bump_value(&outcome), 2.0, "the stray event left the loop serving");
+    }
+
+    #[test]
+    fn early_frames_of_a_joining_run_are_delivered_not_dropped() {
+        // The #170 regression pin at the loop level: a joining run's job and
+        // its eagerly-pumped frames are queued together while the loop is
+        // busy inside another run's turn. On the merged channel the job is
+        // dequeued first by FIFO, so the pre-queued BridgeResponse below
+        // must settle the run — the two-channel loop dropped such frames
+        // (unknown token) about half the time. Several rounds because the
+        // old failure depended on select order.
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        // One settled probe fixes the call-id sequence: viaTool consumes
+        // exactly one id per run, so round i's call id is base + 1 + i.
+        let probe = submit_session_job(
+            &handle, 99, "viaTool", vec![TestValue::Number(0.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let (_, base) = read_bridge_call(&mut server);
+        probe.send(bridge_response_event(99, base, 1.0));
+        probe.outcome.recv_timeout(Duration::from_secs(5)).expect("probe settles");
+
+        for round in 0..8u32 {
+            // Occupy the loop with a CPU-bound start turn (~100 ms class).
+            let a = submit_session_job(
+                &handle, 200 + round, "busy", vec![TestValue::Number(800_000_000.0)],
+                sink.clone(), &counter, sandbox::Limits::default(),
+            );
+            std::thread::sleep(Duration::from_millis(10));
+
+            // While that turn runs, enqueue the joining run AND the response
+            // to the bridge call its start turn will make.
+            let b = submit_session_job(
+                &handle, 100 + round, "viaTool", vec![TestValue::Number(f64::from(round))],
+                sink.clone(), &counter, sandbox::Limits::default(),
+            );
+            b.send(bridge_response_event(100 + round, base + 1 + round, 7.0));
+
+            let out_b = b
+                .outcome
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the joining run settles — its early frame was delivered, not dropped");
+            assert!(!out_b.tainted);
+            out_b.result.expect("viaTool succeeds");
+            let out_a = a.outcome.recv_timeout(Duration::from_secs(30)).expect("A completes");
+            assert!(!out_a.tainted);
+        }
     }
 
     #[test]
