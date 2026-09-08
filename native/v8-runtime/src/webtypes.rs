@@ -277,7 +277,7 @@ pub fn install_with_streams(
     stream_read: v8::Local<v8::Value>,
     stream_cancel: v8::Local<v8::Value>,
 ) -> Result<(), String> {
-    let mut factory_args = Vec::with_capacity(5);
+    let mut factory_args = Vec::with_capacity(9);
     for (name, ctor) in [
         ("HeadersShell", headers_shell_ctor.map_fn_to()),
         ("RequestShell", request_shell_ctor.map_fn_to()),
@@ -310,6 +310,13 @@ pub fn install_with_streams(
     // Streamed-body natives (or `undefined` in stream-less installs).
     factory_args.push(stream_read);
     factory_args.push(stream_cancel);
+
+    // The construction-time stream-body stamp (context-free, so it is built
+    // here for every install path — prefix validation included).
+    let stamp = v8::Function::builder(crate::v8::stamp_stream_body_callback)
+        .build(scope)
+        .ok_or_else(|| "create stampStreamBody failed".to_string())?;
+    factory_args.push(v8::Local::<v8::Value>::from(stamp));
 
     // The frozen-clock cell (see [`FrozenClock`]). Initialized to the wall
     // clock at context creation, so prefix evaluation runs on a frozen "now"

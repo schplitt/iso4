@@ -5030,7 +5030,9 @@ describe('streaming bodies', () => {
     expect(result.exports.default).toEqual({ before: false, after: true })
   })
 
-  test('a Response with a streamed body cannot be returned to the host (clear error)', async () => {
+  test('a Response with a stream body on the EXPORTS leg fails with a clear error', async () => {
+    // Stream bodies are legal only as a session call's result (#128); the
+    // export path keeps the loud codec diagnostic naming the remedy.
     const result = await runtime.run({
       code: `
         const res = await give()
@@ -5039,12 +5041,10 @@ describe('streaming bodies', () => {
       globals: { give: async () => new Response(patternBytes(256 * 1024)) },
       limits: { maxBridgeCalls: 2 },
     })
-    // Host types keep their loud codec diagnostic: the run fails naming the
-    // remedy instead of silently skipping or delivering a gutted Response.
     expect(result.ok).toBe(false)
     if (result.ok || result.status !== 'failed')
       return
-    expect(result.error.message).toContain('streamed body')
+    expect(result.error.message).toContain('stream body')
   })
 })
 

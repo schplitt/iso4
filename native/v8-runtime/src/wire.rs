@@ -211,9 +211,11 @@ pub struct RunSuccessPayload {
     /// feeds eviction scoring); absent for one-off runs, whose isolate
     /// is already gone.
     pub heap_used_bytes: Option<u64>,
-    /// True when `waitUntil` background work is still running: a final
-    /// `RunComplete` frame follows this Result on the same connection.
-    pub background_pending: bool,
+    /// Post-Result flags: bit 0 = `waitUntil` background work is still
+    /// running, bit 1 = outbound stream bodies are open. Nonzero means a
+    /// final `RunComplete` frame follows this Result on the same
+    /// connection (wire-compatible with the former bool).
+    pub background_flags: u8,
 }
 
 /// Payload for a failed run.
@@ -253,7 +255,8 @@ pub enum RunCompletion {
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
 ///   Optional<u64>  heapUsedBytes   (present for prefix runs)
-///   bool backgroundPending          (a RunComplete frame follows)
+///   u8   backgroundFlags            (bit0 waitUntil, bit1 streams; nonzero
+///                                    = a RunComplete frame follows)
 /// u8    failurePresent  (1 when ok = 0)
 ///   RunErrorPayload  error
 ///   List<String>  stdout
@@ -279,7 +282,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_f64(s.cpu_time_ms, &mut out);
             encode_bridge_call_records(&s.bridge_calls, &mut out);
             encode_optional_u64(s.heap_used_bytes, &mut out);
-            encode_bool(s.background_pending, &mut out);
+            out.push(s.background_flags);
             out.push(0); // Optional<RunFailurePayload> absent
         }
         RunCompletion::Failure(f) => {

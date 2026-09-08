@@ -698,6 +698,144 @@ impl StreamTable {
     }
 }
 
+// ── Outbound (sandbox → host) streamed bodies (#128) ─────────────────────────
+
+/// How long an outbound stream may sit with no host activity (no credit
+/// grant, no cancel) before the runtime drops it (Jakob's ruling: 10 s —
+/// our consumer is in-process JS with no socket to error on abandonment).
+const OUT_STREAM_IDLE_MS: u64 = 10_000;
+
+/// Test hook: a nonzero override shrinks the idle allowance so the
+/// deadline path is testable without 10 s waits.
+#[cfg(test)]
+pub(crate) static OUT_IDLE_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn out_stream_idle_ms() -> u64 {
+    #[cfg(test)]
+    {
+        let v = OUT_IDLE_OVERRIDE_MS.load(Ordering::Relaxed);
+        if v > 0 {
+            return v;
+        }
+    }
+    OUT_STREAM_IDLE_MS
+}
+
+/// Runtime-side state of one outbound streamed body: the guest stream
+/// driving it, the host-granted credit, and the pull in flight.
+struct OutStream {
+    /// The guest `Iso4BodyStream` this stream pulls from.
+    body: v8::Global<v8::Object>,
+    /// Bytes the host still allows in flight. Seeded with the implicit
+    /// initial window (eager production, mirroring the inbound direction).
+    credit: u32,
+    /// A started pull whose promise has not settled yet.
+    pending: Option<v8::Global<v8::Promise>>,
+    /// Unsent remainder of a guest chunk that outgrew the credit/chunk cap.
+    backlog: Vec<u8>,
+    backlog_sent: usize,
+    /// A terminal frame (`StreamEnd`) went out or a cancel arrived; the
+    /// entry only remains so late frames are recognized.
+    done: bool,
+}
+
+/// Per-run registry of outbound streamed bodies — the [`StreamTable`]
+/// pattern with the direction reversed. Armed per run; result serialization
+/// registers into it through the per-thread run pointers.
+pub struct OutStreamTable {
+    slot: RefCell<Option<OutTableState>>,
+}
+
+struct OutTableState {
+    streams: HashMap<u32, OutStream>,
+    next_id: u32,
+    /// Wire identity for outbound `StreamChunk`/`StreamEnd` frames.
+    run_id: u32,
+    sink: Option<ipc::FrameSink>,
+    /// Last host read/cancel — the idle-deadline anchor.
+    last_activity: std::time::Instant,
+}
+
+impl OutStreamTable {
+    fn boxed() -> Box<Self> {
+        Box::new(Self {
+            slot: RefCell::new(None),
+        })
+    }
+}
+
+/// Register a guest stream as an outbound body during RESULT serialization.
+/// Returns the allocated stream id, or `None` when the executing run cannot
+/// stream (no run, table not armed — hold-mode runs, or a leg where stream
+/// bodies are not allowed; the codec turns `None` into its own error).
+pub fn register_out_stream(
+    scope: &mut v8::PinScope,
+    body: v8::Local<v8::Object>,
+) -> Option<u32> {
+    if !RESULT_STREAM_MODE.with(|c| c.get()) {
+        return None;
+    }
+    let token = CURRENT_RUN_TOKEN.with(|c| c.get());
+    if token == 0 {
+        return None;
+    }
+    RUN_TABLE_PTR.with(|c| {
+        let ptr = c.get();
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: set only while the owning instance's turn is live on this
+        // thread (same contract as `register_hydrated_stream`).
+        let table = unsafe { &*ptr };
+        let state = table.state_ptr(token);
+        if state.is_null() {
+            return None;
+        }
+        // SAFETY: entry pointers are valid for the remainder of the turn.
+        let mut slot = unsafe { &*state }.out_streams.slot.borrow_mut();
+        let st = slot.as_mut()?;
+        let id = st.next_id;
+        st.next_id += 1;
+        st.streams.insert(
+            id,
+            OutStream {
+                body: v8::Global::new(scope, body),
+                credit: ipc::STREAM_CREDIT_WINDOW_BYTES,
+                pending: None,
+                backlog: Vec::new(),
+                backlog_sent: 0,
+                done: false,
+            },
+        );
+        Some(id)
+    })
+}
+
+thread_local! {
+    /// Whether the value currently being serialized is a run RESULT on a
+    /// leg that may carry stream bodies (session runs with an epilogue).
+    /// Off for exports, bridge arguments, and hold-mode runs — a stream
+    /// body there keeps the existing cannot-cross error.
+    static RESULT_STREAM_MODE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII enabling [`register_out_stream`] for one serialization.
+struct ResultStreamMode;
+impl ResultStreamMode {
+    fn enter(enabled: bool) -> Option<Self> {
+        if !enabled {
+            return None;
+        }
+        RESULT_STREAM_MODE.with(|c| c.set(true));
+        Some(Self)
+    }
+}
+impl Drop for ResultStreamMode {
+    fn drop(&mut self) {
+        RESULT_STREAM_MODE.with(|c| c.set(false));
+    }
+}
+
 // ── Guest timers (#79) ───────────────────────────────────────────────────────
 
 /// Cap on pending timers per run (workerd's number). The entries live
@@ -861,6 +999,9 @@ struct RunCallState {
     pending: Box<PendingWork>,
     /// Streamed-body registry (armed per run).
     streams: Box<StreamTable>,
+    /// Outbound streamed-body registry (armed per run) — result bodies the
+    /// host reads chunk by chunk (#128).
+    out_streams: Box<OutStreamTable>,
     /// Pending `setTimeout` registrations; dropped with the entry, so a
     /// settled run's timer can never fire into a later run.
     timers: Box<RefCell<TimerTable>>,
@@ -884,6 +1025,7 @@ impl RunCallState {
             })),
             pending: PendingWork::boxed(),
             streams: StreamTable::boxed(),
+            out_streams: OutStreamTable::boxed(),
             timers: TimerTable::boxed(),
             stubs: RefCell::new(HashMap::new()),
         })
@@ -1401,6 +1543,7 @@ fn run_module_inner(
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    let out_streams_ptr: *const OutStreamTable = std::ptr::addr_of!(*entry.out_streams);
     let timers_ptr: *const RefCell<TimerTable> = std::ptr::addr_of!(*entry.timers);
     run_table.runs.borrow_mut().insert(token, entry);
     CURRENT_RUN_TOKEN.with(|c| c.set(token));
@@ -1599,6 +1742,7 @@ fn run_module_inner(
             logs: logs_ptr,
             pending: pending_ptr,
             streams: streams_ptr,
+            out_streams: out_streams_ptr,
             timers: timers_ptr,
             epilogue: take_epilogue_spec(),
             cancel_handle: &cancel_handle,
@@ -1609,6 +1753,7 @@ fn run_module_inner(
     // cleanup: close here too (idempotent), so the host releases its sources
     // and the per-thread table pointer never dangles past the Box.
     close_run_streams(streams_ptr);
+    close_out_streams(out_streams_ptr, "run ended");
     result
 }
 
@@ -1727,6 +1872,8 @@ struct CallPhaseCtx<'a> {
     pending: *const PendingWork,
     /// The run's streamed-body registry — in its table entry.
     streams: *const StreamTable,
+    /// The run's outbound streamed-body registry — in its table entry.
+    out_streams: *const OutStreamTable,
     /// The run's pending timers — in its table entry.
     timers: *const RefCell<TimerTable>,
     /// Per-run identity for the early Result frame; `None` = hold mode.
@@ -1778,16 +1925,24 @@ struct RunState {
     logs: *const RefCell<LogBuffers>,
     pending: *const PendingWork,
     streams: *const StreamTable,
+    out_streams: *const OutStreamTable,
     timers: *const RefCell<TimerTable>,
     phase: RunPhase,
 }
 
-/// Grace bookkeeping — the dissolved `run_grace_phase`.
+/// Post-Result bookkeeping: the `waitUntil` grace part (the dissolved
+/// `run_grace_phase`) and, since #128, the outbound-streaming part — the
+/// phase ends when BOTH are done. Stream state itself lives in the run's
+/// [`OutStreamTable`] entry; this holds the waitUntil side.
 struct GraceState {
     /// The settled run value; `background` is stamped at grace end.
     output: Output,
     grace_start: std::time::Instant,
-    deadline: std::time::Instant,
+    /// The waitUntil wall — `None` for a phase entered only for streaming.
+    deadline: Option<std::time::Instant>,
+    /// The waitUntil part's outcome once decided; the phase outlives it
+    /// while outbound streams are still open.
+    grace_status: Option<GraceStatus>,
     grace_cpu: Arc<CpuBudget>,
     grace_cpu_cap: u32,
     error: Option<(String, String)>,
@@ -1823,31 +1978,14 @@ impl RunState {
     }
 
     /// How long the loop may wait for this run: wall budget while settling
-    /// (None = uncapped), grace budget in grace, or its earliest timer —
-    /// whichever is sooner.
+    /// (None = uncapped), the phase deadlines in grace (waitUntil wall /
+    /// stream idle), or its earliest timer — whichever is sooner.
     fn next_timeout(&self) -> Option<Duration> {
-        let boundary = match &self.phase {
-            RunPhase::Starting | RunPhase::Settling { .. } => {
-                if self.limits.wall_time_ms > 0 {
-                    let budget = Duration::from_millis(self.limits.wall_time_ms as u64);
-                    Some(
-                        budget
-                            .saturating_sub(self.start.elapsed())
-                            .max(Duration::from_millis(1)),
-                    )
-                } else {
-                    None
-                }
-            }
-            RunPhase::Grace(g) => Some(
-                g.deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .max(Duration::from_millis(1)),
-            ),
-        };
+        let now = std::time::Instant::now();
+        let boundary = deadline_instant(self)
+            .map(|at| at.saturating_duration_since(now).max(Duration::from_millis(1)));
         let timer = earliest_timer(self).map(|at| {
-            at.saturating_duration_since(std::time::Instant::now())
-                .max(Duration::from_millis(1))
+            at.saturating_duration_since(now).max(Duration::from_millis(1))
         });
         match (boundary, timer) {
             (Some(b), Some(t)) => Some(b.min(t)),
@@ -2007,7 +2145,7 @@ fn run_call_phase(
             // Nothing can ever deliver an event to this run. `scan` fails
             // a sourceless pending run without timers, so only hold-mode
             // grace gets here.
-            return Ok(finish_grace(&mut rs, GraceStatus::Truncated));
+            return Ok(finish_post_phase(&mut rs));
         }
         let timeout = rs.next_timeout();
         let event = {
@@ -2063,6 +2201,7 @@ fn begin_call(
         logs: ctx.logs,
         pending: ctx.pending,
         streams: ctx.streams,
+        out_streams: ctx.out_streams,
         timers: ctx.timers,
         phase: RunPhase::Starting,
     };
@@ -2096,7 +2235,12 @@ fn handle_loop_event(
             ScanOutcome::Continue => None,
         },
         LoopEvent::DeadlineHit => deadline_hit(isolate, context, facts, rs),
-        LoopEvent::SourceClosed(e) => Some(boundary_close(rs, e)),
+        LoopEvent::SourceClosed(e) => {
+            if matches!(rs.phase, RunPhase::Grace(_)) && out_streams_open(rs) {
+                conn_lost_stream_turn(isolate, context, facts, rs);
+            }
+            Some(boundary_close(rs, e))
+        }
     }
 }
 
@@ -2117,11 +2261,103 @@ fn deadline_hit(
                 ScanOutcome::Continue => continue,
             }
         }
+        if matches!(rs.phase, RunPhase::Grace(_)) {
+            // Two deadlines share the post-Result phase: the stream idle
+            // allowance (a real turn — guest cancel cleanup runs) and the
+            // waitUntil wall (bookkeeping — the phase may stay open for
+            // streams).
+            if out_idle_deadline(rs).is_some_and(|d| d <= now) {
+                match stream_idle_turn(isolate, context, facts, rs) {
+                    ScanOutcome::Finished(result) => return Some(*result),
+                    ScanOutcome::Continue => continue,
+                }
+            }
+            if grace_wall_due(rs, now) {
+                if let Some(output) = conclude_grace_wall(rs) {
+                    return Some(Ok(output));
+                }
+                continue;
+            }
+            return None;
+        }
         if deadline_instant(rs).is_some_and(|b| b <= now) {
             return Some(boundary_deadline(rs));
         }
         return None;
     }
+}
+
+/// Whether the phase's waitUntil wall is due (and still undecided).
+fn grace_wall_due(rs: &RunState, now: std::time::Instant) -> bool {
+    matches!(&rs.phase, RunPhase::Grace(g)
+        if g.grace_status.is_none() && g.deadline.is_some_and(|d| d <= now))
+}
+
+/// The waitUntil wall expired: record the truncation. Returns the finished
+/// Output when nothing else holds the phase open, `None` while outbound
+/// streams still do.
+fn conclude_grace_wall(rs: &mut RunState) -> Option<Output> {
+    if let RunPhase::Grace(g) = &mut rs.phase {
+        g.grace_status = Some(GraceStatus::Truncated);
+    }
+    if out_streams_open(rs) {
+        return None;
+    }
+    Some(finish_post_phase(rs))
+}
+
+/// The stream idle deadline fired: the host neither read nor cancelled for
+/// the whole allowance — cancel every open stream WITH guest cleanup (one
+/// turn; the reader-side `StreamEnd` names the timeout), then run the
+/// normal phase-end scan.
+fn stream_idle_turn(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+) -> ScanOutcome {
+    let _turn = TurnGuard::begin(facts.guard, rs);
+    let _epoch = BudgetEpoch::enter(rs.active_budget());
+
+    v8::scope!(let scope, isolate);
+    let context_local = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context_local);
+
+    crate::webtypes::advance_frozen_clock(scope);
+    CURRENT_RUN_TOKEN.with(|c| c.set(rs.token));
+    RUN_TABLE_PTR.with(|c| c.set(rs.table));
+    install_cped_rider(scope, rs.token);
+
+    v8::tc_scope!(let scope, scope);
+    cancel_all_out_streams(scope, rs, "stream idle timeout");
+    scope.perform_microtask_checkpoint();
+    finish_turn(scope, facts, rs, true)
+}
+
+/// Connection death with outbound streams open: run their guest cleanup
+/// (reason `"connection lost"`) as one turn before the boundary close — the
+/// host is gone, but the guest's `finally`/cancel semantics hold (Q4).
+fn conn_lost_stream_turn(
+    isolate: &mut v8::OwnedIsolate,
+    context: &v8::Global<v8::Context>,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+) {
+    let _turn = TurnGuard::begin(facts.guard, rs);
+    let _epoch = BudgetEpoch::enter(rs.active_budget());
+
+    v8::scope!(let scope, isolate);
+    let context_local = v8::Local::new(scope, context);
+    let scope = &mut v8::ContextScope::new(scope, context_local);
+
+    crate::webtypes::advance_frozen_clock(scope);
+    CURRENT_RUN_TOKEN.with(|c| c.set(rs.token));
+    RUN_TABLE_PTR.with(|c| c.set(rs.table));
+    install_cped_rider(scope, rs.token);
+
+    v8::tc_scope!(let scope, scope);
+    cancel_all_out_streams(scope, rs, "connection lost");
+    scope.perform_microtask_checkpoint();
 }
 
 /// A boundary deadline: wall expiry while suspended is a clean per-run
@@ -2131,7 +2367,7 @@ fn deadline_hit(
 fn boundary_deadline(rs: &mut RunState) -> Result<Output, FailureOutput> {
     match rs.phase {
         RunPhase::Starting | RunPhase::Settling { .. } => Err(rs.fail(RunError::WallTimeout)),
-        RunPhase::Grace(_) => Ok(finish_grace(rs, GraceStatus::Truncated)),
+        RunPhase::Grace(_) => Ok(finish_post_phase(rs)),
     }
 }
 
@@ -2151,7 +2387,7 @@ fn boundary_close(rs: &mut RunState, e: io::Error) -> Result<Output, FailureOutp
                     ));
                 }
             }
-            Ok(finish_grace(rs, GraceStatus::Truncated))
+            Ok(finish_post_phase(rs))
         }
     }
 }
@@ -2165,7 +2401,16 @@ fn deadline_instant(rs: &RunState) -> Option<std::time::Instant> {
     match &rs.phase {
         RunPhase::Starting | RunPhase::Settling { .. } => (rs.limits.wall_time_ms > 0)
             .then(|| rs.start + Duration::from_millis(rs.limits.wall_time_ms as u64)),
-        RunPhase::Grace(g) => Some(g.deadline),
+        RunPhase::Grace(g) => {
+            // The waitUntil wall (while that part is undecided) and the
+            // outbound-stream idle deadline, whichever is sooner.
+            let grace = if g.grace_status.is_none() { g.deadline } else { None };
+            let idle = out_idle_deadline(rs);
+            match (grace, idle) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            }
+        }
     }
 }
 
@@ -2315,6 +2560,22 @@ fn start_turn(
             run_id: rs.epilogue.map(|e| e.run_id).unwrap_or(0),
             sink: rs.sink.clone(),
         });
+    }
+    // Arm the OUTBOUND registry only for runs that can stream a result out:
+    // an epilogue (the early Result carries the handle) and a sink to write
+    // chunks through. Hold-mode runs stay unarmed — registration fails and
+    // the codec reports the existing cannot-cross error.
+    if rs.epilogue.is_some() && rs.sink.is_some() {
+        // SAFETY: `out_streams` points at the run entry's OutStreamTable Box.
+        unsafe {
+            *(*rs.out_streams).slot.borrow_mut() = Some(OutTableState {
+                streams: HashMap::new(),
+                next_id: 1,
+                run_id: rs.epilogue.map(|e| e.run_id).unwrap_or(0),
+                sink: rs.sink.clone(),
+                last_activity: std::time::Instant::now(),
+            });
+        }
     }
 
     v8::tc_scope!(let scope, scope);
@@ -2572,6 +2833,10 @@ fn serialize_call_result(
         .call
         .map(|c| c.export_path.as_str())
         .unwrap_or("<call>");
+    // The RESULT of a session run is the one leg that may carry stream
+    // bodies (#128): the codec registers them in the run's outbound table.
+    // Exports and every host→sandbox leg stay stream-free.
+    let _mode = ResultStreamMode::enter(rs.epilogue.is_some() && rs.sink.is_some());
     blob::serialize_value(scope, value).map_err(|message| {
         let error = match blob::take_codec_error() {
             Some(e) => codec_error_to_run_error(e),
@@ -2711,7 +2976,7 @@ fn frame_turn(
                         "[iso4-v8] Terminate received with malformed payload ({e}) — truncating grace"
                     ),
                 }
-                return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+                return finished(Ok(finish_post_phase(rs)));
             }
             // Graceful abort = direct abandon (E2 amendment to E1 ruling 5):
             // the run simply stops existing. Its continuations are never
@@ -2732,6 +2997,32 @@ fn frame_turn(
         ipc::TsToRustMessageType::StreamChunk | ipc::TsToRustMessageType::StreamEnd => {
             if let Err(e) = deliver_stream_frame(scope, rs.streams, &frame) {
                 return finished(Err(rs.fail(e)));
+            }
+        }
+        ipc::TsToRustMessageType::StreamPull => {
+            // Outbound credit grant: production resumes in this turn's scan.
+            match ipc::parse_stream_pull_payload(&frame.payload) {
+                Ok(pull) => note_out_credit(rs, &pull),
+                Err(e) => {
+                    return finished(Err(rs.fail(RunError::Internal(format!(
+                        "stream pull decode: {e}"
+                    )))));
+                }
+            }
+        }
+        ipc::TsToRustMessageType::StreamCancel => {
+            // The host dropped an outbound stream: guest cleanup runs as
+            // part of this turn (web-streams cancel semantics), never taint.
+            match ipc::parse_stream_cancel_payload(&frame.payload) {
+                Ok(cancel) => {
+                    note_out_activity(rs, cancel.run_id);
+                    cancel_out_stream(scope, rs, cancel.stream_id, &cancel.reason, false);
+                }
+                Err(e) => {
+                    return finished(Err(rs.fail(RunError::Internal(format!(
+                        "stream cancel decode: {e}"
+                    )))));
+                }
             }
         }
         other => {
@@ -2766,7 +3057,7 @@ fn finish_turn(
                     g.error = Some(capped_grace_error("Error".to_string(), msg));
                 }
             }
-            return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+            return finished(Ok(finish_post_phase(rs)));
         }
         return finished(Err(rs.fail(owned_bridge_error(err))));
     }
@@ -2775,7 +3066,7 @@ fn finish_turn(
             // A mid-turn kill during grace: the caller's taint verdict sees
             // the reason cell; end the phase now instead of idling out the
             // wall — the slot frees immediately.
-            return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+            return finished(Ok(finish_post_phase(rs)));
         }
         let error = match r {
             TerminationReason::Wall => RunError::WallTimeout,
@@ -2845,7 +3136,7 @@ fn timer_turn(
                         g.error = Some(capped_grace_error(name, message));
                     }
                 }
-                return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+                return finished(Ok(finish_post_phase(rs)));
             }
             return finished(Err(rs.fail(err)));
         }
@@ -3164,13 +3455,14 @@ fn build_output_and_maybe_grace(
         background: None,
     };
 
-    // ── waitUntil ────────────────────────────────────────────────────────
-    // The value is settled and serialized; if the run registered background
-    // work (and the grace budget allows any), the run's second phase starts:
-    // the Result ships early, the pending set is driven under its own
-    // budgets as further turns, and the outcome travels on a final
-    // RunComplete frame. A run that registered nothing takes none of these
-    // branches.
+    // ── waitUntil / outbound streaming ───────────────────────────────────
+    // The value is settled and serialized. Two things can keep the run
+    // alive past its Result: registered `waitUntil` work (driven under
+    // grace budgets), and outbound stream bodies the serialization just
+    // registered (#128 — the host reads them chunk by chunk). Either one
+    // starts the post-Result phase: the Result ships early with the
+    // matching flags, and a final RunComplete frame ends the run once both
+    // parts are done. A run with neither takes none of these branches.
     // SAFETY: `pending` points at the run entry's PendingWork Box.
     let has_pending = unsafe {
         (*rs.pending)
@@ -3179,7 +3471,9 @@ fn build_output_and_maybe_grace(
             .as_ref()
             .is_some_and(|set| !set.is_empty())
     };
-    if !(has_pending && rs.limits.grace_ms > 0) {
+    let has_grace = has_pending && rs.limits.grace_ms > 0;
+    let has_streams = out_streams_open(rs);
+    if !has_grace && !has_streams {
         return finished(Ok(output));
     }
 
@@ -3249,7 +3543,8 @@ fn build_output_and_maybe_grace(
                     cpu_time_ms: run_cpu_ms,
                     bridge_calls: run_records,
                     heap_used_bytes,
-                    background_pending: true,
+                    background_flags: (u8::from(has_grace))
+                        | (u8::from(has_streams) << 1),
                 }),
             );
             match sink.write(ipc::RustToTsMessageType::Result, payload) {
@@ -3281,7 +3576,15 @@ fn build_output_and_maybe_grace(
     rs.phase = RunPhase::Grace(Box::new(GraceState {
         output,
         grace_start,
-        deadline: grace_start + Duration::from_millis(rs.limits.grace_ms as u64),
+        deadline: has_grace
+            .then(|| grace_start + Duration::from_millis(rs.limits.grace_ms as u64)),
+        // A streaming-only phase has no waitUntil work to drive: the grace
+        // part starts concluded and the phase is held open by the streams.
+        grace_status: if has_grace {
+            None
+        } else {
+            Some(GraceStatus::Settled)
+        },
         grace_cpu: Arc::new(CpuBudget::new()),
         grace_cpu_cap,
         error: None,
@@ -3294,6 +3597,421 @@ fn build_output_and_maybe_grace(
     let _turn = TurnGuard::begin(facts.guard, rs);
     let _epoch = BudgetEpoch::enter(rs.active_budget());
     grace_scan(scope, facts, rs)
+}
+
+/// Whether the run has outbound streams the host may still read.
+fn out_streams_open(rs: &RunState) -> bool {
+    // SAFETY: `out_streams` points into the run's live table entry.
+    unsafe { &*rs.out_streams }
+        .slot
+        .borrow()
+        .as_ref()
+        .is_some_and(|t| t.streams.values().any(|st| !st.done))
+}
+
+/// The idle deadline while outbound streams are open: last host activity
+/// plus the 10 s allowance (Jakob's ruling — an in-process consumer has no
+/// socket to error on abandonment).
+fn out_idle_deadline(rs: &RunState) -> Option<std::time::Instant> {
+    // SAFETY: `out_streams` points into the run's live table entry.
+    let table = unsafe { &*rs.out_streams };
+    let slot = table.slot.borrow();
+    let st = slot.as_ref()?;
+    if st.streams.values().any(|s| !s.done) {
+        Some(st.last_activity + Duration::from_millis(out_stream_idle_ms()))
+    } else {
+        None
+    }
+}
+
+/// Apply a host credit grant to an outbound stream (run id validated like
+/// the inbound direction's frames; unknown or done streams ignore it).
+fn note_out_credit(rs: &RunState, pull: &ipc::StreamPullPayload) {
+    // SAFETY: `out_streams` points into the run's live table entry.
+    let table = unsafe { &*rs.out_streams };
+    let mut slot = table.slot.borrow_mut();
+    let Some(st) = slot.as_mut() else { return };
+    if st.run_id != 0 && pull.run_id != st.run_id {
+        return;
+    }
+    st.last_activity = std::time::Instant::now();
+    if let Some(stream) = st.streams.get_mut(&pull.stream_id) {
+        if !stream.done {
+            stream.credit = stream.credit.saturating_add(pull.credit);
+        }
+    }
+}
+
+/// Note host activity on the run's outbound table (a cancel counts — the
+/// idle deadline measures abandonment, not consumption).
+fn note_out_activity(rs: &RunState, run_id: u32) {
+    // SAFETY: `out_streams` points into the run's live table entry.
+    let table = unsafe { &*rs.out_streams };
+    let mut slot = table.slot.borrow_mut();
+    let Some(st) = slot.as_mut() else { return };
+    if st.run_id != 0 && run_id != st.run_id {
+        return;
+    }
+    st.last_activity = std::time::Instant::now();
+}
+
+/// Best-effort, turn-less termination of every open outbound stream: one
+/// `StreamEnd` error frame each (dead sinks ignored), no guest cleanup —
+/// the truncate/kill/give-up paths, where no cleanup slice runs.
+fn close_out_streams(out_streams: *const OutStreamTable, message: &str) {
+    // SAFETY: `out_streams` points into the run's live table entry.
+    let table = unsafe { &*out_streams };
+    let mut slot = table.slot.borrow_mut();
+    let Some(st) = slot.as_mut() else { return };
+    let run_id = st.run_id;
+    let sink = st.sink.clone();
+    for (id, stream) in st.streams.iter_mut() {
+        if stream.done {
+            continue;
+        }
+        stream.done = true;
+        stream.pending = None;
+        stream.backlog = Vec::new();
+        if let Some(sink) = &sink {
+            let payload = ipc::encode_stream_end_payload(run_id, *id, Some(message));
+            let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+        }
+    }
+}
+
+/// Cancel one outbound stream with GUEST cleanup (web-streams semantics):
+/// invokes the stream's internal cancel path — for an async-iterable body
+/// that is `iterator.return()`, so `finally` blocks run; for a pass-through
+/// it cancels the upstream inbound stream — as part of the current turn,
+/// then marks it done. `notify_host` additionally sends a `StreamEnd`
+/// error frame (the idle deadline / connection paths; a host-initiated
+/// cancel sends nothing back).
+fn cancel_out_stream(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    rs: &RunState,
+    id: u32,
+    reason: &str,
+    notify_host: bool,
+) {
+    let body = {
+        // SAFETY: `out_streams` points into the run's live table entry.
+        let table = unsafe { &*rs.out_streams };
+        let mut slot = table.slot.borrow_mut();
+        let Some(st) = slot.as_mut() else { return };
+        let run_id = st.run_id;
+        let sink = st.sink.clone();
+        let Some(stream) = st.streams.get_mut(&id) else { return };
+        if stream.done {
+            return;
+        }
+        stream.done = true;
+        stream.pending = None;
+        stream.backlog = Vec::new();
+        if notify_host {
+            if let Some(sink) = &sink {
+                let payload = ipc::encode_stream_end_payload(run_id, id, Some(reason));
+                let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+            }
+        }
+        stream.body.clone()
+    };
+    let body_local = v8::Local::new(scope, &body);
+    let Some(name) = v8::String::new(scope, "_cancelSource") else { return };
+    let Some(method) = body_local.get(scope, name.into()) else { return };
+    let Ok(method) = v8::Local::<v8::Function>::try_from(method) else { return };
+    let reason_v8: v8::Local<v8::Value> = match v8::String::new(scope, reason) {
+        Some(r) => r.into(),
+        None => v8::undefined(scope).into(),
+    };
+    if method.call(scope, body_local.into(), &[reason_v8]).is_none() {
+        // Guest cleanup threw (or was killed — the caller's tail sees the
+        // reason cell). A plain throw in cleanup is swallowed: the stream
+        // is already over either way.
+        if !scope.is_execution_terminating() {
+            scope.reset();
+        }
+    }
+}
+
+/// Cancel every open outbound stream with guest cleanup — the idle-deadline
+/// and connection-death paths.
+fn cancel_all_out_streams(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    rs: &RunState,
+    reason: &str,
+) {
+    let ids: Vec<u32> = {
+        // SAFETY: `out_streams` points into the run's live table entry.
+        let table = unsafe { &*rs.out_streams };
+        let slot = table.slot.borrow();
+        match slot.as_ref() {
+            Some(st) => st
+                .streams
+                .iter()
+                .filter(|(_, s)| !s.done)
+                .map(|(id, _)| *id)
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    for id in ids {
+        cancel_out_stream(scope, rs, id, reason, true);
+        if scope.is_execution_terminating() {
+            break;
+        }
+    }
+}
+
+/// Extract a pull result: `Ok(Some(bytes))` for a chunk, `Ok(None)` at EOF,
+/// `Err(message)` for anything a body may not yield.
+fn chunk_from_pull(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Local<v8::Value>,
+) -> Result<Option<Vec<u8>>, String> {
+    if value.is_null_or_undefined() {
+        return Ok(None);
+    }
+    if let Ok(u8s) = v8::Local::<v8::Uint8Array>::try_from(value) {
+        let mut bytes = vec![0u8; u8s.byte_length()];
+        let copied = u8s.copy_contents(&mut bytes);
+        bytes.truncate(copied);
+        return Ok(Some(bytes));
+    }
+    if value.is_string() {
+        let Some(text) = value.to_string(scope) else {
+            return Err("body stream chunk could not be read".to_string());
+        };
+        return Ok(Some(text.to_rust_string_lossy(scope).into_bytes()));
+    }
+    Err("a stream body must yield Uint8Array or string chunks".to_string())
+}
+
+/// Start one pull on the guest stream: calls its `_pull()` and returns the
+/// promise (a non-promise return is wrapped). `Err` carries the message of
+/// a synchronous throw.
+fn start_body_pull<'s>(
+    scope: &mut v8::PinnedRef<'s, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    body: v8::Local<'s, v8::Object>,
+) -> Result<v8::Local<'s, v8::Promise>, String> {
+    let Some(name) = v8::String::new(scope, "_pull") else {
+        return Err("could not intern _pull".to_string());
+    };
+    let Some(method) = body.get(scope, name.into()) else {
+        return Err("body stream has no pull".to_string());
+    };
+    let Ok(method) = v8::Local::<v8::Function>::try_from(method) else {
+        return Err("body stream pull is not callable".to_string());
+    };
+    let Some(result) = method.call(scope, body.into(), &[]) else {
+        if scope.is_execution_terminating() {
+            return Err("terminated".to_string());
+        }
+        let message = scope
+            .exception()
+            .and_then(|e| error_message_from_value(scope, e))
+            .unwrap_or_else(|| "body stream pull failed".to_string());
+        scope.reset();
+        return Err(message);
+    };
+    if let Ok(promise) = v8::Local::<v8::Promise>::try_from(result) {
+        return Ok(promise);
+    }
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        return Err("could not wrap pull result".to_string());
+    };
+    resolver.resolve(scope, result);
+    Ok(resolver.get_promise(scope))
+}
+
+/// A drive pass cap: each round may start pulls whose promises settle
+/// within one checkpoint (a sync-ish source); credit bounds the real work,
+/// this only bounds rounds inside ONE turn.
+const OUT_DRIVE_MAX_ROUNDS: usize = 32;
+
+/// Advance every outbound stream as far as host credit and the guest
+/// sources allow. Guest pulls execute as part of the CURRENT turn (billed
+/// to the phase budgets); a pull suspended on host IO parks until its
+/// promise settles in a later turn, when the scan calls back in here.
+fn drive_out_streams(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    rs: &RunState,
+) {
+    let ids: Vec<u32> = {
+        // SAFETY: `out_streams` points into the run's live table entry.
+        let table = unsafe { &*rs.out_streams };
+        let slot = table.slot.borrow();
+        match slot.as_ref() {
+            Some(st) => st.streams.keys().copied().collect(),
+            None => return,
+        }
+    };
+    if ids.is_empty() {
+        return;
+    }
+    for _ in 0..OUT_DRIVE_MAX_ROUNDS {
+        let mut progressed = false;
+        for &id in &ids {
+            progressed |= drive_out_stream(scope, rs, id);
+            if scope.is_execution_terminating() {
+                return;
+            }
+        }
+        if !progressed {
+            return;
+        }
+        // Settle pulls started this round (async sources resolve on the
+        // microtask queue when their data is already available).
+        scope.perform_microtask_checkpoint();
+        if scope.is_execution_terminating() {
+            return;
+        }
+    }
+}
+
+/// One stream's drive step. Returns whether it made progress (sent bytes,
+/// settled a pull, started one) — the caller checkpoints and loops.
+fn drive_out_stream(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    rs: &RunState,
+    id: u32,
+) -> bool {
+    enum Step {
+        Idle,
+        AwaitPending(v8::Global<v8::Promise>),
+        StartPull(v8::Global<v8::Object>),
+    }
+    /// Flush backlog under credit (no JS) and classify the next step.
+    fn classify(rs: &RunState, id: u32, progressed: &mut bool) -> Step {
+        // SAFETY: `out_streams` points into the run's live table entry.
+        let table = unsafe { &*rs.out_streams };
+        let mut slot = table.slot.borrow_mut();
+        let Some(st) = slot.as_mut() else { return Step::Idle };
+        let run_id = st.run_id;
+        let sink = st.sink.clone();
+        let Some(stream) = st.streams.get_mut(&id) else { return Step::Idle };
+        if stream.done {
+            return Step::Idle;
+        }
+        while stream.credit > 0 && stream.backlog_sent < stream.backlog.len() {
+            let remaining = stream.backlog.len() - stream.backlog_sent;
+            let n = remaining
+                .min(stream.credit as usize)
+                .min(ipc::STREAM_CHUNK_MAX_BYTES as usize);
+            let Some(sink) = &sink else {
+                stream.done = true;
+                return Step::Idle;
+            };
+            let slice = &stream.backlog[stream.backlog_sent..stream.backlog_sent + n];
+            let payload = ipc::encode_stream_chunk_payload(run_id, id, slice);
+            if sink
+                .write(ipc::RustToTsMessageType::StreamChunk, payload)
+                .is_err()
+            {
+                // Dead socket: the connection-loss event ends the phase.
+                stream.done = true;
+                return Step::Idle;
+            }
+            stream.backlog_sent += n;
+            stream.credit -= n as u32;
+            *progressed = true;
+        }
+        if stream.backlog_sent >= stream.backlog.len() && !stream.backlog.is_empty() {
+            stream.backlog = Vec::new();
+            stream.backlog_sent = 0;
+        }
+        if !stream.backlog.is_empty() || stream.credit == 0 {
+            return Step::Idle; // waiting for credit
+        }
+        if let Some(p) = &stream.pending {
+            return Step::AwaitPending(p.clone());
+        }
+        Step::StartPull(stream.body.clone())
+    }
+    /// Conclude a settled pull into the stream (no JS).
+    fn settle(rs: &RunState, id: u32, outcome: Result<Option<Vec<u8>>, String>) {
+        // SAFETY: `out_streams` points into the run's live table entry.
+        let table = unsafe { &*rs.out_streams };
+        let mut slot = table.slot.borrow_mut();
+        let Some(st) = slot.as_mut() else { return };
+        let run_id = st.run_id;
+        let sink = st.sink.clone();
+        let Some(stream) = st.streams.get_mut(&id) else { return };
+        stream.pending = None;
+        match outcome {
+            Ok(Some(bytes)) => {
+                stream.backlog = bytes;
+                stream.backlog_sent = 0;
+            }
+            Ok(None) => {
+                stream.done = true;
+                if let Some(sink) = &sink {
+                    let payload = ipc::encode_stream_end_payload(run_id, id, None);
+                    let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+                }
+            }
+            Err(message) => {
+                stream.done = true;
+                if let Some(sink) = &sink {
+                    let payload = ipc::encode_stream_end_payload(run_id, id, Some(&message));
+                    let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+                }
+            }
+        }
+    }
+
+    let mut progressed = false;
+    loop {
+        match classify(rs, id, &mut progressed) {
+            Step::Idle => return progressed,
+            Step::AwaitPending(p) => {
+                let local = v8::Local::new(scope, &p);
+                match local.state() {
+                    v8::PromiseState::Pending => return progressed,
+                    v8::PromiseState::Fulfilled => {
+                        let value = local.result(scope);
+                        let outcome = chunk_from_pull(scope, value);
+                        settle(rs, id, outcome);
+                        progressed = true;
+                    }
+                    v8::PromiseState::Rejected => {
+                        let rejection = local.result(scope);
+                        let message = error_message_from_value(scope, rejection)
+                            .unwrap_or_else(|| "body stream failed".to_string());
+                        settle(rs, id, Err(message));
+                        progressed = true;
+                    }
+                }
+            }
+            Step::StartPull(body) => {
+                let body_local = v8::Local::new(scope, &body);
+                match start_body_pull(scope, body_local) {
+                    Ok(promise) => {
+                        if scope.is_execution_terminating() {
+                            return progressed;
+                        }
+                        let global = v8::Global::new(scope, promise);
+                        // SAFETY: same table contract as above.
+                        let table = unsafe { &*rs.out_streams };
+                        let mut slot = table.slot.borrow_mut();
+                        if let Some(st) = slot.as_mut() {
+                            if let Some(stream) = st.streams.get_mut(&id) {
+                                stream.pending = Some(global);
+                            }
+                        }
+                        // Let the caller checkpoint before re-checking.
+                        return true;
+                    }
+                    Err(message) => {
+                        if scope.is_execution_terminating() {
+                            return progressed;
+                        }
+                        settle(rs, id, Err(message));
+                        return true;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One grace drain: drive the queue, drop settled promises, note the first
@@ -3309,62 +4027,96 @@ fn grace_scan(
     scope.perform_microtask_checkpoint();
 
     // The grace CPU guard writes the REAL reason cell when it kills a
-    // runaway continuation; end the phase the moment that happened instead
-    // of idling out the wall — the instance is tainted either way, but the
-    // slot frees now.
+    // runaway continuation (or pull); end the phase the moment that
+    // happened instead of idling out the wall — the instance is tainted
+    // either way, but the slot frees now.
     if facts.reason.get().is_some() {
-        return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+        return finished(Ok(finish_post_phase(rs)));
     }
 
-    // SAFETY: `pending` points at the run entry's PendingWork Box.
-    let taken = unsafe { (*rs.pending).slot.borrow_mut().take() };
-    let mut still: Vec<v8::Global<v8::Promise>> = Vec::new();
-    let mut first_error: Option<(String, String)> = None;
-    for g in taken.unwrap_or_default() {
-        let p = v8::Local::new(scope, &g);
-        match p.state() {
-            v8::PromiseState::Pending => still.push(g),
-            v8::PromiseState::Rejected => {
-                if first_error.is_none() {
-                    let rejection = p.result(scope);
-                    first_error = Some(capped_grace_error(
-                        error_name_from_value(scope, rejection)
-                            .unwrap_or_else(|| "Error".to_string()),
-                        error_message_from_value(scope, rejection)
-                            .unwrap_or_else(|| "background work failed".to_string()),
-                    ));
+    // Outbound streams: produce as far as host credit and the guest
+    // sources allow — guest pulls run as part of this turn, under the
+    // phase budgets.
+    drive_out_streams(scope, rs);
+    if facts.reason.get().is_some() {
+        return finished(Ok(finish_post_phase(rs)));
+    }
+
+    // ── The waitUntil part, while undecided ──────────────────────────────
+    let grace_undecided = matches!(&rs.phase, RunPhase::Grace(g) if g.grace_status.is_none());
+    if grace_undecided {
+        // SAFETY: `pending` points at the run entry's PendingWork Box.
+        let taken = unsafe { (*rs.pending).slot.borrow_mut().take() };
+        let mut still: Vec<v8::Global<v8::Promise>> = Vec::new();
+        let mut first_error: Option<(String, String)> = None;
+        for g in taken.unwrap_or_default() {
+            let p = v8::Local::new(scope, &g);
+            match p.state() {
+                v8::PromiseState::Pending => still.push(g),
+                v8::PromiseState::Rejected => {
+                    if first_error.is_none() {
+                        let rejection = p.result(scope);
+                        first_error = Some(capped_grace_error(
+                            error_name_from_value(scope, rejection)
+                                .unwrap_or_else(|| "Error".to_string()),
+                            error_message_from_value(scope, rejection)
+                                .unwrap_or_else(|| "background work failed".to_string()),
+                        ));
+                    }
                 }
+                v8::PromiseState::Fulfilled => {}
             }
-            v8::PromiseState::Fulfilled => {}
+        }
+        let empty = still.is_empty();
+        // Re-arm the slot with whatever is still pending.
+        unsafe { *(*rs.pending).slot.borrow_mut() = Some(still) };
+
+        let grace_ms = rs.limits.grace_ms;
+        let RunPhase::Grace(g) = &mut rs.phase else {
+            unreachable!("grace_scan outside grace");
+        };
+        if g.error.is_none() {
+            g.error = first_error;
+        }
+        if empty {
+            g.grace_status = Some(if g.error.is_some() {
+                GraceStatus::Failed
+            } else {
+                GraceStatus::Settled
+            });
+        } else if g.grace_start.elapsed() >= Duration::from_millis(grace_ms as u64) {
+            g.grace_status = Some(GraceStatus::Truncated);
         }
     }
-    let empty = still.is_empty();
-    // Re-arm the slot with whatever is still pending.
-    unsafe { *(*rs.pending).slot.borrow_mut() = Some(still) };
 
-    let RunPhase::Grace(g) = &mut rs.phase else {
-        unreachable!("grace_scan outside grace");
-    };
-    if g.error.is_none() {
-        g.error = first_error;
-    }
-    if empty {
-        let status = if g.error.is_some() {
-            GraceStatus::Failed
-        } else {
-            GraceStatus::Settled
-        };
-        return finished(Ok(finish_grace(rs, status)));
-    }
-    if g.grace_start.elapsed() >= Duration::from_millis(rs.limits.grace_ms as u64) {
-        return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+    // ── Phase end: both parts done ───────────────────────────────────────
+    let grace_done = matches!(&rs.phase, RunPhase::Grace(g) if g.grace_status.is_some());
+    if grace_done && !out_streams_open(rs) {
+        return finished(Ok(finish_post_phase(rs)));
     }
     if rs.source.is_none() && earliest_timer(rs).is_none() {
-        // No event source, no pending timer: nothing can resolve the
-        // rest.
-        return finished(Ok(finish_grace(rs, GraceStatus::Truncated)));
+        // No event source, no pending timer: nothing can resolve the rest
+        // — waitUntil work or stream credit alike.
+        if let RunPhase::Grace(g) = &mut rs.phase {
+            g.grace_status.get_or_insert(GraceStatus::Truncated);
+        }
+        return finished(Ok(finish_post_phase(rs)));
     }
     ScanOutcome::Continue
+}
+
+/// End the post-Result phase with the waitUntil part's recorded status
+/// (`Truncated` when it never got to decide), closing any streams still
+/// open, best-effort and turn-less — the graceful cancel paths (host
+/// cancel, idle deadline, connection death) ran their guest cleanup
+/// already; this covers truncation, kills, and give-ups.
+fn finish_post_phase(rs: &mut RunState) -> Output {
+    close_out_streams(rs.out_streams, "run ended");
+    let status = match &rs.phase {
+        RunPhase::Grace(g) => g.grace_status.unwrap_or(GraceStatus::Truncated),
+        _ => GraceStatus::Truncated,
+    };
+    finish_grace(rs, status)
 }
 
 /// Close out the grace phase: stamp the report (telemetry diff since the
@@ -3810,6 +4562,7 @@ pub fn run_call_on_core(
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    let out_streams_ptr: *const OutStreamTable = std::ptr::addr_of!(*entry.out_streams);
     let timers_ptr: *const RefCell<TimerTable> = std::ptr::addr_of!(*entry.timers);
     core.run_table.runs.borrow_mut().insert(token, entry);
     CURRENT_RUN_TOKEN.with(|c| c.set(token));
@@ -3874,6 +4627,7 @@ pub fn run_call_on_core(
                 logs: logs_ptr,
                 pending: pending_ptr,
                 streams: streams_ptr,
+                out_streams: out_streams_ptr,
                 timers: timers_ptr,
                 epilogue: take_epilogue_spec(),
                 cancel_handle: &cancel_handle,
@@ -3892,6 +4646,7 @@ pub fn run_call_on_core(
     // reached it. Idempotent. Must happen before the entry is removed — the
     // cancel frames read the entry's sink.
     close_run_streams(streams_ptr);
+    close_out_streams(out_streams_ptr, "run ended");
     // Remove the run's entry: stub Functions sandbox code stashed now fail
     // the token lookup and throw, a between-calls waitUntil throws, and the
     // entry's Globals (resolvers, pending promises) drop here, on the owner
@@ -3979,6 +4734,7 @@ fn conclude_run(
         }
     }
     close_run_streams(live.rs.streams);
+    close_out_streams(live.rs.out_streams, "run ended");
     run_table.runs.borrow_mut().remove(&live.rs.token);
     let outcome = CallOutcome {
         result,
@@ -4136,6 +4892,66 @@ fn sweep_expired_deadlines(
             continue;
         }
         let mut l = live.swap_remove(idx);
+        if matches!(l.rs.phase, RunPhase::Grace(_)) {
+            let now = std::time::Instant::now();
+            if out_idle_deadline(&l.rs).is_some_and(|d| d <= now) {
+                // Stream idle allowance: a real turn (guest cancel cleanup).
+                LAST_CULPRIT_RUN_ID.with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
+                let outcome = {
+                    let facts = RunFacts {
+                        call: l.job.call.as_ref(),
+                        reason: &core.reason,
+                        guard: &core.guard,
+                        cancel_handle: core.guard.handle(),
+                    };
+                    stream_idle_turn(&mut core.isolate, &core.context, &facts, &mut l.rs)
+                };
+                let tainted_now = instance_tainted(core);
+                match outcome {
+                    ScanOutcome::Finished(result) => {
+                        conclude_run(&mut core.isolate, &core.run_table, l, *result, tainted_now);
+                    }
+                    ScanOutcome::Continue => {
+                        if tainted_now {
+                            let failure = l.rs.fail(reason_error(&core.reason));
+                            conclude_run(&mut core.isolate, &core.run_table, l, Err(failure), true);
+                        } else {
+                            if let Some(next) = next_deadline(&l.rs) {
+                                deadlines.push(std::cmp::Reverse((next, token)));
+                            }
+                            live.push(l);
+                        }
+                    }
+                }
+                drain_touched_timers(live, deadlines);
+                if tainted_now {
+                    return true;
+                }
+                continue;
+            }
+            // waitUntil wall: bookkeeping — the phase may stay open for
+            // streams.
+            if grace_wall_due(&l.rs, now) {
+                match conclude_grace_wall(&mut l.rs) {
+                    Some(output) => {
+                        conclude_run(&mut core.isolate, &core.run_table, l, Ok(output), false);
+                    }
+                    None => {
+                        if let Some(next) = next_deadline(&l.rs) {
+                            deadlines.push(std::cmp::Reverse((next, token)));
+                        }
+                        live.push(l);
+                    }
+                }
+                continue;
+            }
+            // Stale entry (activity moved the deadline): requeue.
+            if let Some(next) = next_deadline(&l.rs) {
+                deadlines.push(std::cmp::Reverse((next, token)));
+            }
+            live.push(l);
+            continue;
+        }
         let result = boundary_deadline(&mut l.rs);
         conclude_run(&mut core.isolate, &core.run_table, l, result, false);
     }
@@ -4483,6 +5299,7 @@ fn dispatch_job(
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
+    let out_streams_ptr: *const OutStreamTable = std::ptr::addr_of!(*entry.out_streams);
     let timers_ptr: *const RefCell<TimerTable> = std::ptr::addr_of!(*entry.timers);
     core.run_table.runs.borrow_mut().insert(token, entry);
     RUN_TABLE_PTR.with(|c| c.set(std::ptr::addr_of!(*core.run_table)));
@@ -4533,6 +5350,7 @@ fn dispatch_job(
                 logs: logs_ptr,
                 pending: pending_ptr,
                 streams: streams_ptr,
+                out_streams: out_streams_ptr,
                 timers: timers_ptr,
                 epilogue: job.epilogue,
                 cancel_handle: &cancel_handle,
@@ -4577,6 +5395,7 @@ fn dispatch_job(
                     logs: logs_ptr,
                     pending: pending_ptr,
                     streams: streams_ptr,
+                out_streams: out_streams_ptr,
                     timers: timers_ptr,
                     phase: RunPhase::Starting,
                 },
@@ -6965,6 +7784,11 @@ const ISO4_RUNTIME_MODULE_SRC: &str =
 /// serialize a stream back to the host.
 const BODY_STREAM_ID_KEY: &str = "iso4::bodyStreamId";
 
+/// Private marker stamped on EVERY `Iso4BodyStream` at construction (the JS
+/// constructor calls the `stampStreamBody` native), so the codec can
+/// recognize a stream body without consulting guest-mutable state.
+const STREAM_BODY_MARK_KEY: &str = "iso4::streamBody";
+
 fn body_stream_private<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
@@ -6983,6 +7807,36 @@ pub fn body_stream_id_of(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) 
         return None;
     }
     stamped.uint32_value(scope)
+}
+
+/// Whether `value` is a guest body stream (`Iso4BodyStream`), by its
+/// construction-time private stamp — never `instanceof` or duck typing.
+pub fn is_stream_body(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> bool {
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(value) else {
+        return false;
+    };
+    let Some(key) = body_stream_private(scope, STREAM_BODY_MARK_KEY) else {
+        return false;
+    };
+    obj.get_private(scope, key).is_some_and(|v| v.is_true())
+}
+
+/// `stampStreamBody(obj)` — native handed to the web runtime; the
+/// `Iso4BodyStream` constructor stamps every instance with the private
+/// marker [`is_stream_body`] checks.
+pub(crate) fn stamp_stream_body_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return;
+    };
+    let Some(key) = body_stream_private(scope, STREAM_BODY_MARK_KEY) else {
+        return;
+    };
+    let yes = v8::Boolean::new(scope, true);
+    obj.set_private(scope, key, yes.into());
 }
 
 /// Build the sandbox-side body-stream object for a hydrated stream handle:
