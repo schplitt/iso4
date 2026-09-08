@@ -71,6 +71,7 @@ export interface PrefixCallOptions<G extends HostGlobals, M extends Imports> ext
   imports?: RebindImports<M>;
   limits?: ResourceLimits;
   signal?: AbortSignal;
+  hardAbortSignal?: AbortSignal;
 }
 export interface PrefixRunOptions<G extends HostGlobals, M extends Imports> {
   code: string;
@@ -78,6 +79,7 @@ export interface PrefixRunOptions<G extends HostGlobals, M extends Imports> {
   imports?: RebindImports<M>;
   limits?: ResourceLimits;
   signal?: AbortSignal;
+  hardAbortSignal?: AbortSignal;
   filename?: string;
 }
 export interface ReadExportsOptions {
@@ -128,6 +130,7 @@ export interface RunOptions {
   globals?: HostGlobals;
   imports?: Imports;
   signal?: AbortSignal;
+  hardAbortSignal?: AbortSignal;
   filename?: string;
 }
 export interface RunSuccess {

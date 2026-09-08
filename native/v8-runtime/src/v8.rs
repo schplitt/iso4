@@ -88,16 +88,20 @@ pub struct Limits {
     pub grace_ms: u32,
 }
 
-/// Termination reason set by the first limit enforcer to fire.
+/// Termination reason set by the first enforcer to fire — a limit guard, or
+/// a hard abort's mid-turn kill ([`GuardCtl::abort_executing`]).
 ///
 /// Stored in a [`ReasonCell`] - first write wins, subsequent writes are
 /// no-ops. Absence of a fired guard is represented naturally by
-/// `ReasonCell::get()` returning `None`.
+/// `ReasonCell::get()` returning `None`. The kill writes its reason BEFORE
+/// `terminate_execution`, so detection never rides on V8's transient
+/// terminate flag (which a microtask checkpoint can consume silently).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TerminationReason {
     Wall,
     Cpu,
     Memory,
+    Abort,
 }
 
 /// First-writer-wins slot for the run's termination reason, shared between
@@ -2387,8 +2391,9 @@ fn start_turn(
                     Some(TerminationReason::Wall) => RunError::WallTimeout,
                     Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                     Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                    // A terminate with no reason is a routed mid-turn abort
-                    // (`GuardCtl::abort_executing`) — E1 ruling 5's fallback.
+                    // A hard abort's mid-turn kill (`GuardCtl::abort_executing`).
+                    Some(TerminationReason::Abort) => RunError::Aborted,
+                    // Belt-and-suspenders: a terminate with no reason at all.
                     None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
                     None => RunError::RuntimeError(Box::new(RuntimeErrorData {
                         name: exception_name(scope),
@@ -2504,7 +2509,8 @@ fn invoke_requested_call(
                 Some(TerminationReason::Wall) => RunError::WallTimeout,
                 Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                 Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                // A terminate with no reason is a routed mid-turn abort.
+                // A hard abort's mid-turn kill.
+                Some(TerminationReason::Abort) => RunError::Aborted,
                 None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
                 None => match scope.exception() {
                     Some(exception) => runtime_error_from_value(scope, exception),
@@ -2689,11 +2695,16 @@ fn frame_turn(
             }
         }
         ipc::TsToRustMessageType::Terminate => {
+            // Mode is irrelevant here: a Terminate frame that reached the
+            // loop is by definition landing at a turn boundary, where soft
+            // and hard mean the same clean abandon (hard's extra power —
+            // the mid-turn kill — was already applied by the demux, or
+            // there was nothing to kill).
             if in_grace {
                 // A host Terminate mid-grace (abort during the epilogue):
                 // truncate the phase cleanly — the value already shipped.
                 match ipc::parse_terminate_payload(&frame.payload) {
-                    Ok(run_id) => eprintln!(
+                    Ok((run_id, _)) => eprintln!(
                         "[iso4-v8] Terminate received for run {run_id} — truncating grace"
                     ),
                     Err(e) => eprintln!(
@@ -2709,7 +2720,7 @@ fn frame_turn(
             // co-resident runs are unaffected. The failure carries the real
             // telemetry collected so far.
             match ipc::parse_terminate_payload(&frame.payload) {
-                Ok(run_id) => {
+                Ok((run_id, _)) => {
                     eprintln!("[iso4-v8] Terminate received for run {run_id} — abandoning")
                 }
                 Err(e) => eprintln!(
@@ -2770,6 +2781,7 @@ fn finish_turn(
             TerminationReason::Wall => RunError::WallTimeout,
             TerminationReason::Cpu => RunError::CpuTimeout,
             TerminationReason::Memory => RunError::MemoryLimit,
+            TerminationReason::Abort => RunError::Aborted,
         };
         return finished(Err(rs.fail(error)));
     }
@@ -2878,6 +2890,7 @@ fn scan(
                         Some(TerminationReason::Wall) => RunError::WallTimeout,
                         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                        Some(TerminationReason::Abort) => RunError::Aborted,
                         None => {
                             if root_is_call_result {
                                 let path = facts
@@ -3184,15 +3197,20 @@ fn build_output_and_maybe_grace(
         return finished(Err(rs.fail(RunError::Aborted)));
     }
 
-    // A guard may have fired in the microsecond between the settled-value
-    // check above and the clear. The whole window is Rust bookkeeping — no
-    // JS ran, and the terminate is cancelled before any could — so nothing
-    // was interrupted: clear the reason (this run's guard was the only one
-    // armed) and return the clean success without grace, instead of letting
-    // the stale reason truncate grace instantly and name a successful run
-    // as an instance-reset culprit.
-    if facts.reason.get().is_some() {
+    // A guard (or a hard abort's kill) may have fired in the microsecond
+    // between the settled-value check above and the clear. The whole window
+    // is Rust bookkeeping — no JS ran, and the terminate is cancelled
+    // before any could — so nothing was interrupted: clear the reason
+    // (this run's guard was the only one armed). A raced ABORT is honored
+    // as a boundary abandon (silently un-aborting the run would be wrong);
+    // a raced limit fire returns the clean success without grace, instead
+    // of letting the stale reason truncate grace instantly and name a
+    // successful run as an instance-reset culprit.
+    if let Some(r) = facts.reason.get() {
         facts.reason.reset();
+        if r == TerminationReason::Abort {
+            return finished(Err(rs.fail(RunError::Aborted)));
+        }
         return finished(Ok(output));
     }
 
@@ -4045,7 +4063,7 @@ fn reason_error(reason: &ReasonCell) -> RunError {
         Some(TerminationReason::Wall) => RunError::WallTimeout,
         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
-        None => RunError::Aborted,
+        Some(TerminationReason::Abort) | None => RunError::Aborted,
     }
 }
 
@@ -4608,7 +4626,7 @@ fn taint_sweep(
         Some(TerminationReason::Cpu) => ResetCause::Cpu,
         Some(TerminationReason::Memory) => ResetCause::Memory,
         Some(TerminationReason::Wall) => ResetCause::Wall,
-        None => ResetCause::Abort,
+        Some(TerminationReason::Abort) | None => ResetCause::Abort,
     };
     // The culprit was concluded by the caller before the sweep; its wire id
     // travels via the guard's last executing turn... the loop tracks it as
@@ -5096,6 +5114,7 @@ fn termination_or(reason: &ReasonCell, fallback: RunError) -> RunError {
         Some(TerminationReason::Wall) => RunError::WallTimeout,
         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        Some(TerminationReason::Abort) => RunError::Aborted,
         None => fallback,
     }
 }
@@ -5655,14 +5674,21 @@ pub struct GuardCtl {
 }
 
 impl GuardCtl {
-    /// Terminate execution iff `token`'s turn is executing right now.
-    /// Serialized with turn exit under the target lock: a `true` return
-    /// means the kill landed mid-turn (the taint path); `false` means the
-    /// run is between turns and the routed Terminate frame will abandon it
-    /// cleanly.
+    /// Terminate execution iff `token`'s turn is executing right now — the
+    /// HARD abort's mid-turn kill (soft aborts never call this: they ride
+    /// the routed frame to the turn boundary). Serialized with turn exit
+    /// under the target lock: a `true` return means the kill landed
+    /// mid-turn (the taint path); `false` means the run is between turns
+    /// and the routed Terminate frame will abandon it cleanly.
+    ///
+    /// The reason is recorded BEFORE the terminate so the turn end detects
+    /// the kill deterministically — V8's terminate flag alone is unreliable
+    /// (a microtask checkpoint consumes it without surfacing anything,
+    /// which used to leave the aborted run parked forever).
     pub fn abort_executing(&self, token: u64) -> bool {
         let _lock = self.shared.target.lock().unwrap_or_else(|p| p.into_inner());
         if self.shared.executing.load(Ordering::Relaxed) == token {
+            self.shared.reason.set(TerminationReason::Abort);
             self.shared.handle.terminate_execution();
             true
         } else {
@@ -10663,12 +10689,10 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::Terminate,
-                    &7u32.to_be_bytes(),
-                )
-                .unwrap();
+                let mut payload = 7u32.to_be_bytes().to_vec();
+                payload.push(0); // soft
+                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::Terminate, &payload)
+                    .unwrap();
             },
         );
         h.join().unwrap();

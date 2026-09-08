@@ -964,7 +964,7 @@ direction. Both tables start at `0x01`.
 | `0x04` | `PrefixRun`      | Execute against a prepared prefix (served by a warm instance, §13.2.1) |
 | `0x05` | `DisposePrefix`  | Drop a stored prefix and its instances                                 |
 | `0x06` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                                      |
-| `0x07` | `Terminate`      | Abort a running run; Rust replies with an `ERR_ABORTED` result (§14.7) |
+| `0x07` | `Terminate`      | Abort a run — soft (turn-boundary abandon) or hard (mid-turn kill) by mode byte; Rust replies with an `ERR_ABORTED` result (§14.7) |
 | `0x08` | `Stats`          | Ask for a registry snapshot (empty payload)                            |
 
 Next free TS → Rust byte: `0x09`.
@@ -1905,9 +1905,11 @@ executing**: a fired guard (CPU, heap, or a wall deadline hitting mid-turn)
 or a forced terminate — `terminate_execution` rips arbitrary mid-execution
 state, so prefix coherence is unprovable afterwards. Everything that ends a
 run **between** turns is a clean per-run failure and does NOT taint: a
-suspended run's wall expiry, its connection dying, or an abort (which simply
-abandons the run — its continuations never execute again). Ordinary uncaught
-exceptions are clean completions. When a reset does happen, the interrupted
+suspended run's wall expiry, its connection dying, or an abort — soft aborts
+land at turn boundaries by construction (§14.7) and simply abandon the run,
+its continuations never execute again; only a HARD abort's mid-turn kill is
+a forced terminate and taints. Ordinary uncaught exceptions are clean
+completions. When a reset does happen, the interrupted
 run fails with its own classified error and every co-resident run in flight
 fails with `ERR_INSTANCE_RESET` (cause class + culprit run id). The next
 call pays a cold start; never reuse a tainted instance; never evict a
@@ -2226,51 +2228,61 @@ This is a deliberate limitation — callbacks across the boundary would require
 a callback-handle protocol symmetric to callable return values. The same Phase
 11 work that adds callable return values will enable function arguments too.
 
-### 14.7 In-flight run abort via `AbortSignal`
+### 14.7 In-flight run abort: soft (`signal`) and hard (`hardAbortSignal`)
 
-`run({ signal })` and `prefix.run({ signal })` honor an `AbortSignal` that
-fires **at any point during a run**, not just at entry. A pre-aborted signal
-short-circuits to `ERR_ABORTED` before any frame is sent; an abort that lands
-mid-run stops the run promptly and, wherever possible, **gracefully** — with a
-real result frame from Rust rather than a synthesized one.
+Every run entry point honors two abort signals that fire **at any point
+during a run**, not just at entry. A signal already aborted at entry
+short-circuits to `ERR_ABORTED` before any frame is sent; while queued,
+either signal dequeues the caller.
 
-Graceful mechanism:
+**Soft abort (`signal` — the default).** On abort the client writes a
+`Terminate` frame (runId + mode `0`) and keeps the connection routing. The
+runtime delivers it to the run like any other event, so it lands at a turn
+boundary: a **suspended** run (awaiting a bridge response — the
+durable-isolates case) is abandoned on the spot; a run whose turn is
+**executing** finishes that turn first and is abandoned when it yields.
+Abandonment means the run simply stops existing — its continuations never
+execute again, no guest code runs (no `catch`/`finally`), nothing is ever
+interrupted mid-JS — so the warm instance is NOT tainted, keeps its state,
+and co-resident runs are untouched. The `Result` is a real `ERR_ABORTED`
+carrying `durationMs`, `cpuTimeMs`, and the bridge records collected so
+far. The one thing a soft abort cannot reach is a synchronous stretch that
+never yields: with no `cpuTimeMs` cap such a turn runs until a hard abort
+or dispose (documented in `internal/LIMITATIONS.md` and on the option's
+JSDoc). No fallback timer is armed — an unanswered soft abort is a
+legitimate state, not a wedged runtime.
 
-1. **Send `Terminate`**: `drainUntilResult` subscribes to the signal. On abort
-   it writes a `Terminate` frame (carrying the `runId`) and keeps draining,
-   leaving the socket open.
-2. **Rust aborts and reports** — two shapes, decided by the session demux:
-   a run **suspended** (awaiting a bridge response — the durable-isolates
-   case) is simply **abandoned**: its continuations never execute again, no
-   guest code runs (no `catch`/`finally`), nothing is interrupted mid-JS, so
-   the warm instance is NOT tainted and keeps serving with its state. A run
-   whose own turn is **executing** (a CPU-bound spin) is terminated
-   mid-turn via the instance guard's cross-thread face — that IS a mid-JS
-   interruption, so the instance is reset (co-residents get
-   `ERR_INSTANCE_RESET`). Both shapes return an `ERR_ABORTED` result
-   carrying the real `durationMs`, `cpuTimeMs`, and bridge records.
-3. **Remap and reuse**: that result flows back through `drainFrames`; `index.ts`
-   sees the aborted signal + `ERR_ABORTED` code and remaps it to
-   `status: 'aborted'` with the abort `reason`, keeping the telemetry. The
-   connection stays healthy and is **returned to the pool** — no reconnect.
-4. **Drop the late response**: an orphaned bridge handler that resolves *after*
-   the abort writes its `BridgeResponse` onto the (reused) connection, where it
-   is discarded — the demux finds no route for the finished run, and the
-   monotonic per-connection call-ID counter guarantees a stale callId never
-   matches a later run's resolver. The sandbox therefore never observes a
-   return value for the call that was in flight when the abort landed, so
-   `controller.abort()` from inside a bridge handler is a spoof-proof way to
-   stop a run.
+**Hard abort (`hardAbortSignal` — the opt-in escalation).** Mode `1`. The
+session demux additionally checks whether the target's own turn is
+executing right now; if so it records the kill in the instance's reason
+cell (deterministic — V8's transient terminate flag alone is not: a
+microtask checkpoint consumes it silently, which used to leave the run
+parked forever) and terminates the executing JS. That IS a mid-JS
+interruption: the culprit's `Result` is `ERR_ABORTED` and the instance is
+reset — co-residents fail with `ERR_INSTANCE_RESET` (cause `abort`, the
+culprit's run id). A hard abort of a queued or suspended run degrades to
+the same clean abandon as soft, so firing it is never worse than a soft
+abort. Escalation policy belongs to the caller: fire `signal`, wait as long
+as you like, then fire `hardAbortSignal`.
 
-**Fallback (wedged-runtime caveat)**: the mid-turn kill above means a
-CPU-bound run no longer needs the teardown path — the demux consumes the
-`Terminate` and terminates the executing turn directly. The TS fallback
-remains as a last resort for a runtime that cannot answer at all (wedged
-process, dead demux): if no result arrives within `TERMINATE_GRACE_MS`
-(~100 ms), TS closes the frame reader and destroys the socket. The `run()`
-promise resolves as aborted immediately with synthesized zeros, and the
-connection is marked unusable and dropped by the connection registry —
-capacity lives in the slot pool, so the next caller opens a fresh one.
+**Remap and reuse**: the `ERR_ABORTED` result flows back through the
+router; `index.ts` sees a fired signal + the code and remaps it to
+`status: 'aborted'` with the abort `reason`, keeping the telemetry. The
+connection stays healthy and keeps serving — no reconnect. An orphaned
+bridge handler that resolves *after* the abort writes its `BridgeResponse`
+onto the (reused) connection, where it is discarded — the demux finds no
+route for the finished run, and the monotonic per-connection call-ID
+counter guarantees a stale callId never matches a later run's resolver. So
+`controller.abort()` from inside a bridge handler is a spoof-proof way to
+stop a run.
+
+**Fallback (wedged-runtime caveat, hard aborts only)**: a hard abort always
+answers promptly, so if no result arrives within `TERMINATE_GRACE_MS`
+(~100 ms) the runtime cannot answer at all (wedged process, dead demux): TS
+closes the frame reader and destroys the socket. The `run()` promise
+resolves as aborted immediately with synthesized zeros, and the connection
+is marked unusable and dropped by the connection registry — capacity lives
+in the slot pool, so the next caller opens a fresh one.
 
 The `run()` promise resolves with `status: 'aborted'` (see §5.2) in all cases —
 carrying the value passed to `abort(reason)`, and retaining `error.code:

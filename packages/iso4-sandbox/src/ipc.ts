@@ -1118,13 +1118,16 @@ export function encodeDisposePrefixPayload(prefixId: string): Buffer {
 // ── TerminatePayload ────────────────────────────────────────────────────────
 
 /**
- * Encode a `Terminate` payload — just the RunId (u32) of the run to stop.
- * Sent when an `AbortSignal` fires mid-run so Rust can gracefully abort the
- * run and reply with a real `ERR_ABORTED` Result (see client.ts).
+ * Encode a `Terminate` payload: the RunId (u32) of the run to stop plus a
+ * mode byte. Soft (`0`, the default abort) abandons the run at its next
+ * turn boundary — nothing is interrupted mid-execution, the instance
+ * survives. Hard (`1`, opt-in via `hardAbortSignal`) interrupts executing
+ * JS immediately; landing mid-turn costs the instance (see client.ts).
  * @param runId
+ * @param hard
  */
-export function encodeTerminatePayload(runId: number): Buffer {
-  return new PayloadWriter().writeU32(runId).toBuffer()
+export function encodeTerminatePayload(runId: number, hard: boolean): Buffer {
+  return new PayloadWriter().writeU32(runId).writeU8(hard ? 1 : 0).toBuffer()
 }
 
 // ── BridgeCall decoder (Rust → TS) ───────────────────────────────────────────

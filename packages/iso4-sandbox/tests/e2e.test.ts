@@ -1937,7 +1937,9 @@ describe('AbortSignal cancellation', () => {
     })
   })
 
-  test('signal aborted during a CPU-bound loop produces ERR_ABORTED without waiting for wallTimeMs', async () => {
+  test('hardAbortSignal stops a CPU-bound loop promptly; plain signal cannot reach it', async () => {
+    // A synchronous spin never yields, so a SOFT abort (plain `signal`) has
+    // no boundary to land on — only the hard abort interrupts it.
     const controller = new AbortController()
     setTimeout(() => controller.abort(), 100)
     const start = Date.now()
@@ -1946,14 +1948,122 @@ describe('AbortSignal cancellation', () => {
       // prompt exit is via the abort.
       code: 'while (true) {}',
       limits: { cpuTimeMs: 30_000, wallTimeMs: 30_000 },
-      signal: controller.signal,
+      hardAbortSignal: controller.signal,
     })
     expect(Date.now() - start).toBeLessThan(2_000)
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_ABORTED')
+    expect(result.status).toBe('aborted')
   }, 10_000)
+
+  test('soft abort of a spin lands only when the run\'s own CPU cap ends the turn', async () => {
+    // The documented soft-abort corner: code that never yields ignores the
+    // soft abort; the run's own cpuTimeMs concludes it (as a CPU timeout —
+    // the abort never landed), and nothing hangs or tears down.
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 50)
+    const result = await runtime.run({
+      code: 'while (true) {}',
+      limits: { cpuTimeMs: 400, wallTimeMs: 30_000 },
+      signal: controller.signal,
+    })
+    expect(result.status).toBe('failed')
+    if (result.status !== 'failed')
+      return
+    expect(result.error.code).toBe('ERR_CPU_TIMEOUT')
+  }, 10_000)
+
+  test('soft abort during a CPU turn on a warm instance abandons at the boundary; co-resident and instance survive', async () => {
+    await using prefix = await runtime.prepare({
+      code: `
+        export async function burnThenHang() {
+          await tool(1)
+          let x = 1
+          for (let i = 0; i < 80_000_000; i++) x = (x * 31 + i) | 0
+          await new Promise(() => {})
+          return x
+        }
+        export async function idle() { return await tool(2) }
+        export function quick() { return 7 }
+      `,
+      globals: {
+        tool: {
+          kind: 'bridge' as const,
+          handler: async (mode: unknown) => {
+            await new Promise((resolve) => {
+              setTimeout(resolve, mode === 2 ? 1_500 : 100)
+            })
+            return mode
+          },
+        },
+      },
+    })
+
+    // Co-resident suspended on a slow bridge call across the abort window.
+    const coResident = prefix.call({ export: 'idle' })
+
+    const controller = new AbortController()
+    // Fires ~50 ms after the tool response — inside the burn continuation.
+    setTimeout(() => controller.abort(), 150)
+    const aborted = await prefix.call({
+      export: 'burnThenHang',
+      signal: controller.signal,
+      limits: { cpuTimeMs: 10_000, wallTimeMs: 20_000 },
+    })
+    expect(aborted.status).toBe('aborted')
+
+    // The soft abort never interrupted mid-execution: the co-resident is
+    // untouched and the warm instance keeps serving.
+    const co = await coResident
+    expect(co.ok).toBe(true)
+    const after = await prefix.call({ export: 'quick' })
+    expect(after.ok).toBe(true)
+  }, 20_000)
+
+  test('hard abort mid-execution resets co-residents with cause "abort" and the culprit run id', async () => {
+    await using prefix = await runtime.prepare({
+      code: `
+        export async function spinAfterTool() { await tool(1); for (;;) {} }
+        export async function idle() { return await tool(2) }
+        export function quick() { return 1 }
+      `,
+      globals: {
+        tool: {
+          kind: 'bridge' as const,
+          handler: async (mode: unknown) => {
+            await new Promise((resolve) => {
+              setTimeout(resolve, mode === 2 ? 5_000 : 100)
+            })
+            return mode
+          },
+        },
+      },
+    })
+
+    // Seed the prefix's demand averages with cheap calls so the two
+    // concurrent runs below JOIN one instance instead of spawning two.
+    await prefix.call({ export: 'quick' })
+    await prefix.call({ export: 'quick' })
+
+    // Co-resident suspended on a slow bridge call across the kill.
+    const coResident = prefix.call({ export: 'idle' })
+
+    const controller = new AbortController()
+    // Fires while the continuation after the tool response spins.
+    setTimeout(() => controller.abort(), 400)
+    const aborted = await prefix.call({
+      export: 'spinAfterTool',
+      hardAbortSignal: controller.signal,
+      limits: { cpuTimeMs: 30_000, wallTimeMs: 30_000 },
+    })
+    expect(aborted.status).toBe('aborted')
+
+    const co = await coResident
+    expect(co.status).toBe('failed')
+    if (co.status !== 'failed')
+      return
+    expect(co.error.code).toBe('ERR_INSTANCE_RESET')
+    expect(co.error.resetCause).toBe('abort')
+    expect(co.error.culpritRunId).toBeTypeOf('number')
+  }, 20_000)
 
   test('signal aborted on one run does not affect a subsequent run', async () => {
     const controller = new AbortController()

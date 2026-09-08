@@ -1603,13 +1603,32 @@ pub fn parse_dispose_prefix_payload(payload: &[u8]) -> io::Result<String> {
     Ok(id)
 }
 
-/// Parse the payload bytes of a `Terminate` frame.
-/// Payload is a single `RunId` (`u32`, big-endian) identifying the run to stop.
-pub fn parse_terminate_payload(payload: &[u8]) -> io::Result<u32> {
+/// Parse the payload bytes of a `Terminate` frame:
+/// `u32 runId, u8 mode` (`0` = soft — abandon at the run's next turn
+/// boundary; `1` = hard — interrupt executing JS immediately, tainting the
+/// instance when it lands mid-turn).
+pub fn parse_terminate_payload(payload: &[u8]) -> io::Result<(u32, TerminateMode)> {
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
+    let mode = match r.read_u8()? {
+        0 => TerminateMode::Soft,
+        1 => TerminateMode::Hard,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown Terminate mode {other}"),
+            ));
+        }
+    };
     r.assert_done()?;
-    Ok(run_id)
+    Ok((run_id, mode))
+}
+
+/// How a `Terminate` stops its run — see [`parse_terminate_payload`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TerminateMode {
+    Soft = 0,
+    Hard = 1,
 }
 
 /// Convert a raw type byte into a known TS->Rust message type.
@@ -2661,15 +2680,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_terminate_payload_reads_run_id() {
-        let payload = 42u32.to_be_bytes();
-        assert_eq!(parse_terminate_payload(&payload).unwrap(), 42);
+    fn parse_terminate_payload_reads_run_id_and_mode() {
+        let mut payload = 42u32.to_be_bytes().to_vec();
+        payload.push(0);
+        assert_eq!(
+            parse_terminate_payload(&payload).unwrap(),
+            (42, TerminateMode::Soft)
+        );
+        let mut payload = 7u32.to_be_bytes().to_vec();
+        payload.push(1);
+        assert_eq!(
+            parse_terminate_payload(&payload).unwrap(),
+            (7, TerminateMode::Hard)
+        );
     }
 
     #[test]
-    fn parse_terminate_payload_rejects_trailing_bytes() {
+    fn parse_terminate_payload_rejects_missing_mode_unknown_mode_and_trailing_bytes() {
+        // The bare-runId v0 shape is no longer valid.
+        let payload = 1u32.to_be_bytes();
+        assert_eq!(
+            parse_terminate_payload(&payload).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof,
+        );
         let mut payload = 1u32.to_be_bytes().to_vec();
-        payload.push(0xff);
+        payload.push(2); // unknown mode
+        assert_eq!(
+            parse_terminate_payload(&payload).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+        let mut payload = 1u32.to_be_bytes().to_vec();
+        payload.extend([0, 0xff]); // trailing byte
         assert_eq!(
             parse_terminate_payload(&payload).unwrap_err().kind(),
             io::ErrorKind::InvalidData,
