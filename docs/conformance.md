@@ -54,8 +54,35 @@ its console through a `ConsoleDelegate` and iso4 registers none.
 Output is buffered in Rust and delivered with the run's `Result` frame — there
 are no streaming log frames. Each stream is capped by `limits.maxStdoutBytes`
 / `limits.maxStderrBytes`; a line that would cross the cap is dropped whole.
-Arguments are stringified and joined with a single space. There is no `%s`
-format-specifier handling on the wrapped methods.
+
+### How arguments are rendered
+
+Arguments are rendered individually and joined with a single space. Plain data
+becomes JSON; anything JSON cannot describe falls back to `String(value)`.
+
+| Argument                          | Line                                                                        |
+| --------------------------------- | --------------------------------------------------------------------------- |
+| `'text'`                          | `text` — strings are never quoted                                           |
+| `{ user: 'bob', tries: 3 }`       | `{"user":"bob","tries":3}`                                                  |
+| `[1, 2, 3]`                       | `[1,2,3]`                                                                   |
+| a class instance with `a = 1`     | `{"a":1}` — own fields, like any object                                     |
+| an object with a `toJSON()`       | whatever `toJSON` returns                                                   |
+| `new Error('boom')`               | `Error: boom` **plus its stack**, so the line contains newlines             |
+| `new Map([['k', 1]])`             | `[object Map]` — JSON renders every Map as `{}`, so the type name says more |
+| `Promise`, `Set`, `RegExp`        | likewise `[object Promise]`, `[object Set]`, `/re/g`                        |
+| `new Uint8Array([1,2,3])`         | `1,2,3` — binary data would otherwise serialize one entry per byte          |
+| `Symbol('s')`                     | `Symbol(s)`                                                                 |
+| `null`, `undefined`, `42`, `true` | `null`, `undefined`, `42`, `true`                                           |
+
+Rendering never fails a run. It reads guest properties — `toJSON`, `stack` —
+so a throwing getter or a self-referencing object degrades to
+`String(value)`, and in the worst case to `[unprintable]`.
+
+Three known limits, all of which print `[object Object]`: an object that
+contains itself, an object whose getter throws, and any object JSON rejects
+for another reason. A `Date` renders as a quoted ISO string. **`%s` and `%d`
+format specifiers are not substituted** — the format string and the arguments
+are both printed.
 
 **Timing methods are inert, not missing.** `console.time` and friends exist so
 that library code calling them does not crash, but they read no clock and emit
