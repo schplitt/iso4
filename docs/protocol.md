@@ -72,17 +72,19 @@ this version, and the handshake hard-fails otherwise (§8).
 
 ### 2.2 Rust → TS
 
-|   Byte | Name               | Payload                   | Notes                                                                                                 |
-| -----: | ------------------ | ------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `0x01` | `BridgeCall`       | `BridgeCallPayload`       | Sandbox called a configured host global/function or host import.                                      |
-| `0x02` | `Result`           | `RunCompletionPayload`    | Final completion for `Run` or `PrefixRun`; sent exactly once. Includes captured stdout/stderr arrays. |
-| `0x03` | `PrecompileResult` | `PrecompileResultPayload` | Result of `Precompile`.                                                                               |
-| `0x04` | `Log`              | `DiagnosticLogPayload`    | Internal runtime diagnostic; not sandbox stdout/stderr.                                               |
-| `0x05` | `Hello`            | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.               |
-| `0x06` | `StatsResult`      | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request.                                                  |
-| `0x07` | `RunComplete`      | `RunCompletePayload`      | Final frame of a run whose `Result` reported pending background work; frees the run's slot.           |
-| `0x08` | `StreamPull`       | `StreamPullPayload`       | Credit grant: the sandbox consumed streamed-body bytes; the host may send that many more (§5.5).      |
-| `0x09` | `StreamCancel`     | `StreamCancelPayload`     | The sandbox cancelled a streamed body; the host stops pumping and releases the source (§5.5).         |
+|   Byte | Name               | Payload                   | Notes                                                                                                           |
+| -----: | ------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `BridgeCall`       | `BridgeCallPayload`       | Sandbox called a configured host global/function or host import.                                                |
+| `0x02` | `Result`           | `RunCompletionPayload`    | Final completion for `Run` or `PrefixRun`; sent exactly once. Includes captured stdout/stderr arrays.           |
+| `0x03` | `PrecompileResult` | `PrecompileResultPayload` | Result of `Precompile`.                                                                                         |
+| `0x04` | `Log`              | `DiagnosticLogPayload`    | Internal runtime diagnostic; not sandbox stdout/stderr.                                                         |
+| `0x05` | `Hello`            | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.                         |
+| `0x06` | `StatsResult`      | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request.                                                            |
+| `0x07` | `RunComplete`      | `RunCompletePayload`      | Final frame of a run whose `Result` reported pending background work; frees the run's slot.                     |
+| `0x08` | `StreamPull`       | `StreamPullPayload`       | Credit grant: the sandbox consumed streamed-body bytes; the host may send that many more (§5.5).                |
+| `0x09` | `StreamCancel`     | `StreamCancelPayload`     | The sandbox cancelled a streamed body; the host stops pumping and releases the source (§5.5).                   |
+| `0x0A` | `StreamChunk`      | `StreamChunkPayload`      | One chunk of an OUTBOUND (sandbox → host) streamed body, inside the host-granted credit window (§5.5).          |
+| `0x0B` | `StreamEnd`        | `StreamEndPayload`        | End of an outbound streamed body: clean EOF, or a guest source failure the consumer's read rejects with (§5.5). |
 
 ---
 
@@ -368,19 +370,23 @@ V8 copies the bytes once, straight out of the backing store; hand-framing it
 required a copy into an intermediate buffer and then a second copy into the
 serializer.
 
-A body that is anything else — a stream — is rejected before it reaches V8, so
-the error names the real problem rather than surfacing as "could not be
-cloned". This applies to the sandbox → host direction: a hydrated streamed
-body (§5.5) cannot be sent back and is refused with a message naming the
-remedy (read it first). Host → sandbox, a large body crosses as a **stream
-handle** in the descriptor (§4.4.6) with the bytes following as `StreamChunk`
-frames — see §5.5.
+A body that is anything else — a stream — is validated before it reaches V8,
+so a refusal names the real problem rather than surfacing as "could not be
+cloned". Sandbox → host, a stream body (a hydrated inbound stream passed
+through, or an async iterable wrapped at `Request`/`Response` construction)
+is legal exactly on the RESULT leg of a session run: the inline body slot is
+written as `null` and the outbound stream id rides in `extras` as
+`bodyStream`; on every other leg (exports, bridge arguments, hold-mode runs)
+it is refused with a message naming the remedy. Host → sandbox, a large body
+crosses as a **stream handle** in the descriptor (§4.4.6) with the bytes
+following as `StreamChunk` frames — see §5.5.
 
 `extras` is a length-delimited V8 blob holding a plain object of
-forward-compatible fields (`redirect`, `cf`, `signal`, …). It exists so new
-fields can be added **without allocating a new type tag** — the pattern workerd
-uses for the same reason (`Request::serialize` in `api/http.c++`). A zero
-byteLength means no extras.
+forward-compatible fields. It exists so new fields can be added **without
+allocating a new type tag** — the pattern workerd uses for the same reason
+(`Request::serialize` in `api/http.c++`). A zero byteLength means no extras.
+One field is defined today: `bodyStream` (a `u32` outbound stream id) on the
+sandbox → host result leg, when the body streams (§5.5).
 
 `extras` must contain only plain data. It must **not** contain a nested host
 object: the host side hand-writes these payloads (§4.4.6) and Node cannot emit
@@ -395,7 +401,7 @@ does not differ per type.
 
 | Value                                                           | Reason                        |
 | --------------------------------------------------------------- | ----------------------------- |
-| a sandbox body that is a stream (outbound)                      | not self-contained            |
+| a sandbox stream body anywhere but a session run's result       | not self-contained            |
 | `WebSocket`, `AbortSignal`                                      | not self-contained            |
 | a tag this build does not implement                             | unimplemented type            |
 | a host type nested below the top level of a host → sandbox slot | unreachable position (§4.4.6) |
@@ -407,16 +413,15 @@ serialized in a context that offers somewhere to put the reference. iso4 has
 no such context today, so the answer is always the error; the seam exists so
 one can be added without touching any tag.
 
-Streams are the clearest instance, and deliberately unsupported rather than
-buffered-behind-the-scenes.
-workerd can serialize a `ReadableStream` only because its boundary sits on a
-live capability-passing RPC connection: `ReadableStream::serialize` writes no
-bytes at all, it mints a `capnp::ByteStream` capability, puts it in the
-message's cap table via an `ExternalHandler`, and pumps the body over that
-connection afterwards. A one-shot iso4 frame has no such channel, so a stream
-has nowhere to go. Tags 4–6 are reserved so that adding one later is not a
-format change — a streaming body would simply be one of those host objects
-sitting in the body slot, which needs no new framing at all.
+Streams are the clearest instance. workerd can serialize a `ReadableStream`
+because its boundary sits on a live capability-passing RPC connection:
+`ReadableStream::serialize` writes no bytes at all, it mints a
+`capnp::ByteStream` capability and pumps the body over that connection
+afterwards. iso4 has the equivalent channel exactly on the per-run legs —
+the run-tagged stream frames of §5.5 — which is why a body may stream there
+(inbound: call args and bridge responses; outbound: the run's result) and
+nowhere else. Tags 4–6 stay reserved so a first-class stream type later is
+not a format change.
 
 #### 4.4.6 Direction asymmetry
 
@@ -859,41 +864,61 @@ default; an explicit `0` disables it.
 
 ### 5.5 Streaming bodies
 
-A `Request`/`Response` body that outgrows the host's probe (64 KiB) crosses
-as a stream handle (§4.4.6) instead of inline bytes; small bodies keep the
-buffered path unchanged. The bytes follow as frames on the run's connection,
-interleaved with bridge traffic, under credit-based flow control. Streaming
-applies to the per-run host → sandbox legs (call args, bridge responses);
-data globals stay buffered because their values replay per instance. The
-sandbox → host direction stays buffered in this version.
+Bodies stream in both directions under the same credit protocol, with the
+roles swapped per direction. Every stream frame carries the **run id**
+alongside the stream id — stream ids are per-run, and frames route by run
+id on the multiplexed connections.
 
-Every stream frame carries the **run id** alongside the stream id. Today one
-run owns a connection at a time and the field is validated against the run in
-flight; it exists so activating connection multiplexing later is a semantic
-change, not a layout change.
+**Inbound (host → sandbox).** A `Request`/`Response` body that outgrows the
+host's probe (64 KiB) crosses as a stream handle (§4.4.6) instead of inline
+bytes; small bodies keep the buffered path unchanged. Streaming applies to
+the per-run host → sandbox legs (call args, bridge responses); data globals
+stay buffered because their values replay per instance. The runtime
+implicitly grants each stream an initial credit window of 262144 bytes at
+hydration; the host may have at most that many unconsumed bytes in flight,
+each chunk at most 65536 bytes; as the sandbox consumes, the runtime sends
+`StreamPull` frames replenishing exactly the consumed count. A host
+exceeding the window is a protocol fault that fails the run.
 
-**Flow control.** The runtime implicitly grants each stream an initial credit
-window of 262144 bytes at hydration. The host may have at most that many
-unconsumed bytes in flight; each chunk is at most 65536 bytes. As the sandbox
-consumes bytes the runtime sends `StreamPull` frames replenishing exactly the
-consumed count, so runtime-side buffering never exceeds the window (plus one
-in-flight chunk of slack for benign races). A host exceeding the window is a
-protocol fault that fails the run.
+**Outbound (sandbox → host).** A session run's RESULT may carry a
+`Request`/`Response` whose body is a stream: a hydrated inbound stream
+passed through (`new Response(request.body)` — the proxy pattern), or an
+async iterable of `Uint8Array`/string chunks. The handle rides in the
+descriptor's `extras` (§4.4.4); the run enters the post-Result phase
+(§5.8) and stays routed until the body ends. Roles mirror exactly: the
+host implicitly grants the initial 262144-byte window (so production
+starts eagerly), the runtime sends `StreamChunk` frames within it, and the
+host replenishes with `StreamPull` as its consumer reads — the runtime
+pulls the guest source only when it has credit, so a slow consumer stops
+production at the source. Guest pulls execute under the phase's budgets. A
+guest chunk that is neither `Uint8Array` nor string ends the stream with
+an error; the run itself already succeeded — body failures are stream
+events, not run failures. **Idle deadline:** an outbound stream with no
+host read or cancel for 10 s is dropped by the runtime (`StreamEnd` naming
+the timeout, guest cancel semantics below) — the consumer is in-process
+JS, so nothing else would ever reclaim an abandoned stream.
 
 | Frame          | Direction | Payload                                                                  |
 | -------------- | --------- | ------------------------------------------------------------------------ |
-| `StreamChunk`  | TS → Rust | `u32 runId, u32 streamId, Bytes data` (≤ 65536 bytes)                    |
-| `StreamEnd`    | TS → Rust | `u32 runId, u32 streamId, bool ok, Optional<String> error` (when not ok) |
-| `StreamPull`   | Rust → TS | `u32 runId, u32 streamId, u32 credit`                                    |
-| `StreamCancel` | Rust → TS | `u32 runId, u32 streamId, String reason`                                 |
+| `StreamChunk`  | either    | `u32 runId, u32 streamId, Bytes data` (≤ 65536 bytes)                    |
+| `StreamEnd`    | either    | `u32 runId, u32 streamId, bool ok, Optional<String> error` (when not ok) |
+| `StreamPull`   | either    | `u32 runId, u32 streamId, u32 credit`                                    |
+| `StreamCancel` | either    | `u32 runId, u32 streamId, String reason`                                 |
 
-Semantics: a clean `StreamEnd` resolves the sandbox's next read as EOF once
-the buffer drains; a failed one rejects the pending read with a catchable
-error carrying the message. `StreamCancel` (sandbox `reader.cancel()`, or the
-run ending with the stream unread) tells the host to stop pumping and release
-the source; chunks already in flight are dropped. Stream frames arriving for
-a completed run are discarded. During a `waitUntil` grace phase (§5.8)
-streams keep flowing like bridge traffic.
+(Each direction has its own frame-type byte per §2's tables; payload
+layouts are identical.)
+
+Semantics, both directions: a clean `StreamEnd` resolves the receiver's
+next read as EOF once its buffer drains; a failed one rejects the pending
+read with a catchable error carrying the message. `StreamCancel` tells the
+producer to stop and release the source; chunks already in flight are
+dropped. Cancellation follows web-streams semantics on the guest: the
+source's `cancel(reason)` runs as one budgeted turn — an async-generator
+body gets `iterator.return()`, so `finally` blocks run (at yield
+suspension points; a generator blocked mid-`await` queues the return,
+exactly as in Node). Stream termination NEVER taints the instance. Stream
+frames arriving for a completed run are discarded. During the post-Result
+phase (§5.8) streams flow like bridge traffic.
 
 ### 5.6 Diagnostic log payloads
 
@@ -929,16 +954,17 @@ afterwards, so later calls report only their own lines.
 
 `RunSuccessPayload`:
 
-| Field            | Encoding                 | Notes                                                                                                                                                                                                                                       |
-| ---------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `exports`        | `ValueBlob`              | One blob holding a flat object: `default` plus named exports as direct properties. For a run that carried a `call` (§5.2) this is the called function's return value instead — the host knows which it asked for, so the slot needs no tag. |
-| `skippedExports` | `List<String>`           | Export names absent from `exports` because their value cannot cross (a function, a Promise in any state — the export path never awaits — or a failed serialization). Skipping is never fatal. Always empty for a call run.                  |
-| `stdout`         | `List<String>`           | Captured stdout log lines.                                                                                                                                                                                                                  |
-| `stderr`         | `List<String>`           | Captured stderr log lines.                                                                                                                                                                                                                  |
-| `durationMs`     | `f64`                    | Wall-clock runtime duration.                                                                                                                                                                                                                |
-| `cpuTimeMs`      | `f64`                    | Active V8 execution time; bridge waits excluded.                                                                                                                                                                                            |
-| `bridgeCalls`    | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.                                                                                                                                                                                       |
-| `heapUsedBytes`  | `Optional<u64>`          | `used_heap_size` of the isolate that served the run, measured after it settled. Present for `PrefixRun` (warm instances — feeds eviction); absent for one-off `Run`, whose isolate is already gone.                                         |
+| Field             | Encoding                 | Notes                                                                                                                                                                                                                                       |
+| ----------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `exports`         | `ValueBlob`              | One blob holding a flat object: `default` plus named exports as direct properties. For a run that carried a `call` (§5.2) this is the called function's return value instead — the host knows which it asked for, so the slot needs no tag. |
+| `skippedExports`  | `List<String>`           | Export names absent from `exports` because their value cannot cross (a function, a Promise in any state — the export path never awaits — or a failed serialization). Skipping is never fatal. Always empty for a call run.                  |
+| `stdout`          | `List<String>`           | Captured stdout log lines.                                                                                                                                                                                                                  |
+| `stderr`          | `List<String>`           | Captured stderr log lines.                                                                                                                                                                                                                  |
+| `durationMs`      | `f64`                    | Wall-clock runtime duration.                                                                                                                                                                                                                |
+| `cpuTimeMs`       | `f64`                    | Active V8 execution time; bridge waits excluded.                                                                                                                                                                                            |
+| `bridgeCalls`     | `List<BridgeCallRecord>` | One record per bridge call attempt, in attempt order.                                                                                                                                                                                       |
+| `heapUsedBytes`   | `Optional<u64>`          | `used_heap_size` of the isolate that served the run, measured after it settled. Present for `PrefixRun` (warm instances — feeds eviction); absent for one-off `Run`, whose isolate is already gone.                                         |
+| `backgroundFlags` | `u8`                     | Post-Result flags: bit 0 = `waitUntil` work pending, bit 1 = outbound stream bodies open. Nonzero = the run stays routed and a `RunComplete` (§5.8) follows. Wire-compatible with the former `backgroundPending` bool.                      |
 
 `RunFailurePayload`:
 
@@ -994,8 +1020,10 @@ afterwards, so later calls report only their own lines.
 ### 5.8 RunComplete payloads
 
 Sent exactly once, as the final frame of a run whose `Result` carried
-`backgroundPending = true` — after the `waitUntil` grace phase ends. Grace
-telemetry only: the run's own numbers already shipped on the `Result`.
+nonzero `backgroundFlags` — after the post-Result phase (the `waitUntil`
+grace work AND any outbound streams) ends. Grace telemetry only: the run's
+own numbers already shipped on the `Result`; outbound-stream pull CPU is
+included in this frame's `cpuTimeMs` (it is post-Result execution).
 
 `RunCompletePayload`:
 
@@ -1013,8 +1041,8 @@ telemetry only: the run's own numbers already shipped on the `Result`.
 Between the `Result` and the `RunComplete` the connection still belongs to
 the run: grace-time `BridgeCall`/`BridgeResponse` traffic flows exactly as
 during the run, and the host must not start a new run on the slot until the
-`RunComplete` arrives. This post-Result phase is the designed home for
-future in-run streaming frames.
+`RunComplete` arrives. This post-Result phase is also where outbound stream
+bodies live (§5.5).
 
 A `RunComplete` too large to frame is substituted by a minimal one — same
 `runId` and `status`, empty telemetry, and an error naming the substitution —
@@ -1089,12 +1117,13 @@ TS (one shared connection)            Rust (per-run isolate threads)
 │◀─── Result (run 2) ───────────────────│
 ```
 
-A run whose `Result` reports `backgroundPending = true` is not over: it
-stays routed on its connection while `waitUntil` background work runs —
-grace-time `BridgeCall`/`BridgeResponse` traffic included — until exactly
-one `RunComplete` frame ends it. The host resolves the caller and frees the
-run's admission slot at the `Result` (that is the point of the feature);
-the grace-phase frames ride the shared connection beside other runs'.
+A run whose `Result` reports nonzero `backgroundFlags` is not over: it
+stays routed on its connection while `waitUntil` background work runs
+and/or an outbound body streams — post-Result `BridgeCall`/`BridgeResponse`
+and stream traffic included — until exactly one `RunComplete` frame ends
+it. The host resolves the caller and frees the run's admission slot at the
+`Result` (that is the point of the feature); the post-Result frames ride
+the shared connection beside other runs'.
 
 Sharing widens the failure unit from one run to one connection, by design
 and bounded by the per-connection cap: a corrupt or unattributable frame
