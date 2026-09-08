@@ -140,8 +140,9 @@ Explicitly **out of scope**:
   `setTimeout(fn)` shipped by the host, no event listeners on host objects.
   Function values cannot cross — only data. (Tier 2 may add a callback-handle
   table; not needed for v1.)
-- Streaming `Response` / `ReadableStream`. v1 buffers full bodies host-side
-  with a configurable cap.
+- ~~Streaming `Response` / `ReadableStream`~~ — shipped: inbound bodies over
+  the 64 KiB probe stream in (#96), and a session call's result body streams
+  out (#128); see §7 item 3 and `docs/protocol.md` §5.5.
 - Sharing live state between runs. Each `prefix.run()` is a fresh isolate
   the prefix is re-evaluated into — the _prefix's declared shape_ is shared,
   not live mutable state.
@@ -1066,18 +1067,32 @@ Documented up front so we don't drift into rebuilding secure-exec:
    is not a counterexample: its callback never crosses the boundary — see
    item 8. Future tier-2 may add a callback handle table. Not v1.)
 
-3. **Streaming is inbound-only.** A host → sandbox `Request`/`Response`
-   body that outgrows a 64 KiB probe crosses as a stream handle pumped under
-   credit-based flow control (`docs/protocol.md` §5.5); the sandbox reads it
-   through `.body` or the body helpers. Small bodies keep the buffered path,
-   and data globals stay buffered (their values replay per instance). The
-   sandbox → host direction still buffers: a streamed body cannot be
-   returned or re-wrapped — only its bytes after reading it. `clone()` tees
-   a streamed body per the fetch spec (the slower branch's backlog lives in
-   the guest heap, which the isolate memory cap bounds), and reading through
-   `.body` marks `bodyUsed`, matching Node. Total body size on streaming
-   legs is bounded by flow control plus the guest heap cap rather than the
-   16 MiB buffered-path cap.
+3. **Streaming, both directions (#96 inbound, #128 outbound).** Host →
+   sandbox: a `Request`/`Response` body that outgrows a 64 KiB probe crosses
+   as a stream handle pumped under credit-based flow control
+   (`docs/protocol.md` §5.5); the sandbox reads it through `.body` or the
+   body helpers. Small bodies keep the buffered path, and data globals stay
+   buffered (their values replay per instance). Sandbox → host: a session
+   call's RESULT may carry a `Response`/`Request` whose body streams — a
+   hydrated inbound stream passed through (`new Response(request.body)`,
+   the workerd proxy pattern) or an async iterable of `Uint8Array`/string
+   chunks; the host receives a real `ReadableStream` and its reads drive
+   the guest's production (roles mirrored, same constants). The run
+   succeeds at its Result; body failures are stream events. Streams on any
+   other leg (exports, bridge arguments) are refused with an actionable
+   error. Cancellation is web-streams-faithful (guest `cancel`/generator
+   `finally` runs, one budgeted turn, never taints); an outbound stream
+   with no host read or cancel for 10 s is dropped (the consumer is
+   in-process JS — no socket errors on abandonment; Jakob's ruling,
+   #128 design record). `clone()` tees a streamed body per the fetch spec
+   (the slower branch's backlog lives in the guest heap, which the isolate
+   memory cap bounds), and reading through `.body` marks `bodyUsed`,
+   matching Node. Total body size on streaming legs is bounded by flow
+   control plus the guest heap cap rather than the 16 MiB buffered-path
+   cap; outbound bodies have no total-size cap at all (the consumer holds
+   the tap). Pass-through relays naively in v1 (host→child→host); the
+   workerd-style splice is a recorded later optimization
+   (`internal/OPTIMIZATIONS.md`).
 
 4. **No `eval` / `new Function` in run code.** Code generation from strings
    is a `prepare()`-time capability: it is allowed while prepared setup code

@@ -1219,6 +1219,16 @@ export interface CallSuccess {
    * The called function's return value — awaited first when the function
    * returned a Promise. Anything V8's serialization format carries arrives
    * as a real instance, including a `Response`.
+   *
+   * A `Response`/`Request` whose body STREAMS (sandbox code returned
+   * `new Response(asyncIterable)` or passed `request.body` through)
+   * arrives with a real `ReadableStream` body: read it or cancel it. Your
+   * reads drive the sandbox's production under flow control (a slow
+   * reader pauses the source); a stream neither read nor cancelled for
+   * 10 seconds is dropped by the runtime and later reads reject. Body
+   * failures after this result was delivered reject the read, never
+   * change this result — the same split as a `fetch` body dying
+   * mid-transfer.
    */
   value: unknown
   stdout: string[]
