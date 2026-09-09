@@ -277,7 +277,7 @@ Every call to `runtime.run(opts)`:
 {
   memoryMb: 64,                   // V8 heap + ArrayBuffer budget combined
   cpuTimeMs: 100,                 // Active execution only (await-free time)
-  wallTimeMs: 30_000,             // Hard backstop including async waits
+  wallTimeMs: 30_000,             // Caps own logic time: execution + async waits (to arrival)
   maxExportBytes: 16 * 1024 * 1024,
   maxStdoutBytes: 1 * 1024 * 1024,
   maxStderrBytes: 1 * 1024 * 1024,
@@ -338,8 +338,46 @@ count against the budget; tight loops do. The cap is enforced by a thread
 that calls `isolate.terminate_execution()` when the bracketed time exceeds
 `cpuTimeMs`.
 
-**Wall time** is a single guard timer that fires regardless. Catches
-runaway-await cases (e.g., host fetch implementation never resolves).
+**Wall time** (`wallTimeMs`) caps the run's OWN logic time: execution plus
+async waits, each wait counted until its answer arrives at the runtime. It
+catches runaway-await cases (e.g., a host fetch that never resolves), while
+engine time — turns for co-resident runs, delivery backlog — neither erodes
+the budget nor is capped by it. Enforced as a per-run deadline that slides
+by exactly the engine time the run absorbed. What the clocks count:
+
+```
+ enqueued
+            ┌──────┬───────┬────────┬──────┬───────┬──────┐
+┄┄┄┄┄┄┄┄┄┄──┤ own  │ await │ other  │ own  │ await │ own  ├──▶
+not counted │ turn │ bridge│ runs'  │ turn │ timer │ turn │  Result
+            └──────┴───────┴────────┴──────┴───────┴──────┘
+            ▲ dispatch                          processed ▲
+            ├─────────────────────────────────────────────┤ durationMs
+            ├──────────────┤        ├─────────────────────┤ wallTimeMs
+            ├──────┤                ├──────┤       ├──────┤ cpuTimeMs
+```
+
+- `cpuTimeMs` — own V8 execution only; the bracket pauses at every await.
+  Bridge round-trips are itemized separately in `bridgeCalls[]`.
+- `wallTimeMs` — the run's own logic time: execution plus genuine async
+  waits, each wait counted until its answer arrives — a busy loop
+  delivering it late adds nothing. A wait counts in full even when the
+  engine runs other code meanwhile, so co-resident runs' wall times
+  overlap; the excluded "other runs'" slice is only engine time after the
+  answer was already in.
+- `durationMs` — the full picture, dispatch to the processed conclusion:
+  wall plus the engine's time (co-resident runs' turns, backlog drain).
+  Time queued before dispatch counts nowhere.
+- The wall deadline fires in **arrival order**: an answer that reached the
+  runtime while budget remained is always delivered, even when the loop only
+  processes it later; arrivals after the deadline can never delay it. Since
+  only own time erodes the budget, `durationMs` can exceed the `wallTimeMs`
+  limit on a busy instance — the run is never charged for the engine.
+- Timers are inputs due at T: under load they fire late, never early, and
+  the delay is measured from the frozen clock's last sync, so CPU burned
+  before `setTimeout` in the same turn shortens the real wait. Arrival
+  stamps are exact within one connection, best-effort (~µs) across
+  connections feeding the same instance.
 
 **Result serialization is guest execution.** V8's `ValueSerializer` follows
 structured-clone semantics: a getter on an exported object (or on a `call()`
@@ -731,7 +769,8 @@ export const fetchedAt = Date.now()
   },
   stdout: "",
   stderr: "",
-  durationMs: 142,      // wall-clock, measured in the runtime
+  durationMs: 142,      // complete wall-clock, measured in the runtime
+  wallTimeMs: 97.2,     // own logic time: execution + async waits (to arrival)
   cpuTimeMs: 12.4,      // active V8 execution; bridge waits excluded
   bridgeCalls: [        // recorded in the runtime; metadata only, never payloads
     { name: "fetch", startMs: 0.4, durationMs: 2.3, argBytes: 180, responseBytes: 41208, ok: true, blocked: false },
@@ -821,7 +860,7 @@ genuine failure.
 A completed run:
 
 ```ts
-{ status: "completed", ok: true, exports: { … }, stdout, stderr, durationMs, cpuTimeMs, bridgeCalls }
+{ status: "completed", ok: true, exports: { … }, stdout, stderr, durationMs, wallTimeMs, cpuTimeMs, bridgeCalls }
 ```
 
 All three outcomes carry the run's timings (`durationMs` wall, `cpuTimeMs`

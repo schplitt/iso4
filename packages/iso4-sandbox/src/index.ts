@@ -381,6 +381,7 @@ function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilR
     return {
       status: 'truncated',
       durationMs: 0,
+      wallTimeMs: 0,
       cpuTimeMs: 0,
       stdout: [],
       stderr: [],
@@ -391,6 +392,7 @@ function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilR
   const out: WaitUntilResult = {
     status: report.status,
     durationMs: report.durationMs,
+    wallTimeMs: report.wallTimeMs,
     cpuTimeMs: report.cpuTimeMs,
     stdout: report.stdout,
     stderr: report.stderr,
@@ -507,6 +509,7 @@ function queueFullResult(error: QueueFullError): RunResult {
     stdout: [],
     stderr: [],
     durationMs: 0,
+    wallTimeMs: 0,
     cpuTimeMs: 0,
     bridgeCalls: [],
   }
@@ -524,6 +527,7 @@ function desyncResult(error: ProtocolDesyncError): RunResult {
     stdout: [],
     stderr: [],
     durationMs: 0,
+    wallTimeMs: 0,
     cpuTimeMs: 0,
     bridgeCalls: [],
   }
@@ -538,6 +542,7 @@ function abortedResult(reason?: unknown, from?: RunResult): RunResult {
     stdout: from?.stdout ?? [],
     stderr: from?.stderr ?? [],
     durationMs: from?.durationMs ?? 0,
+    wallTimeMs: from?.wallTimeMs ?? 0,
     cpuTimeMs: from?.cpuTimeMs ?? 0,
     bridgeCalls: from?.bridgeCalls ?? [],
   }
@@ -989,6 +994,7 @@ implements Prefix<G, M> {
         stdout: [],
         stderr: [],
         durationMs: 0,
+        wallTimeMs: 0,
         cpuTimeMs: 0,
         bridgeCalls: [],
       }
@@ -1036,6 +1042,7 @@ implements Prefix<G, M> {
           stdout: [],
           stderr: [],
           durationMs: 0,
+          wallTimeMs: 0,
           cpuTimeMs: 0,
           bridgeCalls: [],
         }

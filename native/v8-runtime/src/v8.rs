@@ -558,6 +558,11 @@ pub struct Output {
     /// with microsecond resolution (three decimal places).
     pub duration_ms: f64,
 
+    /// The run's own logic time: execution plus async waits, each wait
+    /// counted until its answer arrived — engine time (turns for co-resident
+    /// runs, delivery backlog) is excluded. `cpu ≤ wall ≤ duration`.
+    pub wall_time_ms: f64,
+
     /// Active V8 execution time (bridge waits excluded), in milliseconds
     /// with microsecond resolution.
     pub cpu_time_ms: f64,
@@ -595,6 +600,8 @@ pub struct GraceReport {
     pub status: GraceStatus,
     /// Wall time of the grace phase (after the Result shipped), ms.
     pub duration_ms: f64,
+    /// Counted grace logic time — see `Output::wall_time_ms`.
+    pub wall_time_ms: f64,
     /// Active V8 execution time during grace, ms.
     pub cpu_time_ms: f64,
     /// Console lines written during grace (the run's own lines already
@@ -1177,6 +1184,9 @@ pub struct FailureOutput {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub duration_ms: f64,
+
+    /// Counted logic time — see `Output::wall_time_ms`.
+    pub wall_time_ms: f64,
 
     /// Active V8 execution time — see `Output::cpu_time_ms`.
     pub cpu_time_ms: f64,
@@ -1966,6 +1976,13 @@ struct RunState {
     out_streams: *const OutStreamTable,
     timers: *const RefCell<TimerTable>,
     phase: RunPhase,
+    /// Counted logic time of the current phase: own turns + waits-to-arrival.
+    /// Frozen for the run phase once grace begins (grace bills its own).
+    counted: Duration,
+    /// When the run last parked; the next wait is counted from here.
+    parked_at: std::time::Instant,
+    /// Set while a turn for this run executes on the thread.
+    turn_entered: Option<std::time::Instant>,
 }
 
 /// Post-Result bookkeeping: the `waitUntil` grace part (the dissolved
@@ -1976,8 +1993,12 @@ struct GraceState {
     /// The settled run value; `background` is stamped at grace end.
     output: Output,
     grace_start: std::time::Instant,
-    /// The waitUntil wall — `None` for a phase entered only for streaming.
-    deadline: Option<std::time::Instant>,
+    /// The waitUntil wall budget — `None` for a phase entered only for
+    /// streaming. Erodes on counted grace time, so the boundary instant is
+    /// `parked_at + (cap − counted)` while parked.
+    wall_cap: Option<Duration>,
+    /// Counted grace logic time (the run's `counted` freezes at grace entry).
+    counted: Duration,
     /// The waitUntil part's outcome once decided; the phase outlives it
     /// while outbound streams are still open.
     grace_status: Option<GraceStatus>,
@@ -2033,6 +2054,54 @@ impl RunState {
     }
 }
 
+/// Fold the wait that ended at `woke_at` into the phase's counted time and
+/// mark a turn as executing. Waits count only to the waking event's arrival
+/// (or a timer's due instant) — the delivery lag is the engine's.
+fn enter_turn(rs: &mut RunState, woke_at: std::time::Instant) {
+    let wait = woke_at.saturating_duration_since(rs.parked_at);
+    match &mut rs.phase {
+        RunPhase::Grace(g) => g.counted += wait,
+        _ => rs.counted += wait,
+    }
+    rs.turn_entered = Some(std::time::Instant::now());
+}
+
+/// Fold the finished turn's execution into the phase's counted time and park.
+fn leave_turn(rs: &mut RunState) {
+    if let Some(t) = rs.turn_entered.take() {
+        let exec = t.elapsed();
+        match &mut rs.phase {
+            RunPhase::Grace(g) => g.counted += exec,
+            _ => rs.counted += exec,
+        }
+    }
+    rs.parked_at = std::time::Instant::now();
+}
+
+/// The live (not yet folded) counted segment: the turn so far when
+/// executing, the wait so far when parked — callers that must cut a wait
+/// earlier than "now" call [`enter_turn`] with the cutoff first.
+fn live_segment(rs: &RunState) -> Duration {
+    match rs.turn_entered {
+        Some(t) => t.elapsed(),
+        None => rs.parked_at.elapsed(),
+    }
+}
+
+/// The RUN phase's counted logic time as of now, for stamping a concluding
+/// result. Frozen once grace began — grace bills its own accumulator.
+fn counted_wall_ms(rs: &RunState) -> f64 {
+    match rs.phase {
+        RunPhase::Grace(_) => dur_ms(rs.counted),
+        _ => dur_ms(rs.counted + live_segment(rs)),
+    }
+}
+
+/// Duration → ms rounded to microsecond resolution (matches `elapsed_ms`).
+fn dur_ms(d: Duration) -> f64 {
+    (d.as_secs_f64() * 1_000_000.0).round() / 1_000.0
+}
+
 /// Borrowed per-run facts the turn functions need beside the mutable state.
 struct RunFacts<'a> {
     call: Option<&'a ipc::CallSpec>,
@@ -2062,12 +2131,20 @@ enum LoopEvent {
     SourceClosed(io::Error),
 }
 
-/// Wait for the next event from either source kind. Only the single-run
-/// drive loop (`run_call_phase`) calls this; instance-channel runs are woken
-/// by their owner loop's select instead.
-fn wait_event(source: &RunSource, timeout: Option<Duration>, limit: u32) -> LoopEvent {
+/// Wait for the next event from either source kind, plus the instant the
+/// wait's counted time cuts off (a frame's arrival stamp; delivery time for the
+/// rest). Only the single-run drive loop (`run_call_phase`) calls this;
+/// instance-channel runs are woken by their owner loop's select instead.
+fn wait_event(
+    source: &RunSource,
+    timeout: Option<Duration>,
+    limit: u32,
+) -> (LoopEvent, std::time::Instant) {
     match source {
-        RunSource::Fd(fd) => wait_frame_on_fd(*fd, timeout, limit),
+        RunSource::Fd(fd) => {
+            // A blocking read: the frame's arrival IS the read's return.
+            (wait_frame_on_fd(*fd, timeout, limit), std::time::Instant::now())
+        }
         RunSource::Instance => {
             unreachable!("instance-channel runs are driven by serve_instance, not wait_event")
         }
@@ -2078,10 +2155,15 @@ fn wait_event(source: &RunSource, timeout: Option<Duration>, limit: u32) -> Loop
                     .recv()
                     .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected),
             };
-            // The stamp is not consulted here: a single-run channel is
+            // Delivery order needs no stamp here — a single-run channel is
             // already arrival-ordered against this run's own deadline (a
-            // queued event always beats the recv timeout).
-            match received.map(|routed| routed.event) {
+            // queued event always beats the recv timeout). The stamp only
+            // cuts off the wait's counted time.
+            let woke_at = received
+                .as_ref()
+                .map(|routed| routed.at)
+                .unwrap_or_else(|_| std::time::Instant::now());
+            let event = match received.map(|routed| routed.event) {
                 Ok(RunEvent::Frame(frame)) => LoopEvent::Frame(frame),
                 Ok(RunEvent::ConnLost(detail)) => {
                     LoopEvent::SourceClosed(io::Error::new(
@@ -2102,7 +2184,8 @@ fn wait_event(source: &RunSource, timeout: Option<Duration>, limit: u32) -> Loop
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => LoopEvent::SourceClosed(
                     io::Error::new(io::ErrorKind::BrokenPipe, "demux gone"),
                 ),
-            }
+            };
+            (event, woke_at)
         }
     }
 }
@@ -2160,7 +2243,7 @@ fn run_call_phase(
         &mut ctx,
     );
     if let ScanOutcome::Finished(result) = start_outcome {
-        return *result;
+        return stamp_wall(&rs, *result);
     }
     let facts = RunFacts {
         call: ctx.call,
@@ -2186,24 +2269,47 @@ fn run_call_phase(
                     }
                 }
                 if let Some(result) = deadline_hit(isolate, context, &facts, &mut rs) {
-                    return result;
+                    return stamp_wall(&rs, result);
                 }
                 continue;
             }
             // Nothing can ever deliver an event to this run. `scan` fails
             // a sourceless pending run without timers, so only hold-mode
             // grace gets here.
-            return Ok(finish_post_phase(&mut rs));
+            let result = Ok(finish_post_phase(&mut rs));
+            return stamp_wall(&rs, result);
         }
         let timeout = rs.next_timeout();
-        let event = {
+        let (event, woke_at) = {
             let source = rs.source.as_ref().expect("checked above");
             wait_event(source, timeout, rs.frame_limit())
         };
-        if let Some(result) = handle_loop_event(isolate, context, &facts, &mut rs, event) {
-            return result;
+        let entered = matches!(event, LoopEvent::Frame(_));
+        if entered {
+            enter_turn(&mut rs, woke_at);
+        }
+        let outcome = handle_loop_event(isolate, context, &facts, &mut rs, event);
+        if entered {
+            leave_turn(&mut rs);
+        }
+        if let Some(result) = outcome {
+            return stamp_wall(&rs, result);
         }
     }
+}
+
+/// Stamp the counted logic time onto a concluding single-run result (the
+/// instance loop's counterpart is in `conclude_run`).
+fn stamp_wall(
+    rs: &RunState,
+    mut result: Result<Output, FailureOutput>,
+) -> Result<Output, FailureOutput> {
+    let wall = counted_wall_ms(rs);
+    match &mut result {
+        Ok(output) => output.wall_time_ms = wall,
+        Err(f) => f.wall_time_ms = wall,
+    }
+    result
 }
 
 /// Build the run's state and execute its start turn: install this call's
@@ -2252,6 +2358,9 @@ fn begin_call(
         out_streams: ctx.out_streams,
         timers: ctx.timers,
         phase: RunPhase::Starting,
+        counted: Duration::ZERO,
+        parked_at: ctx.start,
+        turn_entered: Some(ctx.start),
     };
     let start_outcome = start_turn(
         isolate,
@@ -2266,6 +2375,7 @@ fn begin_call(
     );
     rs.cpu_budget.leave();
     guard.clear();
+    leave_turn(&mut rs);
     (rs, start_outcome)
 }
 
@@ -2303,8 +2413,12 @@ fn deadline_hit(
 ) -> Option<Result<Output, FailureOutput>> {
     loop {
         let now = std::time::Instant::now();
-        if earliest_timer(rs).is_some_and(|t| t <= now) {
-            match timer_turn(isolate, context, facts, rs) {
+        if let Some(due) = earliest_timer(rs).filter(|t| *t <= now) {
+            // The wait ended at the timer's due instant, not its late fire.
+            enter_turn(rs, due);
+            let outcome = timer_turn(isolate, context, facts, rs);
+            leave_turn(rs);
+            match outcome {
                 ScanOutcome::Finished(result) => return Some(*result),
                 ScanOutcome::Continue => continue,
             }
@@ -2314,31 +2428,50 @@ fn deadline_hit(
             // allowance (a real turn — guest cancel cleanup runs) and the
             // waitUntil wall (bookkeeping — the phase may stay open for
             // streams).
-            if out_idle_deadline(rs).is_some_and(|d| d <= now) {
-                match stream_idle_turn(isolate, context, facts, rs) {
+            if let Some(d) = out_idle_deadline(rs).filter(|d| *d <= now) {
+                enter_turn(rs, d);
+                let outcome = stream_idle_turn(isolate, context, facts, rs);
+                leave_turn(rs);
+                match outcome {
                     ScanOutcome::Finished(result) => return Some(*result),
                     ScanOutcome::Continue => continue,
                 }
             }
-            if grace_wall_due(rs, now) {
-                if let Some(output) = conclude_grace_wall(rs) {
+            if let Some(b) = grace_wall_instant(rs).filter(|b| *b <= now) {
+                // Counted grace time reaches its cap exactly here.
+                enter_turn(rs, b);
+                let concluded = conclude_grace_wall(rs);
+                leave_turn(rs);
+                if let Some(output) = concluded {
                     return Some(Ok(output));
                 }
                 continue;
             }
             return None;
         }
-        if deadline_instant(rs).is_some_and(|b| b <= now) {
+        if let Some(b) = deadline_instant(rs).filter(|b| *b <= now) {
+            // Counted wall reaches its cap exactly at the boundary instant.
+            enter_turn(rs, b);
             return Some(boundary_deadline(rs));
         }
         return None;
     }
 }
 
+/// The waitUntil wall's boundary instant while undecided: the counted grace
+/// time reaches its cap after `cap − counted` more parked waiting.
+fn grace_wall_instant(rs: &RunState) -> Option<std::time::Instant> {
+    match &rs.phase {
+        RunPhase::Grace(g) if g.grace_status.is_none() => g
+            .wall_cap
+            .map(|cap| rs.parked_at + cap.saturating_sub(g.counted)),
+        _ => None,
+    }
+}
+
 /// Whether the phase's waitUntil wall is due (and still undecided).
 fn grace_wall_due(rs: &RunState, now: std::time::Instant) -> bool {
-    matches!(&rs.phase, RunPhase::Grace(g)
-        if g.grace_status.is_none() && g.deadline.is_some_and(|d| d <= now))
+    grace_wall_instant(rs).is_some_and(|d| d <= now)
 }
 
 /// The waitUntil wall expired: record the truncation. Returns the finished
@@ -2441,18 +2574,20 @@ fn boundary_close(rs: &mut RunState, e: io::Error) -> Result<Output, FailureOutp
 }
 
 /// The absolute instant of this run's current boundary deadline, if it has
-/// one. Fixed per phase — the wall deadline is set at run start, the grace
-/// deadline at grace entry — so the multi-run loop's heap holds at most two
-/// entries per run over its life, and a heap entry is stale exactly when it
-/// no longer equals this value.
+/// one. Wall budgets erode on COUNTED time, so the instant is fixed per park
+/// (`parked_at + remaining budget` — a parked run bills its wait 1:1 with
+/// real time) and moves later with each turn; a heap entry is stale exactly
+/// when it no longer equals this value.
 fn deadline_instant(rs: &RunState) -> Option<std::time::Instant> {
     match &rs.phase {
-        RunPhase::Starting | RunPhase::Settling { .. } => (rs.limits.wall_time_ms > 0)
-            .then(|| rs.start + Duration::from_millis(rs.limits.wall_time_ms as u64)),
-        RunPhase::Grace(g) => {
+        RunPhase::Starting | RunPhase::Settling { .. } => (rs.limits.wall_time_ms > 0).then(|| {
+            let cap = Duration::from_millis(rs.limits.wall_time_ms as u64);
+            rs.parked_at + cap.saturating_sub(rs.counted)
+        }),
+        RunPhase::Grace(_) => {
             // The waitUntil wall (while that part is undecided) and the
             // outbound-stream idle deadline, whichever is sooner.
-            let grace = if g.grace_status.is_none() { g.deadline } else { None };
+            let grace = grace_wall_instant(rs);
             let idle = out_idle_deadline(rs);
             match (grace, idle) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -3490,7 +3625,7 @@ fn build_output_and_maybe_grace(
         return finished(Err(rs.fail(RunError::Aborted)));
     }
 
-    let output = Output {
+    let mut output = Output {
         exports,
         skipped_exports,
         // SAFETY: `logs` points into the run's live table entry.
@@ -3498,6 +3633,7 @@ fn build_output_and_maybe_grace(
         stderr: unsafe { &*rs.logs }.borrow().stderr.clone(),
         duration_ms: elapsed_ms(rs.start),
         // Stamped by the callers from the shared run state.
+        wall_time_ms: 0.0,
         cpu_time_ms: 0.0,
         bridge_calls: Vec::new(),
         background: None,
@@ -3558,7 +3694,13 @@ fn build_output_and_maybe_grace(
 
     // Freeze the run-phase telemetry for the early Result, and hand the
     // console buffers over to grace: lines from here on belong to the
-    // grace report.
+    // grace report. The counted clock freezes with it — the rest of this
+    // turn belongs to grace.
+    if let Some(t) = rs.turn_entered.take() {
+        rs.counted += t.elapsed();
+    }
+    rs.turn_entered = Some(std::time::Instant::now());
+    output.wall_time_ms = dur_ms(rs.counted);
     let run_cpu_ms = rs.cpu_budget.elapsed_ms_precise();
     let now_ms = elapsed_ms(rs.start);
     let run_records = rs
@@ -3588,6 +3730,7 @@ fn build_output_and_maybe_grace(
                     stdout: output.stdout.clone(),
                     stderr: output.stderr.clone(),
                     duration_ms: output.duration_ms,
+                    wall_time_ms: output.wall_time_ms,
                     cpu_time_ms: run_cpu_ms,
                     bridge_calls: run_records,
                     heap_used_bytes,
@@ -3624,8 +3767,8 @@ fn build_output_and_maybe_grace(
     rs.phase = RunPhase::Grace(Box::new(GraceState {
         output,
         grace_start,
-        deadline: has_grace
-            .then(|| grace_start + Duration::from_millis(rs.limits.grace_ms as u64)),
+        wall_cap: has_grace.then(|| Duration::from_millis(rs.limits.grace_ms as u64)),
+        counted: Duration::ZERO,
         // A streaming-only phase has no waitUntil work to drive: the grace
         // part starts concluded and the phase is held open by the streams.
         grace_status: if has_grace {
@@ -4171,6 +4314,7 @@ fn finish_post_phase(rs: &mut RunState) -> Output {
 /// early Result) onto the run's held Output. Pure bookkeeping — no JS runs,
 /// so boundary events (deadline, socket death) call it without a scope.
 fn finish_grace(rs: &mut RunState, status: GraceStatus) -> Output {
+    let grace_live = live_segment(rs);
     let RunPhase::Grace(g) = &mut rs.phase else {
         unreachable!("finish_grace outside grace");
     };
@@ -4199,6 +4343,7 @@ fn finish_grace(rs: &mut RunState, status: GraceStatus) -> Output {
             stdout: Vec::new(),
             stderr: Vec::new(),
             duration_ms: 0.0,
+            wall_time_ms: 0.0,
             cpu_time_ms: 0.0,
             bridge_calls: Vec::new(),
             background: None,
@@ -4207,6 +4352,7 @@ fn finish_grace(rs: &mut RunState, status: GraceStatus) -> Output {
     output.background = Some(GraceReport {
         status,
         duration_ms: elapsed_ms(g.grace_start),
+        wall_time_ms: dur_ms(g.counted + grace_live),
         cpu_time_ms: g.grace_cpu.elapsed_ms_precise(),
         stdout,
         stderr,
@@ -4234,9 +4380,12 @@ impl<'a> TurnGuard<'a> {
                 cpu_cap_ms: rs.limits.cpu_time_ms,
                 // Enforced mid-turn too, so a synchronous spin under
                 // `cpuTimeMs: 0` still dies at the wall (E2 ruling closing
-                // the boundary-only gap).
-                wall_deadline: (rs.limits.wall_time_ms > 0)
-                    .then(|| rs.start + Duration::from_millis(rs.limits.wall_time_ms as u64)),
+                // the boundary-only gap). Mid-turn the counted clock runs
+                // 1:1 with real time, so the remaining budget is an instant.
+                wall_deadline: (rs.limits.wall_time_ms > 0).then(|| {
+                    let cap = Duration::from_millis(rs.limits.wall_time_ms as u64);
+                    std::time::Instant::now() + cap.saturating_sub(rs.counted)
+                }),
             },
             RunPhase::Grace(g) => GuardTarget {
                 budget: Arc::clone(&g.grace_cpu),
@@ -4774,6 +4923,7 @@ fn conclude_run(
     tainted: bool,
 ) {
     let cpu_time_ms = live.rs.cpu_budget.elapsed_ms_precise();
+    let wall_time_ms = counted_wall_ms(&live.rs);
     let records = live
         .rs
         .bridge_log
@@ -4783,10 +4933,12 @@ fn conclude_run(
     match &mut result {
         Ok(output) => {
             output.cpu_time_ms = cpu_time_ms;
+            output.wall_time_ms = wall_time_ms;
             output.bridge_calls = records;
         }
         Err(f) => {
             f.cpu_time_ms = cpu_time_ms;
+            f.wall_time_ms = wall_time_ms;
             f.bridge_calls = records;
         }
     }
@@ -4892,6 +5044,8 @@ fn sweep_expired_deadlines(
         if earliest_timer(&live[idx].rs) == Some(at) {
             let mut l = live.swap_remove(idx);
             LAST_CULPRIT_RUN_ID.with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
+            // The wait ended at the timer's due instant, not its late fire.
+            enter_turn(&mut l.rs, at);
             let outcome = {
                 let facts = RunFacts {
                     call: l.job.call.as_ref(),
@@ -4913,6 +5067,7 @@ fn sweep_expired_deadlines(
                         let failure = l.rs.fail(reason_error(&core.reason));
                         conclude_run(&mut core.isolate, &core.run_table, l, Err(failure), true);
                     } else {
+                        leave_turn(&mut l.rs);
                         if let Some(next) = next_deadline(&l.rs) {
                             deadlines.push(std::cmp::Reverse((next, token)));
                         }
@@ -4929,9 +5084,10 @@ fn sweep_expired_deadlines(
         let mut l = live.swap_remove(idx);
         if matches!(l.rs.phase, RunPhase::Grace(_)) {
             let now = std::time::Instant::now();
-            if out_idle_deadline(&l.rs).is_some_and(|d| d <= now) {
+            if let Some(d) = out_idle_deadline(&l.rs).filter(|d| *d <= now) {
                 // Stream idle allowance: a real turn (guest cancel cleanup).
                 LAST_CULPRIT_RUN_ID.with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
+                enter_turn(&mut l.rs, d);
                 let outcome = {
                     let facts = RunFacts {
                         call: l.job.call.as_ref(),
@@ -4951,6 +5107,7 @@ fn sweep_expired_deadlines(
                             let failure = l.rs.fail(reason_error(&core.reason));
                             conclude_run(&mut core.isolate, &core.run_table, l, Err(failure), true);
                         } else {
+                            leave_turn(&mut l.rs);
                             if let Some(next) = next_deadline(&l.rs) {
                                 deadlines.push(std::cmp::Reverse((next, token)));
                             }
@@ -4967,11 +5124,14 @@ fn sweep_expired_deadlines(
             // waitUntil wall: bookkeeping — the phase may stay open for
             // streams.
             if grace_wall_due(&l.rs, now) {
+                // Counted grace time reaches its cap exactly here.
+                enter_turn(&mut l.rs, at);
                 match conclude_grace_wall(&mut l.rs) {
                     Some(output) => {
                         conclude_run(&mut core.isolate, &core.run_table, l, Ok(output), false);
                     }
                     None => {
+                        leave_turn(&mut l.rs);
                         if let Some(next) = next_deadline(&l.rs) {
                             deadlines.push(std::cmp::Reverse((next, token)));
                         }
@@ -4987,6 +5147,8 @@ fn sweep_expired_deadlines(
             live.push(l);
             continue;
         }
+        // Counted wall reaches its cap exactly at the boundary instant.
+        enter_turn(&mut l.rs, at);
         let result = boundary_deadline(&mut l.rs);
         conclude_run(&mut core.isolate, &core.run_table, l, result, false);
     }
@@ -5101,12 +5263,15 @@ pub fn serve_instance(
             }
             Ok(RoutedEvent {
                 event: RunEvent::Job(msg),
+                at,
                 ..
             }) => {
-                // Deliberately no deadline sweep on this arm — the job's
-                // arrival stamp exists but is unconsulted; closing that
-                // bounded gap is #148 q3. A job burst can delay a due
-                // deadline by its start turns at most.
+                // Deadlines/timers due before this job arrived fire first —
+                // overdue work beats admitting new runs.
+                if sweep_expired_deadlines(core, &mut live, &mut deadlines, at) {
+                    taint_sweep(core, &mut live, events);
+                    return;
+                }
                 if dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, msg) {
                     taint_sweep(core, &mut live, events);
                     return;
@@ -5149,8 +5314,11 @@ pub fn serve_instance(
                 LAST_CULPRIT_RUN_ID.with(|c| c.set(l.rs.epilogue.map(|e| e.run_id).unwrap_or(0)));
                 // The deadline as the heap knows it; a change during this
                 // turn (settle → grace, a timer armed/fired/cleared)
-                // re-queues below.
+                // re-queues below. Captured before the wait is folded.
                 let queued_deadline = next_deadline(&l.rs);
+                // The wait ended when the event ARRIVED; the delivery lag
+                // was the loop's, not this run's.
+                enter_turn(&mut l.rs, at);
                 let outcome = {
                     let facts = RunFacts {
                         call: l.job.call.as_ref(),
@@ -5173,6 +5341,7 @@ pub fn serve_instance(
                             let failure = l.rs.fail(reason_error(&core.reason));
                             conclude_run(&mut core.isolate, &core.run_table, l, Err(failure), true);
                         } else {
+                            leave_turn(&mut l.rs);
                             let current = next_deadline(&l.rs);
                             if current != queued_deadline {
                                 if let Some(at) = current {
@@ -5383,6 +5552,9 @@ fn dispatch_job(
                 out_streams: out_streams_ptr,
                     timers: timers_ptr,
                     phase: RunPhase::Starting,
+                    counted: Duration::ZERO,
+                    parked_at: start,
+                    turn_entered: Some(start),
                 },
                 job,
                 respond,
@@ -5934,11 +6106,16 @@ fn termination_or(reason: &ReasonCell, fallback: RunError) -> RunError {
 }
 
 fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> FailureOutput {
+    let duration_ms = elapsed_ms(start);
     FailureOutput {
         error,
         stdout: logs.stdout.clone(),
         stderr: logs.stderr.clone(),
-        duration_ms: elapsed_ms(start),
+        duration_ms,
+        // Failures with run state get the real counted value stamped by
+        // their concluder; setup failures ARE one own turn, so wall equals
+        // the elapsed time.
+        wall_time_ms: duration_ms,
         // Stamped by run_module from the shared run state (stays empty/0 for
         // precompile failures, which have no bridge and no CPU budget).
         cpu_time_ms: 0.0,

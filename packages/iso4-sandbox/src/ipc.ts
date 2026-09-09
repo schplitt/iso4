@@ -27,7 +27,7 @@ export type WireResourceLimits = ResourceLimits & {
   hardMemoryMb?: number
 }
 
-export const PROTOCOL_VERSION: 1 = 1
+export const PROTOCOL_VERSION: 2 = 2
 
 export const DEFAULT_MAX_FRAME_LENGTH: number = 64 * 1024 * 1024
 
@@ -1400,6 +1400,7 @@ export interface DecodedRunComplete {
   runId: number
   status: 'settled' | 'truncated' | 'failed'
   durationMs: number
+  wallTimeMs: number
   cpuTimeMs: number
   stdout: string[]
   stderr: string[]
@@ -1420,6 +1421,7 @@ export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
     throw new PayloadDecodeError(`unknown RunComplete status byte: ${statusByte}`)
   }
   const durationMs = reader.readF64()
+  const wallTimeMs = reader.readF64()
   const cpuTimeMs = reader.readF64()
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
@@ -1429,7 +1431,7 @@ export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
     ? { name: reader.readString(), message: reader.readString() }
     : undefined
   reader.assertDone()
-  const decoded: DecodedRunComplete = { runId, status, durationMs, cpuTimeMs, stdout, stderr, bridgeCalls }
+  const decoded: DecodedRunComplete = { runId, status, durationMs, wallTimeMs, cpuTimeMs, stdout, stderr, bridgeCalls }
   if (error !== undefined)
     decoded.error = error
   return decoded
@@ -1626,6 +1628,7 @@ export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
  *   List<String>  stdout
  *   List<String>  stderr
  *   f64  durationMs
+ *   f64  wallTimeMs
  *   f64  cpuTimeMs
  *   List<BridgeCallRecord>  bridgeCalls
  *   Optional<u64>  heapUsedBytes   (present for prefix runs)
@@ -1638,6 +1641,7 @@ export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
  *   List<String>  stdout
  *   List<String>  stderr
  *   f64  durationMs
+ *   f64  wallTimeMs
  *   f64  cpuTimeMs
  *   List<BridgeCallRecord>  bridgeCalls
  *   Optional<u64>  heapUsedBytes   (present for prefix runs)
@@ -1666,6 +1670,7 @@ export function decodeRunCompletionPayload(
     const stdout = reader.readStringList()
     const stderr = reader.readStringList()
     const durationMs = reader.readF64()
+    const wallTimeMs = reader.readF64()
     const cpuTimeMs = reader.readF64()
     const bridgeCalls = readBridgeCallRecords(reader)
     const heapUsedBytes = reader.readOptionalU64()
@@ -1684,6 +1689,7 @@ export function decodeRunCompletionPayload(
           stdout,
           stderr,
           durationMs,
+          wallTimeMs,
           cpuTimeMs,
           bridgeCalls,
           heapUsedBytes,
@@ -1701,6 +1707,7 @@ export function decodeRunCompletionPayload(
         stdout,
         stderr,
         durationMs,
+        wallTimeMs,
         cpuTimeMs,
         bridgeCalls,
         heapUsedBytes,
@@ -1725,6 +1732,7 @@ export function decodeRunCompletionPayload(
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
   const durationMs = reader.readF64()
+  const wallTimeMs = reader.readF64()
   const cpuTimeMs = reader.readF64()
   const bridgeCalls = readBridgeCallRecords(reader)
   const heapUsedBytes = reader.readOptionalU64()
@@ -1740,6 +1748,7 @@ export function decodeRunCompletionPayload(
       stdout,
       stderr,
       durationMs,
+      wallTimeMs,
       cpuTimeMs,
       bridgeCalls,
       heapUsedBytes,

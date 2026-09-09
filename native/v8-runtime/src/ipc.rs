@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// This must stay in sync with `docs/protocol.md` and the TypeScript codec in
 /// `packages/iso4-sandbox/src/ipc.ts`.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Default maximum frame length in bytes, including the 1-byte message type.
 pub const DEFAULT_MAX_FRAME_LENGTH: u32 = 64 * 1024 * 1024;

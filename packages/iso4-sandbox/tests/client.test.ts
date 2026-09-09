@@ -136,11 +136,12 @@ function backgroundResultPayload(runId: number): Buffer {
  * @param runId
  */
 function runCompletePayload(runId: number): Buffer {
-  const buf = Buffer.alloc(34)
+  const buf = Buffer.alloc(42)
   buf.writeUInt32BE(runId, 0)
   buf.writeUInt8(0, 4) // status = settled
   buf.writeDoubleBE(5, 5) // durationMs
-  buf.writeDoubleBE(1, 13) // cpuTimeMs
+  buf.writeDoubleBE(3, 13) // wallTimeMs
+  buf.writeDoubleBE(1, 21) // cpuTimeMs
   // stdout/stderr/bridgeCalls counts (u32 × 3) and errorPresent stay zero
   return buf
 }
