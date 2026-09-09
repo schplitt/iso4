@@ -1,5 +1,85 @@
 # @iso4/v8-linux-x64-gnu
 
+## 0.5.0
+
+### Minor Changes
+
+- f962a14: Freeze the sandbox clock during execution, workerd-style. `Date.now()`, no-arg `new Date()`/`Date()`, no-arg `Intl.DateTimeFormat` formatting, and `Temporal.Now.*` all read one per-context value that advances — monotone, whole milliseconds — only when the runtime regains control at run entry, a bridge response, or a stream frame. Sandboxed code can no longer observe its own elapsed execution time, closing the timing side-channel between co-resident isolates. Explicit-argument `Date`/`Temporal`/`Intl` computation is untouched. Alongside it, `SharedArrayBuffer` is removed from the sandbox global (as in non-cross-origin-isolated browsers; `Atomics` on plain buffers keeps working) and `Atomics.wait` now throws, matching workerd.
+- 139386b: feat: session demux and per-instance turn loop (#125)
+
+  Runs no longer hold a thread while suspended on host calls, and a waiting
+  run's abort or timeout now fails that run alone instead of evicting its
+  warm instance. New error code
+  `ERR_INSTANCE_RESET` (with `resetCause` and `culpritRunId` on the error)
+  reports runs that were in flight on a shared instance when a co-resident run
+  had to be terminated mid-execution.
+
+- e1b10fc: feat: upgrade to V8 15.2 and span Node 22–27 with one binary (#80)
+
+  The runtime picks up five V8 release lines of security fixes and performance
+  work. Serialized values keep the format every shipping Node reads, while the
+  handshake now also accepts hosts on newer Node lines that write V8's
+  next serialization format — so Node 22 through 27 pair with the same binary.
+
+### Patch Changes
+
+- fd462aa: perf: cheaper per-call attribution for bridge calls and console output (#127)
+
+  Native callbacks resolve the owning run in one table lookup and take a
+  reference-counted handle to the stub binding instead of cloning it per
+  invocation. Attribution semantics are unchanged.
+
+- f6cddb7: fix: a host that stops draining a connection can no longer stall sandbox execution (#127)
+
+  Outbound frames now go through a bounded per-connection queue with a
+  dedicated writer thread; a peer that stops reading fails that connection's
+  runs cleanly after a bounded wait instead of freezing every instance that
+  shares it.
+
+- 61e420c: Embed ICU data in the runtime binary. Locale-aware calls in sandboxed code (`toLocaleString`, `Intl.*`, `localeCompare`) previously aborted the whole V8 runtime process with "Fatal process out of memory: DateTimePatternGeneratorCache::CreateGenerator", leaving the sandbox unreachable for every subsequent run. They now return correctly localized output.
+- 8871645: fix: inbound frames are read against the flat protocol ceiling (#127)
+
+  Per-run frame allowances are still enforced per run, but the connection's
+  read ceiling is now a constant — it can no longer shrink under an in-flight
+  frame, so a large late frame for a just-completed run is discarded instead
+  of costing the connection.
+
+- f186aec: perf: the frozen-clock advance no longer allocates V8 state per turn (#127)
+
+  Clock handles are cached per isolate at install time; a turn within the
+  same wall millisecond now skips V8 entirely. Clock semantics are unchanged.
+
+- 03b9e46: perf: one shared watchdog thread now enforces all CPU/wall budgets (#145)
+
+  Warm instances hold one OS thread instead of two, so deployments with hard
+  per-container thread limits can keep roughly twice as many instances warm.
+  Budget and timeout semantics are unchanged.
+
+- dbd1caf: perf: instance turn loops route run events through one channel and a deadline heap (#127)
+
+  Frame routing on a busy instance no longer scales with the number of
+  in-flight runs, and boundary deadlines fire in arrival order: co-resident
+  frame traffic can neither starve a run's wall timeout nor turn a run whose
+  answer arrived in time into one.
+
+- 7aec3d4: perf: outbound frames skip the writer thread when the socket is free (#127)
+
+  Removes the flat per-call overhead the bounded outbound queue introduced
+  for short, frequent calls; the writer thread still takes over whenever the
+  socket backs up, so stall isolation is unchanged.
+
+- 2e6fb0f: fix: an abort that arrives before its run starts still lands gracefully (#127)
+
+  A Terminate (or connection loss) racing ahead of the run's dispatch is now
+  remembered and answered when the run arrives, instead of falling back to
+  the host-side teardown timeout.
+
+- 3504569: fix: an instance thread that fails to spawn fails only its own run (#127)
+
+  Under process resource exhaustion the affected run now reports
+  ERR_INTERNAL and the connection keeps serving, instead of the runtime
+  panicking the connection's demux.
+
 ## 0.4.1
 
 ## 0.4.0

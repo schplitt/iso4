@@ -1,6 +1,6 @@
 {
   "name": "@iso4/v8-darwin-x64",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "type": "module",
   "description": "Native iso4 V8 runtime binary for darwin-x64",
   "license": "MIT",
