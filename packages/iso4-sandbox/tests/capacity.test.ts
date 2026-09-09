@@ -312,6 +312,140 @@ describe('per-workload heap caps (#77)', () => {
   })
 })
 
+describe('two heap lines (#169)', () => {
+  /// Allocates `mb` MB of external `ArrayBuffer` bytes and drops them — the
+  /// budget allocator charges those against the hard line, so this probes
+  /// where the terminating cap sits without retaining anything.
+  const PEAK = `export function peak(mb) {
+    const a = []
+    for (let i = 0; i < mb; i++) a.push(new Uint8Array(1024 * 1024).fill(1))
+    return a.length
+  }`
+
+  /// Retains V8-heap objects across calls, so the instance's
+  /// `used_heap_size` grows the way a leaking prefix's does. Number arrays,
+  /// not `ArrayBuffer`s (those are external, outside `used_heap_size`) and
+  /// not `repeat()` strings (V8 does not materialise those eagerly): one
+  /// 128K-element array of smis is ~1 MB of heap.
+  const LEAK = `let n = 0
+const kept = []
+export function grow(mb) {
+  n++
+  for (let i = 0; i < mb; i++) kept.push(new Array(1024 * 128).fill(i))
+  return n
+}`
+
+  test('a one-off gets no band — its memoryMb is enforced exactly', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+    // A fresh isolate is never reused, so there is nothing to retire and no
+    // reason to loosen the number: 64 means dead at 64, as before #169.
+    const blown = await sandbox.run({
+      code: 'const a = []\n'
+        + 'for (let i = 0; i < 70; i++) a.push(new Uint8Array(1024 * 1024).fill(1))',
+      limits: { memoryMb: 64, wallTimeMs: 20_000, cpuTimeMs: 20_000 },
+    })
+    expect(blown.ok).toBe(false)
+    if (!blown.ok && blown.status === 'failed')
+      expect(blown.error.code).toBe('ERR_MEMORY_LIMIT')
+
+    const fits = await sandbox.run({
+      code: 'const a = []\n'
+        + 'for (let i = 0; i < 40; i++) a.push(new Uint8Array(1024 * 1024).fill(1))\n'
+        + 'export default a.length',
+      limits: { memoryMb: 64, wallTimeMs: 20_000, cpuTimeMs: 20_000 },
+    })
+    expect(fits.ok).toBe(true)
+  })
+
+  test('a prefix instance does get the band above its retirement line', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+    // 64 MB retires at 64 and terminates at 64 + round(sqrt(8 × 64)) = 87,
+    // so a run peaking at ~70 MB completes; the instance is retired for it
+    // rather than the run being killed.
+    await using prefix = await sandbox.prepare({ code: PEAK, memoryMb: 64 })
+    const peaked = await prefix.call({
+      export: 'peak',
+      args: [70],
+      limits: { wallTimeMs: 20_000, cpuTimeMs: 20_000 },
+    })
+    expect(peaked.ok).toBe(true)
+
+    // Past the band, the hard line still terminates.
+    const blown = await prefix.call({
+      export: 'peak',
+      args: [200],
+      limits: { wallTimeMs: 20_000, cpuTimeMs: 20_000 },
+    })
+    expect(blown.ok).toBe(false)
+    if (!blown.ok && blown.status === 'failed')
+      expect(blown.error.code).toBe('ERR_MEMORY_LIMIT')
+  })
+
+  test('an instance over the soft line is retired, and no run fails for it', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+    // Wide band: the soft line is what fires, the hard line is never near.
+    await using leaky = await sandbox.prepare({
+      code: LEAK,
+      memoryMb: { soft: 32, hard: 512 },
+    })
+
+    // Each call retains ~40 MB, so every finish is above the soft line.
+    // `n` is module state: it counts calls on THIS instance, so a reset
+    // to 1 is the retirement becoming visible.
+    const seen: number[] = []
+    for (let i = 0; i < 3; i++) {
+      const r = await leaky.call({
+        export: 'grow',
+        args: [40],
+        limits: { wallTimeMs: 20_000, cpuTimeMs: 20_000 },
+      })
+      expect(r.ok).toBe(true)
+      if (r.ok)
+        seen.push(r.value as number)
+    }
+    // Nothing failed — the retirement is silent — and the third call
+    // landed on a fresh instance after two consecutive crossings.
+    expect(seen.slice(0, 2)).toEqual([1, 2])
+    expect(seen[2]).toBe(1)
+  })
+
+  test('a hard-line-only cap never retires, however much it retains', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+    await using leaky = await sandbox.prepare({
+      code: LEAK,
+      memoryMb: { hard: 512 },
+    })
+    const seen: number[] = []
+    for (let i = 0; i < 3; i++) {
+      const r = await leaky.call({
+        export: 'grow',
+        args: [40],
+        limits: { wallTimeMs: 20_000, cpuTimeMs: 20_000 },
+      })
+      expect(r.ok).toBe(true)
+      if (r.ok)
+        seen.push(r.value as number)
+    }
+    expect(seen).toEqual([1, 2, 3])
+  })
+
+  test('the two-line form is rejected where it could not act', async () => {
+    await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+    // A one-off isolate is never reused, so a soft line has nothing to retire.
+    await expect(
+      sandbox.run({ code: '1', limits: { memoryMb: { hard: 64 } as never } }),
+    ).rejects.toThrow(/number of megabytes/)
+    // A soft line at or above the hard line could never fire first.
+    await expect(
+      sandbox.prepare({ code: COUNTER, memoryMb: { soft: 64, hard: 64 } }),
+    ).rejects.toThrow(/must be below/)
+    // `hard: 0` would leave V8 with no limit at all — a fatal process OOM.
+    await expect(
+      sandbox.prepare({ code: COUNTER, memoryMb: { soft: 32, hard: 0 } }),
+    ).rejects.toThrow(/write memoryMb: 0 for uncapped/)
+  })
+})
+
 describe('prefix-aware acquire (#77)', () => {
   test('waiting-heavy concurrent runs share one instance', async () => {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 4 })

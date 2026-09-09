@@ -62,9 +62,12 @@ pub fn init_platform() {
 pub struct Limits {
     pub wall_time_ms: u32,
     pub cpu_time_ms: u32,
-    /// V8 heap cap enforced via `CreateParams::heap_limits` +
-    /// `add_near_heap_limit_callback`. Zero means no limit.
-    pub memory_mb: u32,
+    /// The retirement line, and the run's inbound frame allowance (see
+    /// `frame_limit`). Nothing terminates at it. Zero means none.
+    pub soft_memory_mb: u32,
+    /// The terminating line: `CreateParams::heap_limits` +
+    /// `add_near_heap_limit_callback` + the ArrayBuffer budget. Zero = none.
+    pub hard_memory_mb: u32,
     /// Maximum byte length of the exports value blob.
     /// Zero means no limit. Violation → `RunError::ExportTooLarge`.
     pub max_export_bytes: u32,
@@ -238,7 +241,7 @@ static BUDGET_ALLOC_VTABLE: v8::RustAllocatorVtable<BudgetAllocState> = v8::Rust
     drop: budget_alloc_drop,
 };
 
-/// Near-heap-limit callback registered when `limits.memory_mb > 0`.
+/// Near-heap-limit callback registered when `limits.hard_memory_mb > 0`.
 ///
 /// # Safety
 /// `data` is a `*mut NearHeapData` kept alive in `run_module` for the
@@ -1415,7 +1418,7 @@ pub fn execute_with_prefix(
     // timeout. The call itself then gets fresh guards from dispatch to
     // settle. The warm registry keeps the core alive between calls; this
     // one-shot wrapper drops it.
-    let mut core = create_instance_core(Some(prefix), imports, limits.memory_mb)?;
+    let mut core = create_instance_core(Some(prefix), imports, limits.hard_memory_mb)?;
     run_call_on_core(
         &mut core,
         code,
@@ -1446,10 +1449,16 @@ pub fn precompile(
     filename: Option<&str>,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-    memory_mb: u32,
+    hard_memory_mb: u32,
 ) -> Result<(), FailureOutput> {
     init_platform();
-    validate_prefix_module(code, filename.unwrap_or("<prefix>"), globals, imports, memory_mb)
+    validate_prefix_module(
+        code,
+        filename.unwrap_or("<prefix>"),
+        globals,
+        imports,
+        hard_memory_mb,
+    )
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
@@ -1573,10 +1582,10 @@ fn run_module_inner(
     // ── ArrayBuffer budget allocator ──────────────────────────────────────────
     // Built before the isolate so we can pass it into CreateParams.
     // The IsolateHandle is set on the state right after Isolate::new returns.
-    let alloc_state: Option<Arc<BudgetAllocState>> = if limits.memory_mb > 0 {
+    let alloc_state: Option<Arc<BudgetAllocState>> = if limits.hard_memory_mb > 0 {
         Some(Arc::new(BudgetAllocState {
             used: AtomicUsize::new(0),
-            budget: limits.memory_mb as usize * 1024 * 1024,
+            budget: limits.hard_memory_mb as usize * 1024 * 1024,
             handle: OnceLock::new(),
             reason: Arc::clone(&reason),
         }))
@@ -1588,8 +1597,8 @@ fn run_module_inner(
         let params = v8::Isolate::create_params();
         // Cap the V8 heap (strings, plain objects). The near-heap callback
         // converts a heap-OOM into a clean terminate_execution().
-        let params = if limits.memory_mb > 0 {
-            params.heap_limits(0, limits.memory_mb as usize * 1024 * 1024)
+        let params = if limits.hard_memory_mb > 0 {
+            params.heap_limits(0, limits.hard_memory_mb as usize * 1024 * 1024)
         } else {
             params
         };
@@ -1614,6 +1623,9 @@ fn run_module_inner(
     if let Some(state) = &alloc_state {
         state.handle.set(isolate.thread_safe_handle()).ok();
     }
+    // V8's default assumes it owns the machine and collects lazily; wrong for
+    // a container full of isolates (workerd flips the same switch).
+    isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
 
     // Explicit policy: microtasks only drain when we call
     // perform_microtask_checkpoint() in the poll loop.  This gives us
@@ -1662,7 +1674,7 @@ fn run_module_inner(
     // Complements the ArrayBuffer allocator above.  Together they cover all
     // memory sources.  The Box must outlive active JS execution; safe because
     // V8 never invokes near-heap callbacks during Isolate::Dispose().
-    let _near_heap: Option<Box<NearHeapData>> = if limits.memory_mb > 0 {
+    let _near_heap: Option<Box<NearHeapData>> = if limits.hard_memory_mb > 0 {
         let data = Box::new(NearHeapData {
             handle,
             reason: Arc::clone(&reason),
@@ -1984,12 +1996,13 @@ impl RunState {
     }
 
     /// The read cap for inbound frames while this run waits: its own memory
-    /// budget, or the global framing cap when it opted out of one.
+    /// budget — the advertised (soft) line, else the terminating one — or the
+    /// global framing cap when it opted out of both.
     fn frame_limit(&self) -> u32 {
-        if self.limits.memory_mb > 0 {
-            self.limits.memory_mb.saturating_mul(1024 * 1024)
-        } else {
-            ipc::DEFAULT_MAX_FRAME_LENGTH
+        match (self.limits.soft_memory_mb, self.limits.hard_memory_mb) {
+            (0, 0) => ipc::DEFAULT_MAX_FRAME_LENGTH,
+            (0, hard) => hard.saturating_mul(1024 * 1024),
+            (soft, _) => soft.saturating_mul(1024 * 1024),
         }
     }
 
@@ -4320,19 +4333,24 @@ pub struct InstanceCore {
 /// Build an isolate with the heap cap, budget ArrayBuffer allocator, and
 /// near-heap callback wired to `reason` — the CreateParams dance shared by
 /// `run_module_inner`-style one-off setup, warm instance creation, and
-/// `prepare()` validation. `memory_mb == 0` means uncapped.
+/// `prepare()` validation. `hard_memory_mb == 0` means uncapped.
+///
+/// The isolate is told memory is under moderate pressure for its whole life
+/// (workerd's posture): V8's default assumes it owns the machine and collects
+/// lazily, which is wrong in a container packed with isolates and would leave
+/// the soft line reading garbage instead of live data.
 fn new_capped_isolate(
-    memory_mb: u32,
+    hard_memory_mb: u32,
     reason: &Arc<ReasonCell>,
 ) -> (
     v8::OwnedIsolate,
     Option<Arc<BudgetAllocState>>,
     Option<Box<NearHeapData>>,
 ) {
-    let alloc_state: Option<Arc<BudgetAllocState>> = if memory_mb > 0 {
+    let alloc_state: Option<Arc<BudgetAllocState>> = if hard_memory_mb > 0 {
         Some(Arc::new(BudgetAllocState {
             used: AtomicUsize::new(0),
-            budget: memory_mb as usize * 1024 * 1024,
+            budget: hard_memory_mb as usize * 1024 * 1024,
             handle: OnceLock::new(),
             reason: Arc::clone(reason),
         }))
@@ -4342,8 +4360,8 @@ fn new_capped_isolate(
 
     let mut isolate = {
         let params = v8::Isolate::create_params();
-        let params = if memory_mb > 0 {
-            params.heap_limits(0, memory_mb as usize * 1024 * 1024)
+        let params = if hard_memory_mb > 0 {
+            params.heap_limits(0, hard_memory_mb as usize * 1024 * 1024)
         } else {
             params
         };
@@ -4361,12 +4379,15 @@ fn new_capped_isolate(
     if let Some(state) = &alloc_state {
         state.handle.set(isolate.thread_safe_handle()).ok();
     }
+    // V8's default assumes it owns the machine and collects lazily; wrong for
+    // a container full of isolates (workerd flips the same switch).
+    isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
     // Same rationale as the one-off path: no blocking Atomics.wait, ever.
     isolate.set_allow_atomics_wait(false);
 
-    let near_heap: Option<Box<NearHeapData>> = if memory_mb > 0 {
+    let near_heap: Option<Box<NearHeapData>> = if hard_memory_mb > 0 {
         let data = Box::new(NearHeapData {
             handle: isolate.thread_safe_handle(),
             reason: Arc::clone(reason),
@@ -4401,14 +4422,14 @@ fn warmup_error(reason: &ReasonCell, fallback: RunError) -> RunError {
 pub fn create_instance_core(
     prefix: Option<PrefixSpec<'_>>,
     imports: &[ImportBinding],
-    memory_mb: u32,
+    hard_memory_mb: u32,
 ) -> Result<InstanceCore, FailureOutput> {
     init_platform();
     let start = std::time::Instant::now();
 
     let run_table = RunTable::boxed();
     let reason = Arc::new(ReasonCell::new());
-    let (mut isolate, alloc_state, near_heap) = new_capped_isolate(memory_mb, &reason);
+    let (mut isolate, alloc_state, near_heap) = new_capped_isolate(hard_memory_mb, &reason);
 
     let handle = isolate.thread_safe_handle();
     let warmup_budget = Arc::new(CpuBudget::new());
@@ -5805,7 +5826,7 @@ fn validate_prefix_module(
     filename: &str,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-    memory_mb: u32,
+    hard_memory_mb: u32,
 ) -> Result<(), FailureOutput> {
     let start = std::time::Instant::now();
     let logs = LogBuffers::default();
@@ -5820,7 +5841,8 @@ fn validate_prefix_module(
     // validation isolate would let it OOM the runtime process at prepare()
     // time instead of failing cleanly.
     let reason = Arc::new(ReasonCell::new());
-    let (mut isolate, _alloc_state, _near_heap) = new_capped_isolate(memory_mb, &reason);
+    let (mut isolate, _alloc_state, _near_heap) =
+        new_capped_isolate(hard_memory_mb, &reason);
 
     let warmup_budget = Arc::new(CpuBudget::new());
     let handle = isolate.thread_safe_handle();
@@ -10196,7 +10218,7 @@ mod tests {
             "#,
             "<test>",
             Limits {
-                memory_mb: 32,
+                hard_memory_mb: 32,
                 wall_time_ms: 10_000,
                 cpu_time_ms: 10_000,
                 ..Default::default()
@@ -10220,7 +10242,7 @@ mod tests {
             "#,
             "<test>",
             Limits {
-                memory_mb: 32,
+                hard_memory_mb: 32,
                 wall_time_ms: 10_000,
                 cpu_time_ms: 10_000,
                 ..Default::default()
@@ -12192,7 +12214,8 @@ mod tests {
             Limits {
                 cpu_time_ms: 5_000,
                 wall_time_ms: 10_000,
-                memory_mb: 64, // sets the BridgeResponse frame cap to 64 MiB
+                soft_memory_mb: 64, // sets the BridgeResponse frame cap to 64 MiB
+                hard_memory_mb: 64,
                 ..Default::default()
             },
             |s| {

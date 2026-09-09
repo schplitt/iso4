@@ -63,6 +63,16 @@ pub struct InstanceHandle {
     load: Arc<sandbox::InstanceLoad>,
 }
 
+/// The two heap lines a run asks for, in bytes. An instance serves only runs
+/// asking for the same pair (#81 r6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeapCaps {
+    /// The retirement line — see `policy::soft_strike`. `0` = none.
+    pub soft_bytes: u64,
+    /// The terminating V8 cap. `0` = uncapped.
+    pub hard_bytes: u64,
+}
+
 /// What a run holds while attached to a pooled instance: the channel plus
 /// the registry id `release` needs. The registry keeps the owning
 /// [`InstanceHandle`]; several runs may hold attachments to one instance at
@@ -142,7 +152,7 @@ pub(crate) fn dead_instance_outcome() -> sandbox::CallOutcome {
 /// the spawner's key covers every later call routed to this instance.
 pub fn spawn_instance(
     prefix: Arc<PrefixData>,
-    memory_mb: u32,
+    hard_memory_mb: u32,
     brand_key: String,
 ) -> std::io::Result<InstanceHandle> {
     let (tx, rx) = crossbeam_channel::unbounded::<sandbox::RoutedEvent>();
@@ -150,7 +160,7 @@ pub fn spawn_instance(
     let thread_load = Arc::clone(&load);
     std::thread::Builder::new()
         .name("iso4-warm-instance".to_string())
-        .spawn(move || instance_main(prefix, memory_mb, brand_key, rx, thread_load))?;
+        .spawn(move || instance_main(prefix, hard_memory_mb, brand_key, rx, thread_load))?;
     Ok(InstanceHandle {
         msgs: tx,
         last_used: Instant::now(),
@@ -161,7 +171,7 @@ pub fn spawn_instance(
 
 fn instance_main(
     prefix: Arc<PrefixData>,
-    memory_mb: u32,
+    hard_memory_mb: u32,
     brand_key: String,
     events: crossbeam_channel::Receiver<sandbox::RoutedEvent>,
     load: Arc<sandbox::InstanceLoad>,
@@ -195,7 +205,7 @@ fn instance_main(
     let mut core = match sandbox::create_instance_core(
         Some(spec),
         &prefix.declared_imports,
-        memory_mb,
+        hard_memory_mb,
     ) {
         Ok(c) => c,
         Err(f) => {
@@ -361,9 +371,12 @@ struct Instance {
     handle: InstanceHandle,
     /// Runs currently attached (parked ones included).
     in_flight: usize,
-    /// The heap cap this instance's isolate was created with — attach
+    /// The heap caps this instance's isolate was created with — attach
     /// refuses a mismatching run (#81 r6).
-    cap_bytes: u64,
+    caps: HeapCaps,
+    /// Consecutive finishes above the soft line; `policy::SOFT_LINE_STRIKES`
+    /// of them retire the instance.
+    soft_strikes: u8,
     dead: bool,
 }
 
@@ -493,7 +506,9 @@ impl WarmRegistry {
             .store(usage_bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// May a NEW isolate be created for a run capped at `run_cap_bytes`?
+    /// May a NEW isolate be created for a run whose terminating cap is
+    /// `run_cap_bytes`? The hard line is what the isolate may actually
+    /// reach, so it is what the container reserves.
     /// `Err` carries the refusal message for the run's `ERR_CAPACITY`.
     fn admit(&self, usage: Option<u64>, run_cap_bytes: u64) -> Result<(), String> {
         // No reading = no lines (matches `pressure_pass`: unavailable
@@ -521,8 +536,8 @@ impl WarmRegistry {
         } else {
             format!(
                 "no capacity for a new isolate: measured container memory ({} MB) plus \
-                 this run's memoryMb ({} MB) crosses the admission line ({} MB — 90% of \
-                 the container limit minus the host reserve)",
+                 this run's heap ceiling ({} MB) crosses the admission line ({} MB — 90% \
+                 of the container limit minus the host reserve)",
                 usage_bytes / MB,
                 run_cap_bytes / MB,
                 self.hard_line_bytes / MB,
@@ -530,8 +545,8 @@ impl WarmRegistry {
         })
     }
 
-    /// Take an instance for a run of `prefix_id` capped at `run_cap_bytes`
-    /// (0 = uncapped). Order: reuse the warmest idle instance; else decide
+    /// Take an instance for a run of `prefix_id` asking for `caps`
+    /// (`hard_bytes: 0` = uncapped). Order: reuse the warmest idle instance; else decide
     /// join-or-spawn from the prefix's demand EWMAs (spawn on CPU demand,
     /// ceiling at cores; routing packs onto the fullest non-saturated
     /// instance, spilling over to a spawn and then to the least-utilized).
@@ -542,9 +557,10 @@ impl WarmRegistry {
     pub fn acquire(
         &self,
         prefix_id: &str,
-        run_cap_bytes: u64,
+        caps: HeapCaps,
         spawn: &dyn Fn() -> std::io::Result<InstanceHandle>,
     ) -> Acquired {
+        let run_cap_bytes = caps.hard_bytes;
         let usage = self.sample_usage();
         let now = Instant::now();
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -563,7 +579,7 @@ impl WarmRegistry {
             .instances
             .iter()
             .enumerate()
-            .filter(|(_, i)| !i.dead && i.in_flight == 0 && i.cap_bytes == run_cap_bytes)
+            .filter(|(_, i)| !i.dead && i.in_flight == 0 && i.caps == caps)
             .max_by_key(|(_, i)| i.handle.last_used)
             .map(|(pos, _)| pos);
         if let Some(pos) = idle_pos {
@@ -577,7 +593,7 @@ impl WarmRegistry {
             .instances
             .iter()
             .enumerate()
-            .filter(|(_, i)| !i.dead && i.cap_bytes == run_cap_bytes)
+            .filter(|(_, i)| !i.dead && i.caps == caps)
             .map(|(pos, _)| pos)
             .collect();
         let live = entry.instances.iter().filter(|i| !i.dead).count();
@@ -603,7 +619,8 @@ impl WarmRegistry {
                 id,
                 handle,
                 in_flight: 1,
-                cap_bytes: run_cap_bytes,
+                caps,
+                soft_strikes: 0,
                 dead: false,
             });
             return Acquired::Attached(attachment(entry.instances.last().unwrap()));
@@ -659,7 +676,8 @@ impl WarmRegistry {
                     id,
                     handle,
                     in_flight: 1,
-                    cap_bytes: run_cap_bytes,
+                    caps,
+                    soft_strikes: 0,
                     dead: false,
                 });
                 Acquired::Attached(attachment(entry.instances.last().unwrap()))
@@ -674,6 +692,7 @@ impl WarmRegistry {
     /// a one-off is an isolate creation like any other. `Err` = refuse the
     /// run with `ERR_CAPACITY`; no counters were taken.
     pub fn reserve_oneoff(&self, run_cap_bytes: u64) -> Result<(), String> {
+        // One-offs are never pooled, so only the hard line matters here.
         let usage = self.sample_usage();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.pressure_pass(usage, self.warm_budget_bytes);
@@ -697,10 +716,12 @@ impl WarmRegistry {
     }
 
     /// One run released its instance. The instance goes idle when its last
-    /// run leaves; tainted instances and instances of a disposed prefix
-    /// are marked dead — no new joins — and dropped once drained (the
-    /// owner thread exits and disposes the isolate). Clean completions
-    /// feed the prefix's demand EWMAs.
+    /// run leaves; tainted instances, instances of a disposed prefix and
+    /// instances that finished over their soft line
+    /// `policy::SOFT_LINE_STRIKES` times running are marked dead — no new
+    /// joins — and dropped once drained (the owner thread exits and disposes
+    /// the isolate). Clean completions feed the prefix's demand EWMAs.
+    /// The soft line fails nobody — not this run, not its co-residents.
     #[allow(clippy::too_many_arguments)] // the release facts, all scalars
     pub fn release(
         &self,
@@ -724,6 +745,16 @@ impl WarmRegistry {
             if let Some(pos) = entry.instances.iter().position(|i| i.id == instance_id) {
                 let inst = &mut entry.instances[pos];
                 inst.in_flight = inst.in_flight.saturating_sub(1);
+                // A tainted reading is taken after a terminate, so it says
+                // nothing about the heap: no strike.
+                if !outcome_tainted && inst.caps.soft_bytes > 0 {
+                    let over = heap_used_bytes > inst.caps.soft_bytes;
+                    let (strikes, retire) = policy::soft_strike(inst.soft_strikes, over);
+                    inst.soft_strikes = strikes;
+                    if retire {
+                        inst.dead = true;
+                    }
+                }
                 if outcome_tainted || !prefix_alive {
                     inst.dead = true;
                 }
@@ -956,8 +987,21 @@ mod tests {
     /// admission line (registries here use hard line 0 unless stated).
     const TEST_CAP: u64 = 128 * TEST_MB;
 
+    /// Test caps: one number, used as both lines — the soft line only
+    /// matters where a test says so, via [`acquire_caps`].
+    fn caps(cap: u64) -> HeapCaps {
+        HeapCaps {
+            soft_bytes: cap,
+            hard_bytes: cap,
+        }
+    }
+
     fn acquire(reg: &WarmRegistry, prefix: &str, cap: u64) -> Acquired {
-        reg.acquire(prefix, cap, &|| {
+        acquire_caps(reg, prefix, caps(cap))
+    }
+
+    fn acquire_caps(reg: &WarmRegistry, prefix: &str, caps: HeapCaps) -> Acquired {
+        reg.acquire(prefix, caps, &|| {
             spawn_instance(counter_prefix(), 0, test_brand_key())
         })
     }
@@ -1027,6 +1071,129 @@ mod tests {
         let outcome = call_via(&a2, bump_job());
         assert_eq!(bump_value(&outcome), 1.0, "fresh instance, fresh state");
         release_outcome(&registry, "p0", &a2, &outcome);
+    }
+
+    // ── The soft line (#169) ───────────────────────────────────────────────
+
+    #[test]
+    fn one_finish_over_the_soft_line_keeps_the_instance() {
+        let registry = WarmRegistry::new(0, 0);
+        let a = att(acquire(&registry, "p", TEST_CAP));
+        registry.release("p", a.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        assert_eq!(
+            registry.stats().warm_idle,
+            1,
+            "a single crossing is a spike, not a leak"
+        );
+    }
+
+    #[test]
+    fn two_finishes_in_a_row_over_the_soft_line_retire_the_instance() {
+        let registry = WarmRegistry::new(0, 0);
+        let a1 = att(acquire(&registry, "p", TEST_CAP));
+        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        let a2 = att(acquire(&registry, "p", TEST_CAP));
+        assert_eq!(a2.id, a1.id, "still reusable after one strike");
+        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        let stats = registry.stats();
+        assert_eq!(
+            (stats.warm_idle, stats.warm_busy),
+            (0, 0),
+            "retired on the second strike — idle, so it drops at once"
+        );
+    }
+
+    #[test]
+    fn a_finish_under_the_soft_line_clears_the_strike() {
+        let registry = WarmRegistry::new(0, 0);
+        let a1 = att(acquire(&registry, "p", TEST_CAP));
+        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        let a2 = att(acquire(&registry, "p", TEST_CAP));
+        registry.release("p", a2.id, false, TEST_MB, 0.0, true);
+        let a3 = att(acquire(&registry, "p", TEST_CAP));
+        registry.release("p", a3.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        assert_eq!(
+            registry.stats().warm_idle,
+            1,
+            "strikes must be consecutive to retire"
+        );
+    }
+
+    #[test]
+    fn a_retiring_instance_keeps_serving_its_co_residents() {
+        let registry = WarmRegistry::new(0, 0);
+        let a1 = att(acquire(&registry, "p", TEST_CAP));
+        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        // Two runs land on the instance; the first pushes it to two strikes
+        // while the second is still in flight.
+        let a2 = att(acquire(&registry, "p", TEST_CAP));
+        let a3 = att(acquire(&registry, "p", TEST_CAP));
+        assert_eq!(a3.id, a2.id, "both runs share the instance");
+        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        assert_eq!(
+            registry.stats().warm_busy,
+            1,
+            "retired but not dropped — the co-resident is still running"
+        );
+        let a4 = att(acquire(&registry, "p", TEST_CAP));
+        assert_ne!(a4.id, a3.id, "a retired instance takes no new joins");
+        registry.release("p", a3.id, false, TEST_MB, 0.0, true);
+        registry.release("p", a4.id, false, TEST_MB, 0.0, true);
+        assert_eq!(
+            registry.stats().warm_idle,
+            1,
+            "the retired instance drops when its last run leaves"
+        );
+    }
+
+    #[test]
+    fn no_soft_line_means_no_retirement_however_big_the_heap() {
+        let registry = WarmRegistry::new(0, 0);
+        let manual = HeapCaps {
+            soft_bytes: 0,
+            hard_bytes: TEST_CAP,
+        };
+        for _ in 0..4 {
+            let a = att(acquire_caps(&registry, "p", manual));
+            registry.release("p", a.id, false, TEST_CAP * 4, 0.0, true);
+        }
+        assert_eq!(
+            registry.stats().warm_idle,
+            1,
+            "a hard-line-only cap has nothing to retire on"
+        );
+    }
+
+    #[test]
+    fn a_tainted_outcome_does_not_count_as_a_soft_strike() {
+        let registry = WarmRegistry::new(0, 0);
+        let a1 = att(acquire(&registry, "p", TEST_CAP));
+        // Tainted already retires; the point is that the heap figure taken
+        // after a terminate must not seed a strike on the NEXT instance.
+        registry.release("p", a1.id, true, TEST_CAP * 4, 0.0, true);
+        let a2 = att(acquire(&registry, "p", TEST_CAP));
+        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        assert_eq!(registry.stats().warm_idle, 1, "fresh instance, one strike");
+    }
+
+    #[test]
+    fn instances_with_different_soft_lines_are_not_shared() {
+        let registry = WarmRegistry::new(0, 0);
+        let managed = HeapCaps {
+            soft_bytes: TEST_CAP,
+            hard_bytes: TEST_CAP + 32 * TEST_MB,
+        };
+        let manual = HeapCaps {
+            soft_bytes: 0,
+            hard_bytes: TEST_CAP + 32 * TEST_MB,
+        };
+        let a1 = att(acquire_caps(&registry, "p", managed));
+        registry.release("p", a1.id, false, TEST_MB, 0.0, true);
+        let a2 = att(acquire_caps(&registry, "p", manual));
+        assert_ne!(
+            a2.id, a1.id,
+            "same hard line, different soft line — not interchangeable"
+        );
     }
 
     // ── Join vs spawn (#77) ────────────────────────────────────────────────

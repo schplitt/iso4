@@ -46,12 +46,16 @@ export interface GlobalOptions {
 export interface HostModuleObject {
   [name: string]: HostModuleValue;
 }
+export interface MemoryLimit {
+  soft?: number;
+  hard: number;
+}
 export interface OneOffResourceLimits extends ResourceLimits {
   memoryMb?: number;
 }
 export interface PrecompileOptions<G extends HostGlobals, M extends Imports> {
   code: string;
-  memoryMb?: number;
+  memoryMb?: number | MemoryLimit;
   globals?: G;
   imports?: M;
   limits?: ResourceLimits;
@@ -162,7 +166,7 @@ export interface Sandbox {
 export interface SandboxOptions {
   maxConcurrentRuns?: number;
   maxQueuedRuns?: number;
-  memoryMb?: number;
+  memoryMb?: number | MemoryLimit;
   memoryBudgetMb?: number;
   binaryPath?: string;
 }

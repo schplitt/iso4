@@ -290,13 +290,45 @@ Every call to `runtime.run(opts)`:
 }
 ```
 
-**Memory** is enforced by:
+**Memory** is two lines for a REUSED instance, one for a one-off (#169).
 
-- `v8::CreateParams::heap_limits(0, memoryMb * MB)` for the V8 heap.
+On a prefix, `memoryMb` is the **soft** line and the terminating cap sits a
+headroom band above it — `round(sqrt(8 × memoryMb))` MB, so 128 terminates at
+160. Write `memoryMb: { soft, hard }` for exact numbers, or `{ hard }` alone
+for a single terminating cap. On a one-off `run()`, `memoryMb` terminates
+exactly: a fresh isolate is never reused, so there is nothing to retire and
+no reason to loosen the number the caller asked for. The band buys reuse the
+room to be retired instead of killed; it is an optimization for warmth, not
+a general loosening of the limit.
+
+The **hard** line is enforced by:
+
+- `v8::CreateParams::heap_limits(0, hard * MB)` for the V8 heap.
 - A custom `v8::Allocator` tracking external `ArrayBuffer` bytes against the
   same budget. Without this, `new ArrayBuffer(2**30)` bypasses heap_limits.
 - `add_near_heap_limit_callback` converts OOM into a clean
   `terminate_execution` instead of a Rust-process abort.
+
+Crossing it terminates, taints and fails co-residents with
+`ERR_INSTANCE_RESET`, so only a runaway allocation gets there. The **soft**
+line is checked in the registry when a run completes — the heap figure is
+already read there — and fails nothing: an instance above it at two
+consecutive completions is marked dead (no new joins, dropped when its
+in-flight runs finish), and a completion below the line clears the count.
+That is the difference between a prefix that accumulates memory across reuse
+being *replaced* and it eventually killing a run. workerd's two-line model
+(`IsolateLimitEnforcer::exitJs` condemns, `hasExcessivelyExceededHeapLimit`
+kills); iso4's soft line needs no forced collection because every isolate
+runs at `MemoryPressureLevel::Moderate` — V8's default assumes it owns the
+machine and collects lazily, which is wrong in a container full of isolates
+(workerd throws the same switch at startup).
+
+Capacity reserves the **hard** line: `admit_isolate` must not admit an
+isolate whose real ceiling could tip the container past the 90% admission
+line — the banded ceiling for a prefix instance, the bare cap for a one-off.
+`maxConcurrentRuns`'s default divides the budget by the banded number, the
+wider of the two. Nothing else changes — the watermarks read measured container
+memory, never a configured cap.
 
 **CPU time** is wall-clock measured but bracketed: a timer starts every time
 V8 enters JS execution (`script.run`, `module.evaluate`, microtask
@@ -1949,7 +1981,9 @@ default; `prepare({ memoryMb })` overrides it per prefix (256 MB edge
 functions beside 32 MB codemode functions in one sandbox — the wire already
 carries the cap per run, instances of a prefix are created with its cap,
 and attach refuses a mismatch per the #81 ruling), and one-off `run()`
-takes `limits.memoryMb` since its isolate is fresh anyway. What stays
+takes `limits.memoryMb` since its isolate is fresh anyway — a plain number
+only there, because the soft line retires a warm instance and a one-off's
+isolate is never reused. What stays
 structurally impossible is a per-run value on a WARM instance: the cap is
 baked into `Isolate::new` and instances are shared across a prefix's runs,
 so prefix `execute()`/`call()` limits reject it. Heap and ArrayBuffer usage
@@ -1960,7 +1994,7 @@ is measured, not multiplied (see below).
 **Capacity (v4): global-memory marks, scored eviction — celld's model,
 adapted.** Two independent resources. `maxConcurrentRuns` (the slot pool's
 admission number) caps **concurrent runs** — its default is the core
-count, bounded by memory (`min(cores, budget / memoryMb)`) so the default
+count, bounded by memory (`min(cores, budget / hard-line)`) so the default
 never promises more concurrent heaps than the budget holds — with
 `maxQueuedRuns` (default 100 × slots) bounding the waiter queue behind it:
 past the bound, runs fail with `ERR_QUEUE_FULL` instead of growing an
@@ -1998,7 +2032,7 @@ prefix-aware acquire policy uses):
 - **The hard admission line (#77)**: above the budget, at 90 % of
   (container limit − 256 MB host reserve, computed by the runtime at
   startup), sits the one refusal rule — a NEW isolate is never created
-  when measured usage plus the run's own `memoryMb` would cross it, so the
+  when measured usage plus the run's own hard line (band included) would cross it, so the
   newest admission always leaves at least one worst-case isolate of
   headroom below the OOM kill. Refused runs fail with `ERR_CAPACITY`,
   deliberately unqueued: a queue is more memory exactly when there is
@@ -2024,7 +2058,9 @@ memory refuses that, the least-utilized instance takes it anyway. Joins are
 never gated by memory or the shedding latch — they add no isolate; spawns
 are gated by both, plus a per-prefix ceiling at the core count (more
 instances can never execute in parallel). Attach refuses only what #81
-ruled: dead (tainted/retiring) instances and a `memoryMb` mismatch.
+ruled: dead (tainted/retiring) instances and a heap-cap mismatch — the
+`(soft, hard)` pair, so instances retiring at different points are not
+interchangeable.
 Admission for a further instance of a recurring prefix uses its *measured*
 mean heap instead of the theoretical cap (seeded with the cap until data
 exists), so small-footprint prefixes scale further under the same line.
