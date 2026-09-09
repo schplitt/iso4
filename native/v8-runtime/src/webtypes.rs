@@ -415,6 +415,30 @@ pub fn install_with_streams(
         prev: std::cell::Cell::new(clock_init_ms),
     });
     tc.set_slot(clock);
+
+    // Last step: delete the removed globals (removals.js).
+    let source = v8::String::new(tc, REMOVALS_JS)
+        .ok_or_else(|| "intern removals source failed".to_string())?;
+    let origin_name = v8::String::new(tc, "iso4:removals")
+        .ok_or_else(|| "intern removals filename failed".to_string())?;
+    let origin = v8::ScriptOrigin::new(
+        tc,
+        origin_name.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let script = v8::Script::compile(tc, source, Some(&origin))
+        .ok_or_else(|| exception_text(tc, "compile removals"))?;
+    script
+        .run(tc)
+        .ok_or_else(|| exception_text(tc, "evaluate removals"))?;
     Ok(())
 }
 
@@ -457,6 +481,10 @@ fn exception_text(
 /// external-references table for every native callback above (see module
 /// docs); the nearer-term step is a process-wide code cache.
 const RUNTIME_JS: &str = include_str!("webtypes.js");
+
+/// Globals deleted from every context (SharedArrayBuffer, WebAssembly).
+/// Runs after `RUNTIME_JS` so nothing installed there resurrects one.
+const REMOVALS_JS: &str = include_str!("removals.js");
 
 // ── Adapter ──────────────────────────────────────────────────────────────────
 //

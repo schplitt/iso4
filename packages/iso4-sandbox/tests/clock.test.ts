@@ -2,10 +2,11 @@
  * Timing posture pins (DESIGN.md §1.2): the sandbox clock is frozen while
  * guest code executes and advances only when the runtime regains control at
  * an event — run entry, bridge responses, stream frames (to real wall
- * time), and native timer fires (to the timer's SCHEDULED time only, #79).
+ * time), and native timer fires (to the timer's SCHEDULED time only).
  * All guest-visible clocks (Date, no-arg Intl.DateTimeFormat formatting,
- * Temporal.Now) read the same frozen value; SharedArrayBuffer is removed and
- * Atomics.wait is disabled, so no replacement timer can be built.
+ * Temporal.Now) read the same frozen value; SharedArrayBuffer and WebAssembly
+ * (whose shared Memory mints one) are removed and Atomics.wait is disabled,
+ * so no replacement timer can be built.
  *
  * These are behavioral pins, not feature tests: a failure here means the
  * timing posture regressed, which is a security property.
@@ -205,7 +206,7 @@ describe('frozen clock — warm prefix path', () => {
   })
 })
 
-describe('frozen clock — native timers (#79)', () => {
+describe('frozen clock — native timers', () => {
   // Timers virtualize onto the frozen clock, the workerd model: the delay
   // is scheduled FROM the frozen value and the fire advances the clock TO
   // exactly the scheduled value. A timer therefore never reveals real
@@ -285,12 +286,9 @@ describe('no replacement timers', () => {
   test('Atomics stays usable on plain ArrayBuffers, but Atomics.wait throws', async () => {
     const out = await evalDefault(`
       const plain = Atomics.add(new Int32Array(new ArrayBuffer(8)), 0, 1)
-      // Wasm shared memory can still mint a shared buffer; without a second
-      // thread it is inert, and the one blocking primitive throws:
       let waitResult
       try {
-        const mem = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true })
-        Atomics.wait(new Int32Array(mem.buffer), 0, 0, 5)
+        Atomics.wait(new Int32Array(new ArrayBuffer(8)), 0, 0, 5)
         waitResult = 'did not throw'
       }
       catch (e) {

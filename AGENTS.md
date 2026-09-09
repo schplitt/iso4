@@ -351,6 +351,10 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   Rationale essays belong in DESIGN.md, the commit message, or the PR, not
   above the statement. (The codebase still carries old blocks like this;
   do not add more, and shorten them when you touch one anyway.)
+- Do not reference GitHub issues or PRs (`#123`-style) in code comments —
+  that history belongs in the commit message and the PR. Remove old
+  references when you touch a comment that has one. The gitignored
+  `internal/` notes are the exception and may cite issues freely.
 - Do not use `pnpm test` in automation.
 - Do not create tiny helper/utility functions or `parse*`/`normalize*`
   wrappers for trivial one-off logic.
