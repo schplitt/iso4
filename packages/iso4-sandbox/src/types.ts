@@ -94,7 +94,8 @@ export interface ResourceLimits {
   cpuTimeMs?: number
 
   /**
-   * Hard wall-clock cap including async waits.
+   * Cap on the run's own logic time — execution + async waits (the result's
+   * `wallTimeMs`). Engine time for co-resident runs doesn't count.
    * @default 30_000
    */
   wallTimeMs?: number
@@ -1293,7 +1294,22 @@ export interface CallSuccess {
   value: unknown
   stdout: string[]
   stderr: string[]
+  /**
+   * Complete wall-clock from dispatch to the processed conclusion — async
+   * waits, engine time for co-resident runs, machinery: everything. May
+   * exceed the `wallTimeMs` limit, which counts {@link wallTimeMs} instead.
+   */
   durationMs: number
+  /**
+   * The call's own logic time: execution plus async waits, each wait counted
+   * until its answer arrived — engine time is excluded and visible as
+   * `durationMs - wallTimeMs`. This is the number `limits.wallTimeMs` caps.
+   * `cpuTimeMs ≤ wallTimeMs ≤ durationMs`.
+   */
+  wallTimeMs: number
+  /**
+   * Active V8 execution only; bridge waits excluded (itemized in `bridgeCalls`).
+   */
   cpuTimeMs: number
   bridgeCalls: BridgeCallEntry[]
   /**
@@ -1375,9 +1391,14 @@ export interface WaitUntilResult {
    */
   status: 'settled' | 'truncated' | 'failed'
   /**
-   * Wall time of the grace phase (after the result shipped), ms.
+   * Complete wall time of the grace phase (after the result shipped), ms.
    */
   durationMs: number
+  /**
+   * The grace phase's own logic time — same rule as
+   * {@link RunSuccess.wallTimeMs}, metered separately from the run's.
+   */
+  wallTimeMs: number
   /**
    * Active V8 execution time during the grace phase, ms.
    */
@@ -1439,14 +1460,23 @@ export interface RunSuccess {
    */
   stderr: string[]
   /**
-   * Wall-clock time of the run (start of execution to result), measured in
-   * the runtime. Milliseconds with microsecond resolution.
+   * Complete wall-clock time of the run (dispatch to the processed
+   * conclusion), measured in the runtime — async waits, engine time for
+   * co-resident runs, machinery: everything. May exceed the `wallTimeMs`
+   * limit, which counts {@link wallTimeMs} instead. Milliseconds with
+   * microsecond resolution.
    */
   durationMs: number
   /**
+   * The run's own logic time: execution plus async waits, each wait counted
+   * until its answer arrived — engine time is excluded and visible as
+   * `durationMs - wallTimeMs`. This is the number `limits.wallTimeMs` caps.
+   * `cpuTimeMs ≤ wallTimeMs ≤ durationMs`.
+   */
+  wallTimeMs: number
+  /**
    * Active V8 execution time — time spent waiting on host bridge calls is
-   * excluded. Milliseconds with microsecond resolution. The remainder
-   * (`durationMs - cpuTimeMs`) is bridge waits plus scheduling.
+   * excluded. Milliseconds with microsecond resolution.
    */
   cpuTimeMs: number
   /**
@@ -1479,6 +1509,10 @@ export interface RunFailure {
   stdout: string[]
   stderr: string[]
   durationMs: number
+  /**
+   * See {@link RunSuccess.wallTimeMs}.
+   */
+  wallTimeMs: number
   cpuTimeMs: number
   bridgeCalls: BridgeCallEntry[]
   /**
@@ -1505,6 +1539,10 @@ export interface RunAborted {
   stdout: string[]
   stderr: string[]
   durationMs: number
+  /**
+   * See {@link RunSuccess.wallTimeMs}.
+   */
+  wallTimeMs: number
   cpuTimeMs: number
   /**
    * Bridge calls recorded before the abort landed. Populated when the runtime

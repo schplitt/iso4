@@ -110,6 +110,7 @@ interface SuccessSpec {
   stdout?: readonly string[]
   stderr?: readonly string[]
   durationMs?: number
+  wallTimeMs?: number
   cpuTimeMs?: number
   bridgeCalls?: readonly TestBridgeRecord[]
   heapUsedBytes?: number
@@ -129,6 +130,7 @@ interface FailureSpec {
   stdout?: readonly string[]
   stderr?: readonly string[]
   durationMs?: number
+  wallTimeMs?: number
   cpuTimeMs?: number
   bridgeCalls?: readonly TestBridgeRecord[]
   heapUsedBytes?: number
@@ -139,6 +141,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
     strList(spec.stdout ?? []),
     strList(spec.stderr ?? []),
     f64(spec.durationMs ?? 0),
+    f64(spec.wallTimeMs ?? 0),
     f64(spec.cpuTimeMs ?? 0),
     bridgeRecords(spec.bridgeCalls ?? []),
     optionalU64(spec.heapUsedBytes), // Optional<u64> heapUsedBytes

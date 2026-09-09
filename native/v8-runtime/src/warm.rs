@@ -130,6 +130,7 @@ pub(crate) fn dead_instance_outcome() -> sandbox::CallOutcome {
             stdout: Vec::new(),
             stderr: Vec::new(),
             duration_ms: 0.0,
+            wall_time_ms: 0.0,
             cpu_time_ms: 0.0,
             bridge_calls: Vec::new(),
         }),
@@ -1583,8 +1584,23 @@ mod tests {
                    export function bump() { return ++n }\n\
                    export async function viaTool(x) { console.log('run-' + x); const v = await tool(); return [x, v] }\n\
                    export async function hangBump() { n++; await tool(); return n }\n\
+                   export async function twoTools() { const a = await tool(); const b = await tool(); return a + b }\n\
                    export function spin() { for (;;) {} }\n\
                    export async function spinAfterTool() { await tool(); for (;;) {} }\n\
+                   export function busy(c) { let x = 0; for (let i = 0; i < c; i++) x = (x + i) & 1048575; return x }"
+                .to_string(),
+            filename: None,
+            globals: Vec::new(),
+            declared_globals: vec!["tool".to_string()],
+            declared_imports: Vec::new(),
+        })
+    }
+
+    fn timer_order_prefix() -> Arc<PrefixData> {
+        Arc::new(PrefixData {
+            code: "const marks = []\n\
+                   export async function sleepMark(ms) { await new Promise(r => setTimeout(() => { marks.push('t'); r() }, ms)); return marks.join(',') }\n\
+                   export function mark() { marks.push('j'); return marks.join(',') }\n\
                    export function busy(c) { let x = 0; for (let i = 0; i < c; i++) x = (x + i) & 1048575; return x }"
                 .to_string(),
             filename: None,
@@ -2344,6 +2360,134 @@ mod tests {
             TestValue::Number(1.0)
         );
         assert!(!out_a.tainted);
+        // The telemetry triple: duration is real elapsed (C's spin included),
+        // wall is A's own logic time (its wait ended when the response
+        // ARRIVED at ~10 ms), cpu only its turns.
+        assert!(v.duration_ms > 160.0, "duration includes the engine's time");
+        assert!(
+            v.wall_time_ms < 150.0,
+            "wall excludes the delivery lag behind C's spin (got {})",
+            v.wall_time_ms
+        );
+        assert!(v.cpu_time_ms <= v.wall_time_ms && v.wall_time_ms <= v.duration_ms);
+    }
+
+    #[test]
+    fn the_wall_budget_excludes_engine_time() {
+        // The wall limit erodes on the run's own logic time. A's answer
+        // arrives early but is delivered long after `start + wallTimeMs`
+        // real time; A must keep its remaining budget and finish a SECOND
+        // bridge round-trip afterwards, instead of hitting a real-time
+        // deadline that expired while the engine was busy elsewhere.
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let started = Instant::now();
+        let a = submit_session_job(
+            &handle, 51, "twoTools", vec![],
+            sink.clone(), &counter,
+            sandbox::Limits {
+                wall_time_ms: 150,
+                ..Default::default()
+            },
+        );
+        let (a_run, c1) = read_bridge_call(&mut server);
+        assert_eq!(a_run, 51);
+
+        // Occupy the loop far past A's 150 ms (loud guard below).
+        let c = submit_session_job(
+            &handle, 53, "busy", vec![TestValue::Number(1_500_000_000.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        std::thread::sleep(Duration::from_millis(10));
+        // Arrives at ~10 ms of A's counted time; delivered only after C.
+        a.send(bridge_response_event(51, c1, 1.0));
+
+        let out_c = c.outcome.recv_timeout(Duration::from_secs(30)).expect("C completes");
+        assert!(!out_c.tainted);
+        out_c.result.expect("busy() succeeds");
+        assert!(
+            started.elapsed() > Duration::from_millis(160),
+            "busy() finished before A's wall — raise its iteration count"
+        );
+
+        // A resumed with ~140 ms of budget left: the second round-trip
+        // happens entirely after the real-time instant `start + 150 ms`.
+        let (a_run2, c2) = read_bridge_call(&mut server);
+        assert_eq!(a_run2, 51);
+        a.send(bridge_response_event(51, c2, 2.0));
+
+        let out_a = a.outcome.recv_timeout(Duration::from_secs(5)).expect("A concludes");
+        let v = out_a.result.expect(
+            "the wall budget counts A's own time only — engine time while C \
+             spun must not expire it",
+        );
+        assert!(!out_a.tainted);
+        assert_eq!(testval::from_blob(&v.exports), TestValue::Number(3.0));
+        assert!(v.wall_time_ms < 150.0, "counted wall stays within the cap (got {})", v.wall_time_ms);
+        assert!(v.duration_ms > 160.0, "real elapsed ran past the cap");
+    }
+
+    #[test]
+    fn a_due_timer_beats_a_job_burst() {
+        // A timer that came due while the loop was busy fires before jobs
+        // stamped after it — overdue work beats admitting new runs.
+        sandbox::init_platform();
+        let (_server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(timer_order_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let started = Instant::now();
+        let a = submit_session_job(
+            &handle, 41, "sleepMark", vec![TestValue::Number(20.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        // Calibrated far above the timer on any machine; the elapsed assert
+        // below fails loudly if it ever gets too fast.
+        let b = submit_session_job(
+            &handle, 42, "busy", vec![TestValue::Number(1_500_000_000.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        // Enqueue the burst only once A's timer is safely due, so both job
+        // stamps land after it.
+        std::thread::sleep(Duration::from_millis(60));
+        let j1 = submit_session_job(
+            &handle, 43, "mark", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let j2 = submit_session_job(
+            &handle, 44, "mark", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+
+        let out_b = b.outcome.recv_timeout(Duration::from_secs(30)).expect("B completes");
+        assert!(!out_b.tainted);
+        out_b.result.expect("busy() succeeds");
+        assert!(
+            started.elapsed() > Duration::from_millis(80),
+            "busy() finished before A's timer was due — raise its iteration \
+             count, the scenario no longer queues the jobs behind a busy turn"
+        );
+
+        let out_a = a.outcome.recv_timeout(Duration::from_secs(5)).expect("A concludes");
+        let v = out_a.result.expect("A settles via its timer");
+        assert!(!out_a.tainted);
+        assert_eq!(
+            testval::from_blob(&v.exports),
+            TestValue::String("t".to_string()),
+            "A's due timer must fire before the queued jobs' start turns"
+        );
+        // The burst ran after the timer: each job sees the mark ahead of its own.
+        let v1 = j1.outcome.recv_timeout(Duration::from_secs(5)).expect("mark 1 concludes")
+            .result.expect("mark 1 ok");
+        assert_eq!(testval::from_blob(&v1.exports), TestValue::String("t,j".to_string()));
+        let v2 = j2.outcome.recv_timeout(Duration::from_secs(5)).expect("mark 2 concludes")
+            .result.expect("mark 2 ok");
+        assert_eq!(testval::from_blob(&v2.exports), TestValue::String("t,j,j".to_string()));
     }
 
     #[test]

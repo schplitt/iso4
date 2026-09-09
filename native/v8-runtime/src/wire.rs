@@ -202,6 +202,9 @@ pub struct RunSuccessPayload {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub duration_ms: f64,
+    /// The run's own logic time: execution + async waits counted until the
+    /// answer arrived; engine time excluded. `cpu ≤ wall ≤ duration`.
+    pub wall_time_ms: f64,
     /// Active V8 execution time (bridge waits excluded), in ms.
     pub cpu_time_ms: f64,
     /// One record per bridge call attempt, in attempt order.
@@ -224,6 +227,8 @@ pub struct RunFailurePayload {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub duration_ms: f64,
+    /// See `RunSuccessPayload::wall_time_ms`.
+    pub wall_time_ms: f64,
     /// Active V8 execution time (bridge waits excluded), in ms.
     pub cpu_time_ms: f64,
     /// One record per bridge call attempt, in attempt order.
@@ -252,6 +257,7 @@ pub enum RunCompletion {
 ///   List<String>  stdout
 ///   List<String>  stderr
 ///   f64  durationMs
+///   f64  wallTimeMs
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
 ///   Optional<u64>  heapUsedBytes   (present for prefix runs)
@@ -262,6 +268,7 @@ pub enum RunCompletion {
 ///   List<String>  stdout
 ///   List<String>  stderr
 ///   f64  durationMs
+///   f64  wallTimeMs
 ///   f64  cpuTimeMs
 ///   List<BridgeCallRecord>  bridgeCalls
 ///   Optional<u64>  heapUsedBytes   (present for prefix runs)
@@ -279,6 +286,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_string_list(&s.stdout, &mut out);
             encode_string_list(&s.stderr, &mut out);
             encode_f64(s.duration_ms, &mut out);
+            encode_f64(s.wall_time_ms, &mut out);
             encode_f64(s.cpu_time_ms, &mut out);
             encode_bridge_call_records(&s.bridge_calls, &mut out);
             encode_optional_u64(s.heap_used_bytes, &mut out);
@@ -293,6 +301,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
             encode_string_list(&f.stdout, &mut out);
             encode_string_list(&f.stderr, &mut out);
             encode_f64(f.duration_ms, &mut out);
+            encode_f64(f.wall_time_ms, &mut out);
             encode_f64(f.cpu_time_ms, &mut out);
             encode_bridge_call_records(&f.bridge_calls, &mut out);
             encode_optional_u64(f.heap_used_bytes, &mut out);
@@ -310,6 +319,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
 /// u32   runId
 /// u8    status  (0 = settled, 1 = truncated, 2 = failed)
 /// f64   durationMs      (grace wall time after the Result)
+/// f64   wallTimeMs      (counted grace logic time)
 /// f64   cpuTimeMs       (active V8 time during grace)
 /// List<String>  stdout  (console lines written during grace)
 /// List<String>  stderr
@@ -325,6 +335,7 @@ pub fn encode_run_complete_payload(run_id: u32, report: &crate::v8::GraceReport)
         crate::v8::GraceStatus::Failed => 2,
     });
     encode_f64(report.duration_ms, &mut out);
+    encode_f64(report.wall_time_ms, &mut out);
     encode_f64(report.cpu_time_ms, &mut out);
     encode_string_list(&report.stdout, &mut out);
     encode_string_list(&report.stderr, &mut out);
@@ -347,6 +358,7 @@ pub fn encode_minimal_run_complete(run_id: u32, status_byte: u8) -> Vec<u8> {
     let mut out = Vec::new();
     encode_u32(run_id, &mut out);
     out.push(status_byte);
+    encode_f64(0.0, &mut out);
     encode_f64(0.0, &mut out);
     encode_f64(0.0, &mut out);
     encode_string_list(&[], &mut out);
@@ -843,6 +855,7 @@ mod tests {
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 duration_ms: 1.0,
+                wall_time_ms: 1.0,
                 cpu_time_ms: 1.0,
                 bridge_calls: Vec::new(),
                 heap_used_bytes: None,

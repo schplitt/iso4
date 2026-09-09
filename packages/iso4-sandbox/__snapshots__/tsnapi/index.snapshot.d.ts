@@ -27,6 +27,7 @@ export interface CallSuccess {
   stdout: string[];
   stderr: string[];
   durationMs: number;
+  wallTimeMs: number;
   cpuTimeMs: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
@@ -124,6 +125,7 @@ export interface RunFailure {
   stdout: string[];
   stderr: string[];
   durationMs: number;
+  wallTimeMs: number;
   cpuTimeMs: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
@@ -145,6 +147,7 @@ export interface RunSuccess {
   stdout: string[];
   stderr: string[];
   durationMs: number;
+  wallTimeMs: number;
   cpuTimeMs: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
@@ -194,6 +197,7 @@ export interface StringGlobal extends GlobalOptions {
 export interface WaitUntilResult {
   status: "settled" | "truncated" | "failed";
   durationMs: number;
+  wallTimeMs: number;
   cpuTimeMs: number;
   stdout: string[];
   stderr: string[];
