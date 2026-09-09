@@ -529,19 +529,35 @@ impl WarmRegistry {
         const MB: u64 = 1024 * 1024;
         Err(if run_cap_bytes == 0 {
             format!(
-                "no capacity for a new isolate: this run is uncapped (memoryMb: 0) and \
-                 measured container memory ({} MB) is at or above the memory budget ({} MB)",
+                "no capacity for a new isolate: this run is uncapped (memoryMb: 0), so \
+                 the memory budget is its refusal line — measured container memory \
+                 ({} MB) is at or above the budget ({} MB, set by memoryBudgetMb)",
                 usage_bytes / MB,
                 self.warm_budget_bytes / MB,
             )
         } else {
+            // The line's inputs aren't stored; reconstruct the limit it implies
+            // (exact modulo the derivation's /10 floor) so the shown arithmetic
+            // checks out even for test-injected lines.
+            let limit_bytes = self.hard_line_bytes / 9 * 10 + crate::container::NODE_RESERVE_BYTES;
+            let headroom_mb = self.hard_line_bytes.saturating_sub(usage_bytes) / MB;
+            let fit = if headroom_mb > 0 {
+                format!("the largest heap ceiling admissible right now is {headroom_mb} MB")
+            } else {
+                "no heap ceiling fits under the line until memory frees".to_string()
+            };
             format!(
                 "no capacity for a new isolate: measured container memory ({} MB) plus \
-                 this run's heap ceiling ({} MB) crosses the admission line ({} MB — 90% \
-                 of the container limit minus the host reserve)",
+                 this run's heap ceiling ({} MB) totals {} MB, crossing the admission \
+                 line of {} MB — 90% of (container limit {} MB minus host reserve \
+                 {} MB); {}",
                 usage_bytes / MB,
                 run_cap_bytes / MB,
+                usage_bytes.saturating_add(run_cap_bytes) / MB,
                 self.hard_line_bytes / MB,
+                limit_bytes / MB,
+                crate::container::NODE_RESERVE_BYTES / MB,
+                fit,
             )
         })
     }
@@ -1300,6 +1316,17 @@ mod tests {
             panic!("128 MB run at 800/900 MB must be refused");
         };
         assert!(msg.contains("admission line"), "message names the line: {msg}");
+        // The reader can reconstruct the whole calculation: the explicit sum,
+        // the line's derivation inputs, and the cap that would still fit.
+        assert!(msg.contains("totals 928 MB"), "message states the sum: {msg}");
+        assert!(
+            msg.contains("90% of (container limit 1128 MB minus host reserve 128 MB)"),
+            "message derives the line: {msg}"
+        );
+        assert!(
+            msg.contains("admissible right now is 100 MB"),
+            "message states the headroom: {msg}"
+        );
         let small = att(acquire(&registry, "p", 64 * TEST_MB));
         registry.release("p", small.id, false, 0, 0.0, true);
 
@@ -1325,6 +1352,17 @@ mod tests {
         registry.reserve_oneoff(64 * TEST_MB).expect("a smaller run fits");
         assert_eq!(registry.stats().oneoff_running, 1);
         registry.release_oneoff();
+
+        // Usage past the line itself: the message says nothing fits instead
+        // of naming a largest admissible cap.
+        registry.set_usage_for_test(950 * TEST_MB);
+        let Err(msg) = registry.reserve_oneoff(64 * TEST_MB) else {
+            panic!("usage over the line must refuse any capped run");
+        };
+        assert!(
+            msg.contains("no heap ceiling fits under the line"),
+            "message reports zero headroom: {msg}"
+        );
     }
 
     #[test]
@@ -1343,6 +1381,10 @@ mod tests {
             panic!("uncapped run at the budget must be refused");
         };
         assert!(msg.contains("uncapped"), "message names the cause: {msg}");
+        assert!(
+            msg.contains("at or above the budget (100 MB, set by memoryBudgetMb)"),
+            "message states the budget and its knob: {msg}"
+        );
         assert!(registry.reserve_oneoff(0).is_err(), "one-offs identically");
     }
 
