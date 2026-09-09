@@ -1,7 +1,13 @@
-# ada-url's C++ is compiled by the runner's GCC; fold libstdc++ into the
-# binary so bookworm-era images (GLIBCXX ≤ 3.4.30) can still run it (#183).
+# ada-url's build.rs links -lstdc++ explicitly (dynamic); mute it via CXXSTDLIB
+# and link the archive instead, + -lgcc for its aarch64 atomics helpers (#183).
+# muldefs: libstdc++.a's ABI objects duplicate rusty_v8's bundled libc++abi;
+# first definition (V8's) wins, same resolution the dynamic binaries had.
+[env]
+CXXSTDLIB_x86_64-unknown-linux-gnu = ""
+CXXSTDLIB_aarch64-unknown-linux-gnu = ""
+
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-static-libstdc++"]
+rustflags = ["-C", "link-arg=-l:libstdc++.a", "-C", "link-arg=-lgcc", "-C", "link-arg=-Wl,-z,muldefs"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-static-libstdc++"]
+rustflags = ["-C", "link-arg=-l:libstdc++.a", "-C", "link-arg=-lgcc", "-C", "link-arg=-Wl,-z,muldefs"]
