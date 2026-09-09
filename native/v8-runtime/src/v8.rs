@@ -261,6 +261,15 @@ extern "C" fn near_heap_limit_cb(
     current_heap_limit + 32 * 1024 * 1024
 }
 
+/// Wasm is removed from the sandbox for now (DESIGN §7.5): the global is
+/// deleted by removals.js; this isolate-wide denial backstops codegen.
+unsafe extern "C" fn deny_wasm_codegen(
+    _context: v8::Local<v8::Context>,
+    _source: v8::Local<v8::String>,
+) -> bool {
+    false
+}
+
 /// Tracks how much active V8 execution time has elapsed.
 ///
 /// `enter()` / `leave()` bracket each period when V8 is actually running JS
@@ -1639,6 +1648,7 @@ fn run_module_inner(
     // caller. Matches workerd (SetAllowAtomicsWait(false)) and browser main
     // threads.
     isolate.set_allow_atomics_wait(false);
+    isolate.set_allow_wasm_code_generation_callback(deny_wasm_codegen);
 
     // Host modules receive their natively-built values through import.meta
     // (see `build_host_module`); the callback consults the resolver context to
@@ -4386,6 +4396,7 @@ fn new_capped_isolate(
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
     // Same rationale as the one-off path: no blocking Atomics.wait, ever.
     isolate.set_allow_atomics_wait(false);
+    isolate.set_allow_wasm_code_generation_callback(deny_wasm_codegen);
 
     let near_heap: Option<Box<NearHeapData>> = if hard_memory_mb > 0 {
         let data = Box::new(NearHeapData {
@@ -10535,6 +10546,41 @@ mod tests {
     fn precompile_runtime_error_is_reported() {
         let err = precompile(r#"throw new Error("prefix failed")"#, None, &[], &[], 0).unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
+    }
+
+    // ── Removed globals: WebAssembly, SharedArrayBuffer ─────────────────────
+
+    #[test]
+    fn one_off_runs_have_no_webassembly_or_sharedarraybuffer() {
+        let out = run_ok("export default [typeof WebAssembly, typeof SharedArrayBuffer].join('|')");
+        assert_eq!(get_default(&out).as_deref(), Some("undefined|undefined"));
+    }
+
+    #[test]
+    fn warm_instance_setup_and_runs_have_no_webassembly() {
+        // Deleted before prefix evaluation too: no reference can be captured
+        // at prepare() time and handed to run code.
+        let prefix = prepared(
+            "globalThis.atSetup = [typeof WebAssembly, typeof SharedArrayBuffer].join('|')",
+            &[],
+            &[],
+        );
+        let out = execute_with_prefix(
+            prefix,
+            Some("export default atSetup + '|' + typeof WebAssembly"),
+            None,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("undefined|undefined|undefined")
+        );
     }
 
     // ── Code generation from strings is a prepare()-time capability ─────────

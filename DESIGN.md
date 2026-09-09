@@ -1138,7 +1138,18 @@ Documented up front so we don't drift into rebuilding secure-exec:
    run should be code the host actually handed over, not strings assembled
    from per-run input. There is no override.
 
-5. **No WebAssembly.** `set_allow_wasm_code_generation_callback(_ => false)`.
+5. **No WebAssembly — for now.** The `WebAssembly` global is deleted from
+   every context (`removals.js`, alongside `SharedArrayBuffer`), so guest
+   code sees `typeof WebAssembly === 'undefined'` and feature-detects like
+   a browser without wasm. Deleting the global — not just denying codegen —
+   also closes the `WebAssembly.Memory({ shared: true })` constructor, which
+   mints a real `SharedArrayBuffer` that the `SharedArrayBuffer` deletion
+   alone cannot reach. Underneath,
+   `set_allow_wasm_code_generation_callback(_ => false)` denies compilation
+   isolate-wide as defense in depth (denial surfaces as a catchable
+   `WebAssembly.CompileError`: "Wasm code generation disallowed by
+   embedder"). Reintroducing wasm as a supported capability is planned for
+   a later phase (#122).
 
 6. **No shared state between runs — as a contract.** One-off `sandbox.run()`
    is always a fresh `v8::Context`, and no run may *depend* on state left by

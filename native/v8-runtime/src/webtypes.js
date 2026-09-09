@@ -1235,14 +1235,6 @@
       if (Now.plainTimeISO)
         def(Now, 'plainTimeISO', (tz) => zoned(tz).toPlainTime())
     }
-
-    // SharedArrayBuffer: removed outright — shared memory plus a counting
-    // thread is the canonical replacement timer, and no guest has a second
-    // thread to share with anyway. Browsers hide it the same way outside
-    // cross-origin isolation, so libraries feature-detect its absence.
-    // (`Atomics` stays: legal on plain ArrayBuffers everywhere, and inert
-    // without shared memory; `Atomics.wait` is disabled isolate-wide in Rust.)
-    delete globalThis.SharedArrayBuffer
   }
 
   // ── Publish ────────────────────────────────────────────────────────────────

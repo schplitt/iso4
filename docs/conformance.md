@@ -222,7 +222,7 @@ rather than at first call.
 | `Error.captureStackTrace`             | ✅  | V8 extension; `Error.stackTraceLimit` is 10                                                         |
 | `SharedArrayBuffer`                   | ❌  | deleted from the global object                                                                      |
 | `Atomics`                             | 🟡  | present and legal on plain `ArrayBuffer`s; `Atomics.wait` is disabled isolate-wide                  |
-| `WebAssembly`                         | 🟡  | **see the deviation below**                                                                         |
+| `WebAssembly`                         | ❌  | deleted from the global object; wasm codegen is additionally denied isolate-wide. `DESIGN.md` §7.5  |
 | `process` `Buffer` `require` `global` | ❌  | Node globals are not provided                                                                       |
 | `navigator` `self` `caches` `crypto`  | ❌  |                                                                                                     |
 
@@ -234,21 +234,6 @@ call site. There is no override. This is the same line workerd draws.
 ---
 
 ## Known deviations
-
-**WebAssembly is documented as disabled and is not.** `DESIGN.md` §7.5 says
-`set_allow_wasm_code_generation_callback(_ => false)`; that callback is not
-installed on either isolate path. Measured today: `new WebAssembly.Module`,
-`WebAssembly.validate` and `WebAssembly.compile` all succeed from run code.
-Cloudflare forbids exactly these for security reasons. Tracked as
-[#122](https://github.com/schplitt/iso4/issues/122).
-
-**`WebAssembly.Memory({ shared: true })` mints a `SharedArrayBuffer`**, even
-though the constructor is deleted from the global object. Shared memory plus a
-counting thread is the canonical way to rebuild a high-resolution timer, so
-this is the one hole in the frozen clock. It is inert in practice — the guest
-has no second thread to share the buffer with, and `Atomics.wait` is disabled
-isolate-wide — but it should not be reachable. Blocking wasm code generation
-closes it too.
 
 **Prefix console output at `prepare()` is discarded.** Validation runs in a
 throwaway isolate with no result frame to carry the bytes. Prefix logging is
