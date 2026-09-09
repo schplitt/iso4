@@ -3,7 +3,7 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, container, oom, rss, session};
+use iso4_v8_runtime::{blob, container, ipc, oom, policy, rss, session};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
@@ -53,6 +53,32 @@ fn main() {
     };
 
     eprintln!("[iso4-v8] listening on {socket_path}");
+
+    // One line answering what a capacity refusal makes an operator ask:
+    // where the lines sit and what derived them.
+    const MB: u64 = 1024 * 1024;
+    let budget = if warm_budget_bytes == 0 {
+        "disabled".to_string()
+    } else {
+        format!("{} MB", warm_budget_bytes / MB)
+    };
+    let default_heap_mb = ipc::DEFAULT_MEMORY_MB;
+    let warm_ceiling_mb = default_heap_mb + policy::heap_band_mb(default_heap_mb);
+    match container::limit_info() {
+        Some((limit, source)) => eprintln!(
+            "[iso4-v8] capacity: container limit {} MB ({source}), host reserve {} MB, \
+             admission line {} MB, warm budget {budget}, default run heap \
+             {default_heap_mb} MB (warm-run ceiling {warm_ceiling_mb} MB)",
+            limit / MB,
+            container::NODE_RESERVE_BYTES / MB,
+            hard_line_bytes / MB,
+        ),
+        None => eprintln!(
+            "[iso4-v8] capacity: container limit unreadable — admission line disabled; \
+             warm budget {budget}, default run heap {default_heap_mb} MB \
+             (warm-run ceiling {warm_ceiling_mb} MB)"
+        ),
+    }
 
     // Shared state across all connection threads: prefix snapshots and the
     // counter used to generate unique PrefixIds. Access control is the

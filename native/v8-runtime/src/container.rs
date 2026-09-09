@@ -24,8 +24,9 @@ use std::time::Instant;
 /// Reserved for the Node host + this runtime's own overhead when deriving
 /// the admission line from the container limit. Mirrored by the host's
 /// budget derivation (`index.ts` `defaultMemoryBudgetMb`) — change both
-/// together. A measured reserve replaces this constant later (#165).
-pub const NODE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+/// together. Sized for a typical Node host (~80 MB measured) with margin;
+/// a measured reserve replaces this constant later.
+pub const NODE_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The hard admission line: 90% of (container limit − Node reserve). An
 /// isolate is only ever created while measured usage + the run's own heap
@@ -39,11 +40,18 @@ pub fn admission_line_bytes() -> u64 {
     }
 }
 
-/// The container's memory limit, read once: cgroup v2 → cgroup v1 → host
-/// total. `None` only when even the host total is unreadable.
-pub fn limit_bytes() -> Option<u64> {
-    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+/// The container's memory limit and the meter it was read from ("cgroup
+/// v2" → "cgroup v1" → "host total"), read once. `None` only when even the
+/// host total is unreadable.
+pub fn limit_info() -> Option<(u64, &'static str)> {
+    static LIMIT: OnceLock<Option<(u64, &'static str)>> = OnceLock::new();
     *LIMIT.get_or_init(read_limit)
+}
+
+/// The container's memory limit, read once. `None` only when even the host
+/// total is unreadable.
+pub fn limit_bytes() -> Option<u64> {
+    limit_info().map(|(bytes, _)| bytes)
 }
 
 /// Measured global usage (the cgroup working set), or `None` when no
@@ -74,19 +82,19 @@ pub fn usage_bytes() -> Option<u64> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_limit() -> Option<u64> {
+fn read_limit() -> Option<(u64, &'static str)> {
     // cgroup v2: "max" or bytes. v1: a near-2^63 sentinel means unlimited
     // (treat anything ≥ 2^50 as no limit, like Node's constrainedMemory).
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
         match s.trim().parse::<u64>() {
-            Ok(n) if n < 1 << 50 => return Some(n),
+            Ok(n) if n < 1 << 50 => return Some((n, "cgroup v2")),
             _ => {} // "max" or sentinel: fall through to the host total
         }
     }
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
         if let Ok(n) = s.trim().parse::<u64>() {
             if n < 1 << 50 {
-                return Some(n);
+                return Some((n, "cgroup v1"));
             }
         }
     }
@@ -99,11 +107,11 @@ fn read_limit() -> Option<u64> {
         .nth(1)?
         .parse()
         .ok()?;
-    Some(kb * 1024)
+    Some((kb * 1024, "host total"))
 }
 
 #[cfg(target_os = "macos")]
-fn read_limit() -> Option<u64> {
+fn read_limit() -> Option<(u64, &'static str)> {
     let mut size: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
     let name = c"hw.memsize";
@@ -116,11 +124,11 @@ fn read_limit() -> Option<u64> {
             0,
         )
     };
-    (rc == 0 && size > 0).then_some(size)
+    (rc == 0 && size > 0).then_some((size, "host total"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_limit() -> Option<u64> {
+fn read_limit() -> Option<(u64, &'static str)> {
     None
 }
 

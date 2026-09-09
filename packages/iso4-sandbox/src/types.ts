@@ -666,7 +666,7 @@ export interface SandboxOptions {
    *
    * Above the budget sits one more, non-configurable line: the runtime
    * never CREATES an isolate when measured usage plus the run's own
-   * `memoryMb` would cross 90 % of the container limit (minus a 256 MB
+   * `memoryMb` would cross 90 % of the container limit (minus a 128 MB
    * host reserve) — such a run fails with `ERR_CAPACITY` instead, so the
    * newest admission can never be what tips the container into an OOM
    * kill. Runs with `memoryMb: 0` (uncapped) are refused already from the
@@ -676,7 +676,7 @@ export interface SandboxOptions {
    * `dispose()`, and uncapped runs are never refused). Independent of
    * `memoryMb`: usage is measured, not derived from per-isolate caps.
    *
-   * Default: 80 % of what remains of the container limit after a 256 MB
+   * Default: 80 % of what remains of the container limit after a 128 MB
    * reserve for the Node host — container/cgroup-aware via
    * `process.constrainedMemory()`, falling back to `os.totalmem()`.
    * Services with a large host-side footprint should set this lower.
