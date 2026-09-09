@@ -138,14 +138,14 @@ describe('memory budget → live-isolate cap', () => {
   })
 
   test('a small-memory host floors the default budget instead of disabling it', async () => {
-    // On a host at or below the 512 MB safety net the derived default goes
-    // to zero or negative — which must NOT silently disable the watermarks
-    // on exactly the machines that need them (the count cap that used to
-    // backstop this case is gone). The default floors at 64 MB; explicit
-    // memoryBudgetMb: 0 stays the only opt-out.
+    // On a host at or below the 128 MB host reserve the derived default
+    // goes to zero or negative — which must NOT silently disable the
+    // watermarks on exactly the machines that need them (the count cap that
+    // used to backstop this case is gone). The default floors at 64 MB;
+    // explicit memoryBudgetMb: 0 stays the only opt-out.
     const constrained = vi
       .spyOn(process, 'constrainedMemory')
-      .mockReturnValue(256 * 1024 * 1024)
+      .mockReturnValue(128 * 1024 * 1024)
     try {
       await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
       const stats = await sandbox.stats()
@@ -178,9 +178,9 @@ describe('memory budget → live-isolate cap', () => {
       const stats = await sandbox.stats()
       const totalMb = totalmem() / (1024 * 1024)
       // The default budget must be clamped to the host total, not the
-      // sentinel; stats reports it in bytes. 80% of (total − the 256 MB
+      // sentinel; stats reports it in bytes. 80% of (total − the 128 MB
       // host reserve).
-      const expected = Math.floor((totalMb - 256) * 0.8) * 1024 * 1024
+      const expected = Math.floor((totalMb - 128) * 0.8) * 1024 * 1024
       expect(stats.budgetBytes).toBe(expected)
     } finally {
       constrained.mockRestore()
@@ -190,7 +190,7 @@ describe('memory budget → live-isolate cap', () => {
   test('the default budget respects a container memory constraint', async () => {
     // Pretend the process runs in a 2 GB container: constrainedMemory()
     // reports the cgroup limit os.totalmem() cannot see. Budget = 80% of
-    // (2048 − the 256 MB host reserve) = 1433 MB — the shedding mark the
+    // (2048 − the 128 MB host reserve) = 1536 MB — the shedding mark the
     // runtime holds against global container memory.
     const constrained = vi
       .spyOn(process, 'constrainedMemory')
@@ -198,7 +198,7 @@ describe('memory budget → live-isolate cap', () => {
     try {
       await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
       const stats = await sandbox.stats()
-      expect(stats.budgetBytes).toBe(Math.floor((2048 - 256) * 0.8) * 1024 * 1024)
+      expect(stats.budgetBytes).toBe(Math.floor((2048 - 128) * 0.8) * 1024 * 1024)
     } finally {
       constrained.mockRestore()
     }

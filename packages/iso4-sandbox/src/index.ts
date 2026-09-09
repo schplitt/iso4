@@ -245,10 +245,11 @@ function resolveWarmBudgetBytes(memoryBudgetMb: number | undefined): number {
 /**
  * The Node-host reserve subtracted from the container limit before any
  * capacity line is drawn. Mirrors the runtime's `container.rs`
- * `NODE_RESERVE_BYTES` — change both together. A measured reserve replaces
- * this constant later (#165).
+ * `NODE_RESERVE_BYTES` — change both together. Sized for a typical Node
+ * host (~80 MB measured) with margin; a measured reserve replaces this
+ * constant later.
  */
-const NODE_RESERVE_MB = 256
+const NODE_RESERVE_MB = 128
 
 /**
  * Default memory budget (the 80% shedding mark): 80% of what remains of the

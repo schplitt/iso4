@@ -24,8 +24,9 @@ use std::time::Instant;
 /// Reserved for the Node host + this runtime's own overhead when deriving
 /// the admission line from the container limit. Mirrored by the host's
 /// budget derivation (`index.ts` `defaultMemoryBudgetMb`) — change both
-/// together. A measured reserve replaces this constant later (#165).
-pub const NODE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+/// together. Sized for a typical Node host (~80 MB measured) with margin;
+/// a measured reserve replaces this constant later.
+pub const NODE_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The hard admission line: 90% of (container limit − Node reserve). An
 /// isolate is only ever created while measured usage + the run's own heap
