@@ -21,6 +21,12 @@ npm i @iso4/sandbox
 npm i @iso4/fetch
 ```
 
+Prebuilt binaries exist for macOS (arm64, x64) and glibc Linux (arm64, x64;
+glibc ≥ 2.34 — Debian 12 "bookworm" / Ubuntu 22.04 or newer). musl-based
+images such as Alpine (`node:*-alpine`) are **not supported** — the binary
+won't start there; use a `node:*-slim` image instead ([#186](https://github.com/schplitt/iso4/issues/186)
+tracks musl support).
+
 ## Quick start
 
 ```ts
