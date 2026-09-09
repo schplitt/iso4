@@ -1,0 +1,7 @@
+# ada-url's C++ is compiled by the runner's GCC; fold libstdc++ into the
+# binary so bookworm-era images (GLIBCXX ≤ 3.4.30) can still run it (#183).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-static-libstdc++"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-static-libstdc++"]
