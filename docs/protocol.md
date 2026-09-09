@@ -665,7 +665,7 @@ distinct from absent.
 
 | Field                | Encoding        | Default  | Notes                                                                                                                                                            |
 | -------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memoryMb`           | `Optional<u32>` | `64`     | Zero = no limit.                                                                                                                                                 |
+| `memoryMb`           | `Optional<u32>` | `128`    | The **soft line** — the retirement trigger, not a kill. Zero = no soft line (and, with `hardMemoryMb` absent, no cap at all).                                    |
 | `cpuTimeMs`          | `Optional<u32>` | `5000`   | Zero = no limit.                                                                                                                                                 |
 | `wallTimeMs`         | `Optional<u32>` | `30000`  | Zero = no limit.                                                                                                                                                 |
 | `maxExportBytes`     | `Optional<u32>` | `16 MiB` | Max byte length of the exports value blob. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                                  |
@@ -674,6 +674,48 @@ distinct from absent.
 | `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
 | `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.               |
 | `graceMs`            | `Optional<u32>` | `30000`  | Wall budget for `waitUntil` background work after the Result ships, one budget for the whole registered set. Zero disables the grace phase entirely.             |
+| `hardMemoryMb`       | `Optional<u32>` | derived  | The **hard line** — V8's terminating heap cap. Absent = derived from `memoryMb` (see below). Zero = uncapped. Block's last field.                                |
+
+**The two heap lines (#169).** `memoryMb` and `hardMemoryMb` resolve together
+in `read_resource_limits`, so nothing downstream sees a half-decided cap. What
+an ABSENT `hardMemoryMb` means depends on the frame kind, because the band
+exists only for isolates that get reused:
+
+- `Run` — **strict**. A one-off gets a fresh isolate, never reused, so there
+  is nothing to retire: `memoryMb` is the terminating cap and there is no
+  soft line. Identical to the pre-#169 behavior.
+- `PrefixRun` / `Precompile` — **managed**. Instances are reused, so
+  `memoryMb` is the retirement line and a band above it terminates.
+
+| Frame       | `memoryMb` | `hardMemoryMb` | Soft  | Hard              |
+| ----------- | ---------- | -------------- | ----- | ----------------- |
+| `Run`       | absent     | absent         | none  | `128`             |
+| `Run`       | `n`        | absent         | none  | `n`               |
+| `Run`       | any        | `h`            | none  | `h`               |
+| `PrefixRun` | absent     | absent         | `128` | `128 + band(128)` |
+| `PrefixRun` | `n`        | absent         | `n`   | `n + band(n)`     |
+| `PrefixRun` | `n`        | `h` (`n < h`)  | `n`   | `h`               |
+| `PrefixRun` | `0`        | `h`            | none  | `h`               |
+| `PrefixRun` | `n ≥ h`    | `h`            | none  | `h`               |
+| either      | `0`        | absent         | none  | uncapped          |
+| either      | any        | `0`            | none  | uncapped          |
+
+`band(n)` is `policy::heap_band_mb` — `round(sqrt(8 × n))` MB, the geometric
+mean of the cap and 8 MB, so a small cap gets a large share of headroom and a
+large cap a small one (8 → +8, 32 → +16, 128 → +32, 512 → +64). It is
+monotonic, so a larger `memoryMb` never yields a smaller ceiling.
+
+An explicit `hardMemoryMb` is always taken as given; a soft line that could
+never fire first (at or above the hard line, or on a one-off) is dropped.
+
+Crossing the **hard** line terminates the executing JS, taints the instance
+and fails its co-residents with `ERR_INSTANCE_RESET` — the pre-#169 behavior,
+reached on a prefix only by a runaway allocation, and on a one-off at exactly
+the cap the caller asked for. Crossing the **soft** line fails
+nothing: a warm instance found above it at two consecutive run completions
+(`policy::SOFT_LINE_STRIKES`) is marked dead in the registry — no new joins,
+dropped once its in-flight runs finish. A completion below the line clears the
+count, so only sustained growth retires an instance.
 
 `GlobalDef`:
 
@@ -833,13 +875,14 @@ buffer, which would otherwise double the peak memory of every bridge call and
 place that allocation before the check meant to bound it.
 
 **BridgeResponse frame cap:** the sandbox cannot hold a response larger than
-its own memory budget, so `memoryMb × 1 MiB` is the natural and only limit.
-The session demux enforces it per run when routing the frame (the connection
-read ceiling is the largest in-flight allowance); a frame over its run's cap
-fails that run alone. When `memoryMb = 0` (unconstrained) the fallback is the
-global 64 MiB `DEFAULT_MAX_FRAME_LENGTH`. There is no separate per-response
-configuration field — to allow responses larger than 64 MiB, increase
-`memoryMb`.
+its own memory budget, so `memoryMb × 1 MiB` is the natural and only limit —
+the soft line where there is one, else the hard line, which is the number the
+caller named either way. The session demux enforces it per run when
+routing the frame (the connection read ceiling is the largest in-flight
+allowance); a frame over its run's cap fails that run alone. With no cap at
+all the fallback is the global 64 MiB `DEFAULT_MAX_FRAME_LENGTH`. There is no
+separate per-response configuration field — to allow responses larger than
+64 MiB, increase `memoryMb`.
 
 **`maxExportBytes` enforcement:** Rust copies the module namespace into a
 plain object, serializes it once, and checks the resulting **blob** length
@@ -1189,7 +1232,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | Code                                  | Cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's heap cap (`memoryMb` — a Runtime-level setting, carried in the limits slot of every frame by the host).                                                                                                                                                                                                                                                                                                                        |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's **hard** heap line (`memoryMb` plus its headroom band, or an explicit `hardMemoryMb` — a Runtime-level setting, carried in the limits slot of every frame by the host). Crossing the soft line produces no error at all.                                                                                                                                                                                                       |
 | `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `ERR_WALL_TIMEOUT`                    | Total runtime exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -1210,7 +1253,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `ERR_INSTANCE_RESET`                  | The run was an innocent victim: a co-resident run on the same shared instance was interrupted mid-execution (a CPU/memory/wall guard fired, or a forced abort landed on running code), so the instance could no longer be trusted and every run in flight on it failed. Carries `ResetInfo` (§5.6): the cause class and the culprit's wire run id. Telemetry fields are this run's real partial values. Never retried automatically — the victim may have had side effects. |
 | `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.7.                                                                                                                          |
-| `ERR_CAPACITY`                        | The memory admission refused the run: it needed a NEW isolate and measured global container memory plus the run's own `memoryMb` would cross the admission line (90% of container limit − host reserve) — or the run is uncapped (`memoryMb: 0`) while usage is at/above the budget. Nothing ran, telemetry is zero; retry when memory frees. Reuse of an existing warm instance is never refused for capacity.                                                             |
+| `ERR_CAPACITY`                        | The memory admission refused the run: it needed a NEW isolate and measured global container memory plus the run's own hard line (band included) would cross the admission line (90% of container limit − host reserve) — or the run is uncapped (`memoryMb: 0`) while usage is at/above the budget. Nothing ran, telemetry is zero; retry when memory frees. Reuse of an existing warm instance is never refused for capacity.                                              |
 | `ERR_QUEUE_FULL`                      | **Host-detected, never sent by the runtime.** The run was shed at the host's `maxQueuedRuns` bound — that many callers were already waiting for a run slot. Never reached the runtime; telemetry is zero.                                                                                                                                                                                                                                                                   |
 | `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure.                                                                                                                                                                                                                                                                                                                                                                                                                             |
 

@@ -29,6 +29,41 @@
  * disables that limit, whereas unset yields the runtime default.
  */
 /**
+ * The two heap lines a REUSED isolate is held to, when the managed default
+ * is not what you want. One-off `run()` isolates are never reused and take a
+ * plain `memoryMb` number, enforced exactly.
+ *
+ * - `hard` **terminates**: V8's heap cap. Crossing it kills whatever JS is
+ *   executing, taints the instance, and fails its co-resident runs with
+ *   `ERR_INSTANCE_RESET`. This is the ceiling the container reserves against
+ *   its admission line.
+ * - `soft` **retires**: a warm instance whose heap sits above it at two
+ *   consecutive finishes takes no further runs and is dropped once the runs
+ *   it is already serving complete. No run fails and nothing is terminated —
+ *   it is how a prefix that accumulates memory across reuse gets replaced
+ *   instead of eventually killing a run. Omit it for a hard line only.
+ *
+ * A plain `memoryMb: number` is the managed form of this: the number is the
+ * soft line and the hard line sits a headroom band above it (`+sqrt(8 × n)`
+ * MB, so 128 → 160). Write the object when you want the exact numbers.
+ */
+export interface MemoryLimit {
+  /**
+   * The retirement line, in megabytes. Omit for no soft line (a `hard`-only
+   * cap behaves exactly like the pre-#169 `memoryMb`). Must be an integer
+   * ≥ 1 and below `hard`.
+   */
+  soft?: number
+  /**
+   * The terminating cap, in megabytes. Must be an integer ≥ 1 — `0` is not
+   * accepted here, because an uncapped isolate has no line to enforce and a
+   * runaway allocation would take the whole runtime process down with a
+   * fatal OOM. Write `memoryMb: 0` for uncapped.
+   */
+  hard: number
+}
+
+/**
  * Limits for a one-off `sandbox.run()`, which always gets a fresh isolate —
  * so unlike prefix runs (whose isolates are shared and reused, cap set at
  * `prepare({ memoryMb })` or the sandbox default) it may cap its own heap.
@@ -36,9 +71,15 @@
 export interface OneOffResourceLimits extends ResourceLimits {
   /**
    * Hard cap on this run's isolate memory, in megabytes — V8 heap plus
-   * external `ArrayBuffer`s. `0` = uncapped (admitted against the memory
-   * budget instead of the 90% line — see `memoryBudgetMb`). Must be an
-   * integer ≥ 0.
+   * external `ArrayBuffer`s. Enforced exactly: this run dies at this number.
+   *
+   * A one-off always gets a fresh isolate, so — unlike a prefix's reused
+   * instances — there is nothing to retire and no headroom band. The number
+   * you write is the number that terminates. A plain number only, for the
+   * same reason: {@link MemoryLimit}'s soft line would be inert here.
+   *
+   * `0` = uncapped (admitted against the memory budget instead of the 90%
+   * line — see `memoryBudgetMb`). Must be an integer ≥ 0.
    * @default the sandbox-level `memoryMb` (128)
    */
   memoryMb?: number
@@ -588,11 +629,24 @@ export interface SandboxOptions {
    * reject it. Memory accumulates across calls on a warm instance —
    * hitting the cap taints the instance and the next call cold-starts.
    *
+   * A plain number is the MANAGED form for a prefix's reused instances: it
+   * is the retirement line, and the terminating cap sits a headroom band
+   * above it (`+sqrt(8 × n)` MB, so `128` terminates at 160). An instance
+   * over the number at two consecutive finishes is retired without failing
+   * anything; only a runaway allocation reaches the terminating cap. Pass a
+   * {@link MemoryLimit} to set the two lines yourself, or `{ hard }` alone
+   * for a single terminating cap and no retirement.
+   *
+   * One-off `run()` isolates take the same number as a plain hard cap — no
+   * band, no retirement, since a fresh isolate is never reused. So `128`
+   * means "retire a prefix instance at 128, kill it at 160" and "kill a
+   * one-off at 128".
+   *
    * Zero means no cap (such runs are admitted against the memory budget
    * instead of the 90% admission line). Must be an integer ≥ 0.
    * @default 128
    */
-  memoryMb?: number
+  memoryMb?: number | MemoryLimit
 
   /**
    * The runtime's memory budget (the shedding mark), in megabytes. The
@@ -848,17 +902,21 @@ export interface PrecompileOptions<
   code: string
 
   /**
-   * Hard cap on isolate memory for THIS prefix, in megabytes — V8 heap plus
+   * Cap on isolate memory for THIS prefix, in megabytes — V8 heap plus
    * external `ArrayBuffer`s, baked into every instance serving it (e.g.
    * 256 MB edge functions beside 32 MB codemode functions in one sandbox).
    * Per-prefix and per-one-off are the only granularities: a per-run value
    * on a warm instance stays impossible — the cap is fixed at isolate
-   * creation and instances are shared across runs. `0` = uncapped (admitted
-   * against the memory budget instead of the 90% line). Must be an integer
-   * ≥ 0.
+   * creation and instances are shared across runs.
+   *
+   * A plain number is the managed form (retirement line + headroom band);
+   * pass a {@link MemoryLimit} for exact lines. This is the granularity the
+   * soft line is really for: prefix instances are the ones that get reused
+   * long enough to accumulate. `0` = uncapped (admitted against the memory
+   * budget instead of the 90% line). Must be an integer ≥ 0.
    * @default the sandbox-level `memoryMb` (128)
    */
-  memoryMb?: number
+  memoryMb?: number | MemoryLimit
 
   /**
    * Declares the globals that sandbox code will be able to call.

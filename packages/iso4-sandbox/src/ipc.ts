@@ -16,9 +16,16 @@ import type {
  * became a Runtime-level setting (uniform heap cap, set at isolate
  * creation, impossible to renegotiate per run) — but the frame layout is
  * unchanged, so the encoder takes the public limits plus the sandbox-level
- * `memoryMb` injected by the `Sandbox`/`Prefix` implementations.
+ * heap caps injected by the `Sandbox`/`Prefix` implementations.
+ *
+ * `memoryMb` is the advertised cap (the runtime's soft line);
+ * `hardMemoryMb` overrides the terminating line, and when it is absent the
+ * runtime derives that line from `memoryMb` plus its headroom band.
  */
-export type WireResourceLimits = ResourceLimits & { memoryMb?: number }
+export type WireResourceLimits = ResourceLimits & {
+  memoryMb?: number
+  hardMemoryMb?: number
+}
 
 export const PROTOCOL_VERSION: 1 = 1
 
@@ -796,6 +803,7 @@ class PayloadWriter {
     this.writeOptionalU32(limits.maxBridgeCallBytes)
     this.writeOptionalU32(limits.maxBridgeCalls)
     this.writeOptionalU32(limits.graceMs)
+    this.writeOptionalU32(limits.hardMemoryMb)
     return this
   }
 
@@ -1015,7 +1023,7 @@ export interface RunPayloadOptions {
   runId: number
   code: string
   filename?: string
-  limits?: ResourceLimits
+  limits?: WireResourceLimits
   globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
   /**
@@ -1053,7 +1061,7 @@ export interface PrecompilePayloadOptions {
   requestId: number
   code: string
   filename?: string
-  limits?: ResourceLimits
+  limits?: WireResourceLimits
   globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
 }
@@ -1085,7 +1093,7 @@ export interface PrefixRunPayloadOptions {
    */
   code?: string
   filename?: string
-  limits?: ResourceLimits
+  limits?: WireResourceLimits
   globals?: readonly GlobalDefPayload[]
   /**
    * Host-import function-leaf rebindings. The declared module shapes are

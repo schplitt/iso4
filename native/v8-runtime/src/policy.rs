@@ -155,6 +155,31 @@ pub fn watermark_action(facts: &PressureFacts) -> PressureVerdict {
     }
 }
 
+/// Headroom above the advertised cap before the terminating line: the
+/// geometric mean of the cap and 8 MB (8 → +8, 128 → +32, 512 → +64).
+/// Monotonic, so a bigger cap never yields a smaller ceiling.
+pub fn heap_band_mb(cap_mb: u32) -> u32 {
+    if cap_mb == 0 {
+        return 0;
+    }
+    let band = ((8.0 * f64::from(cap_mb)).sqrt()).round();
+    band as u32
+}
+
+/// Consecutive over-the-soft-line finishes before an instance is retired.
+/// One crossing is a spike; two in a row is growth.
+pub const SOFT_LINE_STRIKES: u8 = 2;
+
+/// The soft line's verdict at one release: `(strikes, retire)`. A finish
+/// under the line clears the count.
+pub fn soft_strike(prev: u8, over_soft: bool) -> (u8, bool) {
+    if !over_soft {
+        return (0, false);
+    }
+    let strikes = prev.saturating_add(1);
+    (strikes, strikes >= SOFT_LINE_STRIKES)
+}
+
 /// A tenth of the idle population per pass, at least one. A proportion of
 /// what was just measured, because an eviction's effect on the sample is
 /// not visible until a later one — one-at-a-time feedback would stall.
@@ -167,7 +192,9 @@ fn shed_target(idle_count: usize) -> usize {
 pub struct AdmitFacts {
     /// Measured global container usage (same meter as [`PressureFacts`]).
     pub usage_bytes: u64,
-    /// The run's own heap cap (`memoryMb`) in bytes. `0` = uncapped.
+    /// The run's own TERMINATING heap cap in bytes — the hard line, cap
+    /// plus band, since that is what the isolate may actually reach.
+    /// `0` = uncapped.
     pub run_cap_bytes: u64,
     /// The hard admission line — `container::admission_line_bytes()`.
     /// `0` = no container limit readable, the line is disabled.
@@ -283,6 +310,40 @@ mod tests {
             heap_used_bytes: heap_mb * MB,
             last_used: now - idle,
         }
+    }
+
+    #[test]
+    fn the_band_shrinks_as_a_share_of_a_growing_cap() {
+        assert_eq!(heap_band_mb(0), 0, "uncapped has no band");
+        assert_eq!(heap_band_mb(8), 8, "at 8 MB the band equals the cap");
+        assert_eq!(heap_band_mb(32), 16);
+        assert_eq!(heap_band_mb(128), 32);
+        assert_eq!(heap_band_mb(512), 64);
+    }
+
+    #[test]
+    fn the_ceiling_never_shrinks_as_the_cap_grows() {
+        let mut prev = 0u32;
+        for cap in 1u32..=4096 {
+            let ceiling = cap + heap_band_mb(cap);
+            assert!(
+                ceiling >= prev,
+                "cap {cap} lowered the ceiling to {ceiling}"
+            );
+            prev = ceiling;
+        }
+    }
+
+    #[test]
+    fn one_soft_crossing_is_forgiven_and_two_in_a_row_retire() {
+        let (strikes, retire) = soft_strike(0, true);
+        assert_eq!((strikes, retire), (1, false), "first crossing only counts");
+        assert_eq!(soft_strike(strikes, true), (2, true), "second retires");
+    }
+
+    #[test]
+    fn a_clean_finish_clears_the_strike_count() {
+        assert_eq!(soft_strike(1, false), (0, false));
     }
 
     #[test]

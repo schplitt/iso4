@@ -27,7 +27,7 @@ npm i @iso4/fetch
 import { createSandbox } from '@iso4/sandbox'
 import { createSafeFetch } from '@iso4/fetch'
 
-const sandbox = await createSandbox({ memoryMb: 128 }) // default heap cap per isolate
+const sandbox = await createSandbox({ memoryMb: 128 }) // per-isolate heap cap
 
 // Validate and prepare host setup once
 const prefix = await sandbox.prepare({
@@ -158,6 +158,27 @@ const sandbox = await createSandbox({
   memoryBudgetMb: 2048, // RSS mark for the whole runtime process (0 = off)
 })
 ```
+
+`memoryMb` means two different things depending on whether the isolate is
+reused.
+
+**On a prefix**, the number is the retirement line: an instance whose heap sits
+above it when two runs in a row finish takes no new runs and drops once the
+runs it is already serving complete. Nothing fails. The terminating line sits a
+headroom band above it (`round(sqrt(8 × memoryMb))` MB, so 128 → 160); crossing
+_that_ kills the run and fails its co-residents, and only a runaway allocation
+gets there. The band is what lets a grown instance be replaced instead of
+killing a run at the number — an optimization for reuse.
+
+```ts
+await sandbox.prepare({ code, memoryMb: { soft: 96, hard: 256 } }) // exact lines
+await sandbox.prepare({ code, memoryMb: { hard: 128 } }) // terminate at 128, never retire
+```
+
+**On a one-off `run()`**, the number is enforced exactly — `memoryMb: 128`
+dies at 128. A fresh isolate is never reused, so there is nothing to retire
+and no band. It takes a plain number for the same reason: a soft line would
+be inert.
 
 The runtime watches its own process RSS. At or above `memoryBudgetMb` it
 evicts idle instances (largest heap × longest idle first) and stops adding new

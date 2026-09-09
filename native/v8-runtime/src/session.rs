@@ -443,11 +443,11 @@ type ConnRuns = Arc<Mutex<HashMap<u32, RunRoute>>>;
 /// under an in-flight frame, so a late big frame for a just-completed run
 /// reads fine and is discarded as late — only a frame the host could never
 /// have sent kills the connection.
-fn frame_cap_for(memory_mb: u32) -> u32 {
-    if memory_mb > 0 {
-        memory_mb.saturating_mul(1024 * 1024)
-    } else {
-        ipc::DEFAULT_MAX_FRAME_LENGTH
+fn frame_cap_for(limits: &ipc::ResourceLimits) -> u32 {
+    match (limits.soft_memory_mb, limits.hard_memory_mb) {
+        (0, 0) => ipc::DEFAULT_MAX_FRAME_LENGTH,
+        (0, hard) => hard.saturating_mul(1024 * 1024),
+        (soft, _) => soft.saturating_mul(1024 * 1024),
     }
 }
 
@@ -864,7 +864,7 @@ fn insert_run_route(
     conn_runs: &ConnRuns,
     run_id: u32,
     token: u64,
-    memory_mb: u32,
+    limits: &ipc::ResourceLimits,
     ctl: Arc<std::sync::OnceLock<sandbox::GuardCtl>>,
     frames: sandbox::RunEventSender,
 ) {
@@ -873,7 +873,7 @@ fn insert_run_route(
         run_id,
         RunRoute {
             frames,
-            frame_cap: frame_cap_for(memory_mb),
+            frame_cap: frame_cap_for(limits),
             token,
             ctl,
         },
@@ -942,7 +942,7 @@ fn dispatch_oneoff_run(
     }
     // Fresh isolate per one-off, shared ledger; admission-checked before
     // the route exists so a refusal leaves nothing to unwind.
-    let run_cap_bytes = u64::from(payload.limits.memory_mb) * 1024 * 1024;
+    let run_cap_bytes = u64::from(payload.limits.hard_memory_mb) * 1024 * 1024;
     if let Err(refusal) = shared.warm.reserve_oneoff(run_cap_bytes) {
         write_completion(sink, run_id, &Err(capacity_failure(refusal)), None);
         return;
@@ -956,7 +956,7 @@ fn dispatch_oneoff_run(
         conn_runs,
         run_id,
         token,
-        payload.limits.memory_mb,
+        &payload.limits,
         Arc::clone(&ctl),
         events_tx,
     );
@@ -981,7 +981,8 @@ fn dispatch_oneoff_run(
                 sandbox::Limits {
                     wall_time_ms: payload.limits.wall_time_ms,
                     cpu_time_ms: payload.limits.cpu_time_ms,
-                    memory_mb: payload.limits.memory_mb,
+                    soft_memory_mb: payload.limits.soft_memory_mb,
+                    hard_memory_mb: payload.limits.hard_memory_mb,
                     max_export_bytes: payload.limits.max_export_bytes,
                     max_stdout_bytes: payload.limits.max_stdout_bytes,
                     max_stderr_bytes: payload.limits.max_stderr_bytes,
@@ -1058,7 +1059,7 @@ fn dispatch_precompile(
                 payload.filename.as_deref(),
                 &payload.globals,
                 &payload.imports,
-                payload.limits.memory_mb,
+                payload.limits.hard_memory_mb,
             ) {
                 Ok(()) => {
                     let prefix_id = shared
@@ -1261,16 +1262,19 @@ fn dispatch_prefix_run(
     let spawn = || {
         crate::warm::spawn_instance(
             Arc::clone(&prefix_data),
-            payload.limits.memory_mb,
+            payload.limits.hard_memory_mb,
             brand_key.to_string(),
         )
     };
-    let run_cap_bytes = u64::from(payload.limits.memory_mb) * 1024 * 1024;
+    let caps = crate::warm::HeapCaps {
+        soft_bytes: u64::from(payload.limits.soft_memory_mb) * 1024 * 1024,
+        hard_bytes: u64::from(payload.limits.hard_memory_mb) * 1024 * 1024,
+    };
     enum Taken {
         Pooled(crate::warm::AttachedInstance),
         Cold(crate::warm::InstanceHandle),
     }
-    let taken = match shared.warm.acquire(&payload.prefix_id, run_cap_bytes, &spawn) {
+    let taken = match shared.warm.acquire(&payload.prefix_id, caps, &spawn) {
         crate::warm::Acquired::Attached(att) => Taken::Pooled(att),
         crate::warm::Acquired::Cold(handle) => Taken::Cold(handle),
         crate::warm::Acquired::Refused(refusal) => {
@@ -1307,7 +1311,7 @@ fn dispatch_prefix_run(
         conn_runs,
         run_id,
         token,
-        payload.limits.memory_mb,
+        &payload.limits,
         Arc::clone(&ctl),
         msgs_tx.clone(),
     );
@@ -1379,7 +1383,8 @@ fn dispatch_prefix_run(
         limits: sandbox::Limits {
             wall_time_ms: payload.limits.wall_time_ms,
             cpu_time_ms: payload.limits.cpu_time_ms,
-            memory_mb: payload.limits.memory_mb,
+            soft_memory_mb: payload.limits.soft_memory_mb,
+            hard_memory_mb: payload.limits.hard_memory_mb,
             max_export_bytes: payload.limits.max_export_bytes,
             max_stdout_bytes: payload.limits.max_stdout_bytes,
             max_stderr_bytes: payload.limits.max_stderr_bytes,
@@ -1604,7 +1609,7 @@ mod tests {
         pstr(&mut p, code);
         p.push(0); // filename absent
         // limits: memory, cpu, wall, export, stdout, stderr, bridgeBytes,
-        // bridgeCalls, grace — each an Optional<u32>.
+        // bridgeCalls, grace, hardMemory — each an Optional<u32>.
         match memory_mb {
             Some(v) => {
                 p.push(1);
@@ -1621,7 +1626,7 @@ mod tests {
         }
         p.push(1);
         p.extend_from_slice(&wall_ms.to_be_bytes());
-        for _ in 0..6 {
+        for _ in 0..7 {
             p.push(0);
         }
         // globals: one bridge def

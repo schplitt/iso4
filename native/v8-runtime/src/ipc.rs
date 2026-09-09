@@ -991,7 +991,12 @@ pub const STREAM_CREDIT_WINDOW_BYTES: u32 = 256 * 1024;
 /// zero means the limit is explicitly disabled (no cap).
 #[derive(Debug, Clone)]
 pub struct ResourceLimits {
-    pub memory_mb: u32,
+    /// The retirement line: a warm instance whose heap sits above this at
+    /// two consecutive finishes is retired (no run fails). Zero = none.
+    pub soft_memory_mb: u32,
+    /// The terminating V8 cap (`heap_limits` + the near-heap callback) and
+    /// the ArrayBuffer budget. Zero = uncapped.
+    pub hard_memory_mb: u32,
     pub cpu_time_ms: u32,
     pub wall_time_ms: u32,
     pub max_export_bytes: u32,
@@ -1008,12 +1013,41 @@ pub struct ResourceLimits {
     pub grace_ms: u32,
 }
 
+/// Whether an absent hard override earns a headroom band — the band is for
+/// reuse, so a one-off (nothing to retire) does not get one. DESIGN §4.1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BandPolicy {
+    /// Reused instances: cap is the soft line, a band above it terminates.
+    Managed,
+    /// Fresh isolate per run: the cap terminates, no soft line.
+    Strict,
+}
+
+/// Resolve the advertised cap plus optional hard override into the two
+/// enforced lines. Truth table: `docs/protocol.md` §5.2.
+fn resolve_heap_lines(cap_mb: u32, hard_override: Option<u32>, band: BandPolicy) -> (u32, u32) {
+    match (hard_override, band) {
+        // No soft line on a one-off: nothing is ever retired there.
+        (None, BandPolicy::Strict) => (0, cap_mb),
+        (None, BandPolicy::Managed) => (
+            cap_mb,
+            cap_mb.saturating_add(crate::policy::heap_band_mb(cap_mb)),
+        ),
+        (Some(0), _) => (0, 0),
+        (Some(hard), BandPolicy::Strict) => (0, hard),
+        (Some(hard), BandPolicy::Managed) if cap_mb >= hard => (0, hard),
+        (Some(hard), BandPolicy::Managed) => (cap_mb, hard),
+    }
+}
+
 impl Default for ResourceLimits {
     /// The runtime defaults — the posture applied when the client sends no
     /// explicit limits at all.
     fn default() -> Self {
         Self {
-            memory_mb: DEFAULT_MEMORY_MB,
+            soft_memory_mb: DEFAULT_MEMORY_MB,
+            hard_memory_mb: DEFAULT_MEMORY_MB
+                + crate::policy::heap_band_mb(DEFAULT_MEMORY_MB),
             cpu_time_ms: DEFAULT_CPU_TIME_MS,
             wall_time_ms: DEFAULT_WALL_TIME_MS,
             max_export_bytes: DEFAULT_MAX_EXPORT_BYTES,
@@ -1320,31 +1354,47 @@ impl<'a> PayloadReader<'a> {
         }
     }
 
-    /// Read a `ResourceLimits` block: eight `Optional<u32>` fields. Any field
-    /// the client left absent is filled from the runtime default, so the
-    /// returned struct is fully resolved. An explicit `0` is preserved (it
-    /// disables that limit). See `docs/protocol.md` §5.2.
-    fn read_resource_limits(&mut self) -> io::Result<ResourceLimits> {
+    /// Read a `ResourceLimits` block: ten `Optional<u32>` fields, in wire
+    /// order. Any field the client left absent is filled from the runtime
+    /// default, so the returned struct is fully resolved. An explicit `0` is
+    /// preserved (it disables that limit). See `docs/protocol.md` §5.2.
+    ///
+    /// `band` is the caller's frame kind — see [`BandPolicy`].
+    fn read_resource_limits(&mut self, band: BandPolicy) -> io::Result<ResourceLimits> {
+        let cap_mb = self.read_optional_u32()?.unwrap_or(DEFAULT_MEMORY_MB);
+        let cpu_time_ms = self.read_optional_u32()?.unwrap_or(DEFAULT_CPU_TIME_MS);
+        let wall_time_ms = self.read_optional_u32()?.unwrap_or(DEFAULT_WALL_TIME_MS);
+        let max_export_bytes = self
+            .read_optional_u32()?
+            .unwrap_or(DEFAULT_MAX_EXPORT_BYTES);
+        let max_stdout_bytes = self
+            .read_optional_u32()?
+            .unwrap_or(DEFAULT_MAX_STDOUT_BYTES);
+        let max_stderr_bytes = self
+            .read_optional_u32()?
+            .unwrap_or(DEFAULT_MAX_STDERR_BYTES);
+        let max_bridge_call_bytes = self
+            .read_optional_u32()?
+            .unwrap_or(DEFAULT_MAX_BRIDGE_CALL_BYTES);
+        let max_bridge_calls = self
+            .read_optional_u32()?
+            .unwrap_or(DEFAULT_MAX_BRIDGE_CALLS);
+        let grace_ms = self.read_optional_u32()?.unwrap_or(DEFAULT_GRACE_MS);
+        // Block's LAST field. Resolved with the cap, so nothing downstream
+        // sees a half-decided limit.
+        let hard_override = self.read_optional_u32()?;
+        let (soft_memory_mb, hard_memory_mb) = resolve_heap_lines(cap_mb, hard_override, band);
         Ok(ResourceLimits {
-            memory_mb: self.read_optional_u32()?.unwrap_or(DEFAULT_MEMORY_MB),
-            cpu_time_ms: self.read_optional_u32()?.unwrap_or(DEFAULT_CPU_TIME_MS),
-            wall_time_ms: self.read_optional_u32()?.unwrap_or(DEFAULT_WALL_TIME_MS),
-            max_export_bytes: self
-                .read_optional_u32()?
-                .unwrap_or(DEFAULT_MAX_EXPORT_BYTES),
-            max_stdout_bytes: self
-                .read_optional_u32()?
-                .unwrap_or(DEFAULT_MAX_STDOUT_BYTES),
-            max_stderr_bytes: self
-                .read_optional_u32()?
-                .unwrap_or(DEFAULT_MAX_STDERR_BYTES),
-            max_bridge_call_bytes: self
-                .read_optional_u32()?
-                .unwrap_or(DEFAULT_MAX_BRIDGE_CALL_BYTES),
-            max_bridge_calls: self
-                .read_optional_u32()?
-                .unwrap_or(DEFAULT_MAX_BRIDGE_CALLS),
-            grace_ms: self.read_optional_u32()?.unwrap_or(DEFAULT_GRACE_MS),
+            soft_memory_mb,
+            hard_memory_mb,
+            cpu_time_ms,
+            wall_time_ms,
+            max_export_bytes,
+            max_stdout_bytes,
+            max_stderr_bytes,
+            max_bridge_call_bytes,
+            max_bridge_calls,
+            grace_ms,
         })
     }
 
@@ -1493,10 +1543,11 @@ impl<'a> PayloadReader<'a> {
 /// the individual parsers.
 fn parse_code_fields(
     r: &mut PayloadReader,
+    band: BandPolicy,
 ) -> io::Result<(String, Option<String>, ResourceLimits, Vec<HostGlobalDef>)> {
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
-    let limits = r.read_resource_limits()?;
+    let limits = r.read_resource_limits(band)?;
     let globals = r.read_global_defs()?;
     Ok((code, filename, limits, globals))
 }
@@ -1505,7 +1556,8 @@ fn parse_code_fields(
 pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
-    let (code, filename, limits, globals) = parse_code_fields(&mut r)?;
+    // A one-off gets a fresh isolate: strict cap, no band.
+    let (code, filename, limits, globals) = parse_code_fields(&mut r, BandPolicy::Strict)?;
     let imports = r.read_import_bindings()?;
     let call = r.read_optional_call()?;
     r.assert_done()?;
@@ -1541,7 +1593,8 @@ pub struct PrecompilePayload {
 pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload> {
     let mut r = PayloadReader::new(payload);
     let request_id = r.read_u32()?;
-    let (code, filename, limits, globals) = parse_code_fields(&mut r)?;
+    // Validation must match the instances this prefix will get: managed.
+    let (code, filename, limits, globals) = parse_code_fields(&mut r, BandPolicy::Managed)?;
     let imports = r.read_import_bindings()?;
     r.assert_done()?;
     Ok(PrecompilePayload {
@@ -1583,7 +1636,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
     let prefix_id = r.read_string()?;
     let code = r.read_optional_string()?;
     let filename = r.read_optional_string()?;
-    let limits = r.read_resource_limits()?;
+    let limits = r.read_resource_limits(BandPolicy::Managed)?;
     let globals = r.read_global_defs()?;
     let import_rebinds = r.read_import_rebinds()?;
     let call = r.read_optional_call()?;
@@ -2234,7 +2287,7 @@ mod tests {
                 v.push(0);
             }
         }
-        // ResourceLimits: 8 × Optional<u32>, all absent → runtime defaults.
+        // ResourceLimits: 10 × Optional<u32>, all absent → runtime defaults.
         push_absent_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
@@ -2258,7 +2311,7 @@ mod tests {
 
     /// Eight absent `Optional<u32>` limit fields (one presence byte each).
     fn push_absent_limits(v: &mut Vec<u8>) {
-        v.extend_from_slice(&[0u8; 9]);
+        v.extend_from_slice(&[0u8; 10]);
     }
 
     fn push_string(v: &mut Vec<u8>, s: &str) {
@@ -2301,13 +2354,21 @@ mod tests {
         push_optional_u32(&mut v, Some(64 * 1024)); // max_bridge_call_bytes
         push_optional_u32(&mut v, Some(1_000)); // max_bridge_calls
         push_optional_u32(&mut v, Some(5_000)); // grace_ms
+        push_optional_u32(&mut v, Some(192)); // hard_memory_mb: explicit
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.run_id, 42);
-        assert_eq!(p.limits.memory_mb, 128);
+        assert_eq!(
+            p.limits.soft_memory_mb, 0,
+            "a one-off is never reused: no soft line"
+        );
+        assert_eq!(
+            p.limits.hard_memory_mb, 192,
+            "explicit hard line is taken as given"
+        );
         assert_eq!(p.limits.cpu_time_ms, 5000);
         assert_eq!(p.limits.wall_time_ms, 10000);
         assert_eq!(p.limits.max_bridge_calls, 1_000);
@@ -2315,12 +2376,16 @@ mod tests {
 
     #[test]
     fn parse_run_payload_absent_limits_resolve_to_defaults() {
-        // All eight limit fields absent → the runtime fills each from its
+        // Every limit field absent → the runtime fills each from its
         // DEFAULT_* constant. This is the whole point of the optional wire
         // encoding: the client no longer ships the default numbers.
         let bytes = encode_run_payload(1, "export default 1", None);
         let p = parse_run_payload(&bytes).unwrap();
-        assert_eq!(p.limits.memory_mb, DEFAULT_MEMORY_MB);
+        assert_eq!(p.limits.soft_memory_mb, 0, "one-off: no soft line");
+        assert_eq!(
+            p.limits.hard_memory_mb, DEFAULT_MEMORY_MB,
+            "a one-off gets no band — the default cap is what it dies at",
+        );
         assert_eq!(p.limits.cpu_time_ms, DEFAULT_CPU_TIME_MS);
         assert_eq!(p.limits.wall_time_ms, DEFAULT_WALL_TIME_MS);
         assert_eq!(p.limits.max_export_bytes, DEFAULT_MAX_EXPORT_BYTES);
@@ -2331,6 +2396,52 @@ mod tests {
             DEFAULT_MAX_BRIDGE_CALL_BYTES
         );
         assert_eq!(p.limits.max_bridge_calls, DEFAULT_MAX_BRIDGE_CALLS);
+    }
+
+    #[test]
+    fn a_prefix_run_gets_the_band_a_one_off_does_not() {
+        // Same bytes on both frame kinds — only the frame kind differs, and
+        // with it whether an absent hard override earns a band.
+        let prefix = parse_prefix_run_payload(&encode_prefix_run_payload(Some("1"), None)).unwrap();
+        assert_eq!(prefix.limits.soft_memory_mb, DEFAULT_MEMORY_MB);
+        assert_eq!(
+            prefix.limits.hard_memory_mb,
+            DEFAULT_MEMORY_MB + crate::policy::heap_band_mb(DEFAULT_MEMORY_MB),
+            "a reused instance is retired at the cap and terminates above it",
+        );
+
+        let oneoff = parse_run_payload(&encode_run_payload(1, "1", None)).unwrap();
+        assert_eq!(oneoff.limits.soft_memory_mb, 0);
+        assert_eq!(
+            oneoff.limits.hard_memory_mb, DEFAULT_MEMORY_MB,
+            "a fresh isolate dies at the cap it was given",
+        );
+    }
+
+    #[test]
+    fn an_explicit_hard_line_is_taken_as_given_on_either_frame_kind() {
+        for band in [BandPolicy::Managed, BandPolicy::Strict] {
+            assert_eq!(
+                resolve_heap_lines(0, Some(96), band),
+                (0, 96),
+                "hard-only cap: one line, no retirement"
+            );
+            assert_eq!(
+                resolve_heap_lines(64, Some(0), band),
+                (0, 0),
+                "uncapped leaves no line to enforce"
+            );
+        }
+        assert_eq!(
+            resolve_heap_lines(64, Some(256), BandPolicy::Managed),
+            (64, 256),
+            "both lines as given"
+        );
+        assert_eq!(
+            resolve_heap_lines(64, Some(256), BandPolicy::Strict),
+            (0, 256),
+            "a one-off keeps the ceiling and drops the inert soft line"
+        );
     }
 
     #[test]
@@ -2350,12 +2461,17 @@ mod tests {
         push_optional_u32(&mut v, None); // max_bridge_call_bytes
         push_optional_u32(&mut v, Some(0)); // max_bridge_calls: explicitly unlimited
         push_optional_u32(&mut v, Some(0)); // grace_ms: epilogue explicitly off
+        push_optional_u32(&mut v, None); // hard_memory_mb: managed
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
-        assert_eq!(p.limits.memory_mb, 0);
+        assert_eq!(p.limits.soft_memory_mb, 0);
+        assert_eq!(
+            p.limits.hard_memory_mb, 0,
+            "uncapped stays uncapped — no band"
+        );
         assert_eq!(p.limits.max_bridge_calls, 0);
         // Untouched fields still resolve to their defaults.
         assert_eq!(p.limits.cpu_time_ms, DEFAULT_CPU_TIME_MS);

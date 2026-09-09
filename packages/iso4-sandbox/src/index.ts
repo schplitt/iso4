@@ -26,6 +26,7 @@ import type { CallPayload, DecodedRunComplete } from './ipc'
 import type {
   CallResult,
   HostGlobals,
+  MemoryLimit,
   PrecompileOptions,
   PrefixCallOptions,
   PrefixRunOptions,
@@ -97,6 +98,7 @@ export type {
   RunResult,
   RunSuccess,
   RunFailure,
+  MemoryLimit,
   SandboxExports,
   RunError,
   RunErrorCode,
@@ -288,18 +290,25 @@ function defaultMemoryBudgetMb(): number {
 
 /**
  * Default `maxConcurrentRuns`: the core count, unless that many worst-case
- * heaps (`memoryMb` each) could not fit inside the memory budget — then the
- * budget bounds it (`min(cores, budget / memoryMb)`, at least 1). With an
- * uncapped heap (`memoryMb: 0`) or a disabled budget there is nothing to
- * bound with, so the default stays the core count.
+ * heaps could not fit inside the memory budget — then the budget bounds it
+ * (`min(cores, budget / ceiling)`, at least 1). The worst case is each
+ * isolate's terminating ceiling (`memoryMb` plus its headroom band), not the
+ * advertised number. With an uncapped heap (`memoryMb: 0`) or a disabled
+ * budget there is nothing to bound with, so the default stays the core
+ * count.
  * @param warmBudgetBytes
  * @param memoryMb
  */
-function defaultMaxConcurrentRuns(warmBudgetBytes: number, memoryMb: number | undefined): number {
+function defaultMaxConcurrentRuns(
+  warmBudgetBytes: number,
+  memoryMb: number | MemoryLimit | undefined,
+): number {
   const cores = availableParallelism()
   // Mirrors the runtime's frame-decode default (ipc.rs DEFAULT_MEMORY_MB):
-  // an unset memoryMb reaches the child as 128.
-  const capMb = memoryMb ?? 128
+  // an unset memoryMb reaches the child as 128. The worst case is a prefix
+  // instance's TERMINATING line, band included; a one-off's is the bare cap,
+  // so this bound is the conservative one of the two.
+  const capMb = hardCeilingMb(memoryMb) ?? 128 + heapBandMb(128)
   if (capMb <= 0 || warmBudgetBytes <= 0)
     return cores
   const fitting = Math.floor(warmBudgetBytes / (capMb * 1024 * 1024))
@@ -396,15 +405,91 @@ function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilR
  * A heap cap must be an integer number of megabytes ≥ 0 (0 = uncapped):
  * the wire carries it as a u32, and a fractional or negative value would
  * silently misencode instead of capping.
- * @param value the candidate cap
+ * @param value the candidate cap — a plain number, or the two-line object
  * @param where the option name for the error message
  */
-function validateMemoryMb(value: number | undefined, where: string): void {
-  if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+function validateMemoryMb(value: number | MemoryLimit | undefined, where: string): void {
+  if (value === undefined)
+    return
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new TypeError(
+        `[@iso4/sandbox] ${where} must be an integer >= 0 (megabytes; 0 = uncapped)`,
+      )
+    }
+    return
+  }
+  if (value === null || typeof value !== 'object') {
     throw new TypeError(
-      `[@iso4/sandbox] ${where} must be an integer >= 0 (megabytes; 0 = uncapped)`,
+      `[@iso4/sandbox] ${where} must be a number of megabytes or { soft?, hard }`,
     )
   }
+  if (!Number.isInteger(value.hard) || value.hard < 1) {
+    // 0 here would leave V8 unlimited, so a runaway allocation aborts the
+    // whole runtime process. Uncapped is `memoryMb: 0`.
+    throw new TypeError(
+      `[@iso4/sandbox] ${where}.hard must be an integer >= 1 (megabytes) — `
+      + 'write memoryMb: 0 for uncapped',
+    )
+  }
+  if (value.soft === undefined)
+    return
+  if (!Number.isInteger(value.soft) || value.soft < 1) {
+    throw new TypeError(
+      `[@iso4/sandbox] ${where}.soft must be an integer >= 1 (megabytes) — `
+      + 'omit it for a hard line only',
+    )
+  }
+  if (value.soft >= value.hard) {
+    // Soft is checked at a finish, hard during allocation — at or above it,
+    // soft could never fire first.
+    throw new TypeError(
+      `[@iso4/sandbox] ${where}.soft (${value.soft}) must be below `
+      + `${where}.hard (${value.hard})`,
+    )
+  }
+}
+
+/**
+ * Headroom above a managed cap before the terminating line — mirrors
+ * `policy::heap_band_mb` in the runtime, which is the source of truth (the
+ * wire sends the cap, not the band; this copy only sizes host-side
+ * defaults). Geometric mean of the cap and 8 MB: 8 → +8, 128 → +32.
+ * @param capMb
+ */
+function heapBandMb(capMb: number): number {
+  return capMb <= 0 ? 0 : Math.round(Math.sqrt(8 * capMb))
+}
+
+/**
+ * The terminating ceiling a cap implies for a REUSED instance — the widest
+ * of the two paths, so the number capacity planning reserves. A one-off's
+ * ceiling is the bare cap (no band).
+ * @param value a resolved `memoryMb` setting
+ */
+function hardCeilingMb(value: number | MemoryLimit | undefined): number | undefined {
+  if (value === undefined)
+    return undefined
+  if (typeof value === 'number')
+    return value + heapBandMb(value)
+  return value.hard
+}
+
+/**
+ * Split a `memoryMb` setting into the two wire fields. A plain number is
+ * managed — the runtime derives the terminating line from it, so no override
+ * is sent; the object form sends both explicitly, with an absent `soft`
+ * carried as `0` (no retirement line).
+ * @param value a resolved `memoryMb` setting
+ */
+function heapCapsForWire(
+  value: number | MemoryLimit | undefined,
+): { memoryMb?: number, hardMemoryMb?: number } {
+  if (value === undefined)
+    return {}
+  if (typeof value === 'number')
+    return { memoryMb: value }
+  return { memoryMb: value.soft ?? 0, hardMemoryMb: value.hard }
 }
 
 /**
@@ -475,7 +560,7 @@ class SandboxImpl implements Sandbox {
    * per run, this is simply the only writer. `undefined` defers to the
    * runtime default (128 MB).
    */
-  private readonly memoryMb: number | undefined
+  private readonly memoryMb: number | MemoryLimit | undefined
   /**
    * Last-resort cleanup registered on the host's `exit`, removed by
    * `dispose()` so a program that creates and disposes many sandboxes does not
@@ -496,7 +581,7 @@ class SandboxImpl implements Sandbox {
     statsClient: RuntimeIpcClient,
     socketPath: string,
     brandKey: string,
-    memoryMb?: number,
+    memoryMb?: number | MemoryLimit,
   ) {
     this.proc = proc
     this.pool = pool
@@ -542,6 +627,15 @@ class SandboxImpl implements Sandbox {
     // A one-off run always gets a fresh isolate, so its own cap is legal
     // (#77): per-run, per-prefix and the sandbox default are the three
     // granularities; only per-run-on-a-warm-instance stays impossible.
+    if (typeof options.limits?.memoryMb === 'object') {
+      // The soft line retires a warm instance; a one-off's isolate is
+      // never reused, so it would be inert here.
+      throw new TypeError(
+        '[@iso4/sandbox] limits.memoryMb takes a number of megabytes — the '
+        + '{ soft, hard } form belongs on createSandbox or prepare, whose '
+        + 'instances are reused',
+      )
+    }
     validateMemoryMb(options.limits?.memoryMb, 'limits.memoryMb')
     const runMemoryMb = options.limits?.memoryMb ?? this.memoryMb
     const { defs, dispatch } = processGlobals(options.globals ?? {})
@@ -570,7 +664,7 @@ class SandboxImpl implements Sandbox {
         // always starts at line 1.
         const raw = await client.runRawCode(options.code, {
           filename: options.filename,
-          limits: { ...options.limits, memoryMb: runMemoryMb },
+          limits: { ...options.limits, ...heapCapsForWire(runMemoryMb) },
           globals: defs,
           dispatch,
           imports: bindings,
@@ -718,7 +812,7 @@ class SandboxImpl implements Sandbox {
       const raw = await client.precompile({
         code: options.code,
         filename: options.filename,
-        limits: { ...options.limits, memoryMb: prefixMemoryMb },
+        limits: { ...options.limits, ...heapCapsForWire(prefixMemoryMb) },
         globals: defs,
         imports: bindings,
       })
@@ -793,7 +887,7 @@ implements Prefix<G, M> {
    * it; a per-run value stays impossible — the cap is baked into the
    * isolate at creation and instances are shared.
    */
-  private readonly memoryMb: number | undefined
+  private readonly memoryMb: number | MemoryLimit | undefined
   /**
    * Session brand key for host-type descriptors — see `SandboxImpl`.
    */
@@ -806,7 +900,7 @@ implements Prefix<G, M> {
     defaultGlobals: G,
     defaultImportHandlers: ImportHandlerMap,
     brandKey: string,
-    memoryMb?: number,
+    memoryMb?: number | MemoryLimit,
   ) {
     this.id = id
     this.pool = pool
@@ -956,7 +1050,7 @@ implements Prefix<G, M> {
           prefixId: this.id,
           code: payload.code,
           filename: options.filename,
-          limits: { ...options.limits, memoryMb: this.memoryMb },
+          limits: { ...options.limits, ...heapCapsForWire(this.memoryMb) },
           globals: defs,
           dispatch,
           importRebinds: merged.rebinds,
