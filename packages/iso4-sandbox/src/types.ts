@@ -138,7 +138,7 @@ export interface ResourceLimits {
  * Host-provided globals. Any name not reserved by V8 or the runtime is
  * permitted. Each value becomes a bridge stub in the sandbox global object.
  *
- * Reserved names (rejected with `ERR_UNDECLARED_BINDING`): `console`,
+ * Reserved names (rejected with `ERR_RESERVED_NAME`): `console`,
  * `waitUntil`, `setTimeout`, `clearTimeout`, `Headers`, `Request`,
  * `Response`, `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`. These
  * are owned by the runtime; shadowing `Response` would silently break
@@ -1010,8 +1010,10 @@ export interface PrefixRunOptions<
    * Rebind host-module function exports declared at precompile time.
    * Source module imports are frozen at prepare() time and cannot be rebound;
    * data exports are baked into the synthetic module. TypeScript enforces
-   * this at the type level via `RebindImports<M>`; the runtime rejects
-   * anything that slips through with `ERR_UNDECLARED_BINDING`.
+   * this at the type level via `RebindImports<M>`; anything that slips
+   * through is rejected at runtime — `ERR_UNDECLARED_BINDING` for locations
+   * never declared, `ERR_FROZEN_BINDING` for source modules and data leaves,
+   * `ERR_INVALID_REBIND` for a non-function override value.
    */
   imports?: RebindImports<M>
 
@@ -1556,7 +1558,29 @@ export type RunErrorCode
      * is zero. Retry when load falls, or raise `maxQueuedRuns`.
      */
     | 'ERR_QUEUE_FULL'
+    /**
+     * A `prefix.run()` binding (global or import rebind) names something that
+     * was never declared at `prepare()` time. Declared-but-locked locations
+     * are `ERR_FROZEN_BINDING`; runtime-owned names are `ERR_RESERVED_NAME`.
+     */
     | 'ERR_UNDECLARED_BINDING'
+    /**
+     * A host global uses a name the runtime owns (`console`, `setTimeout`,
+     * `Response`, … — see {@link HostGlobals}) and may not shadow it.
+     */
+    | 'ERR_RESERVED_NAME'
+    /**
+     * A `prefix.run()` rebind targets a declared location that is frozen with
+     * the prefix: a source module or a data leaf. Only host-module function
+     * leaves can be rebound.
+     */
+    | 'ERR_FROZEN_BINDING'
+    /**
+     * A `prefix.run()` rebind offered a value of the wrong type — a function
+     * leaf can only be rebound with a function. Host-detected, never reported
+     * by the runtime.
+     */
+    | 'ERR_INVALID_REBIND'
     /**
      * Prefix top-level evaluation never settled — nothing in the isolate
      * can resolve the awaited promise while a prefix evaluates (at

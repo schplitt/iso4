@@ -1132,8 +1132,8 @@ pub struct ImportBinding {
 /// One host-import function-leaf rebinding requested by a `PrefixRun`. Only
 /// the location crosses the wire — the replacement handler stays on the TS
 /// side (bridge dispatch is name-addressed). The runtime validates each entry
-/// against the shape declared at `Precompile` and rejects anything else with
-/// `ERR_UNDECLARED_BINDING`.
+/// against the shape declared at `Precompile` and rejects undeclared locations
+/// with `ERR_UNDECLARED_BINDING`, frozen ones with `ERR_FROZEN_BINDING`.
 #[derive(Debug, Clone)]
 pub struct ImportRebind {
     pub specifier: String,

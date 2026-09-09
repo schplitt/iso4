@@ -557,6 +557,8 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             reset: None,
         },
         RunError::UndeclaredBinding(msg) => plain("ERR_UNDECLARED_BINDING", "Error", msg.clone()),
+        RunError::ReservedName(msg) => plain("ERR_RESERVED_NAME", "Error", msg.clone()),
+        RunError::FrozenBinding(msg) => plain("ERR_FROZEN_BINDING", "Error", msg.clone()),
         RunError::PrefixDidNotSettle(msg) => {
             plain("ERR_PREFIX_DID_NOT_SETTLE", "Error", msg.clone())
         }

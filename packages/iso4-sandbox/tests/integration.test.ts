@@ -1098,10 +1098,11 @@ describe('host imports (Phase 7)', () => {
 })
 
 // ── Imports: rebinding enforcement on prefix.run() ────────────────────
-// Mirrors the globals path: anything not declared at precompile becomes
-// ERR_UNDECLARED_BINDING at run time. TypeScript catches most of this
-// statically via `RebindImports<I>`; these tests verify the runtime
-// fallback when callers bypass the type system with `as any` / dynamic data.
+// Mirrors the globals path: an undeclared location is ERR_UNDECLARED_BINDING,
+// a declared-but-frozen one (source module, data leaf) is ERR_FROZEN_BINDING,
+// and a non-function override value is ERR_INVALID_REBIND. TypeScript catches
+// most of this statically via `RebindImports<I>`; these tests verify the
+// runtime fallback when callers bypass the type system with `as any`.
 
 describe('imports rebinding enforcement (runtime)', () => {
   test('rebinding an undeclared specifier on prefix.run() → ERR_UNDECLARED_BINDING', async () => {
@@ -1149,7 +1150,7 @@ describe('imports rebinding enforcement (runtime)', () => {
     expect(result.error.message).toMatch(/undeclared/)
   })
 
-  test('rebinding a source-module specifier on prefix.run() → ERR_UNDECLARED_BINDING', async () => {
+  test('rebinding a source-module specifier on prefix.run() → ERR_FROZEN_BINDING', async () => {
     await using prefix = await runtime.precompile({
       code: `globalThis.__primed = true`,
       imports: {
@@ -1166,11 +1167,11 @@ describe('imports rebinding enforcement (runtime)', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.code).toBe('ERR_FROZEN_BINDING')
     expect(result.error.message).toMatch(/source imports are frozen/)
   })
 
-  test('rebinding a data export on prefix.run() → ERR_UNDECLARED_BINDING', async () => {
+  test('rebinding a data export on prefix.run() → ERR_INVALID_REBIND', async () => {
     await using prefix = await runtime.precompile({
       code: `globalThis.__primed = true`,
       imports: {
@@ -1188,11 +1189,11 @@ describe('imports rebinding enforcement (runtime)', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.code).toBe('ERR_INVALID_REBIND')
     expect(result.error.message).toMatch(/can only be rebound with a function/)
   })
 
-  test('rebinding a data export with a function → ERR_UNDECLARED_BINDING (runtime shape check)', async () => {
+  test('rebinding a data export with a function → ERR_FROZEN_BINDING (runtime shape check)', async () => {
     // A function value passes the client-side checks, so this exercises the
     // Rust-side validation against the declared prefix shape.
     await using prefix = await runtime.precompile({
@@ -1212,7 +1213,7 @@ describe('imports rebinding enforcement (runtime)', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.error.code).toBe('ERR_FROZEN_BINDING')
     expect(result.error.message).toMatch(/is a data leaf, not a function/)
   })
 
