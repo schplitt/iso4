@@ -27,7 +27,7 @@ export type WireResourceLimits = ResourceLimits & {
   hardMemoryMb?: number
 }
 
-export const PROTOCOL_VERSION: 2 = 2
+export const PROTOCOL_VERSION: 3 = 3
 
 export const DEFAULT_MAX_FRAME_LENGTH: number = 64 * 1024 * 1024
 
@@ -789,6 +789,22 @@ class PayloadWriter {
     return this
   }
 
+  writeOptionalEnv(env: Record<string, string> | undefined): this {
+    // Optional<List<(String name, String value)>> per `docs/protocol.md` §5.2.
+    if (env === undefined) {
+      this.writeU8(0)
+      return this
+    }
+    const entries = Object.entries(env)
+    this.writeU8(1)
+    this.writeU32(entries.length)
+    for (const [name, value] of entries) {
+      this.writeString(name)
+      this.writeString(value)
+    }
+    return this
+  }
+
   writeResourceLimits(limits: WireResourceLimits): this {
     // Each field is `Optional<u32>`: the client sends only the limits the
     // caller explicitly set. Absent fields are filled in by the runtime, which
@@ -1032,6 +1048,10 @@ export interface RunPayloadOptions {
    * instead of the exports, resolved against the freshly evaluated module.
    */
   call?: CallPayload
+  /**
+   * `process.env` entries for this run; absent = empty env.
+   */
+  env?: Record<string, string>
 }
 
 /**
@@ -1047,6 +1067,7 @@ export function encodeRunPayload(options: RunPayloadOptions): Buffer {
     .writeGlobalDefs(options.globals ?? [])
     .writeImports(options.imports ?? [])
     .writeOptionalCall(options.call)
+    .writeOptionalEnv(options.env)
     .toBuffer()
 }
 
@@ -1065,6 +1086,11 @@ export interface PrecompilePayloadOptions {
   limits?: WireResourceLimits
   globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
+  /**
+   * `process.env` entries stored with the prefix: what prefix evaluation
+   * sees, and the fallback for runs that send no env of their own.
+   */
+  env?: Record<string, string>
 }
 
 /**
@@ -1080,6 +1106,7 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buff
     .writeResourceLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImports(options.imports ?? [])
+    .writeOptionalEnv(options.env)
     .toBuffer()
 }
 
@@ -1106,6 +1133,11 @@ export interface PrefixRunPayloadOptions {
    * evaluating a postfix; the result is the function's return value.
    */
   call?: CallPayload
+  /**
+   * `process.env` entries for THIS run. Present replaces the prefix env
+   * wholesale; absent falls back to it.
+   */
+  env?: Record<string, string>
 }
 
 /**
@@ -1131,6 +1163,7 @@ export function encodePrefixRunPayload(
     .writeGlobalDefs(options.globals ?? [])
     .writeImportRebinds(options.importRebinds ?? [])
     .writeOptionalCall(options.call)
+    .writeOptionalEnv(options.env)
     .toBuffer()
 }
 
@@ -1771,7 +1804,7 @@ function readResetInfo(
   if (present !== 1)
     throw new PayloadDecodeError(`invalid reset-info presence byte: ${present}`)
   const causeByte = reader.readU8()
-  const causes: readonly ResetCause[] = ['cpu', 'memory', 'abort', 'internal', 'wall']
+  const causes: readonly ResetCause[] = ['cpu', 'memory', 'abort', 'internal', 'wall', 'exit']
   const resetCause = causes[causeByte]
   if (resetCause === undefined)
     throw new PayloadDecodeError(`invalid instance-reset cause byte: ${causeByte}`)

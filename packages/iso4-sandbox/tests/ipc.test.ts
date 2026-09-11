@@ -355,12 +355,14 @@ describe('payload encoders', () => {
     expect(buf[end]).toBe(1) // code: present (Optional<String>)
     const { value: code } = readString(buf, end + 1)
     expect(code).toBe('y')
-    expect(buf[buf.byteLength - 1]).toBe(0) // call: absent
+    expect(buf[buf.byteLength - 2]).toBe(0) // call: absent
+    expect(buf[buf.byteLength - 1]).toBe(0) // env: absent
   })
 
-  test('encodeRunPayload without a call ends with an absent-call byte', () => {
+  test('encodeRunPayload without a call ends with absent call + env bytes', () => {
     const buf = encodeRunPayload({ runId: 1, code: 'x' })
-    expect(buf[buf.byteLength - 1]).toBe(0)
+    expect(buf[buf.byteLength - 2]).toBe(0) // call: absent
+    expect(buf[buf.byteLength - 1]).toBe(0) // env: absent
   })
 
   test('encodeRunPayload lays out the call as exportPath + args value slot', () => {
@@ -379,7 +381,8 @@ describe('payload encoders', () => {
     expect(path).toBe('default.fetch')
     const argsLength = readU32BE(buf, end)
     expect(deserializeValue(buf.subarray(end + 4, end + 4 + argsLength))).toEqual([1, 'a'])
-    expect(end + 4 + argsLength).toBe(buf.byteLength)
+    expect(buf[end + 4 + argsLength]).toBe(0) // env: absent
+    expect(end + 4 + argsLength + 1).toBe(buf.byteLength)
   })
 
   test('encodePrefixRunPayload with a call carries no code', () => {
@@ -437,7 +440,8 @@ describe('payload encoders', () => {
     const { value: source, end: e2 } = readString(buf, e1 + 1)
     expect(source).toBe('export const add = (a, b) => a + b')
     expect(buf[e2]).toBe(0) // call: absent
-    expect(e2 + 1).toBe(buf.byteLength)
+    expect(buf[e2 + 1]).toBe(0) // env: absent
+    expect(e2 + 2).toBe(buf.byteLength)
   })
 
   test('encodeRunPayload lays out a host-module tree as tagged nodes', () => {
@@ -484,7 +488,8 @@ describe('payload encoders', () => {
     expect(c1).toBe('inner')
     expect(buf[e5]).toBe(0) // node tag: function
     expect(buf[e5 + 1]).toBe(0) // call: absent
-    expect(e5 + 2).toBe(buf.byteLength)
+    expect(buf[e5 + 2]).toBe(0) // env: absent
+    expect(e5 + 3).toBe(buf.byteLength)
   })
 
   test('encodeRunPayload with multiple imports preserves order', () => {
@@ -510,7 +515,8 @@ describe('payload encoders', () => {
     const { value: src2, end: e4 } = readString(buf, e3 + 1)
     expect(src2).toBe('export const b = 2')
     expect(buf[e4]).toBe(0) // call: absent
-    expect(e4 + 1).toBe(buf.byteLength)
+    expect(buf[e4 + 1]).toBe(0) // env: absent
+    expect(e4 + 2).toBe(buf.byteLength)
   })
 
   test('encodePrecompilePayload carries import declarations; encodePrefixRunPayload carries rebind locations', () => {

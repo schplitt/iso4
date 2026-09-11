@@ -173,6 +173,9 @@ pub struct PrefixData {
     /// payload only carry re-binding of host function handlers (TS
     /// dispatch); the wire-level binding shape comes from here.
     pub declared_imports: Vec<ipc::ImportBinding>,
+    /// `process.env` entries declared at precompile time: what prefix
+    /// evaluation sees, and the fallback for runs that send no env.
+    pub env: Vec<(String, String)>,
 }
 
 /// State shared across all connection threads in the same Rust process.
@@ -1005,6 +1008,7 @@ fn dispatch_oneoff_run(
                 call_id_counter,
                 payload.call.as_ref(),
                 Some(ctl),
+                payload.env,
             );
             match &result {
                 Ok(output) => {
@@ -1060,12 +1064,14 @@ fn dispatch_precompile(
         .spawn(move || {
             let sink = worker_sink;
             crate::webcodec::set_session_brand_key(brand_key);
+            let env = payload.env.unwrap_or_default();
             let result_payload = match sandbox::precompile(
                 &payload.code,
                 payload.filename.as_deref(),
                 &payload.globals,
                 &payload.imports,
                 payload.limits.hard_memory_mb,
+                &env,
             ) {
                 Ok(()) => {
                     let prefix_id = shared
@@ -1101,6 +1107,7 @@ fn dispatch_precompile(
                                 globals: payload.globals,
                                 declared_globals,
                                 declared_imports: payload.imports,
+                                env,
                             }),
                         );
                     wire::encode_precompile_result_payload(request_id, Some(&prefix_id), None)
@@ -1413,6 +1420,7 @@ fn dispatch_prefix_run(
         }),
         complete: Some(complete),
         ctl_slot: Some(ctl),
+        env: payload.env,
     });
 
     let msg = sandbox::RoutedEvent::new(token, sandbox::RunEvent::Job((job, None)));
@@ -1648,6 +1656,7 @@ mod tests {
         // imports: none
         p.extend_from_slice(&0u32.to_be_bytes());
         p.push(0); // call absent
+        p.push(0); // env absent
         p
     }
 

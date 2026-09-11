@@ -455,6 +455,7 @@ export class RuntimeIpcClient {
       hardAbortSignal?: AbortSignal
       call?: CallPayload
       streams?: StreamSourceRegistry
+      env?: Record<string, string>
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -473,6 +474,7 @@ export class RuntimeIpcClient {
           globals: options?.globals,
           imports: options?.imports,
           call: options?.call,
+          env: options?.env,
         }),
       ),
       makeDispatcher(options?.dispatch ?? {}, options?.importDispatch),
@@ -500,6 +502,7 @@ export class RuntimeIpcClient {
       hardAbortSignal?: AbortSignal
       call?: CallPayload
       streams?: StreamSourceRegistry
+      env?: Record<string, string>
     },
   ): Promise<RawRunResult> {
     if (this.disposed)
@@ -518,6 +521,7 @@ export class RuntimeIpcClient {
           globals: options.globals,
           importRebinds: options.importRebinds,
           call: options.call,
+          env: options.env,
           runId,
         }),
       ),
@@ -701,6 +705,7 @@ export class RuntimeIpcClient {
       limits?: WireResourceLimits
       globals?: readonly GlobalDefPayload[]
       imports?: readonly ImportBindingPayload[]
+      env?: Record<string, string>
     },
   ): Promise<Uint8Array> {
     if (this.disposed)
@@ -716,6 +721,7 @@ export class RuntimeIpcClient {
         limits: options.limits,
         globals: options.globals,
         imports: options.imports,
+        env: options.env,
       }),
     )
     const reply = new Promise<Uint8Array>((resolve, reject) => {

@@ -105,6 +105,9 @@ enum TerminationReason {
     Cpu,
     Memory,
     Abort,
+    /// Sandbox code called `process.exit(code)` — workerd's model: the run
+    /// is terminated, never resumed.
+    Exit(i32),
 }
 
 /// First-writer-wins slot for the run's termination reason, shared between
@@ -1014,6 +1017,12 @@ pub fn alloc_run_token() -> u64 {
 struct RunCallState {
     /// Console output, capped per this run's limits.
     logs: Box<RefCell<LogBuffers>>,
+    /// This run's `process.env` entries; `None` falls back to the table's
+    /// setup env (the prefix-level env).
+    env: Option<Vec<(String, String)>>,
+    /// The run's writable `process.env` snapshot, materialised from `env` on
+    /// first access and dropped with the entry — writes never outlive the run.
+    env_obj: RefCell<Option<v8::Global<v8::Object>>>,
     /// `waitUntil` registrations (armed at the setup-to-run boundary).
     pending: Box<PendingWork>,
     /// Streamed-body registry (armed per run).
@@ -1035,13 +1044,19 @@ struct RunCallState {
 }
 
 impl RunCallState {
-    fn new(max_stdout_bytes: u32, max_stderr_bytes: u32) -> Box<Self> {
+    fn new(
+        max_stdout_bytes: u32,
+        max_stderr_bytes: u32,
+        env: Option<Vec<(String, String)>>,
+    ) -> Box<Self> {
         Box::new(Self {
             logs: Box::new(RefCell::new(LogBuffers {
                 max_stdout_bytes,
                 max_stderr_bytes,
                 ..LogBuffers::default()
             })),
+            env,
+            env_obj: RefCell::new(None),
             pending: PendingWork::boxed(),
             streams: StreamTable::boxed(),
             out_streams: OutStreamTable::boxed(),
@@ -1059,13 +1074,22 @@ pub struct RunTable {
     /// Console output produced outside any run — prefix warm-up — delivered
     /// on the cold-start call (the old `warmup_logs_pending` flow).
     setup_logs: RefCell<LogBuffers>,
+    /// The prefix-level `process.env` entries: what setup-stage code sees,
+    /// and the fallback for runs that carry no env of their own.
+    setup_env: Vec<(String, String)>,
+    /// The instance's termination-reason slot, shared with `process.exit`
+    /// (which must classify before it terminates). Set right after the cell
+    /// exists; `None` only in tables that never run guest code.
+    reason: OnceLock<Arc<ReasonCell>>,
 }
 
 impl RunTable {
-    fn boxed() -> Box<Self> {
+    fn boxed(setup_env: Vec<(String, String)>) -> Box<Self> {
         Box::new(Self {
             runs: RefCell::new(HashMap::new()),
             setup_logs: RefCell::new(LogBuffers::default()),
+            setup_env,
+            reason: OnceLock::new(),
         })
     }
 
@@ -1234,6 +1258,8 @@ pub enum ResetCause {
     Wall,
     Abort,
     Internal,
+    /// The culprit called `process.exit()`.
+    Exit,
 }
 
 /// All the ways an execution can fail.
@@ -1261,6 +1287,10 @@ pub enum RunError {
     WallTimeout,
     /// V8 heap + ArrayBuffer exceeded `limits.memoryMb`.
     MemoryLimit,
+    /// Sandbox code called `process.exit(code)`. Executing JS is terminated
+    /// immediately (Node/workerd semantics: exit never returns), so on a
+    /// warm instance the mid-JS interruption taints it.
+    ProcessExit(i32),
     /// Configured host global/import handler threw or rejected and the
     /// sandbox did not catch it. Carries the handler error's `name`,
     /// `message`, and own-enumerable `fields` (never the host stack).
@@ -1335,6 +1365,7 @@ pub enum RunError {
 /// on `stream_fd` and block until the matching `BridgeResponse`; string/data
 /// globals are evaluated/materialised in-isolate and need no socket. Pass
 /// `None` for `stream_fd` when no global installs a bridge stub.
+#[allow(clippy::too_many_arguments)]
 pub fn execute(
     code: &str,
     filename: Option<&str>,
@@ -1344,6 +1375,7 @@ pub fn execute(
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
+    env: Option<Vec<(String, String)>>,
 ) -> Result<Output, FailureOutput> {
     execute_with_io(
         code,
@@ -1356,6 +1388,7 @@ pub fn execute(
         call_id_counter,
         call,
         None,
+        env,
     )
 }
 
@@ -1378,6 +1411,7 @@ pub fn execute_with_io(
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+    env: Option<Vec<(String, String)>>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
@@ -1391,6 +1425,7 @@ pub fn execute_with_io(
         call_id_counter,
         call,
         ctl_slot,
+        env,
     )
 }
 
@@ -1410,6 +1445,9 @@ pub struct PrefixSpec<'a> {
     /// The full `prepare()`-time global defs — value globals installed before
     /// the prefix evaluates, bridge callables as throwing placeholders.
     pub globals: &'a [HostGlobalDef],
+    /// The prefix-level `process.env` entries: what prefix evaluation sees,
+    /// and the fallback for runs that send no env of their own.
+    pub env: &'a [(String, String)],
 }
 
 /// Execute a postfix against a prepared prefix.
@@ -1419,6 +1457,7 @@ pub struct PrefixSpec<'a> {
 /// `stream_fd` for this run — overwrite the prefix-time placeholders, then
 /// the postfix runs. String/data globals and shim wrappers are replayed from
 /// `prefix.globals` and are not re-sent per run.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_with_prefix(
     prefix: PrefixSpec<'_>,
     code: Option<&str>,
@@ -1429,6 +1468,7 @@ pub fn execute_with_prefix(
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
+    env: Option<Vec<(String, String)>>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     // Cold start of a warm-capable instance: warm-up (isolate boot + prefix
@@ -1449,6 +1489,7 @@ pub fn execute_with_prefix(
         stream_fd,
         call_id_counter,
         call,
+        env,
     )
     .result
 }
@@ -1469,6 +1510,7 @@ pub fn precompile(
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     hard_memory_mb: u32,
+    env: &[(String, String)],
 ) -> Result<(), FailureOutput> {
     init_platform();
     validate_prefix_module(
@@ -1477,6 +1519,7 @@ pub fn precompile(
         globals,
         imports,
         hard_memory_mb,
+        env,
     )
 }
 
@@ -1506,6 +1549,7 @@ fn run_module(
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+    env: Option<Vec<(String, String)>>,
 ) -> Result<Output, FailureOutput> {
     // The run clock, CPU budget, and bridge-call log live here (not inside
     // the inner function) so the final values can be stamped onto BOTH
@@ -1528,6 +1572,7 @@ fn run_module(
         start,
         Arc::clone(&cpu_budget),
         Arc::clone(&bridge_log),
+        env,
     );
     let cpu_time_ms = cpu_budget.elapsed_ms_precise();
     let records = bridge_log
@@ -1567,13 +1612,14 @@ fn run_module_inner(
     start: std::time::Instant,
     cpu_budget: Arc<CpuBudget>,
     bridge_log: Arc<Mutex<BridgeCallLog>>,
+    env: Option<Vec<(String, String)>>,
 ) -> Result<Output, FailureOutput> {
     // One-off runs hold a single-entry run table for the run's life — the
     // same routing the warm instances use, so the native installs are
     // uniform across both paths.
-    let run_table = RunTable::boxed();
+    let run_table = RunTable::boxed(Vec::new());
     let token = if token != 0 { token } else { alloc_run_token() };
-    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes);
+    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes, env);
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
@@ -1597,6 +1643,7 @@ fn run_module_inner(
     // ArrayBuffer allocator (which is registered in CreateParams, before the
     // isolate exists).
     let reason = Arc::new(ReasonCell::new());
+    run_table.reason.set(Arc::clone(&reason)).ok();
 
     // ── ArrayBuffer budget allocator ──────────────────────────────────────────
     // Built before the isolate so we can pass it into CreateParams.
@@ -1739,6 +1786,15 @@ fn run_module_inner(
 
         // setTimeout/clearTimeout over the attributed run's timer table.
         install_timers(scope, table_ptr).map_err(|error| {
+            failure(
+                termination_or(&reason, error),
+                &unsafe { &*logs_ptr }.borrow(),
+                start,
+            )
+        })?;
+
+        // Lazy `process` global over the attributed run's env.
+        install_process(scope, table_ptr).map_err(|error| {
             failure(
                 termination_or(&reason, error),
                 &unsafe { &*logs_ptr }.borrow(),
@@ -2835,6 +2891,7 @@ fn start_turn(
                     Some(TerminationReason::Wall) => RunError::WallTimeout,
                     Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                     Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                    Some(TerminationReason::Exit(code)) => RunError::ProcessExit(code),
                     // A hard abort's mid-turn kill (`GuardCtl::abort_executing`).
                     Some(TerminationReason::Abort) => RunError::Aborted,
                     // Belt-and-suspenders: a terminate with no reason at all.
@@ -2953,6 +3010,7 @@ fn invoke_requested_call(
                 Some(TerminationReason::Wall) => RunError::WallTimeout,
                 Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                 Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                Some(TerminationReason::Exit(code)) => RunError::ProcessExit(code),
                 // A hard abort's mid-turn kill.
                 Some(TerminationReason::Abort) => RunError::Aborted,
                 None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
@@ -3255,6 +3313,7 @@ fn finish_turn(
             TerminationReason::Wall => RunError::WallTimeout,
             TerminationReason::Cpu => RunError::CpuTimeout,
             TerminationReason::Memory => RunError::MemoryLimit,
+            TerminationReason::Exit(code) => RunError::ProcessExit(code),
             TerminationReason::Abort => RunError::Aborted,
         };
         return finished(Err(rs.fail(error)));
@@ -3364,6 +3423,7 @@ fn scan(
                         Some(TerminationReason::Wall) => RunError::WallTimeout,
                         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                        Some(TerminationReason::Exit(code)) => RunError::ProcessExit(code),
                         Some(TerminationReason::Abort) => RunError::Aborted,
                         None => {
                             if root_is_call_result {
@@ -4568,6 +4628,7 @@ fn new_capped_isolate(
 fn warmup_error(reason: &ReasonCell, fallback: RunError) -> RunError {
     match reason.get() {
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        Some(TerminationReason::Exit(code)) => RunError::ProcessExit(code),
         Some(_) => RunError::WarmupLimit,
         None => fallback,
     }
@@ -4587,8 +4648,9 @@ pub fn create_instance_core(
     init_platform();
     let start = std::time::Instant::now();
 
-    let run_table = RunTable::boxed();
+    let run_table = RunTable::boxed(prefix.map(|p| p.env.to_vec()).unwrap_or_default());
     let reason = Arc::new(ReasonCell::new());
+    run_table.reason.set(Arc::clone(&reason)).ok();
     let (mut isolate, alloc_state, near_heap) = new_capped_isolate(hard_memory_mb, &reason);
 
     let handle = isolate.thread_safe_handle();
@@ -4612,9 +4674,10 @@ pub fn create_instance_core(
         install_async_context(scope)?;
         // No run entry exists during prefix evaluation: a setup-time
         // waitUntil or setTimeout throws, and warm-up console output lands
-        // in setup_logs.
+        // in setup_logs. `process.env` reads the table's setup env there.
         install_wait_until(scope, table_ptr)?;
         install_timers(scope, table_ptr)?;
+        install_process(scope, table_ptr)?;
         let mut prefix_module: Option<v8::Global<v8::Module>> = None;
         if let Some(prefix) = &prefix {
             // Enter the CPU meter for compile + evaluate only — isolate boot
@@ -4696,6 +4759,9 @@ pub struct CallJob {
     /// exists, so the session demux can terminate this run mid-turn
     /// (Terminate for a CPU-bound run — E1 ruling 5's fallback).
     pub ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+    /// `process.env` entries for this run; `None` falls back to the env
+    /// stored with the prefix.
+    pub env: Option<Vec<(String, String)>>,
 }
 
 /// One message to an instance owner thread: the job, plus an optional
@@ -4740,6 +4806,7 @@ pub fn run_call_on_core(
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
     call: Option<&ipc::CallSpec>,
+    env: Option<Vec<(String, String)>>,
 ) -> CallOutcome {
     let start = std::time::Instant::now();
     let cpu_budget = Arc::new(CpuBudget::new());
@@ -4753,7 +4820,7 @@ pub fn run_call_on_core(
     // exactly as when the buffers were shared.)
     core.reason.reset();
     let token = alloc_run_token();
-    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes);
+    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes, env);
     if core.warmup_logs_pending {
         core.warmup_logs_pending = false;
         let mut setup = core.run_table.setup_logs.borrow_mut();
@@ -5006,6 +5073,7 @@ fn reason_error(reason: &ReasonCell) -> RunError {
         Some(TerminationReason::Wall) => RunError::WallTimeout,
         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        Some(TerminationReason::Exit(code)) => RunError::ProcessExit(code),
         Some(TerminationReason::Abort) | None => RunError::Aborted,
     }
 }
@@ -5414,6 +5482,7 @@ fn dispatch_job(
             Some(fd),
             Arc::clone(&job.call_id_counter),
             job.call.as_ref(),
+            job.env.take(),
         );
         if let Some(complete) = job.complete.take() {
             complete(outcome);
@@ -5440,7 +5509,11 @@ fn dispatch_job(
     let bridge_log: Arc<Mutex<BridgeCallLog>> = Arc::new(Mutex::new(BridgeCallLog::default()));
 
     // The run's table entry (see run_call_on_core — the same prelude).
-    let entry = RunCallState::new(job.limits.max_stdout_bytes, job.limits.max_stderr_bytes);
+    let entry = RunCallState::new(
+        job.limits.max_stdout_bytes,
+        job.limits.max_stderr_bytes,
+        job.env.take(),
+    );
     if core.warmup_logs_pending {
         core.warmup_logs_pending = false;
         let mut setup = core.run_table.setup_logs.borrow_mut();
@@ -5602,6 +5675,7 @@ fn taint_sweep(
         Some(TerminationReason::Cpu) => ResetCause::Cpu,
         Some(TerminationReason::Memory) => ResetCause::Memory,
         Some(TerminationReason::Wall) => ResetCause::Wall,
+        Some(TerminationReason::Exit(_)) => ResetCause::Exit,
         Some(TerminationReason::Abort) | None => ResetCause::Abort,
     };
     // The culprit was concluded by the caller before the sweep; its wire id
@@ -6010,6 +6084,7 @@ fn validate_prefix_module(
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     hard_memory_mb: u32,
+    env: &[(String, String)],
 ) -> Result<(), FailureOutput> {
     let start = std::time::Instant::now();
     let logs = LogBuffers::default();
@@ -6048,7 +6123,8 @@ fn validate_prefix_module(
             start,
         )
     })?;
-    let validation_table = RunTable::boxed();
+    let validation_table = RunTable::boxed(env.to_vec());
+    validation_table.reason.set(Arc::clone(&reason)).ok();
     // Same console as a run, for surface parity. Lines land in this throwaway
     // table and die with it — `prepare()` has no result frame to carry them.
     install_console(scope, &*validation_table).map_err(|e| {
@@ -6064,6 +6140,16 @@ fn validate_prefix_module(
     // matches run code; calling it at prefix top level throws the catchable
     // setup-time error.
     install_timers(scope, &*validation_table).map_err(|e| {
+        failure(termination_or(&reason, e), &logs, start)
+    })?;
+    // AsyncLocalStorage for surface parity with warm-up: real instances
+    // install it before the prefix evaluates, and getBuiltinModule reads it.
+    install_async_context(scope).map_err(|e| {
+        failure(termination_or(&reason, e), &logs, start)
+    })?;
+    // `process` with the prefix env, so prefix code validates against the
+    // same surface (and env values) its warm-up evaluation will see.
+    install_process(scope, &*validation_table).map_err(|e| {
         failure(termination_or(&reason, e), &logs, start)
     })?;
     v8::tc_scope!(let scope, scope);
@@ -6100,6 +6186,7 @@ fn termination_or(reason: &ReasonCell, fallback: RunError) -> RunError {
         Some(TerminationReason::Wall) => RunError::WallTimeout,
         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        Some(TerminationReason::Exit(code)) => RunError::ProcessExit(code),
         Some(TerminationReason::Abort) => RunError::Aborted,
         None => fallback,
     }
@@ -6310,6 +6397,12 @@ fn module_resolver_callback<'a>(
         None if specifier_str == ISO4_RUNTIME_SPECIFIER => ImportBinding {
             specifier: specifier_str.clone(),
             module: ImportModule::Source(ISO4_RUNTIME_MODULE_SRC.to_string()),
+        },
+        // Unlike node:async_hooks this is not gated to run code: the process
+        // global exists at every stage, so the module import matches it.
+        None if specifier_str == PROCESS_SPECIFIER => ImportBinding {
+            specifier: specifier_str.clone(),
+            module: ImportModule::Source(PROCESS_MODULE_SRC.to_string()),
         },
         None => return None,
     };
@@ -7489,6 +7582,7 @@ pub const RESERVED_GLOBAL_NAMES: &[&str] = &[
     "waitUntil",
     "setTimeout",
     "clearTimeout",
+    "process",
     "Headers",
     "Request",
     "Response",
@@ -8835,6 +8929,316 @@ fn install_async_context(scope: &mut v8::PinScope) -> Result<(), RunError> {
     Ok(())
 }
 
+// ── process (curated Node surface + per-run env) ─────────────────────────────
+//
+// Lazy `process` global + writable per-run `process.env` snapshot, attributed
+// through the run table. Design and semantics: DESIGN.md §4.2.2.
+
+/// Reserved module specifier resolving to the built-in process module.
+const PROCESS_SPECIFIER: &str = "node:process";
+
+/// ESM source of the built-in `node:process` module. The default export is
+/// the `process` global (materialising it on first import).
+const PROCESS_MODULE_SRC: &str = "const p = globalThis.process;\nexport default p;\n";
+
+/// Private-symbol key caching the setup-stage env object on `globalThis`, so
+/// prefix-stage writes persist across accesses. Dies with the context.
+const SETUP_ENV_KEY: &str = "iso4::setupEnv";
+
+/// Classic script evaluated on first `process` access. Returns the process
+/// object, closing over the native env-target resolver and exit.
+///
+/// `env` proxies the per-run target so writes coerce to strings (Node's
+/// rule); the WeakMap keeps one proxy per target. The emitter is minimal and
+/// real — `emit` fires listeners — but the runtime itself emits nothing
+/// except `emitWarning`'s 'warning'.
+const PROCESS_FACTORY_SRC: &str = r#"
+(function (getEnvTarget, exitNative) {
+  'use strict';
+  const kListener = Symbol('listener');
+  const envProxies = new WeakMap();
+  const envHandler = {
+    set(target, key, value) {
+      if (typeof key === 'symbol' || typeof value === 'symbol')
+        throw new TypeError('Cannot convert a Symbol value to a string');
+      return Reflect.set(target, key, `${value}`);
+    },
+    defineProperty(target, key, desc) {
+      if (typeof key === 'symbol')
+        throw new TypeError('Cannot convert a Symbol value to a string');
+      if ('value' in desc) desc.value = `${desc.value}`;
+      return Reflect.defineProperty(target, key, desc);
+    },
+  };
+  const listeners = new Map();
+  const process = {
+    get env() {
+      const target = getEnvTarget();
+      if (target === undefined)
+        throw new TypeError('process.env is unavailable (iso4 internal error)');
+      let proxy = envProxies.get(target);
+      if (proxy === undefined) {
+        proxy = new Proxy(target, envHandler);
+        envProxies.set(target, proxy);
+      }
+      return proxy;
+    },
+    platform: 'linux',
+    arch: 'x64',
+    title: 'iso4',
+    argv: ['iso4'],
+    argv0: 'iso4',
+    execArgv: [],
+    pid: 1,
+    ppid: 0,
+    nextTick(callback, ...args) {
+      if (typeof callback !== 'function')
+        throw new TypeError('process.nextTick callback must be a function');
+      Promise.resolve().then(() => { callback(...args); });
+    },
+    exit(code) {
+      exitNative(code === undefined || code === null ? 0 : code);
+    },
+    memoryUsage() {
+      return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 };
+    },
+    getBuiltinModule(id) {
+      if (id === 'process' || id === 'node:process') return process;
+      if (id === 'async_hooks' || id === 'node:async_hooks') {
+        const cls = globalThis[Symbol.for('iso4.async_hooks.AsyncLocalStorage')];
+        return cls === undefined ? undefined : { AsyncLocalStorage: cls };
+      }
+      return undefined;
+    },
+    emitWarning(warning, type) {
+      const err = warning instanceof Error ? warning : new Error(`${warning}`);
+      if (!(warning instanceof Error))
+        err.name = typeof type === 'string' ? type : 'Warning';
+      Promise.resolve().then(() => {
+        if (!process.emit('warning', err))
+          globalThis.console?.warn?.(`${err.name}: ${err.message}`);
+      });
+    },
+    on(name, fn) {
+      let list = listeners.get(name);
+      if (list === undefined) { list = []; listeners.set(name, list); }
+      list.push(fn);
+      return process;
+    },
+    addListener(name, fn) { return process.on(name, fn); },
+    once(name, fn) {
+      const wrapped = (...args) => { process.off(name, wrapped); fn(...args); };
+      wrapped[kListener] = fn;
+      return process.on(name, wrapped);
+    },
+    off(name, fn) {
+      const list = listeners.get(name);
+      if (list !== undefined) {
+        const i = list.findIndex(l => l === fn || l[kListener] === fn);
+        if (i !== -1) list.splice(i, 1);
+      }
+      return process;
+    },
+    removeListener(name, fn) { return process.off(name, fn); },
+    removeAllListeners(name) {
+      if (name === undefined) listeners.clear();
+      else listeners.delete(name);
+      return process;
+    },
+    listeners(name) {
+      const list = listeners.get(name);
+      return list === undefined ? [] : list.map(f => f[kListener] ?? f);
+    },
+    listenerCount(name) {
+      const list = listeners.get(name);
+      return list === undefined ? 0 : list.length;
+    },
+    emit(name, ...args) {
+      const list = listeners.get(name);
+      if (list === undefined || list.length === 0) return false;
+      for (const fn of [...list]) fn(...args);
+      return true;
+    },
+  };
+  return process;
+})
+"#;
+
+/// Install `process` as a lazy non-enumerable global. The getter runs on
+/// first read and V8 replaces the property with the returned object.
+fn install_process(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "process")
+        .ok_or_else(|| RunError::Internal("failed to intern process".to_string()))?;
+    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
+    match global.set_lazy_data_property_with_data(
+        scope,
+        key.into(),
+        process_lazy_getter,
+        data.into(),
+        v8::PropertyAttribute::DONT_ENUM,
+        v8::SideEffectType::HasSideEffect,
+        v8::SideEffectType::HasSideEffect,
+    ) {
+        Some(true) => Ok(()),
+        _ => Err(RunError::Internal(
+            "failed to install process".to_string(),
+        )),
+    }
+}
+
+/// First read of `process`: build the object via the JS factory, handing it
+/// the two natives. Internal failures leave the property `undefined`.
+fn process_lazy_getter(
+    scope: &mut v8::PinScope,
+    _name: v8::Local<v8::Name>,
+    args: v8::PropertyCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let data = args.data();
+    let Some(env_fn) = v8::Function::builder(process_env_target_callback)
+        .data(data)
+        .build(scope)
+    else {
+        return;
+    };
+    let Some(exit_fn) = v8::Function::builder(process_exit_callback)
+        .data(data)
+        .build(scope)
+    else {
+        return;
+    };
+    let Ok(factory_val) = eval_script(scope, PROCESS_FACTORY_SRC, "<iso4:process>") else {
+        return;
+    };
+    let Ok(factory) = v8::Local::<v8::Function>::try_from(factory_val) else {
+        return;
+    };
+    let undefined = v8::undefined(scope).into();
+    if let Some(obj) = factory.call(scope, undefined, &[env_fn.into(), exit_fn.into()]) {
+        rv.set(obj);
+    }
+}
+
+/// Native resolver behind `process.env`: the attributed run's writable
+/// snapshot, materialised from its env entries (or the table's setup env) on
+/// first access. Outside any run — prefix warm-up, prepare validation — a
+/// context-cached setup object built from the setup env is used instead.
+///
+/// Attribution is STRICTER than the console fallback: env is per-run
+/// confidential state, so a stale rider (a finished run's continuation
+/// executing during another run's turn) never falls through to the turn
+/// owner — it gets a throwaway setup-env snapshot instead.
+fn process_env_target_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set_undefined();
+    let Ok(external) = v8::Local::<v8::External>::try_from(args.data()) else {
+        return;
+    };
+    let table = external.value().cast::<RunTable>().cast_const();
+    if table.is_null() {
+        return;
+    }
+    // SAFETY: the External points at the instance-lifetime RunTable Box.
+    let table = unsafe { &*table };
+    let current = CURRENT_RUN_TOKEN.with(|c| c.get());
+    let cped = scope.get_continuation_preserved_embedder_data();
+    let rider = rider_parts(scope, cped).map(|(token, _)| token);
+    let (state, foreign_stale) = {
+        let runs = table.runs.borrow();
+        match rider {
+            Some(token) if token != current => match runs.get(&token) {
+                Some(entry) => (std::ptr::addr_of!(**entry), false),
+                None => (std::ptr::null(), current != 0),
+            },
+            _ => (
+                runs.get(&current)
+                    .map_or(std::ptr::null(), |b| std::ptr::addr_of!(**b)),
+                false,
+            ),
+        }
+    };
+    if state.is_null() {
+        if foreign_stale {
+            // Throwaway snapshot: reads see the prefix env, writes vanish.
+            if let Some(obj) = build_env_object(scope, &table.setup_env) {
+                rv.set(obj.into());
+            }
+            return;
+        }
+        let global = scope.get_current_context().global(scope);
+        let Some(key_name) = v8::String::new(scope, SETUP_ENV_KEY) else {
+            return;
+        };
+        let key = v8::Private::for_api(scope, Some(key_name));
+        if let Some(existing) = global.get_private(scope, key) {
+            if existing.is_object() {
+                rv.set(existing);
+                return;
+            }
+        }
+        let Some(obj) = build_env_object(scope, &table.setup_env) else {
+            return;
+        };
+        global.set_private(scope, key, obj.into());
+        rv.set(obj.into());
+        return;
+    }
+    // SAFETY: entry pointers are valid for the remainder of the turn.
+    let state = unsafe { &*state };
+    if let Some(cached) = state.env_obj.borrow().as_ref() {
+        let local = v8::Local::new(scope, cached);
+        rv.set(local.into());
+        return;
+    }
+    let pairs: &[(String, String)] = state.env.as_deref().unwrap_or(&table.setup_env);
+    let Some(obj) = build_env_object(scope, pairs) else {
+        return;
+    };
+    state.env_obj.replace(Some(v8::Global::new(scope, obj)));
+    rv.set(obj.into());
+}
+
+fn build_env_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    pairs: &[(String, String)],
+) -> Option<v8::Local<'s, v8::Object>> {
+    let obj = v8::Object::new(scope);
+    for (name, value) in pairs {
+        let key = v8::String::new(scope, name)?;
+        let val = v8::String::new(scope, value)?;
+        // DefineOwnProperty semantics: a key like "__proto__" becomes a real
+        // own entry instead of vanishing into the prototype setter.
+        obj.create_data_property(scope, key.into(), val.into())?;
+    }
+    Some(obj)
+}
+
+/// Native `process.exit`: classify first, then terminate — the guards' order,
+/// so the failure reports `ERR_PROCESS_EXIT` rather than a generic
+/// termination. Never returns to JS.
+fn process_exit_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let code = args.get(0).int32_value(scope).unwrap_or(0);
+    if let Ok(external) = v8::Local::<v8::External>::try_from(args.data()) {
+        let table = external.value().cast::<RunTable>().cast_const();
+        if !table.is_null() {
+            // SAFETY: the External points at the instance-lifetime RunTable Box.
+            if let Some(reason) = unsafe { &*table }.reason.get() {
+                reason.set(TerminationReason::Exit(code));
+            }
+        }
+    }
+    scope.terminate_execution();
+    rv.set_undefined();
+}
+
 /// Reject the two export shapes whose diagnostic is only useful with the
 /// export name attached.
 ///
@@ -9084,6 +9488,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             None,
             None,
+            None,
         )
     }
 
@@ -9124,6 +9529,7 @@ mod tests {
             RunIo::None,
             0,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
             None,
         )
@@ -9593,6 +9999,7 @@ mod tests {
             &[],
             &[],
             0,
+            &[],
         )
         .unwrap_err();
         let RunError::RuntimeError(data) = &err.error else {
@@ -9612,6 +10019,7 @@ mod tests {
             &[],
             &[],
             0,
+            &[],
         )
         .expect("logging in a prefix must not fail validation");
     }
@@ -10207,16 +10615,167 @@ mod tests {
     }
 
     #[test]
-    fn node_globals_are_not_available() {
-        // `process` and `require` must not exist in the sandbox.
-        let out = run_ok("export default typeof process");
-        assert_eq!(get_default(&out).as_deref(), Some("undefined"));
-    }
-
-    #[test]
     fn node_require_is_not_available() {
         let out = run_ok("export default typeof require");
         assert_eq!(get_default(&out).as_deref(), Some("undefined"));
+    }
+
+    // ── process ───────────────────────────────────────────────────────────
+
+    fn owned_env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn run_with_env(code: &str, pairs: &[(&str, &str)]) -> Result<Output, RunError> {
+        init_platform();
+        run_module(
+            Some(code),
+            "<iso4>",
+            Limits::default(),
+            &[],
+            &[],
+            RunIo::None,
+            0,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            Some(owned_env(pairs)),
+        )
+        .map_err(|failure| failure.error)
+    }
+
+    #[test]
+    fn process_global_exists_lazily_and_non_enumerable() {
+        let out = run_ok(
+            "const enumerated = Object.keys(globalThis).includes('process')\n\
+             export default [typeof process, enumerated].join('|')",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("object|false"));
+    }
+
+    #[test]
+    fn process_env_is_empty_without_host_entries() {
+        let out = run_ok("export default JSON.stringify(process.env)");
+        assert_eq!(get_default(&out).as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn process_env_carries_host_entries() {
+        let out = run_with_env(
+            "export default [process.env.FOO, process.env.MISSING].map(String).join('|')",
+            &[("FOO", "bar")],
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("bar|undefined"));
+    }
+
+    #[test]
+    fn process_env_is_writable_and_coerces_to_string() {
+        let out = run_with_env(
+            "process.env.N = 42\n\
+             delete process.env.FOO\n\
+             export default [typeof process.env.N, process.env.N, process.env.FOO].map(String).join('|')",
+            &[("FOO", "bar")],
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("string|42|undefined"));
+    }
+
+    #[test]
+    fn process_env_object_is_stable_within_a_run() {
+        let out = run_with_env(
+            "process.env.X = 'set'\nexport default process.env.X",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("set"));
+    }
+
+    #[test]
+    fn process_exit_fails_the_run_with_its_code() {
+        match run_err("process.exit(3); export default 'unreachable'") {
+            RunError::ProcessExit(3) => {}
+            other => panic!("expected ProcessExit(3), got {other:?}"),
+        }
+        match run_err("process.exit(); export default 'unreachable'") {
+            RunError::ProcessExit(0) => {}
+            other => panic!("expected ProcessExit(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_next_tick_runs_as_microtask() {
+        let out = run_ok(
+            "const order = []\n\
+             process.nextTick((v) => order.push(v), 'tick')\n\
+             order.push('sync')\n\
+             export default await Promise.resolve().then(() => order.join('|'))",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("sync|tick"));
+    }
+
+    #[test]
+    fn process_module_import_returns_the_global() {
+        let out = run_ok(
+            "import process from 'node:process'\n\
+             export default [process === globalThis.process, process.platform].join('|')",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("true|linux"));
+    }
+
+    #[test]
+    fn process_constants_mirror_the_runtime() {
+        let out = run_ok(
+            "export default [process.platform, process.arch, process.title, \
+             process.pid, process.ppid, typeof process.version].join('|')",
+        );
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("linux|x64|iso4|1|0|undefined")
+        );
+    }
+
+    #[test]
+    fn process_get_builtin_module_resolves_the_two_builtins() {
+        let out = run_ok(
+            "const hooks = process.getBuiltinModule('node:async_hooks')\n\
+             export default [\n\
+               typeof hooks.AsyncLocalStorage,\n\
+               process.getBuiltinModule('node:process') === process,\n\
+               String(process.getBuiltinModule('node:fs')),\n\
+             ].join('|')",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("function|true|undefined"));
+    }
+
+    #[test]
+    fn process_emit_warning_lands_on_stderr_or_listeners() {
+        let out = run_ok(
+            "process.emitWarning('careful')\n\
+             export default await Promise.resolve().then(() => 'done')",
+        );
+        assert!(has_line(&out.stderr, "Warning: careful"));
+
+        let out = run_ok(
+            "let seen = ''\n\
+             process.on('warning', (w) => { seen = w.message })\n\
+             process.emitWarning('handled')\n\
+             export default await Promise.resolve().then(() => seen)",
+        );
+        assert_eq!(get_default(&out).as_deref(), Some("handled"));
+        assert!(!has_line(&out.stderr, "handled"));
+    }
+
+    #[test]
+    fn process_memory_usage_mirrors_workerd_zeros() {
+        let out = run_ok("export default JSON.stringify(process.memoryUsage())");
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some(r#"{"rss":0,"heapTotal":0,"heapUsed":0,"external":0,"arrayBuffers":0}"#)
+        );
     }
 
     // ── Imports ───────────────────────────────────────────────────────────
@@ -10332,6 +10891,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .map_err(|f| f.error)
@@ -10700,28 +11260,29 @@ mod tests {
         globals: &'a [HostGlobalDef],
         imports: &[ImportBinding],
     ) -> PrefixSpec<'a> {
-        precompile(code, None, globals, imports, 0).expect("prefix must validate");
+        precompile(code, None, globals, imports, 0, &[]).expect("prefix must validate");
         PrefixSpec {
             code,
             filename: "<prefix>",
             globals,
+            env: &[],
         }
     }
 
     #[test]
     fn precompile_accepts_a_valid_prefix() {
-        precompile("const x = 1", None, &[], &[], 0).unwrap();
+        precompile("const x = 1", None, &[], &[], 0, &[]).unwrap();
     }
 
     #[test]
     fn precompile_compile_error_is_reported() {
-        let err = precompile("export default (((", None, &[], &[], 0).unwrap_err();
+        let err = precompile("export default (((", None, &[], &[], 0, &[]).unwrap_err();
         assert!(matches!(err.error, RunError::CompileError(_)));
     }
 
     #[test]
     fn precompile_runtime_error_is_reported() {
-        let err = precompile(r#"throw new Error("prefix failed")"#, None, &[], &[], 0).unwrap_err();
+        let err = precompile(r#"throw new Error("prefix failed")"#, None, &[], &[], 0, &[]).unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
@@ -10752,6 +11313,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -10775,6 +11337,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -10810,6 +11373,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42|42|true"));
@@ -10842,6 +11406,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("early"));
@@ -10864,6 +11429,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         let bg = out.background.expect("grace phase ran");
@@ -10884,6 +11450,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -10902,6 +11469,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -10926,6 +11494,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         let got = get_default(&out).unwrap();
@@ -10947,6 +11516,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -10987,6 +11557,7 @@ mod tests {
                 Some(fd),
                 Arc::new(AtomicU32::new(0)),
                 None,
+                None,
             );
             (result, handle)
         };
@@ -11016,6 +11587,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         assert!(!outcome.tainted, "boundary truncation must not taint");
         let out = outcome.result.expect("run succeeded");
@@ -11035,6 +11607,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         let out = second.result.expect("instance reusable after clean truncation");
         assert_eq!(get_default(&out).as_deref(), Some("function"));
@@ -11049,6 +11622,7 @@ mod tests {
             &[],
             &[],
             0,
+            &[],
         )
         .unwrap();
     }
@@ -11074,6 +11648,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("41|x"));
@@ -11094,7 +11669,7 @@ mod tests {
             "await 1",
             "export default await (async () => 1)()",
         ] {
-            let result = precompile(code, None, &[], &[], 0);
+            let result = precompile(code, None, &[], &[], 0, &[]);
             assert!(
                 result.is_ok(),
                 "prefix {code:?} failed: {:?}",
@@ -11126,6 +11701,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("3"));
@@ -11151,6 +11727,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("10"));
@@ -11163,14 +11740,14 @@ mod tests {
             None,
             &[],
             &[],
-        0)
+        0, &[])
         .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
     #[test]
     fn precompile_never_settling_prefix_fails_with_did_not_settle() {
-        let err = precompile("await new Promise(() => {})", None, &[], &[], 0).unwrap_err();
+        let err = precompile("await new Promise(() => {})", None, &[], &[], 0, &[]).unwrap_err();
         assert!(matches!(err.error, RunError::PrefixDidNotSettle(_)));
     }
 
@@ -11186,7 +11763,7 @@ mod tests {
             "await fetch('https://example.com')",
             "fetch('https://example.com')",
         ] {
-            let err = precompile(code, None, &globals, &[], 0).unwrap_err();
+            let err = precompile(code, None, &globals, &[], 0, &[]).unwrap_err();
             match err.error {
                 RunError::PrefixBridgeCall(msg) => {
                     assert!(msg.contains("bridge global 'fetch'"), "message: {msg}");
@@ -11234,6 +11811,7 @@ mod tests {
             Some(client.as_raw_fd()),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         drop(server);
@@ -11278,6 +11856,7 @@ mod tests {
             Some(client.as_raw_fd()),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         drop(server);
@@ -11317,6 +11896,7 @@ mod tests {
             Some(client.as_raw_fd()),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         drop(server);
@@ -11335,7 +11915,7 @@ mod tests {
             enumerable: true,
         }];
         let err =
-            precompile("await fetch('https://example.com')", None, &globals, &[], 0).unwrap_err();
+            precompile("await fetch('https://example.com')", None, &globals, &[], 0, &[]).unwrap_err();
         match err.error {
             // The placeholder sits under the handler name but reports the
             // public name — the user called `fetch`, not `__iso4_fetch_h`.
@@ -11358,6 +11938,7 @@ mod tests {
             &[],
             &imports,
             0,
+            &[],
         )
         .unwrap_err();
         assert!(matches!(err.error, RunError::PrefixBridgeCall(_)));
@@ -11379,6 +11960,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("function"));
@@ -11398,6 +11980,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -11424,6 +12007,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -11442,13 +12026,14 @@ mod tests {
             "new Headers([['content-type', 'text/plain']])",
         ] {
             let prefix_src = format!("globalThis.v = {expr}");
-            precompile(&prefix_src, None, &[], &[], 0)
+            precompile(&prefix_src, None, &[], &[], 0, &[])
                 .unwrap_or_else(|_| panic!("precompile with a live {expr} must not fail"));
             let out = execute_with_prefix(
                 PrefixSpec {
                     code: &prefix_src,
                     filename: "<prefix>",
                     globals: &[],
+                    env: &[],
                 },
                 Some("export default typeof globalThis.v"),
                 None,
@@ -11457,6 +12042,7 @@ mod tests {
                 &[],
                 None,
                 Arc::new(AtomicU32::new(0)),
+                None,
                 None,
             )
             .unwrap_or_else(|_| panic!("run with a prefix holding {expr} must not fail"));
@@ -11479,6 +12065,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         // The export blob carries a host object; the host decodes it. Here we
@@ -11500,6 +12087,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("42"));
@@ -11519,6 +12107,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         let out2 = execute_with_prefix(
@@ -11531,6 +12120,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         let out3 = execute_with_prefix(
@@ -11542,6 +12132,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -11563,6 +12154,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         let out = execute_with_prefix(
@@ -11574,6 +12166,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -11597,6 +12190,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("49"));
@@ -11615,6 +12209,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert!(out.stdout.iter().any(|l| l.contains("hello from postfix")));
@@ -11632,6 +12227,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap_err();
@@ -11835,6 +12431,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         responder.join().unwrap();
         assert!(
@@ -11978,6 +12575,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         (result, handle)
     }
@@ -12105,6 +12703,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -12358,6 +12957,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap_err()
         .error;
@@ -12401,6 +13001,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap_err()
@@ -12529,6 +13130,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap_err()
         .error;
@@ -12591,6 +13193,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap_err()
@@ -12749,6 +13352,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap_err()
         .error;
@@ -12798,6 +13402,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
 
@@ -12834,6 +13439,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -12874,6 +13480,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap_err()
@@ -12916,6 +13523,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -12966,6 +13574,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap_err();
 
@@ -13013,6 +13622,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap_err()
         .error;
@@ -13056,6 +13666,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap_err()
         .error;
@@ -13094,6 +13705,7 @@ mod tests {
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap_err()
@@ -13150,6 +13762,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap_err()
         .error;
@@ -13202,6 +13815,7 @@ mod tests {
             Some(fd1),
             Arc::clone(&counter),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("1"));
@@ -13239,6 +13853,7 @@ mod tests {
             &[],
             Some(fd2),
             Arc::clone(&counter),
+            None,
             None,
         )
         .unwrap_err()
@@ -13311,6 +13926,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
 
@@ -13355,6 +13971,7 @@ mod tests {
             &[HostGlobalDef::bridge("tool")],
             &[], Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         ).unwrap();
 
@@ -13516,6 +14133,7 @@ mod tests {
             &[],
             &[],
             0,
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -13536,6 +14154,7 @@ mod tests {
             &[],
             &[],
             0,
+            &[],
         )
         .unwrap_err();
         assert!(
@@ -13553,6 +14172,7 @@ mod tests {
             &[],
             &[],
             0,
+            &[],
         )
         .unwrap();
     }
@@ -13624,6 +14244,7 @@ mod tests {
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         );
         (result, handle)
@@ -13888,7 +14509,7 @@ mod tests {
             globalThis.maxResults = limit;
             export default 1;
             "#;
-        validate_prefix_module(prefix_src, "<prefix>", &[], &imports, 0).unwrap();
+        validate_prefix_module(prefix_src, "<prefix>", &[], &imports, 0, &[]).unwrap();
 
         let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let client = ManuallyDrop::new(client);
@@ -13914,6 +14535,7 @@ mod tests {
                 code: prefix_src,
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             },
             Some("export default (await globalThis.search('dogs')) + globalThis.maxResults"),
             None,
@@ -13922,6 +14544,7 @@ mod tests {
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -13942,7 +14565,7 @@ mod tests {
             vec![("f", HostModuleNode::Function)],
         )];
         let prefix_src = "globalThis.ready = true;";
-        validate_prefix_module(prefix_src, "<prefix>", &[], &imports, 0).unwrap();
+        validate_prefix_module(prefix_src, "<prefix>", &[], &imports, 0, &[]).unwrap();
 
         let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let client = ManuallyDrop::new(client);
@@ -13965,6 +14588,7 @@ mod tests {
                 code: prefix_src,
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             },
             Some(r#"import { f } from "tools:t"; export default await f()"#),
             None,
@@ -13973,6 +14597,7 @@ mod tests {
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .unwrap();
@@ -14043,6 +14668,7 @@ mod tests {
             0,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
             None,
         )
         .map_err(|failure| failure.error)
@@ -14158,6 +14784,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         )
         .unwrap();
         handle.join().unwrap();
@@ -14188,6 +14815,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -14210,6 +14838,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         )
         .unwrap();
         assert_eq!(value_of(&out), WireValue::String("named|X".to_string()));
@@ -14344,6 +14973,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Some(&call),
             None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::ExportTooLarge));
@@ -14421,6 +15051,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Some(&call),
             None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::CpuTimeout));
@@ -14451,6 +15082,7 @@ mod tests {
                 0,
                 Arc::new(AtomicU32::new(0)),
                 call.as_ref(),
+                None,
                 None,
             );
             let _ = tx.send(result);
@@ -14545,6 +15177,7 @@ mod tests {
                 code: COUNTER_PREFIX,
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -14566,6 +15199,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         )
     }
 
@@ -14591,6 +15225,7 @@ mod tests {
                 code: "globalThis.mk = new Function('return 7')",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -14611,6 +15246,7 @@ mod tests {
                 &[],
                 None,
                 Arc::new(AtomicU32::new(0)),
+                None,
                 None,
             );
             assert!(!outcome.tainted);
@@ -14638,6 +15274,7 @@ mod tests {
                 code: "export function spin() { for (;;) {} }",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -14659,6 +15296,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         );
         assert!(outcome.tainted, "a fired guard must taint the instance");
         let failure = outcome.result.unwrap_err();
@@ -14678,6 +15316,7 @@ mod tests {
                        export function boom() { throw new Error('x') }",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -14697,6 +15336,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
+            None,
         );
         assert!(
             !outcome.tainted,
@@ -14720,6 +15360,7 @@ mod tests {
                 code: "for (;;) {}",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -14736,7 +15377,7 @@ mod tests {
         // un-warmable prefix fails at deploy time, not on the first call.
         // Before warm instances this hung prepare() forever.
         let failure =
-            validate_prefix_module("for (;;) {}", "<prefix>", &[], &[], 0).expect_err("must reject");
+            validate_prefix_module("for (;;) {}", "<prefix>", &[], &[], 0, &[]).expect_err("must reject");
         assert!(matches!(failure.error, RunError::WarmupLimit));
     }
 
@@ -14750,6 +15391,7 @@ mod tests {
                 code: "globalThis.counter = (globalThis.counter ?? 0)",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -14766,6 +15408,7 @@ mod tests {
                 &[],
                 None,
                 Arc::new(AtomicU32::new(0)),
+                None,
                 None,
             );
             assert!(!outcome.tainted);
@@ -14800,6 +15443,7 @@ mod tests {
                 code: "",
                 filename: "<prefix>",
                 globals: &[HostGlobalDef::bridge("g")],
+                env: &[],
             }),
             &[],
             0,
@@ -14823,6 +15467,7 @@ mod tests {
             Some(fd),
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         assert!(!out1.tainted);
         assert!(out1.result.is_ok());
@@ -14843,6 +15488,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         assert!(!out2.tainted, "a caught throw is a clean completion");
         let out = out2.result.expect("call 2 completes");
@@ -14862,6 +15508,7 @@ mod tests {
                 code: "",
                 filename: "<prefix>",
                 globals: &[HostGlobalDef::bridge("g")],
+                env: &[],
             }),
             &[],
             0,
@@ -14883,6 +15530,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         );
         assert!(!out1.tainted);
@@ -14906,6 +15554,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         assert!(!out2.tainted, "the setter must not run during re-arm");
         assert_eq!(get_default(&out2.result.unwrap()).as_deref(), Some("7"));
@@ -14922,6 +15571,7 @@ mod tests {
                 code: "globalThis.hog = new Uint8Array(64 * 1024 * 1024)",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             8,
@@ -14946,6 +15596,7 @@ mod tests {
                 code: "console.log('boot diagnostics')",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -14962,6 +15613,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .result
@@ -14982,6 +15634,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .result
@@ -15009,6 +15662,7 @@ mod tests {
                 code: "",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -15033,6 +15687,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         assert!(!run1.tainted);
         assert!(run1.result.is_ok());
@@ -15051,6 +15706,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         assert!(!run2.tainted);
         assert!(run2.result.is_ok());
@@ -15066,6 +15722,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .result
@@ -15289,6 +15946,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("early"));
@@ -15309,6 +15967,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("early"));
@@ -15328,6 +15987,7 @@ mod tests {
                 code: "globalThis.hit = 'untouched'",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -15343,6 +16003,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         );
         assert!(!run1.tainted);
@@ -15365,6 +16026,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         );
         assert_eq!(
             get_default(&run2.result.expect("run 2 succeeds")).as_deref(),
@@ -15385,6 +16047,7 @@ mod tests {
                        globalThis.prefixTimerError = msg",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -15400,6 +16063,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
+            None,
             None,
         )
         .result
@@ -15419,6 +16083,7 @@ mod tests {
                 code: "globalThis.sleep = (ms) => new Promise(r => setTimeout(r, ms))",
                 filename: "<prefix>",
                 globals: &[],
+                env: &[],
             }),
             &[],
             0,
@@ -15435,6 +16100,7 @@ mod tests {
             None,
             Arc::new(AtomicU32::new(0)),
             None,
+            None,
         )
         .result
         .expect("run succeeds");
@@ -15445,5 +16111,208 @@ mod tests {
     fn set_timeout_and_clear_timeout_are_reserved_global_names() {
         assert!(RESERVED_GLOBAL_NAMES.contains(&"setTimeout"));
         assert!(RESERVED_GLOBAL_NAMES.contains(&"clearTimeout"));
+        assert!(RESERVED_GLOBAL_NAMES.contains(&"process"));
+    }
+
+    // ── process on warm instances ─────────────────────────────────────────
+
+    fn env_core(prefix_code: &str, pairs: &[(&str, &str)]) -> InstanceCore {
+        init_platform();
+        let env = owned_env(pairs);
+        create_instance_core(
+            Some(PrefixSpec {
+                code: prefix_code,
+                filename: "<prefix>",
+                globals: &[],
+                env: &env,
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up")
+    }
+
+    fn run_postfix_on_core(
+        core: &mut InstanceCore,
+        code: &str,
+        env: Option<Vec<(String, String)>>,
+    ) -> CallOutcome {
+        run_call_on_core(
+            core,
+            Some(code),
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            env,
+        )
+    }
+
+    #[test]
+    fn warm_run_env_falls_back_to_the_prefix_env_and_replaces_wholesale() {
+        let mut core = env_core("export {}", &[("A", "1"), ("B", "1")]);
+
+        // No run env: the prefix env is the fallback.
+        let out = run_postfix_on_core(
+            &mut core,
+            "export default [process.env.A, process.env.B].join('|')",
+            None,
+        )
+        .result
+        .expect("run succeeds");
+        assert_eq!(get_default(&out).as_deref(), Some("1|1"));
+
+        // A run env REPLACES the prefix env — no merge, B is gone.
+        let out = run_postfix_on_core(
+            &mut core,
+            "export default [process.env.A, process.env.B].map(String).join('|')",
+            Some(owned_env(&[("A", "2")])),
+        )
+        .result
+        .expect("run succeeds");
+        assert_eq!(get_default(&out).as_deref(), Some("2|undefined"));
+    }
+
+    #[test]
+    fn warm_run_env_writes_do_not_leak_into_the_next_run() {
+        let mut core = env_core("export {}", &[("A", "1")]);
+        let out = run_postfix_on_core(
+            &mut core,
+            "process.env.A = 'mutated'\nprocess.env.NEW = 'x'\n\
+             export default process.env.A",
+            None,
+        )
+        .result
+        .expect("run succeeds");
+        assert_eq!(get_default(&out).as_deref(), Some("mutated"));
+
+        let out = run_postfix_on_core(
+            &mut core,
+            "export default [process.env.A, process.env.NEW].map(String).join('|')",
+            None,
+        )
+        .result
+        .expect("run succeeds");
+        assert_eq!(get_default(&out).as_deref(), Some("1|undefined"));
+    }
+
+    #[test]
+    fn prefix_evaluation_sees_the_prefix_env() {
+        let mut core = env_core(
+            "globalThis.fromPrefix = process.env.A ?? 'absent'",
+            &[("A", "prefix-value")],
+        );
+        // Even a run that overrides env sees what the warm-up read.
+        let out = run_postfix_on_core(
+            &mut core,
+            "export default [fromPrefix, process.env.A].join('|')",
+            Some(owned_env(&[("A", "run-value")])),
+        )
+        .result
+        .expect("run succeeds");
+        assert_eq!(
+            get_default(&out).as_deref(),
+            Some("prefix-value|run-value")
+        );
+    }
+
+    #[test]
+    fn stale_continuation_never_reads_the_turn_owners_env() {
+        // Run A plants a continuation that reads process.env, concludes, and
+        // run B (with a secret env) resolves it: the stale rider must get the
+        // prefix env, never B's. The console fallback (turn owner) would be a
+        // confidentiality leak here.
+        let mut core = env_core(
+            "globalThis.stash = null\n\
+             export function plant() { globalThis.stash = new Promise((r) => { \
+             globalThis.releaseIt = r }).then(() => JSON.stringify(process.env)) }\n\
+             export function release() { globalThis.releaseIt(); return globalThis.stash }",
+            &[("STAGE", "prefix")],
+        );
+        let plant = call_spec("plant", &[]);
+        let outcome = run_call_on_core(
+            &mut core,
+            None,
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&plant),
+            Some(owned_env(&[("SECRET_A", "a")])),
+        );
+        assert!(outcome.result.is_ok(), "plant succeeds");
+
+        let release = call_spec("release", &[]);
+        let outcome = run_call_on_core(
+            &mut core,
+            None,
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&release),
+            Some(owned_env(&[("SECRET_B", "b")])),
+        );
+        let out = outcome.result.expect("release succeeds");
+        match value_of(&out) {
+            WireValue::String(seen) => {
+                assert!(!seen.contains("SECRET_B"), "leaked the turn owner's env: {seen}");
+                assert!(!seen.contains("SECRET_A"), "run A's entry is gone: {seen}");
+                assert!(seen.contains("prefix"), "stale rider reads the prefix env: {seen}");
+            }
+            other => panic!("expected a JSON string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn process_exit_on_a_warm_core_taints_it() {
+        let mut core = env_core("export {}", &[]);
+        let outcome = run_postfix_on_core(&mut core, "process.exit(7)", None);
+        assert!(outcome.tainted, "exit interrupts mid-JS and must taint");
+        match outcome.result {
+            Err(failure) => match failure.error {
+                RunError::ProcessExit(7) => {}
+                other => panic!("expected ProcessExit(7), got {other:?}"),
+            },
+            Ok(out) => panic!("expected failure, got output: {out:?}"),
+        }
+    }
+
+    #[test]
+    fn process_is_a_reserved_global_name_for_hosts() {
+        init_platform();
+        let err = run_module(
+            Some("export default 1"),
+            "<iso4>",
+            Limits::default(),
+            &[ipc::HostGlobalDef::Data {
+                name: "process".to_string(),
+                blob: testval::to_blob(&WireValue::Number(1.0)),
+                enumerable: true,
+            }],
+            &[],
+            RunIo::None,
+            0,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+        )
+        .expect_err("reserved name must be refused")
+        .error;
+        match err {
+            RunError::ReservedName(msg) => assert!(msg.contains("process")),
+            other => panic!("expected ReservedName, got {other:?}"),
+        }
     }
 }

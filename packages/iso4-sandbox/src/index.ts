@@ -405,6 +405,24 @@ function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilR
 }
 
 /**
+ * Env values must be strings — the wire carries them verbatim and the
+ * sandbox's `process.env` is strings-only (Node's rule). TypeScript enforces
+ * this at compile time; this guards untyped callers.
+ * @param env the candidate env record
+ */
+function validateEnv(env: Record<string, string> | undefined): void {
+  if (env === undefined)
+    return
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== 'string') {
+      throw new TypeError(
+        `[@iso4/sandbox] env['${key}'] must be a string, got ${typeof value}`,
+      )
+    }
+  }
+}
+
+/**
  * A heap cap must be an integer number of megabytes ≥ 0 (0 = uncapped):
  * the wire carries it as a u32, and a fractional or negative value would
  * silently misencode instead of capping.
@@ -643,6 +661,7 @@ class SandboxImpl implements Sandbox {
       )
     }
     validateMemoryMb(options.limits?.memoryMb, 'limits.memoryMb')
+    validateEnv(options.env)
     const runMemoryMb = options.limits?.memoryMb ?? this.memoryMb
     const { defs, dispatch } = processGlobals(options.globals ?? {})
     // Drain any Request/Response body before the payload encoder, which is
@@ -679,6 +698,7 @@ class SandboxImpl implements Sandbox {
           hardAbortSignal: options.hardAbortSignal,
           call,
           streams,
+          env: options.env,
         })
         // `call` present ⇒ the value blob is the function's return value;
         // absent ⇒ the exports object. Never both. A result body that
@@ -802,6 +822,7 @@ class SandboxImpl implements Sandbox {
     options: PrecompileOptions<G, M>,
   ): Promise<Prefix<G, M>> {
     validateMemoryMb(options.memoryMb, 'memoryMb')
+    validateEnv(options.env)
     // Per-prefix heap cap (#77): baked into every instance serving this
     // prefix; every run frame for it carries this value, so warm instances
     // are created with it and attach cap-matching holds by construction.
@@ -821,6 +842,7 @@ class SandboxImpl implements Sandbox {
         limits: { ...options.limits, ...heapCapsForWire(prefixMemoryMb) },
         globals: defs,
         imports: bindings,
+        env: options.env,
       })
       const result = decodePrecompileResultPayload(raw)
 
@@ -969,6 +991,7 @@ implements Prefix<G, M> {
    * @param options.signal
    * @param options.hardAbortSignal
    * @param options.filename
+   * @param options.env
    * @param payload
    */
   private async dispatch(
@@ -979,6 +1002,7 @@ implements Prefix<G, M> {
       signal?: AbortSignal
       hardAbortSignal?: AbortSignal
       filename?: string
+      env?: Record<string, string>
     },
     payload: { code: string, call?: undefined, streams?: StreamSourceRegistry }
       | { code?: undefined, call: CallPayload, streams?: StreamSourceRegistry },
@@ -1007,6 +1031,7 @@ implements Prefix<G, M> {
     if (options.hardAbortSignal?.aborted) {
       return abortedResult(options.hardAbortSignal.reason)
     }
+    validateEnv(options.env)
     if (options.limits !== undefined && 'memoryMb' in options.limits) {
       throw new TypeError(
         '[@iso4/sandbox] limits.memoryMb is not a per-run option for prefix '
@@ -1066,6 +1091,7 @@ implements Prefix<G, M> {
           hardAbortSignal: options.hardAbortSignal,
           call: payload.call,
           streams,
+          env: options.env,
         })
         // `call` present ⇒ the value blob is the function's return value;
         // absent ⇒ the exports object. Never both. Streamed result bodies

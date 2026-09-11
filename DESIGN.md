@@ -464,6 +464,8 @@ names that the host must not shadow:
   onto the frozen clock. `setInterval` does not exist and is not reserved —
   it is incoherent for run-scoped code (an interval never settles), a
   closed question rather than a pending tier.
+- `process` — the curated Node-compat surface with the per-run env
+  snapshot (§4.2.2).
 - The web runtime the runtime installs: `Headers`, `Request`, `Response`,
   `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`.
 
@@ -561,6 +563,45 @@ and `URL.canParse` statics are included. `URLSearchParams` remains JS.
 Widening this set is additive and does not change the wire format
 (`docs/protocol.md` §4.4), which is why the tier was chosen deliberately rather
 than aiming at full compliance up front.
+
+### 4.2.2 process and env
+
+Worker-targeted code and its dependencies read `process.env`, so the runtime
+ships a curated `process` — workerd's model, adapted:
+
+- **Lazy.** `process` is a non-enumerable lazy data property on
+  `globalThis`: the object is built (one small factory script) on first
+  read, so a run that never touches it pays nothing at context creation.
+  `import process from 'node:process'` resolves to the same object.
+- **`env` is a writable per-run snapshot.** The host declares entries at
+  `prepare({ env })` and may replace them wholesale per run (`env` on
+  `execute()`/`call()`/`run()` — replace, never merge). Prefix evaluation
+  reads the prefix env; prefix-stage WRITES stay in the setup stage and
+  never reach run snapshots — those are always materialised from the
+  declared entries, so a nondeterministic warm-up cannot make env differ
+  between instances. Writes coerce to strings (Node's rule, via a Proxy),
+  and nothing written survives the run or reaches the host. On a warm
+  instance the snapshot lives in the run's table entry, attributed like
+  console capture but STRICTER: a stale rider — a finished run's
+  continuation executing during another run's turn — never falls through
+  to the turn owner's env (console's cosmetic fallback would be a
+  confidentiality leak here); it gets a throwaway prefix-env snapshot.
+- **`exit(code)` terminates the run** with `ERR_PROCESS_EXIT` (the reason
+  cell is classified before `terminate_execution`, the guards' order).
+  Exit never returns — Node/workerd semantics — so on a warm instance the
+  mid-JS interruption taints it and co-residents fail with
+  `ERR_INSTANCE_RESET` (cause `exit`).
+- **Curated, honest surface.** Constants (`platform: 'linux'`,
+  `arch: 'x64'`, `title`/`argv`/`pid`…), `nextTick` (microtask
+  approximation), `getBuiltinModule`, `emitWarning` (+ a minimal real
+  emitter), and workerd's all-zero `memoryUsage()`. Deliberately absent:
+  `version`/`versions` (iso4 is not Node and does not claim a Node
+  version), and everything filesystem/OS-shaped — absent members are
+  `undefined`, never stubs (the conformance stance). The full table lives
+  in `docs/conformance.md`.
+
+`process` joins the reserved global names; hosts that shipped their own
+`process` data global must move their entries to `env`.
 
 ### 4.3 Imports
 
@@ -1125,13 +1166,15 @@ wait anyway.
 
 Documented up front so we don't drift into rebuilding secure-exec:
 
-1. **No `node:*` builtins** (one exception). If a user does
+1. **No `node:*` builtins** (two exceptions). If a user does
    `import fs from "node:fs"`, it throws `ModuleNotFound` unless the host
    explicitly provided it via `imports`. The host can ship a curated
-   `node:fs` if they want; the runtime won't. The sole runtime-provided
-   `node:*` module is `node:async_hooks`, which exposes a minimal
-   `AsyncLocalStorage` (run/postfix code only). See §16. A host-declared
-   import of the same specifier takes precedence over the built-in.
+   `node:fs` if they want; the runtime won't. The runtime-provided
+   `node:*` modules are `node:async_hooks`, which exposes a minimal
+   `AsyncLocalStorage` (run/postfix code only), and `node:process`, whose
+   default export is the `process` global (§4.2.2). See §16. A
+   host-declared import of the same specifier takes precedence over the
+   built-ins.
 
 2. **No callbacks across the boundary.** No host-shipped callbacks, no
    event listeners on host objects, no `array.forEach` style host

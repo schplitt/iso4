@@ -47,9 +47,11 @@ Frame readers MUST reject:
 | EOF before all `length` bytes arrive           | connection error |
 | unknown message type for the current direction | protocol error   |
 
-Current protocol version: **`2`** — nothing is released yet, so there is no
-version history and no compatibility handling: both sides must speak exactly
-this version, and the handshake hard-fails otherwise (§8).
+Current protocol version: **`3`** (v3 appended the `env` slot to the `Run`,
+`Precompile`, and `PrefixRun` payloads). There is no compatibility handling:
+both sides must speak exactly this version, and the handshake hard-fails
+otherwise (§8) — `@iso4/sandbox` and the `@iso4/v8-*` binaries release in
+lockstep.
 
 ---
 
@@ -600,6 +602,7 @@ time. Never per run, never per value.
 | `globals`  | `List<GlobalDef>`     | Host globals + how the runtime installs each one.                                                           |
 | `imports`  | `List<ImportBinding>` | Source or host import declarations.                                                                         |
 | `call`     | `Optional<CallSpec>`  | Host → sandbox call resolved against the freshly evaluated module.                                          |
+| `env`      | `Optional<EnvList>`   | `process.env` entries for this run; absent = empty env.                                                     |
 
 `PrefixRunPayload`:
 
@@ -613,6 +616,11 @@ time. Never per run, never per value.
 | `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs). |
 | `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                          |
 | `call`     | `Optional<CallSpec>` | Host → sandbox call resolved against the prefix module's exports.                                                          |
+| `env`      | `Optional<EnvList>`  | `process.env` entries for THIS run. Present replaces the prefix env wholesale (no merge); absent falls back to it.         |
+
+`EnvList` is `List<(String name, String value)>`. The runtime materialises the
+run's writable `process.env` snapshot from it on first access — see
+`docs/conformance.md` for the guest-visible semantics.
 
 `CallSpec`:
 
@@ -653,6 +661,7 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 | `limits`    | `ResourceLimits`      | Currently unused at precompile (validation is unlimited).                                                                                                             |
 | `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                                                                                        |
 | `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                                                                                            |
+| `env`       | `Optional<EnvList>`   | `process.env` entries stored with the prefix: what prefix evaluation sees, and the fallback for runs that send no env.                                                |
 
 `ResourceLimits`:
 
@@ -1053,7 +1062,7 @@ afterwards, so later calls report only their own lines.
 
 | Field          | Encoding | Notes                                                                                                                          |
 | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `cause`        | `u8`     | `0 = cpu`, `1 = memory`, `2 = abort`, `3 = internal`, `4 = wall`.                                                              |
+| `cause`        | `u8`     | `0 = cpu`, `1 = memory`, `2 = abort`, `3 = internal`, `4 = wall`, `5 = exit` (a co-resident `process.exit`).                   |
 | `culpritRunId` | `u32`    | The wire run id of the run whose mid-execution interruption reset the shared instance; stable across the victims of one reset. |
 
 `PrecompileResultPayload`:
@@ -1240,6 +1249,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `ERR_WALL_TIMEOUT`                    | The run's own logic time (execution + async waits, counted to arrival — the result's `wallTimeMs`) exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                                                                                                                            |
 | `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `ERR_PROCESS_EXIT`                    | Sandbox code called `process.exit(code)`. Executing JS is terminated immediately (Node/workerd semantics: exit never returns); the message carries the code. On a warm instance the mid-JS interruption taints it, so co-resident runs fail with `ERR_INSTANCE_RESET` (cause `exit`).                                                                                                                                                                                       |
 | `ERR_MODULE_NOT_FOUND`                | Import specifier not in the resolved import set.                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                                                                                                                                                                                                                                                                                       |

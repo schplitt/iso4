@@ -202,6 +202,7 @@ fn instance_main(
         code: &prefix.code,
         filename: prefix.filename.as_deref().unwrap_or("<prefix>"),
         globals: &prefix.globals,
+        env: &prefix.env,
     };
     let mut core = match sandbox::create_instance_core(
         Some(spec),
@@ -947,6 +948,7 @@ mod tests {
             globals: Vec::new(),
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),
+            env: Vec::new(),
         })
     }
 
@@ -977,6 +979,7 @@ mod tests {
             epilogue: None,
             complete: None,
             ctl_slot: None,
+            env: None,
         }
     }
 
@@ -1635,6 +1638,7 @@ mod tests {
             globals: Vec::new(),
             declared_globals: vec!["tool".to_string()],
             declared_imports: Vec::new(),
+            env: Vec::new(),
         })
     }
 
@@ -1649,6 +1653,7 @@ mod tests {
             globals: Vec::new(),
             declared_globals: vec!["tool".to_string()],
             declared_imports: Vec::new(),
+            env: Vec::new(),
         })
     }
 
@@ -1677,6 +1682,7 @@ mod tests {
             globals: Vec::new(),
             declared_globals: vec!["tool".to_string()],
             declared_imports: Vec::new(),
+            env: Vec::new(),
         })
     }
 
@@ -1749,6 +1755,7 @@ mod tests {
             }),
             complete: None,
             ctl_slot,
+            env: None,
         });
         handle
             .sender()
@@ -2673,6 +2680,7 @@ mod tests {
             globals: Vec::new(),
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),
+            env: Vec::new(),
         });
         let dead = spawn_instance(looping, 0, test_brand_key()).expect("spawn instance");
         let first = dead.call(bump_job());
