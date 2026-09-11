@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// This must stay in sync with `docs/protocol.md` and the TypeScript codec in
 /// `packages/iso4-sandbox/src/ipc.ts`.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Default maximum frame length in bytes, including the 1-byte message type.
 pub const DEFAULT_MAX_FRAME_LENGTH: u32 = 64 * 1024 * 1024;
@@ -1199,6 +1199,8 @@ pub struct RunPayload {
     /// When present, the result is the called function's return value instead
     /// of the exports. Resolved against the freshly evaluated module.
     pub call: Option<CallSpec>,
+    /// `process.env` entries for this run; absent = empty env.
+    pub env: Option<Vec<(String, String)>>,
 }
 
 // ── Payload reader ────────────────────────────────────────────────────────────
@@ -1507,6 +1509,26 @@ impl<'a> PayloadReader<'a> {
         Ok(rebinds)
     }
 
+    /// Read an `Optional<List<(String name, String value)>>` env block.
+    fn read_optional_env(&mut self) -> io::Result<Option<Vec<(String, String)>>> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => {
+                let (count, mut pairs) = self.read_list("env entry")?;
+                for _ in 0..count {
+                    let name = self.read_string()?;
+                    let value = self.read_string()?;
+                    pairs.push((name, value));
+                }
+                Ok(Some(pairs))
+            }
+            b => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid optional presence byte: {b:#04x}"),
+            )),
+        }
+    }
+
     /// Read an `Optional<CallSpec>` slot: a presence byte, then
     /// `String exportPath` + a value blob holding the argument array.
     fn read_optional_call(&mut self) -> io::Result<Option<CallSpec>> {
@@ -1560,6 +1582,7 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
     let (code, filename, limits, globals) = parse_code_fields(&mut r, BandPolicy::Strict)?;
     let imports = r.read_import_bindings()?;
     let call = r.read_optional_call()?;
+    let env = r.read_optional_env()?;
     r.assert_done()?;
     Ok(RunPayload {
         run_id,
@@ -1569,6 +1592,7 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
         globals,
         imports,
         call,
+        env,
     })
 }
 
@@ -1587,6 +1611,9 @@ pub struct PrecompilePayload {
     pub limits: ResourceLimits,
     pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
+    /// `process.env` entries stored with the prefix: what prefix evaluation
+    /// sees, and the fallback for runs that send no env of their own.
+    pub env: Option<Vec<(String, String)>>,
 }
 
 /// Parse the payload bytes of a `Precompile` frame per `docs/protocol.md` §5.2.
@@ -1596,6 +1623,7 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
     // Validation must match the instances this prefix will get: managed.
     let (code, filename, limits, globals) = parse_code_fields(&mut r, BandPolicy::Managed)?;
     let imports = r.read_import_bindings()?;
+    let env = r.read_optional_env()?;
     r.assert_done()?;
     Ok(PrecompilePayload {
         request_id,
@@ -1604,6 +1632,7 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
         limits,
         globals,
         imports,
+        env,
     })
 }
 
@@ -1627,6 +1656,9 @@ pub struct PrefixRunPayload {
     /// When present, the run calls into the prefix module's exports instead of
     /// evaluating a postfix; the result is the function's return value.
     pub call: Option<CallSpec>,
+    /// `process.env` entries for THIS run. Present replaces the prefix env
+    /// wholesale; absent falls back to it.
+    pub env: Option<Vec<(String, String)>>,
 }
 
 /// Parse the payload bytes of a `PrefixRun` frame per `docs/protocol.md` §5.2.
@@ -1640,6 +1672,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
     let globals = r.read_global_defs()?;
     let import_rebinds = r.read_import_rebinds()?;
     let call = r.read_optional_call()?;
+    let env = r.read_optional_env()?;
     r.assert_done()?;
     if code.is_some() == call.is_some() {
         return Err(io::Error::new(
@@ -1656,6 +1689,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
         globals,
         import_rebinds,
         call,
+        env,
     })
 }
 
@@ -2292,6 +2326,7 @@ mod tests {
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
+        v.push(0); // env: absent
         v
     }
 
@@ -2358,6 +2393,7 @@ mod tests {
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.run_id, 42);
@@ -2465,6 +2501,7 @@ mod tests {
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.limits.soft_memory_mb, 0);
@@ -2493,6 +2530,7 @@ mod tests {
         v.push(1); // enumerable
         push_u32(&mut v, 0); // 0 imports
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.globals.len(), 2);
@@ -2532,6 +2570,7 @@ mod tests {
         push_string(&mut v, "__iso4_wrapped_h");
         push_u32(&mut v, 0); // 0 imports
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.globals.len(), 4);
@@ -2569,6 +2608,7 @@ mod tests {
         v.push(0); // kind: source
         push_string(&mut v, "export const add = (a, b) => a + b");
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 1);
@@ -2595,6 +2635,7 @@ mod tests {
         v.push(0); // kind: source
         push_string(&mut v, "export const b = 2");
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 2);
@@ -2637,6 +2678,7 @@ mod tests {
         push_string(&mut v, "inner");
         v.push(0);
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.imports.len(), 1);
@@ -2807,6 +2849,7 @@ mod tests {
         push_string(&mut v, "tools:search");
         push_string(&mut v, "nested.inner");
         v.push(0); // call: absent
+        v.push(0); // env: absent
 
         let p = parse_prefix_run_payload(&v).unwrap();
         assert_eq!(p.code.as_deref(), Some("code"));
@@ -2819,11 +2862,13 @@ mod tests {
     #[test]
     fn parse_run_payload_with_call() {
         let mut v = encode_run_payload(9, "export default { fetch() {} }", None);
+        v.pop(); // drop the absent-env byte
         v.pop(); // replace the absent-call byte
         v.push(1); // call: present
         push_string(&mut v, "default.fetch"); // exportPath
         push_u32(&mut v, 3); // argsBlob: value slot
         v.extend_from_slice(&[0xff, 0x0f, 0x41]);
+        v.push(0); // env: absent
 
         let p = parse_run_payload(&v).unwrap();
         let call = p.call.expect("call spec");
@@ -2856,6 +2901,7 @@ mod tests {
             }
             None => v.push(0),
         }
+        v.push(0); // env: absent
         v
     }
 

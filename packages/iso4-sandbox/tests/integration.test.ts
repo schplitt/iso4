@@ -2502,3 +2502,154 @@ describe('globals bridge — BridgeWithShim (Phase 4)', () => {
     expect(exp['fetchOk']).toBe(true)
   })
 })
+
+// ── process & env ───────────────────────────────────────────────────────────
+
+describe('process & env', () => {
+  test('process exists, is non-enumerable, and env defaults empty', async () => {
+    const result = await runtime.run({
+      code: `export default [
+        typeof process,
+        Object.keys(globalThis).includes('process'),
+        JSON.stringify(process.env),
+      ]`,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual(['object', false, '{}'])
+  })
+
+  test('run() env reaches process.env', async () => {
+    const result = await runtime.run({
+      code: 'export default process.env.API_URL',
+      env: { API_URL: 'https://example.test' },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe('https://example.test')
+  })
+
+  test('process.env is a writable snapshot with string coercion', async () => {
+    const result = await runtime.run({
+      code: `process.env.N = 42
+        delete process.env.GONE
+        export default [typeof process.env.N, process.env.N, process.env.GONE === undefined]`,
+      env: { GONE: 'x' },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual(['string', '42', true])
+  })
+
+  test('import process from node:process resolves the global', async () => {
+    const result = await runtime.run({
+      code: `import process from 'node:process'
+        export default [process === globalThis.process, process.platform]`,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual([true, 'linux'])
+  })
+
+  test('process.exit fails the run with ERR_PROCESS_EXIT', async () => {
+    const result = await runtime.run({
+      code: 'process.exit(5); export default "unreachable"',
+    })
+    expect(result.status).toBe('failed')
+    if (result.status !== 'failed')
+      return
+    expect(result.error.code).toBe('ERR_PROCESS_EXIT')
+    expect(result.error.message).toContain('process.exit(5)')
+  })
+
+  test('non-string env values are refused', async () => {
+    await expect(
+      runtime.run({
+        code: 'export default 1',
+        env: { N: 42 as unknown as string },
+      }),
+    ).rejects.toThrow(/env\['N'\] must be a string/)
+  })
+
+  test('prefix env is the fallback; run env replaces it wholesale', async () => {
+    const prefix = await runtime.prepare({
+      code: 'export const atPrefix = process.env.A ?? "absent"',
+      env: { A: '1', B: '1' },
+    })
+    try {
+      const fallback = await prefix.execute({
+        code: 'export default [process.env.A, process.env.B]',
+      })
+      expect(fallback.ok).toBe(true)
+      if (fallback.ok)
+        expect(fallback.exports['default']).toEqual(['1', '1'])
+
+      const replaced = await prefix.execute({
+        code: 'export default [process.env.A, process.env.B ?? null]',
+        env: { A: '2' },
+      })
+      expect(replaced.ok).toBe(true)
+      if (replaced.ok)
+        expect(replaced.exports['default']).toEqual(['2', null])
+    } finally {
+      await prefix.dispose()
+    }
+  })
+
+  test('env writes do not leak between runs on one prefix', async () => {
+    const prefix = await runtime.prepare({
+      code: 'export {}',
+      env: { A: 'clean' },
+    })
+    try {
+      const first = await prefix.execute({
+        code: 'process.env.A = "dirty"; export default process.env.A',
+      })
+      expect(first.ok).toBe(true)
+      if (first.ok)
+        expect(first.exports['default']).toBe('dirty')
+
+      const second = await prefix.execute({
+        code: 'export default process.env.A',
+      })
+      expect(second.ok).toBe(true)
+      if (second.ok)
+        expect(second.exports['default']).toBe('clean')
+    } finally {
+      await prefix.dispose()
+    }
+  })
+
+  test('prefix.call() takes a per-run env too', async () => {
+    const prefix = await runtime.prepare({
+      code: 'export function readEnv(key) { return process.env[key] ?? null }',
+    })
+    try {
+      const result = await prefix.call({
+        export: 'readEnv',
+        args: ['TENANT'],
+        env: { TENANT: 't1' },
+      })
+      expect(result.ok).toBe(true)
+      if (result.ok)
+        expect(result.value).toBe('t1')
+    } finally {
+      await prefix.dispose()
+    }
+  })
+
+  test('process is a reserved global name', async () => {
+    const result = await runtime.run({
+      code: 'export default 1',
+      globals: { process: { kind: 'data', value: { env: {} } } },
+    })
+    expect(result.status).toBe('failed')
+    if (result.status !== 'failed')
+      return
+    expect(result.error.code).toBe('ERR_RESERVED_NAME')
+  })
+})

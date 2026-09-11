@@ -166,6 +166,35 @@ const result = await sandbox.run({
 The handler receives the raw arguments from sandbox code and must return
 plain serializable data. **Functions in return values are currently dropped.**
 
+## Environment variables (`process.env`)
+
+Worker-style code expects `process.env`, so every sandbox context has a
+`process` global (also importable as `node:process`). Declare entries per
+prefix and override them per run — a run-level `env` replaces the prefix env
+wholesale:
+
+```ts
+const prefix = await sandbox.prepare({
+  code: `export function handler() { return process.env.STAGE }`,
+  env: { STAGE: 'dev' },
+})
+
+const a = await prefix.call({ export: 'handler' })
+const b = await prefix.call({ export: 'handler', env: { STAGE: 'prod' } })
+// a.value === 'dev', b.value === 'prod'
+```
+
+Inside the sandbox `process.env` is a **writable per-run snapshot**: code can
+read, write, and delete entries, writes are coerced to strings (Node's rule),
+and nothing written ever reaches the host or a later run. One-off
+`sandbox.run({ env })` works the same way.
+
+The rest of `process` is a small, honest surface — `platform` (`'linux'`),
+`nextTick`, `exit(code)` (fails the run with `ERR_PROCESS_EXIT`),
+`emitWarning`, `getBuiltinModule`, listener methods — not a Node emulation:
+there is no `process.versions.node`, and anything filesystem/OS-shaped is
+`undefined`. The full table is in `docs/conformance.md`.
+
 ## Async context (`AsyncLocalStorage`)
 
 Sandboxed code can carry an ambient value across `await` points without

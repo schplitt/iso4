@@ -203,6 +203,7 @@ recorded as future scope.
 | Specifier                           |     | Notes                                                                                           |
 | ----------------------------------- | --- | ----------------------------------------------------------------------------------------------- |
 | `node:async_hooks`                  | 🟡  | `AsyncLocalStorage` only. **Run code only** — a prefix importing it gets `ERR_MODULE_NOT_FOUND` |
+| `node:process`                      | 🟡  | default export = the `process` global (see below). Available to prefix and run code             |
 | every other `node:*`                | ❌  | `ERR_MODULE_NOT_FOUND`. No stub modules                                                         |
 | bare specifiers (`fs`, `lodash`, …) | ❌  | `ERR_MODULE_NOT_FOUND`                                                                          |
 | host-declared imports               | ✅  | the host declares every specifier a run may import, as source or as a data-shaped module        |
@@ -215,21 +216,68 @@ rather than at first call.
 
 ## Language and engine
 
-| API                                   |     | Notes                                                                                               |
-| ------------------------------------- | --- | --------------------------------------------------------------------------------------------------- |
-| ECMAScript built-ins                  | ✅  | whatever the embedded V8 provides, including `Temporal`, `Iterator` helpers, `AsyncDisposableStack` |
-| `eval` / `new Function`               | 🟡  | allowed while prefix code evaluates, `EvalError` from run code. `DESIGN.md` §7.4                    |
-| `Error.captureStackTrace`             | ✅  | V8 extension; `Error.stackTraceLimit` is 10                                                         |
-| `SharedArrayBuffer`                   | ❌  | deleted from the global object                                                                      |
-| `Atomics`                             | 🟡  | present and legal on plain `ArrayBuffer`s; `Atomics.wait` is disabled isolate-wide                  |
-| `WebAssembly`                         | ❌  | deleted from the global object; wasm codegen is additionally denied isolate-wide. `DESIGN.md` §7.5  |
-| `process` `Buffer` `require` `global` | ❌  | Node globals are not provided                                                                       |
-| `navigator` `self` `caches` `crypto`  | ❌  |                                                                                                     |
+| API                                  |     | Notes                                                                                               |
+| ------------------------------------ | --- | --------------------------------------------------------------------------------------------------- |
+| ECMAScript built-ins                 | ✅  | whatever the embedded V8 provides, including `Temporal`, `Iterator` helpers, `AsyncDisposableStack` |
+| `eval` / `new Function`              | 🟡  | allowed while prefix code evaluates, `EvalError` from run code. `DESIGN.md` §7.4                    |
+| `Error.captureStackTrace`            | ✅  | V8 extension; `Error.stackTraceLimit` is 10                                                         |
+| `SharedArrayBuffer`                  | ❌  | deleted from the global object                                                                      |
+| `Atomics`                            | 🟡  | present and legal on plain `ArrayBuffer`s; `Atomics.wait` is disabled isolate-wide                  |
+| `WebAssembly`                        | ❌  | deleted from the global object; wasm codegen is additionally denied isolate-wide. `DESIGN.md` §7.5  |
+| `process`                            | 🟡  | curated surface with a real per-run `env` — see the `process` section below                         |
+| `Buffer` `require` `global`          | ❌  | Node globals are not provided                                                                       |
+| `navigator` `self` `caches` `crypto` | ❌  |                                                                                                     |
 
 **Code generation** is a `prepare()`-time capability on purpose: setup code
 may compile fast paths from strings (the zod pattern), and the moment per-run
 code starts, `eval` and `new Function` throw a catchable `EvalError` at the
 call site. There is no override. This is the same line workerd draws.
+
+---
+
+## process
+
+A lazily materialised, non-enumerable `process` global (built on first
+access, so untouched runs pay nothing — workerd's pattern), importable as
+`node:process` (default export). The surface is curated, not a Node
+emulation; everything not listed is `undefined`, never a stub.
+
+| Member                                                      |     | Notes                                                                                                             |
+| ----------------------------------------------------------- | --- | ----------------------------------------------------------------------------------------------------------------- |
+| `env`                                                       | ✅  | writable per-run snapshot of the host-declared entries; writes coerce to strings and never reach the host         |
+| `exit(code)`                                                | ✅  | terminates the run with `ERR_PROCESS_EXIT` (never returns; taints a warm instance — workerd's semantics)          |
+| `nextTick(cb, ...args)`                                     | 🟡  | microtask approximation, like workerd (no real nextTick queue)                                                    |
+| `platform` `arch`                                           | ✅  | `'linux'` / `'x64'` constants (workerd's posture)                                                                 |
+| `title` `argv` `argv0` `execArgv` `pid` `ppid`              | ✅  | `'iso4'` / `['iso4']` / `'iso4'` / `[]` / `1` / `0`                                                               |
+| `getBuiltinModule(id)`                                      | ✅  | resolves `node:process` and `node:async_hooks`; `undefined` otherwise                                             |
+| `emitWarning(warning, type?)`                               | 🟡  | emits `'warning'` to listeners; with none registered the warning lands on captured stderr                         |
+| `on` `once` `off` `emit` (+ aliases, `listeners`, counts)   | 🟡  | minimal real emitter — `emit` fires listeners, but the runtime emits nothing itself except `emitWarning`'s event  |
+| `memoryUsage()`                                             | 🟡  | all-zero shape (workerd's behavior)                                                                               |
+| `version` `versions`                                        | ❌  | deliberately absent — iso4 is not Node and does not claim a Node version, so Node-detection snippets report false |
+| `cwd` `chdir` `stdin` `stdout` `stderr` `hrtime` `uptime` … | ❌  | everything filesystem/OS-shaped is `undefined`                                                                    |
+
+**`process.env` semantics.** The host declares entries per prefix
+(`prepare({ env })`) and per run (`env` on `run()`/`execute()`/`call()` — a
+run-level env replaces the prefix env wholesale, no merging). Prefix
+evaluation (warm-up, `prepare()` validation) reads the prefix env. Each run
+gets its own writable snapshot: reads/writes/deletes work, writes are coerced
+to strings (Node's rule), and nothing written survives the run or reaches the
+host. `process` is a reserved global name (`ERR_RESERVED_NAME`).
+
+**Known deviations.**
+
+- `process.env = {...}` throws — the property is an accessor, and module
+  code is always strict. Node allows the assignment. Mutate entries instead.
+- Prefix-stage writes to `process.env` are visible for the rest of the
+  setup stage only; run snapshots always start from the declared entries
+  (`process.env.NODE_ENV ??= 'production'` in a prefix does not carry into
+  runs — pass it via `env` instead). Deliberate: run env must not depend on
+  what a nondeterministic warm-up computed on one particular instance.
+- Listener registrations (`process.on(...)`) live on the shared `process`
+  object and persist for a warm instance's lifetime, like any other global
+  state a run leaves behind (warmth-carryover contract).
+- `versions`/`version` are absent by design, so Node-detection snippets
+  (`process.versions?.node`) correctly report "not Node".
 
 ---
 

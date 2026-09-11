@@ -181,10 +181,10 @@ export interface ResourceLimits {
  * permitted. Each value becomes a bridge stub in the sandbox global object.
  *
  * Reserved names (rejected with `ERR_RESERVED_NAME`): `console`,
- * `waitUntil`, `setTimeout`, `clearTimeout`, `Headers`, `Request`,
- * `Response`, `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`. These
- * are owned by the runtime; shadowing `Response` would silently break
- * serialization.
+ * `waitUntil`, `setTimeout`, `clearTimeout`, `process`, `Headers`,
+ * `Request`, `Response`, `TextEncoder`, `TextDecoder`, `URL`,
+ * `URLSearchParams`. These are owned by the runtime; shadowing `Response`
+ * would silently break serialization.
  *
  * Common usage:
  * ```ts
@@ -944,6 +944,20 @@ export interface PrecompileOptions<
   imports?: M
 
   /**
+   * `process.env` entries for code running against this prefix.
+   *
+   * Values must be strings. Prefix evaluation sees exactly these; runs fall
+   * back to them unless they pass their own `env` (which replaces this set
+   * wholesale — no merging). Inside the sandbox `process.env` is a
+   * **writable per-run snapshot**: sandbox code can read, write, and delete
+   * entries, writes are coerced to strings (Node's rule), and nothing
+   * written ever reaches the host or a later run.
+   *
+   * @default {} (process.env exists but is empty)
+   */
+  env?: Record<string, string>
+
+  /**
    * Resource limits applied to prefix code evaluation.
    *
    * **Currently a no-op placeholder.** Pass limits directly to each
@@ -1076,6 +1090,13 @@ export interface PrefixRunOptions<
    */
   imports?: RebindImports<M>
 
+  /**
+   * `process.env` entries for THIS run. Replaces the prefix-level `env`
+   * wholesale (no merging); omit to fall back to it. Values must be
+   * strings. See `PrecompileOptions.env` for the snapshot semantics.
+   */
+  env?: Record<string, string>
+
   limits?: ResourceLimits
   /**
    * Abort the run. Firing this is always SOFT: while queued the caller is
@@ -1121,6 +1142,14 @@ export interface PrefixCallOptions<
    * rules as {@link PrefixRunOptions.imports}.
    */
   imports?: RebindImports<M>
+
+  /**
+   * `process.env` entries for THIS run. Replaces the prefix-level `env`
+   * wholesale (no merging); omit to fall back to it. Values must be
+   * strings. See `PrecompileOptions.env` for the snapshot semantics.
+   */
+  env?: Record<string, string>
+
   limits?: ResourceLimits
   /**
    * Abort the run. Firing this is always SOFT: while queued the caller is
@@ -1186,6 +1215,14 @@ export interface RunOptions {
   limits?: OneOffResourceLimits
   globals?: HostGlobals
   imports?: Imports
+
+  /**
+   * `process.env` entries for this run. Values must be strings; omitted =
+   * `process.env` exists but is empty. Inside the sandbox `process.env` is
+   * a writable snapshot: writes are coerced to strings and never reach the
+   * host.
+   */
+  env?: Record<string, string>
   /**
    * Abort the run. Firing this is always SOFT: while queued the caller is
    * dequeued; a running run is abandoned at its next execution boundary —
@@ -1602,7 +1639,7 @@ export interface RunError {
  * Why a shared instance was reset under an innocent victim — see
  * `RunError.resetCause`.
  */
-export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal'
+export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'exit'
 
 export type RunErrorCode
   = | 'ERR_USER_CODE'
@@ -1610,6 +1647,14 @@ export type RunErrorCode
     | 'ERR_CPU_TIMEOUT'
     | 'ERR_WALL_TIMEOUT'
     | 'ERR_ABORTED'
+    /**
+     * Sandbox code called `process.exit(code)`. Executing JS is terminated
+     * immediately (Node/workerd semantics: exit never returns); on a warm
+     * instance the mid-execution interruption discards it, so co-resident
+     * runs fail with `ERR_INSTANCE_RESET` (cause `exit`). The message
+     * carries the exit code.
+     */
+    | 'ERR_PROCESS_EXIT'
     | 'ERR_MODULE_NOT_FOUND'
     | 'ERR_COMPILE'
     | 'ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED'

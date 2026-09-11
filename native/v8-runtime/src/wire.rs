@@ -153,6 +153,7 @@ fn reset_cause_byte(cause: crate::v8::ResetCause) -> u8 {
         crate::v8::ResetCause::Abort => 2,
         crate::v8::ResetCause::Internal => 3,
         crate::v8::ResetCause::Wall => 4,
+        crate::v8::ResetCause::Exit => 5,
     }
 }
 
@@ -558,6 +559,11 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             "Error",
             "Memory limit exceeded".to_string(),
         ),
+        RunError::ProcessExit(code) => plain(
+            "ERR_PROCESS_EXIT",
+            "Error",
+            format!("process.exit({code}) was called; the run was terminated"),
+        ),
         RunError::HostBridge(err) => RunErrorPayload {
             code: "ERR_HOST_BRIDGE".to_string(),
             name: err.name.clone(),
@@ -614,6 +620,7 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
                     crate::v8::ResetCause::Wall => "wall deadline",
                     crate::v8::ResetCause::Abort => "mid-execution abort",
                     crate::v8::ResetCause::Internal => "internal failure",
+                    crate::v8::ResetCause::Exit => "process.exit call",
                 },
             ),
             stack: None,
