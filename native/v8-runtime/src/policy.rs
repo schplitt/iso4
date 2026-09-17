@@ -17,7 +17,7 @@
 //! ceiling, the hysteresis gap that stops evict/admit flapping. There is
 //! deliberately NO instance-count cap (celld defaults its resident
 //! ceiling to `usize::MAX`; a default count cap caused them eviction
-//! churn) and no grace period after last use — the `heapUsed × idleTime`
+//! churn) and no grace period after last use — the `heapUsed × idleTime^1.2`
 //! score already sends a just-used instance to the back of every pass
 //! (celld sheds in plain LRU order for the same reason).
 //!
@@ -39,8 +39,9 @@ pub struct VictimFact {
     pub last_used: Instant,
 }
 
-/// Pick the instance to evict: highest `heapUsed × idleTime`, ties to the
-/// longest-idle. Returns an index into `idle`, or `None` when it is empty.
+/// Pick the instance to evict: highest `heapUsed × idleSecs^`[`AGE_EXPONENT`],
+/// ties to the longest-idle. Returns an index into `idle`, or `None` when it
+/// is empty.
 ///
 /// The product prefers a young hoarder over an old small idler once the
 /// heap difference outweighs the age difference, and degenerates to plain
@@ -52,21 +53,35 @@ pub fn pick_victim(idle: &[VictimFact], now: Instant) -> Option<usize> {
         .enumerate()
         .max_by(|(_, a), (_, b)| {
             score(a, now)
-                .cmp(&score(b, now))
+                .partial_cmp(&score(b, now))
+                .unwrap_or(std::cmp::Ordering::Equal)
                 // Equal scores: the earlier `last_used` (longer idle) wins.
                 .then_with(|| b.last_used.cmp(&a.last_used))
         })
         .map(|(i, _)| i)
 }
 
-/// Nanosecond resolution: back-to-back releases are far less than a
-/// microsecond apart, and a coarser clock would zero their idle times and
-/// push the choice into the tie-break. Saturating: a pathological heap ×
-/// a pathological age may exceed even u128, and "maximal score" is the
-/// right answer there, not a panic.
-fn score(fact: &VictimFact, now: Instant) -> u128 {
-    let idle_nanos = now.saturating_duration_since(fact.last_used).as_nanos();
-    u128::from(fact.heap_used_bytes).saturating_mul(idle_nanos)
+/// Age outweighs size: a fat instance may be an infrequently called one that
+/// is still genuinely in use, while an old one is simply unused. Superlinear
+/// because a plain factor would scale every score alike and change no
+/// ranking at all.
+pub const AGE_EXPONENT: f64 = 1.2;
+
+/// Seconds as `f64`, so sub-microsecond gaps between back-to-back releases
+/// stay distinct (an integer-second clock would zero them and push the
+/// choice into the tie-break).
+///
+/// Overflow is unreachable, which is why this needs no saturating guard
+/// where the old `u128` product did: the absolute worst case is
+/// `u64::MAX` bytes × `Duration::MAX` seconds raised to the exponent,
+/// ≈ 1.8e19 × 1.3e23 ≈ 2e42, some 266 orders of magnitude below `f64::MAX`.
+/// Past 2^53 the product loses exact integer precision, but only in the
+/// ~1e-16 relative range — two scores that close are a tie either way, and
+/// the tie-break decides them deterministically. No NaN path either: both
+/// factors are non-negative and finite, and `0.0.powf` is `0.0`.
+fn score(fact: &VictimFact, now: Instant) -> f64 {
+    let idle_secs = now.saturating_duration_since(fact.last_used).as_secs_f64();
+    fact.heap_used_bytes as f64 * idle_secs.powf(AGE_EXPONENT)
 }
 
 /// What the last completed shed pass measured — the futility check compares
@@ -365,6 +380,36 @@ mod tests {
         let idle = [
             fact(50, Duration::from_millis(1), now),
             fact(1, Duration::from_secs(3600), now),
+        ];
+        assert_eq!(pick_victim(&idle, now), Some(1));
+    }
+
+    #[test]
+    fn age_outweighs_size_where_a_linear_product_would_not() {
+        let now = Instant::now();
+        // Linear would take the hoarder (100×20 = 2000 > 30×60 = 1800); the
+        // exponent takes the older one (100×20^1.2 ≈ 3.6e3 < 30×60^1.2 ≈ 4.1e3).
+        let idle = [
+            fact(100, Duration::from_secs(20), now),
+            fact(30, Duration::from_secs(60), now),
+        ];
+        assert_eq!(pick_victim(&idle, now), Some(1));
+    }
+
+    #[test]
+    fn an_absurd_heap_still_scores_and_orders() {
+        let now = Instant::now();
+        // ~3e23 — the `f64` product has no overflow path where the old
+        // `u128` one needed saturation, and stays ordered at that size.
+        let idle = [
+            VictimFact {
+                heap_used_bytes: u64::MAX,
+                last_used: now - Duration::from_secs(1800),
+            },
+            VictimFact {
+                heap_used_bytes: u64::MAX,
+                last_used: now - Duration::from_secs(3600),
+            },
         ];
         assert_eq!(pick_victim(&idle, now), Some(1));
     }

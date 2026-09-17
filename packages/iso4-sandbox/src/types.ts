@@ -655,7 +655,7 @@ export interface SandboxOptions {
    * cgroup's working set, Node host included, the number the container's
    * OOM killer acts on (where no cgroup exists, e.g. macOS, it falls back
    * to the runtime child's own RSS). At/above the mark it evicts idle warm
-   * instances by `heapUsed × idleTime` score (highest first) AND stops
+   * instances by `heapUsed × idleTime^1.2` score (highest first) AND stops
    * pooling new instances — prefix runs without an idle instance execute
    * on cold one-off isolates — until usage falls back to 80 % of the mark
    * (hysteresis, so eviction doesn't flap). Reusing an already-warm
@@ -740,7 +740,9 @@ export interface SandboxStats {
   idleInstances: number
   /**
    * Summed heap of the idle instances in bytes, each measured after its
-   * last call (a busy instance's current heap is unknown mid-call).
+   * last call — or after the collection an instance runs once it has been
+   * idle 30 s, which is the smaller and truer number (a busy instance's
+   * current heap is unknown mid-call).
    */
   idleHeapBytes: number
   /**
