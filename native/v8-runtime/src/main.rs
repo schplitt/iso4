@@ -13,7 +13,10 @@ fn main() {
     // the Node host.
     oom::prefer_this_process_as_victim();
 
-    let (socket_path, warm_budget_bytes) = parse_args();
+    let (socket_path, warm_budget_bytes, host_reserve_bytes) = parse_args();
+
+    // Before any line is drawn: the admission line is derived from it.
+    container::set_host_reserve_bytes(host_reserve_bytes);
 
     // A budget with no readable meter would silently never be enforced —
     // fail at startup instead (rationale: DESIGN.md §13.2.1).
@@ -70,7 +73,7 @@ fn main() {
              admission line {} MB, warm budget {budget}, default run heap \
              {default_heap_mb} MB (warm-run ceiling {warm_ceiling_mb} MB)",
             limit / MB,
-            container::NODE_RESERVE_BYTES / MB,
+            container::host_reserve_bytes() / MB,
             hard_line_bytes / MB,
         ),
         None => eprintln!(
@@ -103,10 +106,11 @@ fn main() {
     }
 }
 
-fn parse_args() -> (String, u64) {
+fn parse_args() -> (String, u64, u64) {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
     let mut warm_budget_bytes: u64 = 0;
+    let mut host_reserve_bytes: u64 = container::DEFAULT_HOST_RESERVE_BYTES;
 
     let mut i = 1;
     while i < args.len() {
@@ -132,6 +136,22 @@ fn parse_args() -> (String, u64) {
                 }
                 i += 2;
             }
+            "--host-reserve-bytes" if i + 1 < args.len() => {
+                // What the container limit owes the Node host before any
+                // line is drawn. 0 is valid (no reserve); absent keeps the
+                // default the host mirrors.
+                match args[i + 1].parse::<u64>() {
+                    Ok(n) => host_reserve_bytes = n,
+                    Err(_) => {
+                        eprintln!(
+                            "[iso4-v8] --host-reserve-bytes must be a non-negative integer, got {:?}",
+                            args[i + 1]
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
             arg => {
                 // Fatal, like every other bad input here. Continuing would
                 // leave a mistyped `--warm-budget-bytes` at its initial 0,
@@ -148,5 +168,5 @@ fn parse_args() -> (String, u64) {
         std::process::exit(1);
     });
 
-    (socket, warm_budget_bytes)
+    (socket, warm_budget_bytes, host_reserve_bytes)
 }

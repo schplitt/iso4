@@ -203,6 +203,71 @@ describe('memory budget → live-isolate cap', () => {
       constrained.mockRestore()
     }
   })
+
+  test('hostReserveMb moves both capacity lines', async () => {
+    // The reserve is the base both lines are drawn from: the default budget
+    // is 80% of what it leaves, the runtime's admission line 90%. The budget
+    // half is exact against a mocked 2 GB container; the runtime reads the
+    // real limit, so the line half is asserted as the difference between two
+    // reserves (exact modulo the derivation's /10 floor).
+    const constrained = vi
+      .spyOn(process, 'constrainedMemory')
+      .mockReturnValue(2 * 1024 * 1024 * 1024)
+    try {
+      await using lean = await createSandbox({ maxConcurrentRuns: 1, hostReserveMb: 0 })
+      await using fat = await createSandbox({ maxConcurrentRuns: 1, hostReserveMb: 256 })
+      const leanStats = await lean.stats()
+      const fatStats = await fat.stats()
+      expect(leanStats.budgetBytes).toBe(Math.floor(2048 * 0.8) * 1024 * 1024)
+      expect(fatStats.budgetBytes).toBe(Math.floor((2048 - 256) * 0.8) * 1024 * 1024)
+      const lineDelta = leanStats.hardLineBytes - fatStats.hardLineBytes
+      expect(Math.abs(lineDelta - 0.9 * 256 * 1024 * 1024)).toBeLessThan(1024)
+    } finally {
+      constrained.mockRestore()
+    }
+  })
+
+  test('a nonsense hostReserveMb is rejected instead of killing the child', async () => {
+    // A fraction reaches the child as a fractional byte count and a negative
+    // value would ADD to the container limit — both surface as an unrelated
+    // socket timeout if they get that far.
+    for (const bad of [12.5, -1]) {
+      await expect(
+        createSandbox({ hostReserveMb: bad }),
+      ).rejects.toThrow(/hostReserveMb must be an integer/)
+    }
+  })
+
+  test('explicit knobs that outrun the memory budget warn instead of throwing', async () => {
+    const lines: string[] = []
+    const stderr = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: string | Uint8Array) => {
+        lines.push(String(chunk))
+        return true
+      })
+    try {
+      // 8 slots × the 576 MB ceiling of memoryMb 512 is 18× the budget.
+      await using loud = await createSandbox({
+        maxConcurrentRuns: 8,
+        memoryMb: 512,
+        memoryBudgetMb: 256,
+      })
+      expect(lines.join('')).toMatch(
+        /maxConcurrentRuns 8 × a 576 MB heap ceiling = 4608 MB, over the 256 MB memory budget/,
+      )
+      expect((await loud.stats()).budgetBytes).toBe(256 * 1024 * 1024)
+
+      // The DEFAULT slot count never warns: it is already the most the
+      // budget allows (1 here), so there is no contradiction to report.
+      lines.length = 0
+      await using quiet = await createSandbox({ memoryMb: 512, memoryBudgetMb: 256 })
+      expect(lines.join('')).not.toMatch(/maxConcurrentRuns/)
+      expect((await quiet.stats()).budgetBytes).toBe(256 * 1024 * 1024)
+    } finally {
+      stderr.mockRestore()
+    }
+  })
 })
 
 describe('saturation queues FIFO', () => {

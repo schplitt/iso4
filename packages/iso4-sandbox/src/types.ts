@@ -666,8 +666,9 @@ export interface SandboxOptions {
    *
    * Above the budget sits one more, non-configurable line: the runtime
    * never CREATES an isolate when measured usage plus the run's own
-   * `memoryMb` would cross 90 % of the container limit (minus a 128 MB
-   * host reserve) — such a run fails with `ERR_CAPACITY` instead, so the
+   * `memoryMb` would cross 90 % of the container limit (minus the
+   * `hostReserveMb` reserve, 128 MB by default) — such a run fails with
+   * `ERR_CAPACITY` instead, so the
    * newest admission can never be what tips the container into an OOM
    * kill. Runs with `memoryMb: 0` (uncapped) are refused already from the
    * budget mark — their worst case has no arithmetic.
@@ -676,8 +677,8 @@ export interface SandboxOptions {
    * `dispose()`, and uncapped runs are never refused). Independent of
    * `memoryMb`: usage is measured, not derived from per-isolate caps.
    *
-   * Default: 80 % of what remains of the container limit after a 128 MB
-   * reserve for the Node host — container/cgroup-aware via
+   * Default: 80 % of what remains of the container limit after the
+   * `hostReserveMb` reserve (128 MB) — container/cgroup-aware via
    * `process.constrainedMemory()`, falling back to `os.totalmem()`.
    * Services with a large host-side footprint should set this lower.
    * On a host too small for that subtraction the default floors at 64 MB
@@ -689,6 +690,24 @@ export interface SandboxOptions {
    * non-finite one throws.
    */
   memoryBudgetMb?: number
+
+  /**
+   * Megabytes of the container limit reserved for the host process before
+   * either capacity line is drawn — the default budget is 80 % of what
+   * remains after it, and the runtime's admission line 90 %.
+   *
+   * It is headroom for the host's own GROWTH, not its current usage: the
+   * runtime meters global container memory, so whatever Node holds right
+   * now is already counted. Raise it when the host caches heavily (a
+   * request-driven cache, parsed specs, a large in-memory index) — the
+   * reserve is what keeps that growth from colliding with an admission the
+   * runtime already granted. Lower it for a thin host that does little but
+   * drive the sandbox; `0` gives the sandbox the whole limit.
+   *
+   * Must be an integer ≥ 0.
+   * @default 128
+   */
+  hostReserveMb?: number
 
   /**
    * Override the path to the Rust V8 binary.

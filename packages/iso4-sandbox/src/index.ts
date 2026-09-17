@@ -119,7 +119,8 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   }
   const binaryPath = resolveRuntimeBinary(options)
   validateMemoryMb(options?.memoryMb, 'memoryMb')
-  const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb)
+  const hostReserveMb = resolveHostReserveMb(options?.hostReserveMb)
+  const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb, hostReserveMb)
   const maxConcurrentRuns = options?.maxConcurrentRuns
     ?? defaultMaxConcurrentRuns(warmBudgetBytes, options?.memoryMb)
   if (!Number.isInteger(maxConcurrentRuns) || maxConcurrentRuns < 1) {
@@ -129,6 +130,8 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
       '[@iso4/sandbox] maxConcurrentRuns must be an integer >= 1',
     )
   }
+  if (options?.maxConcurrentRuns !== undefined)
+    warnIfSlotsOutrunMemory(maxConcurrentRuns, options.memoryMb, warmBudgetBytes, hostReserveMb)
   const maxQueuedRuns = options?.maxQueuedRuns ?? 100 * maxConcurrentRuns
   if (!Number.isInteger(maxQueuedRuns) || maxQueuedRuns < 0) {
     // 0 is valid (no queue: slots full = fail immediately); fractional or
@@ -152,10 +155,11 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const descriptorToken = randomBytes(DESCRIPTOR_TOKEN_LEN)
   const brandKey = brandKeyForToken(descriptorToken)
 
-  // The runtime needs exactly one capacity fact: the warm budget in bytes,
-  // the shedding mark it holds against measured global container memory.
-  // (Its hard admission line is derived runtime-side from the same
-  // container limit.) Concurrency is bounded by this host's slot pool;
+  // The runtime needs two capacity facts: the warm budget (the shedding
+  // mark it holds against measured global container memory) and the host
+  // reserve its own admission line subtracts from the container limit —
+  // passed, not mirrored, so both lines share one base.
+  // Concurrency is bounded by this host's slot pool;
   // there is no instance-count cap (celld's stance — their resident
   // ceiling defaults to unlimited).
   const proc = spawn(binaryPath, [
@@ -163,6 +167,8 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     socketPath,
     '--warm-budget-bytes',
     String(warmBudgetBytes),
+    '--host-reserve-bytes',
+    String(hostReserveMb * 1024 * 1024),
   ], {
     // stdin closed, stdout ignored, stderr forwarded so runtime diagnostics
     // (the [iso4-v8] lines) appear in the host process's stderr.
@@ -221,8 +227,12 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
  * @param memoryBudgetMb the explicit budget knob (`0` opts out of
  * watermarks entirely, like celld's `CELLD_MAX_RSS_MB=0`), or undefined
  * for the container-aware default
+ * @param hostReserveMb what the default subtracts from the container limit
  */
-function resolveWarmBudgetBytes(memoryBudgetMb: number | undefined): number {
+function resolveWarmBudgetBytes(
+  memoryBudgetMb: number | undefined,
+  hostReserveMb: number,
+): number {
   if (memoryBudgetMb !== undefined && !Number.isFinite(memoryBudgetMb)) {
     // Infinity/NaN would reach the child as `--warm-budget-bytes Infinity`,
     // kill it at arg parsing, and surface as an unrelated socket timeout.
@@ -230,7 +240,7 @@ function resolveWarmBudgetBytes(memoryBudgetMb: number | undefined): number {
       '[@iso4/sandbox] memoryBudgetMb must be a finite number of megabytes',
     )
   }
-  const budgetMb = memoryBudgetMb ?? defaultMemoryBudgetMb()
+  const budgetMb = memoryBudgetMb ?? defaultMemoryBudgetMb(hostReserveMb)
   // Clamp both ends: negatives (a nonsense budget) to 0 = disabled, and
   // huge budgets to the JS safe-integer range — beyond it the byte math
   // rounds (wrong mark enforced) and ≥ 1e21 even stringifies to
@@ -243,13 +253,33 @@ function resolveWarmBudgetBytes(memoryBudgetMb: number | undefined): number {
 }
 
 /**
- * The Node-host reserve subtracted from the container limit before any
+ * Default Node-host reserve subtracted from the container limit before any
  * capacity line is drawn. Mirrors the runtime's `container.rs`
- * `NODE_RESERVE_BYTES` — change both together. Sized for a typical Node
- * host (~80 MB measured) with margin; a measured reserve replaces this
- * constant later.
+ * `DEFAULT_HOST_RESERVE_BYTES` — change both together. Sized for a typical
+ * Node host (~80 MB measured) with margin; `hostReserveMb` tunes it.
  */
-const NODE_RESERVE_MB = 128
+const DEFAULT_HOST_RESERVE_MB = 128
+
+/**
+ * The host reserve both capacity lines are drawn from: the runtime gets it
+ * on the command line, the default budget below subtracts the same number.
+ * @param hostReserveMb the explicit knob, or undefined for the default
+ */
+function resolveHostReserveMb(hostReserveMb: number | undefined): number {
+  if (hostReserveMb === undefined)
+    return DEFAULT_HOST_RESERVE_MB
+  if (!Number.isInteger(hostReserveMb) || hostReserveMb < 0) {
+    // A fractional value would reach the child as a fractional byte count
+    // and kill it at arg parsing; a negative one would ADD to the limit.
+    throw new TypeError(
+      '[@iso4/sandbox] hostReserveMb must be an integer >= 0 (megabytes; 0 = no reserve)',
+    )
+  }
+  // Past the safe-integer range the byte count stringifies to exponential
+  // notation and kills the child at arg parsing; such a reserve already
+  // swallows every container limit, so clamping changes no real outcome.
+  return Math.min(hostReserveMb, Math.floor(Number.MAX_SAFE_INTEGER / (1024 * 1024)))
+}
 
 /**
  * Default memory budget (the 80% shedding mark): 80% of what remains of the
@@ -266,27 +296,34 @@ const NODE_RESERVE_MB = 128
  * (`memoryBudgetMb: 0` stays the only deliberate opt-out). The floor makes
  * such a host shed warmth aggressively instead — degraded, never
  * unprotected — and says so on stderr.
+ * @param hostReserveMb the reserve both lines are drawn from
  */
-function defaultMemoryBudgetMb(): number {
-  // constrainedMemory() reports 0/undefined when there is no cgroup limit —
-  // except on cgroup v1, where "unlimited" is a sentinel near 2^63 (seen on
-  // GitHub Actions runners). Take the smaller of it and the host total
-  // instead of trusting either alone: a real container limit is below the
-  // host total, and the sentinel is above it.
-  const constrained = process.constrainedMemory?.() || Number.POSITIVE_INFINITY
-  const totalBytes = Math.min(constrained, totalmem())
-  const totalMb = totalBytes / (1024 * 1024)
-  const budgetMb = Math.floor((totalMb - NODE_RESERVE_MB) * 0.8)
+function defaultMemoryBudgetMb(hostReserveMb: number): number {
+  const totalMb = containerLimitMb()
+  const budgetMb = Math.floor((totalMb - hostReserveMb) * 0.8)
   if (budgetMb < 64) {
     process.stderr.write(
       `[@iso4/sandbox] host memory (${Math.floor(totalMb)} MB) leaves no room `
-      + `for a warm budget after the ${NODE_RESERVE_MB} MB host reserve — `
+      + `for a warm budget after the ${hostReserveMb} MB host reserve — `
       + `flooring the budget at 64 MB (expect aggressive eviction); `
       + `set memoryBudgetMb explicitly to tune or 0 to disable\n`,
     )
     return 64
   }
   return budgetMb
+}
+
+/**
+ * The container limit in megabytes, as the runtime reads it.
+ * `constrainedMemory()` reports 0/undefined when there is no cgroup limit —
+ * except on cgroup v1, where "unlimited" is a sentinel near 2^63 (seen on
+ * GitHub Actions runners). Take the smaller of it and the host total instead
+ * of trusting either alone: a real container limit is below the host total,
+ * and the sentinel is above it.
+ */
+function containerLimitMb(): number {
+  const constrained = process.constrainedMemory?.() || Number.POSITIVE_INFINITY
+  return Math.min(constrained, totalmem()) / (1024 * 1024)
 }
 
 /**
@@ -305,15 +342,61 @@ function defaultMaxConcurrentRuns(
   memoryMb: number | MemoryLimit | undefined,
 ): number {
   const cores = availableParallelism()
-  // Mirrors the runtime's frame-decode default (ipc.rs DEFAULT_MEMORY_MB):
-  // an unset memoryMb reaches the child as 128. The worst case is a prefix
-  // instance's TERMINATING line, band included; a one-off's is the bare cap,
-  // so this bound is the conservative one of the two.
-  const capMb = hardCeilingMb(memoryMb) ?? 128 + heapBandMb(128)
+  const capMb = runCeilingMb(memoryMb)
   if (capMb <= 0 || warmBudgetBytes <= 0)
     return cores
   const fitting = Math.floor(warmBudgetBytes / (capMb * 1024 * 1024))
   return Math.max(1, Math.min(cores, fitting))
+}
+
+/**
+ * The memory one run may reach, in megabytes — what capacity planning has to
+ * reserve for a slot. The worst case is a prefix instance's TERMINATING line,
+ * band included; a one-off's is the bare cap. An unset `memoryMb` reaches the
+ * child as 128 (the runtime's `ipc.rs` `DEFAULT_MEMORY_MB`). `0` = uncapped,
+ * which has no arithmetic.
+ * @param memoryMb
+ */
+function runCeilingMb(memoryMb: number | MemoryLimit | undefined): number {
+  return hardCeilingMb(memoryMb) ?? 128 + heapBandMb(128)
+}
+
+/**
+ * Explicit knobs that promise more concurrent heap than this container can
+ * hold (#144). Warns, never throws: the ceiling is a worst case, and a
+ * workload whose runs stay well under it may never feel this.
+ * @param maxConcurrentRuns the explicit slot count
+ * @param memoryMb
+ * @param warmBudgetBytes
+ * @param hostReserveMb
+ */
+function warnIfSlotsOutrunMemory(
+  maxConcurrentRuns: number,
+  memoryMb: number | MemoryLimit | undefined,
+  warmBudgetBytes: number,
+  hostReserveMb: number,
+): void {
+  const ceilingMb = runCeilingMb(memoryMb)
+  const budgetMb = Math.floor(warmBudgetBytes / (1024 * 1024))
+  // memoryMb: 0 and memoryBudgetMb: 0 opt out — neither has a number to
+  // contradict.
+  if (ceilingMb <= 0 || budgetMb <= 0)
+    return
+  const wantMb = maxConcurrentRuns * ceilingMb
+  if (wantMb <= budgetMb)
+    return
+  const lineMb = Math.floor((containerLimitMb() - hostReserveMb) * 0.9)
+  let consequence = `over the ${budgetMb} MB memory budget — warm instances are `
+    + `evicted to hold the mark; lower maxConcurrentRuns or memoryMb, or raise `
+    + `memoryBudgetMb`
+  if (wantMb > lineMb) {
+    consequence = `over the runtime's ${lineMb} MB admission line — runs that need `
+      + `a new isolate fail with ERR_CAPACITY; lower maxConcurrentRuns or memoryMb`
+  }
+  process.stderr.write(
+    `[@iso4/sandbox] maxConcurrentRuns ${maxConcurrentRuns} × a ${ceilingMb} MB `
+    + `heap ceiling = ${wantMb} MB, ${consequence}\n`,
+  )
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
