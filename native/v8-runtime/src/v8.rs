@@ -5202,15 +5202,33 @@ fn sweep_expired_deadlines(
     false
 }
 
-/// An instance idle this long settles its heap once (one GC, then a fresh
-/// reading for the registry) before parking indefinitely. Long enough that
-/// only a genuinely parked instance pays it: the first allocating call after
-/// a settle has to grow the heap back.
+/// Seconds an instance must be idle before it settles its heap once (one GC,
+/// then a fresh reading for the registry) and parks indefinitely. `0` = off,
+/// which is the shipped default: V8 returns a dropped instance's pages on its
+/// own, so the settle only pays off where warmth must stay resident in a
+/// container tight enough to feel the garbage. `--idle-settle-secs` turns it
+/// on.
 #[cfg(not(test))]
-pub(crate) const IDLE_SETTLE_AFTER: Duration = Duration::from_secs(30);
-/// Shortened for the test suite — 30 s of sleeping per test is not worth it.
+const IDLE_SETTLE_DEFAULT_SECS: u64 = 0;
+/// The suite exercises the feature, shortened — 30 s of sleeping per test is
+/// not worth it.
 #[cfg(test)]
-pub(crate) const IDLE_SETTLE_AFTER: Duration = Duration::from_secs(1);
+const IDLE_SETTLE_DEFAULT_SECS: u64 = 1;
+
+static IDLE_SETTLE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(IDLE_SETTLE_DEFAULT_SECS);
+
+pub fn set_idle_settle_secs(secs: u64) {
+    IDLE_SETTLE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long an idle instance waits before settling, `None` when off.
+pub(crate) fn idle_settle_after() -> Option<Duration> {
+    match IDLE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    }
+}
 
 /// Serve one instance: the per-instance turn loop (#125). Receives from the
 /// instance's ONE ordered channel — jobs, run-tagged events, and the
@@ -5277,7 +5295,7 @@ pub fn serve_instance(
                 .map(|(at, _)| at.saturating_duration_since(std::time::Instant::now()))
                 // Nothing pending and the last run's garbage still held:
                 // wake once to settle the heap, then park indefinitely.
-                .or_else(|| (live.is_empty() && !settled).then_some(IDLE_SETTLE_AFTER));
+                .or_else(|| (live.is_empty() && !settled).then(idle_settle_after).flatten());
             let oper = match timeout {
                 Some(t) => sel.select_timeout(t).ok(),
                 None => Some(sel.select()),

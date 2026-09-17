@@ -3,7 +3,7 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, container, ipc, oom, policy, rss, session};
+use iso4_v8_runtime::{blob, container, ipc, oom, policy, rss, session, v8 as sandbox};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
@@ -13,10 +13,11 @@ fn main() {
     // the Node host.
     oom::prefer_this_process_as_victim();
 
-    let (socket_path, warm_budget_bytes, host_reserve_bytes) = parse_args();
+    let (socket_path, warm_budget_bytes, host_reserve_bytes, idle_settle_secs) = parse_args();
 
     // Before any line is drawn: the admission line is derived from it.
     container::set_host_reserve_bytes(host_reserve_bytes);
+    sandbox::set_idle_settle_secs(idle_settle_secs);
 
     // A budget with no readable meter would silently never be enforced —
     // fail at startup instead (rationale: DESIGN.md §13.2.1).
@@ -106,11 +107,12 @@ fn main() {
     }
 }
 
-fn parse_args() -> (String, u64, u64) {
+fn parse_args() -> (String, u64, u64, u64) {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
     let mut warm_budget_bytes: u64 = 0;
     let mut host_reserve_bytes: u64 = container::DEFAULT_HOST_RESERVE_BYTES;
+    let mut idle_settle_secs: u64 = 0;
 
     let mut i = 1;
     while i < args.len() {
@@ -152,6 +154,21 @@ fn parse_args() -> (String, u64, u64) {
                 }
                 i += 2;
             }
+            "--idle-settle-secs" if i + 1 < args.len() => {
+                // Opt-in: an instance idle this long collects once, then
+                // parks. 0 or absent leaves it off.
+                match args[i + 1].parse::<u64>() {
+                    Ok(n) => idle_settle_secs = n,
+                    Err(_) => {
+                        eprintln!(
+                            "[iso4-v8] --idle-settle-secs must be a non-negative integer, got {:?}",
+                            args[i + 1]
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
             arg => {
                 // Fatal, like every other bad input here. Continuing would
                 // leave a mistyped `--warm-budget-bytes` at its initial 0,
@@ -168,5 +185,5 @@ fn parse_args() -> (String, u64, u64) {
         std::process::exit(1);
     });
 
-    (socket, warm_budget_bytes, host_reserve_bytes)
+    (socket, warm_budget_bytes, host_reserve_bytes, idle_settle_secs)
 }

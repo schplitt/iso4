@@ -1656,7 +1656,8 @@ mod tests {
             "before the settle the registry reads the release-time heap"
         );
 
-        std::thread::sleep(sandbox::IDLE_SETTLE_AFTER + Duration::from_millis(500));
+        let after = sandbox::idle_settle_after().expect("the suite runs with the settle on");
+        std::thread::sleep(after + Duration::from_millis(500));
         let settled = registry.stats().idle_heap_bytes;
         assert!(
             settled < at_release / 2,

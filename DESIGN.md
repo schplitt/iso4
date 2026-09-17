@@ -2167,10 +2167,14 @@ every `PrefixRun` Result frame (`heapUsedBytes`) and feeds the
 `heapUsed × idleTime^1.2` victim scoring — age superlinear because a fat
 instance may be an infrequently called one that is genuinely in use, while
 an old one is simply unused (a plain factor would scale every score alike
-and change no ranking). An instance idle for 30 s then fires one low-memory
-notification and re-measures: nothing pumps the platform loop, so V8's own
-memory reducer never runs and an idle isolate would otherwise hold its
-garbage until eviction. That settled reading feeds `stats()`
+and change no ranking). With `--idle-settle-secs` (off by default), an
+instance idle that long fires one low-memory notification and re-measures:
+nothing pumps the platform loop, so V8's own memory reducer never runs and
+an idle isolate would otherwise hold its garbage until eviction. Off is the
+default because a dropped instance's pages go back to the OS on their own
+within seconds — the settle only earns its cost where warmth must stay
+resident in a container tight enough to feel the garbage. That settled
+reading feeds `stats()`
 (`idleHeapBytes`, "what is still reclaimable") and **deliberately not the
 victim score** — scoring must compare candidates on one basis, and only
 instances past the threshold have a collected one, so mixing them would
