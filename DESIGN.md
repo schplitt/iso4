@@ -2204,6 +2204,117 @@ dispatches one run per connection, so observable concurrency for one prefix
 **One-off runs are untouched**: `sandbox.run()` always gets a fresh isolate
 with unchanged semantics.
 
+### 13.4.1 Who owns which memory (measured 2026-09-17)
+
+The watermarks read one number — the cgroup working set — and that number
+lags what is actually available. Understanding why is the difference between
+leaving V8 alone and fighting it, and the wrong reading of it cost one
+feature that had to be removed again (§13.4.2).
+
+**Three kinds of memory, three owners.**
+
+*Garbage inside a BUSY instance — V8's, handled.* Collection is triggered by
+allocation. A busy instance allocates constantly, so V8 collects it on its
+own schedule and the heap settles at a working size. Nothing to do.
+
+*Garbage inside an IDLE instance — ours, and the only real gap.* A parked
+instance runs no code, so it never allocates, so nothing ever triggers a
+collection: it holds the last call's garbage for as long as it stays warm.
+V8's memory reducer would handle this, but it runs from a posted task and
+iso4 never pumps the platform loop. This is the one case an embedder has to
+act on, and the only thing `--idle-settle-secs` exists for. Off by default —
+see below for why it is usually not worth it.
+
+*Pages of a DEAD instance — V8's, handled, and not visible to us.* Disposing
+an isolate does not hand its pages back to the kernel. They go to a
+process-wide pool (`memory_pool`, on by default in V8), the next isolate
+draws from that pool instead of asking the kernel, and V8 returns what is
+left over after `memory_pool_timeout` — 8 seconds in V8's defaults. Measured
+in a 1 GB cgroup container: a burst of one-off isolates took the container to
+232 MB, and 20 s after the last one died it sat at 37 MB and stayed there for
+five minutes. Across 43,191 isolate creations under two minutes of continuous
+load the resident set oscillated between 83 and 168 MB with no trend — the
+pool is a high-water mark, not a leak.
+
+**What this means for the two marks.** After a burst the meter reads the peak
+for 10–20 seconds while the memory is already dead. The marks therefore act on
+a number that over-reports, which makes the runtime briefly conservative and
+never unsafe: it refuses and evicts more than strictly necessary, and it can
+never admit past a real limit on a stale-low reading. The futility check
+(`policy.rs`) was written for exactly this — a shed pass that leaves usage
+flat within 5 % stops the walk instead of evicting the world, because the
+freed pages went to the pool and the meter cannot see them yet.
+
+**Why eviction still works when the meter does not move.** Dropping an idle
+instance converts memory committed to *that instance* into pages any new
+isolate can take from the pool. The capacity genuinely transfers to the next
+run; only the reading is blind to it. So the 80 % mark does its job even
+while `memory.current` sits flat, and the shape a bursty workload traces is:
+evict a tenth of the idle population, meter stays flat, futility check stops
+the walk, ~20 s later V8 returns the pages and the reading drops, re-evaluate.
+Gradual, and it waits for reality to catch up.
+
+**Why there are two marks and not one.** The budget mark gives up something
+cheap — idle warmth, whose only cost is a cold start next time. The admission
+line gives up something expensive — the run itself, with `ERR_CAPACITY`.
+Shrink before you refuse. Collapsing them would make a failed run, rather
+than a slower one, the first symptom of memory pressure.
+
+**Worked example** (1 GB container, 128 MB default heap, 160 MB warm ceiling,
+128 MB host reserve): budget = 80 % of (1024 − 128) = 716 MB; admission line =
+90 % of the same base = 806 MB. Five warm instances serving 250 calls/s
+measured 72 MB resident. Traffic drops to 42 calls/s across three of the five;
+the two abandoned instances stop allocating, and with the settle switched on
+their heaps are collected ~30 s later — resident falls 72 → 30 MB while the
+other three keep serving, and neither mark is ever reached. With the settle
+off, those two hold their garbage until the budget mark evicts them.
+
+**What NOT to do**, all of it tried or costed and rejected on 2026-09-17:
+
+- Do not force a collection before disposing an instance. The pages come back
+  on their own; the collection buys a pause for memory that was already free.
+- Do not pump V8's platform loop to make its housekeeping run. Same reason,
+  and it changes V8's scheduling wholesale.
+- Do not ship V8 memory flags. `--no-memory-pool` measured no throughput
+  difference on one-off load (within 3 %, less than the spread inside one arm)
+  and released more reliably, but it overrides a maintained V8 default on the
+  strength of two runs. Recorded as an escape hatch, not a default.
+- Do not try to compute "how much of the meter is really free" and admit
+  against it. Some of the residue is reusable pool, some is fragmentation and
+  code that never comes back, and the mix varies per workload. Betting on it
+  is the one change here that would genuinely raise OOM risk.
+- Do not swap the allocator for this. `malloc_trim` returns 6–8 MB of a
+  440 MB residue, so the C allocator holds almost none of it — and jemalloc
+  or mimalloc with lazy purge (`MADV_FREE`) would stop freed memory dropping
+  out of `memory.current` at all, breaking the futility check.
+
+For reference: celld calls `low_memory_notification` in exactly two places
+(an isolate that just filled up, and before re-reading a condemned heap) and
+never before disposal; workerd never calls it at all, sets
+`MemoryPressureNotification(kModerate)` at isolate creation like iso4 does,
+and has no memory admission in its open-source tree — a full machine there
+routes to another machine, which is not an option for a single container.
+
+### 13.4.2 Capacity refusals are honest (#179, won't-fix)
+
+A run needing a new isolate whose ceiling crosses the admission line fails
+with `ERR_CAPACITY`. #179 asked the refusal path to shed idle warmth first so
+the run gets in, and that shipped briefly before being removed.
+
+It cannot work as it reads. The eviction's freed bytes do not appear in the
+meter — they are in the pool — so the refusal path cannot verify that what it
+just freed made room. It can only credit its own bookkeeping and admit on
+trust. And the state it was built to escape is not permanent: the reading
+corrects itself within ~20 s once V8 returns the pages, so the whole feature
+bought about twenty seconds in exchange for an unverifiable estimate and a
+destroyed warm instance.
+
+So the refusal stays. Nothing ran, telemetry is zero, a retry shortly after
+usually succeeds, and the budget mark sheds idle warmth gradually while the
+line holds. Routine rather than occasional refusals mean the container is
+genuinely too small for `maxConcurrentRuns × memoryMb`, which `createSandbox`
+warns about at startup.
+
 ### 13.5 In-process backend (archived; Phase 12 of the original plan)
 
 Archived with the rest of the session sketch: `@iso4/sandbox` has no
