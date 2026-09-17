@@ -221,6 +221,13 @@ export class ConnectionRegistry {
    * visible, not a blind spot.
    */
   private opening = 0
+  /**
+   * Callers parked on the opens in flight, each holding a claim on a place
+   * of the connection that settles first. Settled with `undefined` when that
+   * open failed, which sends the caller back to {@link openOrWait}'s
+   * decision.
+   */
+  private readonly waiters: Array<(client: RuntimeIpcClient | undefined) => void> = []
   private readonly connect: ConnectFn
   private disposed = false
 
@@ -300,16 +307,41 @@ export class ConnectionRegistry {
   }
 
   /**
-   * Open a fresh connection and add it to the shared set. Concurrent
-   * callers that all found the set full each open one — a cold burst can
-   * briefly open more connections than the steady-state packing needs; they
-   * are reused, and the idle sweep gives the overshoot back. A failed
-   * connect fails this caller's run and leaves the ledger untouched.
+   * A place on a connection for a caller {@link tryAcquire} turned away:
+   * open one, or wait for an open already in flight when it still has room.
+   *
+   * A fresh connection seats {@link RUNS_PER_CONNECTION} runs, one of them
+   * the caller that opened it, so the opens in flight promise
+   * `opening * (RUNS_PER_CONNECTION - 1)` places to waiters. Deciding and
+   * taking a place are synchronous with `opening++`, so callers arriving in
+   * one tick see each other's claims: a burst of N opens ceil(N / cap)
+   * connections rather than N. Single-flighting them onto one connection
+   * instead would be wrong — it cannot seat them.
+   */
+  async openOrWait(): Promise<RuntimeIpcClient> {
+    for (;;) {
+      if (this.disposed)
+        throw new Error('runtime is disposed')
+      if (this.opening * (RUNS_PER_CONNECTION - 1) - this.waiters.length < 1)
+        return this.open()
+      const client = await new Promise<RuntimeIpcClient | undefined>((resolve) => {
+        this.waiters.push(resolve)
+      })
+      if (client !== undefined)
+        return client
+    }
+  }
+
+  /**
+   * Open a fresh connection and add it to the shared set, seating the
+   * waiters that claimed a place on it. A failed connect fails this caller's
+   * run, leaves the ledger untouched and sends its waiters back to decide.
    */
   async open(): Promise<RuntimeIpcClient> {
     if (this.disposed)
       throw new Error('runtime is disposed')
     this.opening++
+    let opened: RuntimeIpcClient | undefined
     try {
       const client = await this.connect()
       if (this.disposed) {
@@ -318,9 +350,14 @@ export class ConnectionRegistry {
       }
       this.connections.push({ client, busyAt: Date.now() })
       this.startSweep()
+      opened = client
       return client
     } finally {
       this.opening--
+      // At most the places this connection has: the seated callers register
+      // their runs later, so nothing else counts them yet.
+      for (const settle of this.waiters.splice(0, RUNS_PER_CONNECTION - 1))
+        settle(opened)
     }
   }
 
@@ -329,6 +366,8 @@ export class ConnectionRegistry {
       return
     this.disposed = true
     this.stopSweep()
+    for (const settle of this.waiters.splice(0))
+      settle(undefined)
     // Abrupt by design: the sandbox kills the child right after, so there
     // is nothing to drain for.
     await Promise.all(this.connections.splice(0).map(({ client }) => client.dispose()))
@@ -376,7 +415,7 @@ export class RunPool {
 
     let client: RuntimeIpcClient
     try {
-      client = this.connections.tryAcquire() ?? await this.connections.open()
+      client = this.connections.tryAcquire() ?? await this.connections.openOrWait()
     } catch (error) {
       this.slots.release()
       throw error
