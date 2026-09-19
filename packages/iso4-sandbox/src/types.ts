@@ -759,9 +759,9 @@ export interface SandboxStats {
   idleInstances: number
   /**
    * Summed heap of the idle instances in bytes, each measured after its
-   * last call — or after the collection an instance runs once it has been
-   * idle 30 s, which is the smaller and truer number (a busy instance's
-   * current heap is unknown mid-call).
+   * last call — or, where the runtime's idle settle is switched on, after
+   * the collection a parked instance runs, which is the smaller and truer
+   * number (a busy instance's current heap is unknown mid-call).
    */
   idleHeapBytes: number
   /**
