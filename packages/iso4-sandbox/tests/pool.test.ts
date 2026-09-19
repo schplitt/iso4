@@ -271,6 +271,53 @@ describe('ConnectionRegistry', () => {
     }
   })
 
+  test('a burst opens one connection per run cap, not one per caller', async () => {
+    const settle: Array<(c: RuntimeIpcClient) => void> = []
+    const connect = vi.fn(() => new Promise<RuntimeIpcClient>((r) => {
+      settle.push(r)
+    }))
+    const registry = new ConnectionRegistry(connect)
+
+    // Every caller finds the set full (it is empty) in the same tick.
+    const callers = Array.from({ length: 8 }, () => registry.openOrWait())
+    expect(connect).toHaveBeenCalledTimes(Math.ceil(8 / RUNS_PER_CONNECTION))
+
+    const opened = settle.map(() => fakeClient())
+    settle.forEach((r, i) => r(opened[i]!))
+    const seated = await Promise.all(callers)
+
+    // Each connection seats its opener plus the waiters that claimed a place.
+    for (const client of opened)
+      expect(seated.filter((c) => c === client)).toHaveLength(RUNS_PER_CONNECTION)
+  })
+
+  test('a failed open sends the callers waiting on it back to decide', async () => {
+    const fresh = fakeClient()
+    const connect = vi.fn()
+      .mockRejectedValueOnce(new Error('child is gone'))
+      .mockResolvedValueOnce(fresh)
+    const registry = new ConnectionRegistry(connect)
+
+    const opener = registry.openOrWait()
+    const waiter = registry.openOrWait()
+
+    await expect(opener).rejects.toThrow(/child is gone/)
+    // The waiter was not failed with it: nothing was in flight any more, so
+    // it opened its own.
+    await expect(waiter).resolves.toBe(fresh)
+    expect(connect).toHaveBeenCalledTimes(2)
+  })
+
+  test('dispose releases callers waiting on an open', async () => {
+    const registry = new ConnectionRegistry(vi.fn(() => new Promise<RuntimeIpcClient>(() => {})))
+    const opener = registry.openOrWait()
+    const waiter = registry.openOrWait()
+
+    await registry.dispose()
+    await expect(waiter).rejects.toThrow(/runtime is disposed/)
+    opener.catch(() => {}) // still hanging on the connect that never settles
+  })
+
   test('dispose closes tracked connections and refuses new callers', async () => {
     const open = fakeClient()
     const registry = new ConnectionRegistry(vi.fn().mockResolvedValue(open))
