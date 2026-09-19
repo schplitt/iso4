@@ -1074,16 +1074,19 @@ exist, and callers beyond that queue FIFO. Connections multiplex runs by
 run id: each carries several concurrent runs (an internal per-connection
 cap bounds how many, which also bounds the blast radius of a
 connection-level failure), one more is opened only when every open
-connection is at the cap, all are kept for the process lifetime
-(`dispose()` closes them), and a broken one is dropped so the next run
-opens a replacement.
+connection is at the cap, a surplus one is closed once it has carried
+nothing for 30 s (one is always kept; `dispose()` closes them all), and a
+broken one is dropped so the next run opens a replacement. Grace-phase
+(`waitUntil`) runs do not count against the cap — their frames ride an
+existing connection, and counting them would open connections (two runtime
+threads each) for epilogue traffic.
 
 ```
 Runtime (TypeScript)
   slot pool (admission, maxConcurrentRuns) ──▶ connection registry
       connection ──UDS──▶  Rust process     (≤ cap runs multiplexed,
       connection ──UDS──▶  same process,     routed by run id)
-      ...opened when all are at the cap; count ≈ peak concurrency / cap
+      ...opened when all are at the cap; count ≈ foreground concurrency / cap
 ```
 
 When `prefix.execute()` or `sandbox.run()` is called:

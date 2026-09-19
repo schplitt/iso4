@@ -7,25 +7,29 @@
  * - `ConnectionRegistry` shares connections up to `RUNS_PER_CONNECTION`
  *   concurrent runs each, opens another lazily when all are full, and drops
  *   broken ones so the next caller opens a replacement — a transient connect
- *   failure fails one run instead of permanently costing capacity.
+ *   failure fails one run instead of permanently costing capacity. Surplus
+ *   connections are closed once idle past the TTL.
  * - `RunPool` composes them: a slot plus a shared connection per run.
  */
 
 import { describe, expect, test, vi } from 'vitest'
 
-import { ConnectionRegistry, QueueFullError, RUNS_PER_CONNECTION, RunPool, SlotPool } from '../src/pool'
+import { ConnectionRegistry, IDLE_CONNECTION_TTL_MS, QueueFullError, RUNS_PER_CONNECTION, RunPool, SlotPool } from '../src/pool'
 import { RunAbortedError } from '../src/client'
 import type { RuntimeIpcClient } from '../src/client'
 
 /**
- * Minimal stand-in for a shared connection: `usable` and `load` are
- * the only things the pool reads, and `dispose` the only thing it calls.
+ * Minimal stand-in for a shared connection: `usable`, `load` and `quiescent`
+ * are the only things the pool reads, and `dispose` the only thing it calls.
  * @param usable whether the fake reports itself as reusable
  */
 function fakeClient(usable = true): RuntimeIpcClient & { usable: boolean, load: number } {
   return {
     usable,
     load: 0,
+    get quiescent(): boolean {
+      return this.load === 0
+    },
     dispose: vi.fn(async () => {}),
   } as unknown as RuntimeIpcClient & { usable: boolean, load: number }
 }
@@ -231,6 +235,40 @@ describe('ConnectionRegistry', () => {
     expect(registry.tryAcquire()).toBeUndefined()
     expect(dying.dispose).toHaveBeenCalled()
     expect(registry.openConnections).toBe(0)
+  })
+
+  test('closes surplus connections idle past the TTL, and keeps one', async () => {
+    vi.useFakeTimers()
+    try {
+      const busy = fakeClient()
+      const idleA = fakeClient()
+      const idleB = fakeClient()
+      const registry = new ConnectionRegistry(vi.fn()
+        .mockResolvedValueOnce(busy)
+        .mockResolvedValueOnce(idleA)
+        .mockResolvedValueOnce(idleB))
+      for (let i = 0; i < 3; i++)
+        await registry.open()
+      expect(registry.openConnections).toBe(3)
+
+      // Carrying a run: idleness never accrues, however long the run takes.
+      busy.load = 1
+      vi.advanceTimersByTime(IDLE_CONNECTION_TTL_MS * 2)
+      expect(idleA.dispose).toHaveBeenCalled()
+      expect(idleB.dispose).toHaveBeenCalled()
+      expect(busy.dispose).not.toHaveBeenCalled()
+      expect(registry.openConnections).toBe(1)
+
+      // The last connection is kept for the process lifetime, and the sweep
+      // stops with it — a steady low load never pays a reconnect.
+      busy.load = 0
+      vi.advanceTimersByTime(IDLE_CONNECTION_TTL_MS * 2)
+      expect(busy.dispose).not.toHaveBeenCalled()
+      expect(registry.tryAcquire()).toBe(busy)
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   test('dispose closes tracked connections and refuses new callers', async () => {

@@ -10,10 +10,17 @@
  *   caps foreground execution, not epilogues.
  * - {@link ConnectionRegistry} shares connections: frames are multiplexed by
  *   run id, so one connection carries up to {@link RUNS_PER_CONNECTION}
- *   concurrent runs, and a new one opens only when every open connection is
- *   at the cap. The cap bounds the blast radius of a connection-level death
- *   (protocol desync, outbound stall, socket error) to that many runs.
- *   Connections are kept for the process lifetime; `dispose()` closes them.
+ *   concurrent *foreground* runs, and a new one opens only when every open
+ *   connection is at the cap. The cap bounds the blast radius of a
+ *   connection-level death (protocol desync, outbound stall, socket error) to
+ *   that many runs. Grace-phase (`waitUntil`) runs ride along uncounted:
+ *   counting them would open a connection per epilogue burst, and each
+ *   connection costs two runtime threads. So a connection death truncates
+ *   the epilogues riding it too — their callers already hold their values,
+ *   and a connection only dies on its own with the child process, which
+ *   takes every epilogue anyway. A surplus connection is closed
+ *   after {@link IDLE_CONNECTION_TTL_MS} idle; one is always kept, and
+ *   `dispose()` closes them all.
  *
  * {@link RunPool} composes the two: a slot plus a shared connection per run.
  * Decoupling capacity from sockets is the point — the admission number is
@@ -30,6 +37,18 @@ import type { RuntimeIpcClient } from './client'
  * reproduces the pre-multiplexing one-run-per-connection topology exactly.
  */
 export const RUNS_PER_CONNECTION = 4
+
+/**
+ * How long a connection may sit with nothing routed on it before the registry
+ * closes it, returning its two runtime threads (demux + writer). One
+ * connection is always kept, so a steady low load never pays a reconnect.
+ */
+export const IDLE_CONNECTION_TTL_MS = 30_000
+
+/**
+ * How often idleness is sampled — the reap granularity on top of the TTL.
+ */
+const IDLE_SWEEP_MS = 5_000
 
 interface SlotWaiter {
   resolve: () => void
@@ -174,6 +193,15 @@ export class SlotPool {
 }
 
 /**
+ * One tracked connection plus when the registry last saw traffic on it — the
+ * idle TTL runs from there.
+ */
+interface PooledConnection {
+  client: RuntimeIpcClient
+  busyAt: number
+}
+
+/**
  * The sandbox's open connections, shared by run id multiplexing: each
  * carries up to {@link RUNS_PER_CONNECTION} concurrent runs, one is opened
  * lazily when every open connection is at the cap, and a broken one is
@@ -186,7 +214,8 @@ export class ConnectionRegistry {
    * next `tryAcquire()` observes and drops it — the number is the
    * registry's ledger, not a per-read socket probe.
    */
-  private readonly connections: RuntimeIpcClient[] = []
+  private readonly connections: PooledConnection[] = []
+  private sweepTimer: ReturnType<typeof setInterval> | undefined
   /**
    * Connects in flight — counted in the ledger so a burst of opens is
    * visible, not a blind spot.
@@ -218,26 +247,64 @@ export class ConnectionRegistry {
     if (this.disposed)
       throw new Error('runtime is disposed')
     for (let i = 0; i < this.connections.length; i++) {
-      const client = this.connections[i]!
-      if (!client.usable) {
-        client.dispose().catch(() => {})
+      const entry = this.connections[i]!
+      if (!entry.client.usable) {
+        entry.client.dispose().catch(() => {})
         this.connections.splice(i, 1)
         i--
         continue
       }
-      if (client.load < RUNS_PER_CONNECTION)
-        return client
+      if (entry.client.load < RUNS_PER_CONNECTION) {
+        entry.busyAt = Date.now()
+        return entry.client
+      }
     }
     return undefined
   }
 
   /**
+   * Close connections that have carried nothing for {@link
+   * IDLE_CONNECTION_TTL_MS}, newest first (first-fit packs onto the oldest),
+   * keeping one. The sweep only runs while there is a surplus to reap.
+   */
+  private sweep(): void {
+    const now = Date.now()
+    for (let i = this.connections.length - 1; i >= 0 && this.connections.length > 1; i--) {
+      const entry = this.connections[i]!
+      if (!entry.client.quiescent) {
+        entry.busyAt = now
+        continue
+      }
+      if (now - entry.busyAt < IDLE_CONNECTION_TTL_MS)
+        continue
+      this.connections.splice(i, 1)
+      entry.client.dispose().catch(() => {})
+    }
+    if (this.connections.length <= 1)
+      this.stopSweep()
+  }
+
+  private startSweep(): void {
+    if (this.sweepTimer !== undefined || this.connections.length <= 1)
+      return
+    this.sweepTimer = setInterval(() => this.sweep(), IDLE_SWEEP_MS)
+    // The sweep alone must never keep the host's event loop alive.
+    this.sweepTimer.unref?.()
+  }
+
+  private stopSweep(): void {
+    if (this.sweepTimer === undefined)
+      return
+    clearInterval(this.sweepTimer)
+    this.sweepTimer = undefined
+  }
+
+  /**
    * Open a fresh connection and add it to the shared set. Concurrent
    * callers that all found the set full each open one — a cold burst can
-   * briefly open more connections than the steady-state packing needs;
-   * they are kept and reused, so the count follows demand from then on. A
-   * failed connect fails this caller's run; the registry never shrinks
-   * silently.
+   * briefly open more connections than the steady-state packing needs; they
+   * are reused, and the idle sweep gives the overshoot back. A failed
+   * connect fails this caller's run and leaves the ledger untouched.
    */
   async open(): Promise<RuntimeIpcClient> {
     if (this.disposed)
@@ -249,7 +316,8 @@ export class ConnectionRegistry {
         client.dispose().catch(() => {})
         throw new Error('runtime is disposed')
       }
-      this.connections.push(client)
+      this.connections.push({ client, busyAt: Date.now() })
+      this.startSweep()
       return client
     } finally {
       this.opening--
@@ -260,9 +328,10 @@ export class ConnectionRegistry {
     if (this.disposed)
       return
     this.disposed = true
+    this.stopSweep()
     // Abrupt by design: the sandbox kills the child right after, so there
     // is nothing to drain for.
-    await Promise.all(this.connections.splice(0).map((client) => client.dispose()))
+    await Promise.all(this.connections.splice(0).map(({ client }) => client.dispose()))
   }
 }
 

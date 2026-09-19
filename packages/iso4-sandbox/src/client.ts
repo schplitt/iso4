@@ -244,16 +244,35 @@ export class RuntimeIpcClient {
   private readonly runs = new Map<number, RunEntry>()
 
   /**
-   * Everything routed on this connection that a connection-level failure
-   * would take down: runs (executing AND grace-phase — an entry lives until
-   * its final frame) plus in-flight control requests. The pool's
-   * per-connection cap reads this, so the blast-radius bound covers all of
-   * it. Both counts move synchronously from the call that adds them
-   * (`runRawCode`/`prefixRun`/`precompile`), which keeps the pool's
-   * same-tick load observation exact.
+   * How many of {@link runs} are in their `waitUntil` grace phase. A counter
+   * rather than a scan so {@link load} stays O(1).
+   */
+  private graceRuns = 0
+
+  /**
+   * What the pool's per-connection cap bounds: foreground runs plus in-flight
+   * control requests. Grace-phase runs are deliberately excluded — counting
+   * an epilogue for its whole grace wall opens fresh connections (2 runtime
+   * threads each) for traffic that rides an existing one, and their frames
+   * are mux-routed by run id anyway. The counts move synchronously from the
+   * call that adds them (`runRawCode`/`prefixRun`/`precompile`), which keeps
+   * the pool's same-tick load observation exact.
    */
   get load(): number {
-    return this.runs.size + this.precompileWaiters.size + this.controlWaiters.length
+    return (
+      this.runs.size - this.graceRuns
+      + this.precompileWaiters.size
+      + this.controlWaiters.length
+    )
+  }
+
+  /**
+   * Nothing is routed here at all — grace phases included — and nothing is
+   * left in the socket's write buffer. The pool reaps only quiescent
+   * connections, so closing one never drops a frame already written.
+   */
+  get quiescent(): boolean {
+    return this.load === 0 && this.graceRuns === 0 && this.socket.writableLength === 0
   }
 
   /**
@@ -878,6 +897,7 @@ export class RuntimeIpcClient {
           }
         }
         this.runs.clear()
+        this.graceRuns = 0
         for (const waiter of this.controlWaiters.splice(0))
           waiter.reject(failure)
         for (const [, waiter] of this.precompileWaiters)
@@ -1046,6 +1066,7 @@ export class RuntimeIpcClient {
       settleEpilogue = resolve
     })
     entry.epilogue = settleEpilogue
+    this.graceRuns++
 
     // Aborting during the epilogue cancels the background work gracefully:
     // a Terminate frame truncates the grace phase runtime-side and the
@@ -1103,6 +1124,7 @@ export class RuntimeIpcClient {
       )
     }
     this.runs.delete(report.runId)
+    this.graceRuns--
     entry.detachAbort()
     entry.streams?.releaseAll()
     // The runtime ends every outbound stream before its RunComplete; a

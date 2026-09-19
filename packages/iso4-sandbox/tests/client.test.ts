@@ -870,6 +870,47 @@ describe('RuntimeIpcClient run router (multiplexed)', () => {
     await client.dispose()
   })
 
+  test('a grace-phase run drops out of the connection load at its Result', async () => {
+    // The pool's per-connection cap reads `load`. An epilogue that kept
+    // counting for its whole grace wall would push every following run onto a
+    // fresh connection — two runtime threads each, never reclaimed.
+    let sendGraceEnd: () => void = () => {}
+    const graceEnded = new Promise<void>((r) => {
+      sendGraceEnd = r
+    })
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+
+      const runId = payloadOf(await reader.readFrame()).readUInt32BE(0)
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.Result, backgroundResultPayload(runId)),
+      )
+      await graceEnded
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.RunComplete, runCompletePayload(runId)),
+      )
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    const run = client.runRawCode('export default 1')
+    expect(client.load).toBe(1)
+
+    const raw = await run
+    // Value delivered, run still routed — but no longer counted.
+    expect(client.load).toBe(0)
+    expect(client.quiescent).toBe(false)
+
+    sendGraceEnd()
+    expect(await raw.epilogue).toBeDefined()
+    // The RunComplete must not take the count below zero.
+    expect(client.load).toBe(0)
+    expect(client.quiescent).toBe(true)
+    await client.dispose()
+  })
+
   test('a Result for an unknown run id fails every run in flight and tears the connection down', async () => {
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
