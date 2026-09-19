@@ -2693,6 +2693,15 @@ mod tests {
             ))
             .unwrap();
 
+        // Discarding closes its turn: an open one reads as 100% busy once
+        // it outlasts the load window.
+        std::thread::sleep(Duration::from_millis(250));
+        assert_ne!(
+            handle.load.current_util_permille(),
+            1000,
+            "the discarding turn stayed open"
+        );
+
         let outcome = handle.call(bump_job());
         assert!(!outcome.tainted);
         assert_eq!(bump_value(&outcome), 2.0, "the stray event left the loop serving");

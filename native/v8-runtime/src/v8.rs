@@ -5379,6 +5379,9 @@ pub fn serve_instance(
                         ),
                         RunEvent::Job(_) | RunEvent::Retire => {}
                     }
+                    // Discarding is the whole turn; an unclosed one reads
+                    // as 100% busy until the next event.
+                    load.close_turn();
                     continue;
                 };
                 let mut l = live.swap_remove(idx);
