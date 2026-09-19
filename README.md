@@ -89,6 +89,26 @@ against the freshly evaluated module. The receiver is the exported object
 itself, so handlers reading `this` behave normally; a path that does not
 resolve to a callable fails with `ERR_CALL_TARGET_NOT_FOUND`.
 
+### Batch event streams
+
+For a stream of events, hand the sandbox an array and take an array back.
+Arguments cross as one blob per call, so a batch of 32 pays one crossing
+instead of 32 — the single biggest throughput lever there is for
+event-shaped work:
+
+```ts
+const results = await prefix.call({
+  export: 'default.transform',
+  args: [events], // one array, not one call per event
+})
+```
+
+Measured on a warm prefix over an 8-slot pool, ~750 B analytics events:
+~98k events/sec one at a time, ~365k at 32 per call — 3.6×, most of it
+already there at 8. Keep several batches in flight (one call runs on one
+slot) and remember that a batch shares one run's limits — see
+[`@iso4/sandbox`](./packages/iso4-sandbox#batch-event-streams).
+
 For the deploy path, `sandbox.readExports({ code })` loads a module once and
 returns its serializable exports (IaC-style declarations); function-valued
 exports are absent and reported in `skippedExports` — never an error:
