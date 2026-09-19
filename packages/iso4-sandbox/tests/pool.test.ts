@@ -82,6 +82,21 @@ describe('SlotPool admission', () => {
     expect(slots.queueDepth).toBe(0)
   })
 
+  test('reports the wait to a caller that queued, nothing to one that did not', async () => {
+    const slots = new SlotPool(1, 1000)
+    // A free slot is handed over without reading a clock.
+    await expect(slots.acquire()).resolves.toBeUndefined()
+
+    const queued = slots.acquire()
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+    slots.release()
+
+    const waited = await queued
+    expect(waited).toBeGreaterThanOrEqual(15)
+  })
+
   test('an already-aborted signal is rejected before admission or queueing', async () => {
     // `addEventListener` never fires for a signal that already aborted, so
     // without the entry check a pre-aborted caller (its AbortSignal.timeout
@@ -121,7 +136,8 @@ describe('SlotPool admission', () => {
     await expect(abandoned).rejects.toBeInstanceOf(RunAbortedError)
 
     slots.release()
-    await expect(waiting).resolves.toBeUndefined()
+    // Admitted from the queue, so it resolves with its wait, not `undefined`.
+    await expect(waiting).resolves.toBeTypeOf('number')
   })
 
   test('queueDepth counts only callers still waiting', async () => {
@@ -411,6 +427,25 @@ describe('RunPool composition', () => {
     })))
 
     expect(peak).toBeLessThanOrEqual(2)
+  })
+
+  test('hands the run its queue wait, undefined when it never queued', async () => {
+    const pool = new RunPool(1, 1000, async () => fakeClient())
+    const seen: Array<number | undefined> = []
+
+    const first = pool.withClient(async (_client, queueWaitMs) => {
+      seen.push(queueWaitMs)
+      await new Promise((r) => {
+        setTimeout(r, 20)
+      })
+    })
+    const second = pool.withClient(async (_client, queueWaitMs) => {
+      seen.push(queueWaitMs)
+    })
+    await Promise.all([first, second])
+
+    expect(seen[0]).toBeUndefined()
+    expect(seen[1]).toBeGreaterThanOrEqual(15)
   })
 
   test('concurrent runs below the cap share one connection', async () => {

@@ -287,9 +287,13 @@ describe('saturation queues FIFO', () => {
 
     const queued = await prefix.call({ export: 'slow', args: [0] })
     expect(queued.ok).toBe(true)
+    // The wait for the slot is on the result, outside the runtime's clocks.
+    expect(queued.queueWaitMs).toBeGreaterThan(0)
 
     const first = await busy
     expect(first.ok).toBe(true)
+    // It held the slot from the start, so it never waited for one.
+    expect(first.queueWaitMs).toBeUndefined()
   })
 
   test('past maxQueuedRuns a run is shed with ERR_QUEUE_FULL, not queued', async () => {
@@ -312,6 +316,8 @@ describe('saturation queues FIFO', () => {
       expect(shed.error.code).toBe('ERR_QUEUE_FULL')
       expect(shed.error.message).toContain('maxQueuedRuns')
       expect(shed.durationMs).toBe(0)
+      // Refused at the bound, so it never waited either.
+      expect(shed.queueWaitMs).toBeUndefined()
     }
 
     // The busy run is untouched, and a freed slot admits again.

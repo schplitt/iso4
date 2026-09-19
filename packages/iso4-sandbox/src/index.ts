@@ -597,6 +597,21 @@ function queueFullResult(error: QueueFullError): RunResult {
   }
 }
 
+/**
+ * Stamp what the run waited for its slot onto its result. Absent when it
+ * never queued; an aborted run reports no time of its own either.
+ * @param result the run's outcome
+ * @param queueWaitMs the wait the pool measured
+ */
+function withQueueWait(
+  result: RunResult | CallResult,
+  queueWaitMs: number | undefined,
+): RunResult | CallResult {
+  if (queueWaitMs !== undefined && result.status !== 'aborted')
+    result.queueWaitMs = queueWaitMs
+  return result
+}
+
 function desyncResult(error: ProtocolDesyncError): RunResult {
   return {
     status: 'failed',
@@ -746,7 +761,7 @@ class SandboxImpl implements Sandbox {
           argsBlob: await serializeHostValue(options.call.args ?? [], this.brandKey, streams),
         }
     try {
-      return await this.pool.withClient(async (client) => {
+      return await this.pool.withClient(async (client, queueWaitMs) => {
         // Every global is installed natively by the runtime, so user code
         // always starts at line 1.
         const raw = await client.runRawCode(options.code, {
@@ -786,7 +801,7 @@ class SandboxImpl implements Sandbox {
           if (options.hardAbortSignal?.aborted)
             return abortedResult(options.hardAbortSignal.reason, decoded)
         }
-        return decoded
+        return withQueueWait(decoded, queueWaitMs)
       }, options.signal, options.hardAbortSignal)
     } catch (error) {
       // Failure before or during the exchange: nothing will pump these
@@ -1134,7 +1149,7 @@ implements Prefix<G, M> {
     }
     const streams = payload.streams ?? new StreamSourceRegistry()
     try {
-      return await this.pool.withClient(async (client) => {
+      return await this.pool.withClient(async (client, queueWaitMs) => {
         const raw = await client.prefixRun({
           prefixId: this.id,
           code: payload.code,
@@ -1169,7 +1184,7 @@ implements Prefix<G, M> {
           if (options.hardAbortSignal?.aborted)
             return abortedResult(options.hardAbortSignal.reason, decoded)
         }
-        return decoded
+        return withQueueWait(decoded, queueWaitMs)
       }, options.signal, options.hardAbortSignal)
     } catch (error) {
       streams.releaseAll()

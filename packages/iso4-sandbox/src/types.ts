@@ -1329,6 +1329,10 @@ export interface CallSuccess {
    * (GC, compilation) are not attributable to a run and are not included.
    */
   cpuTimeMs: number
+  /**
+   * See {@link RunSuccess.queueWaitMs}.
+   */
+  queueWaitMs?: number
   bridgeCalls: BridgeCallEntry[]
   /**
    * `used_heap_size` of the isolate that served this call, measured after
@@ -1499,6 +1503,18 @@ export interface RunSuccess {
    */
   cpuTimeMs: number
   /**
+   * How long this run waited on the host for a free run slot
+   * (`maxConcurrentRuns`), before its frame was sent. Absent when a slot was
+   * free and the run went straight out. Milliseconds with microsecond
+   * resolution.
+   *
+   * The wait sits outside the other three clocks, which the runtime measures
+   * from dispatch onwards — end to end, a caller sees this plus
+   * {@link durationMs} plus frame transit. Rising `queueWaitMs` is the sign
+   * that admission, not the code, is the bottleneck.
+   */
+  queueWaitMs?: number
+  /**
    * One entry per bridge call the sandbox attempted, in attempt order —
    * including attempts blocked by limits ({@link BridgeCallEntry.blocked}).
    * Recorded by the Rust runtime.
@@ -1533,6 +1549,11 @@ export interface RunFailure {
    */
   wallTimeMs: number
   cpuTimeMs: number
+  /**
+   * See {@link RunSuccess.queueWaitMs}. Absent on a run that failed before
+   * admission — `ERR_QUEUE_FULL` is refused at the bound without waiting.
+   */
+  queueWaitMs?: number
   bridgeCalls: BridgeCallEntry[]
   /**
    * `used_heap_size` of the isolate that served this run, measured after the

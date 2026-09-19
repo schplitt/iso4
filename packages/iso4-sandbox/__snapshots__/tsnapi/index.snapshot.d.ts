@@ -29,6 +29,7 @@ export interface CallSuccess {
   durationMs: number;
   wallTimeMs: number;
   cpuTimeMs: number;
+  queueWaitMs?: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
   waitUntil?: Promise<WaitUntilResult>;
@@ -127,6 +128,7 @@ export interface RunFailure {
   durationMs: number;
   wallTimeMs: number;
   cpuTimeMs: number;
+  queueWaitMs?: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
 }
@@ -149,6 +151,7 @@ export interface RunSuccess {
   durationMs: number;
   wallTimeMs: number;
   cpuTimeMs: number;
+  queueWaitMs?: number;
   bridgeCalls: BridgeCallEntry[];
   heapUsedBytes?: number;
   waitUntil?: Promise<WaitUntilResult>;
