@@ -216,6 +216,41 @@ idle instance counts, summed idle heap, `budgetBytes` / `rssBytes`, whether the
 runtime is currently `underPressure`, and per-prefix counts. It answers on a
 dedicated connection, so it works even when every run slot is busy.
 
+## Concurrency, and why shedding is yours
+
+How many runs execute at once is the runtime's decision, not a constant. It
+derives the number from the shape of the runs it is serving —
+`5 × cores × wall^0.7 ÷ cpu^1.2` over the uncontended minimum wall and CPU
+time of each prefix, recomputed every 32 completions — so a prefix that
+waits 200 ms on an upstream call is granted thousands of slots while one
+that burns a core for 3 ms is granted a handful. Callers beyond the current
+number queue FIFO, `stats()` reports it as `slotLimit`, and a run that had
+to wait carries `queueWaitMs` on its result.
+
+```ts
+const sandbox = await createSandbox({
+  maxConcurrentRuns: 64, // pins the number — derivation is off entirely
+  maxQueuedRuns: 10_000, // waiters behind it; past this, ERR_QUEUE_FULL
+})
+```
+
+That number is about the sandbox, not about your process. For wait-heavy
+work it grows into the thousands, and every one of those runs is also
+promises, frames and host handlers on **your** Node event loop — the same
+loop serving your own requests. Measured on an 8-core pod against runs that
+wait 250 ms on a host call: ~8k concurrent runs sustain ~28k runs/s at ~43 ms
+event-loop delay, while ~12k push that delay to ~286 ms and throughput _down_
+to ~22k/s. Zero errors at either level — nothing fails, the process just gets
+slow, your own request handling included.
+
+Neither side refuses on that. The runtime grants without enforcing and never
+looks at your event loop, so the ceiling is yours to impose: keep your own
+in-flight bound upstream of `execute()` and reject or defer past it —
+`perf_hooks.monitorEventLoopDelay()` is the signal to set it by — or pin
+`maxConcurrentRuns` to a number you have measured this host at. A pin is a
+fixed number, not a cap on the derived one: it opts out of derivation for
+every workload the sandbox serves.
+
 ## Async context (`AsyncLocalStorage`)
 
 Run/postfix code can import a minimal, Node-compatible `AsyncLocalStorage` to
@@ -375,8 +410,9 @@ Thrown errors keep their identity across the bridge, in both directions:
 ## Architecture
 
 V8 runs in a separate Rust subprocess communicating over a Unix domain socket.
-A slot pool admits up to `maxConcurrentRuns` runs at once (the rest queue
-FIFO — an `AbortSignal`, e.g. `AbortSignal.timeout()`, bounds the wait);
+A slot pool admits as many runs at once as the runtime currently grants (the
+rest queue FIFO — an `AbortSignal`, e.g. `AbortSignal.timeout()`, bounds the
+wait);
 connections to the subprocess open on demand and are reused, and `stats()`
 reports the live count as `openConnections`. Five concurrent
 `prefix.execute()` calls each get their own run slot and execute in
