@@ -2083,9 +2083,10 @@ prefix-aware acquire policy uses):
   left usage flat (within 5 %) stops the walk instead of evicting the
   world; the latch holds, and a sample that moves either way re-arms it.
 - **The hard admission line (#77)**: above the budget, at 90 % of
-  (container limit − 128 MB host reserve, computed by the runtime at
-  startup), sits the one refusal rule — a NEW isolate is never created
-  when measured usage plus the run's own hard line (band included) would cross it, so the
+  (container limit − the host reserve: `hostReserveMb` on `createSandbox`,
+  passed as `--host-reserve-bytes`, 128 MB by default), sits the one refusal
+  rule — a NEW isolate is never created when measured usage plus the run's
+  own hard line (band included) would cross it, so the
   newest admission always leaves at least one worst-case isolate of
   headroom below the OOM kill. Refused runs fail with `ERR_CAPACITY`,
   deliberately unqueued: a queue is more memory exactly when there is
@@ -2130,7 +2131,8 @@ answers a question ("how many?") that memory pressure — the thing that
 actually kills the process — cannot be read from. Concurrency is bounded
 by the host pool, memory by the marks; running instances are never
 evicted. The budget default mirrors the line's base: 80 % of
-(container limit − 128 MB host reserve), container-aware via
+(container limit − the `hostReserveMb` host reserve, 128 MB by default),
+container-aware via
 `process.constrainedMemory()` (falling back to `os.totalmem()`, which lies
 in containers). Independent of `memoryMb`: usage is measured, not derived
 from per-isolate caps. One-off runs never touch the warm pools but share

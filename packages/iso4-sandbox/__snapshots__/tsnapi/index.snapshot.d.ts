@@ -171,6 +171,7 @@ export interface SandboxOptions {
   maxQueuedRuns?: number;
   memoryMb?: number | MemoryLimit;
   memoryBudgetMb?: number;
+  hostReserveMb?: number;
   binaryPath?: string;
 }
 export interface SandboxStats {

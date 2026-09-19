@@ -22,22 +22,38 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 /// Reserved for the Node host + this runtime's own overhead when deriving
-/// the admission line from the container limit. Mirrored by the host's
-/// budget derivation (`index.ts` `defaultMemoryBudgetMb`) — change both
-/// together. Sized for a typical Node host (~80 MB measured) with margin;
-/// a measured reserve replaces this constant later.
-pub const NODE_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
+/// the admission line from the container limit. Sized for a typical Node
+/// host (~80 MB measured) with margin; a host that caches heavily wants
+/// more. Mirrored by `index.ts` `DEFAULT_HOST_RESERVE_MB` — change both
+/// together.
+pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
-/// The hard admission line: 90% of (container limit − Node reserve). An
+/// The reserve actually in force: the host's `hostReserveMb`, set once from
+/// `--host-reserve-bytes` before the first line is drawn.
+static HOST_RESERVE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_HOST_RESERVE_BYTES);
+
+pub fn host_reserve_bytes() -> u64 {
+    HOST_RESERVE_BYTES.load(Ordering::Relaxed)
+}
+
+pub fn set_host_reserve_bytes(bytes: u64) {
+    HOST_RESERVE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The hard admission line: 90% of (container limit − host reserve). An
 /// isolate is only ever created while measured usage + the run's own heap
 /// cap stays at or below it, so the newest admission can never be what
 /// tips the container over (#77 ruling). `0` = no limit readable, line
 /// disabled.
 pub fn admission_line_bytes() -> u64 {
     match limit_bytes() {
-        Some(limit) => limit.saturating_sub(NODE_RESERVE_BYTES) / 10 * 9,
+        Some(limit) => line_from(limit, host_reserve_bytes()),
         None => 0,
     }
+}
+
+fn line_from(limit_bytes: u64, reserve_bytes: u64) -> u64 {
+    limit_bytes.saturating_sub(reserve_bytes) / 10 * 9
 }
 
 /// The container's memory limit and the meter it was read from ("cgroup
@@ -226,7 +242,21 @@ mod tests {
         let limit = limit_bytes().unwrap();
         assert!(line > 0);
         assert!(line < limit, "line {line} must leave headroom below {limit}");
-        assert_eq!(line, limit.saturating_sub(NODE_RESERVE_BYTES) / 10 * 9);
+        assert_eq!(line, line_from(limit, host_reserve_bytes()));
+    }
+
+    #[test]
+    fn the_reserve_moves_the_line_by_90_percent_of_itself() {
+        // Tested on the derivation, not the process-wide reserve: mutating
+        // that would race every other test in this binary.
+        let gb = 1024 * 1024 * 1024;
+        assert_eq!(line_from(gb, 0), gb / 10 * 9);
+        assert_eq!(
+            line_from(gb, DEFAULT_HOST_RESERVE_BYTES),
+            (gb - DEFAULT_HOST_RESERVE_BYTES) / 10 * 9
+        );
+        // A reserve past the limit disables the line rather than wrapping.
+        assert_eq!(line_from(gb, 2 * gb), 0);
     }
 
     #[test]

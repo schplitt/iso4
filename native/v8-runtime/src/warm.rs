@@ -568,7 +568,8 @@ impl WarmRegistry {
             // The line's inputs aren't stored; reconstruct the limit it implies
             // (exact modulo the derivation's /10 floor) so the shown arithmetic
             // checks out even for test-injected lines.
-            let limit_bytes = self.hard_line_bytes / 9 * 10 + crate::container::NODE_RESERVE_BYTES;
+            let reserve_bytes = crate::container::host_reserve_bytes();
+            let limit_bytes = self.hard_line_bytes / 9 * 10 + reserve_bytes;
             let headroom_mb = self.hard_line_bytes.saturating_sub(usage_bytes) / MB;
             let fit = if headroom_mb > 0 {
                 format!("the largest heap ceiling admissible right now is {headroom_mb} MB")
@@ -585,7 +586,7 @@ impl WarmRegistry {
                 usage_bytes.saturating_add(run_cap_bytes) / MB,
                 self.hard_line_bytes / MB,
                 limit_bytes / MB,
-                crate::container::NODE_RESERVE_BYTES / MB,
+                reserve_bytes / MB,
                 fit,
             )
         })

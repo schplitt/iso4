@@ -162,6 +162,7 @@ Residency is bounded by memory, not by a count:
 const sandbox = await createSandbox({
   memoryMb: 128, // default heap cap per isolate (override per prefix at prepare())
   memoryBudgetMb: 2048, // RSS mark for the whole runtime process (0 = off)
+  hostReserveMb: 128, // container memory held back for this host process
 })
 ```
 
@@ -192,7 +193,10 @@ warm ones — prefix runs then execute on cold one-off isolates — until RSS fa
 back to 80 % of the mark. `maxConcurrentRuns` caps concurrent runs; this caps
 memory.
 The default is derived from the memory available to the process
-(container-aware), so most hosts never set it.
+(container-aware), so most hosts never set it: 80 % of the container limit
+minus `hostReserveMb`, which is headroom for this host process to grow into
+(its current usage is already metered) — raise it when the host caches
+heavily, `0` to hand the sandbox the whole limit.
 
 `sandbox.stats()` reports the live picture — active runs, queue depth, warm and
 idle instance counts, summed idle heap, `budgetBytes` / `rssBytes`, whether the
