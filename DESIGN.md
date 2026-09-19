@@ -2103,7 +2103,9 @@ compute-heavy traffic scales out (response time), waiting-heavy traffic
 stacks (memory). An unmeasured prefix spawns (the pre-#77 behavior) until
 its first completion. Routing packs: the fullest instance whose thread is
 not currently saturated (a per-instance utilization window the owner loop
-publishes) takes the join; all saturated spills over to a spawn, and if
+publishes; windows close only between turns, so a turn that outlasts one
+counts as saturated rather than reading idle) takes the join; all saturated
+spills over to a spawn, and if
 memory refuses that, the least-utilized instance takes it anyway. Joins are
 never gated by memory or the shedding latch — they add no isolate; spawns
 are gated by both, plus a per-prefix ceiling at the core count (more

@@ -957,6 +957,10 @@ pub struct InstanceLoad {
     /// When that window closed (ms since [`load_now_ms`]'s epoch). A stale
     /// window means the loop is parked — utilization is genuinely ~0.
     closed_at_ms: std::sync::atomic::AtomicU64,
+    /// When the turn running right now started, `u64::MAX` between turns.
+    /// Windows close only between turns, so a long turn would otherwise
+    /// read as idle and attract more joins.
+    turn_open_since_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Utilization windows: closed every 100 ms of wall time; a reading older
@@ -975,6 +979,7 @@ impl InstanceLoad {
         Self {
             util_permille: std::sync::atomic::AtomicU32::new(0),
             closed_at_ms: std::sync::atomic::AtomicU64::new(0),
+            turn_open_since_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -985,15 +990,40 @@ impl InstanceLoad {
             .store(load_now_ms(), std::sync::atomic::Ordering::Release);
     }
 
+    fn open_turn(&self, at_ms: u64) {
+        self.turn_open_since_ms
+            .store(at_ms, std::sync::atomic::Ordering::Release);
+    }
+
+    fn close_turn(&self) {
+        self.turn_open_since_ms
+            .store(u64::MAX, std::sync::atomic::Ordering::Release);
+    }
+
     /// Recent utilization for routing; 0 when the last window is stale.
     pub fn current_util_permille(&self) -> u32 {
+        self.util_permille_at(load_now_ms())
+    }
+
+    fn util_permille_at(&self, now_ms: u64) -> u32 {
+        let open = self
+            .turn_open_since_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if now_ms.saturating_sub(open) >= LOAD_WINDOW_MS {
+            // A turn holding the thread for a whole window IS saturation,
+            // whatever the last closed window measured.
+            return UTILIZATION_SATURATED_PERMILLE;
+        }
         let at = self.closed_at_ms.load(std::sync::atomic::Ordering::Acquire);
-        if load_now_ms().saturating_sub(at) > LOAD_STALE_MS {
+        if now_ms.saturating_sub(at) > LOAD_STALE_MS {
             return 0;
         }
         self.util_permille.load(std::sync::atomic::Ordering::Acquire)
     }
 }
+
+/// Full utilization: reported for a turn that outlasts a window.
+const UTILIZATION_SATURATED_PERMILLE: u32 = 1000;
 
 impl Default for InstanceLoad {
     fn default() -> Self {
@@ -5199,7 +5229,11 @@ pub fn serve_instance(
     sel.recv(events);
 
     // The job that triggered instance creation, then the loop.
-    if dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, first) {
+    load.open_turn(load_now_ms());
+    let first_tainted =
+        dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, first);
+    load.close_turn();
+    if first_tainted {
         taint_sweep(core, &mut live, events);
         return;
     }
@@ -5225,6 +5259,7 @@ pub fn serve_instance(
         };
 
         let turn_started = std::time::Instant::now();
+        load.open_turn(load_now_ms());
         match received {
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // The recv timed out: the channel was empty for the whole
@@ -5360,6 +5395,7 @@ pub fn serve_instance(
             }
         }
 
+        load.close_turn();
         busy_nanos += turn_started.elapsed().as_nanos() as u64;
         let window = window_start.elapsed();
         if window.as_millis() as u64 >= LOAD_WINDOW_MS {
@@ -9089,6 +9125,22 @@ mod tests {
 
     fn run(code: &str) -> Result<Output, RunError> {
         run_code(code, "<iso4>", Limits::default()).map_err(|failure| failure.error)
+    }
+
+    #[test]
+    fn a_turn_outlasting_a_window_reads_as_saturated() {
+        let load = InstanceLoad::new();
+        load.close_window(300);
+        assert_eq!(load.util_permille_at(10), 300, "between turns: the window");
+        load.open_turn(10);
+        assert_eq!(load.util_permille_at(10 + LOAD_WINDOW_MS - 1), 300);
+        assert_eq!(
+            load.util_permille_at(10 + LOAD_WINDOW_MS),
+            UTILIZATION_SATURATED_PERMILLE,
+            "one turn has held the thread for a whole window",
+        );
+        load.close_turn();
+        assert_eq!(load.util_permille_at(10 + LOAD_WINDOW_MS), 300);
     }
 
     /// Build a source-form `ImportBinding` for tests.

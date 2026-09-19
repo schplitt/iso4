@@ -56,7 +56,8 @@ pub struct InstanceHandle {
     /// eviction score.
     last_used: Instant,
     /// `used_heap_size` after the last call — Result-frame report and the
-    /// heap factor of the eviction score.
+    /// heap factor of the eviction score. 0 until a call finishes, so an
+    /// instance that never served scores nothing despite its ~1.7 MB.
     pub heap_used_bytes: u64,
     /// The owner loop's thread-load signal — join routing's saturation
     /// input.
