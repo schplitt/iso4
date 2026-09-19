@@ -258,6 +258,76 @@ pub fn should_spawn(f: &SpawnFacts) -> bool {
     demand_threads > absorbed
 }
 
+/// One prefix's run shape for the slot formula. The times are UNCONTENDED
+/// minima (`warm.rs`), not averages — loaded readings would feed the
+/// formula its own back-pressure.
+#[derive(Clone, Copy, Debug)]
+pub struct SlotFacts {
+    /// Arrival-rate EWMA (runs/second) — the aggregation weight.
+    pub arrivals_per_sec: f64,
+    /// Wall per run (ms): execution plus waits.
+    pub wall_ms: f64,
+    /// Active execution per run (ms).
+    pub cpu_ms: f64,
+}
+
+/// Fitted over 47 measured throughput curves: longer runs need more slots,
+/// CPU-hungry runs need fewer. The exponents are not 1 — plain Little's law
+/// overshoots short runs badly.
+const SLOT_COEFFICIENT: f64 = 5.0;
+const SLOT_WALL_EXPONENT: f64 = 0.7;
+const SLOT_CPU_EXPONENT: f64 = 1.2;
+
+/// How many runs the host may keep in flight for this workload shape.
+///
+/// Prefixes fold into one shape by arrival-weighted mean — one number over
+/// a shared machine, so the busiest prefix decides most of it. A mix
+/// therefore lands between what its halves would each ask for (#142).
+/// Floored at `cores`.
+/// @param prefixes every prefix with a usable, non-stale sample
+/// @param cores the CPU count
+pub fn target_slots(prefixes: &[SlotFacts], cores: usize) -> usize {
+    let cores_f = cores.max(1) as f64;
+    let total_weight: f64 = prefixes.iter().map(|p| p.arrivals_per_sec.max(0.0)).sum();
+    // No arrival-rate signal yet (a single run, so no inter-arrival gap):
+    // weight every prefix equally rather than dropping them all.
+    let (wall_ms, cpu_ms) = if total_weight > 0.0 {
+        (
+            prefixes
+                .iter()
+                .map(|p| p.wall_ms * p.arrivals_per_sec.max(0.0))
+                .sum::<f64>()
+                / total_weight,
+            prefixes
+                .iter()
+                .map(|p| p.cpu_ms * p.arrivals_per_sec.max(0.0))
+                .sum::<f64>()
+                / total_weight,
+        )
+    } else if prefixes.is_empty() {
+        return cores.max(1);
+    } else {
+        let n = prefixes.len() as f64;
+        (
+            prefixes.iter().map(|p| p.wall_ms).sum::<f64>() / n,
+            prefixes.iter().map(|p| p.cpu_ms).sum::<f64>() / n,
+        )
+    };
+    if !(wall_ms > 0.0) || !(cpu_ms > 0.0) {
+        return cores.max(1);
+    }
+    let slots = SLOT_COEFFICIENT
+        * cores_f
+        * wall_ms.powf(SLOT_WALL_EXPONENT)
+        / cpu_ms.powf(SLOT_CPU_EXPONENT);
+    if !slots.is_finite() {
+        return cores.max(1);
+    }
+    // usize::MAX would overflow the u32 the wire carries; the host clamps
+    // too, but a nonsense number should never leave this function.
+    (slots.round() as u64).clamp(cores.max(1) as u64, u64::from(u32::MAX)) as usize
+}
+
 /// What join routing knows about one live instance. Dead (tainted /
 /// retiring / cap-mismatched) instances must not appear in the slice.
 #[derive(Clone, Copy, Debug)]
@@ -325,6 +395,58 @@ mod tests {
             heap_used_bytes: heap_mb * MB,
             last_used: now - idle,
         }
+    }
+
+    #[test]
+    fn the_slot_formula_separates_waiting_work_from_computing_work() {
+        // An HTTP-shaped run: 200 ms of waiting, a twentieth of a
+        // millisecond of CPU. Little's law says thousands in flight.
+        let io = SlotFacts { arrivals_per_sec: 100.0, wall_ms: 200.0, cpu_ms: 0.05 };
+        // A compute-shaped run: the wall IS the CPU.
+        let cpu = SlotFacts { arrivals_per_sec: 100.0, wall_ms: 3.4, cpu_ms: 3.4 };
+
+        let io_slots = target_slots(&[io], 2);
+        let cpu_slots = target_slots(&[cpu], 2);
+        assert!(io_slots > 1000, "wait-dominated work wants thousands, got {io_slots}");
+        assert!(
+            (4..=12).contains(&cpu_slots),
+            "compute-bound work wants a handful, got {cpu_slots}"
+        );
+    }
+
+    #[test]
+    fn a_shorter_run_of_the_same_shape_wants_more_slots() {
+        // Same wall/cpu ratio, a tenth the run: the fixed per-run cost the
+        // guest cannot see means shorter runs need deeper pipelining.
+        let long = SlotFacts { arrivals_per_sec: 10.0, wall_ms: 100.0, cpu_ms: 1.0 };
+        let short = SlotFacts { arrivals_per_sec: 10.0, wall_ms: 10.0, cpu_ms: 0.1 };
+        assert!(target_slots(&[short], 4) > target_slots(&[long], 4));
+    }
+
+    #[test]
+    fn prefixes_fold_by_arrival_share() {
+        let io = SlotFacts { arrivals_per_sec: 900.0, wall_ms: 200.0, cpu_ms: 0.05 };
+        let cpu = SlotFacts { arrivals_per_sec: 100.0, wall_ms: 3.4, cpu_ms: 3.4 };
+        let mixed = target_slots(&[io, cpu], 2);
+        // Between the two, and nearer the prefix taking most of the traffic.
+        assert!(mixed > target_slots(&[cpu], 2));
+        assert!(mixed < target_slots(&[io], 2));
+    }
+
+    #[test]
+    fn nothing_measured_yet_falls_back_to_one_run_per_core() {
+        assert_eq!(target_slots(&[], 4), 4);
+        // A sample with no usable times is not a reason to admit nothing.
+        let empty = SlotFacts { arrivals_per_sec: 5.0, wall_ms: 0.0, cpu_ms: 0.0 };
+        assert_eq!(target_slots(&[empty], 4), 4);
+    }
+
+    #[test]
+    fn the_core_count_is_a_floor_not_a_suggestion() {
+        // A run that somehow reports more CPU than wall must never take the
+        // sandbox below one job per core.
+        let absurd = SlotFacts { arrivals_per_sec: 1.0, wall_ms: 0.001, cpu_ms: 500.0 };
+        assert_eq!(target_slots(&[absurd], 8), 8);
     }
 
     #[test]

@@ -27,6 +27,7 @@ import {
   peekPrecompileResultRequestId,
   peekRunCompletionBackgroundFlags,
   peekRunCompletionRunId,
+  peekRunCompletionSlotAllowance,
   STREAM_CHUNK_MAX_BYTES,
   STREAM_CREDIT_WINDOW_BYTES,
   decodeStreamCancelPayload,
@@ -55,6 +56,12 @@ export interface RuntimeIpcClientOptions {
    * per sandbox, shared by every pooled connection.
    */
   descriptorToken: Uint8Array
+  /**
+   * Called with the concurrency allowance carried by every `Result`.
+   * `createSandbox` points it at the run pool; `0` means the runtime has no
+   * opinion yet.
+   */
+  onSlotAllowance?: (allowance: number) => void
 }
 
 export interface RawRunResult {
@@ -297,6 +304,10 @@ export class RuntimeIpcClient {
    * Session brand key for host-type descriptors written on this connection.
    */
   private readonly brandKey: string
+  /**
+   * Set by {@link connect} — see `RuntimeIpcClientOptions.onSlotAllowance`.
+   */
+  private onSlotAllowance: ((allowance: number) => void) | undefined
 
   private constructor(socket: Socket, brandKey: string) {
     this.socket = socket
@@ -359,6 +370,7 @@ export class RuntimeIpcClient {
   static async connect(options: RuntimeIpcClientOptions): Promise<RuntimeIpcClient> {
     const socket = await connectSocket(options.socketPath)
     const client = new RuntimeIpcClient(socket, brandKeyForToken(options.descriptorToken))
+    client.onSlotAllowance = options.onSlotAllowance
 
     try {
       await client.write(
@@ -1035,6 +1047,9 @@ export class RuntimeIpcClient {
    * @param payload
    */
   private routeResult(payload: Uint8Array): void {
+    // Every completion carries the runtime's current allowance; applying it
+    // here keeps the host at most one run behind, with no poll.
+    this.onSlotAllowance?.(peekRunCompletionSlotAllowance(payload))
     const runId = peekRunCompletionRunId(payload)
     const entry = runId === undefined ? undefined : this.runs.get(runId)
     if (runId === undefined || entry === undefined || entry.epilogue !== undefined) {

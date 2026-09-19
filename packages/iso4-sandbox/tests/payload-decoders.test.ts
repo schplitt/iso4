@@ -105,6 +105,10 @@ function bridgeRecords(records: readonly TestBridgeRecord[]): Buffer {
 
 interface SuccessSpec {
   ok: true
+  /**
+   * The runtime's concurrency allowance, carried by every completion.
+   */
+  slotAllowance?: number
   exports: unknown
   skippedExports?: readonly string[]
   stdout?: readonly string[]
@@ -118,6 +122,10 @@ interface SuccessSpec {
 
 interface FailureSpec {
   ok: false
+  /**
+   * See {@link SuccessSpec.slotAllowance}.
+   */
+  slotAllowance?: number
   code: string
   name: string
   message: string
@@ -150,6 +158,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
   if (spec.ok) {
     return Buffer.concat([
       u32(runId),
+      u32(spec.slotAllowance ?? 0), // slotAllowance
       Buffer.from([1, 1]), // ok = true, successPresent = 1
       valueSlot(spec.exports),
       strList(spec.skippedExports ?? []),
@@ -161,6 +170,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
 
   return Buffer.concat([
     u32(runId),
+    u32(spec.slotAllowance ?? 0), // slotAllowance
     Buffer.from([0, 0, 1]), // ok = false, successPresent = 0, failurePresent = 1
     str(spec.code),
     str(spec.name),
@@ -517,8 +527,13 @@ describe('decodeRunCompletionPayload — errors', () => {
     expect(() => decodeRunCompletionPayload(u32(1))).toThrow(PayloadDecodeError)
   })
 
+  test('truncated after the slot allowance', () => {
+    expect(() => decodeRunCompletionPayload(Buffer.concat([u32(1), u32(0)])))
+      .toThrow(PayloadDecodeError)
+  })
+
   test('invalid bool byte in the ok field', () => {
-    expect(() => decodeRunCompletionPayload(Buffer.concat([u32(0), Buffer.from([0x02])])))
+    expect(() => decodeRunCompletionPayload(Buffer.concat([u32(0), u32(0), Buffer.from([0x02])])))
       .toThrow(/invalid bool byte/)
   })
 

@@ -179,6 +179,55 @@ describe('SlotPool admission', () => {
     slots.release()
     await slots.acquire() // free slot: admitted without queueing
   })
+
+  test('growing the capacity admits queued callers at once', async () => {
+    const slots = new SlotPool(1, 10)
+    await slots.acquire()
+    let second = false
+    const queued = slots.acquire().then(() => {
+      second = true
+    })
+    await Promise.resolve()
+    expect(second).toBe(false)
+
+    slots.setCapacity(3)
+    await queued
+    expect(second).toBe(true)
+    expect(slots.limit).toBe(3)
+    // The third slot the new capacity opened is genuinely free.
+    await slots.acquire()
+  })
+
+  test('shrinking never interrupts a run: the count walks down as they finish', async () => {
+    const slots = new SlotPool(4, 10)
+    for (let i = 0; i < 4; i++)
+      await slots.acquire()
+
+    let admitted = false
+    const queued = slots.acquire().then(() => {
+      admitted = true
+    })
+    slots.setCapacity(2)
+
+    // Two completions only bring the four in flight down to the new number;
+    // neither may be handed to the caller waiting behind them.
+    slots.release()
+    slots.release()
+    await Promise.resolve()
+    expect(admitted).toBe(false)
+
+    // The third frees a slot under the new capacity.
+    slots.release()
+    await queued
+    expect(admitted).toBe(true)
+  })
+
+  test('a capacity below one is ignored rather than deadlocking the pool', async () => {
+    const slots = new SlotPool(2, 10)
+    slots.setCapacity(0)
+    expect(slots.limit).toBe(2)
+    await slots.acquire()
+  })
 })
 
 describe('ConnectionRegistry', () => {

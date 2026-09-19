@@ -31,8 +31,9 @@
 //! instance may be evicted at any moment (taint, scored eviction, dispose).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::policy;
 use crate::rss;
@@ -280,7 +281,7 @@ pub enum Acquired {
     /// this call only. Run it, then DROP the handle and `release_oneoff`.
     Cold(InstanceHandle),
     /// The memory admission refuses a new isolate, nothing idle exists and
-    /// nothing is joinable. Fail the run with `ERR_CAPACITY` carrying this
+    /// nothing is joinable. Fail the run with `ERR_CAPACITY_MEMORY` carrying this
     /// message; no registry state was taken.
     Refused(String),
     /// The instance thread could not be spawned (process resource
@@ -361,6 +362,35 @@ impl Ewma {
     }
 }
 
+/// The lowest sample seen, drifting up by [`DECAY_PER_SAMPLE`] when nothing
+/// lower arrives. An average would feed the slot formula its own
+/// back-pressure — both times inflate under load; the minimum is the
+/// uncontended reading, and the drift lets a genuinely slower workload
+/// re-baseline.
+#[derive(Default, Clone, Copy)]
+struct DecayingMin {
+    value: f64,
+    seeded: bool,
+}
+
+/// Per-sample upward drift of an unchallenged minimum (0.5%).
+const DECAY_PER_SAMPLE: f64 = 1.005;
+
+impl DecayingMin {
+    fn update(&mut self, sample: f64) {
+        if !self.seeded || sample <= self.value {
+            self.value = sample;
+            self.seeded = true;
+            return;
+        }
+        self.value = (self.value * DECAY_PER_SAMPLE).min(sample);
+    }
+
+    fn get(&self) -> Option<f64> {
+        self.seeded.then_some(self.value)
+    }
+}
+
 /// Per-prefix demand statistics feeding the join/spawn decision. Lives on
 /// the prefix entry — survives eviction, dies at dispose (#77 ruling).
 #[derive(Default)]
@@ -370,6 +400,13 @@ struct PrefixDemand {
     interval_ms: Ewma,
     /// Mean CPU per completed run (ms) — the spawn signal.
     cpu_ms: Ewma,
+    /// Uncontended wall and CPU per run (ms) — the slot formula's inputs.
+    /// Minima, not averages: see [`DecayingMin`].
+    wall_min: DecayingMin,
+    cpu_min: DecayingMin,
+    /// When a completed run last updated the minima — the staleness check
+    /// that keeps a silent prefix out of the aggregate.
+    last_sample: Option<Instant>,
     /// Mean measured heap at release — the admission input for further
     /// instances of a recurring prefix (seeded with the run cap until real
     /// samples exist, #77 expansion item 4).
@@ -391,6 +428,56 @@ impl PrefixDemand {
             _ => 0.0,
         }
     }
+
+    /// Note a completed run's shape (callers exclude tainted outcomes: a
+    /// terminated run's timings describe the termination).
+    fn note_completion(&mut self, wall_ms: f64, cpu_ms: f64, now: Instant) {
+        if wall_ms > 0.0 {
+            self.wall_min.update(wall_ms);
+        }
+        if cpu_ms > 0.0 {
+            self.cpu_min.update(cpu_ms);
+        }
+        self.last_sample = Some(now);
+    }
+
+    /// This prefix's contribution to the slot formula, or `None` when it has
+    /// no usable sample or has been silent for [`DEMAND_STALE_AFTER`].
+    fn slot_facts(&self, now: Instant) -> Option<policy::SlotFacts> {
+        let last = self.last_sample?;
+        if now.duration_since(last) > DEMAND_STALE_AFTER {
+            return None;
+        }
+        Some(policy::SlotFacts {
+            arrivals_per_sec: self.arrivals_per_sec(),
+            wall_ms: self.wall_min.get()?,
+            cpu_ms: self.cpu_min.get()?,
+        })
+    }
+}
+
+/// Silence after which a prefix stops counting towards the allowance — its
+/// arrival EWMA does not decay, so it would hold a share forever.
+const DEMAND_STALE_AFTER: Duration = Duration::from_secs(30);
+
+/// Completed runs between recomputations. A counter, not a timer: new
+/// information IS a completed run, so the allowance tracks fast under load
+/// and costs nothing idle.
+const RECOMPUTE_EVERY: u32 = 32;
+
+/// Runs the host may keep in flight — an allowance it holds, not tickets it
+/// spends, so a completing run frees its own share with no message. Every
+/// `Result` carries the current value.
+static SLOT_ALLOWANCE: AtomicU32 = AtomicU32::new(0);
+
+/// The allowance to stamp on the next `Result`; 0 = no opinion yet.
+pub fn slot_allowance() -> u32 {
+    SLOT_ALLOWANCE.load(Ordering::Relaxed)
+}
+
+/// Seed the cold-start allowance (the core count) before any run reports.
+pub fn seed_slot_allowance(cores: usize) {
+    SLOT_ALLOWANCE.store(u32::try_from(cores).unwrap_or(u32::MAX), Ordering::Relaxed);
 }
 
 /// One pooled instance as the registry tracks it. `in_flight == 0` = idle
@@ -439,9 +526,44 @@ struct RegistryInner {
     /// The last completed shed pass — the futility check compares the next
     /// usage sample against it. Cleared when the latch releases.
     last_pass: Option<policy::PassOutcome>,
+    /// One-off runs' demand: they have no prefix entry, and an all-one-off
+    /// deployment would otherwise never feed the slot formula.
+    oneoff_demand: PrefixDemand,
+    /// Completions since the allowance was last recomputed.
+    releases_since_recompute: u32,
+    /// Cores — the formula's input and the floor under it.
+    cores: usize,
 }
 
 impl RegistryInner {
+    /// Fold one completed run into the slot allowance, recomputing every
+    /// [`RECOMPUTE_EVERY`] completions.
+    fn note_slot_sample(&mut self, prefix_id: Option<&str>, wall_ms: f64, cpu_ms: f64) {
+        let now = Instant::now();
+        match prefix_id {
+            Some(id) => {
+                if let Some(entry) = self.prefixes.get_mut(id) {
+                    entry.demand.note_completion(wall_ms, cpu_ms, now);
+                }
+            }
+            None => self.oneoff_demand.note_completion(wall_ms, cpu_ms, now),
+        }
+        self.releases_since_recompute += 1;
+        if self.releases_since_recompute < RECOMPUTE_EVERY {
+            return;
+        }
+        self.releases_since_recompute = 0;
+        let facts: Vec<policy::SlotFacts> = self
+            .prefixes
+            .values()
+            .map(|e| &e.demand)
+            .chain(std::iter::once(&self.oneoff_demand))
+            .filter_map(|d| d.slot_facts(now))
+            .collect();
+        let slots = policy::target_slots(&facts, self.cores);
+        SLOT_ALLOWANCE.store(u32::try_from(slots).unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
+
     /// Fold one RSS sample through the watermark policy and perform the
     /// verdict: update the latch, shed the pass's worth of victims, record
     /// the pass for the futility check. Returns whether a NEW instance may
@@ -501,6 +623,9 @@ impl WarmRegistry {
                 next_instance_id: 1,
                 shedding: false,
                 last_pass: None,
+                oneoff_demand: PrefixDemand::default(),
+                releases_since_recompute: 0,
+                cores: cores(),
             }),
             warm_budget_bytes,
             hard_line_bytes,
@@ -539,7 +664,7 @@ impl WarmRegistry {
     /// May a NEW isolate be created for a run whose terminating cap is
     /// `run_cap_bytes`? The hard line is what the isolate may actually
     /// reach, so it is what the container reserves.
-    /// `Err` carries the refusal message for the run's `ERR_CAPACITY`.
+    /// `Err` carries the refusal message for the run's `ERR_CAPACITY_MEMORY`.
     fn admit(&self, usage: Option<u64>, run_cap_bytes: u64) -> Result<(), String> {
         // No reading = no lines (matches `pressure_pass`: unavailable
         // watermarks are not pressure).
@@ -737,7 +862,7 @@ impl WarmRegistry {
     /// memory back on its own (celld keeps stateless admission open under
     /// pressure for the same reason) — but the hard admission line does:
     /// a one-off is an isolate creation like any other. `Err` = refuse the
-    /// run with `ERR_CAPACITY`; no counters were taken.
+    /// run with `ERR_CAPACITY_MEMORY`; no counters were taken.
     pub fn reserve_oneoff(&self, run_cap_bytes: u64) -> Result<(), String> {
         // One-offs are never pooled, so only the hard line matters here.
         let usage = self.sample_usage();
@@ -754,11 +879,18 @@ impl WarmRegistry {
     /// thread disposes the isolate asynchronously — the ledger decrements
     /// slightly ahead of the actual memory release, which the next usage
     /// sample absorbs.
-    pub fn release_oneoff(&self) {
+    /// @param tainted the run was terminated — its timings describe the
+    /// termination, not the work, so they are kept out of the slot formula
+    /// @param wall_time_ms the run's counted wall time
+    /// @param cpu_time_ms the run's active execution time
+    pub fn release_oneoff(&self, tainted: bool, wall_time_ms: f64, cpu_time_ms: f64) {
         let usage = self.sample_usage();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner.total = inner.total.saturating_sub(1);
         inner.oneoff_running = inner.oneoff_running.saturating_sub(1);
+        if !tainted {
+            inner.note_slot_sample(None, wall_time_ms, cpu_time_ms);
+        }
         inner.pressure_pass(usage, self.warm_budget_bytes);
     }
 
@@ -776,12 +908,16 @@ impl WarmRegistry {
         instance_id: u64,
         outcome_tainted: bool,
         heap_used_bytes: u64,
+        wall_time_ms: f64,
         cpu_time_ms: f64,
         prefix_alive: bool,
     ) {
         let usage = self.sample_usage();
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let inner = &mut *guard;
+        if !outcome_tainted {
+            inner.note_slot_sample(Some(prefix_id), wall_time_ms, cpu_time_ms);
+        }
         if let Some(entry) = inner.prefixes.get_mut(prefix_id) {
             if !outcome_tainted {
                 entry.demand.cpu_ms.update(cpu_time_ms);
@@ -1087,7 +1223,7 @@ mod tests {
             Ok(o) => o.cpu_time_ms,
             Err(f) => f.cpu_time_ms,
         };
-        reg.release(prefix, a.id, out.tainted, out.heap_used_bytes, cpu, true);
+        reg.release(prefix, a.id, out.tainted, out.heap_used_bytes, 0.0, cpu, true);
     }
 
     #[test]
@@ -1113,7 +1249,7 @@ mod tests {
         let registry = WarmRegistry::new(0, 0);
         let a1 = att(acquire(&registry, "p0", TEST_CAP));
         let outcome = call_via(&a1, bump_job());
-        registry.release("p0", a1.id, true, outcome.heap_used_bytes, 0.0, true);
+        registry.release("p0", a1.id, true, outcome.heap_used_bytes, 0.0, 0.0, true);
 
         // Nothing idle — the next acquire spawns fresh, state reset.
         let a2 = att(acquire(&registry, "p0", TEST_CAP));
@@ -1129,7 +1265,7 @@ mod tests {
     fn one_finish_over_the_soft_line_keeps_the_instance() {
         let registry = WarmRegistry::new(0, 0);
         let a = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         assert_eq!(
             registry.stats().warm_idle,
             1,
@@ -1141,10 +1277,10 @@ mod tests {
     fn two_finishes_in_a_row_over_the_soft_line_retire_the_instance() {
         let registry = WarmRegistry::new(0, 0);
         let a1 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         let a2 = att(acquire(&registry, "p", TEST_CAP));
         assert_eq!(a2.id, a1.id, "still reusable after one strike");
-        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         let stats = registry.stats();
         assert_eq!(
             (stats.warm_idle, stats.warm_busy),
@@ -1157,11 +1293,11 @@ mod tests {
     fn a_finish_under_the_soft_line_clears_the_strike() {
         let registry = WarmRegistry::new(0, 0);
         let a1 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         let a2 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a2.id, false, TEST_MB, 0.0, true);
+        registry.release("p", a2.id, false, TEST_MB, 0.0, 0.0, true);
         let a3 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a3.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a3.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         assert_eq!(
             registry.stats().warm_idle,
             1,
@@ -1173,13 +1309,13 @@ mod tests {
     fn a_retiring_instance_keeps_serving_its_co_residents() {
         let registry = WarmRegistry::new(0, 0);
         let a1 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a1.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         // Two runs land on the instance; the first pushes it to two strikes
         // while the second is still in flight.
         let a2 = att(acquire(&registry, "p", TEST_CAP));
         let a3 = att(acquire(&registry, "p", TEST_CAP));
         assert_eq!(a3.id, a2.id, "both runs share the instance");
-        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         assert_eq!(
             registry.stats().warm_busy,
             1,
@@ -1187,8 +1323,8 @@ mod tests {
         );
         let a4 = att(acquire(&registry, "p", TEST_CAP));
         assert_ne!(a4.id, a3.id, "a retired instance takes no new joins");
-        registry.release("p", a3.id, false, TEST_MB, 0.0, true);
-        registry.release("p", a4.id, false, TEST_MB, 0.0, true);
+        registry.release("p", a3.id, false, TEST_MB, 0.0, 0.0, true);
+        registry.release("p", a4.id, false, TEST_MB, 0.0, 0.0, true);
         assert_eq!(
             registry.stats().warm_idle,
             1,
@@ -1205,7 +1341,7 @@ mod tests {
         };
         for _ in 0..4 {
             let a = att(acquire_caps(&registry, "p", manual));
-            registry.release("p", a.id, false, TEST_CAP * 4, 0.0, true);
+            registry.release("p", a.id, false, TEST_CAP * 4, 0.0, 0.0, true);
         }
         assert_eq!(
             registry.stats().warm_idle,
@@ -1220,9 +1356,9 @@ mod tests {
         let a1 = att(acquire(&registry, "p", TEST_CAP));
         // Tainted already retires; the point is that the heap figure taken
         // after a terminate must not seed a strike on the NEXT instance.
-        registry.release("p", a1.id, true, TEST_CAP * 4, 0.0, true);
+        registry.release("p", a1.id, true, TEST_CAP * 4, 0.0, 0.0, true);
         let a2 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, true);
+        registry.release("p", a2.id, false, TEST_CAP + TEST_MB, 0.0, 0.0, true);
         assert_eq!(registry.stats().warm_idle, 1, "fresh instance, one strike");
     }
 
@@ -1238,7 +1374,7 @@ mod tests {
             hard_bytes: TEST_CAP + 32 * TEST_MB,
         };
         let a1 = att(acquire_caps(&registry, "p", managed));
-        registry.release("p", a1.id, false, TEST_MB, 0.0, true);
+        registry.release("p", a1.id, false, TEST_MB, 0.0, 0.0, true);
         let a2 = att(acquire_caps(&registry, "p", manual));
         assert_ne!(
             a2.id, a1.id,
@@ -1257,7 +1393,7 @@ mod tests {
         let registry = WarmRegistry::new(0, 0);
         // Seed: one completed run with ~zero CPU — demand rate × 0 = 0.
         let a1 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a1.id, false, TEST_MB, 0.0, true);
+        registry.release("p", a1.id, false, TEST_MB, 0.0, 0.0, true);
 
         // The instance goes busy again, then a third run arrives while it
         // is held: no idle, demand says waiting → JOIN the same instance.
@@ -1269,8 +1405,8 @@ mod tests {
         let stats = registry.stats();
         assert_eq!(stats.warm_busy, 1, "one instance carries both runs");
         assert_eq!(stats.warm_runs, 2);
-        registry.release("p", a2.id, false, TEST_MB, 0.0, true);
-        registry.release("p", a3.id, false, TEST_MB, 0.0, true);
+        registry.release("p", a2.id, false, TEST_MB, 0.0, 0.0, true);
+        registry.release("p", a3.id, false, TEST_MB, 0.0, 0.0, true);
         assert_eq!(registry.stats().warm_idle, 1);
     }
 
@@ -1280,15 +1416,15 @@ mod tests {
         // Seed: a completed run that was pure CPU — any real arrival rate
         // makes the demand exceed one instance.
         let a1 = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", a1.id, false, TEST_MB, 1_000.0, true);
+        registry.release("p", a1.id, false, TEST_MB, 0.0, 1_000.0, true);
 
         let a2 = att(acquire(&registry, "p", TEST_CAP));
         assert_eq!(a2.id, a1.id, "idle reuse still wins");
         let a3 = att(acquire(&registry, "p", TEST_CAP));
         assert_ne!(a3.id, a2.id, "CPU demand must open a second isolate");
         assert_eq!(registry.stats().warm_busy, 2);
-        registry.release("p", a2.id, false, TEST_MB, 1_000.0, true);
-        registry.release("p", a3.id, false, TEST_MB, 1_000.0, true);
+        registry.release("p", a2.id, false, TEST_MB, 0.0, 1_000.0, true);
+        registry.release("p", a3.id, false, TEST_MB, 0.0, 1_000.0, true);
     }
 
     #[test]
@@ -1300,8 +1436,8 @@ mod tests {
         let a1 = att(acquire(&registry, "p", TEST_CAP));
         let a2 = att(acquire(&registry, "p", TEST_CAP));
         assert_ne!(a1.id, a2.id);
-        registry.release("p", a1.id, false, 0, 0.0, true);
-        registry.release("p", a2.id, false, 0, 0.0, true);
+        registry.release("p", a1.id, false, 0, 0.0, 0.0, true);
+        registry.release("p", a2.id, false, 0, 0.0, 0.0, true);
     }
 
     #[test]
@@ -1312,7 +1448,7 @@ mod tests {
         registry.set_usage_for_test(700 * TEST_MB);
         let cap = 64 * TEST_MB;
         let a1 = att(acquire(&registry, "p", cap));
-        registry.release("p", a1.id, false, cap, 1_000.0, true);
+        registry.release("p", a1.id, false, cap, 0.0, 1_000.0, true);
 
         let a2 = att(acquire(&registry, "p", cap));
         assert_eq!(a2.id, a1.id);
@@ -1320,8 +1456,8 @@ mod tests {
         registry.set_usage_for_test(850 * TEST_MB);
         let a3 = att(acquire(&registry, "p", cap));
         assert_eq!(a3.id, a2.id, "over the line the run joins, never fails");
-        registry.release("p", a2.id, false, cap, 1_000.0, true);
-        registry.release("p", a3.id, false, cap, 1_000.0, true);
+        registry.release("p", a2.id, false, cap, 0.0, 1_000.0, true);
+        registry.release("p", a3.id, false, cap, 0.0, 1_000.0, true);
     }
 
     #[test]
@@ -1333,8 +1469,8 @@ mod tests {
         let a1 = att(acquire(&registry, "p", 64 * TEST_MB));
         let a2 = att(acquire(&registry, "p", 128 * TEST_MB));
         assert_ne!(a1.id, a2.id);
-        registry.release("p", a1.id, false, 0, 0.0, true);
-        registry.release("p", a2.id, false, 0, 0.0, true);
+        registry.release("p", a1.id, false, 0, 0.0, 0.0, true);
+        registry.release("p", a2.id, false, 0, 0.0, 0.0, true);
     }
 
     // ── Admission line (#77 commit 2) ──────────────────────────────────────
@@ -1361,7 +1497,7 @@ mod tests {
             "message states the headroom: {msg}"
         );
         let small = att(acquire(&registry, "p", 64 * TEST_MB));
-        registry.release("p", small.id, false, 0, 0.0, true);
+        registry.release("p", small.id, false, 0, 0.0, 0.0, true);
 
         // Reuse is never admission-gated: the idle 64 MB instance serves
         // its next run even though a new isolate would be refused.
@@ -1373,7 +1509,7 @@ mod tests {
         assert_eq!(stats.oneoff_running, 0);
         assert_eq!(stats.warm_busy, 1);
         assert_eq!(stats.hard_line_bytes, 900 * TEST_MB);
-        registry.release("p", again.id, false, 0, 0.0, true);
+        registry.release("p", again.id, false, 0, 0.0, 0.0, true);
     }
 
     #[test]
@@ -1384,7 +1520,7 @@ mod tests {
         assert_eq!(registry.stats().oneoff_running, 0, "refusal takes no counters");
         registry.reserve_oneoff(64 * TEST_MB).expect("a smaller run fits");
         assert_eq!(registry.stats().oneoff_running, 1);
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
 
         // Usage past the line itself: the message says nothing fits instead
         // of naming a largest admissible cap.
@@ -1405,7 +1541,7 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB, 900 * TEST_MB);
         registry.set_usage_for_test(50 * TEST_MB);
         let a = att(acquire(&registry, "p", 0));
-        registry.release("p", a.id, false, 0, 0.0, true);
+        registry.release("p", a.id, false, 0, 0.0, 0.0, true);
 
         registry.set_usage_for_test(100 * TEST_MB);
         // "p"'s idle instance was shed by the pass above the mark; a fresh
@@ -1430,15 +1566,15 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB, 0);
         registry.set_usage_for_test(10 * TEST_MB);
         let a = att(acquire(&registry, "a", TEST_CAP));
-        registry.release("a", a.id, false, 0, 0.0, true);
+        registry.release("a", a.id, false, 0, 0.0, 0.0, true);
         let b = att(acquire(&registry, "b", TEST_CAP));
-        registry.release("b", b.id, false, 0, 0.0, true);
+        registry.release("b", b.id, false, 0, 0.0, 0.0, true);
 
         // Usage reaches the mark: the pass sheds one (2 idle / 10 → min 1),
         // and it must be "a" — released first, idle longest.
         registry.set_usage_for_test(100 * TEST_MB);
         registry.reserve_oneoff(TEST_CAP).unwrap();
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
         let stats = registry.stats();
         assert_eq!(stats.warm_idle, 1);
         assert_eq!(stats.per_prefix, vec![("b".to_string(), 1, 0)]);
@@ -1453,14 +1589,14 @@ mod tests {
         for prefix in ["a", "b", "c", "d"] {
             let a = att(acquire(&registry, prefix, TEST_CAP));
             ids.push((prefix, a.id));
-            registry.release(prefix, a.id, false, 0, 0.0, true);
+            registry.release(prefix, a.id, false, 0, 0.0, 0.0, true);
         }
         registry.reserve_oneoff(TEST_CAP).unwrap();
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
         for (prefix, id) in ids {
             let again = att(acquire(&registry, prefix, TEST_CAP));
             assert_eq!(again.id, id, "warmth survives untouched");
-            registry.release(prefix, id, false, 0, 0.0, true);
+            registry.release(prefix, id, false, 0, 0.0, 0.0, true);
         }
     }
 
@@ -1472,9 +1608,9 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB, 0);
         registry.set_usage_for_test(10 * TEST_MB);
         let small = att(acquire(&registry, "small", TEST_CAP));
-        registry.release("small", small.id, false, 1_000, 0.0, true);
+        registry.release("small", small.id, false, 1_000, 0.0, 0.0, true);
         let big = att(acquire(&registry, "big", TEST_CAP));
-        registry.release("big", big.id, false, 1024 * TEST_MB, 0.0, true);
+        registry.release("big", big.id, false, 1024 * TEST_MB, 0.0, 0.0, true);
 
         registry.set_usage_for_test(100 * TEST_MB);
         // Any registry event runs the pressure pass: idle 2 → shed 1.
@@ -1486,21 +1622,21 @@ mod tests {
 
         // Same usage on the next event: flat sample → futility stops the
         // walk, "small" survives.
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
         assert_eq!(registry.stats().warm_idle, 1);
 
         // The latch holds between the release line (80) and the mark, and
         // a moved sample re-arms the walk — it takes the last idle one.
         registry.set_usage_for_test(90 * TEST_MB);
         registry.reserve_oneoff(TEST_CAP).unwrap();
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
         let stats = registry.stats();
         assert!(stats.under_pressure);
         assert_eq!(stats.warm_idle, 0);
 
         registry.set_usage_for_test(80 * TEST_MB);
         registry.reserve_oneoff(TEST_CAP).unwrap();
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
         assert!(!registry.stats().under_pressure);
     }
 
@@ -1509,9 +1645,9 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB, 0);
         registry.set_usage_for_test(10 * TEST_MB);
         let p = att(acquire(&registry, "p", TEST_CAP));
-        registry.release("p", p.id, false, 1_000, 0.0, true);
+        registry.release("p", p.id, false, 1_000, 0.0, 0.0, true);
         let q = att(acquire(&registry, "q", TEST_CAP));
-        registry.release("q", q.id, false, 1024 * TEST_MB, 0.0, true);
+        registry.release("q", q.id, false, 1024 * TEST_MB, 0.0, 0.0, true);
 
         // At the mark: the pass takes "q" (highest score); reuse of "p"'s
         // existing warmth stays allowed — it adds no memory…
@@ -1528,8 +1664,8 @@ mod tests {
         assert_eq!(stats.oneoff_running, 1);
         assert_eq!(stats.warm_busy, 1);
         drop(handle);
-        registry.release_oneoff();
-        registry.release("p", p.id, false, TEST_MB, 0.0, true);
+        registry.release_oneoff(false, 0.0, 0.0);
+        registry.release("p", p.id, false, TEST_MB, 0.0, 0.0, true);
 
         // Latch released (at/below 80% of the mark): normal pooling.
         registry.set_usage_for_test(50 * TEST_MB);
@@ -1545,7 +1681,7 @@ mod tests {
         };
         assert_eq!(registry.stats().oneoff_running, 1);
         drop(handle);
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
         let stats = registry.stats();
         assert_eq!(stats.oneoff_running, 0);
         assert_eq!(stats.warm_busy, 0);
@@ -1562,7 +1698,7 @@ mod tests {
         let a1 = att(acquire(&registry, "a", TEST_CAP));
         let a2 = att(acquire(&registry, "a", TEST_CAP));
         assert_ne!(a1.id, a2.id);
-        registry.release("a", a2.id, false, 1_000, 0.0, true);
+        registry.release("a", a2.id, false, 1_000, 0.0, 0.0, true);
         registry.reserve_oneoff(TEST_CAP).unwrap();
 
         let stats = registry.stats();
@@ -1576,10 +1712,10 @@ mod tests {
 
         // Drain everything (tainted, so nothing is pooled): counts return
         // to zero and the per-prefix row disappears.
-        registry.release_oneoff();
-        registry.release("a", a1.id, true, 0, 0.0, true);
+        registry.release_oneoff(false, 0.0, 0.0);
+        registry.release("a", a1.id, true, 0, 0.0, 0.0, true);
         let a3 = att(acquire(&registry, "a", TEST_CAP));
-        registry.release("a", a3.id, true, 0, 0.0, true);
+        registry.release("a", a3.id, true, 0, 0.0, 0.0, true);
         let stats = registry.stats();
         assert_eq!(stats.oneoff_running, 0);
         assert_eq!(stats.warm_busy, 0);
@@ -1594,7 +1730,7 @@ mod tests {
         let registry = WarmRegistry::new(100 * TEST_MB, 0);
         registry.set_usage_for_test(10 * TEST_MB);
         let a = att(acquire(&registry, "a", TEST_CAP));
-        registry.release("a", a.id, false, 500, 0.0, true);
+        registry.release("a", a.id, false, 500, 0.0, 0.0, true);
 
         // Usage reaches the mark: the one-off's pressure pass evicts a's
         // idle instance — every count reflects that immediately.
@@ -1605,12 +1741,12 @@ mod tests {
         assert_eq!(stats.idle_heap_bytes, 0);
         assert_eq!(stats.oneoff_running, 1);
         assert!(stats.per_prefix.is_empty());
-        registry.release_oneoff();
+        registry.release_oneoff(false, 0.0, 0.0);
 
         // Pressure gone: pooling resumes and the counts follow.
         registry.set_usage_for_test(10 * TEST_MB);
         let b = att(acquire(&registry, "b", TEST_CAP));
-        registry.release("b", b.id, false, 300, 0.0, true);
+        registry.release("b", b.id, false, 300, 0.0, 0.0, true);
         let stats = registry.stats();
         assert_eq!(stats.warm_idle, 1);
         assert_eq!(stats.warm_busy, 0);
@@ -1678,11 +1814,11 @@ mod tests {
     fn dispose_prefix_drops_idle_instances() {
         let registry = WarmRegistry::new(0, 0);
         let a = att(acquire(&registry, "p0", TEST_CAP));
-        registry.release("p0", a.id, false, 0, 0.0, true);
+        registry.release("p0", a.id, false, 0, 0.0, 0.0, true);
         registry.dispose_prefix("p0");
         let fresh = att(acquire(&registry, "p0", TEST_CAP));
         assert_ne!(fresh.id, a.id, "disposed warmth must not serve");
-        registry.release("p0", fresh.id, false, 0, 0.0, true);
+        registry.release("p0", fresh.id, false, 0, 0.0, 0.0, true);
     }
 
     #[test]
@@ -1694,7 +1830,7 @@ mod tests {
         registry.dispose_prefix("p0");
         let stats = registry.stats();
         assert_eq!(stats.warm_busy, 1);
-        registry.release("p0", a.id, false, 0, 0.0, false);
+        registry.release("p0", a.id, false, 0, 0.0, 0.0, false);
         let stats = registry.stats();
         assert_eq!(stats.warm_busy, 0);
         assert!(stats.per_prefix.is_empty());
@@ -1997,7 +2133,7 @@ mod tests {
         let result = read_frame(&mut server);
         assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
         assert_eq!(u32::from_be_bytes(result.payload[0..4].try_into().unwrap()), 40);
-        assert_eq!(result.payload[4], 1, "the run succeeds");
+        assert_eq!(result.payload[8], 1, "the run succeeds");
 
         let c1 = read_frame(&mut server);
         assert_eq!(c1.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
@@ -2090,7 +2226,7 @@ mod tests {
         );
         let result = read_frame(&mut server);
         assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
-        assert_eq!(result.payload[4], 1, "the run itself succeeded");
+        assert_eq!(result.payload[8], 1, "the run itself succeeded");
 
         let end = read_frame(&mut server);
         assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);

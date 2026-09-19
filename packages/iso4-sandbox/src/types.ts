@@ -564,55 +564,41 @@ export type RebindHostModule<T> = T extends HostExportFunction
 
 export interface SandboxOptions {
   /**
-   * Maximum number of runs executing at once. Additional callers queue FIFO
-   * until a run finishes; a queued caller's `AbortSignal` is honoured while
-   * it waits, so `AbortSignal.timeout()` composes as a queue-wait bound —
-   * there is no separate timeout option.
+   * Pin how many runs execute at once, overriding the number the runtime
+   * derives for itself. Callers past it queue FIFO, honouring their
+   * `AbortSignal` while they wait (`AbortSignal.timeout()` composes as a
+   * queue-wait bound — there is no separate timeout option).
    *
-   * This is an admission number, not a socket count: connections to the
-   * runtime process open on demand as runs need them and are reused for the
-   * process lifetime (`SandboxStats.openConnections` reports the live
-   * count). Multiple MCP agents / concurrent callers run in parallel up to
-   * this limit.
+   * **Leave this unset unless you have measured this workload on this
+   * hardware.** By default the runtime sizes concurrency from the shape of
+   * the runs it is serving and follows that shape as it changes; a fixed
+   * number cannot. Set it when you need a hard ceiling — to leave cores to
+   * the host app, or because you know the workload better than a
+   * measurement of it would.
    *
-   * Overridable in both directions: lowering it leaves cores to the host
-   * app; raising it above the core count pays only for workloads that spend
-   * their time suspended on host calls rather than computing.
-   *
-   * This caps *concurrent runs* only. How many isolates stay resident
-   * (warm instances included) is the memory budget's job — see
-   * `memoryBudgetMb`. There is no instance-count cap of any kind, so
-   * idle warm instances may outnumber the running count here, or fall below
-   * it under memory pressure.
+   * An admission number, not a socket count and not an isolate count: the
+   * runs spread over a variable number of shared isolates, and co-resident
+   * runs share that isolate's `memoryMb` heap cap between them.
    *
    * Must be an integer ≥ 1 — anything else throws at `createSandbox()`
    * (`0` would queue every run forever).
-   *
-   * Defaults to `os.availableParallelism()`, bounded by memory: when that
-   * many worst-case heaps (`memoryMb` each) would not fit inside the
-   * memory budget, the default becomes `budget / memoryMb` instead (at
-   * least 1) — the cores default must not promise more concurrent heaps
-   * than the container can hold. With `memoryMb: 0` or `memoryBudgetMb: 0`
-   * there is nothing to bound with and the default stays the core count.
    */
   maxConcurrentRuns?: number
 
   /**
-   * How many callers may wait for a run slot before new ones are shed.
-   * Past the bound, a run fails immediately with `ERR_QUEUE_FULL` instead
-   * of joining the queue: every queued caller holds memory (its serialized
-   * arguments included), so an unbounded queue turns sustained overload
-   * into a host out-of-memory crash. A hammered sandbox should fail some
-   * requests cleanly and keep answering the rest.
+   * How many callers may wait for a run slot before new ones are shed with
+   * `ERR_QUEUE_FULL`. Every queued caller holds its serialized arguments,
+   * so an unbounded queue turns sustained overload into a host
+   * out-of-memory crash.
    *
-   * `0` is valid: no queue at all — every run past `maxConcurrentRuns`
-   * fails immediately. Must be an integer ≥ 0.
+   * A fixed bound, deliberately not a multiple of the concurrency: that
+   * number now moves with the workload, and a shed threshold moving with it
+   * would tighten exactly when load rises.
    *
-   * This bounds queue *depth*; the wait *time* of an individual queued
-   * caller is still bounded only by its own `AbortSignal`
-   * (`AbortSignal.timeout()` composes — there is no timeout knob).
-   *
-   * Defaults to `100 × maxConcurrentRuns`.
+   * `0` is valid: no queue at all. Must be an integer ≥ 0. Bounds queue
+   * depth* only — a queued caller's wait *time* is bounded by its own
+   * `AbortSignal`.
+   * @default 10_000
    */
   maxQueuedRuns?: number
 
@@ -668,7 +654,7 @@ export interface SandboxOptions {
    * never CREATES an isolate when measured usage plus the run's own
    * `memoryMb` would cross 90 % of the container limit (minus the
    * `hostReserveMb` reserve, 128 MB by default) — such a run fails with
-   * `ERR_CAPACITY` instead, so the
+   * `ERR_CAPACITY_MEMORY` instead, so the
    * newest admission can never be what tips the container into an OOM
    * kill. Runs with `memoryMb: 0` (uncapped) are refused already from the
    * budget mark — their worst case has no arithmetic.
@@ -736,6 +722,11 @@ export interface SandboxStats {
    */
   queueDepth: number
   /**
+   * Runs admitted concurrently right now. Follows the runtime's own figure
+   * as the workload changes, unless `maxConcurrentRuns` pinned it.
+   */
+  slotLimit: number
+  /**
    * Host-side count of runtime connections as the pool tracks them (the
    * dedicated `stats()` control connection not included). Runs are
    * multiplexed onto shared connections — several concurrent runs per
@@ -786,7 +777,7 @@ export interface SandboxStats {
   /**
    * The isolate admission line in bytes: 90 % of the container limit minus
    * the host reserve. A run needing a new isolate whose `memoryMb` would
-   * not fit under it fails with `ERR_CAPACITY`. 0 = no container limit
+   * not fit under it fails with `ERR_CAPACITY_MEMORY`. 0 = no container limit
    * readable, line disabled.
    */
   hardLineBytes: number
@@ -1666,9 +1657,10 @@ export type RunErrorCode
      * cross 90% of what the container can hold — or the run is uncapped
      * (`memoryMb: 0`) while memory is already at the budget. The message
      * carries the measured numbers. Nothing ran; retrying after memory
-     * frees is safe. (Queue overload is `ERR_QUEUE_FULL`, not this.)
+     * frees is safe. Concurrency overload is `ERR_QUEUE_FULL`, not this:
+     * the two capacity limits are separate, and only this one is memory.
      */
-    | 'ERR_CAPACITY'
+    | 'ERR_CAPACITY_MEMORY'
     /**
      * Shed at the host-side queue bound: `maxQueuedRuns` callers were
      * already waiting for a run slot. Never reached the runtime; telemetry

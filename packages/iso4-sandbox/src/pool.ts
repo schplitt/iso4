@@ -78,7 +78,7 @@ export type ConnectFn = () => Promise<RuntimeIpcClient>
  * never touches connections.
  */
 export class SlotPool {
-  private readonly capacity: number
+  private capacity: number
   private readonly maxQueued: number
   private active = 0
   private readonly waiters: SlotWaiter[] = []
@@ -87,6 +87,33 @@ export class SlotPool {
   constructor(capacity: number, maxQueued: number) {
     this.capacity = capacity
     this.maxQueued = maxQueued
+  }
+
+  /**
+   * Runs admitted concurrently right now — `stats()` reports this as
+   * `slotLimit`.
+   */
+  get limit(): number {
+    return this.capacity
+  }
+
+  /**
+   * Take the runtime's current allowance. Growing admits queued callers
+   * immediately; shrinking never interrupts a run — `active` walks down to
+   * the new figure as runs finish (see {@link release}).
+   * @param capacity the new admission number
+   */
+  setCapacity(capacity: number): void {
+    if (this.disposed || capacity === this.capacity || capacity < 1)
+      return
+    this.capacity = capacity
+    while (this.active < this.capacity) {
+      const next = this.waiters.shift()
+      if (next === undefined)
+        return
+      this.active++
+      next.resolve()
+    }
   }
 
   /**
@@ -173,12 +200,18 @@ export class SlotPool {
   /**
    * Free a slot. The longest-queued caller takes it directly; only when
    * nobody waits does the active count drop.
+   *
+   * Above capacity — the allowance shrank under runs already executing —
+   * the slot is never handed on: `active` has to walk down to the new
+   * figure, and passing it to a waiter would hold it there forever.
    */
   release(): void {
-    const next = this.waiters.shift()
-    if (next !== undefined) {
-      next.resolve()
-      return
+    if (this.active <= this.capacity) {
+      const next = this.waiters.shift()
+      if (next !== undefined) {
+        next.resolve()
+        return
+      }
     }
     this.active--
   }
@@ -391,8 +424,22 @@ export class RunPool {
     return this.slots.queueDepth
   }
 
+  get slotLimit(): number {
+    return this.slots.limit
+  }
+
   get openConnections(): number {
     return this.connections.openConnections
+  }
+
+  /**
+   * Adopt the runtime's concurrency allowance. Ignored by `createSandbox`
+   * when `maxConcurrentRuns` pinned the number.
+   * @param allowance runs the runtime grants; `0` = no opinion yet
+   */
+  setSlotLimit(allowance: number): void {
+    if (allowance > 0)
+      this.slots.setCapacity(allowance)
   }
 
   /**

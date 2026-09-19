@@ -1069,8 +1069,9 @@ strings.
 
 The `Runtime` admits runs through a **slot pool** and serves them over
 **shared, lazily opened connections** to the Rust process — two separate
-concerns. A slot is a pure admission ticket: `maxConcurrentRuns` of them
-exist, and callers beyond that queue FIFO. Connections multiplex runs by
+concerns. A slot is a pure admission ticket, and callers beyond the
+current number queue FIFO. How many exist is the runtime's decision, not a
+configured constant — see §6.4.1; `maxConcurrentRuns` pins it instead. Connections multiplex runs by
 run id: each carries several concurrent runs (an internal per-connection
 cap bounds how many, which also bounds the blast radius of a
 connection-level failure), one more is opened only when every open
@@ -1083,7 +1084,7 @@ threads each) for epilogue traffic.
 
 ```
 Runtime (TypeScript)
-  slot pool (admission, maxConcurrentRuns) ──▶ connection registry
+  slot pool (admission, the runtime's allowance) ──▶ connection registry
       connection ──UDS──▶  Rust process     (≤ cap runs multiplexed,
       connection ──UDS──▶  same process,     routed by run id)
       ...opened when all are at the cap; count ≈ foreground concurrency / cap
@@ -1107,14 +1108,69 @@ This means five agents calling `prefix.execute()` simultaneously each get
 their own run slot and run truly in parallel on separate isolate
 threads inside the Rust process — the fifth call does not wait on the first.
 
-`maxConcurrentRuns` in `SandboxOptions` controls admission (default
-`os.availableParallelism()`). Additional callers queue behind it
-(backpressure). The ceiling is the host's alone: the Rust process takes no
-concurrency flag and accepts every connection it is given, spawning one OS
-thread per active isolate. The runtime bounds *memory*, not connection
-count — see §13.2.1. Outside the pool the host keeps one dedicated control
-connection for `Stats`, so a snapshot answers while every run slot is busy;
-`stats()` reports the host-side connection count as `openConnections`.
+`maxConcurrentRuns` in `SandboxOptions` **pins** admission; left unset, the
+number follows the workload (§6.4.1). Additional callers queue behind it
+(backpressure). Enforcement is the host's alone: the Rust process decides
+the number but never rejects on it, and accepts every connection it is
+given, spawning one OS thread per active isolate. The runtime bounds
+*memory*, not connection count — see §13.2.1. Outside the pool the host
+keeps one dedicated control connection for `Stats`, so a snapshot answers
+while every run slot is busy; `stats()` reports the host-side connection
+count as `openConnections` and the live admission number as `slotLimit`.
+
+#### 6.4.1 The concurrency number is derived, not configured
+
+One number cannot suit every workload. A run that waits 200 ms on an
+upstream call and burns 0.05 ms of CPU wants thousands in flight; a run
+that holds a core for 3 ms wants a handful. Measured across 47 throughput
+curves, one slot per core delivers ~3 % of the throughput the same pod can
+reach, and a hand-set number is only right for the workload it was set for.
+
+So the runtime derives it from the work it is actually serving:
+
+```
+slots = 5 × cores × wall^0.7 ÷ cpu^1.2
+```
+
+`wall` and `cpu` are per-run milliseconds the runtime already measures.
+Longer runs need more slots; CPU-hungry runs need fewer. Nothing classifies
+the workload — a synchronous transform, a 1 ms database lookup and a 300 ms
+HTTP call all fall out of the same expression. The exponents are fitted,
+not derived: plain Little's law (`cores × wall ÷ cpu`) overshoots short
+runs badly enough to cost a sixth of the achievable throughput.
+
+**Inputs are uncontended minima, not averages.** Both times inflate under
+load, and the formula multiplies by one and divides by the other — fed
+loaded readings it would ask for more slots and inflate them further. Each
+prefix keeps a decaying minimum of each (`warm.rs`), which is that run's
+shape with nothing in the way. Prefixes fold into one shape by
+arrival-weighted mean, so the busiest decides most of the number; a mixed
+workload therefore lands between what its halves would each ask for, which
+is a known compromise (#142).
+
+**Recomputed every 32 completions, not on a timer.** New information *is* a
+completed run, so the number tracks fast under load and costs nothing idle,
+where a stale figure cannot hurt because nothing is arriving to spend it.
+
+**The runtime grants, the host enforces.** Every `Result` frame carries the
+current number, so the host is at most one run behind for four bytes on a
+frame it already reads — no poll, no second channel. It is an allowance the
+host holds, not tickets it spends: the host admits while its in-flight
+count is below the number, and a completing run frees its own share with no
+message. Enforcement stays host-side because that is the last point where
+saying "not yet" is free — nothing serialized, no connection held, and
+cancelling is dropping an entry from an array. (When several host threads
+share one child, the count has to become global and admission moves with
+it; that is the multi-thread host's problem, not this one's.)
+
+**Shrinking never interrupts a run.** Runs already executing finish; each
+completion walks the in-flight count down towards the new number instead of
+handing its slot to a waiter, and the queue resumes once it arrives.
+
+The queue bound is deliberately *not* a multiple of this number. A shed
+threshold that moved with it would tighten exactly when load rises, so
+`maxQueuedRuns` defaults to a flat 10 000 — a memory bound, above the ~8 k
+concurrent runs one host process was measured to sustain.
 
 `BridgeCall` / `BridgeResponse` pairs are sequential **within a single
 run** in v1: Rust sends one `BridgeCall`, waits for `BridgeResponse`,
@@ -2088,7 +2144,7 @@ prefix-aware acquire policy uses):
   rule — a NEW isolate is never created when measured usage plus the run's
   own hard line (band included) would cross it, so the
   newest admission always leaves at least one worst-case isolate of
-  headroom below the OOM kill. Refused runs fail with `ERR_CAPACITY`,
+  headroom below the OOM kill. Refused runs fail with `ERR_CAPACITY_MEMORY`,
   deliberately unqueued: a queue is more memory exactly when there is
   none. Uncapped runs (`memoryMb: 0`) are refused already from the budget
   mark — their worst case has no arithmetic. Reuse of an existing warm
@@ -2256,7 +2312,7 @@ Gradual, and it waits for reality to catch up.
 
 **Why there are two marks and not one.** The budget mark gives up something
 cheap — idle warmth, whose only cost is a cold start next time. The admission
-line gives up something expensive — the run itself, with `ERR_CAPACITY`.
+line gives up something expensive — the run itself, with `ERR_CAPACITY_MEMORY`.
 Shrink before you refuse. Collapsing them would make a failed run, rather
 than a slower one, the first symptom of memory pressure.
 
@@ -2298,7 +2354,7 @@ routes to another machine, which is not an option for a single container.
 ### 13.4.2 Capacity refusals are honest (#179, won't-fix)
 
 A run needing a new isolate whose ceiling crosses the admission line fails
-with `ERR_CAPACITY`. #179 asked the refusal path to shed idle warmth first so
+with `ERR_CAPACITY_MEMORY`. #179 asked the refusal path to shed idle warmth first so
 the run gets in, and that shipped briefly before being removed.
 
 It cannot work as it reads. The eviction's freed bytes do not appear in the

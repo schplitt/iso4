@@ -250,6 +250,7 @@ pub enum RunCompletion {
 /// Wire layout:
 /// ```text
 /// u32   runId
+/// u32   slotAllowance  (runs the host may keep in flight; 0 = no opinion)
 /// u8    ok  (1 = success, 0 = failure)
 /// u8    successPresent  (1 when ok = 1)
 ///   ValueBlob  exports
@@ -276,6 +277,10 @@ pub enum RunCompletion {
 pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> Vec<u8> {
     let mut out = Vec::new();
     encode_u32(run_id, &mut out);
+    // The runtime's current concurrency allowance, on every completion:
+    // four bytes on a frame the host already reads, instead of a poll or a
+    // second channel. Zero = no opinion yet (before the cold-start seed).
+    encode_u32(crate::warm::slot_allowance(), &mut out);
 
     match completion {
         RunCompletion::Success(s) => {
@@ -634,7 +639,7 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
                 crate::v8::WARMUP_CPU_MS,
             ),
         ),
-        RunError::Capacity(msg) => plain("ERR_CAPACITY", "Error", msg.clone()),
+        RunError::Capacity(msg) => plain("ERR_CAPACITY_MEMORY", "Error", msg.clone()),
         RunError::Internal(msg) => plain("ERR_INTERNAL", "Error", msg.clone()),
     }
 }
