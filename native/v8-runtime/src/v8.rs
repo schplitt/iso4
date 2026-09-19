@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::blob;
 use crate::ipc;
@@ -266,65 +266,84 @@ unsafe extern "C" fn deny_wasm_codegen(
     false
 }
 
-/// Tracks how much active V8 execution time has elapsed.
+/// Tracks how much CPU the guest's own thread has burned.
 ///
 /// `enter()` / `leave()` bracket each period when V8 is actually running JS
 /// — one epoch per turn in the instance loop, entered when a turn starts
 /// executing and left at turn exit, so time parked between turns (bridge
-/// waits, queueing) is never billed. Compile/instantiate time is excluded
+/// waits, queueing) is never counted. Compile/instantiate time is excluded
 /// by entering only right before `module.evaluate()` in the start turn.
+///
+/// The epoch reads the executing thread's CPU clock, not the wall clock
+/// (#196): an instance owns its thread, so wall would charge a run for time
+/// it sat descheduled behind co-resident runs. V8's background threads (GC,
+/// compilation) are outside any one thread's clock, so not attributed.
 pub struct CpuBudget {
     accumulated_ns: AtomicU64,
-    epoch_start: Mutex<Option<Instant>>,
+    epoch: Mutex<Option<CpuEpoch>>,
+}
+
+/// An open epoch: the executing thread's clock, for the watchdog to read
+/// remotely, and that thread's reading when the epoch opened. The owning
+/// thread closes the epoch with its own cheaper read of the same counter.
+struct CpuEpoch {
+    clock: crate::cpuclock::ThreadClock,
+    start_ns: u64,
 }
 
 impl CpuBudget {
     pub fn new() -> Self {
         Self {
             accumulated_ns: AtomicU64::new(0),
-            epoch_start: Mutex::new(None),
+            epoch: Mutex::new(None),
         }
     }
 
-    /// Mark the start of a V8 execution epoch.
+    /// Mark the start of a V8 execution epoch on the calling thread.
     pub fn enter(&self) {
-        *self.epoch_start.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now());
+        let epoch = CpuEpoch {
+            clock: crate::cpuclock::ThreadClock::current(),
+            start_ns: crate::cpuclock::self_ns(),
+        };
+        *self.epoch.lock().unwrap_or_else(|p| p.into_inner()) = Some(epoch);
     }
 
-    /// End the current epoch and accumulate its duration.
+    /// End the current epoch and accumulate the CPU it burned. Runs on the
+    /// executing thread, so it reads its own clock directly.
     pub fn leave(&self) {
-        let mut g = self.epoch_start.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(t) = g.take() {
+        let now_ns = crate::cpuclock::self_ns();
+        let mut g = self.epoch.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = g.take() {
             self.accumulated_ns
-                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                .fetch_add(now_ns.saturating_sub(e.start_ns), Ordering::Relaxed);
         }
+    }
+
+    /// Total CPU burned so far, including any epoch still open. Reading an
+    /// open epoch takes the executing thread's clock remotely.
+    fn elapsed_ns(&self) -> u64 {
+        let base = self.accumulated_ns.load(Ordering::Relaxed);
+        let active = self
+            .epoch
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|e| e.clock.read_ns().saturating_sub(e.start_ns))
+            .unwrap_or(0);
+        base + active
     }
 
     /// Total accumulated CPU time in milliseconds.
     pub fn elapsed_ms(&self) -> u64 {
-        let base = self.accumulated_ns.load(Ordering::Relaxed);
-        let active = self
-            .epoch_start
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .map(|t| t.elapsed().as_nanos() as u64)
-            .unwrap_or(0);
-        (base + active) / 1_000_000
+        self.elapsed_ns() / 1_000_000
     }
 
     /// Total accumulated CPU time in milliseconds with microsecond
-    /// resolution. The integer `elapsed_ms` is enough for the 10ms-poll CPU
-    /// guard; the run result reports this precise value so sub-millisecond
-    /// runs don't read as `0`.
+    /// resolution. The integer `elapsed_ms` is enough for the CPU guard; the
+    /// run result reports this precise value so sub-millisecond runs don't
+    /// read as `0`.
     pub fn elapsed_ms_precise(&self) -> f64 {
-        let base = self.accumulated_ns.load(Ordering::Relaxed);
-        let active = self
-            .epoch_start
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .map(|t| t.elapsed().as_nanos() as u64)
-            .unwrap_or(0);
-        ((base + active) as f64 / 1_000.0).round() / 1_000.0
+        (self.elapsed_ns() as f64 / 1_000.0).round() / 1_000.0
     }
 }
 
@@ -6824,7 +6843,10 @@ impl InstanceGuard {
     /// registers nothing — it is still armed so `abort_executing` can match
     /// the turn.
     fn set_for(&self, t: GuardTarget, token: u64) {
-        let next_check = next_check_for(&t, std::time::Instant::now());
+        // The turn's epoch has not opened yet, so this reads the banked total
+        // without touching a thread clock.
+        let cpu_ms = (t.cpu_cap_ms > 0).then(|| t.budget.elapsed_ms());
+        let next_check = next_check_for(&t, std::time::Instant::now(), cpu_ms);
         let generation;
         {
             let mut guard = self.shared.target.lock().unwrap_or_else(|p| p.into_inner());
@@ -6989,7 +7011,10 @@ fn check_deadline(entry: &WatchEntry) -> Option<std::time::Instant> {
     }
     let t = guard.as_ref()?;
     let now = std::time::Instant::now();
-    if t.cpu_cap_ms > 0 && t.budget.elapsed_ms() >= t.cpu_cap_ms as u64 {
+    // One budget read per pop: it takes the executing thread's CPU clock,
+    // under the lock that thread needs at every turn boundary.
+    let cpu_ms = (t.cpu_cap_ms > 0).then(|| t.budget.elapsed_ms());
+    if cpu_ms.is_some_and(|ms| ms >= t.cpu_cap_ms as u64) {
         s.reason.set(TerminationReason::Cpu); // first writer wins
         s.handle.terminate_execution();
         Some(now + Duration::from_millis(10))
@@ -6998,19 +7023,29 @@ fn check_deadline(entry: &WatchEntry) -> Option<std::time::Instant> {
         s.handle.terminate_execution();
         Some(now + Duration::from_millis(10))
     } else {
-        next_check_for(t, now)
+        next_check_for(t, now, cpu_ms)
     }
 }
 
 /// The next moment worth re-reading `t`'s budgets: the earlier of the
-/// estimated CPU expiry (a [`CpuBudget`] advances at wall rate while its
-/// epoch is open, so cap-minus-elapsed from now is the earliest it can
-/// expire) and the wall deadline. `None` when the target caps nothing.
-/// Floored at 1 ms so a paused budget cannot spin the watchdog.
-fn next_check_for(t: &GuardTarget, now: std::time::Instant) -> Option<std::time::Instant> {
+/// estimated CPU expiry and the wall deadline. `None` when the target caps
+/// nothing. Floored at 1 ms so a paused budget cannot spin the watchdog.
+///
+/// CPU advances at most at wall rate, so cap-minus-elapsed is a lower bound
+/// on expiry, never late. It is optimistic for a starved turn, which re-arms
+/// instead of firing; the estimate halves each round, so the extra checks are
+/// logarithmic in the cap.
+///
+/// `cpu_elapsed_ms` is the caller's already-taken reading, `None` when
+/// uncapped — the read takes a thread clock and is not worth repeating.
+fn next_check_for(
+    t: &GuardTarget,
+    now: std::time::Instant,
+    cpu_elapsed_ms: Option<u64>,
+) -> Option<std::time::Instant> {
     let floor = now + Duration::from_millis(1);
-    let cpu = (t.cpu_cap_ms > 0).then(|| {
-        let remaining = (t.cpu_cap_ms as u64).saturating_sub(t.budget.elapsed_ms());
+    let cpu = cpu_elapsed_ms.map(|elapsed| {
+        let remaining = (t.cpu_cap_ms as u64).saturating_sub(elapsed);
         (now + Duration::from_millis(remaining)).max(floor)
     });
     let wall = t.wall_deadline.map(|d| d.max(floor));
@@ -11960,6 +11995,88 @@ mod tests {
             out.is_ok(),
             "expected Ok (bridge wait excluded from cpu), got: {:?}",
             out.map_err(|f| f.error)
+        );
+    }
+
+    #[test]
+    fn cpu_budget_does_not_count_a_descheduled_thread() {
+        // #196: an epoch spanning time the thread is NOT on a core accrues
+        // nothing. Sleeping is the deterministic stand-in for starvation.
+        let budget = CpuBudget::new();
+        budget.enter();
+        std::thread::sleep(Duration::from_millis(200));
+        budget.leave();
+        assert!(
+            budget.elapsed_ms() < 20,
+            "parked 200 ms charged {} ms of CPU",
+            budget.elapsed_ms()
+        );
+    }
+
+    #[test]
+    fn cpu_budget_counts_what_the_thread_actually_burned() {
+        // The other half: work inside the epoch IS counted, and the reported
+        // figure tracks the thread's own clock rather than drifting off it.
+        let clock = crate::cpuclock::ThreadClock::current();
+        let budget = CpuBudget::new();
+        let before = clock.read_ns();
+        budget.enter();
+        let spin = std::time::Instant::now();
+        let mut x = 0u64;
+        while spin.elapsed() < Duration::from_millis(50) {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        }
+        std::hint::black_box(x);
+        budget.leave();
+        let truth = (clock.read_ns() - before) as f64 / 1e6;
+        let reported = budget.elapsed_ms_precise();
+        assert!(
+            (reported - truth).abs() < 2.0,
+            "reported {reported} ms against {truth} ms on the thread's own clock"
+        );
+    }
+
+    #[test]
+    fn reported_cpu_stays_below_wall_when_cores_are_contended() {
+        // #196, the property the number is read for: what a run is charged
+        // describes its own work, not who it shared cores with. Oversubscribe
+        // and wall stretches while CPU does not — before the fix both were
+        // the same measurement and this ratio was ~1.0.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let load: Vec<_> = (0..cores * 2)
+            .map(|_| {
+                let s = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !s.load(Ordering::Relaxed) {
+                        x = x.wrapping_mul(2862933555777941757).wrapping_add(3);
+                    }
+                    x
+                })
+            })
+            .collect();
+
+        let out = run_code(
+            "let x = 0; for (let i = 0; i < 20_000_000; i++) x = (x + i) & 1048575; export default x",
+            "<test>",
+            Limits::default(),
+        );
+        stop.store(true, Ordering::Relaxed);
+        for t in load {
+            t.join().unwrap();
+        }
+
+        let out = out.expect("the spin must finish: starvation costs wall, not CPU");
+        // 3x oversubscription should put this near 0.33; 0.8 leaves room for
+        // a CI box that schedules generously without admitting the old bug.
+        assert!(
+            out.cpu_time_ms < out.wall_time_ms * 0.8,
+            "cpu {} ms vs wall {} ms — cpu is tracking wall, not the core",
+            out.cpu_time_ms,
+            out.wall_time_ms
         );
     }
 

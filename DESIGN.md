@@ -276,7 +276,7 @@ Every call to `runtime.run(opts)`:
 ```ts
 {
   memoryMb: 64,                   // V8 heap + ArrayBuffer budget combined
-  cpuTimeMs: 100,                 // Active execution only (await-free time)
+  cpuTimeMs: 100,                 // CPU actually burned (no awaits, no contention)
   wallTimeMs: 30_000,             // Caps own logic time: execution + async waits (to arrival)
   maxExportBytes: 16 * 1024 * 1024,
   maxStdoutBytes: 1 * 1024 * 1024,
@@ -330,13 +330,25 @@ line — the banded ceiling for a prefix instance, the bare cap for a one-off.
 wider of the two. Nothing else changes — the watermarks read measured container
 memory, never a configured cap.
 
-**CPU time** is wall-clock measured but bracketed: a timer starts every time
-V8 enters JS execution (`script.run`, `module.evaluate`, microtask
-checkpoint, callback dispatch) and pauses every time control returns to the
-Rust event loop waiting for a host response. So `await fetch(...)` does not
-count against the budget; tight loops do. The cap is enforced by a thread
-that calls `isolate.terminate_execution()` when the bracketed time exceeds
-`cpuTimeMs`.
+**CPU time** is the executing thread's CPU clock, bracketed: the bracket
+opens every time V8 enters JS execution (`script.run`, `module.evaluate`,
+microtask checkpoint, callback dispatch) and closes every time control
+returns to the Rust event loop waiting for a host response. So
+`await fetch(...)` does not count against the budget; tight loops do. The cap
+is enforced by a thread that calls `isolate.terminate_execution()` when the
+bracketed CPU exceeds `cpuTimeMs`.
+
+A thread clock rather than wall (#196) because every instance runs on its own
+thread: N concurrent runs are N threads sharing the container's cores, and a
+wall bracket charges a run for the time it sat descheduled waiting for one.
+Measured on a 2-core pod, one compute run read 2.1 ms at 6 slots and 86.1 ms
+at 256 — the same guest code, the same ~5 ms of real work. So the same run
+now reports the same figure whatever else is co-resident, and a starved run
+gets its whole allowance and simply takes longer in wall terms, with
+`wallTimeMs` still bounding it. What a thread clock cannot see is V8's own
+background threads (GC, compilation); that work is real but unattributable —
+V8 does not say which pool thread served which isolate — so the reported
+figure runs modestly under true cost rather than wildly over it.
 
 **Wall time** (`wallTimeMs`) caps the run's OWN logic time: execution plus
 async waits, each wait counted until its answer arrives at the runtime. It
@@ -357,8 +369,10 @@ not counted │ turn │ bridge│ runs'  │ turn │ timer │ turn │  Resul
             ├──────┤                ├──────┤       ├──────┤ cpuTimeMs
 ```
 
-- `cpuTimeMs` — own V8 execution only; the bracket pauses at every await.
-  Bridge round-trips are itemized separately in `bridgeCalls[]`.
+- `cpuTimeMs` — CPU burned on the run's own thread; the bracket pauses at
+  every await, and time descheduled under contention never enters it, so the
+  figure does not move with how many runs share the host. Bridge round-trips
+  are itemized separately in `bridgeCalls[]`.
 - `wallTimeMs` — the run's own logic time: execution plus genuine async
   waits, each wait counted until its answer arrives — a busy loop
   delivering it late adds nothing. A wait counts in full even when the
@@ -771,7 +785,7 @@ export const fetchedAt = Date.now()
   stderr: "",
   durationMs: 142,      // complete wall-clock, measured in the runtime
   wallTimeMs: 97.2,     // own logic time: execution + async waits (to arrival)
-  cpuTimeMs: 12.4,      // active V8 execution; bridge waits excluded
+  cpuTimeMs: 12.4,      // CPU burned on the run's thread; bridge waits excluded
   bridgeCalls: [        // recorded in the runtime; metadata only, never payloads
     { name: "fetch", startMs: 0.4, durationMs: 2.3, argBytes: 180, responseBytes: 41208, ok: true, blocked: false },
   ],

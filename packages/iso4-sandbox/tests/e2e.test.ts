@@ -3245,15 +3245,15 @@ describe('native timers', () => {
   })
 
   test('CPU burned before arming a timer eats into its delay', async () => {
-    // The burn takes well over the 200 ms delay on any machine, so the
-    // timer is already due when the run suspends: total duration must be
-    // ~the CPU time, NOT cpu + 200. (A real-anchored implementation would
-    // add the full 200 and fail the tail assertion.)
+    // The burn takes well over the 1 s delay on any machine, so the timer
+    // is already due when the run suspends: total duration must be ~the CPU
+    // time, NOT cpu + 1000. (A real-anchored implementation would add the
+    // full second and fail the tail assertion.)
     const result = await runtime.run({
       code: `
         let x = 0
-        for (let i = 0; i < 2e8; i++) x = (x + i) % 97
-        await new Promise(r => setTimeout(r, 200))
+        for (let i = 0; i < 5e8; i++) x = (x + i) % 97
+        await new Promise(r => setTimeout(r, 1000))
         export default x
       `,
       limits: { cpuTimeMs: 15_000, wallTimeMs: 20_000 },
@@ -3262,17 +3262,18 @@ describe('native timers', () => {
     if (!result.ok)
       return
     // Vacuity guard: the burn really exceeded the delay.
-    expect(result.cpuTimeMs).toBeGreaterThan(200)
-    // The sleep added (nearly) nothing on top of the CPU time.
-    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(150)
+    expect(result.cpuTimeMs).toBeGreaterThan(1000)
+    // The sleep added (nearly) nothing on top of the CPU time. The bound is
+    // wide because cpuTimeMs is a CPU clock: descheduled time lands here.
+    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(500)
   }, 25_000)
 
   test('the rule is identical when the timer is armed before the burn', async () => {
     const result = await runtime.run({
       code: `
-        const armed = new Promise(r => setTimeout(r, 200))
+        const armed = new Promise(r => setTimeout(r, 1000))
         let x = 0
-        for (let i = 0; i < 2e8; i++) x = (x + i) % 97
+        for (let i = 0; i < 5e8; i++) x = (x + i) % 97
         await armed
         export default x
       `,
@@ -3281,8 +3282,8 @@ describe('native timers', () => {
     expect(result.ok, result.ok ? undefined : JSON.stringify(result.error)).toBe(true)
     if (!result.ok)
       return
-    expect(result.cpuTimeMs).toBeGreaterThan(200)
-    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(150)
+    expect(result.cpuTimeMs).toBeGreaterThan(1000)
+    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(500)
   }, 25_000)
 
   test('CPU burned inside a timer callback bills the run\'s budget', async () => {
