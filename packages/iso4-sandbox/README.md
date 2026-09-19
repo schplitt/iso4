@@ -282,7 +282,7 @@ lever available:
 ```ts
 export default {
   transform(events) {
-    return events.map(event => ({ id: event.eventId, bucket: event.type }))
+    return events.map((event) => ({ id: event.eventId, bucket: event.type }))
   },
 }
 ```
@@ -300,7 +300,7 @@ Measured on a warm prefix over an 8-slot pool with ~750 B analytics events
 is already there at 8.
 
 Two things bound it. One call runs on one slot, so a single batch of 128
-comes out *slower* than four batches of 32 running in parallel — size
+comes out _slower_ than four batches of 32 running in parallel — size
 batches so several are in flight across the pool. And a batch shares one
 run's limits: `cpuTimeMs`, `wallTimeMs` and `memoryMb` cover the whole
 array, so an oversized batch turns a per-event cost into a per-run timeout.
