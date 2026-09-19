@@ -19,7 +19,7 @@
 //! Capacity model (v4, #77 — full rationale: DESIGN.md §13.2.1): metered
 //! against GLOBAL container memory (`container.rs`; child RSS where no
 //! cgroup exists). Two lines: the warm budget latches shedding (evict idle
-//! by `heapUsed × idleTime`, stop pooling new; release at 4/5), and the
+//! by `heapUsed × idleTime^1.2`, stop pooling new; release at 4/5), and the
 //! hard admission line (90% of limit − reserve) refuses CREATING an
 //! isolate that could tip the container — refused runs fail, never queue;
 //! uncapped runs are refused from the budget mark. Reuse is never gated.
@@ -59,8 +59,8 @@ pub struct InstanceHandle {
     /// heap factor of the eviction score. 0 until a call finishes, so an
     /// instance that never served scores nothing despite its ~1.7 MB.
     pub heap_used_bytes: u64,
-    /// The owner loop's thread-load signal — join routing's saturation
-    /// input.
+    /// The owner loop's shared signals — join routing's saturation input
+    /// and the settled idle heap.
     load: Arc<sandbox::InstanceLoad>,
 }
 
@@ -108,6 +108,18 @@ impl InstanceHandle {
     /// instance.
     pub fn sender(&self) -> sandbox::RunEventSender {
         self.msgs.clone()
+    }
+
+    /// What this instance still holds while idle, for `stats()` only: the
+    /// settle GC's reading once it has run, else the last call's. Eviction
+    /// deliberately does NOT read this — it must compare all candidates on
+    /// the same basis, and only instances past the settle threshold have a
+    /// collected one.
+    fn idle_heap_bytes(&self) -> u64 {
+        match self.load.settled_heap_bytes() {
+            0 => self.heap_used_bytes,
+            settled => settled,
+        }
     }
 }
 
@@ -238,8 +250,24 @@ fn instance_main(
         &load,
     );
     // The loop ended — the registry evicted this instance (taint, eviction,
-    // dispose) or the process is shutting down. `core` drops here, on the
-    // thread that created the isolate, as rusty_v8 requires.
+    // dispose) or the process is shutting down. The isolate drops here, on
+    // the thread that created it, as rusty_v8 requires.
+    drop(core);
+    // Disposal is where the memory actually comes back; glibc holds the
+    // freed arenas until asked.
+    trim_malloc_arenas();
+}
+
+/// Return free malloc arenas to the OS so the container meter — the signal
+/// every watermark acts on — sees the disposal.
+fn trim_malloc_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: no arguments to get wrong, and glibc takes the arena locks
+    // itself. Its one precondition is the call site: never from a signal
+    // handler or a malloc hook. This is an ordinary thread about to exit.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// What `acquire` hands the session thread.
@@ -784,6 +812,9 @@ impl WarmRegistry {
                 } else if inst.in_flight == 0 {
                     inst.handle.last_used = Instant::now();
                     inst.handle.heap_used_bytes = heap_used_bytes;
+                    // This call outlived the last settle; the owner thread
+                    // takes a fresh one when the idle stretch is long enough.
+                    inst.handle.load.clear_settled_heap();
                     inner.idle_total += 1;
                 }
             }
@@ -847,7 +878,7 @@ impl WarmRegistry {
                     .instances
                     .iter()
                     .filter(|i| i.in_flight == 0 && !i.dead)
-                    .map(|i| i.handle.heap_used_bytes)
+                    .map(|i| i.handle.idle_heap_bytes())
                     .sum::<u64>();
                 (id.clone(), idle, busy)
             })
@@ -900,7 +931,7 @@ fn attachment(inst: &Instance) -> AttachedInstance {
 }
 
 /// Drop the highest-scored idle instance across ALL prefixes:
-/// `heapUsed × idleTime`, ties to the longest-idle — `policy::pick_victim`
+/// `heapUsed × idleTime^1.2`, ties to the longest-idle — `policy::pick_victim`
 /// decides, this function only gathers facts and performs. Returns false
 /// when nothing is idle. The single victim-picking path: every eviction
 /// (shed passes today, anything later) comes through here, so policies
@@ -1583,6 +1614,62 @@ mod tests {
         assert_eq!(stats.warm_idle, 1);
         assert_eq!(stats.warm_busy, 0);
         assert_eq!(stats.idle_heap_bytes, 300);
+    }
+
+    #[test]
+    fn an_idle_instance_settles_its_heap() {
+        sandbox::init_platform();
+        // `kept` is warmth, `junk` is garbage: the settle must take one and
+        // leave the other.
+        let garbage = Arc::new(PrefixData {
+            code: "const kept = []\n\
+                   export function churn() {\n\
+                     kept.push(new Array(1000).fill(kept.length))\n\
+                     const junk = []\n\
+                     for (let i = 0; i < 400; i++) junk.push(new Array(10000).fill(i))\n\
+                     return kept.length\n\
+                   }"
+            .to_string(),
+            filename: None,
+            globals: Vec::new(),
+            declared_globals: Vec::new(),
+            declared_imports: Vec::new(),
+        });
+        let churn_job = || {
+            let mut job = bump_job();
+            job.call.as_mut().expect("call spec").export_path = "churn".to_string();
+            job
+        };
+        let registry = WarmRegistry::new(0, 0);
+        let a = att(registry.acquire("p0", caps(TEST_CAP), &|| {
+            spawn_instance(Arc::clone(&garbage), 0, test_brand_key())
+        }));
+        let outcome = call_via(&a, churn_job());
+        assert!(!outcome.tainted);
+        assert_eq!(bump_value(&outcome), 1.0);
+        let at_release = outcome.heap_used_bytes;
+        release_outcome(&registry, "p0", &a, &outcome);
+        assert_eq!(
+            registry.stats().idle_heap_bytes,
+            at_release,
+            "before the settle the registry reads the release-time heap"
+        );
+
+        std::thread::sleep(sandbox::IDLE_SETTLE_AFTER + Duration::from_millis(500));
+        let settled = registry.stats().idle_heap_bytes;
+        assert!(
+            settled < at_release / 2,
+            "the settle must drop the call's garbage: {at_release} -> {settled}"
+        );
+
+        // The instance is still the same warm one, with its state intact.
+        let a2 = att(registry.acquire("p0", caps(TEST_CAP), &|| {
+            panic!("the settled instance must be reused, not respawned")
+        }));
+        assert_eq!(a2.id, a.id);
+        let outcome = call_via(&a2, churn_job());
+        assert_eq!(bump_value(&outcome), 2.0, "module state survives the settle");
+        release_outcome(&registry, "p0", &a2, &outcome);
     }
 
     #[test]

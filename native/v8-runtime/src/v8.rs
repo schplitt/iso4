@@ -949,8 +949,8 @@ thread_local! {
 /// the wire-facing side but allocated globally so no two live runs anywhere
 /// share one (wire run ids can collide across connections; tokens cannot).
 /// Starts at 1 — 0 means "no run".
-/// Per-instance thread-load signal, shared between the owner loop (writer)
-/// and the warm registry (reader) for join routing.
+/// Per-instance signals written by the owner loop and read by the warm
+/// registry: thread load for join routing, settled heap for eviction.
 pub struct InstanceLoad {
     /// Thread utilization over the last closed window, per-mille.
     util_permille: std::sync::atomic::AtomicU32,
@@ -961,6 +961,10 @@ pub struct InstanceLoad {
     /// Windows close only between turns, so a long turn would otherwise
     /// read as idle and attract more joins.
     turn_open_since_ms: std::sync::atomic::AtomicU64,
+    /// Heap measured after the idle settle GC; 0 = none since the last
+    /// release. Fresher than the release-time reading, which still counts
+    /// the last run's garbage.
+    settled_heap_bytes: std::sync::atomic::AtomicU64,
 }
 
 /// Utilization windows: closed every 100 ms of wall time; a reading older
@@ -980,7 +984,24 @@ impl InstanceLoad {
             util_permille: std::sync::atomic::AtomicU32::new(0),
             closed_at_ms: std::sync::atomic::AtomicU64::new(0),
             turn_open_since_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
+            settled_heap_bytes: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    fn publish_settled_heap(&self, bytes: u64) {
+        self.settled_heap_bytes
+            .store(bytes, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The settled reading, or 0 when none is current.
+    pub fn settled_heap_bytes(&self) -> u64 {
+        self.settled_heap_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A run finished on the instance: whatever was settled is spent.
+    pub fn clear_settled_heap(&self) {
+        self.publish_settled_heap(0);
     }
 
     fn close_window(&self, permille: u32) {
@@ -5185,6 +5206,16 @@ fn sweep_expired_deadlines(
     false
 }
 
+/// An instance idle this long settles its heap once (one GC, then a fresh
+/// reading for the registry) before parking indefinitely. Long enough that
+/// only a genuinely parked instance pays it: the first allocating call after
+/// a settle has to grow the heap back.
+#[cfg(not(test))]
+pub(crate) const IDLE_SETTLE_AFTER: Duration = Duration::from_secs(30);
+/// Shortened for the test suite — 30 s of sleeping per test is not worth it.
+#[cfg(test)]
+pub(crate) const IDLE_SETTLE_AFTER: Duration = Duration::from_secs(1);
+
 /// Serve one instance: the per-instance turn loop (#125). Receives from the
 /// instance's ONE ordered channel — jobs, run-tagged events, and the
 /// registry's Retire all ride it (#170) — bounded by the nearest per-run
@@ -5219,6 +5250,8 @@ pub fn serve_instance(
     let mut live: Vec<LiveRun> = Vec::new();
     let mut deadlines = DeadlineHeap::new();
     let mut retired = false;
+    // Whether the current idle stretch has had its settle GC.
+    let mut settled = false;
     // Utilization bookkeeping: busy time per wall window, published for the
     // registry's join routing.
     let mut window_start = std::time::Instant::now();
@@ -5245,7 +5278,10 @@ pub fn serve_instance(
 
         let received = {
             let timeout = peek_valid_deadline(&live, &mut deadlines)
-                .map(|(at, _)| at.saturating_duration_since(std::time::Instant::now()));
+                .map(|(at, _)| at.saturating_duration_since(std::time::Instant::now()))
+                // Nothing pending and the last run's garbage still held:
+                // wake once to settle the heap, then park indefinitely.
+                .or_else(|| (live.is_empty() && !settled).then_some(IDLE_SETTLE_AFTER));
             let oper = match timeout {
                 Some(t) => sel.select_timeout(t).ok(),
                 None => Some(sel.select()),
@@ -5257,10 +5293,18 @@ pub fn serve_instance(
                     .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected),
             }
         };
+        if received.is_ok() {
+            settled = false;
+        }
 
         let turn_started = std::time::Instant::now();
         load.open_turn(load_now_ms());
         match received {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if live.is_empty() => {
+                settled = true;
+                settle_heap(&mut core.isolate);
+                load.publish_settled_heap(heap_used(&mut core.isolate));
+            }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // The recv timed out: the channel was empty for the whole
                 // window, so nothing arrived-but-undelivered can beat the
@@ -5688,6 +5732,12 @@ thread_local! {
 
 fn heap_used(isolate: &mut v8::OwnedIsolate) -> u64 {
     isolate.get_heap_statistics().used_heap_size() as u64
+}
+
+/// One full collection when an instance goes idle — V8's own memory reducer
+/// never runs here: nothing pumps the platform loop.
+fn settle_heap(isolate: &mut v8::OwnedIsolate) {
+    isolate.low_memory_notification();
 }
 
 /// Clone the shared `bridge_error` OnceLock's content into an owned RunError.

@@ -2066,7 +2066,7 @@ decision functions (`policy.rs`, the same replaceable-rule style the
 prefix-aware acquire policy uses):
 
 - **Usage at/above the budget latches shedding**: evict idle instances by
-  `heapUsed × idleTime` score — highest first, ties to the longest-idle —
+  `heapUsed × idleTime^1.2` score — highest first, ties to the longest-idle —
   a tenth of the idle population per pass, AND stop pooling NEW instances:
   a `PrefixRun` without an idle instance runs on a cold one-off isolate
   (fresh per call, never pooled, one-off accounting); reuse of
@@ -2162,10 +2162,24 @@ the shedding latch (`underPressure`), per-prefix counts) over a
 **dedicated control connection** outside the run pool, so it answers
 precisely when everything is saturated. `used_heap_size` is reported on
 every `PrefixRun` Result frame (`heapUsedBytes`) and feeds the
-`heapUsed × idleTime` victim scoring. Per-prefix fairness caps and the
-wait-vs-cold-start acquire policy are deliberately not here: they are
-the prefix-aware cost model, built on the per-prefix busy/idle state the registry
-now tracks.
+`heapUsed × idleTime^1.2` victim scoring — age superlinear because a fat
+instance may be an infrequently called one that is genuinely in use, while
+an old one is simply unused (a plain factor would scale every score alike
+and change no ranking). An instance idle for 30 s then fires one low-memory
+notification and re-measures: nothing pumps the platform loop, so V8's own
+memory reducer never runs and an idle isolate would otherwise hold its
+garbage until eviction. That settled reading feeds `stats()`
+(`idleHeapBytes`, "what is still reclaimable") and **deliberately not the
+victim score** — scoring must compare candidates on one basis, and only
+instances past the threshold have a collected one, so mixing them would
+shield the long-parked and evict the recently used. The threshold is long
+because the settle shrinks the heap: the first allocating call afterwards
+has to grow it back, so only a genuinely parked instance should pay it. A
+settle frees nothing the prefix still reaches — module state, caches and
+compiled code survive it, and the instance stays warm.
+Per-prefix fairness caps and the wait-vs-cold-start acquire policy
+are deliberately not here: they are the prefix-aware cost model, built on
+the per-prefix busy/idle state the registry now tracks.
 
 **Instance pools, not singletons.** The registry maps prefix → pool of
 instances, because the same trigger fires concurrently: a call takes an
