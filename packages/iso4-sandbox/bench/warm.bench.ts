@@ -17,12 +17,18 @@
  * events/sec. Two variants: all calls on one prefix (the warm sweet spot)
  * and interleaved across two prefixes (post-warm: catches eviction thrash).
  *
+ * batched calls — the same EVENTS_PER_ITER events handed over in batches of
+ * 1, 8, 32 and 128. Per-event work and payload bytes are identical across
+ * the rows; only the number of boundary crossings differs, so the spread is
+ * what batching alone is worth.
+ *
  * Run with the RELEASE native binary (`pnpm build:native`).
  */
 
 import { afterAll, bench, describe } from 'vitest'
 import { createSandbox } from '../src/index.js'
-import type { CallResult, Prefix, Sandbox } from '../src/index.js'
+import type { CallResult, HostExportData, Prefix, Sandbox } from '../src/index.js'
+import { sparse1k } from './payloads.js'
 import { HEAVY_OPTS } from './profile.js'
 
 const SYNC_HANDLER = `
@@ -76,6 +82,27 @@ export default {
 }
 `
 
+/**
+ * An event-stream handler: one call carries an array of events and returns
+ * one result per event. The per-event body is deliberately trivial — the
+ * measurement is the crossing, not the transform.
+ */
+const TRANSFORM = `
+export default {
+  transform(events) {
+    const out = []
+    for (const event of events) {
+      out.push({
+        id: event.eventId,
+        bucket: event.timestamp % 8,
+        length: event.description.length,
+      })
+    }
+    return out
+  },
+}
+`
+
 function assertOk(result: CallResult, what: string): void {
   if (!result.ok) {
     throw new Error(
@@ -84,9 +111,59 @@ function assertOk(result: CallResult, what: string): void {
   }
 }
 
+/**
+ * A batched call must come back with one result per event — a handler that
+ * returned early would otherwise read as a speedup.
+ * @param result the call's outcome
+ * @param size events the call carried
+ * @param what the row, for the failure message
+ */
+function assertBatch(result: CallResult, size: number, what: string): void {
+  assertOk(result, what)
+  if (result.ok) {
+    const value = result.value as unknown[]
+    if (!Array.isArray(value) || value.length !== size) {
+      throw new Error(
+        `[bench sanity] ${what} returned ${Array.isArray(value) ? value.length : typeof value}, expected ${size} results`,
+      )
+    }
+  }
+}
+
 // Throughput pool shape: one iteration fires SLOTS×BATCH calls.
 const SLOTS = 8
 const BATCH = 64
+
+// Batched calls: every row moves the same events per iteration, split into
+// batches of these sizes — 128 events as 128 calls, or as one.
+const EVENTS_PER_ITER = 128
+const BATCH_SIZES = [1, 8, 32, 128]
+
+/**
+ * Distinct event objects, not one repeated: the V8 serializer writes a
+ * back-reference for a repeated object, which would make a batch of 128
+ * cost about as much as a batch of 1 and hide the thing being measured.
+ */
+const EVENTS: Record<string, HostExportData>[] = Array.from(
+  { length: EVENTS_PER_ITER },
+  (_, i) => {
+    const event = sparse1k()
+    return { ...event, eventId: `${event.eventId as string}_${i}`, timestamp: 1722945600000 + i }
+  },
+)
+
+/**
+ * The events split into batches of `size`, built once — an iteration pays
+ * for the calls, never for slicing.
+ * @param size events per call
+ */
+function batched(size: number): Record<string, HostExportData>[][] {
+  const out: Record<string, HostExportData>[][] = []
+  for (let i = 0; i < EVENTS.length; i += size) {
+    out.push(EVENTS.slice(i, i + size))
+  }
+  return out
+}
 
 // ── Runtimes, setup, teardown ──────────────────────────────────────────────
 //
@@ -118,6 +195,7 @@ let asyncPrefix!: Prefix
 let realisticPrefix!: Prefix
 let tpPrefixA!: Prefix
 let tpPrefixB!: Prefix
+let batchPrefix!: Prefix
 
 try {
   // Call latency — one call per iteration, single slot.
@@ -149,6 +227,14 @@ try {
   assertOk(
     await tpPrefixB.call({ export: 'default.fetch', args: [{ n: 1 }] }),
     'throughput prefix B',
+  )
+
+  // Batched calls — one prefix, the batch size is the only variable.
+  batchPrefix = await throughputRt.prepare({ code: TRANSFORM })
+  assertBatch(
+    await batchPrefix.call({ export: 'default.transform', args: [EVENTS.slice(0, 4)] }),
+    4,
+    'batch probe',
   )
 } catch (error) {
   await Promise.allSettled([latencyRt.dispose(), throughputRt.dispose()])
@@ -194,4 +280,18 @@ describe('call throughput', () => {
       assertOk(result, 'interleaved throughput call')
     }
   }, HEAVY_OPTS)
+})
+
+describe('batched calls', () => {
+  for (const size of BATCH_SIZES) {
+    const batches = batched(size)
+    bench(`${size} events per call, ${SLOTS} slots [x${EVENTS_PER_ITER}]`, async () => {
+      const results = await Promise.all(
+        batches.map((events) => batchPrefix.call({ export: 'default.transform', args: [events] })),
+      )
+      for (const result of results) {
+        assertBatch(result, size, `batch ${size}`)
+      }
+    }, HEAVY_OPTS)
+  }
 })

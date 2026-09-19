@@ -272,6 +272,39 @@ still reads cleanly. `sandbox.readExports({ code })` wraps that for the
 deploy path — load once, read the declaration exports, and get the skipped
 handler names back.
 
+### Batch event streams
+
+Arguments cross as one blob per call, so a handler that takes an array of
+events and returns an array of results pays one crossing per batch instead
+of one per event. For event-shaped work this is the biggest throughput
+lever available:
+
+```ts
+export default {
+  transform(events) {
+    return events.map((event) => ({ id: event.eventId, bucket: event.type }))
+  },
+}
+```
+
+```ts
+const result = await prefix.call({
+  export: 'default.transform',
+  args: [events], // one array, not one call per event
+})
+```
+
+Measured on a warm prefix over an 8-slot pool with ~750 B analytics events
+(`bench/warm.bench.ts`, "batched calls"): ~98k events/sec one at a time,
+~319k at 8 per call, ~365k at 32. That is 3.6× at the peak, and most of it
+is already there at 8.
+
+Two things bound it. One call runs on one slot, so a single batch of 128
+comes out _slower_ than four batches of 32 running in parallel — size
+batches so several are in flight across the pool. And a batch shares one
+run's limits: `cpuTimeMs`, `wallTimeMs` and `memoryMb` cover the whole
+array, so an oversized batch turns a per-event cost into a per-run timeout.
+
 ## Result shape
 
 ```ts
