@@ -381,7 +381,8 @@ not counted │ turn │ bridge│ runs'  │ turn │ timer │ turn │  Resul
   answer was already in.
 - `durationMs` — the full picture, dispatch to the processed conclusion:
   wall plus the engine's time (co-resident runs' turns, backlog drain).
-  Time queued before dispatch counts nowhere.
+  Time queued before dispatch counts in none of the three; the host-side
+  wait for a run slot is reported beside them as `queueWaitMs` (§6.4).
 - The wall deadline fires in **arrival order**: an answer that reached the
   runtime while budget remained is always delivered, even when the loop only
   processes it later; arrivals after the deadline can never delay it. Since
@@ -1131,6 +1132,12 @@ given, spawning one OS thread per active isolate. The runtime bounds
 keeps one dedicated control connection for `Stats`, so a snapshot answers
 while every run slot is busy; `stats()` reports the host-side connection
 count as `openConnections` and the live admission number as `slotLimit`.
+
+A run that had to queue reports the wait on its own result as
+`queueWaitMs`; a run admitted straight away carries no such field, and the
+immediate path reads no clock. The wait happens before the frame is sent,
+so it is outside `durationMs` and the two budgets inside it (§4.1) — it is
+the number that separates "the code got slower" from "admission is full".
 
 #### 6.4.1 The concurrency number is derived, not configured
 

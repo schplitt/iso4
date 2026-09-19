@@ -125,7 +125,9 @@ export class SlotPool {
   }
 
   /**
-   * Take a slot, or queue FIFO until one frees.
+   * Take a slot, or queue FIFO until one frees. Resolves with the wait in
+   * milliseconds, or `undefined` when the slot was free — the immediate
+   * path never reads a clock.
    * @param signal
    *   The caller's abort signal, honoured *while queued*. Per-run
    *   `wallTimeMs` / `cpuTimeMs` cannot bound that wait: the caller is
@@ -137,7 +139,7 @@ export class SlotPool {
    *   is executing; while queued, either firing dequeues the caller the
    *   same way.
    */
-  acquire(signal?: AbortSignal, hardAbortSignal?: AbortSignal): Promise<void> {
+  acquire(signal?: AbortSignal, hardAbortSignal?: AbortSignal): Promise<number | undefined> {
     if (this.disposed)
       return Promise.reject(new Error('runtime is disposed'))
 
@@ -152,7 +154,7 @@ export class SlotPool {
 
     if (this.active < this.capacity) {
       this.active++
-      return Promise.resolve()
+      return Promise.resolve(undefined)
     }
 
     if (this.waiters.length >= this.maxQueued) {
@@ -163,8 +165,10 @@ export class SlotPool {
       ))
     }
 
-    return new Promise<void>((resolve, reject) => {
-      const waiter: SlotWaiter = { resolve, reject }
+    const queuedAt = performance.now()
+    return new Promise<number | undefined>((resolve, reject) => {
+      const admit = (): void => resolve(performance.now() - queuedAt)
+      const waiter: SlotWaiter = { resolve: admit, reject }
       if (signal === undefined && hardAbortSignal === undefined) {
         this.waiters.push(waiter)
         return
@@ -187,7 +191,7 @@ export class SlotPool {
 
       waiter.resolve = () => {
         settle()
-        resolve()
+        admit()
       }
       waiter.reject = (error) => {
         settle()
@@ -448,17 +452,18 @@ export class RunPool {
    * settles — which is at the run's Result. A run that ended with pending
    * `waitUntil` work holds no slot during its grace phase: the grace frames
    * ride the shared connection, routed by run id, until its RunComplete.
-   * @param fn ran with the shared connection
+   * @param fn ran with the shared connection and how long the slot was
+   * waited for — `undefined` when one was free
    * @param signal the caller's abort signal, honoured while queued
    * @param hardAbortSignal the caller's hard-abort signal — while queued it
    * dequeues exactly like `signal`
    */
   async withClient<T>(
-    fn: (client: RuntimeIpcClient) => Promise<T>,
+    fn: (client: RuntimeIpcClient, queueWaitMs: number | undefined) => Promise<T>,
     signal?: AbortSignal,
     hardAbortSignal?: AbortSignal,
   ): Promise<T> {
-    await this.slots.acquire(signal, hardAbortSignal)
+    const queueWaitMs = await this.slots.acquire(signal, hardAbortSignal)
 
     let client: RuntimeIpcClient
     try {
@@ -469,7 +474,7 @@ export class RunPool {
     }
 
     try {
-      return await fn(client)
+      return await fn(client, queueWaitMs)
     } finally {
       this.slots.release()
     }
