@@ -7,6 +7,7 @@
 
 pub mod blob;
 pub mod container;
+pub mod cpuclock;
 pub mod ipc;
 pub mod oom;
 pub mod policy;

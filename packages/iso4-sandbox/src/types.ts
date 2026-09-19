@@ -87,8 +87,11 @@ export interface OneOffResourceLimits extends ResourceLimits {
 
 export interface ResourceLimits {
   /**
-   * Maximum *active* execution time in milliseconds. Time spent waiting on
-   * host bridge calls (globals, host imports) is excluded.
+   * Maximum CPU time in milliseconds — what the run's own thread actually
+   * burns on a core. Time waiting on host bridge calls (globals, host
+   * imports) is excluded, and so is time the thread spends descheduled while
+   * co-resident runs use the cores: a run gets its full allowance however
+   * busy the host is, and `wallTimeMs` bounds how long that may take.
    * @default 5_000
    */
   cpuTimeMs?: number
@@ -1320,7 +1323,10 @@ export interface CallSuccess {
    */
   wallTimeMs: number
   /**
-   * Active V8 execution only; bridge waits excluded (itemized in `bridgeCalls`).
+   * CPU burned on the run's own thread; bridge waits excluded (itemized in
+   * `bridgeCalls`), as is time spent descheduled under contention — so this
+   * does not grow with how many runs share the host. V8's background threads
+   * (GC, compilation) are not attributable to a run and are not included.
    */
   cpuTimeMs: number
   bridgeCalls: BridgeCallEntry[]
@@ -1412,7 +1418,7 @@ export interface WaitUntilResult {
    */
   wallTimeMs: number
   /**
-   * Active V8 execution time during the grace phase, ms.
+   * CPU burned on the instance thread during the grace phase, ms.
    */
   cpuTimeMs: number
   /**
@@ -1487,8 +1493,9 @@ export interface RunSuccess {
    */
   wallTimeMs: number
   /**
-   * Active V8 execution time — time spent waiting on host bridge calls is
-   * excluded. Milliseconds with microsecond resolution.
+   * CPU burned on the run's own thread — time waiting on host bridge calls,
+   * and time descheduled under contention, are excluded. Milliseconds with
+   * microsecond resolution.
    */
   cpuTimeMs: number
   /**
