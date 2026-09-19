@@ -105,6 +105,15 @@ export type {
   WaitUntilResult,
 } from './types'
 
+/**
+ * Default queue bound. Fixed rather than a multiple of the concurrency,
+ * which now moves with the workload: a threshold that moved with it would
+ * tighten exactly when load rises. Sits above the ~8 k concurrent runs one
+ * host process was measured to sustain, so it bounds memory without
+ * shedding work the sandbox could still have taken.
+ */
+const DEFAULT_MAX_QUEUED_RUNS = 10_000
+
 // ── Public API ─────────────────────────────────────────────────────────────
 
 export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> {
@@ -121,8 +130,11 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   validateMemoryMb(options?.memoryMb, 'memoryMb')
   const hostReserveMb = resolveHostReserveMb(options?.hostReserveMb)
   const warmBudgetBytes = resolveWarmBudgetBytes(options?.memoryBudgetMb, hostReserveMb)
-  const maxConcurrentRuns = options?.maxConcurrentRuns
-    ?? defaultMaxConcurrentRuns(warmBudgetBytes, options?.memoryMb)
+  // Pinned or adaptive: an explicit number is enforced for the process
+  // lifetime and the runtime's allowance is ignored; otherwise the sandbox
+  // starts at one run per core and follows what the runtime reports.
+  const pinnedConcurrency = options?.maxConcurrentRuns
+  const maxConcurrentRuns = pinnedConcurrency ?? availableParallelism()
   if (!Number.isInteger(maxConcurrentRuns) || maxConcurrentRuns < 1) {
     // 0 or a negative value would queue every run forever (total deadlock),
     // and a fractional value admits more runs than documented.
@@ -130,9 +142,9 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
       '[@iso4/sandbox] maxConcurrentRuns must be an integer >= 1',
     )
   }
-  if (options?.maxConcurrentRuns !== undefined)
-    warnIfSlotsOutrunMemory(maxConcurrentRuns, options.memoryMb, warmBudgetBytes, hostReserveMb)
-  const maxQueuedRuns = options?.maxQueuedRuns ?? 100 * maxConcurrentRuns
+  if (pinnedConcurrency !== undefined)
+    warnIfSlotsOutrunMemory(maxConcurrentRuns, options?.memoryMb, warmBudgetBytes, hostReserveMb)
+  const maxQueuedRuns = options?.maxQueuedRuns ?? DEFAULT_MAX_QUEUED_RUNS
   if (!Number.isInteger(maxQueuedRuns) || maxQueuedRuns < 0) {
     // 0 is valid (no queue: slots full = fail immediately); fractional or
     // negative bounds are nonsense.
@@ -194,12 +206,21 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     await waitForSocket(socketPath, proc)
 
     // Run connections open lazily, on demand, and are reused for the process
-    // lifetime — capacity is the slot pool's admission number
-    // (`maxConcurrentRuns`), not a set of sockets (see `pool.ts`). Nothing
-    // connects eagerly here except the control connection below.
+    // lifetime — capacity is the slot pool's admission number, not a set of
+    // sockets (see `pool.ts`). Nothing connects eagerly here except the
+    // control connection below.
+    let pool: RunPool
     const connect = (): Promise<RuntimeIpcClient> =>
-      RuntimeIpcClient.connect({ socketPath, descriptorToken })
-    const pool = new RunPool(maxConcurrentRuns, maxQueuedRuns, connect)
+      RuntimeIpcClient.connect({
+        socketPath,
+        descriptorToken,
+        // Every Result carries the runtime's current allowance; an explicit
+        // maxConcurrentRuns pins the number and ignores it.
+        onSlotAllowance: pinnedConcurrency === undefined
+          ? (allowance) => pool.setSlotLimit(allowance)
+          : undefined,
+      })
+    pool = new RunPool(maxConcurrentRuns, maxQueuedRuns, connect)
 
     // Dedicated control connection for `stats()`: it never enters the
     // pool, so a capacity snapshot answers even while every run slot is busy —
@@ -327,29 +348,6 @@ function containerLimitMb(): number {
 }
 
 /**
- * Default `maxConcurrentRuns`: the core count, unless that many worst-case
- * heaps could not fit inside the memory budget — then the budget bounds it
- * (`min(cores, budget / ceiling)`, at least 1). The worst case is each
- * isolate's terminating ceiling (`memoryMb` plus its headroom band), not the
- * advertised number. With an uncapped heap (`memoryMb: 0`) or a disabled
- * budget there is nothing to bound with, so the default stays the core
- * count.
- * @param warmBudgetBytes
- * @param memoryMb
- */
-function defaultMaxConcurrentRuns(
-  warmBudgetBytes: number,
-  memoryMb: number | MemoryLimit | undefined,
-): number {
-  const cores = availableParallelism()
-  const capMb = runCeilingMb(memoryMb)
-  if (capMb <= 0 || warmBudgetBytes <= 0)
-    return cores
-  const fitting = Math.floor(warmBudgetBytes / (capMb * 1024 * 1024))
-  return Math.max(1, Math.min(cores, fitting))
-}
-
-/**
  * The memory one run may reach, in megabytes — what capacity planning has to
  * reserve for a slot. The worst case is a prefix instance's TERMINATING line,
  * band included; a one-off's is the bare cap. An unset `memoryMb` reaches the
@@ -391,7 +389,7 @@ function warnIfSlotsOutrunMemory(
     + `memoryBudgetMb`
   if (wantMb > lineMb) {
     consequence = `over the runtime's ${lineMb} MB admission line — runs that need `
-      + `a new isolate fail with ERR_CAPACITY; lower maxConcurrentRuns or memoryMb`
+      + `a new isolate fail with ERR_CAPACITY_MEMORY; lower maxConcurrentRuns or memoryMb`
   }
   process.stderr.write(
     `[@iso4/sandbox] maxConcurrentRuns ${maxConcurrentRuns} × a ${ceilingMb} MB `
@@ -581,7 +579,7 @@ function heapCapsForWire(
 /**
  * The failed result for a run shed at the host-side queue bound
  * (`maxQueuedRuns`). Nothing reached the runtime, so telemetry is genuinely
- * zero. Distinct from `ERR_CAPACITY` (the runtime's memory admission):
+ * zero. Distinct from `ERR_CAPACITY_MEMORY` (the runtime's memory admission):
  * this wall is queue depth, that one is memory.
  * @param error the pool's refusal, carrying the bound in its message
  */
@@ -813,6 +811,7 @@ class SandboxImpl implements Sandbox {
     const raw = await this.statsClient.stats()
     return {
       activeRuns: raw.oneoffRunning + raw.warmRuns,
+      slotLimit: this.pool.slotLimit,
       queueDepth: this.pool.queueDepth,
       openConnections: this.pool.openConnections,
       warmInstances: raw.warmBusy + raw.warmIdle,

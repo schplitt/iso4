@@ -27,7 +27,7 @@ export type WireResourceLimits = ResourceLimits & {
   hardMemoryMb?: number
 }
 
-export const PROTOCOL_VERSION: 2 = 2
+export const PROTOCOL_VERSION: 1 = 1
 
 export const DEFAULT_MAX_FRAME_LENGTH: number = 64 * 1024 * 1024
 
@@ -1369,6 +1369,11 @@ export interface DecodedRunCompletion {
    * Run identifier echoed from the `Run` request.
    */
   runId: number
+  /**
+   * Runs the runtime is currently granting this host, from the shape of the
+   * work it is serving. `0` = no opinion yet. See `SlotPool`.
+   */
+  slotAllowance: number
   result: RunResult
   /**
    * Post-Result flags: bit 0 = `waitUntil` background work still running,
@@ -1385,6 +1390,10 @@ export interface DecodedRunCompletion {
  */
 export interface DecodedCallCompletion {
   runId: number
+  /**
+   * See {@link DecodedRunCompletion.slotAllowance}.
+   */
+  slotAllowance: number
   result: CallResult
   /**
    * See {@link DecodedRunCompletion.backgroundFlags}.
@@ -1583,9 +1592,10 @@ export function encodeStreamCancelPayload(runId: number, streamId: number, reaso
  * @param payload the raw Result frame payload
  */
 export function peekRunCompletionBackgroundFlags(payload: Uint8Array): number {
-  if (payload.byteLength < 7)
+  if (payload.byteLength < 11)
     return 0
-  const ok = payload[4] === 1
+  // runId (4) + slotAllowance (4), then the ok byte.
+  const ok = payload[8] === 1
   return ok ? payload[payload.byteLength - 2]! : 0
 }
 
@@ -1607,6 +1617,19 @@ export function peekRunCompletionRunId(buf: Uint8Array): number | undefined {
     return undefined
   return (
     (buf[0]! << 24) | (buf[1]! << 16) | (buf[2]! << 8) | buf[3]!
+  ) >>> 0
+}
+
+/**
+ * Read just the runtime's concurrency allowance, the second field. Applied
+ * on every completion, so it must not decode the rest. `0` = no opinion.
+ * @param buf
+ */
+export function peekRunCompletionSlotAllowance(buf: Uint8Array): number {
+  if (buf.byteLength < 8)
+    return 0
+  return (
+    (buf[4]! << 24) | (buf[5]! << 16) | (buf[6]! << 8) | buf[7]!
   ) >>> 0
 }
 
@@ -1656,6 +1679,7 @@ export function decodeRunCompletionPayload(
 ): DecodedRunCompletion | DecodedCallCompletion {
   const reader = new PayloadReader(buf)
   const runId = reader.readU32()
+  const slotAllowance = reader.readU32()
   const ok = reader.readBool()
 
   if (ok) {
@@ -1681,6 +1705,7 @@ export function decodeRunCompletionPayload(
     if (resultKind === 'call') {
       return {
         runId,
+        slotAllowance,
         backgroundFlags,
         result: {
           status: 'completed',
@@ -1698,6 +1723,7 @@ export function decodeRunCompletionPayload(
     }
     return {
       runId,
+      slotAllowance,
       backgroundFlags,
       result: {
         status: 'completed',
@@ -1740,6 +1766,7 @@ export function decodeRunCompletionPayload(
   reader.assertDone()
   return {
     runId,
+    slotAllowance,
     backgroundFlags: 0,
     result: {
       status: 'failed',

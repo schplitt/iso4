@@ -199,7 +199,7 @@ minus `hostReserveMb`, which is headroom for this host process to grow into
 heavily, `0` to hand the sandbox the whole limit.
 
 Above the budget sits the admission line, and a run that needs a new isolate
-whose heap ceiling would cross it fails with `ERR_CAPACITY` rather than
+whose heap ceiling would cross it fails with `ERR_CAPACITY_MEMORY` rather than
 risking the container. That refusal is honest, not a bug to route around:
 nothing ran, the telemetry is zero, and a retry a moment later usually
 succeeds. The runtime does not evict warm instances to squeeze the refused

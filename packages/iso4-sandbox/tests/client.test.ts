@@ -87,8 +87,9 @@ function writeHello(socket: Socket): void {
  * @param body
  */
 function resultPayload(runId: number, body: string): Buffer {
-  const head = Buffer.allocUnsafe(4)
+  const head = Buffer.allocUnsafe(8)
   head.writeUInt32BE(runId, 0)
+  head.writeUInt32BE(0, 4) // slotAllowance — no opinion
   return Buffer.concat([head, Buffer.from(body, 'utf8')])
 }
 
@@ -122,11 +123,12 @@ function bridgeCallPayload(runId: number, callId: number, exportName: string, ar
  * @param runId
  */
 function backgroundResultPayload(runId: number): Buffer {
-  const buf = Buffer.alloc(7)
+  const buf = Buffer.alloc(11)
   buf.writeUInt32BE(runId, 0)
-  buf.writeUInt8(1, 4) // ok
-  buf.writeUInt8(1, 5) // backgroundPending
-  buf.writeUInt8(0, 6) // failurePresent
+  buf.writeUInt32BE(0, 4) // slotAllowance — no opinion
+  buf.writeUInt8(1, 8) // ok
+  buf.writeUInt8(1, 9) // backgroundPending
+  buf.writeUInt8(0, 10) // failurePresent
   return buf
 }
 
@@ -186,7 +188,7 @@ describe('RuntimeIpcClient', () => {
     const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const result = await client.runRawCode('export default 42')
 
-    expect(Buffer.from(result.result).subarray(4).toString('utf8')).toBe('payload')
+    expect(Buffer.from(result.result).subarray(8).toString('utf8')).toBe('payload')
 
     await client.dispose()
   })
@@ -416,7 +418,7 @@ describe('RuntimeIpcClient', () => {
         },
       },
     })
-    expect(Buffer.from(raw.result).subarray(4).toString('utf8')).toBe('payload')
+    expect(Buffer.from(raw.result).subarray(8).toString('utf8')).toBe('payload')
     expect(dispatched).toEqual(['world'])
     await client.dispose()
   })
@@ -469,7 +471,7 @@ describe('RuntimeIpcClient', () => {
       },
     })
 
-    expect(Buffer.from(raw.result).subarray(4).toString('utf8')).toBe('payload')
+    expect(Buffer.from(raw.result).subarray(8).toString('utf8')).toBe('payload')
     await new Promise((r) => {
       setTimeout(r, 20)
     })
@@ -558,7 +560,7 @@ describe('RuntimeIpcClient', () => {
     // Pin the path: this must be the framing ceiling, not the
     // serializeHostValue catch that already worked before this fix.
     expect(responseMessage).toMatch(/exceeds max frame length/)
-    expect(Buffer.from(raw.result).subarray(4).toString('utf8')).toBe('payload')
+    expect(Buffer.from(raw.result).subarray(8).toString('utf8')).toBe('payload')
     expect(client.usable).toBe(true)
 
     await client.dispose()
@@ -715,7 +717,7 @@ describe('RuntimeIpcClient', () => {
     expect(responseOk).toBe(0)
     expect(dispatched).toEqual([])
     // The run completed and the connection is still poolable.
-    expect(Buffer.from(raw.result).subarray(4).toString('utf8')).toBe('payload')
+    expect(Buffer.from(raw.result).subarray(8).toString('utf8')).toBe('payload')
     expect(client.usable).toBe(true)
 
     await client.dispose()
@@ -768,7 +770,7 @@ describe('RuntimeIpcClient run router (multiplexed)', () => {
     results.forEach((raw, at) => {
       const body = Buffer.from(raw.result)
       expect(body.readUInt32BE(0)).toBe(at + 1)
-      expect(body.subarray(4).toString('utf8')).toBe(`run-${at + 1}`)
+      expect(body.subarray(8).toString('utf8')).toBe(`run-${at + 1}`)
     })
     expect(client.usable).toBe(true)
     await client.dispose()
@@ -847,12 +849,12 @@ describe('RuntimeIpcClient run router (multiplexed)', () => {
 
     // B finishes first — its bridge call was answered by B's dispatcher.
     const rawB = await runB
-    expect(Buffer.from(rawB.result).subarray(4).toString('utf8')).toBe('b-done')
+    expect(Buffer.from(rawB.result).subarray(8).toString('utf8')).toBe('b-done')
 
     // Abort C: the graceful path resolves it with the runtime's own Result.
     controller.abort(new Error('lost interest'))
     const rawC = await runC
-    expect(Buffer.from(rawC.result).subarray(4).toString('utf8')).toBe('c-aborted')
+    expect(Buffer.from(rawC.result).subarray(8).toString('utf8')).toBe('c-aborted')
 
     // A's value arrives early; the epilogue settles after grace-time bridge
     // traffic and the RunComplete frame.

@@ -3,7 +3,7 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, container, ipc, oom, policy, rss, session, v8 as sandbox};
+use iso4_v8_runtime::{blob, container, ipc, oom, policy, rss, session, v8 as sandbox, warm};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
@@ -92,6 +92,9 @@ fn main() {
         warm_budget_bytes,
         hard_line_bytes,
     ));
+
+    // Cold start: one run per core until a completed run reports its shape.
+    warm::seed_slot_allowance(std::thread::available_parallelism().map_or(1, |n| n.get()));
 
     for stream in listener.incoming() {
         match stream {

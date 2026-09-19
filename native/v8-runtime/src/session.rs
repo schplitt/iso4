@@ -1020,7 +1020,13 @@ fn dispatch_oneoff_run(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&run_id);
-            shared.warm.release_oneoff();
+            let (wall_time_ms, cpu_time_ms) = match &result {
+                Ok(output) => (output.wall_time_ms, output.cpu_time_ms),
+                Err(failure) => (failure.wall_time_ms, failure.cpu_time_ms),
+            };
+            shared
+                .warm
+                .release_oneoff(result.is_err(), wall_time_ms, cpu_time_ms);
             write_completion(&sink, run_id, &result, None);
         });
     if let Err(e) = spawned {
@@ -1029,7 +1035,8 @@ fn dispatch_oneoff_run(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&run_id);
-        shared.warm.release_oneoff();
+        // Never ran: no shape to learn from.
+        shared.warm.release_oneoff(true, 0.0, 0.0);
         let failure = sandbox::FailureOutput {
             error: sandbox::RunError::Internal(format!("failed to spawn run worker: {e}")),
             stdout: Vec::new(),
@@ -1350,15 +1357,16 @@ fn dispatch_prefix_run(
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
                     let prefix_alive = store.contains_key(&prefix_id);
-                    let cpu_time_ms = match &outcome.result {
-                        Ok(output) => output.cpu_time_ms,
-                        Err(failure) => failure.cpu_time_ms,
+                    let (wall_time_ms, cpu_time_ms) = match &outcome.result {
+                        Ok(output) => (output.wall_time_ms, output.cpu_time_ms),
+                        Err(failure) => (failure.wall_time_ms, failure.cpu_time_ms),
                     };
                     shared.warm.release(
                         &prefix_id,
                         att.id,
                         outcome.tainted,
                         outcome.heap_used_bytes,
+                        wall_time_ms,
                         cpu_time_ms,
                         prefix_alive,
                     );
@@ -1367,7 +1375,13 @@ fn dispatch_prefix_run(
                     // Never pooled: drop the handle (the owner thread exits
                     // and disposes the isolate), give back the one-off slot.
                     drop(handle);
-                    shared.warm.release_oneoff();
+                    let (wall_time_ms, cpu_time_ms) = match &outcome.result {
+                        Ok(output) => (output.wall_time_ms, output.cpu_time_ms),
+                        Err(failure) => (failure.wall_time_ms, failure.cpu_time_ms),
+                    };
+                    shared
+                        .warm
+                        .release_oneoff(outcome.tainted, wall_time_ms, cpu_time_ms);
                 }
             }
             match &outcome.result {
@@ -1680,10 +1694,11 @@ mod tests {
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Result);
         let p = &frame.payload;
         let run_id = u32::from_be_bytes(p[0..4].try_into().unwrap());
-        assert_eq!(p[4], 1, "run {run_id} must succeed, payload says ok = {}", p[4]);
-        assert_eq!(p[5], 1);
-        let blob_len = u32::from_be_bytes(p[6..10].try_into().unwrap()) as usize;
-        let exports = testval::from_blob(&p[10..10 + blob_len]);
+        // p[4..8] is slotAllowance.
+        assert_eq!(p[8], 1, "run {run_id} must succeed, payload says ok = {}", p[8]);
+        assert_eq!(p[9], 1);
+        let blob_len = u32::from_be_bytes(p[10..14].try_into().unwrap()) as usize;
+        let exports = testval::from_blob(&p[14..14 + blob_len]);
         (run_id, exports)
     }
 
@@ -1829,7 +1844,7 @@ mod tests {
             u32::from_be_bytes(failure.payload[0..4].try_into().unwrap()),
             1
         );
-        assert_eq!(failure.payload[4], 0, "run 1 must fail on its allowance");
+        assert_eq!(failure.payload[8], 0, "run 1 must fail on its allowance");
 
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1868,7 +1883,7 @@ mod tests {
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Result);
         let p = &frame.payload;
         assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
-        assert_eq!(p[4], 0, "the aborted run must fail");
+        assert_eq!(p[8], 0, "the aborted run must fail");
         let text = String::from_utf8_lossy(p);
         assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
         assert!(
@@ -1916,7 +1931,7 @@ mod tests {
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Result);
         let p = &frame.payload;
         assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
-        assert_eq!(p[4], 0, "the aborted run must fail");
+        assert_eq!(p[8], 0, "the aborted run must fail");
         let text = String::from_utf8_lossy(p);
         assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
         assert!(
@@ -1964,7 +1979,7 @@ mod tests {
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Result);
         let p = &frame.payload;
         assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
-        assert_eq!(p[4], 0, "the aborted run must fail");
+        assert_eq!(p[8], 0, "the aborted run must fail");
         let text = String::from_utf8_lossy(p);
         assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
         assert!(
