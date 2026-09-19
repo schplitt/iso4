@@ -198,6 +198,19 @@ minus `hostReserveMb`, which is headroom for this host process to grow into
 (its current usage is already metered) — raise it when the host caches
 heavily, `0` to hand the sandbox the whole limit.
 
+Above the budget sits the admission line, and a run that needs a new isolate
+whose heap ceiling would cross it fails with `ERR_CAPACITY` rather than
+risking the container. That refusal is honest, not a bug to route around:
+nothing ran, the telemetry is zero, and a retry a moment later usually
+succeeds. The runtime does not evict warm instances to squeeze the refused
+run in — eviction hands the freed pages to V8's pool, which the _next_
+isolate draws from, so the measured usage the line compares against does not
+move for seconds either way. Instead the budget mark sheds idle warmth
+gradually while the line holds, and V8 returns what it no longer needs to the
+operating system on its own. If refusals are routine rather than occasional,
+the container is genuinely too small for `maxConcurrentRuns × memoryMb` —
+`createSandbox` warns at startup when those two contradict each other.
+
 `sandbox.stats()` reports the live picture — active runs, queue depth, warm and
 idle instance counts, summed idle heap, `budgetBytes` / `rssBytes`, whether the
 runtime is currently `underPressure`, and per-prefix counts. It answers on a
