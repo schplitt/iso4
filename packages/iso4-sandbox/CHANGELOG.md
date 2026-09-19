@@ -1,5 +1,65 @@
 # @iso4/sandbox
 
+## 0.6.0
+
+### Minor Changes
+
+- e56c4dd: feat: `hostReserveMb` — the host's share of the container limit is now a knob
+
+  Both capacity lines are drawn from the container limit minus a reserve for the host process: the default memory budget is 80 % of what it leaves, the runtime's admission line 90 %. That reserve was a constant mirrored in two places (128 MB); it is now the `hostReserveMb` option, passed to the runtime instead of mirrored, so the two lines can no longer be derived from different bases. The default is unchanged at 128 MB — it is headroom for the host's GROWTH, not its current usage, which the global container meter already counts, so a host that caches heavily wants more and a thin one can hand the sandbox the whole limit with `0`. The refusal message keeps quoting the reserve actually in force.
+
+  `createSandbox` also warns on stderr when an explicit `maxConcurrentRuns` promises more concurrent heap than the container can hold — slots × the run's terminating ceiling over the memory budget, or over the admission line, where the consequence is routine `ERR_CAPACITY`. It never throws: the ceiling is a worst case, and `memoryMb: 0` or `memoryBudgetMb: 0` opts out.
+
+### Patch Changes
+
+- bc9ac10: fix: stop a cold burst from opening a connection per run
+
+  Runs arriving together on an empty pool each found no connection with room and opened their own, so a burst of 64 opened 61 connections where the steady-state packing needs 16 — two runtime threads each, given back only by the idle reaper 30 s later. A caller turned away now claims a place on a connection already being opened when one still has room, and opens its own only when they are all spoken for: a connection seats `RUNS_PER_CONNECTION` runs, one of them its opener. Measured on the real child: 64 concurrent runs open 16 connections instead of 61, 16 runs open 4 instead of 13.
+
+- a360c64: fix: `cpuTimeMs` measures CPU rather than elapsed time
+
+  A run was charged for time its thread sat waiting for a core, so the same guest code read 2.1 ms with 6 runs in flight and 86.1 ms with 256 — and the `cpuTimeMs` cap fired on that inflated figure, failing runs with `ERR_CPU_TIMEOUT` for CPU they never used.
+
+  Expect reported `cpuTimeMs` to drop sharply on a busy host and to stop moving with how many runs share it. A starved run now gets its full allowance and takes longer in elapsed terms, still bounded by `wallTimeMs`.
+
+- e007dae: feat: the sandbox derives its own concurrency from the work it is serving
+
+  Left unset, `maxConcurrentRuns` no longer means one run per core: the runtime sizes concurrency from the shape of the runs completing and follows it as the workload changes. Setting it pins the number instead — leave it unset unless you have measured this workload on this hardware.
+
+  Two things to check before upgrading: `maxQueuedRuns` now defaults to a flat `10_000` rather than `100 × maxConcurrentRuns`, and `ERR_CAPACITY` is renamed `ERR_CAPACITY_MEMORY`. `SandboxStats` gains `slotLimit`.
+
+- 698c595: chore: drop the separate ICU data embed
+
+  The runtime carried `deno_core_icudata` because the V8 it was built against shipped without ICU data, and a locale-aware call in a sandbox aborts the whole process when that data is missing. The prebuilt V8 the runtime now pins links the full ICU data itself, so the embed was a second copy: dropping it takes 10.9 MB off the binary (54.1 MB to 43.2 MB) and changes nothing a sandbox can observe — locales, time zones, collation, segmentation and non-Gregorian calendars all still work.
+
+- 60c4b6a: fix: weight age above size when choosing which idle instance to evict
+
+  The victim score was `heapUsed × idleTime`, which treats a megabyte and a second as interchangeable. They are not: a large instance is often just an infrequently called one that is genuinely in use, while a long-idle instance is simply unused. The score is now `heapUsed × idleTime^1.2`, so age wins once the ages differ enough — a 100 MB instance idle 20 s is no longer evicted ahead of a 30 MB instance idle 60 s. The exponent is what carries the change; a plain multiplier would scale every score alike and reorder nothing.
+
+- 2d9f3e0: fix: keep `waitUntil` grace phases from opening connections, and reap idle ones
+
+  Runs in their grace phase counted toward a connection's run cap until their `RunComplete`, so a steady stream of epilogues opened connection after connection — two runtime threads each, never closed. Grace runs are now excluded from the cap (their frames are routed by run id on whichever connection they already hold), and a connection that has carried nothing for 30 s is closed; one is always kept. Measured on a 16-slot sandbox with 100 ms grace work: 385 open connections before, 13 after.
+
+- 60c4b6a: perf: an idle instance can collect its garbage instead of holding it until eviction
+
+  A warm instance keeps the last call's garbage for as long as it stays resident: V8 collects on allocation, and an idle instance never allocates, so nothing triggers it. The runtime can now fire one low-memory notification on an instance that has been parked for a given number of seconds, re-measure, and report the settled heap — module state, caches and compiled code all survive, and the instance stays warm. Disposal additionally trims the runtime's malloc arenas.
+
+  **Off by default**, behind the runtime's `--idle-settle-secs` flag, with no host-side option yet. A dropped instance's pages go back to the operating system on their own within about twenty seconds, so the settle only pays for itself where warmth has to stay resident in a container tight enough to feel the garbage. Measured there it is worth a lot — in a 1 GB container running 400 heavy calls across 4 instances, resident memory held 195–220 MB before and 33 MB after, and the registry's idle heap read 93–116 MB before and 1.4 MB after. The cost is that a settle shrinks the heap, so the first allocating call afterwards has to grow it back: a call allocating ~16 MB measured ~3 ms before a settle and ~12–15 ms directly after.
+
+  Also changes the eviction score from `heapUsed × idleTime` to `heapUsed × idleTime^1.2`, so age outweighs size — a fat instance may be infrequently but genuinely used, while an old one is simply unused.
+
+- 4361331: fix: close the turn when an instance discards a late frame
+
+  A frame that arrives after its run concluded is discarded, and that path skipped the bookkeeping that marks the instance's turn as finished. The instance then reported full thread utilization to the registry until its next event, so the join policy routed new runs elsewhere — spawning or packing onto another instance while one with free capacity sat idle. It corrected itself on the next event; until then it cost warmth and memory.
+
+- 0b4e338: fix: an instance in a long turn no longer reads as idle to the join policy
+
+  Instances publish thread utilization once per closed window, and windows close only between turns. An instance deep in a turn that outlasts a window therefore still advertised whatever its last closed window measured — usually idle — so the router kept sending work to the one thread already busy. A turn that has been open for a whole window now reports as saturated.
+
+- eecae2a: feat: report how long a run waited for a slot
+
+  A run that had to queue for admission now carries `queueWaitMs` on its result; a run admitted straight away carries no such field. The wait sits outside `durationMs`, `wallTimeMs` and `cpuTimeMs`, which the runtime measures from dispatch onwards.
+
 ## 0.5.3
 
 ### Patch Changes
