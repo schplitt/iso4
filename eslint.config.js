@@ -7,7 +7,7 @@ export default schplitt({
   // the whole tree would leave `src/webtypes.js` — the sandbox runtime, and the
   // largest hand-written file in the project — unlinted, so it stays in scope
   // and only the build output is excluded.
-  ignores: ['DESIGN.md', 'internal/**', 'native/**/target/**', 'findings/**', '.claude/**'],
+  ignores: ['DESIGN.md', 'internal/**', 'native/**/target/**', 'native/v8-runtime/vendor/**', 'findings/**', '.claude/**'],
 }).overrideRules({
   'antfu/no-top-level-await': 'off',
   'jsdoc/require-param-description': 'off',

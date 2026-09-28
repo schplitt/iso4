@@ -57,3 +57,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Patched v8, unpacked by scripts/prepare-v8.ts (run `pnpm prepare:v8` first).
+[patch.crates-io]
+v8 = { path = "vendor/v8" }

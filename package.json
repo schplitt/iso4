@@ -26,14 +26,15 @@
     "release": "pnpm fmt:native:check && pnpm lint:native && pnpm lint && pnpm typecheck && pnpm build:dev && pnpm test:run && changeset",
     "bench": "pnpm --filter @iso4/sandbox bench",
     "bench:json": "pnpm --filter @iso4/sandbox bench:json",
-    "bench:native": "cargo bench --manifest-path native/v8-runtime/Cargo.toml",
-    "build:native": "node scripts/build-native.ts --release",
-    "build:native:dev": "node scripts/build-native.ts",
-    "check:native": "cargo check --manifest-path native/v8-runtime/Cargo.toml",
-    "test:native": "cargo test --manifest-path native/v8-runtime/Cargo.toml",
-    "lint:native": "cargo clippy --manifest-path native/v8-runtime/Cargo.toml -- -D warnings",
-    "fmt:native": "cargo fmt --manifest-path native/v8-runtime/Cargo.toml",
-    "fmt:native:check": "cargo fmt --check --manifest-path native/v8-runtime/Cargo.toml"
+    "prepare:v8": "node scripts/prepare-v8.ts",
+    "bench:native": "node scripts/prepare-v8.ts && cargo bench --manifest-path native/v8-runtime/Cargo.toml",
+    "build:native": "node scripts/prepare-v8.ts && node scripts/build-native.ts --release",
+    "build:native:dev": "node scripts/prepare-v8.ts && node scripts/build-native.ts",
+    "check:native": "node scripts/prepare-v8.ts && cargo check --manifest-path native/v8-runtime/Cargo.toml",
+    "test:native": "node scripts/prepare-v8.ts && cargo test --manifest-path native/v8-runtime/Cargo.toml",
+    "lint:native": "node scripts/prepare-v8.ts && cargo clippy --manifest-path native/v8-runtime/Cargo.toml -- -D warnings",
+    "fmt:native": "node scripts/prepare-v8.ts && cargo fmt --manifest-path native/v8-runtime/Cargo.toml",
+    "fmt:native:check": "node scripts/prepare-v8.ts && cargo fmt --check --manifest-path native/v8-runtime/Cargo.toml"
   },
   "devDependencies": {
     "@changesets/cli": "catalog:",

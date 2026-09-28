@@ -1,0 +1,368 @@
+Free the IsolateLiveness cell when its last reference drops.
+Upstream: https://github.com/denoland/rusty_v8/pull/2076 (src/ hunks only).
+Applied to the v8 crate by scripts/prepare-v8.ts; delete once a release ships it.
+
+diff --git a/src/handle.rs b/src/handle.rs
+index 039bde074b..5bc3a6a7a4 100644
+--- a/src/handle.rs
++++ b/src/handle.rs
+@@ -4,10 +4,11 @@ use std::ffi::c_void;
+ use std::hash::Hash;
+ use std::hash::Hasher;
+ use std::marker::PhantomData;
+-use std::mem::forget;
++use std::mem::ManuallyDrop;
+ use std::mem::transmute;
+ use std::ops::Deref;
+ use std::ptr::NonNull;
++use std::sync::Arc;
+ 
+ use crate::Data;
+ use crate::Isolate;
+@@ -314,15 +315,17 @@ impl<'s, T> Local<'s, T> {
+ #[derive(Debug)]
+ pub struct Global<T> {
+   data: NonNull<T>,
+-  isolate_liveness: NonNull<IsolateLiveness>,
++  /// Liveness cell of the host isolate, shared with the isolate's annex
++  /// and every other `Global` it hosts. This reference keeps the cell
++  /// readable after the isolate is disposed, so a late drop can observe
++  /// the null isolate pointer; the last reference frees the cell.
++  isolate_liveness: Arc<IsolateLiveness>,
+ }
+ 
+ impl<T> Global<T> {
+   #[inline(always)]
+   fn assert_access_allowed(&self) {
+-    unsafe {
+-      self.isolate_liveness.as_ref().assert_access_allowed();
+-    }
++    self.isolate_liveness.assert_access_allowed();
+   }
+ 
+   /// Construct a new Global from an existing Handle.
+@@ -330,22 +333,31 @@ impl<T> Global<T> {
+   pub fn new(isolate: &Isolate, handle: impl Handle<Data = T>) -> Self {
+     let HandleInfo { data, host } = handle.get_handle_info();
+     host.assert_match_isolate(isolate);
+-    unsafe { Self::new_raw(isolate as *const Isolate as *mut Isolate, data) }
++    unsafe {
++      Self::new_raw(
++        isolate as *const Isolate as *mut Isolate,
++        data,
++        isolate.clone_global_liveness(),
++      )
++    }
+   }
+ 
+   /// Implementation helper function that contains the code that can be shared
+-  /// between `Global::new()` and `Global::clone()`.
++  /// between `Global::new()` and `Global::clone()`. The caller supplies the
++  /// liveness reference so `clone` can duplicate the one it already holds
++  /// instead of re-fetching the annex.
+   #[inline(always)]
+-  unsafe fn new_raw(isolate: *mut Isolate, data: NonNull<T>) -> Self {
++  unsafe fn new_raw(
++    isolate: *mut Isolate,
++    data: NonNull<T>,
++    isolate_liveness: Arc<IsolateLiveness>,
++  ) -> Self {
+     let data = data.cast().as_ptr();
+     unsafe {
+-      let isolate_liveness = (*isolate).global_liveness();
+       // Cheap checkpoint (a relaxed load when empty) so cells dropped by
+       // threads that couldn't touch the isolate don't pin their JS
+       // objects indefinitely on isolates that are never locked.
+-      isolate_liveness
+-        .as_ref()
+-        .maybe_drain_deferred_global_resets();
++      isolate_liveness.maybe_drain_deferred_global_resets();
+       let data = v8__Global__New((*isolate).as_real_ptr(), data) as *const T;
+       let data = NonNull::new_unchecked(data as *mut _);
+       Self {
+@@ -363,16 +375,22 @@ impl<T> Global<T> {
+   /// collected.
+   #[inline(always)]
+   pub fn into_raw(self) -> NonNull<T> {
+-    let data = self.data;
+-    forget(self);
+-    data
++    let this = ManuallyDrop::new(self);
++    // The raw form carries no liveness reference; `from_raw` re-acquires
++    // one from the live isolate it requires. Release ours here without
++    // running `Global::drop`, which would also reset the V8 cell.
++    // SAFETY: `this` is `ManuallyDrop`, so `Global::drop` never runs, and
++    // the `isolate_liveness` field is never touched again; the `Arc` read
++    // out here is therefore dropped exactly once.
++    drop(unsafe { std::ptr::read(&this.isolate_liveness) });
++    this.data
+   }
+ 
+   /// Converts a raw pointer created with [`Global::into_raw()`] back to its
+   /// original `Global`.
+   #[inline(always)]
+   pub unsafe fn from_raw(isolate: &mut Isolate, data: NonNull<T>) -> Self {
+-    let isolate_liveness = isolate.global_liveness();
++    let isolate_liveness = isolate.clone_global_liveness();
+     Self {
+       data,
+       isolate_liveness,
+@@ -407,7 +425,7 @@ impl<T> Global<T> {
+ 
+   #[inline(always)]
+   fn get_handle_host(&self) -> HandleHost {
+-    let isolate = unsafe { self.isolate_liveness.as_ref().get_isolate_ptr() };
++    let isolate = self.isolate_liveness.get_isolate_ptr();
+     NonNull::new(isolate)
+       .map_or(HandleHost::DisposedIsolate, HandleHost::Isolate)
+   }
+@@ -418,36 +436,45 @@ impl<T> Global<T> {
+ // its Locker), or that are guarded through `IsolateLiveness`: `clone`,
+ // `eq` and `hash` assert the current thread may touch the isolate, and
+ // `drop` releases the cell immediately when it may, deferring to the
+-// liveness queue otherwise.
++// liveness queue otherwise. The `Arc<IsolateLiveness>` is `Send + Sync`
++// on its own; these impls are needed for the raw `data` pointer.
+ unsafe impl<T> Send for Global<T> {}
+ unsafe impl<T> Sync for Global<T> {}
+ 
++// The blanket impls above would mask it if `IsolateLiveness` ever lost
++// these auto traits, so assert them where the claim is made.
++const _: () = {
++  const fn assert_send_sync<T: Send + Sync>() {}
++  assert_send_sync::<IsolateLiveness>()
++};
++
+ impl<T> Clone for Global<T> {
+   fn clone(&self) -> Self {
+     self.assert_access_allowed();
+     let HandleInfo { data, host } = self.get_handle_info();
+     let mut isolate = unsafe { Isolate::from_non_null(host.get_isolate()) };
+-    unsafe { Self::new_raw(isolate.as_mut(), data) }
++    let isolate_liveness = Arc::clone(&self.isolate_liveness);
++    unsafe { Self::new_raw(isolate.as_mut(), data, isolate_liveness) }
+   }
+ }
+ 
+ impl<T> Drop for Global<T> {
+   fn drop(&mut self) {
+-    unsafe {
+-      let liveness = self.isolate_liveness.as_ref();
+-      if liveness.get_isolate_ptr().is_null() {
+-        // This `Global` handle is associated with an `Isolate` that has already
+-        // been disposed.
+-      } else if !liveness.is_shared() && liveness.on_home_thread() {
+-        // Destroy the storage cell that contains the contents of this Global.
+-        v8__Global__Reset(self.data.cast().as_ptr());
+-        liveness.maybe_drain_deferred_global_resets();
+-      } else {
+-        // Another thread may own the isolate right now; release the cell
+-        // immediately if we may touch it, otherwise defer to the next
+-        // lock acquisition or isolate teardown.
+-        liveness.reset_or_defer_global(self.data.cast());
+-      }
++    // The `Arc` field keeps the cell alive for this whole body; its own
++    // decrement (and a possible final free) runs after it.
++    let liveness = &*self.isolate_liveness;
++    if liveness.get_isolate_ptr().is_null() {
++      // This `Global` handle is associated with an `Isolate` that has already
++      // been disposed.
++    } else if !liveness.is_shared() && liveness.on_home_thread() {
++      // Destroy the storage cell that contains the contents of this Global.
++      unsafe { v8__Global__Reset(self.data.cast().as_ptr()) };
++      liveness.maybe_drain_deferred_global_resets();
++    } else {
++      // Another thread may own the isolate right now; release the cell
++      // immediately if we may touch it, otherwise defer to the next
++      // lock acquisition or isolate teardown.
++      liveness.reset_or_defer_global(self.data.cast());
+     }
+   }
+ }
+@@ -598,7 +625,7 @@ impl<T: Hash> Hash for Global<T> {
+   fn hash<H: Hasher>(&self, state: &mut H) {
+     // Hashing may call into V8 (e.g. `Object::GetIdentityHash`, which can
+     // mutate the object), so it needs the same gate as any other access.
+-    if unsafe { self.isolate_liveness.as_ref().get_isolate_ptr().is_null() } {
++    if self.isolate_liveness.get_isolate_ptr().is_null() {
+       panic!("can't hash Global after its host Isolate has been disposed");
+     }
+     self.assert_access_allowed();
+@@ -881,7 +908,7 @@ impl<T> Weak<T> {
+     // isolate's lock, racing the `WeakData` owned by this (non-Send)
+     // handle on its home thread.
+     assert!(
+-      !unsafe { (*isolate).global_liveness().as_ref() }.is_shared(),
++      !unsafe { (*isolate).global_liveness() }.is_shared(),
+       "v8::Weak is not supported on shared isolates"
+     );
+   }
+@@ -1035,7 +1062,8 @@ impl<T> Weak<T> {
+     if let Some(data) = self.get_pointer() {
+       let handle_host: HandleHost = (&self.isolate_handle).into();
+       handle_host.assert_match_isolate(isolate);
+-      Some(unsafe { Global::new_raw(isolate, data) })
++      let isolate_liveness = isolate.clone_global_liveness();
++      Some(unsafe { Global::new_raw(isolate, data, isolate_liveness) })
+     } else {
+       None
+     }
+diff --git a/src/isolate.rs b/src/isolate.rs
+index 827cff933a..ea0b3d8976 100644
+--- a/src/isolate.rs
++++ b/src/isolate.rs
+@@ -1094,8 +1094,17 @@ impl Isolate {
+   }
+ 
+   #[inline(always)]
+-  pub(crate) fn global_liveness(&self) -> NonNull<IsolateLiveness> {
+-    self.get_annex().global_liveness
++  pub(crate) fn global_liveness(&self) -> &IsolateLiveness {
++    self.get_annex().global_liveness()
++  }
++
++  /// One liveness reference for a new `Global`; released when that
++  /// `Global` is dropped or converted with `Global::into_raw`. Code that
++  /// only needs to observe the cell goes through [`Self::global_liveness`]
++  /// instead and stays refcount-free.
++  #[inline(always)]
++  pub(crate) fn clone_global_liveness(&self) -> Arc<IsolateLiveness> {
++    Arc::clone(&self.get_annex().global_liveness)
+   }
+ 
+   /// See [`IsolateHandle::terminate_execution`]
+@@ -1221,7 +1230,9 @@ impl Isolate {
+   /// Drains any guaranteed finalizers V8's teardown GC may have
+   /// registered, then drops the annex box. `ANNEX_SLOT` is not cleared
+   /// because the isolate is gone — its embedder data storage no longer
+-  /// exists.
++  /// exists. Dropping the annex releases its reference to the liveness
++  /// cell, which is freed with its last reference — this drop, or a
++  /// late-dropped `Global`'s.
+   ///
+   /// # Safety
+   ///
+@@ -2242,7 +2253,14 @@ pub(crate) struct IsolateAnnex {
+   finalizer_map: FinalizerMap,
+   maybe_snapshot_creator: Option<SnapshotCreator>,
+   isolate_handle: IsolateHandle,
+-  global_liveness: NonNull<IsolateLiveness>,
++  /// Liveness cell shared with every `Global` hosted by this isolate.
++  /// Globals may be dropped after their host isolate is disposed; each
++  /// holds a reference so those late drops can observe the null isolate
++  /// pointer, and the last reference — annex or `Global` — frees the
++  /// cell instead of leaking it. Refcount traffic is confined to
++  /// `Global` creation and destruction, which already pay a V8 FFI
++  /// call; liveness reads on access stay refcount-free.
++  global_liveness: Arc<IsolateLiveness>,
+   /// Number of live `Weak` handles, maintained so `try_into_shared()` can
+   /// reject isolates with outstanding weaks (their GC callbacks are not
+   /// thread-safe against the owning `Weak`).
+@@ -2255,17 +2273,13 @@ pub(crate) struct IsolateAnnex {
+ 
+ impl IsolateAnnex {
+   fn new(isolate: &Isolate, create_param_allocations: Box<dyn Any>) -> Self {
+-    // Globals may be dropped after their host isolate is disposed. Keep this
+-    // tiny liveness cell valid so those late drops can observe the null isolate
+-    // pointer without retaining an Arc per Global.
+-    let global_liveness = Box::leak(Box::new(IsolateLiveness::new(isolate)));
+     Self {
+       create_param_allocations: Some(create_param_allocations),
+       slots: HashMap::default(),
+       finalizer_map: FinalizerMap::default(),
+       maybe_snapshot_creator: None,
+       isolate_handle: IsolateHandle::new(isolate),
+-      global_liveness: NonNull::from(global_liveness),
++      global_liveness: Arc::new(IsolateLiveness::new(isolate)),
+       live_weak_count: 0,
+       has_embedder_cpp_heap: false,
+     }
+@@ -2273,7 +2287,7 @@ impl IsolateAnnex {
+ 
+   #[inline(always)]
+   fn global_liveness(&self) -> &IsolateLiveness {
+-    unsafe { self.global_liveness.as_ref() }
++    &self.global_liveness
+   }
+ 
+   #[inline(always)]
+@@ -2550,6 +2564,14 @@ impl IsolateLiveness {
+   }
+ }
+ 
++impl Debug for IsolateLiveness {
++  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
++    f.debug_struct("IsolateLiveness")
++      .field("isolate", &self.get_isolate_ptr())
++      .finish_non_exhaustive()
++  }
++}
++
+ impl Debug for IsolateAnnex {
+   fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+     f.debug_struct("IsolateAnnex")
+@@ -2891,7 +2913,7 @@ impl OwnedIsolate {
+ 
+     unsafe {
+       let isolate_handle = self.thread_safe_handle();
+-      self.global_liveness().as_ref().mark_shared();
++      self.global_liveness().mark_shared();
+       self.exit();
+       let cxx_isolate = self.cxx_isolate;
+       forget(self);
+diff --git a/src/locker.rs b/src/locker.rs
+index f283e54f1e..e76d4198da 100644
+--- a/src/locker.rs
++++ b/src/locker.rs
+@@ -191,10 +191,7 @@ impl Drop for SharedIsolateInner {
+       let ptr = self.cxx_isolate.as_ptr();
+       let mut raw = Box::new(RawLocker([0; 2]));
+       v8__Locker__CONSTRUCT(&mut *raw, ptr);
+-      isolate
+-        .global_liveness()
+-        .as_ref()
+-        .close_deferred_global_resets();
++      isolate.global_liveness().close_deferred_global_resets();
+       v8__Locker__DESTRUCT(&mut *raw);
+       let (annex_ptr, _create_param_allocations) =
+         isolate.prepare_annex_for_dispose();
+@@ -246,7 +243,6 @@ impl<'s> Locker<'s> {
+       // Release Globals that were dropped by threads not holding the lock.
+       locker
+         .global_liveness()
+-        .as_ref()
+         .maybe_drain_deferred_global_resets();
+       locker
+     }
+@@ -285,10 +281,7 @@ impl<'s> Locker<'s> {
+       );
+       // Release what other threads queued while we held the lock; they
+       // can't do it themselves, and we're about to stop being able to.
+-      self
+-        .global_liveness()
+-        .as_ref()
+-        .maybe_drain_deferred_global_resets();
++      self.global_liveness().maybe_drain_deferred_global_resets();
+     }
+     unsafe { v8__Isolate__Exit(ptr) };
+     let mut raw = Box::new(RawUnlocker([0; 1]));
+@@ -328,7 +321,6 @@ impl Drop for RelockGuard {
+       // lock acquisition boundary just like `SharedIsolate::lock()`.
+       Isolate::from_non_null(self.cxx_isolate)
+         .global_liveness()
+-        .as_ref()
+         .maybe_drain_deferred_global_resets();
+     }
+   }
+@@ -340,10 +332,7 @@ impl Drop for Locker<'_> {
+       // Final drain while we still hold the lock, so cells dropped by
+       // other threads during this lock don't sit in the queue (keeping
+       // their JS objects alive) until the next acquisition.
+-      self
+-        .global_liveness()
+-        .as_ref()
+-        .maybe_drain_deferred_global_resets();
++      self.global_liveness().maybe_drain_deferred_global_resets();
+       assert!(
+         std::ptr::eq(self.cxx_isolate.as_ptr(), v8__Isolate__TryGetCurrent()),
+         "Locker dropped while its isolate was not the entered one; lockers \

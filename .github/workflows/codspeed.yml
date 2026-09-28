@@ -82,6 +82,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare patched v8 crate
+        run: node scripts/prepare-v8.ts
+
       # Build outside the instrumented step so compilation isn't measured.
       - name: Build benches (codspeed profile)
         run: cd native/v8-runtime && cargo codspeed build
