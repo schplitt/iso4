@@ -1,5 +1,11 @@
 # @iso4/sandbox
 
+## 0.6.1
+
+### Patch Changes
+
+- 9eb95a2: fix: stop leaking ~150 bytes of native memory for every isolate the runtime creates
+
 ## 0.6.0
 
 ### Minor Changes
