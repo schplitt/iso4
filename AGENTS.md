@@ -263,6 +263,11 @@ learned during development.
 - `pnpm test:run` now includes `pnpm test:native` (Rust unit tests via
   `cargo test`) before the TS vitest run. The Rust unit tests use the debug
   profile and are fast; no separate `cargo test` call is needed.
+- The `v8` crate is patched: `scripts/prepare-v8.ts` unpacks the pinned
+  crate into the gitignored `native/v8-runtime/vendor/v8` and applies
+  `native/v8-runtime/patches/`. Every `pnpm *:native` script runs it first;
+  plain `cargo` and rust-analyzer fail until `pnpm prepare:v8` has run once.
+  Bumping `v8` means updating `VERSION` + `SHA256` in the script.
 - Prefer `pnpm lint:fix` before manual lint cleanup.
 - The pnpm catalog (`pnpm-workspace.yaml`) is the single source of truth
   for dev-dep versions. Reference deps as `"catalog:"` in package.json,
