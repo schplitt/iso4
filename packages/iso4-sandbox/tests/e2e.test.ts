@@ -2196,6 +2196,36 @@ describe('AbortSignal cancellation', () => {
     expect(sandboxSawValue).toBe(false)
   })
 
+  test('bridge calls queued behind an abort are not dispatched to host globals', async () => {
+    const controller = new AbortController()
+    let charges = 0
+    const result = await runtime.run({
+      code: `
+        const first = bad()
+        const rest = [1, 2, 3].map(() => charge())
+        export default await Promise.all([first, ...rest])
+      `,
+      signal: controller.signal,
+      globals: {
+        bad: () => {
+          controller.abort()
+          return new Promise((resolve) => {
+            setTimeout(() => resolve('late'), 20)
+          })
+        },
+        charge: () => {
+          charges += 1
+          return 1
+        },
+      },
+    })
+    expect(result.status).toBe('aborted')
+    await new Promise<void>((r) => {
+      setTimeout(r, 100)
+    })
+    expect(charges).toBe(0)
+  })
+
   test('prefix.run honors an in-flight abort and keeps the prefix usable', async () => {
     const prefix = await runtime.precompile({
       code: '',

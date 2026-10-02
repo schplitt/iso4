@@ -1282,6 +1282,10 @@ export class RuntimeIpcClient {
     runId: number,
   ): Promise<void> {
     const { dispatcher, streams } = entry
+    // The run is already gone: its answer can never be delivered, so do not
+    // run host code for it. Handlers already in flight finish on their own.
+    if (entry.signal?.aborted || entry.hardAbortSignal?.aborted)
+      return
     // Guest-controlled bytes. A host type the sandbox accepted but this
     // Node refuses to reconstruct (a URL carrying credentials, say)
     // throws here, and the peer is parked waiting for our response — so
