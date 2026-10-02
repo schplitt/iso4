@@ -84,6 +84,11 @@ export interface RawRunResult {
    * handles to `ReadableStream`s through it.
    */
   outStreams: OutboundStreamRegistry
+  /**
+   * Bridge calls skipped because the run was already aborted; their records
+   * decode as `dropped`.
+   */
+  droppedCallIds?: ReadonlySet<number>
 }
 
 /**
@@ -203,6 +208,10 @@ interface RunEntry {
   outStreams: OutboundStreamRegistry
   signal: AbortSignal | undefined
   hardAbortSignal: AbortSignal | undefined
+  /**
+   * callIds of BridgeCall frames skipped after the run's signal fired.
+   */
+  droppedCallIds?: Set<number>
   resolve: (result: RawRunResult) => void
   reject: (error: Error) => void
   /**
@@ -1068,7 +1077,12 @@ export class RuntimeIpcClient {
       // (the runtime cancelled its side already).
       this.runs.delete(runId)
       entry.streams?.releaseAll()
-      entry.resolve({ result: payload, graceWork: false, outStreams: entry.outStreams })
+      entry.resolve({
+        result: payload,
+        graceWork: false,
+        outStreams: entry.outStreams,
+        ...(entry.droppedCallIds && { droppedCallIds: entry.droppedCallIds }),
+      })
       return
     }
 
@@ -1120,6 +1134,7 @@ export class RuntimeIpcClient {
       epilogue,
       graceWork: (flags & 1) !== 0,
       outStreams: entry.outStreams,
+      ...(entry.droppedCallIds && { droppedCallIds: entry.droppedCallIds }),
     })
   }
 
@@ -1130,7 +1145,12 @@ export class RuntimeIpcClient {
    * @param payload
    */
   private routeRunComplete(payload: Uint8Array): void {
-    const report = decodeRunCompletePayload(payload)
+    // Both frames lead with the run id, so the Result peek serves here too.
+    const runId = peekRunCompletionRunId(payload)
+    const report = decodeRunCompletePayload(
+      payload,
+      runId === undefined ? undefined : this.runs.get(runId)?.droppedCallIds,
+    )
     const entry = this.runs.get(report.runId)
     if (entry === undefined || entry.epilogue === undefined) {
       throw new ProtocolDesyncError(
@@ -1284,8 +1304,12 @@ export class RuntimeIpcClient {
     const { dispatcher, streams } = entry
     // The run is already gone: its answer can never be delivered, so do not
     // run host code for it. Handlers already in flight finish on their own.
-    if (entry.signal?.aborted || entry.hardAbortSignal?.aborted)
+    if (entry.signal?.aborted || entry.hardAbortSignal?.aborted) {
+      const callId = peekBridgeCallId(payload)
+      if (callId !== undefined)
+        (entry.droppedCallIds ??= new Set()).add(callId)
       return
+    }
     // Guest-controlled bytes. A host type the sandbox accepted but this
     // Node refuses to reconstruct (a URL carrying credentials, say)
     // throws here, and the peer is parked waiting for our response — so

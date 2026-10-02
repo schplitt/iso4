@@ -354,15 +354,20 @@ type RunResult
 // durationMs — wall-clock time of the run; cpuTimeMs — active V8 execution
 // time (bridge waits excluded). Both measured in the runtime, µs resolution.
 
-interface BridgeCallEntry { // recorded in the Rust runtime; one per attempt, in order
+type BridgeCallEntry = { // recorded in the Rust runtime; one per attempt, in order
   name: string // 'fetch', 'myTool', or '<specifier>.<path>' for host-module imports
   startMs: number // offset from run start (same clock as durationMs)
   durationMs: number // round-trip the sandbox waited (handler + IPC)
   argBytes: number // serialized call payload size
-  responseBytes: number // serialized response value size (0 on handler error)
-  ok: boolean
-  blocked: boolean // blocked by a limit runtime-side; never reached the host
-}
+  responseBytes: number // serialized response value size (0 unless ok)
+} & (
+  | { ok: true }
+  | { ok: false, reason: 'blocked' | 'error' | 'unanswered' | 'dropped' }
+)
+// blocked: refused runtime-side (limit, function argument, ...), never reached the host
+// error: the handler threw / rejected, or the host could not decode or encode a value
+// unanswered: no answer when the run ended (handler still ran)
+// dropped: the run was already aborted, the handler was never called
 
 interface RunError {
   code: RunErrorCode

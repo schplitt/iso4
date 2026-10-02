@@ -66,6 +66,8 @@ export type {
   HostGlobalValue,
   DataGlobal,
   BridgeCallEntry,
+  BridgeCallEntryBase,
+  BridgeCallFailureReason,
   BridgeGlobal,
   BridgeWithShim,
   GlobalOptions,
@@ -783,8 +785,8 @@ class SandboxImpl implements Sandbox {
         const decoded = withBodyStreamBinder(
           (id) => raw.outStreams.attach(id),
           () => call === undefined
-            ? decodeRunCompletionPayload(raw.result).result
-            : decodeRunCompletionPayload(raw.result, 'call').result,
+            ? decodeRunCompletionPayload(raw.result, undefined, raw.droppedCallIds).result
+            : decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds).result,
         )
         // waitUntil: the value arrived early; hand the caller the grace
         // outcome as a never-rejecting promise. A streaming-only epilogue
@@ -1170,8 +1172,8 @@ implements Prefix<G, M> {
         const decoded = withBodyStreamBinder(
           (id) => raw.outStreams.attach(id),
           () => payload.call === undefined
-            ? decodeRunCompletionPayload(raw.result).result
-            : decodeRunCompletionPayload(raw.result, 'call').result,
+            ? decodeRunCompletionPayload(raw.result, undefined, raw.droppedCallIds).result
+            : decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds).result,
         )
         // waitUntil — see the note in SandboxImpl.run.
         if (raw.epilogue !== undefined && raw.graceWork && decoded.ok)

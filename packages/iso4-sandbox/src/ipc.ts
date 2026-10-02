@@ -3,6 +3,7 @@ import { deserializeValue, serializeValue } from './v8-codec.js'
 import { DESCRIPTOR_TOKEN_LEN } from './web-codec.js'
 import type {
   BridgeCallEntry,
+  BridgeCallFailureReason,
   CallResult,
   ResourceLimits,
   ResetCause,
@@ -1420,8 +1421,13 @@ export interface DecodedRunComplete {
 /**
  * Decode a `RunComplete` frame payload.
  * @param buf the frame payload
+ * @param droppedCallIds bridge calls the client skipped because the run was
+ * already aborted; their records are reported as `dropped`
  */
-export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
+export function decodeRunCompletePayload(
+  buf: Uint8Array,
+  droppedCallIds?: ReadonlySet<number>,
+): DecodedRunComplete {
   const reader = new PayloadReader(buf)
   const runId = reader.readU32()
   const statusByte = reader.readU8()
@@ -1434,7 +1440,7 @@ export function decodeRunCompletePayload(buf: Uint8Array): DecodedRunComplete {
   const cpuTimeMs = reader.readF64()
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
-  const bridgeCalls = readBridgeCallRecords(reader)
+  const bridgeCalls = readBridgeCallRecords(reader, droppedCallIds)
   const errorPresent = reader.readU8()
   const error = errorPresent === 1
     ? { name: reader.readString(), message: reader.readString() }
@@ -1670,12 +1676,23 @@ export function peekRunCompletionSlotAllowance(buf: Uint8Array): number {
  *   Optional<u64>  heapUsedBytes   (present for prefix runs)
  * ```
  * @param buf
+ * @param resultKind
+ * @param droppedCallIds
  */
-export function decodeRunCompletionPayload(buf: Uint8Array): DecodedRunCompletion
-export function decodeRunCompletionPayload(buf: Uint8Array, resultKind: 'call'): DecodedCallCompletion
+export function decodeRunCompletionPayload(
+  buf: Uint8Array,
+  resultKind?: undefined,
+  droppedCallIds?: ReadonlySet<number>,
+): DecodedRunCompletion
+export function decodeRunCompletionPayload(
+  buf: Uint8Array,
+  resultKind: 'call',
+  droppedCallIds?: ReadonlySet<number>,
+): DecodedCallCompletion
 export function decodeRunCompletionPayload(
   buf: Uint8Array,
   resultKind?: 'call',
+  droppedCallIds?: ReadonlySet<number>,
 ): DecodedRunCompletion | DecodedCallCompletion {
   const reader = new PayloadReader(buf)
   const runId = reader.readU32()
@@ -1696,7 +1713,7 @@ export function decodeRunCompletionPayload(
     const durationMs = reader.readF64()
     const wallTimeMs = reader.readF64()
     const cpuTimeMs = reader.readF64()
-    const bridgeCalls = readBridgeCallRecords(reader)
+    const bridgeCalls = readBridgeCallRecords(reader, droppedCallIds)
     const heapUsedBytes = reader.readOptionalU64()
     const backgroundFlags = reader.readU8()
     reader.readU8() // failurePresent = 0; consumed for forward-compat
@@ -1760,7 +1777,7 @@ export function decodeRunCompletionPayload(
   const durationMs = reader.readF64()
   const wallTimeMs = reader.readF64()
   const cpuTimeMs = reader.readF64()
-  const bridgeCalls = readBridgeCallRecords(reader)
+  const bridgeCalls = readBridgeCallRecords(reader, droppedCallIds)
   const heapUsedBytes = reader.readOptionalU64()
 
   reader.assertDone()
@@ -1810,8 +1827,12 @@ function readResetInfo(
  * already resolved — the runtime owns the import handle table and the shim
  * naming convention, so no client-side mapping remains.
  * @param reader
+ * @param droppedCallIds
  */
-function readBridgeCallRecords(reader: PayloadReader): BridgeCallEntry[] {
+function readBridgeCallRecords(
+  reader: PayloadReader,
+  droppedCallIds?: ReadonlySet<number>,
+): BridgeCallEntry[] {
   const count = reader.readU32()
   const entries: BridgeCallEntry[] = []
   for (let i = 0; i < count; i++) {
@@ -1820,17 +1841,29 @@ function readBridgeCallRecords(reader: PayloadReader): BridgeCallEntry[] {
     const durationMs = reader.readF64()
     const argBytes = reader.readU32()
     const responseBytes = reader.readU32()
-    const ok = reader.readBool()
-    const blocked = reader.readBool()
-    entries.push({
-      name,
-      startMs,
-      durationMs,
-      argBytes,
-      responseBytes,
-      ok,
-      blocked,
-    })
+    const callId = reader.readU32()
+    const outcome = reader.readU8()
+    const base = { name, startMs, durationMs, argBytes, responseBytes }
+    // The runtime cannot tell a call the client never dispatched from one
+    // whose answer came too late; only the client knows which it skipped.
+    let reason: BridgeCallFailureReason
+    switch (outcome) {
+      case 0:
+        entries.push({ ...base, ok: true })
+        continue
+      case 1:
+        reason = 'blocked'
+        break
+      case 2:
+        reason = 'error'
+        break
+      case 3:
+        reason = droppedCallIds?.has(callId) ? 'dropped' : 'unanswered'
+        break
+      default:
+        throw new PayloadDecodeError(`unknown bridge call outcome byte: ${outcome}`)
+    }
+    entries.push({ ...base, ok: false, reason })
   }
   return entries
 }

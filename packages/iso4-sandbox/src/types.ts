@@ -1354,7 +1354,35 @@ export interface CallSuccess {
  * an entry (~100 bytes); consumers that only care about a subset filter the
  * list themselves.
  */
-export interface BridgeCallEntry {
+export type BridgeCallEntry = BridgeCallEntryBase & (
+  | { ok: true }
+  | { ok: false, reason: BridgeCallFailureReason }
+)
+
+/**
+ * Why a bridge call did not succeed ({@link BridgeCallEntry} with
+ * `ok: false`).
+ *
+ * - `blocked`: refused inside the runtime (`maxBridgeCalls`, payload over
+ *   `maxBridgeCallBytes`, function argument, invalid import handle, failed
+ *   write). Never reached the host; the sandbox promise rejected.
+ * - `error`: the host answered with an error — the handler threw or
+ *   rejected, the host could not decode the arguments, or the return value
+ *   could not be serialized. The sandbox promise rejected.
+ * - `unanswered`: sent, but no answer by the time these records were taken —
+ *   abort, a limit, an uncaught throw, or the sandbox never awaited it. The
+ *   handler ran (or is still running); its answer is discarded. On a run
+ *   with pending `waitUntil` work the Result's records are a snapshot, so a
+ *   call still in flight shows here even if it settles during the epilogue.
+ * - `dropped`: the run's signal was already aborted when the call reached
+ *   the host, so the handler was never invoked.
+ */
+export type BridgeCallFailureReason = 'blocked' | 'error' | 'unanswered' | 'dropped'
+
+/**
+ * Fields shared by every {@link BridgeCallEntry}.
+ */
+export interface BridgeCallEntryBase {
   /**
    * The name sandbox code called. Plain globals appear as-is (`fetch`),
    * shimmed globals under their public name (not the private stub), and
@@ -1369,8 +1397,8 @@ export interface BridgeCallEntry {
   startMs: number
   /**
    * Round-trip time the sandbox waited for the response (host handler + IPC),
-   * in milliseconds. For calls still unanswered when the run ended
-   * (timeout/abort): the time until the run ended. `0` for blocked attempts.
+   * in milliseconds. For `unanswered` and `dropped` calls: the time until
+   * the run ended. `0` for blocked attempts.
    */
   durationMs: number
   /**
@@ -1384,18 +1412,6 @@ export interface BridgeCallEntry {
    * handler failed or the call never settled.
    */
   responseBytes: number
-  /**
-   * `true` when the host handler resolved and its response reached the
-   * sandbox. `false` for handler errors, blocked attempts, and calls still
-   * in flight when the run ended.
-   */
-  ok: boolean
-  /**
-   * `true` when the attempt was blocked inside the runtime (`maxBridgeCalls`
-   * exceeded, payload over `maxBridgeCallBytes`, function argument) and never
-   * reached the host.
-   */
-  blocked: boolean
 }
 
 /**
@@ -1516,8 +1532,8 @@ export interface RunSuccess {
   queueWaitMs?: number
   /**
    * One entry per bridge call the sandbox attempted, in attempt order —
-   * including attempts blocked by limits ({@link BridgeCallEntry.blocked}).
-   * Recorded by the Rust runtime.
+   * including attempts that never reached the host (see
+   * {@link BridgeCallFailureReason}). Recorded by the Rust runtime.
    */
   bridgeCalls: BridgeCallEntry[]
   /**
