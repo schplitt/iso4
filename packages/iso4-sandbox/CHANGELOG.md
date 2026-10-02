@@ -1,5 +1,17 @@
 # @iso4/sandbox
 
+## 0.6.3
+
+### Patch Changes
+
+- 7fae88e: fix(sandbox): refuse host-module shapes nested deeper than 64 levels
+
+  An `imports` host-module shape may nest at most 64 levels. A deeper shape now fails `prepare()`/`run()` on the host with the offending path instead of crashing the shared runtime process.
+
+- f2f66fa: fix(sandbox): lift the 32-level nesting cap on host → sandbox values
+
+  Host values may now nest to any depth V8 can serialize, and cycles, shared references and `Map`/`Set` entries holding a `Response`, `Request` or `Headers` rehydrate correctly. A host value too deep for the runtime to read fails the run with `ERR_TYPE_NOT_SERIALIZABLE` instead of `ERR_INTERNAL`.
+
 ## 0.6.2
 
 ### Patch Changes
