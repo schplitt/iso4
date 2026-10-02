@@ -788,7 +788,9 @@ export const fetchedAt = Date.now()
   wallTimeMs: 97.2,     // own logic time: execution + async waits (to arrival)
   cpuTimeMs: 12.4,      // CPU burned on the run's thread; bridge waits excluded
   bridgeCalls: [        // recorded in the runtime; metadata only, never payloads
-    { name: "fetch", startMs: 0.4, durationMs: 2.3, argBytes: 180, responseBytes: 41208, ok: true, blocked: false },
+    { name: "fetch", startMs: 0.4, durationMs: 2.3, argBytes: 180, responseBytes: 41208, ok: true },
+    { name: "charge", startMs: 2.9, durationMs: 0.1, argBytes: 40, responseBytes: 0, ok: false, reason: "dropped" },
+    // reason ∈ blocked | error | unanswered | dropped — see types.ts BridgeCallFailureReason
   ],
 }
 ```
@@ -880,8 +882,9 @@ A completed run:
 
 All three outcomes carry the run's timings (`durationMs` wall, `cpuTimeMs`
 active execution) and `bridgeCalls` — per-attempt metadata recorded inside
-the Rust runtime, including attempts blocked by limits (`blocked: true`); see
-§5 above. Aborted runs carry these too: graceful termination (§14.7) has the
+the Rust runtime; a failed entry says why (`reason`: `blocked` runtime-side,
+`error` from the host, `unanswered` when the run ended first, `dropped` when
+the abort beat the dispatch); see §5 above. Aborted runs carry these too: graceful termination (§14.7) has the
 runtime send a real result frame on abort, so timings and `bridgeCalls` reflect
 work done up to the abort. They report zeros and an empty `bridgeCalls` only
 when graceful termination falls back to socket teardown (a CPU-bound run not

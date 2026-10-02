@@ -180,11 +180,25 @@ pub struct BridgeCallRecord {
     /// Serialized response value size in bytes. `0` on handler error or when
     /// the call never settled.
     pub response_bytes: u32,
-    /// The host handler resolved and its response reached the sandbox.
-    pub ok: bool,
-    /// The attempt was blocked runtime-side (maxBridgeCalls, oversized
-    /// payload, function argument) and never reached the host.
-    pub blocked: bool,
+    /// The callId the BridgeCall frame carried; `u32::MAX` for blocked
+    /// attempts, which never got one.
+    pub call_id: u32,
+    pub outcome: BridgeCallOutcome,
+}
+
+/// How a bridge call attempt ended, as the runtime saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BridgeCallOutcome {
+    /// The host resolved and the response reached the sandbox.
+    Ok = 0,
+    /// Refused runtime-side (limit, oversized payload, function argument,
+    /// invalid import handle, transport failure); never sent.
+    Blocked = 1,
+    /// The host answered with an error; the sandbox promise rejected.
+    Error = 2,
+    /// Sent, but no answer before the run ended.
+    Unanswered = 3,
 }
 
 /// Payload for a successful run.
@@ -395,8 +409,8 @@ fn encode_optional_u64(value: Option<u64>, out: &mut Vec<u8>) {
 /// f64           durationMs
 /// u32           argBytes
 /// u32           responseBytes
-/// bool          ok
-/// bool          blocked
+/// u32           callId
+/// u8            outcome (0 ok, 1 blocked, 2 error, 3 unanswered)
 /// ```
 fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
     encode_u32(records.len() as u32, out);
@@ -406,8 +420,8 @@ fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
         encode_f64(r.duration_ms, out);
         encode_u32(r.arg_bytes, out);
         encode_u32(r.response_bytes, out);
-        encode_bool(r.ok, out);
-        encode_bool(r.blocked, out);
+        encode_u32(r.call_id, out);
+        out.push(r.outcome as u8);
     }
 }
 

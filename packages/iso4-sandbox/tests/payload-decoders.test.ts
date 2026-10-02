@@ -84,8 +84,8 @@ interface TestBridgeRecord {
   durationMs: number
   argBytes: number
   responseBytes: number
-  ok: boolean
-  blocked: boolean
+  callId: number
+  outcome: number
 }
 
 function bridgeRecords(records: readonly TestBridgeRecord[]): Buffer {
@@ -97,8 +97,8 @@ function bridgeRecords(records: readonly TestBridgeRecord[]): Buffer {
       f64(r.durationMs),
       u32(r.argBytes),
       u32(r.responseBytes),
-      Buffer.from([r.ok ? 1 : 0]),
-      Buffer.from([r.blocked ? 1 : 0]),
+      u32(r.callId),
+      Buffer.from([r.outcome]),
     ])),
   ])
 }
@@ -351,8 +351,8 @@ describe('decodeRunCompletionPayload — success', () => {
         durationMs: 2.25,
         argBytes: 180,
         responseBytes: 4096,
-        ok: true,
-        blocked: false,
+        callId: 7,
+        outcome: 0,
       },
       {
         name: 'tools:search.query',
@@ -360,8 +360,8 @@ describe('decodeRunCompletionPayload — success', () => {
         durationMs: 0.5,
         argBytes: 64,
         responseBytes: 0,
-        ok: false,
-        blocked: false,
+        callId: 8,
+        outcome: 2,
       },
     ]
     const success = decodeRunCompletionPayload(
@@ -374,7 +374,10 @@ describe('decodeRunCompletionPayload — success', () => {
       }),
     )
     expect(success.result.cpuTimeMs).toBeCloseTo(1.25)
-    expect(success.result.bridgeCalls).toEqual(records)
+    expect(success.result.bridgeCalls).toEqual([
+      { name: 'fetch', startMs: 0.5, durationMs: 2.25, argBytes: 180, responseBytes: 4096, ok: true },
+      { name: 'tools:search.query', startMs: 3, durationMs: 0.5, argBytes: 64, responseBytes: 0, ok: false, reason: 'error' },
+    ])
 
     const failure = decodeRunCompletionPayload(
       encodeCompletionPayload(0, {
@@ -390,14 +393,43 @@ describe('decodeRunCompletionPayload — success', () => {
           durationMs: 0,
           argBytes: 0,
           responseBytes: 0,
-          ok: false,
-          blocked: true,
+          callId: 0xFFFFFFFF,
+          outcome: 1,
         }],
       }),
     )
     expect(failure.result.cpuTimeMs).toBeCloseTo(0.75)
     expect(failure.result.bridgeCalls).toHaveLength(1)
-    expect(failure.result.bridgeCalls[0]?.blocked).toBe(true)
+    expect(failure.result.bridgeCalls[0]).toMatchObject({ ok: false, reason: 'blocked' })
+  })
+
+  test('an unanswered record is dropped only when the client skipped its callId', () => {
+    const records = [
+      { name: 'a', startMs: 0, durationMs: 1, argBytes: 8, responseBytes: 0, callId: 41, outcome: 3 },
+      { name: 'b', startMs: 0, durationMs: 1, argBytes: 8, responseBytes: 0, callId: 42, outcome: 3 },
+    ]
+    const plain = decodeRunCompletionPayload(
+      encodeCompletionPayload(1, { ok: true, exports: {}, bridgeCalls: records }),
+    )
+    expect(plain.result.bridgeCalls.map((c) => (c.ok ? 'ok' : c.reason)))
+      .toEqual(['unanswered', 'unanswered'])
+    const marked = decodeRunCompletionPayload(
+      encodeCompletionPayload(1, { ok: true, exports: {}, bridgeCalls: records }),
+      undefined,
+      new Set([42]),
+    )
+    expect(marked.result.bridgeCalls.map((c) => (c.ok ? 'ok' : c.reason)))
+      .toEqual(['unanswered', 'dropped'])
+  })
+
+  test('an unknown outcome byte is a decode error', () => {
+    expect(() => decodeRunCompletionPayload(
+      encodeCompletionPayload(1, {
+        ok: true,
+        exports: {},
+        bridgeCalls: [{ name: 'a', startMs: 0, durationMs: 0, argBytes: 0, responseBytes: 0, callId: 1, outcome: 9 }],
+      }),
+    )).toThrow(PayloadDecodeError)
   })
 })
 

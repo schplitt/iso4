@@ -2224,6 +2224,10 @@ describe('AbortSignal cancellation', () => {
       setTimeout(r, 100)
     })
     expect(charges).toBe(0)
+    // `bad` ran and was still in flight; the three `charge` frames were
+    // never handed to the host.
+    expect(result.bridgeCalls.map((c) => (c.ok ? 'ok' : c.reason)))
+      .toEqual(['unanswered', 'dropped', 'dropped', 'dropped'])
   })
 
   test('prefix.run honors an in-flight abort and keeps the prefix usable', async () => {
@@ -3906,7 +3910,6 @@ describe('bridge report', () => {
     expect(first.responseBytes).toBeGreaterThan(2000)
     for (const call of result.bridgeCalls) {
       expect(call.ok).toBe(true)
-      expect(call.blocked).toBe(false)
       expect(call.startMs).toBeGreaterThanOrEqual(0)
       expect(call.durationMs).toBeGreaterThanOrEqual(0)
       expect(call.argBytes).toBeGreaterThan(0)
@@ -3995,8 +3998,7 @@ describe('bridge report', () => {
     expect(result.ok).toBe(true)
     expect(result.exports.default).toBe(true)
     expect(result.bridgeCalls).toHaveLength(1)
-    expect(result.bridgeCalls[0].ok).toBe(false)
-    expect(result.bridgeCalls[0].blocked).toBe(false)
+    expect(result.bridgeCalls[0]).toMatchObject({ ok: false, reason: 'error' })
     expect(result.bridgeCalls[0].responseBytes).toBe(0)
   })
 
@@ -4032,10 +4034,9 @@ describe('bridge report', () => {
     expect(result.error.code).toBe('ERR_BRIDGE_CALL_LIMIT_EXCEEDED')
     // The 4th attempt never reached the host but is on the record — blocked.
     expect(result.bridgeCalls).toHaveLength(4)
-    expect(result.bridgeCalls.slice(0, 3).every((c) => c.ok && !c.blocked)).toBe(true)
+    expect(result.bridgeCalls.slice(0, 3).every((c) => c.ok)).toBe(true)
     const violating = result.bridgeCalls[3]
-    expect(violating.blocked).toBe(true)
-    expect(violating.ok).toBe(false)
+    expect(violating).toMatchObject({ ok: false, reason: 'blocked' })
     expect(violating.responseBytes).toBe(0)
   })
 

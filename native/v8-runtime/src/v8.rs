@@ -484,8 +484,8 @@ impl BridgeCallLog {
             duration_ms: 0.0,
             arg_bytes,
             response_bytes: 0,
-            ok: false,
-            blocked: true,
+            call_id: u32::MAX,
+            outcome: wire::BridgeCallOutcome::Blocked,
         });
     }
 
@@ -500,8 +500,8 @@ impl BridgeCallLog {
             duration_ms: 0.0,
             arg_bytes,
             response_bytes: 0,
-            ok: false,
-            blocked: false,
+            call_id,
+            outcome: wire::BridgeCallOutcome::Unanswered,
         });
         self.in_flight.insert(call_id, self.records.len() - 1);
     }
@@ -512,7 +512,11 @@ impl BridgeCallLog {
         if let Some(idx) = self.in_flight.remove(&call_id) {
             let r = &mut self.records[idx];
             r.duration_ms = round_micro((now_ms - r.start_ms).max(0.0));
-            r.ok = ok;
+            r.outcome = if ok {
+                wire::BridgeCallOutcome::Ok
+            } else {
+                wire::BridgeCallOutcome::Error
+            };
             r.response_bytes = response_bytes;
         }
     }
@@ -531,7 +535,7 @@ impl BridgeCallLog {
     }
 
     /// Snapshot the records for the run result. Calls still in flight get
-    /// their duration set to "until run end" and stay `ok: false`.
+    /// their duration set to "until run end" and stay `Unanswered`.
     fn finalize(&mut self, now_ms: f64) -> Vec<wire::BridgeCallRecord> {
         for idx in self.in_flight.values() {
             let r = &mut self.records[*idx];
@@ -12273,8 +12277,7 @@ mod tests {
         // (unsettled → ok=false), not dropped.
         assert_eq!(failure.bridge_calls.len(), 1);
         assert_eq!(failure.bridge_calls[0].name, "myTool");
-        assert!(!failure.bridge_calls[0].ok);
-        assert!(!failure.bridge_calls[0].blocked);
+        assert_eq!(failure.bridge_calls[0].outcome, wire::BridgeCallOutcome::Unanswered);
         // Timings are stamped from the shared run state, not left as zeros.
         assert!(failure.duration_ms >= 0.0);
         assert!(failure.cpu_time_ms >= 0.0);
@@ -13160,8 +13163,7 @@ mod tests {
         assert_eq!(out.bridge_calls.len(), 3);
         for record in &out.bridge_calls {
             assert_eq!(record.name, "myTool");
-            assert!(record.ok, "served call must settle ok");
-            assert!(!record.blocked);
+            assert_eq!(record.outcome, wire::BridgeCallOutcome::Ok, "served call must settle ok");
             assert!(record.arg_bytes > 0, "call payload has at least the header");
             assert!(record.response_bytes > 0, "number response has bytes");
             assert!(record.duration_ms >= 0.0);
@@ -13208,10 +13210,9 @@ mod tests {
         handle.join().unwrap();
         assert!(matches!(failure.error, RunError::BridgeCallLimitExceeded));
         assert_eq!(failure.bridge_calls.len(), 4);
-        assert!(failure.bridge_calls[..3].iter().all(|r| r.ok && !r.blocked));
+        assert!(failure.bridge_calls[..3].iter().all(|r| r.outcome == wire::BridgeCallOutcome::Ok));
         let violating = &failure.bridge_calls[3];
-        assert!(violating.blocked, "attempt past the limit is blocked");
-        assert!(!violating.ok);
+        assert_eq!(violating.outcome, wire::BridgeCallOutcome::Blocked);
         assert_eq!(violating.response_bytes, 0);
     }
 
@@ -13972,7 +13973,7 @@ mod tests {
         // The bridge record carries the resolved public name.
         assert_eq!(out.bridge_calls.len(), 1);
         assert_eq!(out.bridge_calls[0].name, "tools:search.query");
-        assert!(out.bridge_calls[0].ok);
+        assert_eq!(out.bridge_calls[0].outcome, wire::BridgeCallOutcome::Ok);
     }
 
     #[test]
@@ -14072,7 +14073,7 @@ mod tests {
         );
         // One blocked record for the refused attempt.
         assert_eq!(out.bridge_calls.len(), 1);
-        assert!(out.bridge_calls[0].blocked);
+        assert_eq!(out.bridge_calls[0].outcome, wire::BridgeCallOutcome::Blocked);
         // The responder thread never got a frame; drop it by closing our end.
         drop(h);
     }
