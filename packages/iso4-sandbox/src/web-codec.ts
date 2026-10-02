@@ -28,6 +28,7 @@
  */
 
 import { Buffer } from 'node:buffer'
+import { types } from 'node:util'
 import v8 from 'node:v8'
 import { STREAM_PROBE_BYTES } from './ipc.js'
 
@@ -454,12 +455,6 @@ async function toDescriptor(
 }
 
 /**
- * Depth cap, matching `MAX_DEPTH` in `webcodec.rs`. Cycles are handled by the
- * `seen` map, so this only bounds pathologically deep graphs.
- */
-const MAX_DEPTH = 32
-
-/**
  * Replace every `Request`/`Response`/`Headers` anywhere in `value` with a
  * branded plain object, returning a graph ordinary serialization can write.
  *
@@ -469,7 +464,10 @@ const MAX_DEPTH = 32
  * instance and do not reuse it afterwards (streams cannot cross the boundary,
  * so the body must be buffered rather than forwarded). Object identity and
  * cycles are preserved through `seen`. `Map`/`Set` are rebuilt because a host
- * type can hide in either.
+ * type can hide in either. A value with no host type (and no Proxy) anywhere
+ * is returned as is, so the common case costs one scan and no copy. Depth is not capped:
+ * the scan is iterative and every level of the rebuild suspends on an
+ * `await`, so neither deepens the call stack.
  * @param value the value to transform
  * @param brandKey the sandbox's session brand key ({@link brandKeyForToken});
  * the runtime rehydrates only descriptors stamped with it
@@ -480,7 +478,47 @@ export async function materializeHostTypes(
   brandKey: string,
   streams?: StreamSourceRegistry,
 ): Promise<unknown> {
-  return transform(value, brandKey, streams, new Map(), 0)
+  if (!hasHostType(value))
+    return value
+  return transform(value, brandKey, streams, new Map())
+}
+
+function hasHostType(value: unknown): boolean {
+  const seen = new Set<object>()
+  const stack: object[] = []
+  const push = (v: unknown): void => {
+    if (v !== null && typeof v === 'object')
+      stack.push(v)
+  }
+  push(value)
+  for (let v = stack.pop(); v !== undefined; v = stack.pop()) {
+    if (seen.has(v))
+      continue
+    seen.add(v)
+    // A Proxy also forces the rebuild: V8 refuses to clone one, the copy
+    // reads through its traps as before.
+    if (v instanceof globalThis.Response || v instanceof globalThis.Request || v instanceof globalThis.Headers
+      || types.isProxy(v)) {
+      return true
+    }
+    if (ArrayBuffer.isView(v) || v instanceof ArrayBuffer
+      || v instanceof Date || v instanceof RegExp || v instanceof Error) {
+      continue
+    }
+    if (Array.isArray(v)) {
+      for (const item of v) push(item)
+    } else if (v instanceof Map) {
+      for (const [k, item] of v) {
+        push(k)
+        push(item)
+      }
+    } else if (v instanceof Set) {
+      for (const item of v) push(item)
+    } else {
+      for (const item of Object.values(v)) push(item)
+    }
+  }
+  return false
 }
 
 async function transform(
@@ -488,15 +526,9 @@ async function transform(
   brandKey: string,
   streams: StreamSourceRegistry | undefined,
   seen: Map<object, unknown>,
-  depth: number,
 ): Promise<unknown> {
   if (value === null || typeof value !== 'object')
     return value
-  if (depth > MAX_DEPTH) {
-    throw new HostTypeError(
-      `[iso4] value nests deeper than ${MAX_DEPTH} levels; cannot scan it for host types`,
-    )
-  }
 
   const existing = seen.get(value)
   if (existing !== undefined)
@@ -518,7 +550,7 @@ async function transform(
   if (Array.isArray(value)) {
     const out: unknown[] = []
     seen.set(value, out)
-    for (const item of value) out.push(await transform(item, brandKey, streams, seen, depth + 1))
+    for (const item of value) out.push(await transform(item, brandKey, streams, seen))
     return out
   }
 
@@ -526,14 +558,14 @@ async function transform(
     const out = new Map<unknown, unknown>()
     seen.set(value, out)
     for (const [k, v] of value)
-      out.set(await transform(k, brandKey, streams, seen, depth + 1), await transform(v, brandKey, streams, seen, depth + 1))
+      out.set(await transform(k, brandKey, streams, seen), await transform(v, brandKey, streams, seen))
     return out
   }
 
   if (value instanceof Set) {
     const out = new Set<unknown>()
     seen.set(value, out)
-    for (const v of value) out.add(await transform(v, brandKey, streams, seen, depth + 1))
+    for (const v of value) out.add(await transform(v, brandKey, streams, seen))
     return out
   }
 
@@ -546,7 +578,7 @@ async function transform(
   const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>
   seen.set(value, out)
   for (const [k, v] of Object.entries(value))
-    out[k] = await transform(v, brandKey, streams, seen, depth + 1)
+    out[k] = await transform(v, brandKey, streams, seen)
   return out
 }
 

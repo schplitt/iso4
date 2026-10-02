@@ -173,6 +173,9 @@ request and response values cross the bridge.
 | `Response` | 🟡            | `formData`, `blob`                                                                                 |
 | `fetch`    | ❌ by default | host-supplied capability; `@iso4/fetch` ships a hardened implementation                            |
 
+Host-supplied `Request`/`Response`/`Headers` arrive as real instances at any
+position in a value — nested, in `Map`/`Set` entries, shared or cyclic.
+
 `Response.body` is `null` for a buffered body. Streamed bodies exist on the
 wire in both directions, but the guest reads them through the runtime's own
 stream object rather than a spec `ReadableStream` — see `DESIGN.md` §7.3 and
