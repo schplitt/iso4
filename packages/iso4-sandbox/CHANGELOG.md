@@ -1,5 +1,17 @@
 # @iso4/sandbox
 
+## 0.6.2
+
+### Patch Changes
+
+- f89eed5: feat(sandbox): say why a bridge call failed in `bridgeCalls`
+
+  `BridgeCallEntry` loses `blocked` and gains `reason` (`blocked` | `error` | `unanswered` | `dropped`) whenever `ok` is false. Replace `entry.blocked` checks with `entry.reason === 'blocked'`.
+
+- 8a585c6: fix(sandbox): stop dispatching queued bridge calls once a run is aborted
+
+  Host globals are no longer invoked for bridge calls the sandbox sent before the abort but the client had not yet dispatched. Handlers already running still finish.
+
 ## 0.6.1
 
 ### Patch Changes
