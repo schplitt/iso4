@@ -785,6 +785,13 @@ Handle IDs never cross the wire: the runtime derives them from the declared
 shape (depth-first over each binding, bindings in wire order) and resolves
 them back to `(specifier, path)` before a `BridgeCall` frame is written.
 
+Shape depth is bounded at **64** levels, counted as a node's path length from
+its top-level export (`search` is 1, `users.create` is 2). The runtime refuses
+a deeper shape at decode, at the first node past the bound, as a decode error
+for that connection like any other malformed payload (§3). The bound covers only the
+shape: the value inside a `data` leaf is bounded only by V8's deserializer
+(§4.4.5).
+
 `ImportRebind` (`PrefixRun` only):
 
 The declared module shapes are frozen at declaration and stored with the

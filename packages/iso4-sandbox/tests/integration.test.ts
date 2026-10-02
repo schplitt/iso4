@@ -1306,6 +1306,17 @@ describe('imports failure paths', () => {
       return
     expect(result.error.code).toBe('ERR_HOST_BRIDGE')
   })
+
+  test('a host-module shape nested past the depth limit is refused on the host; the runtime stays up', async () => {
+    let deep: Record<string, unknown> = { leaf: 1 }
+    for (let i = 0; i < 2500; i++)
+      deep = { c: deep }
+    await expect(
+      runtime.prepare({ code: 'export const ok = true', imports: { 'host:x': { d: deep as never } } }),
+    ).rejects.toThrow(/imports\['host:x'\]\.d\.c\..*: host-module shapes may nest at most 64 levels deep/)
+    const result = await runtime.run({ code: 'export default 1' })
+    expect(result.ok).toBe(true)
+  })
 })
 
 // ── Phase 3/8: resource limits enforcement ─────────────────────────────────

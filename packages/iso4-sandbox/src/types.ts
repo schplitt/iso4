@@ -414,7 +414,7 @@ export type Imports<M extends Record<string, ImportValue> = Record<string, Impor
 
 /**
  * A single import value. String = source module. Object = host module
- * description (the recursive walker handles all nesting).
+ * description (nested up to 64 levels, see {@link HostModuleObject}).
  */
 export type ImportValue = string | HostModuleObject
 
@@ -432,6 +432,11 @@ export type ImportValue = string | HostModuleObject
  * path: V8's format would carry them, but only as their own enumerable
  * properties, so the methods you meant to send would vanish silently. Copy
  * what you mean to send into a plain object.
+ *
+ * Shapes may nest at most 64 levels (a node's path length from its top-level
+ * export). A deeper shape is rejected at registration, naming the path. Plain
+ * objects always describe shape, so this cap also applies to deep plain-object
+ * data; data in any other container is bounded only by V8's deserializer.
  */
 export interface HostModuleObject {
   [name: string]: HostModuleValue

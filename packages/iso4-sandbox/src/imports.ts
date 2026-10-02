@@ -51,6 +51,12 @@ import type {
 export const BRIDGE_DISPATCH_GLOBAL = '__iso4_call'
 
 /**
+ * Deepest host-module shape node, as a path length from a top-level export.
+ * A wire rule shared with the runtime (`docs/protocol.md` §5.2).
+ */
+export const MAX_HOST_MODULE_DEPTH = 64
+
+/**
  * Handler lookup for host-module function leaves, keyed by
  * `importHandlerKey(specifier, path)`. Built at `processImports` time
  * (precompile / direct run) and re-derived with per-run overrides by
@@ -169,6 +175,12 @@ function lowerNode(
   handlers: ImportHandlerMap,
   seen: Set<object> = new Set(),
 ): HostModuleNodePayload {
+  if (path.length > MAX_HOST_MODULE_DEPTH) {
+    throw new Error(
+      `[@iso4/sandbox] imports['${specifier}'].${path.join('.')}: `
+      + `host-module shapes may nest at most ${MAX_HOST_MODULE_DEPTH} levels deep`,
+    )
+  }
   if (typeof value === 'function') {
     handlers.set(importHandlerKey(specifier, path.join('.')), value as HostExportFunction)
     return { kind: 'function' }
