@@ -93,6 +93,13 @@ fn malformed<T>(what: &str) -> Result<T, CodecError> {
 
 type Codec<T> = Result<T, CodecError>;
 
+/// A V8 call came back empty mid-walk: the run is being terminated.
+fn interrupted<T>() -> Codec<T> {
+    Err(CodecError::Unsupported(
+        "host-type rehydration interrupted: execution terminating".to_string(),
+    ))
+}
+
 // ── Primitives ───────────────────────────────────────────────────────────────
 
 fn write_bytes(helper: &dyn ValueSerializerHelper, bytes: &[u8]) {
@@ -530,10 +537,10 @@ pub fn might_contain_web_types(blob: &[u8], brand_key: &str) -> bool {
 
 /// Replace every stamped descriptor in `value` with a real instance, in place.
 ///
-/// Depth-limited rather than cycle-tracked: V8 preserves object identity, so a
-/// cyclic graph would otherwise recurse forever. 32 levels is far past anything
-/// a request/response payload needs, and exceeding it is a refusal rather than
-/// silent truncation.
+/// Iterative over an explicit worklist, so depth is bounded only by what V8
+/// deserialized. `seen` maps every visited object to what stands in for it:
+/// itself for a container, the built instance for a descriptor — cycles end
+/// and a shared descriptor keeps one identity.
 pub fn rehydrate<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
@@ -544,63 +551,117 @@ pub fn rehydrate<'s>(
     let Some(key) = v8::String::new(scope, brand_key) else {
         return malformed("could not intern the brand key");
     };
-    rehydrate_at(scope, value, key, 0)
-}
-
-const MAX_DEPTH: u32 = 32;
-
-fn rehydrate_at<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-    brand_key: v8::Local<'s, v8::String>,
-    depth: u32,
-) -> Codec<v8::Local<'s, v8::Value>> {
-    if depth > MAX_DEPTH {
-        return Err(CodecError::Unsupported(format!(
-            "value nests deeper than {MAX_DEPTH} levels; cannot scan it for host types"
-        )));
+    let seen = v8::Map::new(scope);
+    let mut pending: Vec<v8::Local<'s, v8::Object>> = Vec::new();
+    if let Some(replaced) = visit(scope, value, key, seen, &mut pending)? {
+        return Ok(replaced);
     }
-    if !value.is_object() || value.is_array_buffer_view() || value.is_array_buffer() {
-        return Ok(value);
-    }
-    let obj: v8::Local<v8::Object> = match value.try_into() {
-        Ok(o) => o,
-        Err(_) => return Ok(value),
-    };
-
-    // A stamped descriptor is replaced wholesale; its own fields are plain data.
-    if let Some(tag) = brand_of(scope, obj, brand_key) {
-        return build_from_descriptor(scope, obj, tag).map(|o| o.into());
-    }
-
-    if let Ok(array) = v8::Local::<v8::Array>::try_from(value) {
-        for i in 0..array.length() {
-            if let Some(item) = array.get_index(scope, i) {
-                let replaced = rehydrate_at(scope, item, brand_key, depth + 1)?;
-                array.set_index(scope, i, replaced);
-            }
+    while let Some(obj) = pending.pop() {
+        if scope.is_execution_terminating() {
+            return interrupted();
         }
-        return Ok(value);
-    }
-
-    // Own enumerable string keys only — the same surface V8 serialized.
-    let keys = match obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default()) {
-        Some(k) => k,
-        None => return Ok(value),
-    };
-    for i in 0..keys.length() {
-        let Some(key) = keys.get_index(scope, i) else {
+        // Map/Set entries come out flat; a replacement rebuilds them in order.
+        if let Ok(map) = v8::Local::<v8::Map>::try_from(obj) {
+            let entries = map.as_array(scope);
+            let mut pairs = Vec::with_capacity(entries.length() as usize / 2);
+            let mut changed = false;
+            for i in (0..entries.length()).step_by(2) {
+                let (Some(k), Some(v)) = (entries.get_index(scope, i), entries.get_index(scope, i + 1))
+                else {
+                    return interrupted();
+                };
+                let k = visit(scope, k, key, seen, &mut pending)?.inspect(|_| changed = true).unwrap_or(k);
+                let v = visit(scope, v, key, seen, &mut pending)?.inspect(|_| changed = true).unwrap_or(v);
+                pairs.push((k, v));
+            }
+            if changed {
+                map.clear();
+                for (k, v) in pairs {
+                    map.set(scope, k, v);
+                }
+            }
             continue;
-        };
-        let Some(item) = obj.get(scope, key) else {
+        }
+        if let Ok(set) = v8::Local::<v8::Set>::try_from(obj) {
+            let entries = set.as_array(scope);
+            let mut items = Vec::with_capacity(entries.length() as usize);
+            let mut changed = false;
+            for i in 0..entries.length() {
+                let Some(item) = entries.get_index(scope, i) else {
+                    return interrupted();
+                };
+                items.push(visit(scope, item, key, seen, &mut pending)?.inspect(|_| changed = true).unwrap_or(item));
+            }
+            if changed {
+                set.clear();
+                for item in items {
+                    set.add(scope, item);
+                }
+            }
             continue;
+        }
+        if let Ok(array) = v8::Local::<v8::Array>::try_from(obj) {
+            for i in 0..array.length() {
+                let Some(item) = array.get_index(scope, i) else {
+                    return interrupted();
+                };
+                if let Some(replaced) = visit(scope, item, key, seen, &mut pending)? {
+                    array.set_index(scope, i, replaced);
+                }
+            }
+            continue;
+        }
+        // Own enumerable string keys only — the same surface V8 serialized.
+        let Some(keys) = obj.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+        else {
+            return interrupted();
         };
-        let replaced = rehydrate_at(scope, item, brand_key, depth + 1)?;
-        if replaced != item {
-            obj.set(scope, key, replaced);
+        for i in 0..keys.length() {
+            let Some(k) = keys.get_index(scope, i) else {
+                return interrupted();
+            };
+            let Some(item) = obj.get(scope, k) else {
+                return interrupted();
+            };
+            if let Some(replaced) = visit(scope, item, key, seen, &mut pending)? {
+                obj.set(scope, k, replaced);
+            }
         }
     }
     Ok(value)
+}
+
+/// One node: `Some` is the value to write in its place, `None` leaves it.
+/// An unseen container is queued for its children to be visited.
+fn visit<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    brand_key: v8::Local<'s, v8::String>,
+    seen: v8::Local<'s, v8::Map>,
+    pending: &mut Vec<v8::Local<'s, v8::Object>>,
+) -> Codec<Option<v8::Local<'s, v8::Value>>> {
+    if !value.is_object() || value.is_array_buffer_view() || value.is_array_buffer() {
+        return Ok(None);
+    }
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(value) else {
+        return Ok(None);
+    };
+    // A miss reads as `undefined`; a stand-in is always an object.
+    if let Some(stand_in) = seen.get(scope, value).filter(|s| s.is_object()) {
+        return Ok(if stand_in == value { None } else { Some(stand_in) });
+    }
+    // A stamped descriptor is replaced wholesale; its own fields are plain data.
+    // The host only ever emits one as a plain object.
+    if !value.is_array() && !value.is_map() && !value.is_set() {
+        if let Some(tag) = brand_of(scope, obj, brand_key) {
+            let built: v8::Local<v8::Value> = build_from_descriptor(scope, obj, tag)?.into();
+            seen.set(scope, value, built);
+            return Ok(Some(built));
+        }
+    }
+    seen.set(scope, value, value);
+    pending.push(obj);
+    Ok(None)
 }
 
 fn brand_of(
@@ -608,7 +669,11 @@ fn brand_of(
     obj: v8::Local<v8::Object>,
     brand_key: v8::Local<v8::String>,
 ) -> Option<u32> {
-    match obj.get(scope, brand_key.into()) {
+    // Own property only: a plain `get` would consult guest-mutable prototypes.
+    if obj.has_own_property(scope, brand_key.into()) != Some(true) {
+        return None;
+    }
+    match obj.get_real_named_property(scope, brand_key.into()) {
         Some(v) if v.is_uint32() => v.uint32_value(scope),
         _ => None,
     }
@@ -978,6 +1043,148 @@ mod tests {
             probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
         });
         assert_eq!(out, "false");
+    }
+
+    #[test]
+    fn a_cyclic_graph_rehydrates_and_a_shared_descriptor_keeps_one_identity() {
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let out = with_web(|scope| {
+            let value = eval(
+                scope,
+                &format!(
+                    "(() => {{ const r = {{ '{key}': 3, status: 201, statusText: '', \
+                        headers: [], body: null }}; \
+                      const g = {{ res: r, list: [r] }}; g.self = g; g.list.push(g); \
+                      return g; }})()"
+                ),
+            );
+            let out = rehydrate(scope, value, &key).expect("rehydrate");
+            let global = scope.get_current_context().global(scope);
+            let name = v8::String::new(scope, "__rt").unwrap();
+            global.set(scope, name.into(), out);
+            let probe = eval(
+                scope,
+                "[__rt.self === __rt, __rt.list[1] === __rt, \
+                  __rt.res instanceof Response, __rt.list[0] === __rt.res, \
+                  __rt.res.status].join('|')",
+            );
+            probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
+        });
+        assert_eq!(out, "true|true|true|true|201");
+    }
+
+    #[test]
+    fn nesting_depth_is_not_capped() {
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let out = with_web(|scope| {
+            let value = eval(
+                scope,
+                &format!(
+                    "(() => {{ let v = {{ '{key}': 3, status: 202, statusText: '', \
+                        headers: [], body: null }}; \
+                      for (let i = 0; i < 100000; i++) v = i % 2 ? [v] : {{ c: v }}; \
+                      return v; }})()"
+                ),
+            );
+            let out = rehydrate(scope, value, &key).expect("rehydrate");
+            let global = scope.get_current_context().global(scope);
+            let name = v8::String::new(scope, "__rt").unwrap();
+            global.set(scope, name.into(), out);
+            let probe = eval(
+                scope,
+                "(() => { let d = 0, v = __rt; \
+                  while (!(v instanceof Response)) { v = Array.isArray(v) ? v[0] : v.c; d++ } \
+                  return d + '|' + v.status; })()",
+            );
+            probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
+        });
+        assert_eq!(out, "100000|202");
+    }
+
+    #[test]
+    fn host_types_inside_map_and_set_rehydrate_in_order() {
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let out = with_web(|scope| {
+            let value = eval(
+                scope,
+                &format!(
+                    "(() => {{ const h = {{ '{key}': 1, headers: ['x-a', '1'], body: null }}; \
+                      const r = {{ '{key}': 3, status: 204, statusText: '', headers: [], body: null }}; \
+                      return {{ m: new Map([['first', 1], [h, r], ['last', 2]]), \
+                               s: new Set([0, r, 'z']) }}; }})()"
+                ),
+            );
+            let out = rehydrate(scope, value, &key).expect("rehydrate");
+            let global = scope.get_current_context().global(scope);
+            let name = v8::String::new(scope, "__rt").unwrap();
+            global.set(scope, name.into(), out);
+            let probe = eval(
+                scope,
+                "(() => { const [[k0], [k1, v1], [k2]] = [...__rt.m]; const [s0, s1, s2] = [...__rt.s]; \
+                  return [k0, k1 instanceof Headers, k1.get('x-a'), v1 instanceof Response, v1.status, k2, \
+                          s0, s1 === v1, s2].join('|'); })()",
+            );
+            probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
+        });
+        assert_eq!(out, "first|true|1|true|204|last|0|true|z");
+    }
+
+    #[test]
+    fn shared_subtrees_are_visited_once() {
+        // 40 levels of [a, a] is 2^40 paths; the visited map makes it 40 nodes.
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let out = with_web(|scope| {
+            let value = eval(
+                scope,
+                &format!(
+                    "(() => {{ let a = [{{ '{key}': 3, status: 205, statusText: '', headers: [], body: null }}]; \
+                      for (let i = 0; i < 40; i++) a = [a, a]; return a; }})()"
+                ),
+            );
+            let out = rehydrate(scope, value, &key).expect("rehydrate");
+            let global = scope.get_current_context().global(scope);
+            let name = v8::String::new(scope, "__rt").unwrap();
+            global.set(scope, name.into(), out);
+            let probe = eval(
+                scope,
+                "(() => { let v = __rt; while (Array.isArray(v)) v = v[0]; return v.status; })()",
+            );
+            probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
+        });
+        assert_eq!(out, "205");
+    }
+
+    #[test]
+    fn a_graph_without_descriptors_is_returned_untouched() {
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        with_web(|scope| {
+            let value = eval(scope, "({ a: [1, { b: 2 }], m: new Map([[1, 2]]), s: new Set([3]) })");
+            let out = rehydrate(scope, value, &key).expect("rehydrate");
+            assert!(out == value);
+        });
+    }
+
+    #[test]
+    fn a_brand_key_on_the_prototype_chain_is_not_a_descriptor() {
+        let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
+        let out = with_web(|scope| {
+            let value = eval(
+                scope,
+                &format!(
+                    "(() => {{ const proto = {{ '{key}': 3 }}; \
+                      const fake = Object.setPrototypeOf({{ status: 200, statusText: '', headers: [], body: null }}, proto); \
+                      const arr = Object.setPrototypeOf([], proto); \
+                      return [fake, arr]; }})()"
+                ),
+            );
+            let out = rehydrate(scope, value, &key).expect("rehydrate");
+            let global = scope.get_current_context().global(scope);
+            let name = v8::String::new(scope, "__rt").unwrap();
+            global.set(scope, name.into(), out);
+            let probe = eval(scope, "[__rt[0] instanceof Response, Array.isArray(__rt[1])].join('|')");
+            probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
+        });
+        assert_eq!(out, "false|true");
     }
 
     #[test]

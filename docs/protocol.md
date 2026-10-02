@@ -405,6 +405,7 @@ does not differ per type.
 | `WebSocket`, `AbortSignal`                                      | not self-contained            |
 | a tag this build does not implement                             | unimplemented type            |
 | a host type nested below the top level of a host → sandbox slot | unreachable position (§4.4.6) |
+| a host value deeper than V8's deserializer stack                | too deep (§4.4.6)             |
 
 Types that are **not self-contained** are the general category, borrowed from
 workerd's `ExternalHandler` split (`jsg/ser.h:62`): a value that refers to a
@@ -487,7 +488,14 @@ constructor in the rehydration switch. The walk runs only on host → sandbox
 legs — bridge responses, data globals, and call args — and is guarded by a
 byte scan for the session brand key, so a payload with no stamped descriptors
 pays only that scan (the random token in the needle makes false positives
-practically impossible). Depth is capped at 32 levels on both sides.
+practically impossible). Neither side caps nesting depth: the host walk
+suspends on an `await` at every level and the runtime walk is iterative over
+an explicit worklist with a visited map, so a cycle ends and a shared
+descriptor keeps one identity. The practical ceiling is V8's own stack check
+in its serializer and deserializer, in the low thousands of levels. The
+writing side surfaces V8's `RangeError` as an encode failure (a thrown error
+from `run()`/`call()`, `ERR_HOST_BRIDGE` from a handler); the reading side
+fails the run with `ERR_TYPE_NOT_SERIALIZABLE` on every leg.
 
 The asymmetry is safe because the two directions never share a reader: Rust reads
 what Node writes and vice versa, never both.
@@ -1250,7 +1258,7 @@ state with each other. One-off `Run` frames always get a fresh isolate.
 | `ERR_HOST_BRIDGE`                     | Host global/import handler threw or rejected, uncaught by sandbox code.                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `ERR_BRIDGE_PAYLOAD_TOO_LARGE`        | Bridge call payload exceeded `limits.maxBridgeCallBytes`.                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`      | Total bridge calls in this run exceeded `limits.maxBridgeCalls`.                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`). See §4.4.5.                                                                                                                                                                                                                                                                                |
+| `ERR_TYPE_NOT_SERIALIZABLE`           | A registered host type cannot cross — an unimplemented tag, or contents that are not self-contained (a body that is not `null`/string/`Uint8Array`, `WebSocket`, `AbortSignal`) — or a graph too deep for V8's deserializer. See §4.4.5.                                                                                                                                                                                                                                    |
 | `ERR_UNDECLARED_BINDING`              | `PrefixRun` attempted to bind a global/import location never declared by `Precompile`.                                                                                                                                                                                                                                                                                                                                                                                      |
 | `ERR_RESERVED_NAME`                   | A host global (or bridge stub) uses a name the runtime owns (`console`, `setTimeout`, `Response`, …) and may not shadow. Shaped to also cover runtime-owned module specifiers if one ever becomes non-overridable.                                                                                                                                                                                                                                                          |
 | `ERR_FROZEN_BINDING`                  | A `PrefixRun` rebind targets a declared location that is frozen with the prefix: a source module or a data leaf. Only host-module function leaves can be rebound.                                                                                                                                                                                                                                                                                                           |

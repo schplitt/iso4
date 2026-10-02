@@ -214,10 +214,10 @@ pub fn deserialize_value_with_web_types<'s>(
 
 /// Read one V8 value back from a blob.
 ///
-/// `None` means the bytes are truncated, corrupt, or written by a newer V8
-/// serialization format than this binary can read. The format version is
-/// checked once per connection at handshake time (see `session.rs`), so
-/// reaching `None` at run time means a corrupt payload.
+/// `None` means the bytes are truncated, corrupt, written by a newer V8
+/// serialization format than this binary can read, or nested past V8's
+/// reader stack — then `take_codec_error` carries the reason. The format
+/// version is checked once per connection at handshake time (`session.rs`).
 pub fn deserialize_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
@@ -233,6 +233,19 @@ pub fn deserialize_value<'s>(
     }
     let value = deserializer.read_value(context);
     if value.is_none() {
+        // V8's reader is recursive: a graph past its stack check throws a
+        // RangeError, which is a refusal rather than corrupt bytes.
+        let too_deep = tc
+            .message()
+            .map(|m| m.get(tc).to_rust_string_lossy(tc))
+            .is_some_and(|m| m.contains("Maximum call stack size exceeded"));
+        if too_deep {
+            LAST_CODEC_ERROR.with(|slot| {
+                *slot.borrow_mut() = Some(CodecError::Unsupported(
+                    "value nests too deep for V8 to deserialize".to_string(),
+                ));
+            });
+        }
         tc.reset();
     }
     value
@@ -343,10 +356,45 @@ pub fn probe_format_version(probe: &[u8]) -> Option<u8> {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+/// A format-15 blob of `depth` nested one-element dense arrays around `0`,
+/// built without recursion so it can be as deep as a test needs.
+#[cfg(test)]
+pub(crate) fn deep_array_blob(depth: usize) -> Vec<u8> {
+    let mut out = vec![0xFF, RELABELLED_FORMAT_VERSION];
+    for _ in 0..depth {
+        out.extend_from_slice(b"A\x01");
+    }
+    out.extend_from_slice(b"I\x00");
+    for _ in 0..depth {
+        out.extend_from_slice(b"$\x00\x01");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::v8::init_platform;
+
+    #[test]
+    fn a_shallow_hand_built_blob_reads_back() {
+        with_scope(|scope| {
+            let value = deserialize_value(scope, &deep_array_blob(3)).expect("deserialize");
+            assert_eq!(display(scope, value), "[[[number:0]]]");
+        });
+    }
+
+    #[test]
+    fn a_blob_too_deep_for_the_reader_is_a_too_deep_codec_error() {
+        with_scope(|scope| {
+            assert!(deserialize_value(scope, &deep_array_blob(1_000_000)).is_none());
+            let err = take_codec_error().expect("codec error recorded");
+            assert!(
+                matches!(err, CodecError::Unsupported(ref m) if m.contains("too deep")),
+                "got {err:?}"
+            );
+        });
+    }
 
     /// Run `body` inside a fresh isolate + context.
     fn with_scope<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {

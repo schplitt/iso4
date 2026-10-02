@@ -1673,7 +1673,8 @@ export type RunErrorCode
     /**
      * A registered host type (`Request`, `Response`, …) cannot cross this
      * boundary in this position — an unimplemented tag, or content that is not
-     * self-contained such as a stream body. See `docs/protocol.md` §4.4.5.
+     * self-contained such as a stream body — or a host value nests too deep
+     * for the runtime to read. See `docs/protocol.md` §4.4.5.
      */
     | 'ERR_TYPE_NOT_SERIALIZABLE'
     | 'ERR_EXPORT_TOO_LARGE'

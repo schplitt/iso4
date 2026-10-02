@@ -3180,21 +3180,18 @@ fn frame_turn(
                                         blob::deserialize_value_with_web_types(scope, bytes)
                                     }
                                 };
-                                if let Some(v8_val) = decoded {
-                                    resolver.resolve(scope, v8_val);
-                                } else {
-                                    let detail = blob::take_codec_error()
-                                        .map(|e| e.message().to_string())
-                                        .unwrap_or_else(|| {
-                                            "failed to deserialize response value".to_string()
-                                        });
-                                    let msg = v8::String::new(
-                                        scope,
-                                        &format!("[iso4] bridge: {detail}"),
-                                    )
-                                    .unwrap();
-                                    resolver.reject(scope, msg.into());
-                                }
+                                let Some(v8_val) = decoded else {
+                                    // Same outcome as a data global or call
+                                    // argument that cannot cross: the run fails.
+                                    let error = match blob::take_codec_error() {
+                                        Some(e) => codec_error_to_run_error(e),
+                                        None => RunError::Internal(
+                                            "failed to deserialize response value".to_string(),
+                                        ),
+                                    };
+                                    return finished(Err(rs.fail(error)));
+                                };
+                                resolver.resolve(scope, v8_val);
                             }
                             Err(bridge_err) => {
                                 // Reject with a real Error carrying the
@@ -12375,6 +12372,37 @@ mod tests {
         assert!(
             matches!(err, RunError::HostBridge(ref e) if e.message.contains("handler blew up")),
             "expected HostBridge, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bridge_result_too_deep_for_the_reader_fails_the_run_as_type_not_serializable() {
+        let (result, h) = run_with_bridge(
+            "try { await myTool() } catch {} export default 1",
+            "myTool",
+            Limits {
+                cpu_time_ms: 5_000,
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            |s| {
+                let blob = crate::blob::deep_array_blob(1_000_000);
+                let mut p = Vec::new();
+                p.extend_from_slice(&0u32.to_be_bytes()); // runId
+                p.extend_from_slice(&0u32.to_be_bytes()); // callId
+                p.push(1); // ok
+                p.push(1); // value present
+                p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+                p.extend_from_slice(&blob);
+                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse, &p)
+                    .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let err = result.unwrap_err().error;
+        assert!(
+            matches!(err, RunError::TypeNotSerializable(ref m) if m.contains("too deep")),
+            "expected TypeNotSerializable, got {err:?}"
         );
     }
 

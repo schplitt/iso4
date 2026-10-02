@@ -204,6 +204,113 @@ describe('host → sandbox nesting', () => {
     )
     expect(value).toBe('m|true|204')
   })
+
+  test('nesting is not capped — a Response 1000 levels down rehydrates', async () => {
+    let deep: unknown = new Response('leaf', { status: 208 })
+    for (let i = 0; i < 1000; i++) deep = { c: deep }
+    const value = await run(
+      `let d = 0, v = globalThis.payload
+       while (!(v instanceof Response)) { v = v.c; d++ }
+       export default [d, v.status, await v.text()].join('|')`,
+      { payload: { kind: 'data', value: deep } },
+    )
+    expect(value).toBe('1000|208|leaf')
+  })
+
+  test('a bridge handler may return plain data hundreds of levels deep', async () => {
+    let deep: unknown = { leaf: true }
+    for (let i = 0; i < 500; i++) deep = [deep]
+    const value = await run(
+      `let d = 0, v = await globalThis.callHost()
+       while (Array.isArray(v)) { v = v[0]; d++ }
+       export default [d, v.leaf].join('|')`,
+      { callHost: () => deep },
+    )
+    expect(value).toBe('500|true')
+  })
+
+  test('a cyclic graph sharing one Response keeps identity in the sandbox', async () => {
+    const res = new Response(null, { status: 209 })
+    const graph: Record<string, unknown> = { res, list: [res] }
+    graph.self = graph
+    ;(graph.list as unknown[]).push(graph)
+    const value = await run(
+      `const g = globalThis.payload
+       export default [g.self === g, g.list[1] === g, g.res instanceof Response,
+                       g.list[0] === g.res, g.res.status].join('|')`,
+      { payload: { kind: 'data', value: graph } },
+    )
+    expect(value).toBe('true|true|true|true|209')
+  })
+
+  test('host types inside Map and Set rehydrate, keys included', async () => {
+    const h = new Headers([['x-a', '1']])
+    const r = new Response(null, { status: 210 })
+    const value = await run(
+      `const [[k0], [k1, v1], [k2]] = [...globalThis.payload.m]
+       const [s0, s1] = [...globalThis.payload.s]
+       export default [k0, k1 instanceof Headers, k1.get('x-a'), v1 instanceof Response, v1.status, k2,
+                       s0, s1 === v1].join('|')`,
+      {
+        payload: {
+          kind: 'data',
+          value: { m: new Map<unknown, unknown>([['first', 1], [h, r], ['last', 2]]), s: new Set<unknown>([0, r]) },
+        },
+      },
+    )
+    expect(value).toBe('first|true|1|true|210|last|0|true')
+  })
+
+  test('a bridge handler may return host types inside Map and Set', async () => {
+    const value = await run(
+      `const { m, s } = await globalThis.callHost()
+       export default [m.get('r') instanceof Response, [...s][0] instanceof Headers, [...s][0].get('x-a')].join('|')`,
+      { callHost: () => ({ m: new Map([['r', new Response(null)]]), s: new Set([new Headers([['x-a', '1']])]) }) },
+    )
+    expect(value).toBe('true|true|1')
+  })
+
+  test('a cyclic graph may come back from a bridge handler', async () => {
+    const graph: Record<string, unknown> = { req: new Request('https://ex.com/') }
+    graph.self = graph
+    const value = await run(
+      `const g = await globalThis.callHost()
+       export default [g.self === g, g.req instanceof Request, g.req.url].join('|')`,
+      { callHost: () => graph },
+    )
+    expect(value).toBe('true|true|https://ex.com/')
+  })
+
+  test('call() arguments may be deep and cyclic', async () => {
+    const prefix = await sandbox.prepare({
+      code: `export function probe(deep, cyc) {
+               let d = 0, v = deep
+               while (!(v instanceof Response)) { v = v.c; d++ }
+               return [d, v.status, cyc.self === cyc, cyc.res instanceof Response].join('|')
+             }`,
+    })
+    try {
+      let deep: unknown = new Response(null, { status: 211 })
+      for (let i = 0; i < 1000; i++) deep = { c: deep }
+      const cyc: Record<string, unknown> = { res: new Response(null) }
+      cyc.self = cyc
+      const result = await prefix.call({ export: 'probe', args: [deep, cyc] })
+      if (!result.ok)
+        throw new Error(`${result.error.code}: ${result.error.message}`)
+      expect(result.value).toBe('1000|211|true|true')
+    } finally {
+      await prefix.dispose()
+    }
+  })
+
+  test('a Proxy without host types still crosses as a plain copy', async () => {
+    const proxied = new Proxy({ a: 1 }, { get: (t, k) => (k === 'b' ? 2 : Reflect.get(t, k)), ownKeys: () => ['a', 'b'], getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) })
+    const value = await run(
+      `const v = await globalThis.callHost(); export default [v.a, v.b].join('|')`,
+      { callHost: () => ({ p: proxied }).p },
+    )
+    expect(value).toBe('1|2')
+  })
 })
 
 describe('refusals', () => {
