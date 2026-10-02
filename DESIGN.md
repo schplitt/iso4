@@ -2600,9 +2600,12 @@ connection stays healthy and keeps serving — no reconnect. An orphaned
 bridge handler that resolves *after* the abort writes its `BridgeResponse`
 onto the (reused) connection, where it is discarded — the demux finds no
 route for the finished run, and the monotonic per-connection call-ID
-counter guarantees a stale callId never matches a later run's resolver. So
-`controller.abort()` from inside a bridge handler is a spoof-proof way to
-stop a run.
+counter guarantees a stale callId never matches a later run's resolver.
+`BridgeCall` frames the run had already sent but the client has not yet
+dispatched when a signal fires are dropped without invoking the host handler —
+even when the run still concludes `ok` because it never awaited them. So
+`controller.abort()` from inside a bridge handler is a spoof-proof way to stop
+a run: handlers already running finish, nothing new starts.
 
 **Fallback (wedged-runtime caveat, hard aborts only)**: a hard abort always
 answers promptly, so if no result arrives within `TERMINATE_GRACE_MS`
