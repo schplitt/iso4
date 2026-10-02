@@ -18,6 +18,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   ImportRebindError,
+  MAX_HOST_MODULE_DEPTH,
   importHandlerKey,
   mergeRebindImports,
   processImports,
@@ -240,6 +241,25 @@ describe('processImports — rejected configurations', () => {
         'host:bad': { cfg: cyclic as unknown as never },
       }),
     ).toThrow(/circular references/)
+  })
+
+  it('accepts a host-module shape nested exactly at the depth limit', () => {
+    let node: Record<string, unknown> = { leaf: () => 1 }
+    for (let i = 1; i < MAX_HOST_MODULE_DEPTH; i++)
+      node = { c: node }
+    const { handlers } = processImports({ 'host:deep': node as never })
+    expect(handlers.size).toBe(1)
+    const [key] = handlers.keys()
+    expect(key!.split('.').length).toBe(MAX_HOST_MODULE_DEPTH)
+  })
+
+  it('rejects a host-module shape nested one level past the limit, naming the path', () => {
+    let node: Record<string, unknown> = { leaf: 1 }
+    for (let i = 1; i < MAX_HOST_MODULE_DEPTH + 1; i++)
+      node = { c: node }
+    expect(() =>
+      processImports({ 'host:deep': node as never }),
+    ).toThrow(/imports\['host:deep'\]\.c\.c\..*\.leaf: host-module shapes may nest at most 64 levels deep/)
   })
 
   it('rejects a top-level key that is not a valid identifier', () => {

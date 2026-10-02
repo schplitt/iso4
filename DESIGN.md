@@ -616,8 +616,9 @@ value type is the discriminator:
   whenever the declared imports contain a function leaf. There are **no
   generated bridge-global names** — nothing to sanitise, no collision
   class. Nested objects mixing data and functions are walked recursively
-  and Just Work — `db.users.create()` is a single dispatcher call to one
-  handle ID, no more expensive than a flat call.
+  (shape depth capped at 64, see below) and Just Work — `db.users.create()`
+  is a single dispatcher call to one handle ID, no more expensive than a
+  flat call.
 
   The same dispatcher is the foundation for **callable handles**
   (Phase 13): functions *returned* from a bridge call get registered the
@@ -665,6 +666,15 @@ The object form imposes these restrictions on the value tree:
   shape walker must descend plain objects to find function leaves and cannot
   tell nested shape from cyclic data. Cycles inside any other container
   (arrays, `Map`, `Set`, class instances) cross fine.
+- **Shape depth is capped at 64 levels** (a node's path length from its
+  top-level export). The runtime decodes and walks the shape recursively on a
+  fixed-size thread stack, and the Rust child is shared, so an unbounded
+  shape would be a crash of every tenant, not of one run. The client refuses
+  a deeper shape at registration with the offending path; the runtime
+  independently refuses it at decode (`docs/protocol.md` §5.2). Because
+  plain objects always describe shape, deep plain-object *data* counts
+  against this cap too; data inside any other container is bounded only by
+  V8's own deserializer depth (`docs/protocol.md` §4.4.6).
 - **Stateful object handles** (`createReadStream` returning a stream)
   remain unsupported; nothing changes there.
 - **Class instances with prototype methods** — methods on the prototype
@@ -1383,7 +1393,7 @@ warm instances, §13.2.1; the phase order is unchanged.)
 | 4 ✅   | Generic host-bridge dispatch for globals (string / function / shimmed); `fetch` is just one allowed name on this path                     | Hosts can expose any allowlisted global; `fetch` works as a regular global |
 | 5 ✅   | `@iso4/fetch` package: `createSafeFetch` with allowlist, DNS pin, private-IP blocking, no-auto-redirect                                   | Hardened default users can opt into in two lines                           |
 | 6 ✅   | Imports: source modules (Flavor B); host-supplied ESM strings compiled per-isolate. No separate code-cache LRU — the stored prefix is the cache.   | `import { add } from "lib:math"` works when the host declares the source     |
-| 7 ✅   | Imports: host modules — host provides a JS object; the shape crosses the wire as plain data and the Rust runtime builds the module natively (data leaves via the value codec, function leaves as trampolines dispatching `BridgeCall { targetKind: 1 }` with runtime-resolved names). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for arbitrarily-nested mixed data/function shapes; bridge records report `host:tools.search` with no client-side name resolution |
+| 7 ✅   | Imports: host modules — host provides a JS object; the shape crosses the wire as plain data and the Rust runtime builds the module natively (data leaves via the value codec, function leaves as trampolines dispatching `BridgeCall { targetKind: 1 }` with runtime-resolved names). Nested mixed objects supported via recursive walker. See §4.3. | `import { search } from "host:tools"` works for nested mixed data/function shapes (up to 64 levels); bridge records report `host:tools.search` with no client-side name resolution |
 | 8 ✅   | Custom `ArrayBuffer` allocator, near-heap-limit graceful kill, hard wall-clock guard separate from CPU budget                             | Memory and time limits are tight under adversarial input                   |
 | 9 ✅   | Resident warm instances per prefix — registry, taint-and-evict, memory budget, eviction scoring (shipped as always-on, not behind an option — §13.2.1) | Sub-ms warm calls for high-throughput workloads                            |
 | 10    | Polish: error types, integration tests, READMEs, examples                                                                                 | Shippable v1                                                               |

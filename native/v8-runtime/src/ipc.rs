@@ -1129,6 +1129,10 @@ impl HostGlobalDef {
     }
 }
 
+/// Deepest host-module shape node accepted, as a path length from a top-level
+/// export. Mirrors the TS client's constant (`docs/protocol.md` §5.2).
+const MAX_HOST_MODULE_DEPTH: usize = 64;
+
 /// One node in a host-module shape tree. The tree is plain data — the client
 /// never generates sandbox source from it; the runtime builds the module
 /// natively (see `v8.rs`). Mirrors `HostModuleNodePayload` on the TS side.
@@ -1448,7 +1452,16 @@ impl<'a> PayloadReader<'a> {
     /// Read one host-module shape node. Tags mirror `writeHostModuleNode` in
     /// the TS codec (`ipc.ts`) and `docs/protocol.md` §5.2:
     /// `0 = function`, `1 = data (value blob)`, `2 = object`.
-    fn read_host_module_node(&mut self) -> io::Result<HostModuleNode> {
+    ///
+    /// `depth` is the node's path length from the top-level export; the
+    /// first node past `MAX_HOST_MODULE_DEPTH` is refused.
+    fn read_host_module_node(&mut self, depth: usize) -> io::Result<HostModuleNode> {
+        if depth > MAX_HOST_MODULE_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("host-module shape nests deeper than {MAX_HOST_MODULE_DEPTH} levels"),
+            ));
+        }
         match self.read_u8()? {
             0 => Ok(HostModuleNode::Function),
             1 => Ok(HostModuleNode::Data(self.read_value_blob()?)),
@@ -1456,7 +1469,7 @@ impl<'a> PayloadReader<'a> {
                 let (count, mut entries) = self.read_list("host-module object entry")?;
                 for _ in 0..count {
                     let key = self.read_string()?;
-                    let node = self.read_host_module_node()?;
+                    let node = self.read_host_module_node(depth + 1)?;
                     entries.push((key, node));
                 }
                 Ok(HostModuleNode::Object(entries))
@@ -1479,7 +1492,7 @@ impl<'a> PayloadReader<'a> {
                     let (export_count, mut exports) = self.read_list("host-module export")?;
                     for _ in 0..export_count {
                         let name = self.read_string()?;
-                        let node = self.read_host_module_node()?;
+                        let node = self.read_host_module_node(1)?;
                         exports.push((name, node));
                     }
                     ImportModule::Host(exports)
@@ -2656,6 +2669,64 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "inner");
         assert!(matches!(entries[0].1, HostModuleNode::Function));
+    }
+
+    /// `Run` payload with one host import whose single export chain nests a
+    /// function leaf at path length `depth` (`c.c.….leaf`).
+    fn run_payload_with_host_shape_of_depth(depth: usize) -> Vec<u8> {
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // run_id
+        push_string(&mut v, "code");
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 1); // 1 import
+        push_string(&mut v, "host:deep");
+        v.push(1); // kind: host
+        push_u32(&mut v, 1); // 1 top-level export
+        for _ in 1..depth {
+            push_string(&mut v, "c");
+            v.push(2); // object
+            push_u32(&mut v, 1);
+        }
+        push_string(&mut v, "leaf");
+        v.push(0); // function leaf
+        v.push(0); // call: absent
+        v
+    }
+
+    #[test]
+    fn parse_run_payload_accepts_host_shape_at_the_depth_limit() {
+        let p = parse_run_payload(&run_payload_with_host_shape_of_depth(MAX_HOST_MODULE_DEPTH))
+            .unwrap();
+        let ImportModule::Host(exports) = &p.imports[0].module else {
+            panic!("expected host module");
+        };
+        let mut node = &exports[0].1;
+        let mut depth = 1;
+        while let HostModuleNode::Object(entries) = node {
+            node = &entries[0].1;
+            depth += 1;
+        }
+        assert!(matches!(node, HostModuleNode::Function));
+        assert_eq!(depth, MAX_HOST_MODULE_DEPTH);
+    }
+
+    #[test]
+    fn parse_run_payload_rejects_host_shape_past_the_depth_limit() {
+        let err = parse_run_payload(&run_payload_with_host_shape_of_depth(
+            MAX_HOST_MODULE_DEPTH + 1,
+        ))
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("nests deeper than 64 levels"), "{err}");
+    }
+
+    #[test]
+    fn parse_run_payload_rejects_a_host_shape_too_deep_for_the_stack() {
+        // Would overflow the thread stack if decoded; must fail cleanly instead.
+        let err = parse_run_payload(&run_payload_with_host_shape_of_depth(100_000)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
