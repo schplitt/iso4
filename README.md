@@ -187,7 +187,10 @@ The handler receives the raw arguments from sandbox code and must return
 plain serializable data. **Functions in return values are currently dropped.**
 
 `SANDBOX_GLOBALS` is a `Set` of every name a fresh sandbox already defines.
-Check generated names against it before installing them.
+Check generated names against it before installing them. `RESERVED_WORDS`
+is a `Set` of names that cannot be a binding in module source, such as
+`class` or `eval`; check generated global and host-module export names
+against it too.
 
 ## Async context (`AsyncLocalStorage`)
 

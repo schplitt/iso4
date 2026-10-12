@@ -277,6 +277,14 @@ describe('processImports — rejected configurations', () => {
       }),
     ).toThrow(/not a valid JavaScript identifier/)
   })
+
+  it.each(['eval', 'arguments'])('rejects strict-mode-restricted %s as a top-level key', (name) => {
+    expect(() =>
+      processImports({
+        'host:bad': { [name]: () => 1 },
+      }),
+    ).toThrow(/not a valid JavaScript identifier/)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────

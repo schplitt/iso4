@@ -30,7 +30,8 @@ import type {
  * Every global name a fresh sandbox defines: the JS built-ins of the bundled
  * V8 plus the runtime's own (`console`, `waitUntil`, timers, web classes).
  * A host global under one of these names replaces the built-in, or is
- * silently ignored for `undefined`, `NaN` and `Infinity`.
+ * silently ignored for `undefined`, `NaN` and `Infinity`. Names the grammar
+ * forbids outright are in {@link RESERVED_WORDS}.
  */
 export const SANDBOX_GLOBALS: ReadonlySet<string> = new Set([
   'AggregateError',
@@ -109,6 +110,65 @@ export const SANDBOX_GLOBALS: ReadonlySet<string> = new Set([
   'undefined',
   'unescape',
   'waitUntil',
+])
+
+/**
+ * Every name that cannot be a binding in module source, so it cannot be a
+ * host-module export name. As globals, all but `eval` and `arguments` are
+ * unreachable by bare name. `default` is
+ * included, though iso4 itself accepts it as a host-module export (emitted as
+ * `export default`). Unlike {@link SANDBOX_GLOBALS}, which lists names that are
+ * taken, these are names the grammar forbids.
+ */
+export const RESERVED_WORDS: ReadonlySet<string> = new Set([
+  'break',
+  'case',
+  'catch',
+  'class',
+  'const',
+  'continue',
+  'debugger',
+  'default',
+  'delete',
+  'do',
+  'else',
+  'export',
+  'extends',
+  'finally',
+  'for',
+  'function',
+  'if',
+  'import',
+  'in',
+  'instanceof',
+  'new',
+  'return',
+  'super',
+  'switch',
+  'this',
+  'throw',
+  'try',
+  'typeof',
+  'var',
+  'void',
+  'while',
+  'with',
+  'yield',
+  'let',
+  'static',
+  'enum',
+  'await',
+  'implements',
+  'package',
+  'protected',
+  'interface',
+  'private',
+  'public',
+  'null',
+  'true',
+  'false',
+  'eval',
+  'arguments',
 ])
 
 export function isBridgeWithShim(v: HostGlobalValue): v is BridgeWithShim {

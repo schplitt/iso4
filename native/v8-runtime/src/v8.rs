@@ -6657,7 +6657,7 @@ extern "C" fn host_import_meta_callback(
 }
 
 /// Reserved words that cannot appear as named ESM exports. Mirrors the list
-/// in the TS client (`imports.ts`).
+/// in the TS client (`RESERVED_WORDS` in `globals.ts`), minus `default`.
 const RESERVED_EXPORT_WORDS: &[&str] = &[
     "break",
     "case",
@@ -6704,6 +6704,8 @@ const RESERVED_EXPORT_WORDS: &[&str] = &[
     "null",
     "true",
     "false",
+    "eval",
+    "arguments",
 ];
 
 /// Whether `name` can appear as a named ESM export in generated host-module
@@ -14068,6 +14070,13 @@ mod tests {
             matches!(&err, RunError::CompileError(m) if m.contains("not a name")),
             "expected CompileError about the invalid key, got {err:?}"
         );
+    }
+
+    #[test]
+    fn host_module_export_name_refuses_strict_mode_restricted_names() {
+        assert!(!is_valid_export_identifier("eval"));
+        assert!(!is_valid_export_identifier("arguments"));
+        assert!(is_valid_export_identifier("evaluate"));
     }
 
     #[test]

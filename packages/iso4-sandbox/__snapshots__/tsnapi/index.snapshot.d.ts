@@ -250,5 +250,6 @@ export declare function createSandbox(_?: SandboxOptions): Promise<Sandbox>;
 // #endregion
 
 // #region Variables
+export declare const RESERVED_WORDS: ReadonlySet<string>;
 export declare const SANDBOX_GLOBALS: ReadonlySet<string>;
 // #endregion

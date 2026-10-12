@@ -540,6 +540,15 @@ non-writable `undefined`, `NaN` and `Infinity`, where it is silently
 ignored. An integration test compares the set against a live sandbox, so a
 V8 bump that adds a global fails CI until the set is updated.
 
+The exported `RESERVED_WORDS` set is the other half: names that cannot be a
+binding in module source (reserved words plus strict-mode `eval` and
+`arguments`). A global under one of them installs but, except for `eval`
+and `arguments`, cannot be referenced by bare name; a host-module export
+under one is refused before the run.
+`default` is in the set, but iso4 accepts it as a host-module export because
+it emits `export default`. `is_valid_export_identifier` in `v8.rs` mirrors
+the list.
+
 ### 4.2.1 The web runtime
 
 The sandbox ships a minimal, deliberately incomplete web runtime so that

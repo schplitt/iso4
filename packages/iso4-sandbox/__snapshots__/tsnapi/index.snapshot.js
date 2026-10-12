@@ -6,5 +6,6 @@ export async function createSandbox(_) {}
 // #endregion
 
 // #region Variables
+export var RESERVED_WORDS /* const */
 export var SANDBOX_GLOBALS /* const */
 // #endregion

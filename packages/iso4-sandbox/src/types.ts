@@ -190,7 +190,8 @@ export interface ResourceLimits {
  * serialization.
  *
  * {@link SANDBOX_GLOBALS} holds every name a fresh sandbox defines, V8
- * built-ins included.
+ * built-ins included. Names in {@link RESERVED_WORDS} install but, except for
+ * `eval` and `arguments`, cannot be referenced by bare name.
  *
  * Common usage:
  * ```ts
