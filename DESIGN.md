@@ -497,11 +497,10 @@ names is rejected with `ERR_RESERVED_NAME`. Allowing a host to shadow
 > and are **not** reserved. `waitUntil` joined the reserved list with the
 > grace-phase feature.
 
-Any other name sandbox code can reference by bare name may be provided by
-the host as a global (see the bare-name rule below). The host passes
-`globals: { fetch: fn, myTool: fn, transform: fn }` and each name becomes a
-bridge stub in the sandbox's global object — callable from user code just
-like a built-in.
+Any name **not** on that reserved list may be provided by the host as a
+global. The host passes `globals: { fetch: fn, myTool: fn, transform: fn }`
+and each name becomes a bridge stub in the sandbox's global object —
+callable from user code just like a built-in.
 
 `fetch` is not special in this mechanism. It is simply the most common
 global name hosts will provide. It goes through the exact same bridge path
@@ -548,22 +547,25 @@ binding in module source (reserved words plus strict-mode `eval` and
 it emits `export default`. `is_valid_export_identifier` in `v8.rs` mirrors
 the list.
 
-A host global name must be one sandbox code can reference by bare name,
-otherwise it is refused with `ERR_INVALID_GLOBAL_NAME` instead of installing
-an unreachable global. It must be a JavaScript identifier and not in
-`RESERVED_WORDS`, except `eval` and `arguments`, which a bare reference still
-reaches. `class`, `true`, `default`, `my-tool` and `1abc` are refused.
-`ERR_RESERVED_NAME` is only for the runtime-owned names above. Keys
-nested inside a global's value are property names and stay unrestricted. The
-client checks before anything is sent (`processGlobals`); the runtime repeats
-the check (`check_bare_global_name`) as the final guard.
+Any string is a valid host global name; `ERR_RESERVED_NAME` is the only
+name check. Every host global is a property of `globalThis` (`enumerable:
+false` only hides it from enumeration), so a name that is not a JavaScript
+identifier, or is in `RESERVED_WORDS` other than `eval` and `arguments`
+(`my-tool`, `user.lookup`, `class`, `1abc`), is reachable only as
+`globalThis[name]`, not by bare name. Hosts that mirror external names one
+to one rely on this. If iso4 ever adds a global that is not a property of
+`globalThis` (a lexical binding only), the identifier rule would apply to
+that kind. A name that is not a well-formed string (a lone surrogate, as in
+`'y\uD800'`) is refused on the client with a plain `TypeError` before
+anything is sent. Import specifiers cross the wire as UTF-8 too and get the
+same refusal.
 
-Global names and host-module export names share one identifier rule: the
-full Unicode `IdentifierName` grammar (`ID_Start`/`ID_Continue` plus `$`,
-`_`, and ZWNJ/ZWJ after the first character), so `café` and `π` are valid.
-This is exactly what V8 accepts. The client uses a Unicode property regex;
-the runtime uses the `unicode-ident` crate's XID tables widened by the few
-code points in ID but not XID.
+Host-module export names follow the full Unicode `IdentifierName` grammar
+(`ID_Start`/`ID_Continue` plus `$`, `_`, and ZWNJ/ZWJ after the first
+character), so `café` and `π` are valid. This is exactly what V8 accepts.
+The client uses a Unicode property regex; the runtime uses the
+`unicode-ident` crate's XID tables widened by the few code points in ID but
+not XID.
 
 ### 4.2.1 The web runtime
 
@@ -1680,9 +1682,7 @@ modules cannot be rebound — their code is frozen at declaration
 (`ERR_FROZEN_BINDING`, likewise for data leaves).
 
 If `prefix.run()` passes a name that wasn't declared at `precompile()`
-time, the run fails fast with `ERR_UNDECLARED_BINDING` (or
-`ERR_INVALID_GLOBAL_NAME`, checked first, if sandbox code could not reference
-the name by bare name anyway). This is intentional:
+time, the run fails fast with `ERR_UNDECLARED_BINDING`. This is intentional:
 we could silently install new globals into the run's context, but that
 breaks the invariant that the declared prefix shape represents the full
 sandbox surface the prefix was validated against. Better to be strict and
@@ -1837,7 +1837,7 @@ the generic host-bridge error path.
     serializes call arguments and return values as `HostExportData` in both
     directions. No fetch-specific logic anywhere in the core.
   - `HostGlobals` is `Record<string, HostExportFunction>` — any non-reserved
-    name usable by bare name, any bridge function.
+    name, any bridge function.
 
 - **`@iso4/fetch`** ships:
   - `FetchHandler`, `HostFetchRequest`, `HostFetchResponse` — typed
@@ -2548,9 +2548,7 @@ Callable return values are planned in Phase 13 (callable handles). See §15.
 `prefix.run({ globals })` may only **rebind** globals declared at
 `precompile({ globals })` time. Adding a new name at run time results in
 `ERR_UNDECLARED_BINDING` at runtime and a TypeScript compile-time error (when
-the `Prefix<G>` type parameter is specific). A name that fails the bare-name
-rule (§4.2) is `ERR_INVALID_GLOBAL_NAME` instead, on both the client and the
-runtime, ahead of the undeclared check.
+the `Prefix<G>` type parameter is specific).
 
 Rationale: the declared shape is what the prefix was validated against.
 Silently installing an undeclared global into a run's context would widen

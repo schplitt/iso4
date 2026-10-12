@@ -3039,22 +3039,15 @@ describe('ERR_UNDECLARED_BINDING', () => {
     await prefix.dispose()
   })
 
-  test('an unusable undeclared name is ERR_INVALID_GLOBAL_NAME, a valid one ERR_UNDECLARED_BINDING', async () => {
+  test('an undeclared non-identifier name is ERR_UNDECLARED_BINDING', async () => {
     const prefix = await runtime.prepare({ code: '' })
-    const invalid = await prefix.run({
+    const result = await prefix.run({
       code: 'export default 1',
-      globals: { class: async () => 1 } as never,
+      globals: { 'my-tool': async () => 1 } as never,
     })
-    expect(invalid.ok).toBe(false)
-    if (!invalid.ok)
-      expect(invalid.error.code).toBe('ERR_INVALID_GLOBAL_NAME')
-    const undeclared = await prefix.call({
-      export: 'default',
-      globals: { zzz: async () => 1 } as never,
-    })
-    expect(undeclared.ok).toBe(false)
-    if (!undeclared.ok)
-      expect(undeclared.error.code).toBe('ERR_UNDECLARED_BINDING')
+    expect(result.ok).toBe(false)
+    if (!result.ok)
+      expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
     await prefix.dispose()
   })
 
@@ -3211,22 +3204,64 @@ describe('native timers', () => {
     expect(result.error.message).toMatch(/reserved/)
   })
 
-  test('a global name unreachable by bare name fails the run with ERR_INVALID_GLOBAL_NAME', async () => {
+  test('a non-identifier global name is reachable through globalThis[name]', async () => {
     const result = await runtime.run({
-      code: 'export default 1',
-      globals: { 'my-tool': async () => 1 },
+      code: `export default [await globalThis['my-tool'](), globalThis['user.lookup'], globalThis.class, globalThis['1abc']]`,
+      globals: {
+        'my-tool': () => 1,
+        'user.lookup': { kind: 'data', value: 2 },
+        'class': `3`,
+        '1abc': { kind: 'data', value: 4, enumerable: false },
+      },
     })
-    expect(result.ok).toBe(false)
+    expect(result.ok).toBe(true)
     if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_INVALID_GLOBAL_NAME')
-    expect(result.error.message).toBe(`global 'my-tool' cannot be referenced by bare name in sandbox code`)
+      expect(result.exports.default).toEqual([1, 2, 3, 4])
   })
 
-  test('a global name unreachable by bare name fails prepare() with ERR_INVALID_GLOBAL_NAME', async () => {
+  test('a non-identifier global name works in prepare() and can be rebound per run', async () => {
+    const prefix = await runtime.prepare({
+      code: `export const call = () => globalThis['my-tool']()`,
+      globals: { 'my-tool': () => 'default' },
+    })
+    const first = await prefix.call({ export: 'call' })
+    const rebound = await prefix.call({ export: 'call', globals: { 'my-tool': () => 'rebound' } })
+    expect(first.ok && first.value).toBe('default')
+    expect(rebound.ok && rebound.value).toBe('rebound')
+    await prefix.dispose()
+  })
+
+  test('a reserved name still fails prepare() with ERR_RESERVED_NAME', async () => {
     await expect(
-      runtime.prepare({ code: '', globals: { class: async () => 1 } }),
-    ).rejects.toMatchObject({ code: 'ERR_INVALID_GLOBAL_NAME', message: `global 'class' cannot be referenced by bare name in sandbox code` })
+      runtime.prepare({ code: '', globals: { console: () => 1 } }),
+    ).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME' })
+  })
+
+  test('an import specifier that is not a well-formed string is a TypeError on every entry point', async () => {
+    const error = new TypeError(`[@iso4/sandbox] import specifier 'x\uD800' is not a well-formed string`)
+    const imports = { 'x\uD800': { f: () => 1 } }
+    await expect(runtime.run({ code: 'export default 1', imports })).rejects.toThrow(error)
+    await expect(runtime.prepare({ code: '', imports })).rejects.toThrow(error)
+    await expect(runtime.prepare({ code: '', imports: { 'x\uD800': 'export default 1' } })).rejects.toThrow(error)
+    const prefix = await runtime.prepare({ code: 'export default () => 1' })
+    await expect(prefix.run({ code: 'export default 1', imports } as never)).rejects.toThrow(error)
+    await expect(prefix.call({ export: 'default', imports } as never)).rejects.toThrow(error)
+    await prefix.dispose()
+  })
+
+  test('a host-module export key that is not a well-formed string is refused by the identifier rule', async () => {
+    await expect(runtime.prepare({ code: '', imports: { 'host:t': { 'f\uD800': () => 1 } } })).rejects.toThrow(/is not a valid JavaScript identifier/)
+  })
+
+  test('a global name that is not a well-formed string is a TypeError on every entry point', async () => {
+    const error = new TypeError(`[@iso4/sandbox] global name 'y\uD800' is not a well-formed string`)
+    const globals = { 'y\uD800': () => 1 }
+    await expect(runtime.run({ code: 'export default 1', globals })).rejects.toThrow(error)
+    await expect(runtime.prepare({ code: '', globals })).rejects.toThrow(error)
+    const prefix = await runtime.prepare({ code: 'export default () => 1' })
+    await expect(prefix.run({ code: 'export default 1', globals } as never)).rejects.toThrow(error)
+    await expect(prefix.call({ export: 'default', globals } as never)).rejects.toThrow(error)
+    await prefix.dispose()
   })
 
   test('a Unicode identifier works as a host global name', async () => {

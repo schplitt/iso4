@@ -302,6 +302,15 @@ describe('processImports — rejected configurations', () => {
 // mergeRebindImports — rebinding on prefix.run()
 // ─────────────────────────────────────────────────────────────────────────
 
+describe('import specifiers that are not well-formed strings', () => {
+  it.each(['x\uD800', '\uDC00'])('processImports and mergeRebindImports refuse %j', (specifier) => {
+    const error = new TypeError(`[@iso4/sandbox] import specifier '${specifier}' is not a well-formed string`)
+    expect(() => processImports({ [specifier]: { f: () => 1 } })).toThrow(error)
+    expect(() => processImports({ [specifier]: 'export default 1' })).toThrow(error)
+    expect(() => mergeRebindImports({ [specifier]: { f: () => 1 } } as never, new Map())).toThrow(error)
+  })
+})
+
 describe('mergeRebindImports', () => {
   const fnA: HostExportFunction = () => 'a'
   const fnB: HostExportFunction = () => 'b'

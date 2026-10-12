@@ -43,7 +43,7 @@ libc = "0.2"
 # time (C++20; every toolchain we build on qualifies).
 ada-url = "4"
 
-# Unicode XID tables for the host global/export name check (widened to ID in v8.rs).
+# Unicode XID tables for the host-module export name check (widened to ID in v8.rs).
 unicode-ident = "1"
 
 [dev-dependencies]

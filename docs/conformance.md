@@ -26,7 +26,9 @@ code against it. Three consequences run through everything below:
 1. **No ambient I/O.** There is no network, no filesystem, no clock the guest
    can advance. Anything that reaches outside the isolate is a capability the
    host passes in explicitly as a bridge global or an import — including
-   `fetch`. A sandbox with no `fetch` configured has no `fetch`.
+   `fetch`. A sandbox with no `fetch` configured has no `fetch`. A host
+   global is a property of `globalThis`; one whose name is not an identifier
+   (`my-tool`) is reachable only as `globalThis['my-tool']`.
 2. **The clock is frozen** (`DESIGN.md` §7.11). `Date.now()` returns the same
    value for the whole of a turn and advances only when the runtime lets it.
    Anything whose only purpose is to measure elapsed time is therefore either

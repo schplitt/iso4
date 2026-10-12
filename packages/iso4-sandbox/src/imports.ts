@@ -130,6 +130,8 @@ export function processImports(imports: Imports | undefined): ProcessedImports {
   const handlers: ImportHandlerMap = new Map()
 
   for (const [specifier, value] of Object.entries(imports)) {
+    if (!specifier.isWellFormed())
+      throw new TypeError(`[@iso4/sandbox] import specifier '${specifier}' is not a well-formed string`)
     if (typeof value === 'string') {
       // Source module: pass through verbatim.
       bindings.push({ specifier, source: value })
@@ -242,6 +244,8 @@ export function mergeRebindImports(
   const rebinds: ImportRebindPayload[] = []
 
   for (const [specifier, value] of Object.entries(runImports)) {
+    if (!specifier.isWellFormed())
+      throw new TypeError(`[@iso4/sandbox] import specifier '${specifier}' is not a well-formed string`)
     if (typeof value === 'string') {
       throw new ImportRebindError(
         'ERR_FROZEN_BINDING',

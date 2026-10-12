@@ -1342,9 +1342,6 @@ pub enum RunError {
     /// ([`RESERVED_GLOBAL_NAMES`]). Shaped to also cover runtime-owned
     /// module specifiers if one ever becomes non-overridable.
     ReservedName(String),
-    /// A host global name sandbox code cannot reference by bare name: not
-    /// an identifier, or a reserved word other than `eval`/`arguments`.
-    InvalidGlobalName(String),
     /// A PrefixRun rebind targets a declared location that is frozen with
     /// the prefix: a source module or a data leaf.
     FrozenBinding(String),
@@ -6659,9 +6656,8 @@ extern "C" fn host_import_meta_callback(
     meta.create_data_property(scope, key.into(), array.into());
 }
 
-/// Reserved words that cannot appear as named ESM exports, and (minus `eval`
-/// and `arguments`) as host global names. Mirrors the list in the TS client
-/// (`RESERVED_WORDS` in `globals.ts`), minus `default`.
+/// Reserved words that cannot appear as named ESM exports. Mirrors the list
+/// in the TS client (`RESERVED_WORDS` in `globals.ts`), minus `default`.
 const RESERVED_EXPORT_WORDS: &[&str] = &[
     "break",
     "case",
@@ -7664,22 +7660,6 @@ fn check_not_reserved(name: &str) -> Result<(), RunError> {
     if RESERVED_GLOBAL_NAMES.contains(&name) {
         return Err(RunError::ReservedName(format!(
             "global '{name}' is reserved by the runtime and cannot be provided by the host"
-        )));
-    }
-    check_bare_global_name(name)
-}
-
-/// Refuse a host global name sandbox code cannot reference by bare name.
-/// Mirrors `checkGlobalName` in the TS client.
-pub(crate) fn check_bare_global_name(name: &str) -> Result<(), RunError> {
-    // `eval`/`arguments` are reachable by bare name; `default` is a valid
-    // export name but not a binding.
-    let bare_name = name == "eval"
-        || name == "arguments"
-        || (name != "default" && is_valid_export_identifier(name));
-    if !bare_name {
-        return Err(RunError::InvalidGlobalName(format!(
-            "global '{name}' cannot be referenced by bare name in sandbox code"
         )));
     }
     Ok(())
@@ -15771,19 +15751,10 @@ mod tests {
     }
 
     #[test]
-    fn global_names_unreachable_by_bare_name_are_refused() {
-        for name in ["class", "true", "default", "my-tool", "1abc", ""] {
-            assert!(
-                matches!(&check_not_reserved(name), Err(RunError::InvalidGlobalName(m)) if m.contains("bare name")),
-                "expected '{name}' to be refused"
-            );
-        }
-        for name in [
-            "eval", "arguments", "undefined", "myTool", "$x", "$", "_", "café", "π", "a\u{200C}b",
-            "\u{309B}",
-            "__iso4_myTool_h",
-        ] {
+    fn any_non_reserved_string_is_a_valid_global_name() {
+        for name in ["my-tool", "user.lookup", "class", "default", "1abc", "", "café", "eval"] {
             assert!(check_not_reserved(name).is_ok(), "expected '{name}' to be allowed");
         }
+        assert!(matches!(check_not_reserved("console"), Err(RunError::ReservedName(_))));
     }
 }

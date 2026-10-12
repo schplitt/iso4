@@ -113,12 +113,8 @@ export const SANDBOX_GLOBALS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * Every name that cannot be a binding in module source, so it cannot be a
- * host-module export name. As host global names, all but `eval` and
- * `arguments` are refused with `ERR_INVALID_GLOBAL_NAME`. `default` is
- * included, though iso4 itself accepts it as a host-module export (emitted as
- * `export default`). Unlike {@link SANDBOX_GLOBALS}, which lists names that
- * are taken, these are names the grammar forbids.
+ * Names that cannot be a binding in module source. A host-module export may
+ * not use one, except `default`.
  */
 export const RESERVED_WORDS: ReadonlySet<string> = new Set([
   'break',
@@ -176,14 +172,6 @@ export const RESERVED_WORDS: ReadonlySet<string> = new Set([
  * `$`, `_`, ZWNJ and ZWJ.
  */
 export const IDENTIFIER_NAME: RegExp = /^[\p{ID_Start}$_][\p{ID_Continue}$\u200C\u200D]*$/u
-
-/**
- * A host global name sandbox code cannot reference by bare name. Carries the
- * same code and message the runtime reports for it.
- */
-export class GlobalNameError extends Error {
-  readonly code = 'ERR_INVALID_GLOBAL_NAME' as const
-}
 
 export function isBridgeWithShim(v: HostGlobalValue): v is BridgeWithShim {
   return (
@@ -244,22 +232,9 @@ export interface ProcessedGlobals {
 }
 
 /**
- * Throw {@link GlobalNameError} unless sandbox code can reference `name` by
- * bare name. Mirrored by `check_bare_global_name` in `v8.rs`.
- * @param name host global name
- */
-function checkGlobalName(name: string): void {
-  // `eval` and `arguments` are reserved for bindings but still reachable by bare name.
-  if (name !== 'eval' && name !== 'arguments'
-    && (!IDENTIFIER_NAME.test(name) || RESERVED_WORDS.has(name))) {
-    throw new GlobalNameError(`global '${name}' cannot be referenced by bare name in sandbox code`)
-  }
-}
-
-/**
  * Lower a `HostGlobals` map into wire-shaped `defs` plus the bridge-dispatch
- * map. See the module comment for the split. Throws {@link GlobalNameError}
- * for a name sandbox code cannot reference by bare name.
+ * map. See the module comment for the split. Throws a `TypeError` for a name
+ * that is not a well-formed string.
  *   - `HostExportFunction` → `{ kind: 'bridge' }` + dispatch entry.
  *   - `string`             → `{ kind: 'string', expr }` (evaluated by Rust).
  *   - `DataGlobal`         → `{ kind: 'data', value }` (materialised by Rust).
@@ -272,7 +247,8 @@ export function processGlobals(globals: HostGlobals): ProcessedGlobals {
   const dispatch: Record<string, HostExportFunction> = {}
 
   for (const [name, value] of Object.entries(globals)) {
-    checkGlobalName(name)
+    if (!name.isWellFormed())
+      throw new TypeError(`[@iso4/sandbox] global name '${name}' is not a well-formed string`)
     // The bare shorthands are always enumerable by design; the object forms
     // carry an optional opt-out (default true).
     if (typeof value === 'function') {
@@ -376,10 +352,10 @@ export function extractBridgeGlobals(
   // Undeclared function overrides go to Rust, which refuses them with
   // ERR_UNDECLARED_BINDING; undeclared non-functions are dropped.
   for (const [name, override] of Object.entries(runGlobals)) {
+    if (!name.isWellFormed())
+      throw new TypeError(`[@iso4/sandbox] global name '${name}' is not a well-formed string`)
     if (name in precompileGlobals)
       continue
-    // An unusable name is refused here, ahead of Rust's undeclared check.
-    checkGlobalName(name)
     if (typeof override === 'function') {
       defs.push({ kind: 'bridge', name, enumerable: true })
       dispatch[name] = override as HostExportFunction

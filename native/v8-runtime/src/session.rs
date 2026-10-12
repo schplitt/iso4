@@ -1209,31 +1209,23 @@ fn dispatch_prefix_run(
     };
 
     // ── Binding checks ───────────────────────────────────────────────────
-    // Globals must be usable names (ERR_INVALID_GLOBAL_NAME) declared at
-    // precompile time (ERR_UNDECLARED_BINDING); import rebinds must target
-    // function leaves, not frozen locations (ERR_FROZEN_BINDING).
+    // Every global in payload.globals must have been declared at precompile
+    // time (ERR_UNDECLARED_BINDING); host-import rebinds must additionally
+    // target function leaves, not frozen locations (ERR_FROZEN_BINDING).
     let declared_set: std::collections::HashSet<&str> = prefix_data
         .declared_globals
         .iter()
         .map(String::as_str)
         .collect();
-    // An unusable name is ERR_INVALID_GLOBAL_NAME even when undeclared.
     let violation: Option<sandbox::RunError> = payload
         .globals
         .iter()
         .filter_map(|g| g.bridge_stub_name())
-        .find_map(|name| sandbox::check_bare_global_name(name).err())
-        .or_else(|| {
-            payload
-                .globals
-                .iter()
-                .filter_map(|g| g.bridge_stub_name())
-                .find(|name| !declared_set.contains(name))
-                .map(|name| {
-                    sandbox::RunError::UndeclaredBinding(format!(
-                        "global '{name}' was not declared at precompile time"
-                    ))
-                })
+        .find(|name| !declared_set.contains(name))
+        .map(|name| {
+            sandbox::RunError::UndeclaredBinding(format!(
+                "global '{name}' was not declared at precompile time"
+            ))
         })
         .or_else(|| {
             validate_import_rebinds(&payload.import_rebinds, &prefix_data.declared_imports).err()
