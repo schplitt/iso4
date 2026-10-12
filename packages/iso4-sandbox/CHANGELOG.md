@@ -1,5 +1,21 @@
 # @iso4/sandbox
 
+## 0.8.0
+
+### Minor Changes
+
+- b51b8be: feat(sandbox): export `RESERVED_WORDS`, the names that cannot be a binding in module source
+- f27fc5d: feat(sandbox): refuse host global names sandbox code cannot reference by bare name with the new `ERR_INVALID_GLOBAL_NAME`.
+  Names like `my-tool` or `class` used to install unreachably; host-module export names now also accept Unicode identifiers such as `café`.
+
+### Patch Changes
+
+- 194ebea: fix(sandbox): stop logging a connection error on every `sandbox.dispose()`
+
+  The host now sends a close frame on orderly shutdown, so only connections that end without one (or mid-frame) are logged.
+
+- b51b8be: fix(sandbox): refuse `eval` and `arguments` as host-module export names up front instead of failing the run with `ERR_COMPILE`.
+
 ## 0.7.0
 
 ### Minor Changes
