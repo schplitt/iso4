@@ -706,6 +706,16 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 
 // ── BridgeCall payload encoder ────────────────────────────────────────────────────
 
+/// What a `BridgeCall` targets: a global by name, or a host-module function
+/// leaf by specifier and key segments.
+pub enum BridgeTarget<'a> {
+    Global(&'a str),
+    Import {
+        specifier: &'a str,
+        path: &'a [String],
+    },
+}
+
 /// Encode a `BridgeCallPayload` per `docs/protocol.md` §5.4.
 ///
 /// Wire layout:
@@ -714,8 +724,9 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 /// u32                callId
 /// u8                 targetKind  (0 = global, 1 = import)
 /// Optional<String>   specifier   (present when targetKind = 1)
-/// String             exportName
-/// ValueBlob          args   (one blob holding the whole argument array)
+/// String             exportName  (targetKind = 0)
+///   | List<String>   path        (targetKind = 1: the leaf's key segments)
+/// ValueBlob         args   (one blob holding the whole argument array)
 /// ```
 /// Everything in that layout except the argument bytes themselves, ending
 /// with the blob's `u32` length prefix.
@@ -731,29 +742,27 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 pub fn encode_bridge_call_header(
     run_id: u32,
     call_id: u32,
-    target_kind: u8, // 0 = global
-    specifier: Option<&str>,
-    export_name: &str,
+    target: BridgeTarget<'_>,
     args_blob_len: u32,
 ) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(64);
     // The owning run leads the frame, like every other run-scoped frame:
     // handlers are per run, and the host cannot map callId → run on its own
     // (call ids are allocated child-side). 0 = a direct-API run with no wire
     // identity.
     encode_u32(run_id, &mut out);
     encode_u32(call_id, &mut out);
-    out.push(target_kind);
-    match specifier {
-        Some(s) => {
-            out.push(1);
-            encode_string(s, &mut out);
+    match target {
+        BridgeTarget::Global(name) => {
+            out.extend_from_slice(&[0, 0]); // targetKind, specifier absent
+            encode_string(name, &mut out);
         }
-        None => {
-            out.push(0);
+        BridgeTarget::Import { specifier, path } => {
+            out.extend_from_slice(&[1, 1]); // targetKind, specifier present
+            encode_string(specifier, &mut out);
+            encode_string_list(path, &mut out);
         }
     }
-    encode_string(export_name, &mut out);
     encode_u32(args_blob_len, &mut out);
     out
 }

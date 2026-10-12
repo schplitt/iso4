@@ -50,9 +50,9 @@ Frame readers MUST reject:
 EOF before the first byte of a frame is not a framing error, but a host
 that closes in order sends `Close` first (§6).
 
-Current protocol version: **`1`** — nothing is released yet, so there is no
-version history and no compatibility handling: both sides must speak exactly
-this version, and the handshake hard-fails otherwise (§8).
+Current protocol version: **`1`**. There is no compatibility handling: both
+sides must speak exactly this version, and the handshake hard-fails otherwise
+(§8).
 
 ---
 
@@ -791,6 +791,13 @@ Handle IDs never cross the wire: the runtime derives them from the declared
 shape (depth-first over each binding, bindings in wire order) and resolves
 them back to `(specifier, path)` before a `BridgeCall` frame is written.
 
+A leaf's **path** is the list of keys from its top-level export down to the
+leaf, one `String` per key. Nested keys may contain any characters, dots
+included, so `{ api: { 'a.b': f } }` has the path `["api", "a.b"]` and
+`{ api: { a: { b: f } } }` the path `["api", "a", "b"]` — two different
+leaves. Every frame that names a leaf carries the segments, never a joined
+string.
+
 Shape depth is bounded at **64** levels, counted as a node's path length from
 its top-level export (`search` is 1, `users.create` is 2). The runtime refuses
 a deeper shape at decode, at the first node past the bound, as a decode error
@@ -807,7 +814,9 @@ location against the declared shape and fails the run for anything that is
 not a declared host-module function leaf: `ERR_UNDECLARED_BINDING` for an
 undeclared specifier or path (the same enforcement point that guards
 undeclared globals), `ERR_FROZEN_BINDING` for a declared location that is
-frozen with the prefix (data leaf, source module).
+frozen with the prefix (data leaf, source module). Paths match whole key
+segments. Error messages print a path dot-joined for reading, and an
+undeclared path is printed up to the first key that is not declared.
 
 The globals of a `PrefixRun` may only be bridge defs for declared bridge
 stubs (plain bridge names and shim handler names). Any other def fails the
@@ -815,10 +824,10 @@ run: `ERR_FROZEN_BINDING` when its name is a declared data or string global,
 `ERR_UNDECLARED_BINDING` otherwise. Globals are checked first, then import
 rebinds.
 
-| Field       | Encoding | Notes                                                      |
-| ----------- | -------- | ---------------------------------------------------------- |
-| `specifier` | `String` | Declared host-module specifier.                            |
-| `path`      | `String` | Dot-joined function-leaf path (e.g. `someObj.someMethod`). |
+| Field       | Encoding       | Notes                                                          |
+| ----------- | -------------- | -------------------------------------------------------------- |
+| `specifier` | `String`       | Declared host-module specifier.                                |
+| `path`      | `List<String>` | Function-leaf key segments (e.g. `["someObj", "someMethod"]`). |
 
 ### 5.3 Prefix identifiers
 
@@ -832,14 +841,15 @@ rebinds.
 
 `BridgeCallPayload`:
 
-| Field        | Encoding           | Notes                                                                        |
-| ------------ | ------------------ | ---------------------------------------------------------------------------- |
-| `runId`      | `u32`              | The owning run — handlers are per run, and call ids alone cannot name it.    |
-| `callId`     | `u32`              | Unique within one connection (the counter spans runs).                       |
-| `targetKind` | `u8`               | `0 = global`, `1 = import`.                                                  |
-| `specifier`  | `Optional<String>` | Import specifier when `targetKind = import`.                                 |
-| `exportName` | `String`           | Global/stub name for globals; the dot-joined function-leaf path for imports. |
-| `args`       | `ValueBlob`        | **One** blob holding the whole argument array (§4).                          |
+| Field        | Encoding           | Notes                                                                                   |
+| ------------ | ------------------ | --------------------------------------------------------------------------------------- |
+| `runId`      | `u32`              | The owning run — handlers are per run, and call ids alone cannot name it.               |
+| `callId`     | `u32`              | Unique within one connection (the counter spans runs).                                  |
+| `targetKind` | `u8`               | `0 = global`, `1 = import`.                                                             |
+| `specifier`  | `Optional<String>` | Present exactly when `targetKind = import`: the import specifier.                       |
+| `exportName` | `String`           | `targetKind = global` only. The global/stub name.                                       |
+| `path`       | `List<String>`     | `targetKind = import` only, in place of `exportName`. The function leaf's key segments. |
+| `args`       | `ValueBlob`        | **One** blob holding the whole argument array (§4).                                     |
 
 Host-module function leaves dispatch through the reserved `__iso4_call`
 bridge stub (installed by the runtime, never declared by the client) with
@@ -1058,7 +1068,7 @@ afterwards, so later calls report only their own lines.
 
 | Field           | Encoding | Notes                                                                                                                                                                                                                                   |
 | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`          | `String` | Public call name, resolved by the runtime: plain globals as-is (`fetch`), shims under their public name, host-module import leaves as `<specifier>.<path>`.                                                                             |
+| `name`          | `String` | Public call name, resolved by the runtime: plain globals as-is (`fetch`), shims under their public name, host-module import leaves as `<specifier>.<path>` with the path dot-joined (display only; a key may contain dots).             |
 | `startMs`       | `f64`    | Offset from run start (same clock as `durationMs`).                                                                                                                                                                                     |
 | `durationMs`    | `f64`    | Round-trip the sandbox waited; time-until-run-end for calls that never settled.                                                                                                                                                         |
 | `argBytes`      | `u32`    | Serialized call payload size in bytes (envelope + args blob) — what `maxBridgeCallBytes` is enforced against.                                                                                                                           |
@@ -1319,7 +1329,9 @@ Two independent versions are checked at handshake time (§5.1), both fatal:
 
 1. **The iso4 protocol version** — the `u16` in the `Authenticate` frame.
    Bump it whenever the frame envelope, message tables, or payload layouts
-   change incompatibly.
+   change incompatibly. Before 1.0 the version stays `1`, because
+   `@iso4/sandbox` and the `@iso4/v8-*` binaries are released together as a
+   fixed group.
 2. **The V8 serialization format version** — carried in each side's probe.
    Not ours to bump: V8 changes it, and neither Node nor rusty_v8 lets an
    embedder pin what it writes — the runtime instead relabels its emitted

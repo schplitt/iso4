@@ -3306,6 +3306,30 @@ describe('native timers', () => {
     await prefix.dispose()
   })
 
+  test('non-ASCII specifiers, dotted keys and empty segments dispatch through the runtime', async () => {
+    // Top-level keys must be identifiers, so the dotted and empty keys sit under `default`.
+    const imports = { 'host:ü😀': { default: { 'é': { '': async () => 7 }, 'a.b': async () => 8 } } }
+    const code = `import m from 'host:ü😀'\nexport default [await m['é'][''](), await m['a.b']()]`
+    expect(await runtime.run({ code, imports })).toMatchObject({ ok: true, exports: { default: [7, 8] } })
+
+    const prefix = await runtime.prepare({ code: '', imports })
+    const rebound = await prefix.run({ code, imports: { 'host:ü😀': { default: { é: { '': async () => 70 } } } } } as never)
+    expect(rebound).toMatchObject({ ok: true, exports: { default: [70, 8] } })
+    expect(await prefix.run({ code })).toMatchObject({ ok: true, exports: { default: [7, 8] } })
+    await prefix.dispose()
+  })
+
+  test('a nested host-module key that is not a well-formed string is a TypeError on every entry point', async () => {
+    const error = new TypeError(`[@iso4/sandbox] import key 'x\uD800' is not a well-formed string`)
+    const imports = { 'host:t': { f: { 'x\uD800': () => 1 } } }
+    await expect(runtime.run({ code: 'export default 1', imports })).rejects.toThrow(error)
+    await expect(runtime.prepare({ code: '', imports })).rejects.toThrow(error)
+    const prefix = await runtime.prepare({ code: 'export default () => 1', imports: { 'host:t': { f: { g: () => 1 } } } })
+    await expect(prefix.run({ code: 'export default 1', imports } as never)).rejects.toThrow(error)
+    await expect(prefix.call({ export: 'default', imports } as never)).rejects.toThrow(error)
+    await prefix.dispose()
+  })
+
   test('a host-module export key that is not a well-formed string is refused by the identifier rule', async () => {
     await expect(runtime.prepare({ code: '', imports: { 'host:t': { 'f\uD800': () => 1 } } })).rejects.toThrow(/is not a valid JavaScript identifier/)
   })

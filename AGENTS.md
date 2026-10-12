@@ -287,6 +287,7 @@ learned during development.
 ### Patterns & Conventions
 
 - ESM only. No CJS anywhere.
+- Pre-1.0, do not bump PROTOCOL_VERSION for wire changes; host and binary ship in lockstep as a fixed version group.
 - Use conventional branch prefixes and conventional-commit style commit
   subjects / PR titles.
 - The public API of every package is what's exported from its

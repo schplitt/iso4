@@ -365,16 +365,11 @@ const BRIDGE_DISPATCH_GLOBAL: &str = "__iso4_call";
 #[derive(Debug, Clone, PartialEq)]
 struct ImportHandleEntry {
     specifier: String,
-    /// Dot-joined path inside the module (e.g. `"nested.inner"`); doubles as
-    /// the `exportName` on `BridgeCall` frames with `targetKind = import`.
-    path: String,
-}
-
-impl ImportHandleEntry {
-    /// The public bridge-record name for this leaf: `<specifier>.<path>`.
-    fn record_name(&self) -> String {
-        format!("{}.{}", self.specifier, self.path)
-    }
+    /// Key segments inside the module (a key may contain dots); the `path`
+    /// on `BridgeCall` frames with `targetKind = import`.
+    path: Vec<String>,
+    /// The public bridge-record name, `<specifier>.<path>` dot-joined.
+    record_name: String,
 }
 
 /// Walk the declared imports in wire order (bindings first-to-last, each tree
@@ -399,7 +394,8 @@ fn collect_import_handles(imports: &[ImportBinding]) -> Vec<ImportHandleEntry> {
             match node {
                 HostModuleNode::Function => out.push(ImportHandleEntry {
                     specifier: specifier.to_string(),
-                    path: path.join("."),
+                    path: path.clone(),
+                    record_name: format!("{specifier}.{}", path.join(".")),
                 }),
                 HostModuleNode::Object(children) => walk(specifier, children, path, out),
                 HostModuleNode::Data(_) => {}
@@ -7322,18 +7318,9 @@ fn bridge_global_callback(
     // dispatcher stub with their handle ID as the first argument; the runtime
     // owns the handle table, so the frame carries the resolved specifier and
     // leaf path (targetKind = 1) and the ID never leaves the process.
-    #[allow(clippy::type_complexity)]
-    let (target_kind, specifier, export_name, first_arg, record_name): (
-        u8,
-        Option<&str>,
-        &str,
-        i32,
-        String,
-    ) = match &data.import_handles {
+    let (target, first_arg, record_name) = match &data.import_handles {
         None => (
-            0,
-            None,
-            data.stub_name.as_str(),
+            wire::BridgeTarget::Global(data.stub_name.as_str()),
             0,
             data.record_name.clone(),
         ),
@@ -7355,11 +7342,12 @@ fn bridge_global_callback(
             };
             let entry = &table[handle as usize];
             (
-                1,
-                Some(entry.specifier.as_str()),
-                entry.path.as_str(),
+                wire::BridgeTarget::Import {
+                    specifier: entry.specifier.as_str(),
+                    path: &entry.path,
+                },
                 1, // the handle ID never leaves the process
-                entry.record_name(),
+                entry.record_name.clone(),
             )
         }
     };
@@ -7425,9 +7413,7 @@ fn bridge_global_callback(
     let bridge_call_header = wire::encode_bridge_call_header(
         data.run_id,
         call_id,
-        target_kind,
-        specifier,
-        export_name,
+        target,
         args_blob_len,
     );
     let payload_len = bridge_call_header.len() + args_blob.len();
@@ -12345,7 +12331,7 @@ mod tests {
             // callId (4) + targetKind (1) + specifier absent (1) + name len (4)
             // + "add" (3) = 13, then the args value slot: u32 length + blob.
             let (_, _, _, export_name, args) = parse_bridge_call(&frame.payload);
-            assert_eq!(export_name, "add");
+            assert_eq!(export_name, ["add"]);
             assert_eq!(args, vec![WireValue::Number(7.0)]);
             ipc::write_ts_to_rust_frame(
                 &mut server,
@@ -13855,9 +13841,12 @@ mod tests {
     // auto-installed `__iso4_call` stub, so those tests use a responder thread
     // like the bridge tests above.
 
-    /// Parse a BridgeCall payload: (callId, targetKind, specifier, exportName, args).
+    /// Parse a BridgeCall payload: (callId, targetKind, specifier, name, args),
+    /// where `name` is the global as one segment or the import leaf's segments.
     /// The leading runId (0 for direct-API runs) is validated and skipped.
-    fn parse_bridge_call(payload: &[u8]) -> (u32, u8, Option<String>, String, Vec<WireValue>) {
+    fn parse_bridge_call(
+        payload: &[u8],
+    ) -> (u32, u8, Option<String>, Vec<String>, Vec<WireValue>) {
         let mut off = 0usize;
         let run_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
         assert_eq!(run_id, 0, "direct-API BridgeCall frames carry runId 0");
@@ -13877,10 +13866,20 @@ mod tests {
             off += 1;
             None
         };
-        let len = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        let export_name = String::from_utf8(payload[off..off + len].to_vec()).unwrap();
-        off += len;
+        let read_string = |off: &mut usize| {
+            let len = u32::from_be_bytes(payload[*off..*off + 4].try_into().unwrap()) as usize;
+            *off += 4;
+            let s = String::from_utf8(payload[*off..*off + len].to_vec()).unwrap();
+            *off += len;
+            s
+        };
+        let export_name = if target_kind == 1 {
+            let count = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
+            off += 4;
+            (0..count).map(|_| read_string(&mut off)).collect()
+        } else {
+            vec![read_string(&mut off)]
+        };
         // The whole argument list is one value slot holding an array.
         let blob_len = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
@@ -14005,7 +14004,7 @@ mod tests {
                 // never leaves the runtime.
                 assert_eq!(target_kind, 1);
                 assert_eq!(specifier.as_deref(), Some("tools:search"));
-                assert_eq!(export_name, "query");
+                assert_eq!(export_name, ["query"]);
                 assert_eq!(
                     args,
                     vec![
@@ -14061,7 +14060,7 @@ mod tests {
                 let (call_id, target_kind, specifier, export_name, _) = parse_bridge_call(payload);
                 assert_eq!(target_kind, 1);
                 assert_eq!(specifier.as_deref(), Some("tools:b"));
-                assert_eq!(export_name, "second");
+                assert_eq!(export_name, ["second"]);
                 ipc::write_ts_to_rust_frame(
                     s,
                     ipc::TsToRustMessageType::BridgeResponse,
@@ -14074,6 +14073,56 @@ mod tests {
         let out = out.unwrap();
         assert_eq!(get_default(&out).as_deref(), Some("ok"));
         assert_eq!(out.bridge_calls[0].name, "tools:b.second");
+    }
+
+    #[test]
+    fn host_module_dotted_key_and_nested_twin_dispatch_by_segments() {
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let imports = vec![host_import(
+            "api",
+            vec![(
+                "x",
+                HostModuleNode::Object(vec![
+                    ("a.b".to_string(), HostModuleNode::Function),
+                    (
+                        "a".to_string(),
+                        HostModuleNode::Object(vec![("b".to_string(), HostModuleNode::Function)]),
+                    ),
+                ]),
+            )],
+        )];
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        let fd = client.as_raw_fd();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+                let (call_id, _, _, path, _) = parse_bridge_call(&frame.payload);
+                ipc::write_ts_to_rust_frame(
+                    &mut server,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(call_id, &WireValue::String(path.join("/"))),
+                )
+                .unwrap();
+            }
+        });
+        let out = execute(
+            r#"
+            import { x } from "api";
+            export default (await x["a.b"]()) + "|" + (await x.a.b())
+            "#,
+            None,
+            Limits::default(),
+            &[],
+            &imports,
+            Some(fd),
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(get_default(&out).as_deref(), Some("x/a.b|x/a/b"));
     }
 
     #[test]
@@ -14207,7 +14256,7 @@ mod tests {
                 parse_bridge_call(&frame.payload);
             assert_eq!(target_kind, 1);
             assert_eq!(specifier.as_deref(), Some("tools:search"));
-            assert_eq!(export_name, "query");
+            assert_eq!(export_name, ["query"]);
             assert_eq!(args, vec![WireValue::String("dogs".to_string())]);
             ipc::write_ts_to_rust_frame(
                 &mut server,
@@ -14259,7 +14308,7 @@ mod tests {
             let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
             let (call_id, _, specifier, export_name, _) = parse_bridge_call(&frame.payload);
             assert_eq!(specifier.as_deref(), Some("tools:t"));
-            assert_eq!(export_name, "f");
+            assert_eq!(export_name, ["f"]);
             ipc::write_ts_to_rust_frame(
                 &mut server,
                 ipc::TsToRustMessageType::BridgeResponse,
@@ -14318,7 +14367,7 @@ mod tests {
             host_import("b", vec![("four", HostModuleNode::Function)]),
         ];
         let handles = collect_import_handles(&imports);
-        let names: Vec<String> = handles.iter().map(|h| h.record_name()).collect();
+        let names: Vec<&str> = handles.iter().map(|h| h.record_name.as_str()).collect();
         assert_eq!(
             names,
             vec!["a.one", "a.obj.two", "a.obj.deeper.three", "b.four"]

@@ -12,8 +12,8 @@
  *
  * Dispatch mechanism — location-addressed handlers:
  *
- *   Every function leaf is identified by its `(specifier, dot-joined path)`
- *   location. The client keeps a handler map keyed by that location; the
+ *   Every function leaf is identified by its `(specifier, key segments)`
+ *   location (a key may contain dots). The client keeps a handler map keyed by that location; the
  *   runtime assigns its own handle IDs (tree-walk order over the declared
  *   bindings), builds async trampolines into the module, and resolves each
  *   call back to the location before the `BridgeCall` frame is written — so
@@ -26,6 +26,7 @@
  */
 
 import type { HostModuleNodePayload, ImportBindingPayload, ImportRebindPayload } from './ipc.js'
+import { encodeImportKey } from './ipc.js'
 import type {
   HostExportFunction,
   HostModuleObject,
@@ -60,15 +61,12 @@ export const MAX_HOST_MODULE_DEPTH = 64
 export type ImportHandlerMap = Map<string, HostExportFunction>
 
 /**
- * The dispatch-map key for one host-module function leaf. The NUL separator
- * cannot collide with anything a specifier or dot-joined path can contain in
- * practice, so keys stay unambiguous.
+ * The dispatch-map key for one host-module function leaf: the wire bytes of
+ * its specifier and key segments, so `{ 'a.b': f }` and `{ a: { b: f } }` differ.
  * @param specifier
- * @param path dot-joined function-leaf path
+ * @param path the leaf's key segments
  */
-export function importHandlerKey(specifier: string, path: string): string {
-  return `${specifier}\u0000${path}`
-}
+export const importHandlerKey: (specifier: string, path: readonly string[]) => string = encodeImportKey
 
 export interface ProcessedImports {
   /**
@@ -176,7 +174,7 @@ function lowerNode(
     )
   }
   if (typeof value === 'function') {
-    handlers.set(importHandlerKey(specifier, path.join('.')), value as HostExportFunction)
+    handlers.set(importHandlerKey(specifier, path), value as HostExportFunction)
     return { kind: 'function' }
   }
   if (isPlainObject(value)) {
@@ -191,6 +189,8 @@ function lowerNode(
     for (const [key, child] of Object.entries(value)) {
       if (child === undefined)
         continue
+      if (!key.isWellFormed())
+        throw new TypeError(`[@iso4/sandbox] import key '${key}' is not a well-formed string`)
       entries.push([key, lowerNode(specifier, child, [...path, key], handlers, seen)])
     }
     seen.delete(value)
@@ -282,7 +282,10 @@ function walkRebind(
   rebinds: ImportRebindPayload[],
 ): void {
   for (const [key, value] of Object.entries(node)) {
-    const joined = [...path, key].join('.')
+    if (!key.isWellFormed())
+      throw new TypeError(`[@iso4/sandbox] import key '${key}' is not a well-formed string`)
+    const segments = [...path, key]
+    const joined = segments.join('.')
     const shape = declared.find(([name]) => name === key)?.[1]
     if (shape === undefined)
       throw new ImportRebindError('ERR_UNDECLARED_BINDING', `import '${specifier}'.${joined} was not declared at precompile time`)
@@ -299,7 +302,7 @@ function walkRebind(
           `import '${specifier}'.${joined} can only be rebound with a plain object; got ${describeKind(value)}`,
         )
       }
-      walkRebind(specifier, value, shape.entries, [...path, key], handlers, rebinds)
+      walkRebind(specifier, value, shape.entries, segments, handlers, rebinds)
       continue
     }
     if (typeof value !== 'function') {
@@ -308,8 +311,8 @@ function walkRebind(
         `import '${specifier}'.${joined} can only be rebound with a function; got ${describeKind(value)}`,
       )
     }
-    handlers.set(importHandlerKey(specifier, joined), value as HostExportFunction)
-    rebinds.push({ specifier, path: joined })
+    handlers.set(importHandlerKey(specifier, segments), value as HostExportFunction)
+    rebinds.push({ specifier, path: segments })
   }
 }
 

@@ -772,11 +772,13 @@ class PayloadWriter {
   writeImportRebinds(rebinds: readonly ImportRebindPayload[]): this {
     // Wire layout per docs/protocol.md §5.2 (PrefixRun only):
     //   u32   count
-    //   for each: String specifier, String path
+    //   for each: String specifier, List<String> path
     this.writeU32(rebinds.length)
     for (const rebind of rebinds) {
       this.writeString(rebind.specifier)
-      this.writeString(rebind.path)
+      this.writeU32(rebind.path.length)
+      for (const segment of rebind.path)
+        this.writeString(segment)
     }
     return this
   }
@@ -922,6 +924,19 @@ class PayloadReader {
     return slice
   }
 
+  /**
+   * Advance past `len` bytes with the same bounds check as {@link readRawBytes}.
+   * @param len
+   */
+  skipBytes(len: number): void {
+    if (this.remaining < len) {
+      throw new PayloadDecodeError(
+        `unexpected end of payload: need ${len} bytes, have ${this.remaining}`,
+      )
+    }
+    this.offset += len
+  }
+
   readString(): string {
     return Buffer.from(this.readRawBytes(this.readU32())).toString('utf8')
   }
@@ -931,6 +946,19 @@ class PayloadReader {
     const items: string[] = []
     for (let i = 0; i < count; i++) items.push(this.readString())
     return items
+  }
+
+  /**
+   * Read a `String specifier` + `List<String> path` and return exactly those
+   * validated bytes as a latin1 string: the import key, see {@link encodeImportKey}.
+   */
+  readImportKey(): string {
+    const start = this.offset
+    this.skipBytes(this.readU32())
+    const count = this.readU32()
+    for (let i = 0; i < count; i++)
+      this.skipBytes(this.readU32())
+    return Buffer.from(this.view.buffer, this.view.byteOffset + start, this.offset - start).toString('latin1')
   }
 
   /**
@@ -1000,10 +1028,10 @@ export type ImportBindingPayload
 export interface ImportRebindPayload {
   specifier: string
   /**
-   * Dot-joined function-leaf path inside the host module
-   * (e.g. `"someObj.someMethod"`).
+   * Key segments of the function leaf inside the host module
+   * (e.g. `['someObj', 'someMethod']`); a key may itself contain dots.
    */
-  path: string
+  path: readonly string[]
 }
 
 // ── CallPayload ─────────────────────────────────────────────────────────────
@@ -1175,13 +1203,39 @@ export interface BridgeCallInfo {
    */
   runId: number
   callId: number
-  /**
-   * 0 = global, 1 = import (Phase 7)
-   */
-  targetKind: 0 | 1
-  specifier: string | undefined
-  exportName: string
+  target: BridgeTarget
   args: unknown[]
+}
+
+/**
+ * What a `BridgeCall` targets: a global by name (`targetKind = 0`), or a
+ * host-module function leaf by its import key (`targetKind = 1`).
+ */
+export type BridgeTarget
+  = | { targetKind: 0, exportName: string }
+    | { targetKind: 1, key: string }
+
+/**
+ * The handler-map key of a host-module function leaf: its specifier and path
+ * in wire encoding (`String` + `List<String>`), as latin1. Unambiguous, and
+ * equal to the bytes a `BridgeCall` carries, so dispatch needs no decoding.
+ * @param specifier
+ * @param path the leaf's key segments
+ */
+export function encodeImportKey(specifier: string, path: readonly string[]): string {
+  const writer = new PayloadWriter().writeString(specifier).writeU32(path.length)
+  for (const segment of path)
+    writer.writeString(segment)
+  return writer.toBuffer().toString('latin1')
+}
+
+/**
+ * Decode an import key back to its specifier and path, for messages.
+ * @param key a key from {@link encodeImportKey} or a `BridgeCall`
+ */
+export function decodeImportKey(key: string): { specifier: string, path: string[] } {
+  const reader = new PayloadReader(Buffer.from(key, 'latin1'))
+  return { specifier: reader.readString(), path: reader.readStringList() }
 }
 
 /**
@@ -1235,10 +1289,12 @@ export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
   const targetKindRaw = reader.readU8()
   if (targetKindRaw !== 0 && targetKindRaw !== 1)
     throw new Error(`invalid bridge targetKind: ${targetKindRaw}`)
-  const targetKind = targetKindRaw as 0 | 1
-  const specifierPresent = reader.readU8()
-  const specifier = specifierPresent === 1 ? reader.readString() : undefined
-  const exportName = reader.readString()
+  const specifierPresent = reader.readU8() === 1
+  if (specifierPresent !== (targetKindRaw === 1))
+    throw new PayloadDecodeError('BridgeCall specifier must be present exactly for an import target')
+  const target: BridgeTarget = targetKindRaw === 0
+    ? { targetKind: 0, exportName: reader.readString() }
+    : { targetKind: 1, key: reader.readImportKey() }
   const decoded = reader.readValueBlob()
   if (!Array.isArray(decoded)) {
     throw new PayloadDecodeError(
@@ -1247,7 +1303,7 @@ export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
       }`,
     )
   }
-  return { runId, callId, targetKind, specifier, exportName, args: decoded }
+  return { runId, callId, target, args: decoded }
 }
 
 // ── BridgeResponse encoder (TS → Rust) ──────────────────────────────────────

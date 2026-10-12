@@ -677,6 +677,15 @@ value type is the discriminator:
   never leave the runtime. The TS client routes the call through a
   location-keyed handler map (`(specifier, path) → fn`).
 
+  A **path** is the list of keys from the top-level export to the leaf,
+  and it crosses the wire as that list of segments, never joined. Nested
+  keys may contain dots: `{ api: { 'a.b': f1, a: { b: f2 } } }` declares
+  two leaves, `["api", "a.b"]` and `["api", "a", "b"]`, each dispatched to
+  and rebound on its own handler. The joined `tools:search.query` form is
+  only the readable name in bridge-call records and error messages. Nested
+  keys must be well-formed strings (no lone surrogates); the client refuses
+  others with a `TypeError`.
+
   `__iso4_call` is a reserved bridge stub the runtime installs itself
   whenever the declared imports contain a function leaf. There are **no
   generated bridge-global names** — nothing to sanitise, no collision
@@ -1732,7 +1741,7 @@ sees is exactly what the prefix produces deterministically:
 When `prefix.run()` provides `globals` or `imports`, the replacement
 handlers stay on the TS side — bridge dispatch is name-addressed, so a
 rebind just re-points the per-run dispatch entry (global name, or
-host-import `specifier` + leaf path). The client and then the Rust runtime
+host-import `specifier` + leaf path segments, §4.3). The client and then the Rust runtime
 validate every rebound name/location against the shape declared at
 `prepare()` (§5.2). Only function globals (plain, bridge or shim) and
 host-module function leaves can be rebound, and only with a function; a

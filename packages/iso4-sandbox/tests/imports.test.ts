@@ -24,6 +24,7 @@ import {
   mergeRebindImports,
   processImports,
 } from '../src/imports.js'
+import { decodeImportKey } from '../src/ipc.js'
 import { serializeValue } from '../src/v8-codec.js'
 import type { HostExportFunction, Imports, RebindImports } from '../src/types.js'
 
@@ -60,7 +61,7 @@ describe('processImports', () => {
     }])
     // No source text anywhere — the runtime builds the module from the tree.
     expect(bindings[0]).not.toHaveProperty('source')
-    expect(handlers.get(importHandlerKey('host:tools', 'search'))).toBe(search)
+    expect(handlers.get(importHandlerKey('host:tools', ['search']))).toBe(search)
   })
 
   it('recursively walks nested mixed data + function objects', () => {
@@ -90,7 +91,7 @@ describe('processImports', () => {
         }],
       ],
     }])
-    expect(handlers.get(importHandlerKey('host:nested', 'someObj.someMethod'))).toBe(greet)
+    expect(handlers.get(importHandlerKey('host:nested', ['someObj', 'someMethod']))).toBe(greet)
   })
 
   it('registers handlers for multiple modules under distinct keys', () => {
@@ -100,9 +101,42 @@ describe('processImports', () => {
       'host:one': { a },
       'host:two': { b },
     })
-    expect(handlers.get(importHandlerKey('host:one', 'a'))).toBe(a)
-    expect(handlers.get(importHandlerKey('host:two', 'b'))).toBe(b)
+    expect(handlers.get(importHandlerKey('host:one', ['a']))).toBe(a)
+    expect(handlers.get(importHandlerKey('host:two', ['b']))).toBe(b)
     expect(handlers.size).toBe(2)
+  })
+
+  it('keeps a dotted key apart from the nested path it spells', () => {
+    const dotted: HostExportFunction = () => 'dotted'
+    const nested: HostExportFunction = () => 'nested'
+    const { handlers } = processImports({ 'host:api': { api: { 'a.b': dotted, 'a': { b: nested } } } })
+    expect(handlers.get(importHandlerKey('host:api', ['api', 'a.b']))).toBe(dotted)
+    expect(handlers.get(importHandlerKey('host:api', ['api', 'a', 'b']))).toBe(nested)
+    expect(handlers.size).toBe(2)
+  })
+
+  it('gives every distinct specifier and path its own key and handler', () => {
+    const keys = [
+      ['host:api', ['api', 'a.b']],
+      ['host:api', ['api', 'a', 'b']],
+      ['host:api', ['api', 'a', '']],
+      ['host:api', ['api', 'a']],
+      ['host:api', ['api', 'ab']],
+      ['host:ap', ['iapi', 'a']],
+    ] as const
+    expect(new Set(keys.map(([s, p]) => importHandlerKey(s, p))).size).toBe(keys.length)
+
+    const fns = [() => 1, () => 2, () => 3]
+    const { handlers } = processImports({ 'host:api': { api: { 'a.b': fns[0], 'a': { 'b': fns[1], '': fns[2] } } } })
+    expect(handlers.get(importHandlerKey('host:api', ['api', 'a.b']))).toBe(fns[0])
+    expect(handlers.get(importHandlerKey('host:api', ['api', 'a', 'b']))).toBe(fns[1])
+    expect(handlers.get(importHandlerKey('host:api', ['api', 'a', '']))).toBe(fns[2])
+  })
+
+  it('refuses a nested key that is not a well-formed string', () => {
+    expect(() => processImports({ 'host:api': { api: { 'x\uD800': () => 1 } } })).toThrow(
+      new TypeError(`[@iso4/sandbox] import key 'x\uD800' is not a well-formed string`),
+    )
   })
 
   it('accepts a default export entry', () => {
@@ -122,7 +156,7 @@ describe('processImports', () => {
         }],
       ],
     }])
-    expect(handlers.get(importHandlerKey('host:default', 'default.handler'))).toBe(handler)
+    expect(handlers.get(importHandlerKey('host:default', ['default', 'handler']))).toBe(handler)
   })
 
   it('carries BigInt, Uint8Array, and arrays as data leaves', () => {
@@ -251,7 +285,7 @@ describe('processImports — rejected configurations', () => {
     const { handlers } = processImports({ 'host:deep': node as never })
     expect(handlers.size).toBe(1)
     const [key] = handlers.keys()
-    expect(key!.split('.').length).toBe(MAX_HOST_MODULE_DEPTH)
+    expect(decodeImportKey(key!).path).toHaveLength(MAX_HOST_MODULE_DEPTH)
   })
 
   it('rejects a host-module shape nested one level past the limit, naming the path', () => {
@@ -333,10 +367,10 @@ describe('mergeRebindImports', () => {
   it('overrides a declared function leaf and reports the rebind location', () => {
     const { handlers: defaults, bindings } = makeFixture()
     const { rebinds, handlers } = mergeRebindImports({ 'host:tools': { search: fnB } }, defaults, bindings)
-    expect(rebinds).toEqual([{ specifier: 'host:tools', path: 'search' }])
-    expect(handlers.get(importHandlerKey('host:tools', 'search'))).toBe(fnB)
+    expect(rebinds).toEqual([{ specifier: 'host:tools', path: ['search'] }])
+    expect(handlers.get(importHandlerKey('host:tools', ['search']))).toBe(fnB)
     // The defaults map is not mutated.
-    expect(defaults.get(importHandlerKey('host:tools', 'search'))).toBe(fnA)
+    expect(defaults.get(importHandlerKey('host:tools', ['search']))).toBe(fnA)
   })
 
   it('overrides a function leaf at a nested path', () => {
@@ -350,8 +384,8 @@ describe('mergeRebindImports', () => {
       defaults,
       declaredImportShape(bindings),
     )
-    expect(rebinds).toEqual([{ specifier: 'host:nested', path: 'someObj.someMethod' }])
-    expect(handlers.get(importHandlerKey('host:nested', 'someObj.someMethod'))).toBe(replaced)
+    expect(rebinds).toEqual([{ specifier: 'host:nested', path: ['someObj', 'someMethod'] }])
+    expect(handlers.get(importHandlerKey('host:nested', ['someObj', 'someMethod']))).toBe(replaced)
   })
 
   it('omitted overrides fall back to the precompile-time handler', () => {
@@ -359,8 +393,27 @@ describe('mergeRebindImports', () => {
     const fnY: HostExportFunction = () => 'y'
     const { handlers: defaults, bindings } = processImports({ 'host:multi': { a: fnX, b: fnY } })
     const { handlers } = mergeRebindImports({ 'host:multi': { a: () => 'new-a' } }, defaults, bindings)
-    expect(handlers.get(importHandlerKey('host:multi', 'a'))?.()).toBe('new-a')
-    expect(handlers.get(importHandlerKey('host:multi', 'b'))).toBe(fnY)
+    expect(handlers.get(importHandlerKey('host:multi', ['a']))?.()).toBe('new-a')
+    expect(handlers.get(importHandlerKey('host:multi', ['b']))).toBe(fnY)
+  })
+
+  it('rebinds a dotted key and its nested twin as separate segment paths', () => {
+    const { handlers: defaults, bindings } = processImports({ 'host:api': { api: { 'a.b': fnA, 'a': { b: fnA } } } })
+    const shape = declaredImportShape(bindings)
+    const dotted = mergeRebindImports({ 'host:api': { api: { 'a.b': fnB } } }, defaults, shape)
+    expect(dotted.rebinds).toEqual([{ specifier: 'host:api', path: ['api', 'a.b'] }])
+    expect(dotted.handlers.get(importHandlerKey('host:api', ['api', 'a.b']))).toBe(fnB)
+    expect(dotted.handlers.get(importHandlerKey('host:api', ['api', 'a', 'b']))).toBe(fnA)
+    const nested = mergeRebindImports({ 'host:api': { api: { a: { b: fnB } } } }, defaults, shape)
+    expect(nested.rebinds).toEqual([{ specifier: 'host:api', path: ['api', 'a', 'b'] }])
+    expect(nested.handlers.get(importHandlerKey('host:api', ['api', 'a.b']))).toBe(fnA)
+  })
+
+  it('refuses a rebind key that is not a well-formed string', () => {
+    const { handlers: defaults, bindings } = processImports({ 'host:api': { api: { f: fnA } } })
+    expect(() => mergeRebindImports({ 'host:api': { api: { 'x\uD800': fnB } } } as never, defaults, bindings)).toThrow(
+      new TypeError(`[@iso4/sandbox] import key 'x\uD800' is not a well-formed string`),
+    )
   })
 })
 

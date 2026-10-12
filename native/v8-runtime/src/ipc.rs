@@ -1213,9 +1213,9 @@ pub struct ImportBinding {
 #[derive(Debug, Clone)]
 pub struct ImportRebind {
     pub specifier: String,
-    /// Dot-joined path of the function leaf inside the host module
-    /// (e.g. `"someObj.someMethod"`).
-    pub path: String,
+    /// Key segments of the function leaf inside the host module; a key may
+    /// itself contain dots.
+    pub path: Vec<String>,
 }
 
 /// A host → sandbox function call requested by a `Run` / `PrefixRun` frame
@@ -1552,7 +1552,10 @@ impl<'a> PayloadReader<'a> {
         let (count, mut rebinds) = self.read_list("import rebind")?;
         for _ in 0..count {
             let specifier = self.read_string()?;
-            let path = self.read_string()?;
+            let (segments, mut path) = self.read_list("import rebind path segment")?;
+            for _ in 0..segments {
+                path.push(self.read_string()?);
+            }
             rebinds.push(ImportRebind { specifier, path });
         }
         Ok(rebinds)
@@ -2942,17 +2945,20 @@ mod tests {
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 2); // 2 rebinds
         push_string(&mut v, "tools:search");
+        push_u32(&mut v, 1);
         push_string(&mut v, "query");
         push_string(&mut v, "tools:search");
-        push_string(&mut v, "nested.inner");
+        push_u32(&mut v, 2);
+        push_string(&mut v, "a.b");
+        push_string(&mut v, "inner");
         v.push(0); // call: absent
 
         let p = parse_prefix_run_payload(&v).unwrap();
         assert_eq!(p.code.as_deref(), Some("code"));
         assert_eq!(p.import_rebinds.len(), 2);
         assert_eq!(p.import_rebinds[0].specifier, "tools:search");
-        assert_eq!(p.import_rebinds[0].path, "query");
-        assert_eq!(p.import_rebinds[1].path, "nested.inner");
+        assert_eq!(p.import_rebinds[0].path, ["query"]);
+        assert_eq!(p.import_rebinds[1].path, ["a.b", "inner"]);
     }
 
     #[test]

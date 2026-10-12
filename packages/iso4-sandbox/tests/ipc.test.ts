@@ -523,12 +523,17 @@ describe('payload encoders', () => {
       runId: 1,
       prefixId: 'p',
       code: 'x',
-      importRebinds: [{ specifier: 'tools:search', path: 'nested.inner' }],
+      importRebinds: [{ specifier: 'tools:search', path: ['a.b', 'inner'] }],
     })
-    // Tail: u32 count, String specifier, String path.
-    const s = pref.toString('utf8')
-    expect(s).toContain('tools:search')
-    expect(s).toContain('nested.inner')
+    // Tail: u32 count, String specifier, List<String> path, call absent.
+    const u32be = (n: number): Buffer => {
+      const b = Buffer.alloc(4)
+      b.writeUInt32BE(n)
+      return b
+    }
+    const str = (v: string): Buffer => Buffer.concat([u32be(Buffer.byteLength(v)), Buffer.from(v)])
+    const tail = Buffer.concat([u32be(1), str('tools:search'), u32be(2), str('a.b'), str('inner'), Buffer.from([0])])
+    expect(pref.subarray(pref.byteLength - tail.byteLength).equals(tail)).toBe(true)
   })
 
   test('imports field defaults to empty list when omitted', () => {

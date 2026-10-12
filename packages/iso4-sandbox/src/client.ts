@@ -38,11 +38,11 @@ import {
   encodeStreamChunkPayload,
   encodeStreamEndPayload,
   encodeStreamPullPayload,
+  decodeImportKey,
 } from './ipc'
-import type { WireResourceLimits, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
+import type { WireResourceLimits, BridgeTarget, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
-import { importHandlerKey } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
 import type { StreamSourceRegistry } from './web-codec.js'
 import { OutboundStreamRegistry, brandKeyForToken } from './web-codec.js'
@@ -98,12 +98,7 @@ export interface RawRunResult {
  * function-leaf path already resolved by the runtime and route through the
  * per-run import handler map (see `imports.ts`).
  */
-export type BridgeCallDispatcher = (call: {
-  targetKind: 0 | 1
-  specifier: string | undefined
-  exportName: string
-  args: unknown[]
-}) => Promise<unknown>
+export type BridgeCallDispatcher = (target: BridgeTarget, args: unknown[]) => Promise<unknown>
 
 export type { ResourceLimits }
 
@@ -1370,12 +1365,7 @@ export class RuntimeIpcClient {
       // If the run timed out by then, Rust ignores the late frame.
       // Responses echo the frame's own run id — the demux routes by it.
       const { runId: frameRunId, callId } = call
-      dispatcher({
-        targetKind: call.targetKind,
-        specifier: call.specifier,
-        exportName: call.exportName,
-        args: call.args,
-      }).then(
+      dispatcher(call.target, call.args).then(
         async (value) => {
           // serializeHostValue throws for the handful of types V8 refuses
           // to clone (function, symbol, promise, WeakMap, proxy). Catch
@@ -1506,19 +1496,18 @@ function makeDispatcher(
 ): BridgeCallDispatcher | undefined {
   if (Object.keys(globals).length === 0 && (imports === undefined || imports.size === 0))
     return undefined
-  return async ({ targetKind, specifier, exportName, args }) => {
-    if (targetKind === 1) {
-      const handler = imports?.get(importHandlerKey(specifier ?? '', exportName))
+  return async (target, args) => {
+    if (target.targetKind === 1) {
+      const handler = imports?.get(target.key)
       if (handler === undefined) {
-        throw new Error(
-          `no handler configured for host import '${specifier}'.${exportName}`,
-        )
+        const { specifier, path } = decodeImportKey(target.key)
+        throw new Error(`no handler configured for host import '${specifier}'.${path.join('.')}`)
       }
       return handler(...(args as any[]))
     }
-    const handler = globals[exportName]
+    const handler = globals[target.exportName]
     if (handler === undefined)
-      throw new Error(`no handler configured for bridge global '${exportName}'`)
+      throw new Error(`no handler configured for bridge global '${target.exportName}'`)
     return handler(...(args as any[]))
   }
 }

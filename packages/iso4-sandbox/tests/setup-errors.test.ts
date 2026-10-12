@@ -25,7 +25,14 @@ beforeAll(async () => {
       expr: '1',
     },
     imports: {
-      'host:tools': { add: (n: number) => n + 1, version: '1.0.0', nested: { fn: () => 1 } },
+      'host:tools': {
+        add: (n: number) => n + 1,
+        version: '1.0.0',
+        nested: { fn: () => 1 },
+        dotted: { 'a.b': () => 'dotted', 'a': { b: () => 'nested' }, 'v.x': '1' },
+        flat: { 'c.d': () => 1 },
+        deep: { c: { d: () => 1 } },
+      },
       'lib:math': 'export const x = 1',
     },
   })
@@ -182,6 +189,14 @@ describe('allowed rebinds still reach the runtime', () => {
     } as never)
     expect(result).toMatchObject({ ok: true, exports: { default: ['tool', 'shim', 'add', 'nested'] } })
   })
+
+  test('a dotted key and its nested twin dispatch and rebind separately', async () => {
+    const code = `import { dotted } from 'host:tools'\nexport default [await dotted['a.b'](), await dotted.a.b()]`
+    const at = async (imports?: object): Promise<unknown> => prefix.run({ code, ...(imports && { imports: { 'host:tools': { dotted: imports } } }) } as never)
+    expect(await at()).toMatchObject({ ok: true, exports: { default: ['dotted', 'nested'] } })
+    expect(await at({ 'a.b': () => 'rebound' })).toMatchObject({ ok: true, exports: { default: ['rebound', 'nested'] } })
+    expect(await at({ a: { b: () => 'rebound' } })).toMatchObject({ ok: true, exports: { default: ['dotted', 'rebound'] } })
+  })
 })
 
 describe('the declared shape is a copy', () => {
@@ -212,8 +227,21 @@ describe('the declared shape is a copy', () => {
 describe('the client mirrors the runtime', () => {
   const fn = async (): Promise<number> => 1
   const bridge = { kind: 'bridge', handler: fn, enumerable: true }
+  const fnNode = { kind: 'function' }
+  const toolsModule: [string, object][] = [
+    ['add', fnNode],
+    ['version', { kind: 'data', value: undefined }],
+    ['nested', { kind: 'object', entries: [['fn', fnNode]] }],
+    ['dotted', { kind: 'object', entries: [['a.b', fnNode], ['a', { kind: 'object', entries: [['b', fnNode]] }], ['v.x', { kind: 'data', value: undefined }]] }],
+    ['flat', { kind: 'object', entries: [['c.d', fnNode]] }],
+    ['deep', { kind: 'object', entries: [['c', { kind: 'object', entries: [['d', fnNode]] }]] }],
+  ]
   const declaredImports = [
-    { specifier: 'host:tools', module: [['add', { kind: 'function' }], ['version', { kind: 'data', value: undefined }], ['nested', { kind: 'object', entries: [['fn', { kind: 'function' }]] }]] },
+    { specifier: 'host:tools', module: toolsModule },
+    { specifier: 'lib:math', source: '' },
+  ]
+  const widenTools = (key: string, entries: object[]): object[] => [
+    { specifier: 'host:tools', module: [...toolsModule.filter(([k]) => k !== key), [key, { kind: 'object', entries }]] },
     { specifier: 'lib:math', source: '' },
   ]
   const asFunction = (specifier: string, path: string): object[] => [
@@ -230,6 +258,9 @@ describe('the client mirrors the runtime', () => {
     ['an undeclared path', { imports: { 'host:tools': { nope: fn } } }, { imports: asFunction('host:tools', 'nope') }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.nope was not declared at precompile time`],
     ['a data leaf', { imports: { 'host:tools': { version: fn } } }, { imports: asFunction('host:tools', 'version') }, 'ERR_FROZEN_BINDING', `import 'host:tools'.version is a data leaf, not a function — data leaves cannot be rebound`],
     ['a source module', { imports: { 'lib:math': { x: fn } } }, { imports: asFunction('lib:math', 'x') }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`],
+    ['a dotted key rebound as nesting', { imports: { 'host:tools': { flat: { c: { d: fn } } } } }, { imports: widenTools('flat', [['c.d', fnNode], ['c', { kind: 'object', entries: [['d', fnNode]] }]]) }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.flat.c was not declared at precompile time`],
+    ['a nested path rebound as a dotted key', { imports: { 'host:tools': { deep: { 'c.d': fn } } } }, { imports: widenTools('deep', [['c', { kind: 'object', entries: [['d', fnNode]] }], ['c.d', fnNode]]) }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.deep.c.d was not declared at precompile time`],
+    ['a data leaf under a dotted key', { imports: { 'host:tools': { dotted: { 'v.x': fn } } } }, { imports: widenTools('dotted', [['v.x', fnNode]]) }, 'ERR_FROZEN_BINDING', `import 'host:tools'.dotted.v.x is a data leaf, not a function — data leaves cannot be rebound`],
   ]
 
   test.each(cases)('%s', async (_kind, options, widen, code, message) => {
@@ -240,7 +271,17 @@ describe('the client mirrors the runtime', () => {
     const widened = await sandbox.prepare({
       code: 'export default () => 1',
       globals: { config: { kind: 'data', value: 1 }, expr: '1' },
-      imports: { 'host:tools': { add: (n: number) => n + 1, version: '1.0.0', nested: { fn: () => 1 } }, 'lib:math': 'export const x = 1' },
+      imports: {
+        'host:tools': {
+          add: (n: number) => n + 1,
+          version: '1.0.0',
+          nested: { fn: () => 1 },
+          dotted: { 'a.b': () => 1, 'a': { b: () => 1 }, 'v.x': '1' },
+          flat: { 'c.d': () => 1 },
+          deep: { c: { d: () => 1 } },
+        },
+        'lib:math': 'export const x = 1',
+      },
     })
     const internals = widened as unknown as { declaredGlobals: Map<string, unknown>, declaredImports: object[] }
     internals.declaredGlobals = new Map((widen.globals ?? []).map((name) => [name, bridge]))

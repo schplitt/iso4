@@ -15,6 +15,8 @@ import { describe, expect, test } from 'vitest'
 import {
   PayloadDecodeError,
   decodeBridgeCallPayload,
+  decodeImportKey,
+  encodeImportKey,
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
   decodeStatsPayload,
@@ -189,7 +191,7 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
 
 function encodeBridgeCallPayload(
   callId: number,
-  exportName: string,
+  name: string | readonly string[],
   args: readonly unknown[],
   specifier?: string,
 ): Buffer {
@@ -198,7 +200,7 @@ function encodeBridgeCallPayload(
     u32(callId),
     Buffer.from([specifier === undefined ? 0 : 1]), // targetKind
     optionalString(specifier),
-    str(exportName),
+    typeof name === 'string' ? str(name) : strList(name),
     valueSlot(args),
   ])
 }
@@ -720,9 +722,7 @@ describe('decodeBridgeCallPayload', () => {
     expect(call).toEqual({
       runId: 1,
       callId: 7,
-      targetKind: 0,
-      specifier: undefined,
-      exportName: 'greet',
+      target: { targetKind: 0, exportName: 'greet' },
       args: ['world', 42, { deep: true }],
     })
   })
@@ -732,13 +732,29 @@ describe('decodeBridgeCallPayload', () => {
     expect(call.args).toEqual([])
   })
 
-  test('an import target carries its specifier and leaf path', () => {
+  test('an import target carries its specifier and leaf path segments', () => {
     const call = decodeBridgeCallPayload(
-      encodeBridgeCallPayload(1, 'nested.inner', [1], 'tools:search'),
+      encodeBridgeCallPayload(1, ['a.b', 'inner'], [1], 'tools:search'),
     )
-    expect(call.targetKind).toBe(1)
-    expect(call.specifier).toBe('tools:search')
-    expect(call.exportName).toBe('nested.inner')
+    expect(call.target).toEqual({ targetKind: 1, key: encodeImportKey('tools:search', ['a.b', 'inner']) })
+    expect(call.target.targetKind === 1 && decodeImportKey(call.target.key)).toEqual({ specifier: 'tools:search', path: ['a.b', 'inner'] })
+  })
+
+  test('the import key covers exactly the specifier and path bytes', () => {
+    const call = decodeBridgeCallPayload(encodeBridgeCallPayload(1, ['é', ''], [1], 'tools:ü'))
+    expect(call.target).toEqual({ targetKind: 1, key: Buffer.concat([str('tools:ü'), strList(['é', ''])]).toString('latin1') })
+  })
+
+  test('rejects a specifier on a global target and its absence on an import target', () => {
+    const imp = Buffer.concat([u32(1), u32(0), Buffer.from([1, 0]), strList(['f']), valueSlot([])])
+    expect(() => decodeBridgeCallPayload(imp)).toThrow(/present exactly for an import target/)
+    const glob = Buffer.concat([u32(1), u32(0), Buffer.from([0, 1]), str('s'), str('f'), valueSlot([])])
+    expect(() => decodeBridgeCallPayload(glob)).toThrow(/present exactly for an import target/)
+  })
+
+  test('rejects an import path whose segment runs past the payload', () => {
+    const buf = Buffer.concat([u32(1), u32(0), Buffer.from([1, 1]), str('s'), u32(1), u32(99), Buffer.from('ab')])
+    expect(() => decodeBridgeCallPayload(buf)).toThrow(/unexpected end of payload/)
   })
 
   test('arguments sharing one object keep their identity', () => {

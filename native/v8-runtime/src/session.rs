@@ -144,18 +144,27 @@ fn validate_import_rebinds(
             ipc::ImportModule::Host(exports) => exports,
         };
         match find_host_node(exports, &rb.path) {
-            Some(ipc::HostModuleNode::Function) => {}
-            Some(ipc::HostModuleNode::Data(_)) => {
+            Ok(ipc::HostModuleNode::Function) => {}
+            Ok(ipc::HostModuleNode::Data(_)) => {
                 return Err(sandbox::RunError::FrozenBinding(format!(
                     "import '{}'.{} is a data leaf, not a function — data leaves \
                      cannot be rebound",
-                    rb.specifier, rb.path
+                    rb.specifier,
+                    rb.path.join(".")
                 )))
             }
-            _ => {
+            Ok(ipc::HostModuleNode::Object(_)) => {
                 return Err(sandbox::RunError::UndeclaredBinding(format!(
                     "import '{}'.{} was not declared at precompile time",
-                    rb.specifier, rb.path
+                    rb.specifier,
+                    rb.path.join(".")
+                )))
+            }
+            Err(depth) => {
+                return Err(sandbox::RunError::UndeclaredBinding(format!(
+                    "import '{}'.{} was not declared at precompile time",
+                    rb.specifier,
+                    rb.path[..depth].join(".")
                 )))
             }
         }
@@ -163,24 +172,28 @@ fn validate_import_rebinds(
     Ok(())
 }
 
-/// Follow a dot-joined path through a host-module tree.
+/// Follow a path of key segments through a host-module tree. `Err` carries
+/// the length of the path up to and including the first segment not found.
 fn find_host_node<'a>(
     entries: &'a [(String, ipc::HostModuleNode)],
-    path: &str,
-) -> Option<&'a ipc::HostModuleNode> {
-    let mut segments = path.split('.');
-    let first = segments.next()?;
-    let mut node = entries.iter().find(|(k, _)| k == first).map(|(_, n)| n)?;
-    for segment in segments {
-        let ipc::HostModuleNode::Object(children) = node else {
-            return None;
-        };
-        node = children
+    path: &[String],
+) -> Result<&'a ipc::HostModuleNode, usize> {
+    let mut entries = entries;
+    let mut node = None;
+    for (i, segment) in path.iter().enumerate() {
+        let found = entries
             .iter()
             .find(|(k, _)| k == segment)
-            .map(|(_, n)| n)?;
+            .map(|(_, n)| n)
+            .ok_or(i + 1)?;
+        if let ipc::HostModuleNode::Object(children) = found {
+            entries = children;
+        } else if i + 1 < path.len() {
+            return Err(path.len());
+        }
+        node = Some(found);
     }
-    Some(node)
+    node.ok_or(path.len())
 }
 
 /// Validated source + declared global / import shape for one prepared prefix.
@@ -1484,6 +1497,35 @@ fn dispatch_prefix_run(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn import_rebind_paths_match_whole_key_segments() {
+        let declared = vec![ipc::ImportBinding {
+            specifier: "api".into(),
+            module: ipc::ImportModule::Host(vec![(
+                "x".into(),
+                ipc::HostModuleNode::Object(vec![
+                    ("a.b".into(), ipc::HostModuleNode::Function),
+                    ("c".into(), ipc::HostModuleNode::Object(vec![("d".into(), ipc::HostModuleNode::Function)])),
+                ]),
+            )]),
+        }];
+        let check = |path: &[&str]| {
+            let rebind = ipc::ImportRebind {
+                specifier: "api".into(),
+                path: path.iter().map(|s| s.to_string()).collect(),
+            };
+            validate_import_rebinds(&[rebind], &declared)
+        };
+
+        assert!(check(&["x", "a.b"]).is_ok());
+        assert!(check(&["x", "c", "d"]).is_ok());
+        assert!(matches!(
+            check(&["x", "a", "b"]),
+            Err(sandbox::RunError::UndeclaredBinding(m)) if m == "import 'api'.x.a was not declared at precompile time"
+        ));
+        assert!(matches!(check(&["x", "c.d"]), Err(sandbox::RunError::UndeclaredBinding(_))));
+    }
 
     #[test]
     fn prefix_run_globals_may_only_rebind_declared_bridge_stubs() {
