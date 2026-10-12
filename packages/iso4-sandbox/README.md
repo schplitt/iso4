@@ -74,6 +74,10 @@ await sandbox.dispose()
 object as a bridge stub. The bridge is fully generic — `fetch` is not
 special-cased:
 
+`SANDBOX_GLOBALS` lists every name a fresh sandbox already defines, and
+`isReservedGlobal(name)` also covers the runtime-internal `__iso4_` prefix.
+Check generated names against it before installing them.
+
 ```ts
 const options = {
   globals: {

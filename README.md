@@ -168,6 +168,10 @@ pnpm changeset          # record a per-package version bump
 `globals` wires any non-reserved name directly into the sandbox's global
 object. The bridge is completely generic — the name `fetch` is not special:
 
+`SANDBOX_GLOBALS` lists every name a fresh sandbox already defines, and
+`isReservedGlobal(name)` also covers the runtime-internal `__iso4_` prefix.
+Check generated names against it before installing them.
+
 ```ts
 const result = await sandbox.run({
   code: `

@@ -26,6 +26,101 @@ import type {
   StringGlobal,
 } from './types.js'
 
+/**
+ * Every global name a fresh sandbox defines: the JS built-ins of the bundled
+ * V8 plus the runtime's own (`console`, `waitUntil`, timers, web classes).
+ * A host global under one of these names replaces or collides with it.
+ */
+export const SANDBOX_GLOBALS: readonly string[] = Object.freeze([
+  'AggregateError',
+  'Array',
+  'ArrayBuffer',
+  'AsyncDisposableStack',
+  'Atomics',
+  'BigInt',
+  'BigInt64Array',
+  'BigUint64Array',
+  'Boolean',
+  'DataView',
+  'Date',
+  'DisposableStack',
+  'Error',
+  'EvalError',
+  'FinalizationRegistry',
+  'Float16Array',
+  'Float32Array',
+  'Float64Array',
+  'Function',
+  'Headers',
+  'Infinity',
+  'Int16Array',
+  'Int32Array',
+  'Int8Array',
+  'Intl',
+  'Iterator',
+  'JSON',
+  'Map',
+  'Math',
+  'NaN',
+  'Number',
+  'Object',
+  'Promise',
+  'Proxy',
+  'RangeError',
+  'ReferenceError',
+  'Reflect',
+  'RegExp',
+  'Request',
+  'Response',
+  'Set',
+  'String',
+  'SuppressedError',
+  'Symbol',
+  'SyntaxError',
+  'Temporal',
+  'TextDecoder',
+  'TextEncoder',
+  'TypeError',
+  'URIError',
+  'URL',
+  'URLSearchParams',
+  'Uint16Array',
+  'Uint32Array',
+  'Uint8Array',
+  'Uint8ClampedArray',
+  'WeakMap',
+  'WeakRef',
+  'WeakSet',
+  'clearTimeout',
+  'console',
+  'decodeURI',
+  'decodeURIComponent',
+  'encodeURI',
+  'encodeURIComponent',
+  'escape',
+  'eval',
+  'globalThis',
+  'isFinite',
+  'isNaN',
+  'parseFloat',
+  'parseInt',
+  'setTimeout',
+  'undefined',
+  'unescape',
+  'waitUntil',
+])
+
+const SANDBOX_GLOBAL_SET: ReadonlySet<string> = new Set(SANDBOX_GLOBALS)
+
+/**
+ * Whether `name` is taken in the sandbox: one of {@link SANDBOX_GLOBALS} or
+ * under the runtime-internal `__iso4_` prefix.
+ * @param name
+ */
+export function isReservedGlobal(name: string): boolean {
+  return SANDBOX_GLOBAL_SET.has(name) || name.startsWith('__iso4_')
+}
+
 export function isBridgeWithShim(v: HostGlobalValue): v is BridgeWithShim {
   return (
     typeof v === 'object'

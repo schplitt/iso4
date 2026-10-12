@@ -19,7 +19,7 @@
 import * as http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
-import { createSandbox as createRuntime } from '../src/index.js'
+import { createSandbox as createRuntime, isReservedGlobal, SANDBOX_GLOBALS } from '../src/index.js'
 import type { Sandbox as Runtime } from '../src/types.js'
 
 // ── Shared runtime ─────────────────────────────────────────────────────────
@@ -32,6 +32,23 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await runtime?.dispose()
+})
+
+describe('SANDBOX_GLOBALS', () => {
+  test('matches the globals a fresh sandbox defines', async () => {
+    const result = await runtime.run({ code: 'export default Object.getOwnPropertyNames(globalThis)' })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect([...(result.exports['default'] as string[])].sort()).toEqual([...SANDBOX_GLOBALS].sort())
+  })
+
+  test('isReservedGlobal covers the list and the __iso4_ prefix', () => {
+    expect(isReservedGlobal('Response')).toBe(true)
+    expect(isReservedGlobal('Temporal')).toBe(true)
+    expect(isReservedGlobal('__iso4_call')).toBe(true)
+    expect(isReservedGlobal('fetch')).toBe(false)
+  })
 })
 
 // ── Phase 1: direct runtime.run() ─────────────────────────────────────────
