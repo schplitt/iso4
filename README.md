@@ -186,8 +186,7 @@ const result = await sandbox.run({
 The handler receives the raw arguments from sandbox code and must return
 plain serializable data. **Functions in return values are currently dropped.**
 
-`SANDBOX_GLOBALS` lists every name a fresh sandbox already defines, and
-`isReservedGlobal(name)` also covers the runtime-internal `__iso4_` prefix.
+`SANDBOX_GLOBALS` is a `Set` of every name a fresh sandbox already defines.
 Check generated names against it before installing them.
 
 ## Async context (`AsyncLocalStorage`)

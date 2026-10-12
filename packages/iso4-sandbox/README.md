@@ -88,8 +88,7 @@ const options = {
 Functions in bridge return values are currently dropped — return plain data,
 not class instances with methods.
 
-`SANDBOX_GLOBALS` lists every name a fresh sandbox already defines, and
-`isReservedGlobal(name)` also covers the runtime-internal `__iso4_` prefix.
+`SANDBOX_GLOBALS` is a `Set` of every name a fresh sandbox already defines.
 Check generated names against it before installing them.
 
 ## TypeScript-checked rebinding

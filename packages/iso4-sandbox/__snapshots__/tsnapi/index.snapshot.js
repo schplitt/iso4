@@ -3,7 +3,6 @@
  */
 // #region Functions
 export async function createSandbox(_) {}
-export function isReservedGlobal(_) {}
 // #endregion
 
 // #region Variables

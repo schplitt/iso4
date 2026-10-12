@@ -32,7 +32,7 @@ import type {
  * A host global under one of these names replaces the built-in, or is
  * silently ignored for `undefined`, `NaN` and `Infinity`.
  */
-export const SANDBOX_GLOBALS: readonly string[] = Object.freeze([
+export const SANDBOX_GLOBALS: ReadonlySet<string> = new Set([
   'AggregateError',
   'Array',
   'ArrayBuffer',
@@ -110,17 +110,6 @@ export const SANDBOX_GLOBALS: readonly string[] = Object.freeze([
   'unescape',
   'waitUntil',
 ])
-
-const SANDBOX_GLOBAL_SET: ReadonlySet<string> = new Set(SANDBOX_GLOBALS)
-
-/**
- * Whether `name` is taken in the sandbox: one of {@link SANDBOX_GLOBALS} or
- * under the runtime-internal `__iso4_` prefix.
- * @param name
- */
-export function isReservedGlobal(name: string): boolean {
-  return SANDBOX_GLOBAL_SET.has(name) || name.startsWith('__iso4_')
-}
 
 export function isBridgeWithShim(v: HostGlobalValue): v is BridgeWithShim {
   return (

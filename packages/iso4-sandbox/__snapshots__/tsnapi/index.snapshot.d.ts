@@ -247,9 +247,8 @@ export type SandboxExports = {
 
 // #region Functions
 export declare function createSandbox(_?: SandboxOptions): Promise<Sandbox>;
-export declare function isReservedGlobal(_: string): boolean;
 // #endregion
 
 // #region Variables
-export declare const SANDBOX_GLOBALS: readonly string[];
+export declare const SANDBOX_GLOBALS: ReadonlySet<string>;
 // #endregion
