@@ -1,5 +1,13 @@
 # @iso4/sandbox
 
+## 0.7.0
+
+### Minor Changes
+
+- 9c7cdbc: feat(sandbox): export `SANDBOX_GLOBALS`
+
+  Hosts can check generated global names against every name the sandbox already defines instead of keeping their own list.
+
 ## 0.6.3
 
 ### Patch Changes

@@ -1,5 +1,19 @@
 # @iso4/fetch
 
+## 0.1.0
+
+### Minor Changes
+
+- a0dd284: feat: add `createSafeFetcher`, a fetch-compatible function that runs the safe-fetch pipeline in host code
+
+  It takes the same options as `createSafeFetch` and resolves to a real `Response`.
+
+### Patch Changes
+
+- b4fc2d1: fix: block IPv4-mapped and other IPv4-embedding IPv6 addresses that reach private networks
+
+  With `pinDns`, literals such as `[::ffff:127.0.0.1]` and `[::ffff:a9fe:a9fe]` were treated as public and reached loopback, private ranges and cloud metadata.
+
 ## 0.0.2
 
 ### Patch Changes
