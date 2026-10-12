@@ -227,6 +227,26 @@ createSafeFetch({
 `policy` runs only when no `rules` origin matched. If an origin matches but
 no route does the request is denied without consulting `policy`.
 
+## Host-side fetch
+
+`createSafeFetcher` takes the same options and returns a `fetch`-compatible
+function for host code: same rules, policy, middleware and security defaults,
+but it resolves to a real `Response`.
+
+```ts
+import { createSafeFetcher } from '@iso4/fetch'
+
+const safeFetch = createSafeFetcher({ rules: { host: 'api.example.com', routes: [{ path: '/v1/**' }] } })
+const res = await safeFetch('https://api.example.com/v1/users', { headers: { accept: 'application/json' } })
+const users = await res.json()
+```
+
+It accepts what `fetch` accepts (a URL, a `Request`, any `init` with headers,
+body and `signal`). Transport options such as `redirect` are ignored —
+`maxRedirects` decides. The body is buffered under `maxBodyBytes`, and a
+middleware body that is not bytes or text is JSON-encoded. Each call to
+`createSafeFetcher` gets its own connection pool.
+
 ## Security defaults
 
 | Threat                      | Mitigation                                                                                                                                      |

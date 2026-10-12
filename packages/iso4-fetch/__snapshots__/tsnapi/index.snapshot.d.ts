@@ -75,10 +75,12 @@ export interface SafeFetchRequest {
 // #region Types
 export type FetchMiddleware = (_: FetchContext, _: Next) => HostFetchResponse | void | Promise<HostFetchResponse | void>;
 export type Next = () => Promise<void>;
+export type SafeFetcher = (..._: Parameters<typeof fetch>) => Promise<Response>;
 export type SafeFetchFn = (..._: unknown[]) => Promise<HostFetchResponse>;
 export type SafeFetchPolicy = (_: SafeFetchRequest) => boolean | Promise<boolean>;
 // #endregion
 
 // #region Functions
 export declare function createSafeFetch(_: SafeFetchOptions): SafeFetchGlobal;
+export declare function createSafeFetcher(_: SafeFetchOptions): SafeFetcher;
 // #endregion

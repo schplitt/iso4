@@ -18,7 +18,7 @@ import type {
   FetchRouteRule,
   HostFetchRequest,
   HostFetchResponse,
-  SafeFetchFn,
+  SafeFetcher,
   SafeFetchGlobal,
   SafeFetchOptions,
   SafeFetchRequest,
@@ -33,6 +33,7 @@ export type {
   HostFetchRequest,
   HostFetchResponse,
   Next,
+  SafeFetcher,
   SafeFetchFn,
   SafeFetchGlobal,
   SafeFetchOptions,
@@ -368,9 +369,10 @@ function parseFetchArgs(args: unknown[]): HostFetchRequest {
  * @param options
  */
 export function createSafeFetch(options: SafeFetchOptions): SafeFetchGlobal {
+  const run = buildSafeFetchHandler(options)
   return {
     kind: 'bridge-with-shim',
-    handler: buildSafeFetchHandler(options),
+    handler: async (...args: unknown[]) => run(parseFetchArgs(args)),
     shim: `(result) => ({
       ...result,
       ok:    result.status >= 200 && result.status < 300,
@@ -384,12 +386,50 @@ export function createSafeFetch(options: SafeFetchOptions): SafeFetchGlobal {
 }
 
 /**
- * Internal: builds the bridge handler (SafeFetchFn) without the shim.
+ * Build a `fetch`-compatible function that runs the same safe pipeline as
+ * `createSafeFetch` directly in host code, with its own connection pool.
+ *
+ * ```ts
+ * const safeFetch = createSafeFetcher({ rules: [...] })
+ * const users = await (await safeFetch('https://api.example.com/v1/users')).json()
+ * ```
+ *
+ * `redirect`, `credentials` and the other transport options in `init` are
+ * ignored; `maxRedirects` decides. A middleware body that is not bytes or text
+ * is JSON-encoded.
  * @param options
  */
-function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
+export function createSafeFetcher(options: SafeFetchOptions): SafeFetcher {
+  const run = buildSafeFetchHandler(options)
+  return async (input, init) => {
+    const request = new Request(input, init)
+    const headers: Record<string, string> = {}
+    request.headers.forEach((value, key) => {
+      headers[key] = value
+    })
+    const { status, statusText, headers: resHeaders, body } = await run({
+      url: request.url,
+      method: request.method,
+      headers,
+      body: request.body === null ? null : new Uint8Array(await request.arrayBuffer()),
+      signal: request.signal,
+    })
+    // Null-body statuses (204, 304, …) throw in `new Response` when given any body.
+    const nullBody = body === null || body === undefined || [101, 103, 204, 205, 304].includes(status)
+    return new Response(
+      nullBody ? null : body instanceof Uint8Array || typeof body === 'string' ? body : JSON.stringify(body),
+      { status, headers: resHeaders, ...(statusText !== undefined ? { statusText } : {}) },
+    )
+  }
+}
+
+/**
+ * Internal: builds the safe pipeline shared by `createSafeFetch` and `createSafeFetcher`.
+ * @param options
+ */
+function buildSafeFetchHandler(options: SafeFetchOptions): (hostRequest: HostFetchRequest) => Promise<HostFetchResponse> {
   if (options.rules === undefined && options.policy === undefined)
-    throw new TypeError('createSafeFetch: at least one of `rules` or `policy` must be provided')
+    throw new TypeError('@iso4/fetch: at least one of `rules` or `policy` must be provided')
 
   const compiled = options.rules !== undefined ? compileRules(options.rules) : []
   const doPinDns = options.pinDns !== false
@@ -517,9 +557,7 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
     })
   }
 
-  return async (...args: unknown[]): Promise<HostFetchResponse> => {
-    const hostRequest = parseFetchArgs(args)
-
+  return async (hostRequest: HostFetchRequest): Promise<HostFetchResponse> => {
     let parsedUrl: URL
     try {
       parsedUrl = new URL(hostRequest.url)

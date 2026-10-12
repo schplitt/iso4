@@ -7,7 +7,7 @@
 import { createServer } from 'node:net'
 import type { AddressInfo, Socket } from 'node:net'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { createSafeFetch } from '../src/index.js'
+import { createSafeFetch, createSafeFetcher } from '../src/index.js'
 import type { FetchOriginRule, SafeFetchPolicy } from '../src/index.js'
 import { assertPublicAddresses, isReservedIp, makeDnsLookupFn, makeGuardedConnector } from '../src/dns.js'
 
@@ -1346,5 +1346,55 @@ describe('middleware', () => {
     await handler('https://api.example.com/users', { method: 'GET', headers: { 'x-original': 'yes' }, body: null })
     expect(seenRaw[0]?.headers['x-original']).toBe('yes')
     expect(seenRaw[0]?.headers['authorization']).toBeUndefined()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// createSafeFetcher — host-side fetch-compatible entry
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('createSafeFetcher', () => {
+  const rules: FetchOriginRule = { host: 'api.example.com', routes: [{ path: '/v1/**' }] }
+
+  it('returns a real Response for an allowed request', async () => {
+    mockFetch.mockResolvedValue(new Response('{"a":1}', { status: 201, headers: { 'content-type': 'application/json' } }))
+    const res = await createSafeFetcher({ rules, pinDns: false })('https://api.example.com/v1/x')
+    expect(res).toBeInstanceOf(Response)
+    expect(res.status).toBe(201)
+    expect(res.headers.get('content-type')).toBe('application/json')
+    expect(await res.json()).toEqual({ a: 1 })
+  })
+
+  it('rejects a request no rule allows', async () => {
+    await expect(createSafeFetcher({ rules, pinDns: false })('https://api.example.com/admin')).rejects.toThrow(/no matching route/)
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('accepts Request input, Headers, a body and a signal like fetch', async () => {
+    const controller = new AbortController()
+    const request = new Request('https://api.example.com/v1/items', { method: 'post', headers: new Headers({ 'X-Trace': 't1' }) })
+    await createSafeFetcher({ rules, pinDns: false })(request, { body: 'hello', signal: controller.signal })
+    const [url, init] = mockFetch.mock.calls[0] as [string, { method: string, headers: Record<string, string>, body: Uint8Array, signal: AbortSignal }]
+    expect(url).toBe('https://api.example.com/v1/items')
+    expect(init.method).toBe('POST')
+    expect(init.headers['x-trace']).toBe('t1')
+    expect(new TextDecoder().decode(init.body)).toBe('hello')
+    controller.abort()
+    expect(init.signal.aborted).toBe(true)
+  })
+
+  it('JSON-encodes a middleware object body and drops the body of a null-body status', async () => {
+    const safeFetch = createSafeFetcher({
+      rules: { host: 'api.example.com', routes: [
+        { path: '/v1/obj', middleware: () => ({ status: 200, headers: {}, body: { queued: true } }) },
+        { path: '/v1/none', middleware: () => ({ status: 204, headers: {}, body: new Uint8Array(0) }) },
+      ] },
+      pinDns: false,
+    })
+    expect(await (await safeFetch('https://api.example.com/v1/obj')).json()).toEqual({ queued: true })
+    const empty = await safeFetch('https://api.example.com/v1/none')
+    expect(empty.status).toBe(204)
+    expect(empty.body).toBeNull()
+    expect(mockFetch).not.toHaveBeenCalled()
   })
 })

@@ -49,9 +49,15 @@ export interface HostFetchResponse {
  *
  * Returned as the `handler` field of `BridgeWithShim` — not meant to be
  * used directly. Assign `createSafeFetch({...})` to a global and the sandbox
- * layer handles wiring.
+ * layer handles wiring. For host code use `createSafeFetcher`.
  */
 export type SafeFetchFn = (...args: unknown[]) => Promise<HostFetchResponse>
+
+/**
+ * What `createSafeFetcher` returns: a `fetch`-compatible function that runs
+ * the safe pipeline in host code and resolves to a real `Response`.
+ */
+export type SafeFetcher = (...args: Parameters<typeof fetch>) => Promise<Response>
 
 /**
  * What `createSafeFetch` returns. Conforms to `BridgeWithShim` from

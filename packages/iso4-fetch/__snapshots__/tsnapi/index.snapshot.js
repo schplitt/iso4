@@ -3,4 +3,5 @@
  */
 // #region Functions
 export function createSafeFetch(_) {}
+export function createSafeFetcher(_) {}
 // #endregion
