@@ -20,6 +20,7 @@ import {
   ImportRebindError,
   MAX_HOST_MODULE_DEPTH,
   importHandlerKey,
+  declaredImportShape,
   mergeRebindImports,
   processImports,
 } from '../src/imports.js'
@@ -307,7 +308,7 @@ describe('import specifiers that are not well-formed strings', () => {
     const error = new TypeError(`[@iso4/sandbox] import specifier '${specifier}' is not a well-formed string`)
     expect(() => processImports({ [specifier]: { f: () => 1 } })).toThrow(error)
     expect(() => processImports({ [specifier]: 'export default 1' })).toThrow(error)
-    expect(() => mergeRebindImports({ [specifier]: { f: () => 1 } } as never, new Map())).toThrow(error)
+    expect(() => mergeRebindImports({ [specifier]: { f: () => 1 } } as never, new Map(), [])).toThrow(error)
   })
 })
 
@@ -316,26 +317,22 @@ describe('mergeRebindImports', () => {
   const fnB: HostExportFunction = () => 'b'
 
   function makeFixture() {
-    const { handlers } = processImports({
+    return processImports({
       'host:tools': { search: fnA, version: '1.0.0' },
       'lib:math': 'export const x = 1',
     })
-    return handlers
   }
 
   it('returns the precompile defaults and no rebinds when no override is passed', () => {
-    const defaults = makeFixture()
-    const { rebinds, handlers } = mergeRebindImports(undefined, defaults)
+    const { handlers: defaults, bindings } = makeFixture()
+    const { rebinds, handlers } = mergeRebindImports(undefined, defaults, bindings)
     expect(rebinds).toEqual([])
     expect(handlers).toBe(defaults)
   })
 
   it('overrides a declared function leaf and reports the rebind location', () => {
-    const defaults = makeFixture()
-    const { rebinds, handlers } = mergeRebindImports(
-      { 'host:tools': { search: fnB } },
-      defaults,
-    )
+    const { handlers: defaults, bindings } = makeFixture()
+    const { rebinds, handlers } = mergeRebindImports({ 'host:tools': { search: fnB } }, defaults, bindings)
     expect(rebinds).toEqual([{ specifier: 'host:tools', path: 'search' }])
     expect(handlers.get(importHandlerKey('host:tools', 'search'))).toBe(fnB)
     // The defaults map is not mutated.
@@ -345,12 +342,13 @@ describe('mergeRebindImports', () => {
   it('overrides a function leaf at a nested path', () => {
     const greet: HostExportFunction = () => 'hi'
     const replaced: HostExportFunction = () => 'bye'
-    const { handlers: defaults } = processImports({
+    const { handlers: defaults, bindings } = processImports({
       'host:nested': { someObj: { someMethod: greet, meta: 'x' } },
     })
     const { rebinds, handlers } = mergeRebindImports(
       { 'host:nested': { someObj: { someMethod: replaced } } },
       defaults,
+      declaredImportShape(bindings),
     )
     expect(rebinds).toEqual([{ specifier: 'host:nested', path: 'someObj.someMethod' }])
     expect(handlers.get(importHandlerKey('host:nested', 'someObj.someMethod'))).toBe(replaced)
@@ -359,74 +357,54 @@ describe('mergeRebindImports', () => {
   it('omitted overrides fall back to the precompile-time handler', () => {
     const fnX: HostExportFunction = () => 'x'
     const fnY: HostExportFunction = () => 'y'
-    const { handlers: defaults } = processImports({
-      'host:multi': { a: fnX, b: fnY },
-    })
-    const { handlers } = mergeRebindImports(
-      { 'host:multi': { a: () => 'new-a' } },
-      defaults,
-    )
+    const { handlers: defaults, bindings } = processImports({ 'host:multi': { a: fnX, b: fnY } })
+    const { handlers } = mergeRebindImports({ 'host:multi': { a: () => 'new-a' } }, defaults, bindings)
     expect(handlers.get(importHandlerKey('host:multi', 'a'))?.()).toBe('new-a')
     expect(handlers.get(importHandlerKey('host:multi', 'b'))).toBe(fnY)
   })
+})
 
-  it('collects rebind locations even for specifiers it has no defaults for', () => {
-    // Declared-shape enforcement is the runtime's job: the location is sent
-    // on the wire and the run fails with ERR_UNDECLARED_BINDING there. The
-    // client merge stays permissive so a non-TS caller path can't bypass
-    // enforcement that only existed here.
-    const { rebinds } = mergeRebindImports(
-      { 'host:never-declared': { fn: () => 1 } },
-      new Map(),
-    )
-    expect(rebinds).toEqual([{ specifier: 'host:never-declared', path: 'fn' }])
+describe('declaredImportShape', () => {
+  it('keeps the shape but drops data values and source text', () => {
+    const big = 'x'.repeat(1000)
+    const { bindings } = processImports({ 'host:m': { f: () => 1, d: big, o: { g: () => 1 } }, 'lib:s': big })
+    expect(declaredImportShape(bindings)).toEqual([
+      { specifier: 'host:m', module: [['f', { kind: 'function' }], ['d', { kind: 'data', value: undefined }], ['o', { kind: 'object', entries: [['g', { kind: 'function' }]] }]] },
+      { specifier: 'lib:s', source: '' },
+    ])
   })
 })
 
 // ─────────────────────────────────────────────────────────────────────────
-// mergeRebindImports — client-visible rejections
+// mergeRebindImports — refusals: shape lookup first, then the value
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('mergeRebindImports — ImportRebindError', () => {
-  it('refuses to rebind a specifier with a string (source-module form)', () => {
-    expect(() =>
-      mergeRebindImports({ 'lib:math': 'export const x = 2' }, new Map()),
-    ).toThrow(/source imports are frozen/)
+  const { handlers, bindings } = processImports({
+    'host:tools': { search: () => 1, version: '1.0.0', nested: { fn: () => 1 } },
+    'lib:math': 'export const x = 1',
   })
 
-  it('a source-module rebind carries the ERR_FROZEN_BINDING code', () => {
-    try {
-      mergeRebindImports({ 'lib:math': 'export const x = 2' }, new Map())
-      throw new Error('should have thrown')
-    } catch (e) {
-      expect(e).toBeInstanceOf(ImportRebindError)
-      expect((e as ImportRebindError).code).toBe('ERR_FROZEN_BINDING')
-    }
-  })
-
-  it('a non-function rebind value carries the ERR_INVALID_REBIND code', () => {
-    try {
-      mergeRebindImports({ 'host:cfg': { version: '2.0.0' } } as never, new Map())
-      throw new Error('should have thrown')
-    } catch (e) {
-      expect(e).toBeInstanceOf(ImportRebindError)
-      expect((e as ImportRebindError).code).toBe('ERR_INVALID_REBIND')
-    }
-  })
-
-  it('refuses a non-function, non-object value at a leaf', () => {
-    expect(() =>
-      mergeRebindImports(
-        { 'host:tools': { search: 'not-a-function' as unknown as never } },
-        new Map(),
-      ),
-    ).toThrow(/can only be rebound with a function/)
-  })
-
-  it('rejects a non-object specifier override', () => {
-    expect(() =>
-      mergeRebindImports({ 'host:tools': 42 as unknown as never }, new Map()),
-    ).toThrow(/must be a plain object/)
+  it.each([
+    ['an undeclared specifier as a string', { 'host:nope': 'x' }, 'ERR_UNDECLARED_BINDING', `import 'host:nope' was not declared at precompile time`],
+    ['an undeclared specifier as null', { 'host:nope': null }, 'ERR_UNDECLARED_BINDING', `import 'host:nope' was not declared at precompile time`],
+    ['an undeclared path with a non-function', { 'host:tools': { nope: 42 } }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.nope was not declared at precompile time`],
+    ['a function at an object node', { 'host:tools': { nested: () => 1 } }, 'ERR_INVALID_REBIND', `import 'host:tools'.nested can only be rebound with a plain object; got function`],
+    ['a source module as a string', { 'lib:math': 'export const x = 2' }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`],
+    ['a source module as an object', { 'lib:math': { x: () => 2 } }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`],
+    ['a data leaf with data', { 'host:tools': { version: '2.0.0' } }, 'ERR_FROZEN_BINDING', `import 'host:tools'.version is a data leaf, not a function — data leaves cannot be rebound`],
+    ['a data leaf with a function', { 'host:tools': { version: () => '2' } }, 'ERR_FROZEN_BINDING', `import 'host:tools'.version is a data leaf, not a function — data leaves cannot be rebound`],
+    ['a host module as a string', { 'host:tools': 'x' }, 'ERR_INVALID_REBIND', `import 'host:tools' can only be rebound with a plain object; got string`],
+    ['a host module as null', { 'host:tools': null }, 'ERR_INVALID_REBIND', `import 'host:tools' can only be rebound with a plain object; got null`],
+    ['a host module as undefined', { 'host:tools': undefined }, 'ERR_INVALID_REBIND', `import 'host:tools' can only be rebound with a plain object; got undefined`],
+    ['a host module as a number', { 'host:tools': 42 }, 'ERR_INVALID_REBIND', `import 'host:tools' can only be rebound with a plain object; got number`],
+    ['a function leaf with a string', { 'host:tools': { search: 'nope' } }, 'ERR_INVALID_REBIND', `import 'host:tools'.search can only be rebound with a function; got string`],
+    ['a function leaf with undefined', { 'host:tools': { search: undefined } }, 'ERR_INVALID_REBIND', `import 'host:tools'.search can only be rebound with a function; got undefined`],
+    ['an object node with a number', { 'host:tools': { nested: 1 } }, 'ERR_INVALID_REBIND', `import 'host:tools'.nested can only be rebound with a plain object; got number`],
+  ])('refuses %s', (_kind, imports, code, message) => {
+    expect(() => mergeRebindImports(imports as never, handlers, bindings)).toThrow(
+      expect.objectContaining({ constructor: ImportRebindError, code, message }),
+    )
   })
 })
 

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { createSandbox } from '../src/index.js'
 import type { Sandbox } from '../src/types.js'
 import { RUNTIME_OWNED_GLOBALS } from '../src/names.js'
@@ -44,6 +44,18 @@ describe('the predicates agree with the runtime', () => {
 
   const globalCode = (name: string): string => isValidGlobalName(name) ? '' : 'ERR_RESERVED_NAME'
 
+  // The runtime's own answer: the client's reserved-name check is switched off for the call.
+  async function runtimeCode(name: string, value: unknown): Promise<string | undefined> {
+    const spy = vi.spyOn(RUNTIME_OWNED_GLOBALS as Set<string>, 'has').mockReturnValue(false)
+    try {
+      const globals = Object.defineProperty({}, name, { value, enumerable: true })
+      return await sandbox.run({ code: 'export default 1', globals })
+        .then((result) => result.ok ? '' : result.error.code, (error: { code?: string }) => error.code)
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
   it.each(CANDIDATES.filter((name) => name !== 'default'))('compiles export const %s iff isValidExportName', async (name) => {
     const result = await sandbox.run({ code: `export const ${name} = 1` })
     expect(result.ok).toBe(isValidExportName(name))
@@ -83,22 +95,16 @@ describe('the predicates agree with the runtime', () => {
   })
 
   it('the runtime refuses every name in the runtime-owned copy', async () => {
-    for (const name of RUNTIME_OWNED_GLOBALS) {
-      const globals = Object.defineProperty({}, name, { value: { kind: 'data', value: 1 }, enumerable: true })
-      const code = await sandbox.run({ code: 'export default 1', globals })
-        .then((result) => result.ok ? '' : result.error.code, (error: { code?: string }) => error.code)
-      expect(code, name).toBe('ERR_RESERVED_NAME')
-    }
+    for (const name of RUNTIME_OWNED_GLOBALS)
+      expect(await runtimeCode(name, { kind: 'data', value: 1 }), name).toBe('ERR_RESERVED_NAME')
   })
 
   it.each([
     ['data', { kind: 'data', value: 1 }],
     ['function', async () => 1],
   ] as const)('run() takes every SANDBOX_GLOBALS name as a %s global iff isValidGlobalName', async (kind, value) => {
-    for (const name of SANDBOX_GLOBALS) {
-      const result = await sandbox.run({ code: 'export default 1', globals: { [name]: value } as never })
-      expect(result.ok ? '' : result.error.code, name).toBe(globalCode(name))
-    }
+    for (const name of SANDBOX_GLOBALS)
+      expect(await runtimeCode(name, value), name).toBe(globalCode(name))
   })
 
   it.each(['NaN', 'undefined', 'Infinity', '__proto__'])('prepare() and run() refuse %s as a global of every kind with ERR_RESERVED_NAME', async (name) => {
@@ -115,9 +121,8 @@ describe('the predicates agree with the runtime', () => {
     ]
     for (const value of values) {
       await expect(sandbox.prepare({ code: '', globals: { [name]: value } as never })).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME' })
-      const result = await sandbox.run({ code: 'export default 1', globals: { [name]: value } as never })
-        .then((r) => r.ok ? '' : r.error.code, (e: { code?: string }) => e.code)
-      expect(result).toBe('ERR_RESERVED_NAME')
+      await expect(sandbox.run({ code: 'export default 1', globals: { [name]: value } as never })).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME' })
+      expect(await runtimeCode(name, value)).toBe('ERR_RESERVED_NAME')
     }
   })
 })

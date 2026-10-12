@@ -341,13 +341,10 @@ describe('refusals', () => {
   })
 
   test('a reserved global name is rejected', async () => {
-    const result = await sandbox.run({
+    await expect(sandbox.run({
       code: `export default 1`,
       globals: { Response: { kind: 'data', value: 1 } } as never,
-    })
-    expect(result.ok).toBe(false)
-    if (!result.ok)
-      expect(result.error.code).toBe('ERR_RESERVED_NAME')
+    })).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME' })
   })
 })
 

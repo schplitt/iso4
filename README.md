@@ -151,7 +151,7 @@ pnpm changeset          # record a per-package version bump
 - `sandbox.precompile()` + `prefix.run()` — prefix/postfix pattern ✅
 - CPU and wall-clock limits enforced, async wait excluded from CPU budget ✅
 - Host-declared globals bridged into V8 (`fetch`, `myTool`, any name) ✅
-- `ERR_UNDECLARED_BINDING` enforced on `prefix.run()` globals ✅
+- Setup errors on prefix runs (undeclared, frozen or invalid rebinds, a disposed prefix) throw before anything runs ✅
 - Host-provided imports — source modules (`string`) and host modules (objects with function/data leaves) resolved via `import` in sandbox code ✅
 - `AbortSignal` support — cancel in-flight runs; `RunResult.status` discriminates `'completed'` | `'failed'` | `'aborted'`, with `reason` on abort ✅
 - Error propagation — thrown error `name`, `stack`, and extra enumerable properties (`error.fields`) survive the bridge in both directions ✅

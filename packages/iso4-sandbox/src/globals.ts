@@ -15,6 +15,7 @@
  */
 
 import type { GlobalDefPayload } from './ipc.js'
+import { RUNTIME_OWNED_GLOBALS } from './names.js'
 import type {
   BridgeGlobal,
   BridgeWithShim,
@@ -23,8 +24,23 @@ import type {
   HostGlobalValue,
   HostGlobals,
   RebindGlobals,
+  SetupErrorCode,
   StringGlobal,
 } from './types.js'
+
+/**
+ * The error every setup refusal is thrown as, whichever side detects it: a
+ * plain `Error` carrying the runtime's code.
+ * @param code the setup code
+ * @param message the runtime's message for it
+ */
+export function setupError(code: SetupErrorCode, message: string): Error & { code: SetupErrorCode } {
+  const err = new Error(message) as Error & { code: SetupErrorCode }
+  // Own `name` and `code`, exactly as `thrownRunError` builds the runtime's refusals.
+  err.name = 'Error'
+  err.code = code
+  return err
+}
 
 export function isBridgeWithShim(v: HostGlobalValue): v is BridgeWithShim {
   return (
@@ -87,7 +103,8 @@ export interface ProcessedGlobals {
 /**
  * Lower a `HostGlobals` map into wire-shaped `defs` plus the bridge-dispatch
  * map. See the module comment for the split. Throws a `TypeError` for a name
- * that is not a well-formed string.
+ * that is not a well-formed string and `ERR_RESERVED_NAME` for a runtime-owned
+ * one.
  *   - `HostExportFunction` → `{ kind: 'bridge' }` + dispatch entry.
  *   - `string`             → `{ kind: 'string', expr }` (evaluated by Rust).
  *   - `DataGlobal`         → `{ kind: 'data', value }` (materialised by Rust).
@@ -102,6 +119,8 @@ export function processGlobals(globals: HostGlobals): ProcessedGlobals {
   for (const [name, value] of Object.entries(globals)) {
     if (!name.isWellFormed())
       throw new TypeError(`[@iso4/sandbox] global name '${name}' is not a well-formed string`)
+    if (RUNTIME_OWNED_GLOBALS.has(name))
+      throw setupError('ERR_RESERVED_NAME', `global '${name}' is reserved by the runtime and cannot be provided by the host`)
     // The bare shorthands are always enumerable by design; the object forms
     // carry an optional opt-out (default true).
     if (typeof value === 'function') {
@@ -133,86 +152,74 @@ export function processGlobals(globals: HostGlobals): ProcessedGlobals {
 }
 
 /**
- * Resolve bridge globals for a `prefix.run()` call.
- *
- * String/data globals and shim *wrappers* are already compiled into the
- * declared prefix state, replayed by the runtime when the prefix evaluates —
- * only the bridge *stubs* they call need re-installing per run (bridge stubs
- * are bound to the run's socket). So
- * every returned def is `kind: 'bridge'`, and shimmed globals are routed to
- * their private `__iso4_<name>_h` key so rebinding updates the handler the
- * shim calls, without touching the shim itself.
- * @param runGlobals
- * @param precompileGlobals
+ * What a prefix keeps of one declared global: its kind, and for a function
+ * global the default handler. Data values and source text are not kept.
  */
+export type DeclaredGlobal
+  = | { kind: 'value' }
+    | { kind: 'bridge', handler: HostExportFunction, enumerable: boolean }
+    | { kind: 'shim', handler: HostExportFunction }
+
 /**
- * Resolve a per-run override for a declared bridge global.
- *
- * An omitted key falls back to the precompile-time handler (the intended
- * default). But a key that IS supplied yet is not a function — the runtime
- * shape TypeScript cannot catch, e.g. a tenant handler that resolves to
- * `undefined` — throws instead of silently reusing the (often broader) default,
- * which would be a fail-open exactly where the API is used to narrow privilege.
- * This matches the imports side, which already rejects a non-function rebind.
- * @param runGlobals the per-run rebind map
- * @param name the declared global's name
- * @param fallback the precompile-time handler used when no override is supplied
+ * Copy the declared global shape at `prepare()`, so later changes to the
+ * caller's object change nothing. Kinds `processGlobals` ignores are left out.
+ * @param globals the `globals` passed to `prepare()`
  */
-function resolveOverride(
-  runGlobals: RebindGlobals<HostGlobals>,
-  name: string,
-  fallback: HostExportFunction,
-): HostExportFunction {
-  if (!Object.hasOwn(runGlobals, name))
-    return fallback
-  const override = (runGlobals as Record<string, unknown>)[name]
-  if (typeof override !== 'function') {
-    throw new TypeError(
-      `[iso4] global override "${name}" must be a function, got ${override === null ? 'null' : typeof override}`,
-    )
+export function declareGlobals(globals: HostGlobals): Map<string, DeclaredGlobal> {
+  const declared = new Map<string, DeclaredGlobal>()
+  for (const [name, value] of Object.entries(globals)) {
+    if (typeof value === 'function')
+      declared.set(name, { kind: 'bridge', handler: value, enumerable: true })
+    else if (typeof value === 'string' || isStringGlobal(value) || isDataGlobal(value))
+      declared.set(name, { kind: 'value' })
+    else if (isBridgeWithShim(value))
+      declared.set(name, { kind: 'shim', handler: value.handler as HostExportFunction })
+    else if (isBridgeGlobal(value))
+      declared.set(name, { kind: 'bridge', handler: value.handler as HostExportFunction, enumerable: value.enumerable ?? true })
   }
-  return override as HostExportFunction
+  return declared
 }
 
+/**
+ * Resolve bridge globals for a `prefix.run()` call.
+ *
+ * Value globals and shim wrappers are replayed from the declared prefix
+ * state, so every returned def is `kind: 'bridge'`; a shim override is routed
+ * to its private `__iso4_<name>_h` key. Throws the setup error the runtime
+ * would send for an undeclared or frozen name, and `ERR_INVALID_REBIND` for a
+ * non-function override.
+ * @param runGlobals the run's `globals` option
+ * @param declared the shape kept from `prepare()` by {@link declareGlobals}
+ */
 export function extractBridgeGlobals(
   runGlobals: RebindGlobals<HostGlobals>,
-  precompileGlobals: HostGlobals,
+  declared: ReadonlyMap<string, DeclaredGlobal>,
 ): ProcessedGlobals {
-  const defs: GlobalDefPayload[] = []
-  const dispatch: Record<string, HostExportFunction> = {}
-
-  for (const [name, value] of Object.entries(precompileGlobals)) {
-    if (typeof value === 'string' || isStringGlobal(value) || isDataGlobal(value))
-      continue // constants replayed from the declared prefix defs; no bridge stub
-
-    if (isBridgeWithShim(value)) {
-      // RebindValue<BridgeWithShim<H>> = H — override is always a function, never a new shim.
-      // The handler stub is runtime-internal (`__iso4_*`) and non-enumerable
-      // regardless; the declared flag applies to the shim wrapper the prefix
-      // replays.
-      const handlerName = shimHandlerName(name)
-      defs.push({ kind: 'bridge', name: handlerName, enumerable: true })
-      dispatch[handlerName] = resolveOverride(runGlobals, name, value.handler)
-    } else if (isBridgeGlobal(value)) {
-      defs.push({ kind: 'bridge', name, enumerable: value.enumerable ?? true })
-      dispatch[name] = resolveOverride(runGlobals, name, value.handler as HostExportFunction)
-    } else if (typeof value === 'function') {
-      defs.push({ kind: 'bridge', name, enumerable: true })
-      dispatch[name] = resolveOverride(runGlobals, name, value as HostExportFunction)
-    }
-  }
-
-  // Undeclared function overrides go to Rust, which refuses them with
-  // ERR_UNDECLARED_BINDING; undeclared non-functions are dropped.
-  for (const [name, override] of Object.entries(runGlobals)) {
+  // Same checks and messages as the runtime's PrefixRun binding check.
+  const overrides = runGlobals as Record<string, unknown>
+  for (const [name, override] of Object.entries(overrides)) {
     if (!name.isWellFormed())
       throw new TypeError(`[@iso4/sandbox] global name '${name}' is not a well-formed string`)
-    if (name in precompileGlobals)
+    const shape = declared.get(name)
+    if (shape === undefined)
+      throw setupError('ERR_UNDECLARED_BINDING', `global '${name}' was not declared at precompile time`)
+    if (shape.kind === 'value')
+      throw setupError('ERR_FROZEN_BINDING', `global '${name}' is a value global, frozen with the prefix — only function globals can be rebound`)
+    // A supplied non-function must not fall back to the (often broader) default.
+    if (typeof override !== 'function')
+      throw setupError('ERR_INVALID_REBIND', `global '${name}' can only be rebound with a function; got ${override === null ? 'null' : typeof override}`)
+  }
+
+  const defs: GlobalDefPayload[] = []
+  const dispatch: Record<string, HostExportFunction> = {}
+  for (const [name, shape] of declared) {
+    if (shape.kind === 'value')
       continue
-    if (typeof override === 'function') {
-      defs.push({ kind: 'bridge', name, enumerable: true })
-      dispatch[name] = override as HostExportFunction
-    }
+    const override = Object.hasOwn(overrides, name) ? overrides[name] as HostExportFunction : undefined
+    // The shim handler stub is runtime-internal and non-enumerable regardless.
+    const stub = shape.kind === 'shim' ? shimHandlerName(name) : name
+    defs.push({ kind: 'bridge', name: stub, enumerable: shape.kind === 'shim' || shape.enumerable })
+    dispatch[stub] = override ?? shape.handler
   }
 
   return { defs, dispatch }

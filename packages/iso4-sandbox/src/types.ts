@@ -17,18 +17,6 @@
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
- * Per-run resource caps. Every field is optional at the call site
- * (`limits?: ResourceLimits`): pass only the limits you want to
- * override. The client sends just those over the wire and the **runtime owns
- * the defaults** — it fills in any field you leave unset. The `@default` values
- * documented below mirror the runtime's defaults (defined in
- * `native/v8-runtime/src/ipc.rs`, the source of truth); if they ever drift, the
- * runtime wins.
- *
- * A field set to `0` is not the same as leaving it unset: `0` explicitly
- * disables that limit, whereas unset yields the runtime default.
- */
-/**
  * The two heap lines a REUSED isolate is held to, when the managed default
  * is not what you want. One-off `run()` isolates are never reused and take a
  * plain `memoryMb` number, enforced exactly.
@@ -85,6 +73,22 @@ export interface OneOffResourceLimits extends ResourceLimits {
   memoryMb?: number
 }
 
+/**
+ * Per-run resource caps. Every field is optional at the call site
+ * (`limits?: ResourceLimits`): pass only the limits you want to
+ * override. The client sends just those over the wire and the **runtime owns
+ * the defaults** — it fills in any field you leave unset. The `@default` values
+ * documented below mirror the runtime's defaults (defined in
+ * `native/v8-runtime/src/ipc.rs`, the source of truth); if they ever drift, the
+ * runtime wins.
+ *
+ * A field set to `0` is not the same as leaving it unset: `0` explicitly
+ * disables that limit, whereas unset yields the runtime default.
+ *
+ * Every field must be an integer from `0` to `2³² − 1`. Anything else
+ * (negative, fractional, `NaN`, `Infinity`, a non-number) rejects the call
+ * with a `TypeError` before anything runs.
+ */
 export interface ResourceLimits {
   /**
    * Maximum CPU time in milliseconds — what the run's own thread actually
@@ -834,6 +838,14 @@ export interface Sandbox {
    *   call: { export: 'default.fetch', args: [request] },
    * })
    * ```
+   *
+   * Invalid options reject, like `prepare()`: a global name the runtime owns
+   * rejects with an `Error` whose `code` is `ERR_RESERVED_NAME`; a malformed
+   * option (a bad limit or `memoryMb`, a global name that is not a
+   * well-formed string, an invalid host-module shape) rejects with a plain
+   * `Error`/`TypeError`.
+   * Nothing ran. Everything that happens once the run starts resolves as
+   * `{ ok: false, error }` — see {@link RunErrorCode}.
    */
   run: {
     (options: RunCallOptions): Promise<CallResult>
@@ -1082,7 +1094,8 @@ export interface Prefix<
  * `G` is the declared-globals shape from the matching `precompile()` call.
  * The `globals` field is typed as `Partial<G>` — only names present in `G`
  * may be overridden. Passing any other name is a TypeScript error at compile
- * time and `ERR_UNDECLARED_BINDING` at runtime.
+ * time and rejects with `ERR_UNDECLARED_BINDING` at runtime. Every rebind
+ * refusal rejects; nothing runs.
  */
 export interface PrefixRunOptions<
   G extends HostGlobals,
@@ -1096,7 +1109,8 @@ export interface PrefixRunOptions<
   /**
    * Override implementations for a **subset** of globals declared at
    * precompile time. Only names present in `G` are accepted (TypeScript
-   * error + runtime `ERR_UNDECLARED_BINDING` for anything else), but the
+   * error + a runtime rejection with `ERR_UNDECLARED_BINDING` for anything
+   * else), but the
    * function signature does not need to match the precompile-time handler
    * exactly — any `HostExportFunction`-compatible value is accepted.
    */
@@ -1107,7 +1121,7 @@ export interface PrefixRunOptions<
    * Source module imports are frozen at prepare() time and cannot be rebound;
    * data exports are baked into the synthetic module. TypeScript enforces
    * this at the type level via `RebindImports<M>`; anything that slips
-   * through is rejected at runtime — `ERR_UNDECLARED_BINDING` for locations
+   * through rejects the run at runtime — `ERR_UNDECLARED_BINDING` for locations
    * never declared, `ERR_FROZEN_BINDING` for source modules and data leaves,
    * `ERR_INVALID_REBIND` for a non-function override value.
    */
@@ -1682,6 +1696,49 @@ export interface RunError {
  */
 export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal'
 
+/**
+ * Why a run's options were refused before anything ran. `sandbox.run()`,
+ * `prefix.run()`, `prefix.call()` and `prepare()` reject with an `Error`
+ * whose `code` is one of these; a run never returns them as a result. The
+ * client checks first and throws without a runtime round trip; the runtime
+ * repeats every check (except `ERR_INVALID_REBIND`) and the client throws its
+ * answer the same way. `ERR_PREFIX_DISPOSED`: the prefix was disposed, or the
+ * runtime no longer holds it.
+ */
+export type SetupErrorCode
+  = | 'ERR_PREFIX_DISPOSED'
+    /**
+     * A `prefix.run()` / `prefix.call()` binding (global or import rebind)
+     * names something that was never declared at `prepare()` time, a
+     * runtime-owned name included. Declared-but-locked locations are
+     * `ERR_FROZEN_BINDING`.
+     */
+    | 'ERR_UNDECLARED_BINDING'
+    /**
+     * A host global uses a name the runtime owns (`console`, `setTimeout`,
+     * `Response`, … — see {@link HostGlobals}) and may not shadow it, or one
+     * of the non-writable `NaN`, `undefined` and `Infinity`, or `__proto__`.
+     */
+    | 'ERR_RESERVED_NAME'
+    /**
+     * A rebind targets a declared location that is frozen with the prefix: a
+     * source module, a host-module data leaf, or a data or string global.
+     * Only function leaves and function globals can be rebound.
+     */
+    | 'ERR_FROZEN_BINDING'
+    /**
+     * A rebind offered a value of the wrong type for its declared location —
+     * a function leaf or a function global can only be rebound with a
+     * function, a host module or object node only with a plain object.
+     * Host-detected, never reported by the runtime.
+     */
+    | 'ERR_INVALID_REBIND'
+
+/**
+ * Why a run failed, in a `{ ok: false }` result. Setup refusals are thrown
+ * instead and carry a {@link SetupErrorCode}. `prepare()` and
+ * `readExports()` reject on any failure.
+ */
 export type RunErrorCode
   = | 'ERR_USER_CODE'
     | 'ERR_MEMORY_LIMIT'
@@ -1735,30 +1792,6 @@ export type RunErrorCode
      */
     | 'ERR_QUEUE_FULL'
     /**
-     * A `prefix.run()` binding (global or import rebind) names something that
-     * was never declared at `prepare()` time. Declared-but-locked locations
-     * are `ERR_FROZEN_BINDING`; runtime-owned names are `ERR_RESERVED_NAME`.
-     */
-    | 'ERR_UNDECLARED_BINDING'
-    /**
-     * A host global uses a name the runtime owns (`console`, `setTimeout`,
-     * `Response`, … — see {@link HostGlobals}) and may not shadow it, or one
-     * of the non-writable `NaN`, `undefined` and `Infinity`, or `__proto__`.
-     */
-    | 'ERR_RESERVED_NAME'
-    /**
-     * A `prefix.run()` rebind targets a declared location that is frozen with
-     * the prefix: a source module or a data leaf. Only host-module function
-     * leaves can be rebound.
-     */
-    | 'ERR_FROZEN_BINDING'
-    /**
-     * A `prefix.run()` rebind offered a value of the wrong type — a function
-     * leaf can only be rebound with a function. Host-detected, never reported
-     * by the runtime.
-     */
-    | 'ERR_INVALID_REBIND'
-    /**
      * Prefix top-level evaluation never settled — nothing in the isolate
      * can resolve the awaited promise while a prefix evaluates (at
      * `prepare()` validation or at a run's prefix stage).
@@ -1779,7 +1812,6 @@ export type RunErrorCode
      * call runs under that call's budget and survives warm reuse.
      */
     | 'ERR_WARMUP_LIMIT'
-    | 'ERR_PREFIX_DISPOSED'
     /**
      * The runtime answered with a `Result` belonging to a different run, or
      * sent a frame that has no place in the run protocol. Host-detected, never

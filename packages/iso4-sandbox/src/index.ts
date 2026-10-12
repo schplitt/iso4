@@ -22,7 +22,7 @@ import {
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
 } from './ipc'
-import type { CallPayload, DecodedRunComplete } from './ipc'
+import type { CallPayload, DecodedRunComplete, ImportBindingPayload, WireResourceLimits } from './ipc'
 import type {
   CallResult,
   HostGlobals,
@@ -37,6 +37,8 @@ import type {
   ReadExportsResult,
   ResourceLimits,
   RunCallOptions,
+  RunError,
+  SetupErrorCode,
   RunOptions,
   RunResult,
   Sandbox,
@@ -48,9 +50,11 @@ import type {
 
 // ── Global processing (imported from globals.ts for testability) ──────────
 
-import { extractBridgeGlobals, processGlobals } from './globals.js'
+import { declareGlobals, extractBridgeGlobals, processGlobals, setupError } from './globals.js'
+import type { DeclaredGlobal } from './globals.js'
 import {
   ImportRebindError,
+  declaredImportShape,
   mergeRebindImports,
   processImports,
 } from './imports.js'
@@ -104,6 +108,7 @@ export type {
   SandboxExports,
   RunError,
   RunErrorCode,
+  SetupErrorCode,
   WaitUntilResult,
 } from './types'
 
@@ -488,6 +493,56 @@ function waitUntilResultFrom(report: DecodedRunComplete | undefined): WaitUntilR
 }
 
 /**
+ * The `ResourceLimits` fields the wire carries as a `u32`; `0` disables each.
+ */
+const U32_LIMIT_FIELDS = [
+  'cpuTimeMs',
+  'wallTimeMs',
+  'maxBridgeCallBytes',
+  'maxExportBytes',
+  'maxStdoutBytes',
+  'maxStderrBytes',
+  'maxBridgeCalls',
+  'graceMs',
+] as const satisfies readonly (keyof ResourceLimits)[]
+
+const U32_MAX = 0xFFFF_FFFF
+
+/**
+ * Refuse a limit the wire cannot carry as a `u32` instead of letting the
+ * encoder throw a `RangeError` or silently truncate a fraction.
+ * @param limits the caller's `limits` option
+ */
+function validateLimits(limits: ResourceLimits | undefined): void {
+  if (limits === undefined)
+    return
+  if (limits === null || typeof limits !== 'object')
+    throw new TypeError('[@iso4/sandbox] limits must be an object')
+  for (const field of U32_LIMIT_FIELDS) {
+    const value: unknown = limits[field]
+    if (value !== undefined && !(Number.isInteger(value) && (value as number) >= 0 && (value as number) <= U32_MAX)) {
+      throw new TypeError(
+        `[@iso4/sandbox] limits.${field} must be an integer from 0 to ${U32_MAX}`,
+      )
+    }
+  }
+}
+
+/**
+ * Only the public `u32` fields; heap caps come from `heapCapsForWire`, so an
+ * untyped caller cannot smuggle `memoryMb`/`hardMemoryMb` onto the wire.
+ * @param limits the validated `limits` option
+ */
+function wireLimits(limits: ResourceLimits | undefined): WireResourceLimits {
+  const out: WireResourceLimits = {}
+  for (const field of U32_LIMIT_FIELDS) {
+    if (limits?.[field] !== undefined)
+      out[field] = limits[field]
+  }
+  return out
+}
+
+/**
  * A heap cap must be an integer number of megabytes ≥ 0 (0 = uncapped):
  * the wire carries it as a u32, and a fractional or negative value would
  * silently misencode instead of capping.
@@ -498,9 +553,9 @@ function validateMemoryMb(value: number | MemoryLimit | undefined, where: string
   if (value === undefined)
     return
   if (typeof value === 'number') {
-    if (!Number.isInteger(value) || value < 0) {
+    if (!Number.isInteger(value) || value < 0 || value > U32_MAX) {
       throw new TypeError(
-        `[@iso4/sandbox] ${where} must be an integer >= 0 (megabytes; 0 = uncapped)`,
+        `[@iso4/sandbox] ${where} must be an integer from 0 to ${U32_MAX} (megabytes; 0 = uncapped)`,
       )
     }
     return
@@ -510,11 +565,11 @@ function validateMemoryMb(value: number | MemoryLimit | undefined, where: string
       `[@iso4/sandbox] ${where} must be a number of megabytes or { soft?, hard }`,
     )
   }
-  if (!Number.isInteger(value.hard) || value.hard < 1) {
+  if (!Number.isInteger(value.hard) || value.hard < 1 || value.hard > U32_MAX) {
     // 0 here would leave V8 unlimited, so a runaway allocation aborts the
     // whole runtime process. Uncapped is `memoryMb: 0`.
     throw new TypeError(
-      `[@iso4/sandbox] ${where}.hard must be an integer >= 1 (megabytes) — `
+      `[@iso4/sandbox] ${where}.hard must be an integer from 1 to ${U32_MAX} (megabytes) — `
       + 'write memoryMb: 0 for uncapped',
     )
   }
@@ -632,6 +687,33 @@ function desyncResult(error: ProtocolDesyncError): RunResult {
   }
 }
 
+/**
+ * Codes the runtime reports for a run whose options are invalid. The client
+ * checks first; this catches what it cannot know, such as a prefix the
+ * runtime dropped. Runs throw these, like `prepare()`, instead of returning them.
+ */
+const SETUP_ERROR_CODES: ReadonlySet<SetupErrorCode> = new Set<SetupErrorCode>([
+  'ERR_RESERVED_NAME',
+  'ERR_UNDECLARED_BINDING',
+  'ERR_FROZEN_BINDING',
+  'ERR_INVALID_REBIND',
+  'ERR_PREFIX_DISPOSED',
+])
+
+/**
+ * The error `prepare()`, `readExports()` and `run()` throw for a failure the
+ * runtime reported: an `Error` carrying the runtime's `code`, `name`, `stack`.
+ * @param error the reported failure
+ */
+function thrownRunError<C extends string>(error: Pick<RunError, 'name' | 'message' | 'stack'> & { code: C }): Error & { code: C } {
+  const err = new Error(error.message) as Error & { code: C }
+  err.name = error.name
+  err.code = error.code
+  if (error.stack)
+    err.stack = error.stack
+  return err
+}
+
 function abortedResult(reason?: unknown, from?: RunResult): RunResult {
   return {
     status: 'aborted',
@@ -728,6 +810,7 @@ class SandboxImpl implements Sandbox {
     if (options.hardAbortSignal?.aborted) {
       return abortedResult(options.hardAbortSignal.reason)
     }
+    validateLimits(options.limits)
     // A one-off run always gets a fresh isolate, so its own cap is legal
     // (#77): per-run, per-prefix and the sandbox default are the three
     // granularities; only per-run-on-a-warm-instance stays impossible.
@@ -756,19 +839,19 @@ class SandboxImpl implements Sandbox {
     // Per-run stream registry: bodies that outgrow the probe cross as
     // stream handles pumped under flow control instead of inline bytes.
     const streams = new StreamSourceRegistry()
-    const call = options.call === undefined
-      ? undefined
-      : {
-          exportPath: options.call.export,
-          argsBlob: await serializeHostValue(options.call.args ?? [], this.brandKey, streams),
-        }
     try {
+      const call = options.call === undefined
+        ? undefined
+        : {
+            exportPath: options.call.export,
+            argsBlob: await serializeHostValue(options.call.args ?? [], this.brandKey, streams),
+          }
       return await this.pool.withClient(async (client, queueWaitMs) => {
         // Every global is installed natively by the runtime, so user code
         // always starts at line 1.
         const raw = await client.runRawCode(options.code, {
           filename: options.filename,
-          limits: { ...options.limits, ...heapCapsForWire(runMemoryMb) },
+          limits: { ...wireLimits(options.limits), ...heapCapsForWire(runMemoryMb) },
           globals: defs,
           dispatch,
           imports: bindings,
@@ -788,6 +871,8 @@ class SandboxImpl implements Sandbox {
             ? decodeRunCompletionPayload(raw.result, undefined, raw.droppedCallIds).result
             : decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds).result,
         )
+        if (decoded.status === 'failed' && (SETUP_ERROR_CODES as ReadonlySet<string>).has(decoded.error.code))
+          throw thrownRunError({ ...decoded.error, code: decoded.error.code as string as SetupErrorCode })
         // waitUntil: the value arrived early; hand the caller the grace
         // outcome as a never-rejecting promise. A streaming-only epilogue
         // carries no waitUntil work and stays invisible.
@@ -857,18 +942,8 @@ class SandboxImpl implements Sandbox {
       filename: options.filename,
       limits: options.limits,
     })
-    if (result.status !== 'completed') {
-      const err = new Error(result.error.message) as Error & {
-        code: string
-        name: string
-        stack?: string
-      }
-      err.name = result.error.name
-      err.code = result.error.code
-      if (result.error.stack)
-        err.stack = result.error.stack
-      throw err
-    }
+    if (result.status !== 'completed')
+      throw thrownRunError(result.error)
     return { exports: result.exports, skippedExports: result.skippedExports }
   }
 
@@ -901,13 +976,15 @@ class SandboxImpl implements Sandbox {
     options: PrecompileOptions<G, M>,
   ): Promise<Prefix<G, M>> {
     validateMemoryMb(options.memoryMb, 'memoryMb')
+    validateLimits(options.limits)
     // Per-prefix heap cap (#77): baked into every instance serving this
     // prefix; every run frame for it carries this value, so warm instances
     // are created with it and attach cap-matching holds by construction.
     const prefixMemoryMb = options.memoryMb ?? this.memoryMb
-    // Throws for a malformed global name before a client is taken.
+    // Throws for a malformed or reserved global name before a client is taken.
     const rawGlobals = options.globals ?? {} as G
     const { defs } = processGlobals(rawGlobals)
+    const declaredGlobals = declareGlobals(rawGlobals)
     return this.pool.withClient(async (client) => {
       await materializeHostTypesInGlobals(defs, this.brandKey)
       // The declared import shape travels as data and is stored with the
@@ -918,26 +995,16 @@ class SandboxImpl implements Sandbox {
       const raw = await client.precompile({
         code: options.code,
         filename: options.filename,
-        limits: { ...options.limits, ...heapCapsForWire(prefixMemoryMb) },
+        limits: { ...wireLimits(options.limits), ...heapCapsForWire(prefixMemoryMb) },
         globals: defs,
         imports: bindings,
       })
       const result = decodePrecompileResultPayload(raw)
 
-      if (!result.ok) {
-        const err = new Error(result.error.message) as Error & {
-          code: string
-          name: string
-          stack?: string
-        }
-        err.name = result.error.name
-        err.code = result.error.code
-        if (result.error.stack)
-          err.stack = result.error.stack
-        throw err
-      }
+      if (!result.ok)
+        throw thrownRunError(result.error)
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, rawGlobals, handlers, this.brandKey, prefixMemoryMb)
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, prefixMemoryMb)
     })
   }
 
@@ -971,22 +1038,19 @@ implements Prefix<G, M> {
   readonly id: string
   private readonly pool: RunPool
   /**
-   * Handlers declared at precompile time. Used as defaults for any run that
-   * does not supply its own override, per DESIGN.md §11.4 "Rebinding rules":
-   * "If the prefix declared a global the run doesn't supply, the
-   * precompile-time implementation is reused."
+   * The global shape declared at `prepare()`, with the default handlers a run
+   * falls back to when it does not override them (DESIGN.md §11.4).
    */
-  private readonly defaultGlobals: G
+  private declaredGlobals: ReadonlyMap<string, DeclaredGlobal>
   /**
-   * Host-import function-leaf handlers declared at precompile time, keyed by
-   * `(specifier, path)`. Same rebinding rules as `defaultGlobals` — a
-   * `prefix.run()` may override a subset of function leaves; everything else
-   * falls back to these. Source modules and data leaves are frozen in the
-   * declared prefix state and not represented here. The declared shape itself lives with
-   * the prefix in the Rust runtime, which rejects rebind attempts outside it
-   * (`ERR_UNDECLARED_BINDING`) or at frozen locations (`ERR_FROZEN_BINDING`).
+   * Host-import function-leaf handlers declared at `prepare()`, keyed by
+   * `(specifier, path)`; a run's overrides apply on top.
    */
-  private readonly defaultImportHandlers: ImportHandlerMap
+  private defaultImportHandlers: ImportHandlerMap
+  /**
+   * The import shape declared at `prepare()`, for client-side rebind checks.
+   */
+  private declaredImports: readonly ImportBindingPayload[]
   /**
    * THIS prefix's heap cap (`prepare({ memoryMb })`, falling back to the
    * sandbox default). Warm instances serving the prefix are created with
@@ -1003,15 +1067,17 @@ implements Prefix<G, M> {
   constructor(
     id: string,
     pool: RunPool,
-    defaultGlobals: G,
+    declaredGlobals: ReadonlyMap<string, DeclaredGlobal>,
     defaultImportHandlers: ImportHandlerMap,
+    declaredImports: readonly ImportBindingPayload[],
     brandKey: string,
     memoryMb?: number | MemoryLimit,
   ) {
     this.id = id
     this.pool = pool
-    this.defaultGlobals = defaultGlobals
+    this.declaredGlobals = declaredGlobals
     this.defaultImportHandlers = defaultImportHandlers
+    this.declaredImports = declaredImports
     this.brandKey = brandKey
     this.memoryMb = memoryMb
   }
@@ -1034,7 +1100,7 @@ implements Prefix<G, M> {
    * @deprecated Renamed to {@link PrefixImpl.execute}; kept as an alias.
    */
   async run(options: PrefixRunOptions<G, M>): Promise<RunResult> {
-    const result = await this.dispatch(options, { code: options.code })
+    const result = await this.dispatch(options, async () => ({ code: options.code }))
     return result as RunResult
   }
 
@@ -1047,21 +1113,22 @@ implements Prefix<G, M> {
     // Same host-type-aware args leg as SandboxImpl.run — a real `Request`
     // (async body drain) works at any depth, as one blob holding the array.
     // The stream registry covers both the args and this run's bridge
-    // responses.
-    const streams = new StreamSourceRegistry()
-    const call = {
-      exportPath: options.export,
-      argsBlob: await serializeHostValue(options.args ?? [], this.brandKey, streams),
-    }
-    const result = await this.dispatch(options, { call, streams })
+    // responses. Serialized only after dispatch's checks pass.
+    const result = await this.dispatch(options, async (streams) => ({
+      call: {
+        exportPath: options.export,
+        argsBlob: await serializeHostValue(options.args ?? [], this.brandKey, streams),
+      },
+    }))
     return result as CallResult
   }
 
   /**
    * Shared body of {@link run} and {@link call}: disposal/abort guards,
    * bridge-global extraction, import-rebind merging, and the PrefixRun round
-   * trip. `payload` carries the postfix source or the call — exactly one, as
-   * the wire demands; it also selects how the result blob decodes.
+   * trip. `buildPayload` yields the postfix source or the call — exactly one,
+   * as the wire demands; it also selects how the result blob decodes. It runs
+   * after the checks, so a refused run never registers a stream source.
    * @param options
    * @param options.globals
    * @param options.imports
@@ -1069,7 +1136,7 @@ implements Prefix<G, M> {
    * @param options.signal
    * @param options.hardAbortSignal
    * @param options.filename
-   * @param payload
+   * @param buildPayload
    */
   private async dispatch(
     options: {
@@ -1080,26 +1147,12 @@ implements Prefix<G, M> {
       hardAbortSignal?: AbortSignal
       filename?: string
     },
-    payload: { code: string, call?: undefined, streams?: StreamSourceRegistry }
-      | { code?: undefined, call: CallPayload, streams?: StreamSourceRegistry },
+    buildPayload: (streams: StreamSourceRegistry) => Promise<
+      { code: string, call?: undefined } | { code?: undefined, call: CallPayload }
+    >,
   ): Promise<RunResult | CallResult> {
-    if (!this._alive) {
-      return {
-        status: 'failed',
-        ok: false,
-        error: {
-          code: 'ERR_PREFIX_DISPOSED',
-          name: 'Error',
-          message: `prefix '${this.id}' has been disposed`,
-        },
-        stdout: [],
-        stderr: [],
-        durationMs: 0,
-        wallTimeMs: 0,
-        cpuTimeMs: 0,
-        bridgeCalls: [],
-      }
-    }
+    if (!this._alive)
+      throw setupError('ERR_PREFIX_DISPOSED', `prefix '${this.id}' has been disposed or never existed`)
 
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
@@ -1107,6 +1160,7 @@ implements Prefix<G, M> {
     if (options.hardAbortSignal?.aborted) {
       return abortedResult(options.hardAbortSignal.reason)
     }
+    validateLimits(options.limits)
     if (options.limits !== undefined && 'memoryMb' in options.limits) {
       throw new TypeError(
         '[@iso4/sandbox] limits.memoryMb is not a per-run option for prefix '
@@ -1118,41 +1172,30 @@ implements Prefix<G, M> {
     // Only bridge stubs are re-installed per run; value globals come from the prefix.
     const { defs, dispatch } = extractBridgeGlobals(
       (options.globals ?? {}) as RebindGlobals<HostGlobals>,
-      this.defaultGlobals as HostGlobals,
+      this.declaredGlobals,
     )
-    // Run overrides on top of the precompile handlers; the runtime checks the locations.
+    // Run overrides on top of the precompile handlers, checked against the declared shape.
     let merged: ReturnType<typeof mergeRebindImports>
     try {
       merged = mergeRebindImports(
         options.imports as Imports | undefined,
         this.defaultImportHandlers,
+        this.declaredImports,
       )
     } catch (e) {
-      if (e instanceof ImportRebindError) {
-        // Symmetric with the Rust-side rebind validation: surface the error
-        // as a RunResult failure rather than a thrown promise.
-        return {
-          status: 'failed',
-          ok: false,
-          error: { code: e.code, name: 'Error', message: e.message },
-          stdout: [],
-          stderr: [],
-          durationMs: 0,
-          wallTimeMs: 0,
-          cpuTimeMs: 0,
-          bridgeCalls: [],
-        }
-      }
+      if (e instanceof ImportRebindError)
+        throw setupError(e.code, e.message)
       throw e
     }
-    const streams = payload.streams ?? new StreamSourceRegistry()
+    const streams = new StreamSourceRegistry()
     try {
+      const payload = await buildPayload(streams)
       return await this.pool.withClient(async (client, queueWaitMs) => {
         const raw = await client.prefixRun({
           prefixId: this.id,
           code: payload.code,
           filename: options.filename,
-          limits: { ...options.limits, ...heapCapsForWire(this.memoryMb) },
+          limits: { ...wireLimits(options.limits), ...heapCapsForWire(this.memoryMb) },
           globals: defs,
           dispatch,
           importRebinds: merged.rebinds,
@@ -1171,6 +1214,8 @@ implements Prefix<G, M> {
             ? decodeRunCompletionPayload(raw.result, undefined, raw.droppedCallIds).result
             : decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds).result,
         )
+        if (decoded.status === 'failed' && (SETUP_ERROR_CODES as ReadonlySet<string>).has(decoded.error.code))
+          throw thrownRunError({ ...decoded.error, code: decoded.error.code as string as SetupErrorCode })
         // waitUntil — see the note in SandboxImpl.run.
         if (raw.epilogue !== undefined && raw.graceWork && decoded.ok)
           decoded.waitUntil = raw.epilogue.then(waitUntilResultFrom)
@@ -1200,6 +1245,9 @@ implements Prefix<G, M> {
     if (!this._alive)
       return
     this._alive = false
+    this.declaredGlobals = new Map()
+    this.defaultImportHandlers = new Map()
+    this.declaredImports = []
     // Fire-and-forget - no response frame for DisposePrefix.
     await this.pool.withClient((client) => client.disposePrefix(this.id))
   }

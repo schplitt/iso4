@@ -436,11 +436,7 @@ await search('dogs')`,
   test('run on disposed prefix rejects', async () => {
     const prefix = await runtime.precompile({ code: '' })
     await prefix.dispose()
-    const result = await prefix.run({ code: 'export default 1' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_PREFIX_DISPOSED')
+    await expect(prefix.run({ code: 'export default 1' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
   })
 })
 
@@ -3025,30 +3021,68 @@ describe('ERR_UNDECLARED_BINDING', () => {
 
   test('passing undeclared global at run time is ERR_UNDECLARED_BINDING', async () => {
     // The prefix does NOT declare fetch at precompile time.
-    // Passing fetch at run time must be rejected — adding it would silently
-    // mutate the restored snapshot context in an undeclared way.
+    // Passing fetch at run time must be rejected — adding it would widen the
+    // declared prefix surface.
     const prefix = await runtime.precompile({ code: '' })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
     await prefix.dispose()
   })
 
   test('an undeclared non-identifier name is ERR_UNDECLARED_BINDING', async () => {
     const prefix = await runtime.prepare({ code: '' })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       globals: { 'my-tool': async () => 1 } as never,
-    })
-    expect(result.ok).toBe(false)
-    if (!result.ok)
-      expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
+    })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
+    await expect(prefix.call({
+      export: 'default',
+      globals: { zzz: async () => 1 } as never,
+    })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
     await prefix.dispose()
+  })
+
+  test.each(['toString', 'constructor', '__proto__', 'hasOwnProperty'])('an undeclared %s rebind rejects instead of being dropped', async (name) => {
+    const prefix = await runtime.prepare({ code: 'export default () => 1' })
+    const globals = Object.defineProperty({}, name, { value: async () => 1, enumerable: true }) as never
+    await expect(prefix.call({ export: 'default', globals }))
+      .rejects
+      .toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
+    await prefix.dispose()
+  })
+
+  test('refused rebinds release the slot and keep the warm instance reusable', async () => {
+    const solo = await createRuntime({ maxConcurrentRuns: 1 })
+    try {
+      const prefix = await solo.prepare({
+        code: 'globalThis.base = 41',
+        imports: { 'host:tools': { add: (n: number) => n + 1 } },
+      })
+      expect((await prefix.run({ code: 'export default globalThis.base + 1' })).ok).toBe(true)
+      for (let i = 0; i < 3; i++) {
+        await expect(prefix.run({ code: 'export default 1', globals: { zzz: async () => 1 } as never }))
+          .rejects
+          .toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
+        await expect(prefix.run({ code: 'export default 1', imports: { 'host:tools': { nope: () => 1 } } as never }))
+          .rejects
+          .toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
+        await expect(prefix.run({ code: 'export default 1', imports: { 'host:tools': { add: 1 } } as never }))
+          .rejects
+          .toMatchObject({ code: 'ERR_INVALID_REBIND' })
+      }
+      expect((await solo.stats()).activeRuns).toBe(0)
+      const after = await prefix.run({
+        code: `import { add } from 'host:tools'\nexport default await add(globalThis.base)`,
+      })
+      expect(after).toMatchObject({ ok: true, exports: { default: 42 } })
+      expect((await solo.stats()).warmInstances).toBe(1)
+      await prefix.dispose()
+      await expect(prefix.run({ code: 'export default 1' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+    } finally {
+      await solo.dispose()
+    }
   })
 
   test('declared global at precompile time can be rebound at run time', async () => {
@@ -3193,15 +3227,38 @@ describe('native timers', () => {
   })
 
   test('setTimeout cannot be shadowed by a host global', async () => {
-    const result = await runtime.run({
+    await expect(runtime.run({
       code: 'export default 1',
       globals: { setTimeout: async () => 'impostor' },
+    })).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME', message: expect.stringMatching(/reserved/) })
+  })
+
+  test('a reserved global name rejects run() with the same error as prepare()', async () => {
+    const options = { code: 'export default 1', globals: { console: async () => 1 } }
+    const fromPrepare = await runtime.prepare(options).catch((e: unknown) => e)
+    const fromRun = await runtime.run(options).catch((e: unknown) => e)
+    expect(fromRun).toBeInstanceOf(Error)
+    expect(fromRun).toMatchObject({ code: 'ERR_RESERVED_NAME' })
+    expect(fromRun).toMatchObject({
+      name: (fromPrepare as Error).name,
+      message: (fromPrepare as Error).message,
+      code: (fromPrepare as Error & { code: string }).code,
     })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_RESERVED_NAME')
-    expect(result.error.message).toMatch(/reserved/)
+  })
+
+  test('a rejected setup error releases its run slot', async () => {
+    const solo = await createRuntime({ maxConcurrentRuns: 1 })
+    try {
+      for (let i = 0; i < 3; i++) {
+        await expect(solo.run({ code: 'export default 1', globals: { console: async () => 1 } }))
+          .rejects
+          .toMatchObject({ code: 'ERR_RESERVED_NAME' })
+      }
+      expect((await solo.stats()).activeRuns).toBe(0)
+      expect((await solo.run({ code: 'export default 2' })).ok).toBe(true)
+    } finally {
+      await solo.dispose()
+    }
   })
 
   test('a non-identifier global name is reachable through globalThis[name]', async () => {
@@ -5259,5 +5316,144 @@ describe('readExports', () => {
     await expect(runtime.readExports({ code: 'throw new Error("deploy-time boom")' }))
       .rejects
       .toMatchObject({ code: 'ERR_USER_CODE', message: 'deploy-time boom' })
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// limits validation — every u32 field, every entry point, refused up front
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('limits validation', () => {
+  let runtime: Runtime
+  let prefix: Awaited<ReturnType<Runtime['prepare']>>
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+    prefix = await runtime.prepare({ code: 'export default () => 1' })
+  })
+
+  afterAll(async () => {
+    await prefix?.dispose()
+    await runtime?.dispose()
+  })
+
+  const fields = [
+    'cpuTimeMs',
+    'wallTimeMs',
+    'maxBridgeCallBytes',
+    'maxExportBytes',
+    'maxStdoutBytes',
+    'maxStderrBytes',
+    'maxBridgeCalls',
+    'graceMs',
+  ] as const
+  const bad: [string, unknown][] = [
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+    ['above u32', 2 ** 32],
+    ['a string', '100'],
+    ['null', null],
+  ]
+  const entryPoints: [string, (limits: never) => Promise<unknown>][] = [
+    ['sandbox.run()', (limits) => runtime.run({ code: 'export default 1', limits })],
+    ['sandbox.readExports()', (limits) => runtime.readExports({ code: 'export default 1', limits })],
+    ['sandbox.prepare()', (limits) => runtime.prepare({ code: '', limits })],
+    ['prefix.run()', (limits) => prefix.run({ code: 'export default 1', limits })],
+    ['prefix.call()', (limits) => prefix.call({ export: 'default', limits })],
+  ]
+  const cases = entryPoints.flatMap(([entry, invoke]) =>
+    fields.flatMap((field) => bad.map(([kind, value]) => [entry, field, kind, value, invoke] as const)),
+  )
+
+  test.each(cases)('%s refuses a %s that is %s', async (_entry, field, _kind, value, invoke) => {
+    await expect(invoke({ [field]: value } as never))
+      .rejects
+      .toThrow(new TypeError(`[@iso4/sandbox] limits.${field} must be an integer from 0 to 4294967295`))
+  })
+
+  test.each(entryPoints)('%s refuses a limits value that is not an object', async (_entry, invoke) => {
+    await expect(invoke(null as never)).rejects.toThrow(/limits must be an object/)
+  })
+
+  test.each(entryPoints)('%s accepts 0 and the u32 maximum', async (_entry, invoke) => {
+    await expect(invoke({ cpuTimeMs: 0, maxStdoutBytes: 2 ** 32 - 1 } as never)).resolves.toBeDefined()
+  })
+
+  test('a memoryMb above the u32 range is refused, not a RangeError', async () => {
+    await expect(runtime.run({ code: 'export default 1', limits: { memoryMb: 2 ** 32 } }))
+      .rejects
+      .toThrow(TypeError)
+    await expect(runtime.prepare({ code: '', memoryMb: { hard: 2 ** 32 } }))
+      .rejects
+      .toThrow(TypeError)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// refused runs leave call arguments untouched and the wire limits clean
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('refused runs release call arguments', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  function streamingRequest(): { request: Request, cancelled: () => boolean } {
+    let cancelled = false
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(64 * 1024))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const request = new Request('https://example.test/', { method: 'POST', body, duplex: 'half' })
+    return { request, cancelled: () => cancelled }
+  }
+
+  test('a refusal before serialization never locks the body', async () => {
+    const prefix = await runtime.prepare({ code: 'export default (r) => r.method' })
+    const { request } = streamingRequest()
+    await expect(prefix.call({ export: 'default', args: [request], limits: { cpuTimeMs: 1.5 } }))
+      .rejects
+      .toThrow(TypeError)
+    expect(request.body?.locked).toBe(false)
+    await prefix.dispose()
+    const disposed = streamingRequest()
+    await expect(prefix.call({ export: 'default', args: [disposed.request] }))
+      .rejects
+      .toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+    expect(disposed.request.body?.locked).toBe(false)
+  })
+
+  test('a runtime refusal after serialization cancels the body', async () => {
+    const prefix = await runtime.prepare({ code: 'export default (r) => r.method' })
+    // Widen the client's view of the declared globals so only the runtime refuses.
+    ;(prefix as unknown as { declaredGlobals: Map<string, unknown> }).declaredGlobals = new Map([['zzz', { kind: 'bridge', handler: async () => 1, enumerable: true }]])
+    const { request, cancelled } = streamingRequest()
+    await expect(prefix.call({ export: 'default', args: [request], globals: { zzz: async () => 1 } as never }))
+      .rejects
+      .toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
+    await expect.poll(cancelled).toBe(true)
+    await prefix.dispose()
+  })
+
+  test('heap caps smuggled through limits never reach the wire', async () => {
+    const code = 'const a = new Uint8Array(32 * 1024 * 1024); a[0] = 1; export default a.length'
+    const oneOff = await runtime.run({ code, limits: { hardMemoryMb: 4 } as never })
+    expect(oneOff).toMatchObject({ ok: true, exports: { default: 32 * 1024 * 1024 } })
+    const prefix = await runtime.prepare({ code: '' })
+    const warm = await prefix.run({ code, limits: { hardMemoryMb: 4 } as never })
+    expect(warm).toMatchObject({ ok: true, exports: { default: 32 * 1024 * 1024 } })
+    await prefix.dispose()
   })
 })

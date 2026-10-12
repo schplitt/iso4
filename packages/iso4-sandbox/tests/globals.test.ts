@@ -18,7 +18,12 @@ import type {
   RebindGlobals,
 } from '../src/types.js'
 import type { GlobalDefPayload } from '../src/ipc.js'
-import { extractBridgeGlobals, processGlobals } from '../src/globals.js'
+import { declareGlobals, extractBridgeGlobals as extractFromShape, processGlobals } from '../src/globals.js'
+
+// The prefix keeps the declared shape from prepare(); these tests start from the HostGlobals.
+function extractBridgeGlobals(runGlobals: RebindGlobals<HostGlobals>, precompileGlobals: HostGlobals): ReturnType<typeof extractFromShape> {
+  return extractFromShape(runGlobals, declareGlobals(precompileGlobals))
+}
 
 // Find a produced global def by its public name.
 function defFor(defs: GlobalDefPayload[], name: string): GlobalDefPayload | undefined {
@@ -342,7 +347,7 @@ describe('bad paths — runtime', () => {
           { fetch: 'https://evil.com' } as unknown as RebindGlobals<HostGlobals>,
           { fetch: shimGlobal },
         ),
-      ).toThrow(/must be a function/)
+      ).toThrow(expect.objectContaining({ code: 'ERR_INVALID_REBIND', message: expect.stringMatching(/can only be rebound with a function/) }))
     })
 
     it('a supplied undefined override throws (e.g. a tenant handler resolving to undefined)', () => {
@@ -352,7 +357,7 @@ describe('bad paths — runtime', () => {
           { myTool: undefined as unknown as HostExportFunction },
           { myTool: defaultFn },
         ),
-      ).toThrow(/must be a function/)
+      ).toThrow(expect.objectContaining({ code: 'ERR_INVALID_REBIND', message: expect.stringMatching(/can only be rebound with a function/) }))
     })
 
     it('an omitted override still falls back to the precompile default', () => {

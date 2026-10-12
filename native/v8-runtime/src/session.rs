@@ -81,6 +81,42 @@ fn has_function_leaf(entries: &[(String, ipc::HostModuleNode)]) -> bool {
     })
 }
 
+/// Validate the globals a `PrefixRun` carries. Only declared bridge stubs may
+/// be re-installed; value globals are frozen with the prefix. A name declared
+/// as a data or string global is `FrozenBinding`, anything else
+/// `UndeclaredBinding`. Mirrors `extractBridgeGlobals` in the TS client.
+fn validate_global_rebinds(
+    globals: &[ipc::HostGlobalDef],
+    declared_stubs: &[String],
+    declared: &[ipc::HostGlobalDef],
+) -> Result<(), sandbox::RunError> {
+    for def in globals {
+        let (name, is_stub) = match def {
+            ipc::HostGlobalDef::Bridge { name, .. } => (name.as_str(), true),
+            ipc::HostGlobalDef::StringExpr { name, .. }
+            | ipc::HostGlobalDef::Data { name, .. }
+            | ipc::HostGlobalDef::Shim { name, .. } => (name.as_str(), false),
+        };
+        if is_stub && declared_stubs.iter().any(|d| d == name) {
+            continue;
+        }
+        let frozen = declared.iter().any(|d| {
+            matches!(d, ipc::HostGlobalDef::StringExpr { name: n, .. }
+                | ipc::HostGlobalDef::Data { name: n, .. } if n == name)
+        });
+        return Err(if frozen {
+            sandbox::RunError::FrozenBinding(format!(
+                "global '{name}' is a value global, frozen with the prefix — only function globals can be rebound"
+            ))
+        } else {
+            sandbox::RunError::UndeclaredBinding(format!(
+                "global '{name}' was not declared at precompile time"
+            ))
+        });
+    }
+    Ok(())
+}
+
 /// Validate the host-import rebinds a `PrefixRun` requested against the shape
 /// declared at `Precompile`. Only declared host-module *function leaves* may
 /// be re-pointed at a new host handler. An unknown specifier or path is
@@ -101,7 +137,7 @@ fn validate_import_rebinds(
             ipc::ImportModule::Source(_) => {
                 return Err(sandbox::RunError::FrozenBinding(format!(
                     "import '{}' is a source module — source imports are frozen \
-                     in the snapshot and cannot be rebound at prefix.run() time",
+                     with the prefix and cannot be rebound at prefix.run() time",
                     rb.specifier
                 )))
             }
@@ -163,8 +199,9 @@ pub struct PrefixData {
     /// context before the prefix evaluates (value globals as values, bridge
     /// callables as throwing placeholders).
     pub globals: Vec<ipc::HostGlobalDef>,
-    /// Global names declared at precompile time. PrefixRun globals must be a
-    /// subset of this set; extras are rejected with ERR_UNDECLARED_BINDING.
+    /// Bridge stub names declared at precompile time, the only globals a
+    /// PrefixRun may carry; anything else is ERR_UNDECLARED_BINDING, or
+    /// ERR_FROZEN_BINDING for a declared data or string global.
     pub declared_globals: Vec<String>,
     /// Imports declared at precompile time. Re-used as-is on PrefixRun:
     /// source modules and host data exports are frozen at declaration, and
@@ -1209,27 +1246,17 @@ fn dispatch_prefix_run(
     };
 
     // ── Binding checks ───────────────────────────────────────────────────
-    // Every global in payload.globals must have been declared at precompile
-    // time (ERR_UNDECLARED_BINDING); host-import rebinds must additionally
-    // target function leaves, not frozen locations (ERR_FROZEN_BINDING).
-    let declared_set: std::collections::HashSet<&str> = prefix_data
-        .declared_globals
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let violation: Option<sandbox::RunError> = payload
-        .globals
-        .iter()
-        .filter_map(|g| g.bridge_stub_name())
-        .find(|name| !declared_set.contains(name))
-        .map(|name| {
-            sandbox::RunError::UndeclaredBinding(format!(
-                "global '{name}' was not declared at precompile time"
-            ))
-        })
-        .or_else(|| {
-            validate_import_rebinds(&payload.import_rebinds, &prefix_data.declared_imports).err()
-        });
+    // Globals first, then import rebinds; the TS client runs the same checks
+    // before sending.
+    let violation: Option<sandbox::RunError> = validate_global_rebinds(
+        &payload.globals,
+        &prefix_data.declared_globals,
+        &prefix_data.globals,
+    )
+    .err()
+    .or_else(|| {
+        validate_import_rebinds(&payload.import_rebinds, &prefix_data.declared_imports).err()
+    });
     if let Some(error) = violation {
         let error = wire::run_error_to_payload(&error);
         eprintln!(
@@ -1457,6 +1484,53 @@ fn dispatch_prefix_run(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn prefix_run_globals_may_only_rebind_declared_bridge_stubs() {
+        let declared = vec![
+            ipc::HostGlobalDef::bridge("tool"),
+            ipc::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true },
+            ipc::HostGlobalDef::StringExpr { name: "expr".into(), expr: "1".into(), enumerable: true },
+            ipc::HostGlobalDef::Shim {
+                name: "shimmed".into(),
+                shim: "(h) => h".into(),
+                handler_name: "__iso4_shimmed_h".into(),
+                enumerable: true,
+            },
+        ];
+        let stubs: Vec<String> = declared
+            .iter()
+            .filter_map(|g| g.bridge_stub_name().map(str::to_string))
+            .collect();
+        let check = |globals: Vec<ipc::HostGlobalDef>| validate_global_rebinds(&globals, &stubs, &declared);
+
+        assert!(check(vec![ipc::HostGlobalDef::bridge("tool"), ipc::HostGlobalDef::bridge("__iso4_shimmed_h")]).is_ok());
+        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("other")]), Err(sandbox::RunError::UndeclaredBinding(_))));
+        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("console")]), Err(sandbox::RunError::UndeclaredBinding(_))));
+        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("config")]), Err(sandbox::RunError::FrozenBinding(_))));
+        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("expr")]), Err(sandbox::RunError::FrozenBinding(_))));
+        assert!(matches!(
+            check(vec![ipc::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true }]),
+            Err(sandbox::RunError::FrozenBinding(m)) if m.contains("frozen with the prefix")
+        ));
+        assert!(matches!(
+            check(vec![ipc::HostGlobalDef::Data { name: "fresh".into(), blob: Vec::new(), enumerable: true }]),
+            Err(sandbox::RunError::UndeclaredBinding(m)) if m == "global 'fresh' was not declared at precompile time"
+        ));
+        assert!(matches!(
+            check(vec![ipc::HostGlobalDef::StringExpr { name: "fresh".into(), expr: "1".into(), enumerable: true }]),
+            Err(sandbox::RunError::UndeclaredBinding(_))
+        ));
+        assert!(matches!(
+            check(vec![ipc::HostGlobalDef::Shim {
+                name: "shimmed".into(),
+                shim: "(h) => h".into(),
+                handler_name: "__iso4_shimmed_h".into(),
+                enumerable: true,
+            }]),
+            Err(sandbox::RunError::UndeclaredBinding(_))
+        ));
+    }
 
     /// Drive `handle_client` over a socket pair with the given Authenticate
     /// payload and return the first frame it writes back (if any).

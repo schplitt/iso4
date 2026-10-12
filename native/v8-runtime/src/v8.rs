@@ -2779,9 +2779,8 @@ fn start_turn(
     }
 
     // Install the value globals (string exprs, constants, shim wrappers)
-    // natively. For a direct run these arrive here; for a PrefixRun they were
-    // replayed from the prefix defs during prefix evaluation, so `globals`
-    // carries only bridge stubs and this is a no-op.
+    // natively. A PrefixRun carrying one is refused in session.rs, so for it
+    // this is a no-op; its value globals were replayed from the prefix defs.
     if let Err(e) = install_value_globals(scope, ctx.globals) {
         return finished(Err(rs.fail(termination_or(facts.reason, e))));
     }

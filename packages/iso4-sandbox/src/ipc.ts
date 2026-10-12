@@ -1769,6 +1769,7 @@ export function decodeRunCompletionPayload(
       'expected failure present byte = 1 when ok = false',
     )
   }
+  // May be a SetupErrorCode, which the caller throws instead of returning.
   const code = reader.readString() as RunErrorCode
   const name = reader.readString()
   const message = reader.readString()

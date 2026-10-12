@@ -290,6 +290,15 @@ Every call to `runtime.run(opts)`:
 }
 ```
 
+Every field is an integer from 0 to 2³²−1, because the wire carries each as a
+`u32`. `0` disables a limit (for `cpuTimeMs` and `wallTimeMs` too, which
+then do not arm their guard), `graceMs: 0` turns off the grace phase, and
+`memoryMb: 0` is uncapped. The client
+checks every field at `sandbox.run()`, `readExports()`, `prepare()`,
+`prefix.run()` and `prefix.call()` and throws a `TypeError` for a negative,
+fractional, non-finite, non-number or out-of-range value. That is a setup
+error (§5.2), so nothing is sent.
+
 **Memory** is two lines for a REUSED instance, one for a one-off (#169).
 
 On a prefix, `memoryMb` is the **soft** line and the terminating cap sits a
@@ -740,13 +749,13 @@ The object form imposes these restrictions on the value tree:
 Rebinding on `prefix.run()` is keyed on the same shape: only function
 leaves declared at `precompile()` time may be rebound, and only with the
 same signature. TypeScript enforces this via `RebindImports<I>` at compile
-time; at run time the client sends the rebind **locations**
-(`specifier` + leaf path) on the `PrefixRun` payload and the Rust runtime
-validates them against the shape stored with the prefix, returning
-`ERR_UNDECLARED_BINDING` for locations never declared and
-`ERR_FROZEN_BINDING` for declared-but-frozen ones (source modules, data
-leaves) — one enforcement point, shared with the undeclared-globals
-check, that a non-TS client cannot skip.
+time. At run time the client checks the rebind **locations**
+(`specifier` + leaf path) against the shape it kept from `prepare()` and
+rejects the run before sending (§5.2): `ERR_UNDECLARED_BINDING` for
+locations never declared, `ERR_FROZEN_BINDING` for declared-but-frozen ones
+(source modules, data leaves). The Rust runtime repeats the same check on
+the `PrefixRun` payload against the shape stored with the prefix, so a
+non-TS client cannot skip it.
 
 #### Implementation note: how host modules are built (shape-as-data)
 
@@ -1005,7 +1014,32 @@ to `AbortController.abort(reason)`:
 
 The result is _always_ an object; `status` (or the `ok` alias) discriminates.
 `run()` does not throw for sandboxed failures — only for infrastructure failures
-(e.g., the Rust process crashed).
+(e.g., the Rust process crashed) and for **setup errors**: options that are
+invalid before anything runs. Those reject `sandbox.run()`, `prefix.run()` and
+`prefix.call()` exactly as they reject `prepare()` — a plain `Error` whose
+`code` is a `SetupErrorCode` (`ERR_RESERVED_NAME`, `ERR_UNDECLARED_BINDING`,
+`ERR_FROZEN_BINDING`, `ERR_INVALID_REBIND`, `ERR_PREFIX_DISPOSED`), or an
+`Error` (`TypeError`, `ValueEncodeError`, …) without
+an iso4 code that the client raises for a malformed option (a limit,
+`memoryMb`, a global name that is not a well-formed string, host-module
+shape, unencodable `globals`/`call.args` value). A setup error is a programming error, not an
+outcome: nothing ran and retrying the same options can never succeed, so it
+does not belong next to `ERR_USER_CODE`, and `RunErrorCode` does not list it.
+
+The TS client checks first: reserved global names on `run()`/`prepare()`,
+and on `prefix.run()`/`prefix.call()` every global and import rebind
+against the shape it kept from `prepare()`. A refusal throws before a pool
+slot is taken or a frame is sent. The Rust runtime is the authority and
+repeats every check except `ERR_INVALID_REBIND` (it never sees the value),
+with the same codes and messages, so a non-TS client gets the same answer;
+the client throws the runtime's refusal in the same shape, which also covers
+what it cannot know in advance, such as a prefix the runtime no longer
+holds. An already-aborted signal wins over validation and resolves as
+aborted, except disposal: using a disposed prefix always throws
+`ERR_PREFIX_DISPOSED`. Everything else — user code, limits,
+bridge failures, abort, capacity and queue refusals — stays a result. That
+includes `ERR_COMPILE`, `ERR_MODULE_NOT_FOUND`, `ERR_CALL_TARGET_NOT_FOUND`,
+`ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL` and `ERR_TYPE_NOT_SERIALIZABLE`.
 
 ### 5.3 Host → sandbox calls
 
@@ -1569,7 +1603,7 @@ To be resolved as we build, not blocking the start:
   typically a few KB each, in an unbounded map that only `prefix.dispose()`
   removes from. A cap (sketched as 100 prefixes, LRU evicted, configurable
   via `SandboxOptions.maxPrecompiledPrefixes`) would make evicted handles
-  fail with `ERR_PREFIX_DISPOSED` and force the host to re-prepare. Note that
+  throw `ERR_PREFIX_DISPOSED` and force the host to re-prepare. Note that
   the *instances* of a prefix are already bounded by the memory mark
   (§13.2.1) — this question is only about the stored source.
 
@@ -1698,13 +1732,22 @@ sees is exactly what the prefix produces deterministically:
 When `prefix.run()` provides `globals` or `imports`, the replacement
 handlers stay on the TS side — bridge dispatch is name-addressed, so a
 rebind just re-points the per-run dispatch entry (global name, or
-host-import `specifier` + leaf path). The Rust runtime validates every
-rebound name/location against the shape stored with the prefix. Source
-modules cannot be rebound — their code is frozen at declaration
-(`ERR_FROZEN_BINDING`, likewise for data leaves).
+host-import `specifier` + leaf path). The client and then the Rust runtime
+validate every rebound name/location against the shape declared at
+`prepare()` (§5.2). Only function globals (plain, bridge or shim) and
+host-module function leaves can be rebound, and only with a function; a
+host module or object node takes only a plain object (`ERR_INVALID_REBIND`
+otherwise). Each location is looked up in the declared shape before its
+value is looked at, so an undeclared location is `ERR_UNDECLARED_BINDING`
+and a frozen one `ERR_FROZEN_BINDING` whatever the value. Source modules, data leaves and data or
+string globals are frozen at declaration (`ERR_FROZEN_BINDING`). A
+`PrefixRun` that carries a value global (data, string or shim wrapper) is
+refused by the runtime: `ERR_FROZEN_BINDING` for a declared data or string
+name, `ERR_UNDECLARED_BINDING` otherwise.
 
 If `prefix.run()` passes a name that wasn't declared at `precompile()`
-time, the run fails fast with `ERR_UNDECLARED_BINDING`. This is intentional:
+time, `prefix.run()` rejects before anything runs with
+`ERR_UNDECLARED_BINDING`. This is intentional:
 we could silently install new globals into the run's context, but that
 breaks the invariant that the declared prefix shape represents the full
 sandbox surface the prefix was validated against. Better to be strict and
@@ -2568,9 +2611,11 @@ Callable return values are planned in Phase 13 (callable handles). See §15.
 ### 14.3 `prefix.run()` globals are rebind-only
 
 `prefix.run({ globals })` may only **rebind** globals declared at
-`precompile({ globals })` time. Adding a new name at run time results in
-`ERR_UNDECLARED_BINDING` at runtime and a TypeScript compile-time error (when
-the `Prefix<G>` type parameter is specific).
+`precompile({ globals })` time. Adding a new name at run time, of any kind
+and runtime-owned names included, rejects with `ERR_UNDECLARED_BINDING` and
+is a TypeScript compile-time error (when the `Prefix<G>` type parameter is
+specific). Rebinding a declared data or string global rejects with
+`ERR_FROZEN_BINDING`.
 
 Rationale: the declared shape is what the prefix was validated against.
 Silently installing an undeclared global into a run's context would widen

@@ -418,9 +418,41 @@ interface RunError {
 }
 ```
 
-`run()` never throws for sandboxed failures — only for infrastructure errors
-(subprocess crashed, binary not found). `ok: false` with an error code is the
-normal failure path.
+`run()` never throws for sandboxed failures. `ok: false` with an error code is
+the normal failure path. It throws only for infrastructure errors (subprocess
+crashed, binary not found) and for invalid options, the same way `prepare()`
+does. `sandbox.run()`, `prefix.run()` and `prefix.call()` reject with an
+`Error` whose `code` is a `SetupErrorCode`: `ERR_RESERVED_NAME` (a global
+name the runtime owns), `ERR_UNDECLARED_BINDING`, `ERR_FROZEN_BINDING` or
+`ERR_INVALID_REBIND` (a rebind the prefix does not allow), or
+`ERR_PREFIX_DISPOSED`. The client checks these before anything is sent, and
+the runtime repeats the checks. A malformed option, such as a limit out of range or a
+global name that is not a well-formed string, rejects with a plain
+`TypeError`. Nothing ran, so retrying with the same options can never
+succeed. Every other code, including `ERR_COMPILE`, is a
+result.
+
+```ts
+import type { SetupErrorCode } from '@iso4/sandbox'
+
+const setupCodes: readonly string[] = [
+  'ERR_RESERVED_NAME',
+  'ERR_UNDECLARED_BINDING',
+  'ERR_FROZEN_BINDING',
+  'ERR_INVALID_REBIND',
+  'ERR_PREFIX_DISPOSED',
+] satisfies SetupErrorCode[]
+
+try {
+  const result = await sandbox.run({ code, globals })
+  if (!result.ok)
+    console.log('the program failed:', result.error.code)
+} catch (error) {
+  if (!(error instanceof Error && 'code' in error && setupCodes.includes(error.code as string)))
+    throw error
+  console.log('the options are wrong:', error.code as SetupErrorCode)
+}
+```
 
 One code is about a _neighbor_, not your own run: `ERR_INSTANCE_RESET` means a
 run sharing the same warm instance had to be terminated mid-execution

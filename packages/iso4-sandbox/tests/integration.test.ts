@@ -419,14 +419,10 @@ describe('precompile + prefix.run()', () => {
     expect(prefix.alive).toBe(false)
   })
 
-  test('run on disposed prefix returns ERR_PREFIX_DISPOSED', async () => {
+  test('run on disposed prefix rejects with ERR_PREFIX_DISPOSED', async () => {
     const prefix = await runtime.precompile({ code: '' })
     await prefix.dispose()
-    const result = await prefix.run({ code: 'export default 1' })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_PREFIX_DISPOSED')
+    await expect(prefix.run({ code: 'export default 1' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
   })
 
   test('compile error in precompile throws', async () => {
@@ -650,15 +646,11 @@ describe('globals bridge (Phase 4)', () => {
 
   test('globals not declared at precompile time → ERR_UNDECLARED_BINDING', async () => {
     const prefix = await runtime.precompile({ code: '' })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
-    })
+    })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
     await prefix.dispose()
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
   })
 })
 
@@ -1109,19 +1101,14 @@ describe('imports rebinding enforcement (runtime)', () => {
         'host:declared': { fn: () => 1 },
       },
     })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       // Bypass the type system the way a JS caller might.
       imports: {
 
         'host:never-declared': { fn: () => 2 },
       } as any,
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
-    expect(result.error.message).toMatch(/host:never-declared/)
+    })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING', message: expect.stringMatching(/host:never-declared/) })
   })
 
   test('rebinding an undeclared function export on a declared specifier → ERR_UNDECLARED_BINDING', async () => {
@@ -1132,18 +1119,13 @@ describe('imports rebinding enforcement (runtime)', () => {
         'host:tools': { search: () => 'a' },
       },
     })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       imports: {
 
         'host:tools': { undeclared: () => 1 },
       } as any,
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_UNDECLARED_BINDING')
-    expect(result.error.message).toMatch(/undeclared/)
+    })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING', message: expect.stringMatching(/undeclared/) })
   })
 
   test('rebinding a source-module specifier on prefix.run() → ERR_FROZEN_BINDING', async () => {
@@ -1154,20 +1136,15 @@ describe('imports rebinding enforcement (runtime)', () => {
         'lib:math': 'export const x = 1',
       },
     })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       imports: {
         'lib:math': 'export const x = 2',
       } as any,
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_FROZEN_BINDING')
-    expect(result.error.message).toMatch(/source imports are frozen/)
+    })).rejects.toMatchObject({ code: 'ERR_FROZEN_BINDING', message: expect.stringMatching(/source imports are frozen/) })
   })
 
-  test('rebinding a data export on prefix.run() → ERR_INVALID_REBIND', async () => {
+  test('rebinding a data export with data on prefix.run() → ERR_FROZEN_BINDING', async () => {
     await using prefix = await runtime.precompile({
       code: `globalThis.__primed = true`,
       imports: {
@@ -1175,18 +1152,13 @@ describe('imports rebinding enforcement (runtime)', () => {
         'host:cfg': { version: '1.0.0' },
       },
     })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       imports: {
 
         'host:cfg': { version: '2.0.0' },
       } as any,
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_INVALID_REBIND')
-    expect(result.error.message).toMatch(/can only be rebound with a function/)
+    })).rejects.toMatchObject({ code: 'ERR_FROZEN_BINDING', message: expect.stringMatching(/is a data leaf, not a function/) })
   })
 
   test('rebinding a data export with a function → ERR_FROZEN_BINDING (runtime shape check)', async () => {
@@ -1199,18 +1171,13 @@ describe('imports rebinding enforcement (runtime)', () => {
         'host:cfg': { version: '1.0.0' },
       },
     })
-    const result = await prefix.run({
+    await expect(prefix.run({
       code: 'export default 1',
       imports: {
 
         'host:cfg': { version: () => '2.0.0' },
       } as any,
-    })
-    expect(result.ok).toBe(false)
-    if (result.ok)
-      return
-    expect(result.error.code).toBe('ERR_FROZEN_BINDING')
-    expect(result.error.message).toMatch(/is a data leaf, not a function/)
+    })).rejects.toMatchObject({ code: 'ERR_FROZEN_BINDING', message: expect.stringMatching(/is a data leaf, not a function/) })
   })
 
   test('declared function leaf CAN be rebound and the new handler is used', async () => {

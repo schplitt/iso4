@@ -154,9 +154,10 @@ export const IDENTIFIER_NAME: RegExp = /^[\p{ID_Start}$_][\p{ID_Continue}$\u200C
 
 /**
  * Names the runtime owns; a host global under one fails with
- * `ERR_RESERVED_NAME`. Only the runtime enforces them; this mirrors
- * `RESERVED_GLOBAL_NAMES` in `v8.rs`. `utils.test.ts` checks every name here
- * and every {@link SANDBOX_GLOBALS} name against the runtime.
+ * `ERR_RESERVED_NAME`. The client checks them before sending and the runtime
+ * again; this mirrors `RESERVED_GLOBAL_NAMES` in `v8.rs`. `utils.test.ts`
+ * checks every name here and every {@link SANDBOX_GLOBALS} name against the
+ * runtime.
  */
 export const RUNTIME_OWNED_GLOBALS: ReadonlySet<string> = new Set([
   'console',

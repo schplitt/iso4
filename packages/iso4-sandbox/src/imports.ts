@@ -20,15 +20,9 @@
  *   frames arrive here as `targetKind = import` with the specifier and leaf
  *   path, and the handle IDs never leave the runtime.
  *
- * Rebinding rules (mirroring globals):
- *   - Source modules cannot be rebound at `prefix.run()` (frozen at declaration).
- *   - Host-module function leaves can be rebound by passing a new function at
- *     the same path; data leaves cannot (frozen at declaration).
- *   - Declared-shape enforcement lives in the Rust runtime: `prefix.run()`
- *     sends the rebind locations and the runtime rejects undeclared locations
- *     with `ERR_UNDECLARED_BINDING` (the same enforcement point that guards
- *     undeclared globals) and frozen ones (source module, data leaf) with
- *     `ERR_FROZEN_BINDING`.
+ * Rebinding rules (mirroring globals): only host-module function leaves can
+ * be rebound, with a function. The client checks every location against the
+ * declared shape before sending; the runtime repeats the check.
  */
 
 import type { HostModuleNodePayload, ImportBindingPayload, ImportRebindPayload } from './ipc.js'
@@ -103,15 +97,12 @@ export interface ProcessedRebinds {
 }
 
 /**
- * Thrown when the host's import configuration is structurally invalid in a
- * way only the client can see. `PrefixImpl.run` converts it into a failed
- * `RunResult` carrying `code`: `ERR_FROZEN_BINDING` for a rebind of a frozen
- * location (a source module), `ERR_INVALID_REBIND` for a non-function rebind
- * value. Matches the runtime-side enforcement for locations only Rust can see.
+ * Thrown for an import rebind the prefix does not allow. `PrefixImpl.run`
+ * rethrows it as the same coded `Error` the runtime's refusals become.
  */
 export class ImportRebindError extends Error {
-  readonly code: 'ERR_FROZEN_BINDING' | 'ERR_INVALID_REBIND'
-  constructor(code: 'ERR_FROZEN_BINDING' | 'ERR_INVALID_REBIND', message: string) {
+  readonly code: 'ERR_UNDECLARED_BINDING' | 'ERR_FROZEN_BINDING' | 'ERR_INVALID_REBIND'
+  constructor(code: 'ERR_UNDECLARED_BINDING' | 'ERR_FROZEN_BINDING' | 'ERR_INVALID_REBIND', message: string) {
     super(message)
     this.name = 'ImportRebindError'
     this.code = code
@@ -220,22 +211,37 @@ function lowerNode(
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
+ * The declared import shape without data-leaf values or source text, kept by a
+ * prefix for {@link mergeRebindImports} so it does not pin large data.
+ * @param bindings the bindings sent at `prepare()`
+ */
+export function declaredImportShape(bindings: readonly ImportBindingPayload[]): ImportBindingPayload[] {
+  const strip = (entries: readonly (readonly [string, HostModuleNodePayload])[]): [string, HostModuleNodePayload][] =>
+    entries.map(([key, node]) => [
+      key,
+      node.kind === 'object' ? { kind: 'object', entries: strip(node.entries) } : node.kind === 'data' ? { kind: 'data', value: undefined } : node,
+    ])
+  return bindings.map((b) => 'source' in b ? { specifier: b.specifier, source: '' } : { specifier: b.specifier, module: strip(b.module) })
+}
+
+/**
  * Merge the handlers behind a `Prefix`'s host-module function leaves with the
  * run's overrides and collect the rebind locations to send on the wire.
  *
- * Only client-visible shape problems throw here (a string value — source
- * modules are frozen; a non-function leaf value — there is nothing to
- * dispatch to). Whether each location was actually declared as a function
- * leaf at precompile time is enforced by the Rust runtime against the stored
- * prefix shape (`ERR_UNDECLARED_BINDING` for undeclared locations,
- * `ERR_FROZEN_BINDING` for frozen ones).
+ * Every location is looked up in the declared shape before its value is
+ * looked at, with the same codes and messages as `validate_import_rebinds` in
+ * the runtime, which repeats the check: undeclared is `ERR_UNDECLARED_BINDING`,
+ * a source module or data leaf `ERR_FROZEN_BINDING`. A declared location
+ * given the wrong kind of value is `ERR_INVALID_REBIND`.
  *
- * @param runImports
+ * @param runImports the run's `imports` option
  * @param defaults handler map captured at precompile time
+ * @param declared the import shape declared at `prepare()`
  */
 export function mergeRebindImports(
   runImports: Imports | undefined,
   defaults: ImportHandlerMap,
+  declared: readonly ImportBindingPayload[],
 ): ProcessedRebinds {
   if (runImports === undefined)
     return { rebinds: [], handlers: defaults }
@@ -243,23 +249,25 @@ export function mergeRebindImports(
   const handlers: ImportHandlerMap = new Map(defaults)
   const rebinds: ImportRebindPayload[] = []
 
-  for (const [specifier, value] of Object.entries(runImports)) {
+  for (const [specifier, value] of Object.entries(runImports as Record<string, unknown>)) {
     if (!specifier.isWellFormed())
       throw new TypeError(`[@iso4/sandbox] import specifier '${specifier}' is not a well-formed string`)
-    if (typeof value === 'string') {
+    const binding = declared.find((b) => b.specifier === specifier)
+    if (binding === undefined)
+      throw new ImportRebindError('ERR_UNDECLARED_BINDING', `import '${specifier}' was not declared at precompile time`)
+    if ('source' in binding) {
       throw new ImportRebindError(
         'ERR_FROZEN_BINDING',
-        `import '${specifier}' is a source module — source imports are frozen `
-        + `with the prefix and cannot be rebound at prefix.run() time`,
+        `import '${specifier}' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`,
       )
     }
     if (!isPlainObject(value)) {
-      throw new Error(
-        `[@iso4/sandbox] imports['${specifier}'] override must be a plain object; `
-        + `got ${describeKind(value)}`,
+      throw new ImportRebindError(
+        'ERR_INVALID_REBIND',
+        `import '${specifier}' can only be rebound with a plain object; got ${describeKind(value)}`,
       )
     }
-    walkRebind(specifier, value, [], handlers, rebinds)
+    walkRebind(specifier, value, binding.module, [], handlers, rebinds)
   }
 
   return { rebinds, handlers }
@@ -268,29 +276,40 @@ export function mergeRebindImports(
 function walkRebind(
   specifier: string,
   node: HostModuleObject,
+  declared: readonly (readonly [string, HostModuleNodePayload])[],
   path: string[],
   handlers: ImportHandlerMap,
   rebinds: ImportRebindPayload[],
 ): void {
   for (const [key, value] of Object.entries(node)) {
-    if (value === undefined)
-      continue
-    const newPath = [...path, key]
-    if (typeof value === 'function') {
-      const joined = newPath.join('.')
-      handlers.set(importHandlerKey(specifier, joined), value as HostExportFunction)
-      rebinds.push({ specifier, path: joined })
+    const joined = [...path, key].join('.')
+    const shape = declared.find(([name]) => name === key)?.[1]
+    if (shape === undefined)
+      throw new ImportRebindError('ERR_UNDECLARED_BINDING', `import '${specifier}'.${joined} was not declared at precompile time`)
+    if (shape.kind === 'data') {
+      throw new ImportRebindError(
+        'ERR_FROZEN_BINDING',
+        `import '${specifier}'.${joined} is a data leaf, not a function — data leaves cannot be rebound`,
+      )
+    }
+    if (shape.kind === 'object') {
+      if (!isPlainObject(value)) {
+        throw new ImportRebindError(
+          'ERR_INVALID_REBIND',
+          `import '${specifier}'.${joined} can only be rebound with a plain object; got ${describeKind(value)}`,
+        )
+      }
+      walkRebind(specifier, value, shape.entries, [...path, key], handlers, rebinds)
       continue
     }
-    if (isPlainObject(value)) {
-      walkRebind(specifier, value, newPath, handlers, rebinds)
-      continue
+    if (typeof value !== 'function') {
+      throw new ImportRebindError(
+        'ERR_INVALID_REBIND',
+        `import '${specifier}'.${joined} can only be rebound with a function; got ${describeKind(value)}`,
+      )
     }
-    throw new ImportRebindError(
-      'ERR_INVALID_REBIND',
-      `import '${specifier}'.${newPath.join('.')} can only be rebound with a `
-      + `function; got ${describeKind(value)}`,
-    )
+    handlers.set(importHandlerKey(specifier, joined), value as HostExportFunction)
+    rebinds.push({ specifier, path: joined })
   }
 }
 
