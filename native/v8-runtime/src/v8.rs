@@ -12039,18 +12039,19 @@ mod tests {
 
     #[test]
     fn reported_cpu_stays_below_wall_when_cores_are_contended() {
-        // #196, the property the number is read for: what a run is charged
-        // describes its own work, not who it shared cores with. Oversubscribe
-        // and wall stretches while CPU does not — before the fix both were
-        // the same measurement and this ratio was ~1.0.
+        // A run is charged its own work, not the time it shared cores: under
+        // oversubscription wall stretches while CPU does not.
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(2);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let load: Vec<_> = (0..cores * 2)
+        let ready = Arc::new(std::sync::Barrier::new(cores * 4 + 1));
+        let load: Vec<_> = (0..cores * 4)
             .map(|_| {
                 let s = Arc::clone(&stop);
+                let r = Arc::clone(&ready);
                 std::thread::spawn(move || {
+                    r.wait();
                     let mut x = 0u64;
                     while !s.load(Ordering::Relaxed) {
                         x = x.wrapping_mul(2862933555777941757).wrapping_add(3);
@@ -12059,9 +12060,11 @@ mod tests {
                 })
             })
             .collect();
+        ready.wait();
 
+        // ~70 ms of CPU, so the run spans many scheduler slices.
         let out = run_code(
-            "let x = 0; for (let i = 0; i < 20_000_000; i++) x = (x + i) & 1048575; export default x",
+            "let x = 0; for (let i = 0; i < 100_000_000; i++) x = (x + i) & 1048575; export default x",
             "<test>",
             Limits::default(),
         );
@@ -12071,8 +12074,7 @@ mod tests {
         }
 
         let out = out.expect("the spin must finish: starvation costs wall, not CPU");
-        // 3x oversubscription should put this near 0.33; 0.8 leaves room for
-        // a CI box that schedules generously without admitting the old bug.
+        // ~4x oversubscription puts this near 0.25; cpu tracking wall reads ~1.0.
         assert!(
             out.cpu_time_ms < out.wall_time_ms * 0.8,
             "cpu {} ms vs wall {} ms — cpu is tracking wall, not the core",
