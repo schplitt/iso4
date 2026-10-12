@@ -29,7 +29,8 @@ import type {
 /**
  * Every global name a fresh sandbox defines: the JS built-ins of the bundled
  * V8 plus the runtime's own (`console`, `waitUntil`, timers, web classes).
- * A host global under one of these names replaces or collides with it.
+ * A host global under one of these names replaces the built-in, or is
+ * silently ignored for `undefined`, `NaN` and `Infinity`.
  */
 export const SANDBOX_GLOBALS: readonly string[] = Object.freeze([
   'AggregateError',

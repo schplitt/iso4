@@ -535,8 +535,9 @@ non-enumerable too; do not name globals into it.
 Hosts that generate global names (one per API namespace, say) check them
 with the exported `SANDBOX_GLOBALS` — every name a fresh sandbox defines,
 V8 built-ins included — or `isReservedGlobal(name)`, which adds the
-`__iso4_` prefix. Only the runtime-owned names above are enforced; a host
-global named after a V8 built-in still replaces it. An integration test
+`__iso4_` prefix. Only the runtime-owned names above are enforced. A host
+global named after a V8 built-in replaces it, except the non-writable
+`undefined`, `NaN` and `Infinity`, where it is silently ignored. An integration test
 compares the list against a live sandbox, so a V8 bump that adds a global
 fails CI until the list is updated.
 

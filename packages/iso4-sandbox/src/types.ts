@@ -189,8 +189,9 @@ export interface ResourceLimits {
  * are owned by the runtime; shadowing `Response` would silently break
  * serialization.
  *
- * `SANDBOX_GLOBALS` lists every name a fresh sandbox defines (V8 built-ins
- * included); `isReservedGlobal(name)` checks a name against it and `__iso4_`.
+ * {@link SANDBOX_GLOBALS} lists every name a fresh sandbox defines (V8
+ * built-ins included); {@link isReservedGlobal} checks a name against it and
+ * the `__iso4_` prefix.
  *
  * Common usage:
  * ```ts
