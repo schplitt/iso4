@@ -278,6 +278,17 @@ describe('processImports — rejected configurations', () => {
     ).toThrow(/not a valid JavaScript identifier/)
   })
 
+  it.each(['café', 'π', '$', '_', 'a\u200Cb', 'a\u200Db', '\u309B'])('accepts the Unicode identifier %s as a top-level key', (name) => {
+    const { bindings } = processImports({ 'host:ok': { [name]: 1 } })
+    expect(bindings[0]!.module![0]![0]).toBe(name)
+  })
+
+  it.each(['', '1abc', 'my-tool', '\u200Ca'])('rejects %j as a top-level key', (name) => {
+    expect(() =>
+      processImports({ 'host:bad': { [name]: 1 } }),
+    ).toThrow(/not a valid JavaScript identifier/)
+  })
+
   it.each(['eval', 'arguments'])('rejects strict-mode-restricted %s as a top-level key', (name) => {
     expect(() =>
       processImports({

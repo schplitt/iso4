@@ -533,6 +533,7 @@ describe('decodeRunCompletionPayload — failure', () => {
     'ERR_BRIDGE_CALL_LIMIT_EXCEEDED',
     'ERR_UNDECLARED_BINDING',
     'ERR_RESERVED_NAME',
+    'ERR_INVALID_GLOBAL_NAME',
     'ERR_FROZEN_BINDING',
     'ERR_PREFIX_DISPOSED',
     'ERR_ABORTED',

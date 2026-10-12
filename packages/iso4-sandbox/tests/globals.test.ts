@@ -304,6 +304,36 @@ describe('bad paths — runtime', () => {
     })
   })
 
+  describe('processGlobals — names unreachable by bare name', () => {
+    const fn: HostExportFunction = async () => null
+    it.each(['class', 'true', 'default', 'my-tool', '1abc', ''])('refuses %j with ERR_INVALID_GLOBAL_NAME', (name) => {
+      for (const value of [fn, `1`, { kind: 'data', value: 1 }, { kind: 'bridge-with-shim', shim: `(h) => h`, handler: fn }] as const) {
+        expect(() => processGlobals({ [name]: value } as HostGlobals)).toThrow(
+          expect.objectContaining({
+            code: 'ERR_INVALID_GLOBAL_NAME',
+            message: `global '${name}' cannot be referenced by bare name in sandbox code`,
+          }),
+        )
+      }
+    })
+
+    it.each(['eval', 'arguments', 'undefined', 'myTool', '$x', '$', '_', 'café', 'π', 'a\u200Cb', '\u309B'])('allows %s', (name) => {
+      const { defs } = processGlobals({ [name]: fn })
+      expect(defFor(defs, name)).toBeDefined()
+    })
+
+    it('refuses an unusable undeclared rebind name before the runtime sees it', () => {
+      expect(() => extractBridgeGlobals({ class: async () => 1 } as never, {})).toThrow(
+        expect.objectContaining({ code: 'ERR_INVALID_GLOBAL_NAME' }),
+      )
+    })
+
+    it('leaves nested keys of a data global unrestricted', () => {
+      const { defs } = processGlobals({ config: { kind: 'data', value: { 'class': 1, 'my-key': 2 } } })
+      expect(defFor(defs, 'config')).toBeDefined()
+    })
+  })
+
   describe('extractBridgeGlobals — rejects a supplied-but-malformed override', () => {
     it('a supplied string override throws instead of reusing the default', () => {
       // At runtime someone bypasses TypeScript with `as any`. A key that is

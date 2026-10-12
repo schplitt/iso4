@@ -3039,6 +3039,25 @@ describe('ERR_UNDECLARED_BINDING', () => {
     await prefix.dispose()
   })
 
+  test('an unusable undeclared name is ERR_INVALID_GLOBAL_NAME, a valid one ERR_UNDECLARED_BINDING', async () => {
+    const prefix = await runtime.prepare({ code: '' })
+    const invalid = await prefix.run({
+      code: 'export default 1',
+      globals: { class: async () => 1 } as never,
+    })
+    expect(invalid.ok).toBe(false)
+    if (!invalid.ok)
+      expect(invalid.error.code).toBe('ERR_INVALID_GLOBAL_NAME')
+    const undeclared = await prefix.call({
+      export: 'default',
+      globals: { zzz: async () => 1 } as never,
+    })
+    expect(undeclared.ok).toBe(false)
+    if (!undeclared.ok)
+      expect(undeclared.error.code).toBe('ERR_UNDECLARED_BINDING')
+    await prefix.dispose()
+  })
+
   test('declared global at precompile time can be rebound at run time', async () => {
     // fetch IS declared at precompile time (even if the stub is never called).
     // Rebinding at run time is allowed.
@@ -3190,6 +3209,54 @@ describe('native timers', () => {
       return
     expect(result.error.code).toBe('ERR_RESERVED_NAME')
     expect(result.error.message).toMatch(/reserved/)
+  })
+
+  test('a global name unreachable by bare name fails the run with ERR_INVALID_GLOBAL_NAME', async () => {
+    const result = await runtime.run({
+      code: 'export default 1',
+      globals: { 'my-tool': async () => 1 },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_INVALID_GLOBAL_NAME')
+    expect(result.error.message).toBe(`global 'my-tool' cannot be referenced by bare name in sandbox code`)
+  })
+
+  test('a global name unreachable by bare name fails prepare() with ERR_INVALID_GLOBAL_NAME', async () => {
+    await expect(
+      runtime.prepare({ code: '', globals: { class: async () => 1 } }),
+    ).rejects.toMatchObject({ code: 'ERR_INVALID_GLOBAL_NAME', message: `global 'class' cannot be referenced by bare name in sandbox code` })
+  })
+
+  test('a Unicode identifier works as a host global name', async () => {
+    const result = await runtime.run({
+      code: 'export default café + π',
+      globals: { café: { kind: 'data', value: 1 }, π: `3` },
+    })
+    expect(result.ok).toBe(true)
+    if (result.ok)
+      expect(result.exports.default).toBe(4)
+  })
+
+  test('a Unicode identifier works as a host-module export name', async () => {
+    const result = await runtime.run({
+      code: `import { café, π } from 'host:u'; export default [café, await π()]`,
+      imports: { 'host:u': { café: 1, π: async () => 3 } },
+    })
+    expect(result.ok).toBe(true)
+    if (result.ok)
+      expect(result.exports.default).toEqual([1, 3])
+  })
+
+  test('eval and arguments stay usable as host global names', async () => {
+    const result = await runtime.run({
+      code: 'export default [typeof eval, arguments]',
+      globals: { eval: { kind: 'data', value: 1 }, arguments: { kind: 'data', value: 2 } },
+    })
+    expect(result.ok).toBe(true)
+    if (result.ok)
+      expect(result.exports.default).toEqual(['number', 2])
   })
 
   test('setTimeout at prefix top level fails prepare() with a clear error', async () => {

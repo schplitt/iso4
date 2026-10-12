@@ -37,7 +37,7 @@ import type {
   HostModuleObject,
   Imports,
 } from './types.js'
-import { RESERVED_WORDS } from './globals.js'
+import { IDENTIFIER_NAME, RESERVED_WORDS } from './globals.js'
 
 // ─────────────────────────────────────────────────────────────────────────
 // Public surface
@@ -319,7 +319,7 @@ function isPlainObject(value: unknown): value is HostModuleObject {
 function isValidExportIdentifier(name: string): boolean {
   if (name === 'default')
     return true
-  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name))
+  if (!IDENTIFIER_NAME.test(name))
     return false
   if (RESERVED_WORDS.has(name))
     return false

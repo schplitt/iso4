@@ -1342,6 +1342,9 @@ pub enum RunError {
     /// ([`RESERVED_GLOBAL_NAMES`]). Shaped to also cover runtime-owned
     /// module specifiers if one ever becomes non-overridable.
     ReservedName(String),
+    /// A host global name sandbox code cannot reference by bare name: not
+    /// an identifier, or a reserved word other than `eval`/`arguments`.
+    InvalidGlobalName(String),
     /// A PrefixRun rebind targets a declared location that is frozen with
     /// the prefix: a source module or a data leaf.
     FrozenBinding(String),
@@ -6656,8 +6659,9 @@ extern "C" fn host_import_meta_callback(
     meta.create_data_property(scope, key.into(), array.into());
 }
 
-/// Reserved words that cannot appear as named ESM exports. Mirrors the list
-/// in the TS client (`RESERVED_WORDS` in `globals.ts`), minus `default`.
+/// Reserved words that cannot appear as named ESM exports, and (minus `eval`
+/// and `arguments`) as host global names. Mirrors the list in the TS client
+/// (`RESERVED_WORDS` in `globals.ts`), minus `default`.
 const RESERVED_EXPORT_WORDS: &[&str] = &[
     "break",
     "case",
@@ -6709,7 +6713,7 @@ const RESERVED_EXPORT_WORDS: &[&str] = &[
 ];
 
 /// Whether `name` can appear as a named ESM export in generated host-module
-/// source: ASCII identifier rules plus a reserved-word filter. `default` is
+/// source: Unicode identifier rules plus a reserved-word filter. `default` is
 /// allowed (emitted as `export default`). Mirrors `isValidExportIdentifier`
 /// in the TS client.
 fn is_valid_export_identifier(name: &str) -> bool {
@@ -6720,10 +6724,27 @@ fn is_valid_export_identifier(name: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+    // ID minus XID; V8 uses ID.
+    let id_not_xid = |c: char| {
+        matches!(c, '\u{037A}' | '\u{309B}' | '\u{309C}' | '\u{FC5E}'..='\u{FC63}'
+            | '\u{FDFA}' | '\u{FDFB}' | '\u{FE70}' | '\u{FE72}' | '\u{FE74}' | '\u{FE76}'
+            | '\u{FE78}' | '\u{FE7A}' | '\u{FE7C}' | '\u{FE7E}')
+    };
+    if !(unicode_ident::is_xid_start(first)
+        || id_not_xid(first)
+        || matches!(first, '\u{0E33}' | '\u{0EB3}' | '\u{FF9E}' | '\u{FF9F}')
+        || first == '_'
+        || first == '$')
+    {
         return false;
     }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') {
+    if !chars.all(|c| {
+        unicode_ident::is_xid_continue(c)
+            || id_not_xid(c)
+            || c == '$'
+            || c == '\u{200C}'
+            || c == '\u{200D}'
+    }) {
         return false;
     }
     !RESERVED_EXPORT_WORDS.contains(&name)
@@ -7643,6 +7664,22 @@ fn check_not_reserved(name: &str) -> Result<(), RunError> {
     if RESERVED_GLOBAL_NAMES.contains(&name) {
         return Err(RunError::ReservedName(format!(
             "global '{name}' is reserved by the runtime and cannot be provided by the host"
+        )));
+    }
+    check_bare_global_name(name)
+}
+
+/// Refuse a host global name sandbox code cannot reference by bare name.
+/// Mirrors `checkGlobalName` in the TS client.
+pub(crate) fn check_bare_global_name(name: &str) -> Result<(), RunError> {
+    // `eval`/`arguments` are reachable by bare name; `default` is a valid
+    // export name but not a binding.
+    let bare_name = name == "eval"
+        || name == "arguments"
+        || (name != "default" && is_valid_export_identifier(name));
+    if !bare_name {
+        return Err(RunError::InvalidGlobalName(format!(
+            "global '{name}' cannot be referenced by bare name in sandbox code"
         )));
     }
     Ok(())
@@ -14082,6 +14119,16 @@ mod tests {
     }
 
     #[test]
+    fn host_module_export_name_follows_unicode_identifier_rules() {
+        for name in ["café", "π", "$", "_", "a\u{200C}b", "a\u{200D}b", "\u{309B}", "\u{0E33}", "a\u{FE70}"] {
+            assert!(is_valid_export_identifier(name), "expected '{name}' to be valid");
+        }
+        for name in ["", "1abc", "my-tool", "\u{200C}a"] {
+            assert!(!is_valid_export_identifier(name), "expected '{name}' to be invalid");
+        }
+    }
+
+    #[test]
     fn host_module_direct_dispatcher_call_with_bad_handle_rejects_catchably() {
         // Sandbox code calling the reserved dispatcher directly with a bogus
         // handle gets a catchable rejection — not a hang, not a crash.
@@ -15721,5 +15768,22 @@ mod tests {
     fn set_timeout_and_clear_timeout_are_reserved_global_names() {
         assert!(RESERVED_GLOBAL_NAMES.contains(&"setTimeout"));
         assert!(RESERVED_GLOBAL_NAMES.contains(&"clearTimeout"));
+    }
+
+    #[test]
+    fn global_names_unreachable_by_bare_name_are_refused() {
+        for name in ["class", "true", "default", "my-tool", "1abc", ""] {
+            assert!(
+                matches!(&check_not_reserved(name), Err(RunError::InvalidGlobalName(m)) if m.contains("bare name")),
+                "expected '{name}' to be refused"
+            );
+        }
+        for name in [
+            "eval", "arguments", "undefined", "myTool", "$x", "$", "_", "café", "π", "a\u{200C}b",
+            "\u{309B}",
+            "__iso4_myTool_h",
+        ] {
+            assert!(check_not_reserved(name).is_ok(), "expected '{name}' to be allowed");
+        }
     }
 }
