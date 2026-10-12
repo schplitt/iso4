@@ -176,12 +176,13 @@ export interface ResourceLimits {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Globals (generic bridge — any non-reserved name is permitted)
+// Globals (generic bridge — any non-reserved bare-name identifier)
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
- * Host-provided globals. Any name not reserved by V8 or the runtime is
- * permitted. Each value becomes a bridge stub in the sandbox global object.
+ * Host-provided globals. Any name not reserved by the runtime that sandbox
+ * code can reference by bare name is permitted. Each value becomes a bridge
+ * stub in the sandbox global object.
  *
  * Reserved names (rejected with `ERR_RESERVED_NAME`): `console`,
  * `waitUntil`, `setTimeout`, `clearTimeout`, `Headers`, `Request`,
@@ -189,9 +190,14 @@ export interface ResourceLimits {
  * are owned by the runtime; shadowing `Response` would silently break
  * serialization.
  *
+ * A name sandbox code cannot reference by bare name is rejected with
+ * `ERR_INVALID_GLOBAL_NAME`: one that is not a JavaScript identifier
+ * (`my-tool`, `1abc`; Unicode identifiers such as `café` are fine), or one in
+ * {@link RESERVED_WORDS} other than `eval` and `arguments`. Keys nested inside
+ * a global's value are unrestricted.
+ *
  * {@link SANDBOX_GLOBALS} holds every name a fresh sandbox defines, V8
- * built-ins included. Names in {@link RESERVED_WORDS} install but, except for
- * `eval` and `arguments`, cannot be referenced by bare name.
+ * built-ins included.
  *
  * Common usage:
  * ```ts
@@ -1069,7 +1075,8 @@ export interface Prefix<
  * `G` is the declared-globals shape from the matching `precompile()` call.
  * The `globals` field is typed as `Partial<G>` — only names present in `G`
  * may be overridden. Passing any other name is a TypeScript error at compile
- * time and `ERR_UNDECLARED_BINDING` at runtime.
+ * time and `ERR_UNDECLARED_BINDING` at runtime (`ERR_INVALID_GLOBAL_NAME`
+ * first, for a name sandbox code cannot reference by bare name).
  */
 export interface PrefixRunOptions<
   G extends HostGlobals,
@@ -1083,7 +1090,8 @@ export interface PrefixRunOptions<
   /**
    * Override implementations for a **subset** of globals declared at
    * precompile time. Only names present in `G` are accepted (TypeScript
-   * error + runtime `ERR_UNDECLARED_BINDING` for anything else), but the
+   * error + runtime `ERR_UNDECLARED_BINDING` for anything else, or
+   * `ERR_INVALID_GLOBAL_NAME` for a name unusable by bare name), but the
    * function signature does not need to match the precompile-time handler
    * exactly — any `HostExportFunction`-compatible value is accepted.
    */
@@ -1724,7 +1732,8 @@ export type RunErrorCode
     /**
      * A `prefix.run()` binding (global or import rebind) names something that
      * was never declared at `prepare()` time. Declared-but-locked locations
-     * are `ERR_FROZEN_BINDING`; runtime-owned names are `ERR_RESERVED_NAME`.
+     * are `ERR_FROZEN_BINDING`; runtime-owned names are `ERR_RESERVED_NAME`;
+     * names unusable by bare name are `ERR_INVALID_GLOBAL_NAME`, checked first.
      */
     | 'ERR_UNDECLARED_BINDING'
     /**
@@ -1732,6 +1741,13 @@ export type RunErrorCode
      * `Response`, … — see {@link HostGlobals}) and may not shadow it.
      */
     | 'ERR_RESERVED_NAME'
+    /**
+     * A host global name sandbox code cannot reference by bare name: not a
+     * JavaScript identifier (`my-tool`), or a reserved word other than `eval`
+     * and `arguments` (`class`, `true`). The client refuses it before sending;
+     * the runtime checks again.
+     */
+    | 'ERR_INVALID_GLOBAL_NAME'
     /**
      * A `prefix.run()` rebind targets a declared location that is frozen with
      * the prefix: a source module or a data leaf. Only host-module function

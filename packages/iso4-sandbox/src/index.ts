@@ -48,7 +48,7 @@ import type {
 
 // ── Global processing (imported from globals.ts for testability) ──────────
 
-import { extractBridgeGlobals, processGlobals } from './globals.js'
+import { extractBridgeGlobals, GlobalNameError, processGlobals } from './globals.js'
 import {
   ImportRebindError,
   mergeRebindImports,
@@ -744,7 +744,27 @@ class SandboxImpl implements Sandbox {
     }
     validateMemoryMb(options.limits?.memoryMb, 'limits.memoryMb')
     const runMemoryMb = options.limits?.memoryMb ?? this.memoryMb
-    const { defs, dispatch } = processGlobals(options.globals ?? {})
+    let processed: ReturnType<typeof processGlobals>
+    try {
+      processed = processGlobals(options.globals ?? {})
+    } catch (e) {
+      if (e instanceof GlobalNameError) {
+        // Same result shape the runtime returns for this refusal.
+        return {
+          status: 'failed',
+          ok: false,
+          error: { code: e.code, name: 'Error', message: e.message },
+          stdout: [],
+          stderr: [],
+          durationMs: 0,
+          wallTimeMs: 0,
+          cpuTimeMs: 0,
+          bridgeCalls: [],
+        }
+      }
+      throw e
+    }
+    const { defs, dispatch } = processed
     // Drain any Request/Response body before the payload encoder, which is
     // synchronous. See materializeHostTypesInGlobals.
     await materializeHostTypesInGlobals(defs, this.brandKey)
@@ -907,9 +927,10 @@ class SandboxImpl implements Sandbox {
     // prefix; every run frame for it carries this value, so warm instances
     // are created with it and attach cap-matching holds by construction.
     const prefixMemoryMb = options.memoryMb ?? this.memoryMb
+    // Throws GlobalNameError (code ERR_INVALID_GLOBAL_NAME) before a client is taken.
+    const rawGlobals = options.globals ?? {} as G
+    const { defs } = processGlobals(rawGlobals)
     return this.pool.withClient(async (client) => {
-      const rawGlobals = options.globals ?? {} as G
-      const { defs } = processGlobals(rawGlobals)
       await materializeHostTypesInGlobals(defs, this.brandKey)
       // The declared import shape travels as data and is stored with the
       // prefix on the Rust side — it is the runtime's reference for building
@@ -1119,22 +1140,24 @@ implements Prefix<G, M> {
     // Extract bridge globals, routing shimmed overrides to their private keys.
     // String/data globals and shim wrappers are already compiled into the
     // declared prefix state — only the bridge stubs they call are re-installed per run.
-    const { defs, dispatch } = extractBridgeGlobals(
-      (options.globals ?? {}) as RebindGlobals<HostGlobals>,
-      this.defaultGlobals as HostGlobals,
-    )
     // Merge run-time handler overrides over the precompile defaults and
     // collect the rebind locations for the wire. Declared-shape enforcement
     // happens in the Rust runtime against the stored prefix shape (the same
     // check that guards globals); only client-visible shape problems throw here.
+    let defs: ReturnType<typeof extractBridgeGlobals>['defs']
+    let dispatch: ReturnType<typeof extractBridgeGlobals>['dispatch']
     let merged: ReturnType<typeof mergeRebindImports>
     try {
+      ({ defs, dispatch } = extractBridgeGlobals(
+        (options.globals ?? {}) as RebindGlobals<HostGlobals>,
+        this.defaultGlobals as HostGlobals,
+      ))
       merged = mergeRebindImports(
         options.imports as Imports | undefined,
         this.defaultImportHandlers,
       )
     } catch (e) {
-      if (e instanceof ImportRebindError) {
+      if (e instanceof ImportRebindError || e instanceof GlobalNameError) {
         // Symmetric with the Rust-side rebind validation: surface the error
         // as a RunResult failure rather than a thrown promise.
         return {

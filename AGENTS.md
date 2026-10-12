@@ -306,7 +306,8 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   named `export`s, never via globals or `console`.
 - **Globals are runtime-curated, block-listed not allowlisted.** The host may
   contribute any name that is not on the reserved list (JS built-ins plus the
-  runtime's own web globals and `console`); `fetch` is not special-cased.
+  runtime's own web globals and `console`) that sandbox code can reference by
+  bare name; `fetch` is not special-cased.
   Prefer `imports` for anything user code does not expect as a bare name.
   Changing what the runtime installs or reserves is a deliberate design
   decision recorded in `DESIGN.md` §4.2 / §4.2.1.

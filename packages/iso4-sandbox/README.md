@@ -70,7 +70,7 @@ await sandbox.dispose()
 
 ## How globals work
 
-`globals` wires any non-reserved name directly into the sandbox's global
+`globals` wires any non-reserved identifier directly into the sandbox's global
 object as a bridge stub. The bridge is fully generic — `fetch` is not
 special-cased:
 
@@ -88,11 +88,16 @@ const options = {
 Functions in bridge return values are currently dropped — return plain data,
 not class instances with methods.
 
+Global names must be usable by bare name: iso4 refuses one that is not a
+JavaScript identifier (`my-tool`) or is a reserved word (`class`, `true`)
+with `ERR_INVALID_GLOBAL_NAME`. Unicode identifiers (`café`) and `eval` and
+`arguments` are allowed.
+
 `SANDBOX_GLOBALS` is a `Set` of every name a fresh sandbox already defines.
 Check generated names against it before installing them. `RESERVED_WORDS`
 is a `Set` of names that cannot be a binding in module source, such as
-`class` or `eval`; check generated global and host-module export names
-against it too.
+`class` or `eval`; iso4 refuses host-module export names in it, and global
+names in it other than `eval` and `arguments`.
 
 ## TypeScript-checked rebinding
 

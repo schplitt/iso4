@@ -114,11 +114,11 @@ export const SANDBOX_GLOBALS: ReadonlySet<string> = new Set([
 
 /**
  * Every name that cannot be a binding in module source, so it cannot be a
- * host-module export name. As globals, all but `eval` and `arguments` are
- * unreachable by bare name. `default` is
+ * host-module export name. As host global names, all but `eval` and
+ * `arguments` are refused with `ERR_INVALID_GLOBAL_NAME`. `default` is
  * included, though iso4 itself accepts it as a host-module export (emitted as
- * `export default`). Unlike {@link SANDBOX_GLOBALS}, which lists names that are
- * taken, these are names the grammar forbids.
+ * `export default`). Unlike {@link SANDBOX_GLOBALS}, which lists names that
+ * are taken, these are names the grammar forbids.
  */
 export const RESERVED_WORDS: ReadonlySet<string> = new Set([
   'break',
@@ -170,6 +170,20 @@ export const RESERVED_WORDS: ReadonlySet<string> = new Set([
   'eval',
   'arguments',
 ])
+
+/**
+ * A JavaScript identifier name, Unicode included: ID_Start/ID_Continue plus
+ * `$`, `_`, ZWNJ and ZWJ.
+ */
+export const IDENTIFIER_NAME: RegExp = /^[\p{ID_Start}$_][\p{ID_Continue}$\u200C\u200D]*$/u
+
+/**
+ * A host global name sandbox code cannot reference by bare name. Carries the
+ * same code and message the runtime reports for it.
+ */
+export class GlobalNameError extends Error {
+  readonly code = 'ERR_INVALID_GLOBAL_NAME' as const
+}
 
 export function isBridgeWithShim(v: HostGlobalValue): v is BridgeWithShim {
   return (
@@ -230,8 +244,22 @@ export interface ProcessedGlobals {
 }
 
 /**
+ * Throw {@link GlobalNameError} unless sandbox code can reference `name` by
+ * bare name. Mirrored by `check_bare_global_name` in `v8.rs`.
+ * @param name host global name
+ */
+function checkGlobalName(name: string): void {
+  // `eval` and `arguments` are reserved for bindings but still reachable by bare name.
+  if (name !== 'eval' && name !== 'arguments'
+    && (!IDENTIFIER_NAME.test(name) || RESERVED_WORDS.has(name))) {
+    throw new GlobalNameError(`global '${name}' cannot be referenced by bare name in sandbox code`)
+  }
+}
+
+/**
  * Lower a `HostGlobals` map into wire-shaped `defs` plus the bridge-dispatch
- * map. See the module comment for the split.
+ * map. See the module comment for the split. Throws {@link GlobalNameError}
+ * for a name sandbox code cannot reference by bare name.
  *   - `HostExportFunction` → `{ kind: 'bridge' }` + dispatch entry.
  *   - `string`             → `{ kind: 'string', expr }` (evaluated by Rust).
  *   - `DataGlobal`         → `{ kind: 'data', value }` (materialised by Rust).
@@ -244,6 +272,7 @@ export function processGlobals(globals: HostGlobals): ProcessedGlobals {
   const dispatch: Record<string, HostExportFunction> = {}
 
   for (const [name, value] of Object.entries(globals)) {
+    checkGlobalName(name)
     // The bare shorthands are always enumerable by design; the object forms
     // carry an optional opt-out (default true).
     if (typeof value === 'function') {
@@ -344,14 +373,13 @@ export function extractBridgeGlobals(
     }
   }
 
-  // Pass any run-time override that was NOT in the precompile globals through
-  // to Rust unchanged. Rust will reject it with ERR_UNDECLARED_BINDING, which
-  // is the correct runtime behaviour for undeclared globals.
-  // TypeScript's RebindGlobals<G> prevents this at the type level, but `as any`
-  // can bypass it — Rust is the final enforcement point.
+  // Undeclared function overrides go to Rust, which refuses them with
+  // ERR_UNDECLARED_BINDING; undeclared non-functions are dropped.
   for (const [name, override] of Object.entries(runGlobals)) {
     if (name in precompileGlobals)
       continue
+    // An unusable name is refused here, ahead of Rust's undeclared check.
+    checkGlobalName(name)
     if (typeof override === 'function') {
       defs.push({ kind: 'bridge', name, enumerable: true })
       dispatch[name] = override as HostExportFunction

@@ -548,6 +548,7 @@ dependencies = [
  "crossbeam-channel",
  "libc",
  "signal-hook",
+ "unicode-ident",
  "v8",
 ]
 

@@ -150,7 +150,7 @@ pnpm changeset          # record a per-package version bump
 - `sandbox.run({ code, limits })` — direct sandboxed execution ✅
 - `sandbox.precompile()` + `prefix.run()` — prefix/postfix pattern ✅
 - CPU and wall-clock limits enforced, async wait excluded from CPU budget ✅
-- Host-declared globals bridged into V8 (`fetch`, `myTool`, any name) ✅
+- Host-declared globals bridged into V8 (`fetch`, `myTool`, any bare-name identifier) ✅
 - `ERR_UNDECLARED_BINDING` enforced on `prefix.run()` globals ✅
 - Host-provided imports — source modules (`string`) and host modules (objects with function/data leaves) resolved via `import` in sandbox code ✅
 - `AbortSignal` support — cancel in-flight runs; `RunResult.status` discriminates `'completed'` | `'failed'` | `'aborted'`, with `reason` on abort ✅
@@ -165,7 +165,7 @@ pnpm changeset          # record a per-package version bump
 
 ## How globals work
 
-`globals` wires any non-reserved name directly into the sandbox's global
+`globals` wires any non-reserved identifier directly into the sandbox's global
 object. The bridge is completely generic — the name `fetch` is not special:
 
 ```ts
@@ -186,11 +186,16 @@ const result = await sandbox.run({
 The handler receives the raw arguments from sandbox code and must return
 plain serializable data. **Functions in return values are currently dropped.**
 
+Global names must be usable by bare name: iso4 refuses one that is not a
+JavaScript identifier (`my-tool`) or is a reserved word (`class`, `true`)
+with `ERR_INVALID_GLOBAL_NAME`. Unicode identifiers (`café`) and `eval` and
+`arguments` are allowed.
+
 `SANDBOX_GLOBALS` is a `Set` of every name a fresh sandbox already defines.
 Check generated names against it before installing them. `RESERVED_WORDS`
 is a `Set` of names that cannot be a binding in module source, such as
-`class` or `eval`; check generated global and host-module export names
-against it too.
+`class` or `eval`; iso4 refuses host-module export names in it, and global
+names in it other than `eval` and `arguments`.
 
 ## Async context (`AsyncLocalStorage`)
 
