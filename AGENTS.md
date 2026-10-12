@@ -43,6 +43,8 @@ iso4/                              ← workspace root
         index.ts                   ← public re-exports + createSandbox
         types.ts                   ← canonical API types
         client.ts, pool.ts, ipc.ts ← IPC client, connection pool, frame codec
+        utils.ts                   ← @iso4/sandbox/utils entry; re-exports names.ts
+        names.ts                   ← name rules; imports nothing (no client/binary)
       tests/
       bench/
       __snapshots__/tsnapi/        ← public API snapshot (tsdown --update-snapshot)
@@ -202,7 +204,9 @@ When working on this project:
 5. **Run type checking** before committing: `pnpm typecheck`.
 6. **Validation order**: `pnpm lint:fix` → `pnpm typecheck` → `pnpm build:native:dev` → `pnpm test:run`. The native build step is required so the TS integration tests use the current binary. Skip it only when the Rust source has not changed.
 7. **Public API stays in `packages/<pkg>/src/index.ts`.** All re-exports
-   listed explicitly. No barrel-exports of `*`.
+   listed explicitly. No barrel-exports of `*`. A subpath entry
+   (`@iso4/sandbox/utils` → `src/utils.ts`) follows the same rule and has
+   its own tsnapi snapshot.
 8. **Add tests** for new functionality in `packages/<pkg>/tests/`.
 9. **Record learnings** — When the user corrects a mistake or provides
    context about how something should be done, add it to the "Project

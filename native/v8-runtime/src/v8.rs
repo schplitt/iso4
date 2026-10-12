@@ -6657,7 +6657,7 @@ extern "C" fn host_import_meta_callback(
 }
 
 /// Reserved words that cannot appear as named ESM exports. Mirrors the list
-/// in the TS client (`RESERVED_WORDS` in `globals.ts`), minus `default`.
+/// in the TS client (`RESERVED_WORDS` in `names.ts`), minus `default`.
 const RESERVED_EXPORT_WORDS: &[&str] = &[
     "break",
     "case",
@@ -6710,8 +6710,8 @@ const RESERVED_EXPORT_WORDS: &[&str] = &[
 
 /// Whether `name` can appear as a named ESM export in generated host-module
 /// source: Unicode identifier rules plus a reserved-word filter. `default` is
-/// allowed (emitted as `export default`). Mirrors `isValidExportIdentifier`
-/// in the TS client.
+/// allowed (emitted as `export default`). Mirrors `isValidExportName`
+/// in the TS client (`names.ts`).
 fn is_valid_export_identifier(name: &str) -> bool {
     if name == "default" {
         return true;
@@ -7640,7 +7640,7 @@ const PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC: &str = r#"(name, kind) => (...args)
 /// than allowed to shadow it: replacing `Response` would leave user code
 /// building objects the codec cannot recognise.
 ///
-/// Keep in sync with the `HostGlobals` docs in
+/// Keep in sync with `RUNTIME_OWNED_GLOBALS` in `names.ts`, the `HostGlobals` docs in
 /// `packages/iso4-sandbox/src/types.ts` and DESIGN.md §4.2.
 pub const RESERVED_GLOBAL_NAMES: &[&str] = &[
     "console",
@@ -7654,6 +7654,12 @@ pub const RESERVED_GLOBAL_NAMES: &[&str] = &[
     "TextDecoder",
     "URL",
     "URLSearchParams",
+    // Non-writable, non-configurable on the global object: a host global could never take effect.
+    "NaN",
+    "undefined",
+    "Infinity",
+    // Assigning it replaces a prototype instead of creating a property.
+    "__proto__",
 ];
 
 fn check_not_reserved(name: &str) -> Result<(), RunError> {
@@ -15748,6 +15754,24 @@ mod tests {
     fn set_timeout_and_clear_timeout_are_reserved_global_names() {
         assert!(RESERVED_GLOBAL_NAMES.contains(&"setTimeout"));
         assert!(RESERVED_GLOBAL_NAMES.contains(&"clearTimeout"));
+    }
+
+    #[test]
+    fn non_writable_global_names_are_reserved() {
+        for name in ["NaN", "undefined", "Infinity"] {
+            assert!(
+                matches!(&check_not_reserved(name), Err(RunError::ReservedName(m)) if m.contains("reserved")),
+                "expected '{name}' to be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_is_a_reserved_global_name() {
+        assert!(matches!(
+            &check_not_reserved("__proto__"),
+            Err(RunError::ReservedName(m)) if m.contains("reserved")
+        ));
     }
 
     #[test]

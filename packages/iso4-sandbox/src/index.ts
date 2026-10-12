@@ -58,8 +58,6 @@ import type { ImportHandlerMap } from './imports.js'
 import { materializeHostTypesInGlobals, serializeHostValue } from './v8-codec.js'
 import { brandKeyForToken, DESCRIPTOR_TOKEN_LEN, StreamSourceRegistry, withBodyStreamBinder } from './web-codec.js'
 
-export { RESERVED_WORDS, SANDBOX_GLOBALS } from './globals.js'
-
 export type {
   ResourceLimits,
   OneOffResourceLimits,

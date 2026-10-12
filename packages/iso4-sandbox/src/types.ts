@@ -185,18 +185,24 @@ export interface ResourceLimits {
  *
  * Reserved names (rejected with `ERR_RESERVED_NAME`): `console`,
  * `waitUntil`, `setTimeout`, `clearTimeout`, `Headers`, `Request`,
- * `Response`, `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`. These
- * are owned by the runtime; shadowing `Response` would silently break
- * serialization.
+ * `Response`, `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`, plus
+ * `NaN`, `undefined`, `Infinity` and `__proto__`. The first are owned by the
+ * runtime; shadowing `Response` would silently break serialization. `NaN`,
+ * `undefined` and `Infinity` are non-writable on the global object, so a host
+ * global could never take effect; assigning `__proto__` replaces a prototype
+ * instead of creating a property.
  *
  * A name that is not a JavaScript identifier (`my-tool`, `user.lookup`), or
- * is in {@link RESERVED_WORDS} other than `eval` and `arguments`, is
+ * is in `RESERVED_WORDS` other than `eval` and `arguments`, is
  * reachable only as `globalThis[name]`, not by bare name. A name that is
  * not a well-formed string (`'y\uD800'`) throws a `TypeError` before
- * anything is sent.
+ * anything is sent. Names starting with `__iso4_` are iso4's internal
+ * namespace (the dispatcher, shim handlers): a host global there may be
+ * silently overwritten or dropped, and `isValidGlobalName` does not flag it.
  *
- * {@link SANDBOX_GLOBALS} holds every name a fresh sandbox defines, V8
- * built-ins included.
+ * `SANDBOX_GLOBALS` holds every name a fresh sandbox defines, V8 built-ins
+ * included. Both sets and `isValidGlobalName`, which checks a name before
+ * `prepare()`, come from `@iso4/sandbox/utils`.
  *
  * Common usage:
  * ```ts
@@ -1736,7 +1742,8 @@ export type RunErrorCode
     | 'ERR_UNDECLARED_BINDING'
     /**
      * A host global uses a name the runtime owns (`console`, `setTimeout`,
-     * `Response`, … — see {@link HostGlobals}) and may not shadow it.
+     * `Response`, … — see {@link HostGlobals}) and may not shadow it, or one
+     * of the non-writable `NaN`, `undefined` and `Infinity`, or `__proto__`.
      */
     | 'ERR_RESERVED_NAME'
     /**

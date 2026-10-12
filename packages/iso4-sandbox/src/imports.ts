@@ -37,7 +37,7 @@ import type {
   HostModuleObject,
   Imports,
 } from './types.js'
-import { IDENTIFIER_NAME, RESERVED_WORDS } from './globals.js'
+import { isValidExportName } from './names.js'
 
 // ─────────────────────────────────────────────────────────────────────────
 // Public surface
@@ -149,7 +149,7 @@ export function processImports(imports: Imports | undefined): ProcessedImports {
     for (const [name, child] of Object.entries(value)) {
       if (child === undefined)
         continue
-      if (!isValidExportIdentifier(name)) {
+      if (!isValidExportName(name)) {
         throw new Error(
           `[@iso4/sandbox] imports['${specifier}'] top-level key '${name}' is not a `
           + `valid JavaScript identifier and cannot be exported as a named ESM export`,
@@ -311,23 +311,6 @@ function isPlainObject(value: unknown): value is HostModuleObject {
   // those types, so there is no per-type list here to keep in sync.
   const proto = Object.getPrototypeOf(value)
   return proto === null || proto === Object.prototype
-}
-
-/**
- * Whether `name` can appear as a named ESM export. JS identifier rules plus
- * a reserved-word filter. `default` is allowed (the runtime emits it as
- * `export default`). Mirrored by `is_valid_export_identifier` in the Rust
- * runtime (`v8.rs`), which owns the final defensive check.
- * @param name
- */
-function isValidExportIdentifier(name: string): boolean {
-  if (name === 'default')
-    return true
-  if (!IDENTIFIER_NAME.test(name))
-    return false
-  if (RESERVED_WORDS.has(name))
-    return false
-  return true
 }
 
 function describeKind(value: unknown): string {

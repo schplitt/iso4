@@ -19,8 +19,9 @@
 import * as http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
-import { createSandbox as createRuntime, SANDBOX_GLOBALS } from '../src/index.js'
+import { createSandbox as createRuntime } from '../src/index.js'
 import type { Sandbox as Runtime } from '../src/types.js'
+import { SANDBOX_GLOBALS } from '../src/utils.js'
 
 // ── Shared runtime ─────────────────────────────────────────────────────────
 

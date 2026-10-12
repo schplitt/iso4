@@ -481,6 +481,11 @@ names that the host must not shadow:
   closed question rather than a pending tier.
 - The web runtime the runtime installs: `Headers`, `Request`, `Response`,
   `TextEncoder`, `TextDecoder`, `URL`, `URLSearchParams`.
+- `NaN`, `undefined` and `Infinity` — non-writable, non-configurable
+  properties of the global object, so a host global under one could never
+  take effect. Refused for every value kind instead of being dropped.
+- `__proto__` — assigning it replaces a prototype (of `globalThis`, or of
+  the client's dispatch table) instead of creating a property.
 
 These are **enforced**, not merely documented: a host global using one of these
 names is rejected with `ERR_RESERVED_NAME`. Allowing a host to shadow
@@ -533,18 +538,17 @@ runtime-internal namespace: a host global under that prefix would install
 non-enumerable too; do not name globals into it.
 
 Hosts that generate global names (one per API namespace, say) check them
-against the exported `SANDBOX_GLOBALS` set — every name a fresh sandbox
-defines, V8 built-ins included. Of those, only the runtime-owned names above
-are enforced. A host global named after a V8 built-in replaces it, except the
-non-writable `undefined`, `NaN` and `Infinity`, where it is silently
-ignored. An integration test compares the set against a live sandbox, so a
+against the `SANDBOX_GLOBALS` set from `@iso4/sandbox/utils` — every name a
+fresh sandbox defines, V8 built-ins included. Of those, only the runtime-owned names above
+are enforced. A host global named after any other V8 built-in replaces it.
+An integration test compares the set against a live sandbox, so a
 V8 bump that adds a global fails CI until the set is updated.
 
-The exported `RESERVED_WORDS` set is the other half: names that cannot be a
-binding in module source (reserved words plus strict-mode `eval` and
-`arguments`). A host-module export under one is refused before the run.
-`default` is in the set, but iso4 accepts it as a host-module export because
-it emits `export default`. `is_valid_export_identifier` in `v8.rs` mirrors
+The `RESERVED_WORDS` set (same entry) is the other half: names that cannot be
+a binding in module source (reserved words plus strict-mode `eval` and
+`arguments`). A host-module key under one is refused before the run, except
+`default`, which maps to the module's default export (iso4 emits
+`export default`). `is_valid_export_identifier` in `v8.rs` mirrors
 the list.
 
 Any string is a valid host global name; `ERR_RESERVED_NAME` is the only
@@ -566,6 +570,23 @@ character), so `café` and `π` are valid. This is exactly what V8 accepts.
 The client uses a Unicode property regex; the runtime uses the
 `unicode-ident` crate's XID tables widened by the few code points in ID but
 not XID.
+
+Hosts check names up front with the `@iso4/sandbox/utils` entry, which
+imports nothing from the client and never loads the binary. It is the only
+place that exports
+`IDENTIFIER_NAME` (the client regex), `RESERVED_WORDS`, `SANDBOX_GLOBALS` and
+two predicates. `isValidExportName` answers whether a string can be a key
+of a host-module object in `imports`: an identifier that is not a reserved
+word, or `default` (the module's default export, never
+`export const default`). The client's host-module key validation calls it.
+`isValidGlobalName` is the global-name check `prepare()` and `run()` apply:
+a well-formed string that is not runtime-owned. The runtime-owned half is
+enforced only by the runtime (`check_not_reserved`); `names.ts` keeps a copy
+of `RESERVED_GLOBAL_NAMES`. A test runs every name in the copy and every
+`SANDBOX_GLOBALS` name as a global against the runtime, so the copy cannot
+list a name the runtime accepts, and cannot miss a reserved name a fresh
+sandbox defines. A runtime-only reserved name outside both would go
+unnoticed.
 
 ### 4.2.1 The web runtime
 
@@ -1399,6 +1420,7 @@ iso4/
   packages/
     iso4-sandbox/                   ← @iso4/sandbox — createSandbox, prepare, run
       src/types.ts                  ← canonical API shapes for @iso4/sandbox
+      src/utils.ts                  ← @iso4/sandbox/utils — name rules, no client code
     iso4-fetch/                     ← @iso4/fetch — hardened fetch helpers
     iso4-v8-darwin-arm64/           ← @iso4/v8-darwin-arm64 — native Rust binary
     iso4-v8-darwin-x64/             ← (one package per supported platform;

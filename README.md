@@ -186,14 +186,43 @@ const result = await sandbox.run({
 The handler receives the raw arguments from sandbox code and must return
 plain serializable data. **Functions in return values are currently dropped.**
 
-A global name can be any string. One that is not a JavaScript identifier
+A global name can be any well-formed string the runtime does not reserve.
+One that is not a JavaScript identifier
 (`my-tool`, `user.lookup`) or is a reserved word (`class`) is reachable only
 as `globalThis['my-tool']`, not by bare name.
 
-`SANDBOX_GLOBALS` is a `Set` of every name a fresh sandbox already defines.
-Check generated names against it before installing them. `RESERVED_WORDS`
-is a `Set` of names that cannot be a binding in module source, such as
-`class` or `eval`; iso4 refuses host-module export names in it.
+`@iso4/sandbox/utils` exports the name rules. `SANDBOX_GLOBALS` is a `Set`
+of every name a fresh sandbox already defines. Check generated names against
+it before installing them. `RESERVED_WORDS` is a `Set` of names that cannot be
+a binding in module source, such as `class` or `eval`; iso4 refuses
+host-module export names in it, except `default`.
+
+To check generated names before `prepare()` instead of getting a failed
+setup back, import the predicates from `@iso4/sandbox/utils`. That entry
+never loads the client or the native binary:
+
+```ts
+import { isValidExportName, isValidGlobalName } from '@iso4/sandbox/utils'
+
+for (const name of Object.keys(tools)) {
+  if (!isValidExportName(name))
+    throw new Error(`'${name}' cannot be a host-module export`)
+}
+if (!isValidGlobalName(globalName))
+  throw new Error(`'${globalName}' cannot be a host global`)
+```
+
+`isValidExportName` answers whether a string can be a key of a host-module
+object in `imports`: an identifier per `IDENTIFIER_NAME` (Unicode included,
+so `café` is fine) that is not in `RESERVED_WORDS`, or `default`, which maps
+to the module's default export. `default` cannot be written as
+`export const default` in generated source. `isValidGlobalName` is the check `prepare()` and
+`run()` apply to host global names: any well-formed string except the
+runtime-owned names (`console`, `Response`, `NaN`, …), a copy of the
+runtime's list that a test checks against the runtime. Names starting with
+`__iso4_` are iso4's internal namespace (the dispatcher, shim handlers): a
+host global there may be silently overwritten or dropped, and
+`isValidGlobalName` does not flag it.
 
 ## Async context (`AsyncLocalStorage`)
 
