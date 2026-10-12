@@ -44,8 +44,11 @@ Frame readers MUST reject:
 | ---------------------------------------------- | ---------------- |
 | `length == 0`                                  | invalid frame    |
 | `length > maxFrameLength`                      | invalid frame    |
-| EOF before all `length` bytes arrive           | connection error |
+| EOF inside a frame (prefix or body)            | connection error |
 | unknown message type for the current direction | protocol error   |
+
+EOF before the first byte of a frame is not a framing error, but a host
+that closes in order sends `Close` first (§6).
 
 Current protocol version: **`1`** — nothing is released yet, so there is no
 version history and no compatibility handling: both sides must speak exactly
@@ -69,6 +72,9 @@ this version, and the handshake hard-fails otherwise (§8).
 | `0x08` | `Stats`          | empty                   | exactly one `StatsResult`                                                                                                                                         |
 | `0x09` | `StreamChunk`    | `StreamChunkPayload`    | one chunk of a streamed body (§5.5), inside the granted credit window; no reply                                                                                   |
 | `0x0A` | `StreamEnd`      | `StreamEndPayload`      | end of a streamed body: clean EOF or a source failure; no reply                                                                                                   |
+| `0x0B` | `StreamPull`     | `StreamPullPayload`     | credit grant for an outbound streamed body (§5.5); no reply                                                                                                       |
+| `0x0C` | `StreamCancel`   | `StreamCancelPayload`   | the host cancelled an outbound streamed body (§5.5); no reply                                                                                                     |
+| `0x0D` | `Close`          | empty                   | orderly close: the host is done with the connection; no reply, Rust ends the session (§6)                                                                         |
 
 ### 2.2 Rust → TS
 
@@ -1244,6 +1250,15 @@ instances can therefore outnumber concurrent runs, and their number follows
 memory rather than the pool size. State inside one instance survives between
 its calls as a cache, never a guarantee; instances of one prefix share no
 state with each other. One-off `Run` frames always get a fresh isolate.
+
+**Closing a connection.** A host that is done with a connection (sandbox
+dispose, an idle connection reaped by the pool) sends `Close` and then ends
+the socket. The runtime ends the session on `Close` without logging, failing
+any run still in flight on it exactly as on EOF. A connection the host tears
+down instead (a hard abort that got no answer, a protocol desync, a failed
+handshake) ends with no `Close`, as does a host crash. The runtime logs EOF
+without `Close` as `connection closed without close frame`, and EOF inside a
+frame as a truncated-frame error, so those stay visible.
 
 ---
 

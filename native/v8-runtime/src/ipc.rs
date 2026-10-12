@@ -85,6 +85,8 @@ pub enum TsToRustMessageType {
     /// The host cancelled an outbound streamed body (consumer cancel, idle
     /// deadline, dispose); the runtime cancels the guest source.
     StreamCancel = 0x0C,
+    /// Orderly close: the host is done with this connection. Empty payload.
+    Close = 0x0D,
 }
 
 /// Message types sent from Rust to the TypeScript host.
@@ -189,9 +191,25 @@ pub fn read_frame(reader: &mut impl Read) -> io::Result<Frame> {
 }
 
 /// Read a single raw frame from `reader` with an explicit frame-length cap.
+/// EOF before the first byte is an orderly close (`UnexpectedEof`); EOF
+/// mid-frame is `InvalidData`.
 pub fn read_frame_with_limit(reader: &mut impl Read, max_frame_length: u32) -> io::Result<Frame> {
     let mut length_prefix = [0; 4];
-    reader.read_exact(&mut length_prefix)?;
+    match read_until_eof(reader, &mut length_prefix)? {
+        0 => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            ))
+        }
+        4 => {}
+        got => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated frame: got {got} of 4 length-prefix bytes"),
+            ))
+        }
+    }
     let length = u32::from_be_bytes(length_prefix);
     if length == 0 {
         return Err(io::Error::new(
@@ -206,7 +224,13 @@ pub fn read_frame_with_limit(reader: &mut impl Read, max_frame_length: u32) -> i
         ));
     }
     let mut buffer = vec![0; length as usize];
-    reader.read_exact(&mut buffer)?;
+    let got = read_until_eof(reader, &mut buffer)?;
+    if got < buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("truncated frame: got {got} of {length} bytes"),
+        ));
+    }
 
     let type_byte = buffer[0];
     let payload = buffer[1..].to_vec();
@@ -215,6 +239,20 @@ pub fn read_frame_with_limit(reader: &mut impl Read, max_frame_length: u32) -> i
         message_type: type_byte,
         payload,
     })
+}
+
+/// Fill `buf` like `read_exact`, but return the byte count on EOF instead of failing.
+fn read_until_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match reader.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(got)
 }
 
 /// Read a single TS->Rust frame and validate its message type byte.
@@ -1898,6 +1936,7 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
         0x0A => Ok(TsToRustMessageType::StreamEnd),
         0x0B => Ok(TsToRustMessageType::StreamPull),
         0x0C => Ok(TsToRustMessageType::StreamCancel),
+        0x0D => Ok(TsToRustMessageType::Close),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown TS->Rust message type: {byte:#04x}"),
@@ -2192,10 +2231,30 @@ mod tests {
     }
 
     #[test]
+    fn read_frame_reports_eof_between_frames_as_clean_close() {
+        let err = read_frame(&mut [].as_slice()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.to_string(), "connection closed");
+    }
+
+    #[test]
+    fn read_frame_rejects_truncated_length_prefix() {
+        let err = read_frame(&mut [0, 0].as_slice()).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "truncated frame: got 2 of 4 length-prefix bytes"
+        );
+    }
+
+    #[test]
     fn read_frame_rejects_truncated_body() {
         let err = read_frame(&mut [0, 0, 0, 3, 0x01, 0x02].as_slice()).unwrap_err();
 
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "truncated frame: got 2 of 3 bytes");
     }
 
     #[test]
@@ -2280,6 +2339,15 @@ mod tests {
         assert!(matches!(
             parse_rust_to_ts_message_type(0x06),
             Ok(RustToTsMessageType::StatsResult)
+        ));
+    }
+
+    #[test]
+    fn close_byte_matches_protocol_spec() {
+        assert_eq!(TsToRustMessageType::Close as u8, 0x0D);
+        assert!(matches!(
+            parse_ts_to_rust_message_type(0x0D),
+            Ok(TsToRustMessageType::Close)
         ));
     }
 

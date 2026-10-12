@@ -150,6 +150,23 @@ function runCompletePayload(runId: number): Buffer {
 
 const descriptorToken = new Uint8Array(DESCRIPTOR_TOKEN_LEN).fill(0xAB)
 
+/**
+ * Every frame type the client sends until it ends the socket.
+ * @param socket
+ * @param reader
+ */
+async function framesUntilEnd(socket: Socket, reader: FrameReader): Promise<number[]> {
+  socket.once('end', () => reader.close())
+  socket.once('close', () => reader.close())
+  const types: number[] = []
+  try {
+    for (;;)
+      types.push((await reader.readFrame()).messageType)
+  } catch {
+    return types
+  }
+}
+
 describe('RuntimeIpcClient', () => {
   test('connects, authenticates, sends Run, and receives Result', async () => {
     const socketPath = await listen(async (socket) => {
@@ -191,6 +208,52 @@ describe('RuntimeIpcClient', () => {
     expect(Buffer.from(result.result).subarray(8).toString('utf8')).toBe('payload')
 
     await client.dispose()
+  })
+
+  test('dispose() sends Close before ending the socket', async () => {
+    let sent!: Promise<number[]>
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      sent = framesUntilEnd(socket, reader)
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    await client.dispose()
+
+    expect(await sent).toEqual([TsToRustMessageTypes.Close])
+  })
+
+  test('a connection torn down after an unanswered hard abort ends without Close', async () => {
+    let sent!: Promise<number[]>
+    let runArrived!: () => void
+    const arrived = new Promise<void>((resolve) => {
+      runArrived = resolve
+    })
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      await reader.readFrame() // Run
+      // Never answer: the Terminate goes unacknowledged and the grace timer tears down.
+      sent = framesUntilEnd(socket, reader)
+      runArrived()
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    const controller = new AbortController()
+    const run = client.runRawCode('export default 1', { hardAbortSignal: controller.signal })
+    run.catch(() => {})
+    await arrived
+    controller.abort()
+    await expect(run).rejects.toThrow('run was aborted')
+    expect(client.usable).toBe(false)
+    await client.dispose()
+
+    expect(await sent).toEqual([TsToRustMessageTypes.Terminate])
   })
 
   test('stats() decodes a StatsResult and rejects unexpected frame types', async () => {
@@ -350,6 +413,24 @@ describe('RuntimeIpcClient', () => {
     await expect(
       RuntimeIpcClient.connect({ socketPath, descriptorToken }),
     ).rejects.toThrow(/expected a Hello frame/)
+  })
+
+  test('a failed handshake ends the connection without Close', async () => {
+    let sent!: Promise<number[]>
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      sent = framesUntilEnd(socket, reader)
+      socket.write(
+        encodeRustToTsFrame(RustToTsMessageTypes.Result, Buffer.from('nope')),
+      )
+    })
+
+    await expect(
+      RuntimeIpcClient.connect({ socketPath, descriptorToken }),
+    ).rejects.toThrow(/expected a Hello frame/)
+    expect(await sent).toEqual([])
   })
 
   test('handles BridgeCall: dispatches to handler, sends BridgeResponse, awaits Result', async () => {

@@ -1075,8 +1075,10 @@ direction. Both tables start at `0x01`.
 | `0x06` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                                      |
 | `0x07` | `Terminate`      | Abort a run — soft (turn-boundary abandon) or hard (mid-turn kill) by mode byte; Rust replies with an `ERR_ABORTED` result (§14.7) |
 | `0x08` | `Stats`          | Ask for a registry snapshot (empty payload)                            |
+| `0x0D` | `Close`          | Orderly close of the connection (empty payload; no reply)              |
 
-Next free TS → Rust byte: `0x09`.
+`0x09`–`0x0C` are the streaming frames (`docs/protocol.md` §2.1). Next free
+TS → Rust byte: `0x0E`.
 
 **Rust → TS**
 
@@ -1089,7 +1091,8 @@ Next free TS → Rust byte: `0x09`.
 | `0x05` | `Hello`            | Handshake accepted: protocol version + V8 format probe |
 | `0x06` | `StatsResult`      | The registry snapshot answering a `Stats` request      |
 
-Next free Rust → TS byte: `0x07`.
+`0x07`–`0x0B` are `RunComplete` and the streaming frames (`docs/protocol.md`
+§2.2). Next free Rust → TS byte: `0x0C`.
 
 There is **no `StdioChunk` frame**: `console.*` output is buffered in the
 runtime and rides inside the `Result` frame, so a run's stdout/stderr arrive
@@ -1113,7 +1116,10 @@ cap bounds how many, which also bounds the blast radius of a
 connection-level failure), one more is opened only when every open
 connection is at the cap, a surplus one is closed once it has carried
 nothing for 30 s (one is always kept; `dispose()` closes them all), and a
-broken one is dropped so the next run opens a replacement. Grace-phase
+broken one is dropped so the next run opens a replacement. An orderly close
+(the idle reap, `dispose()`) sends a `Close` frame first; a broken
+connection is torn down without one, so the runtime can tell the two apart
+and log only the second. Grace-phase
 (`waitUntil`) runs do not count against the cap — their frames ride an
 existing connection, and counting them would open connections (two runtime
 threads each) for epilogue traffic.

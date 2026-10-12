@@ -64,6 +64,10 @@ export const TsToRustMessageTypes = {
    * the runtime cancels the guest source.
    */
   StreamCancel: 0x0C,
+  /**
+   * Orderly close: the host is done with this connection. Empty payload.
+   */
+  Close: 0x0D,
 } as const
 
 export type TsToRustMessageType
@@ -2060,6 +2064,7 @@ export function parseTsToRustMessageType(
     case TsToRustMessageTypes.Stats:
     case TsToRustMessageTypes.StreamPull:
     case TsToRustMessageTypes.StreamCancel:
+    case TsToRustMessageTypes.Close:
       return byte
     default:
       throw new Error(`unknown TS->Rust message type: ${formatByte(byte)}`)

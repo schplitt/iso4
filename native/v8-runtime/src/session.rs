@@ -631,13 +631,21 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
             ipc::DEFAULT_MAX_FRAME_LENGTH,
         ) {
             Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                eprintln!("[iso4-v8] connection closed without close frame");
+                break;
+            }
             Err(e) => {
-                eprintln!("[iso4-v8] connection closed or error: {e}");
+                eprintln!("[iso4-v8] connection error: {e}");
                 break;
             }
         };
 
         match frame.message_type {
+            ipc::TsToRustMessageType::Close => {
+                trace!("[iso4-v8] connection closed by host");
+                break;
+            }
             ipc::TsToRustMessageType::Authenticate => {
                 eprintln!("[iso4-v8] unexpected second Authenticate — closing");
                 break;
@@ -1724,6 +1732,20 @@ mod tests {
         let hello = ipc::read_rust_to_ts_frame(&mut host).expect("a Hello frame");
         assert_eq!(hello.message_type, ipc::RustToTsMessageType::Hello);
         (host, done)
+    }
+
+    #[test]
+    fn a_close_frame_ends_the_session_while_the_socket_stays_open() {
+        let (mut host, done) = open_session();
+
+        ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Close, &[]).unwrap();
+
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("a Close frame did not end the session");
+        assert!(
+            ipc::read_rust_to_ts_frame(&mut host).is_err(),
+            "the runtime closes its end after Close"
+        );
     }
 
     #[test]

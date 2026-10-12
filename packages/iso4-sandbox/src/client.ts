@@ -394,6 +394,8 @@ export class RuntimeIpcClient {
       )
       await client.awaitHello()
     } catch (error) {
+      // A failed handshake is not an orderly close: end without `Close`.
+      client.broken = true
       await client.dispose()
       throw error
     }
@@ -837,6 +839,9 @@ export class RuntimeIpcClient {
     }
 
     this.disposed = true
+    // `Close` tells the runtime this is an orderly close; a torn-down connection ends without it.
+    if (!this.broken && !this.socket.destroyed)
+      this.socket.write(encodeTsToRustFrame(TsToRustMessageTypes.Close, new Uint8Array(0)))
     this.socket.end()
     await new Promise<void>((resolve) => {
       if (this.socket.destroyed) {
