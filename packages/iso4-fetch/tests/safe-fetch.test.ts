@@ -704,14 +704,32 @@ describe('DNS interceptor — private-IP block', () => {
     ['RFC1918 192.168/16', '192.168.1.1'],
     ['IPv6 loopback', '::1'],
     ['IPv6 link-local', 'fe80::1'],
+    ['IPv6 unspecified', '::'],
+    ['IPv6 unique-local', 'fd00::1'],
+    ['IPv6 multicast', 'ff02::1'],
+    ['IPv4-mapped loopback, dotted', '::ffff:127.0.0.1'],
+    ['IPv4-mapped loopback, hex', '::ffff:7f00:1'],
+    ['IPv4-mapped loopback, bracketed', '[::ffff:7f00:1]'],
+    ['IPv4-mapped IMDS, hex', '::ffff:a9fe:a9fe'],
+    ['IPv4-mapped 10/8, expanded', '0:0:0:0:0:ffff:a00:1'],
+    ['IPv4-compatible loopback', '::7f00:1'],
+    ['NAT64 loopback', '64:ff9b::7f00:1'],
+    ['6to4 RFC1918', '2002:c0a8:101::1'],
+    ['unparseable IPv6', '::ffff:zz'],
   ])('assertPublicAddresses blocks %s', (_label, ip) => {
     expect(() => assertPublicAddresses('h', [{ address: ip }])).toThrow(/private\/reserved IP/)
     expect(isReservedIp(ip)).toBe(true)
   })
 
-  it('assertPublicAddresses allows a public address', () => {
-    expect(() => assertPublicAddresses('h', [{ address: '1.2.3.4' }])).not.toThrow()
-    expect(isReservedIp('1.2.3.4')).toBe(false)
+  it.each([
+    '1.2.3.4',
+    '2606:4700::1111',
+    '::ffff:102:304',
+    '64:ff9b::102:304',
+    '2002:102:304::1',
+  ])('assertPublicAddresses allows public %s', (ip) => {
+    expect(() => assertPublicAddresses('h', [{ address: ip }])).not.toThrow()
+    expect(isReservedIp(ip)).toBe(false)
   })
 })
 
@@ -725,6 +743,18 @@ describe('DNS pinning (pinDns: true)', () => {
     // refused inline before any request is made.
     await expect(
       handler('https://192.168.1.1/', { method: 'GET', headers: {}, body: null }),
+    ).rejects.toThrow(/private\/reserved/)
+  })
+
+  it.each([
+    'http://[::ffff:127.0.0.1]/',
+    'http://[::ffff:7f00:1]/',
+    'http://[::ffff:a9fe:a9fe]/',
+    'http://[::ffff:192.168.1.1]/',
+  ])('blocks IPv4-mapped IPv6 literal %s', async (url) => {
+    const { handler: allowAll } = createSafeFetch({ policy: () => true })
+    await expect(
+      allowAll(url, { method: 'GET', headers: {}, body: null }),
     ).rejects.toThrow(/private\/reserved/)
   })
 

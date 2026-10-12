@@ -12,6 +12,7 @@
  */
 
 import { lookup as nodeDnsLookupCb } from 'node:dns'
+import { isIPv6 } from 'node:net'
 import type { interceptors } from 'undici'
 
 /**
@@ -22,20 +23,33 @@ import type { interceptors } from 'undici'
  */
 export function isReservedIp(ip: string): boolean {
   if (ip.includes(':')) {
-    const addr = ip.toLowerCase().replace(/^\[|\]$/g, '')
-    if (addr === '::1')
+    const addr = ip.toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '')
+    if (!isIPv6(addr))
       return true
-    // The unspecified address. Connecting to it reaches the local host.
-    if (addr === '::')
-      return true
-    const firstWord = parseInt(addr.split(':')[0] ?? '0', 16)
-    if ((firstWord & 0xffc0) === 0xfe80)
-      return true // fe80::/10 link-local
-    if ((firstWord & 0xfe00) === 0xfc00)
-      return true // fc00::/7 unique-local
-    if (addr.startsWith('::ffff:'))
-      return isReservedIp(addr.slice(7))
-    return false
+    // Move a trailing dotted IPv4 into two hex words, then expand `::`.
+    const hex = addr.replace(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/, (_m, a, b, c, d) =>
+      `${(Number(a) * 256 + Number(b)).toString(16)}:${(Number(c) * 256 + Number(d)).toString(16)}`)
+    const [head = '', tail] = hex.split('::')
+    const headWords = head === '' ? [] : head.split(':')
+    const tailWords = tail === undefined || tail === '' ? [] : tail.split(':')
+    const w = [...headWords, ...Array.from<string>({ length: 8 - headWords.length - tailWords.length }).fill('0'), ...tailWords]
+      .map((word) => parseInt(word, 16))
+    const v4 = (hi: number, lo: number): string => `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`
+
+    // Embedded IPv4 is judged as that IPv4. `::/96` also covers `::` and `::1`.
+    if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && (w[5] === 0 || w[5] === 0xffff))
+      return isReservedIp(v4(w[6]!, w[7]!)) // ::/96 compatible, ::ffff:0:0/96 mapped
+    if (w[0] === 0x64 && w[1] === 0xff9b && w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0)
+      return isReservedIp(v4(w[6]!, w[7]!)) // 64:ff9b::/96 NAT64
+    if (w[0] === 0x2002)
+      return isReservedIp(v4(w[1]!, w[2]!)) // 2002::/16 6to4
+
+    const first = w[0]!
+    return (
+      (first & 0xffc0) === 0xfe80 // fe80::/10 link-local
+      || (first & 0xfe00) === 0xfc00 // fc00::/7 unique-local
+      || (first & 0xff00) === 0xff00 // ff00::/8 multicast
+    )
   }
 
   const parts = ip.split('.').map(Number)
