@@ -8,7 +8,7 @@ import type { RouterContext } from 'rou3'
 import { fetch as undiciFetch, Agent, interceptors } from 'undici'
 import type { Dispatcher } from 'undici'
 
-import { isReservedIp, makeDnsLookupFn } from './dns.js'
+import { isReservedIp, makeDnsLookupFn, makeGuardedConnector } from './dns.js'
 
 import type {
   FetchContext,
@@ -411,7 +411,7 @@ function buildSafeFetchHandler(options: SafeFetchOptions): SafeFetchFn {
   // work. Every resolved address is still checked against the reserved ranges
   // of its own family in `makeDnsLookupFn` before anything connects.
   const agent: Dispatcher = doPinDns
-    ? new Agent().compose(interceptors.dns({ lookup: makeDnsLookupFn(), maxTTL: 10_000 }))
+    ? new Agent({ connect: makeGuardedConnector() }).compose(interceptors.dns({ lookup: makeDnsLookupFn(), maxTTL: 10_000 }))
     : new Agent()
 
   function buildSafeFetchRequest(parsedUrl: URL, method: string, headers: Record<string, string>, hop: number): SafeFetchRequest {

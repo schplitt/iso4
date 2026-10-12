@@ -13,6 +13,7 @@
 
 import { lookup as nodeDnsLookupCb } from 'node:dns'
 import { isIPv6 } from 'node:net'
+import { buildConnector } from 'undici'
 import type { interceptors } from 'undici'
 
 /**
@@ -131,6 +132,29 @@ export function makeDnsLookupFn(): NonNullable<NonNullable<Parameters<typeof int
         return
       }
       callback(null, addresses.map((addr) => ({ address: addr.address, family: addr.family as 4 | 6, ttl: 10_000 })))
+    })
+  }
+}
+
+/**
+ * undici connector that drops a socket whose actual remote address is reserved.
+ * Catches whatever the literal and DNS checks miss, before any request bytes are sent.
+ */
+export function makeGuardedConnector(): buildConnector.connector {
+  const connect = buildConnector({})
+  return (opts, callback) => {
+    connect(opts, (err, socket) => {
+      if (err !== null) {
+        callback(err, null)
+        return
+      }
+      const address = socket.remoteAddress ?? ''
+      if (isReservedIp(address)) {
+        socket.destroy()
+        callback(new Error(`fetch: request blocked — "${opts.hostname}" connected to private/reserved IP ${address}`), null)
+        return
+      }
+      callback(null, socket)
     })
   }
 }

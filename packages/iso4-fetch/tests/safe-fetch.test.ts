@@ -4,10 +4,12 @@
  * Network calls are mocked via vi.mock so these run without internet access.
  */
 
+import { createServer } from 'node:net'
+import type { AddressInfo, Socket } from 'node:net'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { createSafeFetch } from '../src/index.js'
 import type { FetchOriginRule, SafeFetchPolicy } from '../src/index.js'
-import { assertPublicAddresses, isReservedIp, makeDnsLookupFn } from '../src/dns.js'
+import { assertPublicAddresses, isReservedIp, makeDnsLookupFn, makeGuardedConnector } from '../src/dns.js'
 
 // ─────────────────────────────────────────────────────────────────────────
 // Mock undici (fetch) and both dns modules so no real network calls happen.
@@ -734,6 +736,29 @@ describe('DNS interceptor — private-IP block', () => {
   ])('assertPublicAddresses allows public %s', (ip) => {
     expect(() => assertPublicAddresses('h', [{ address: ip }])).not.toThrow()
     expect(isReservedIp(ip)).toBe(false)
+  })
+})
+
+describe('connect-time remote-address guard', () => {
+  function connect(hostname: string, port: number): Promise<{ err: Error | null, socket: Socket | null }> {
+    return new Promise((resolve) => {
+      makeGuardedConnector()({ hostname, port: String(port), protocol: 'http:' }, (err, socket) => resolve({ err, socket }))
+    })
+  }
+
+  it.each(['127.0.0.1', '::ffff:127.0.0.1'])('refuses a socket that lands on loopback via %s', async (hostname) => {
+    const server = createServer((s) => s.end())
+    await new Promise<void>((resolve) => {
+      server.listen(0, '::', resolve)
+    })
+    const { port } = server.address() as AddressInfo
+    try {
+      const { err, socket } = await connect(hostname, port)
+      expect(socket).toBeNull()
+      expect(err?.message).toMatch(/connected to private\/reserved IP/)
+    } finally {
+      server.close()
+    }
   })
 })
 

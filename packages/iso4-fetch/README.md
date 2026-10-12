@@ -231,7 +231,7 @@ no route does the request is denied without consulting `policy`.
 
 | Threat                      | Mitigation                                                                                     |
 | --------------------------- | ---------------------------------------------------------------------------------------------- |
-| SSRF / private IP           | DNS resolved at connection time (allowed requests only); loopback, RFC1918, link-local blocked |
+| SSRF / private IP           | DNS resolved at connection time (allowed requests only); loopback, RFC1918, link-local blocked; the connected socket's address is checked again |
 | DNS rebinding               | undici DNS interceptor pins the connection to the resolved IP                                  |
 | Redirect bypass             | No auto-follow by default; allow/deny re-checked on each hop                                   |
 | Credential leak on redirect | `authorization`/`cookie`/`proxy-authorization` dropped on a cross-origin hop                   |
