@@ -39,6 +39,8 @@ export function isReservedIp(ip: string): boolean {
     // Embedded IPv4 is judged as that IPv4. `::/96` also covers `::` and `::1`.
     if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && (w[5] === 0 || w[5] === 0xffff))
       return isReservedIp(v4(w[6]!, w[7]!)) // ::/96 compatible, ::ffff:0:0/96 mapped
+    if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0xffff && w[5] === 0)
+      return isReservedIp(v4(w[6]!, w[7]!)) // ::ffff:0:0:0/96 SIIT
     if (w[0] === 0x64 && w[1] === 0xff9b && w[2] === 0 && w[3] === 0 && w[4] === 0 && w[5] === 0)
       return isReservedIp(v4(w[6]!, w[7]!)) // 64:ff9b::/96 NAT64
     if (w[0] === 0x2002)
@@ -46,7 +48,10 @@ export function isReservedIp(ip: string): boolean {
 
     const first = w[0]!
     return (
-      (first & 0xffc0) === 0xfe80 // fe80::/10 link-local
+      (first === 0x64 && w[1] === 0xff9b && w[2] === 1) // 64:ff9b:1::/48 local-use NAT64
+      || (first === 0x2001 && w[1] === 0) // 2001::/32 Teredo
+      || (first & 0xffc0) === 0xfe80 // fe80::/10 link-local
+      || (first & 0xffc0) === 0xfec0 // fec0::/10 site-local (deprecated)
       || (first & 0xfe00) === 0xfc00 // fc00::/7 unique-local
       || (first & 0xff00) === 0xff00 // ff00::/8 multicast
     )

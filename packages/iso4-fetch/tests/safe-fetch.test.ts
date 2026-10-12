@@ -715,6 +715,10 @@ describe('DNS interceptor — private-IP block', () => {
     ['IPv4-compatible loopback', '::7f00:1'],
     ['NAT64 loopback', '64:ff9b::7f00:1'],
     ['6to4 RFC1918', '2002:c0a8:101::1'],
+    ['SIIT loopback', '::ffff:0:7f00:1'],
+    ['local-use NAT64', '64:ff9b:1::7f00:1'],
+    ['Teredo', '2001::1'],
+    ['site-local', 'fec0::1'],
     ['unparseable IPv6', '::ffff:zz'],
   ])('assertPublicAddresses blocks %s', (_label, ip) => {
     expect(() => assertPublicAddresses('h', [{ address: ip }])).toThrow(/private\/reserved IP/)
