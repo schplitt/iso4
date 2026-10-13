@@ -1,5 +1,12 @@
 # @iso4/fetch
 
+## 0.1.1
+
+### Patch Changes
+
+- 6a428e7: fix(fetch): never quote the URL or a header value in an error message.
+  A URL with credentials is now refused with `fetch: URL must not contain credentials` by both `createSafeFetcher` and `createSafeFetch`; the handler used to drop them silently.
+
 ## 0.1.0
 
 ### Minor Changes
