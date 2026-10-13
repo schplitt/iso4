@@ -1,5 +1,16 @@
 # @iso4/sandbox
 
+## 0.8.1
+
+### Patch Changes
+
+- a1953a1: fix(sandbox): accept any string as a host global name again and drop `ERR_INVALID_GLOBAL_NAME`.
+  A name that is not an identifier, such as `my-tool`, is reachable as `globalThis['my-tool']`; a global name or import specifier that is not a well-formed string throws a `TypeError`.
+- 8b4ce57: fix(sandbox): host-module keys may contain dots; import paths travel as segments
+- 8efafc5: fix(sandbox)!: `sandbox.run()`, `prefix.run()` and `prefix.call()` now throw setup errors (`SetupErrorCode`) like `prepare()` instead of returning `{ ok: false }`, checked on the client before anything is sent.
+  Undeclared or frozen data globals on prefix runs now throw instead of being ignored, and a limit that is not an integer from 0 to 2³²−1 throws a `TypeError`.
+- d1a4346: feat(sandbox): add `@iso4/sandbox/utils` with `isValidExportName` and `isValidGlobalName`; the name constants now live there, and `NaN`, `undefined`, `Infinity` and `__proto__` are refused as global names.
+
 ## 0.8.0
 
 ### Minor Changes
