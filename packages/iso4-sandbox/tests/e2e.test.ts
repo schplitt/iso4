@@ -3346,45 +3346,63 @@ describe('native timers', () => {
   })
 
   test('CPU burned before arming a timer eats into its delay', async () => {
-    // The burn takes well over the 1 s delay on any machine, so the timer
-    // is already due when the run suspends: total duration must be ~the CPU
-    // time, NOT cpu + 1000. (A real-anchored implementation would add the
-    // full second and fail the tail assertion.)
+    // The burn outlasts the 1 s delay, so the timer is already due when the
+    // run suspends; a real-anchored timer would add the full second after it.
+    let burnEnd = 0
     const result = await runtime.run({
       code: `
         let x = 0
         for (let i = 0; i < 5e8; i++) x = (x + i) % 97
-        await new Promise(r => setTimeout(r, 1000))
+        const armed = new Promise(r => setTimeout(r, 1000))
+        await burnt()
+        await armed
         export default x
       `,
+      globals: {
+        burnt: async () => {
+          burnEnd = performance.now()
+          return 1
+        },
+      },
       limits: { cpuTimeMs: 15_000, wallTimeMs: 20_000 },
     })
+    const tail = performance.now() - burnEnd
     expect(result.ok, result.ok ? undefined : JSON.stringify(result.error)).toBe(true)
     if (!result.ok)
       return
     // Vacuity guard: the burn really exceeded the delay.
     expect(result.cpuTimeMs).toBeGreaterThan(1000)
-    // The sleep added (nearly) nothing on top of the CPU time. The bound is
-    // wide because cpuTimeMs is a CPU clock: descheduled time lands here.
-    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(500)
+    // The sleep added (nearly) nothing after the burn. Timed from the burn's
+    // end so time descheduled during the burn can't count.
+    expect(tail).toBeLessThan(500)
   }, 25_000)
 
   test('the rule is identical when the timer is armed before the burn', async () => {
+    let burnEnd = 0
     const result = await runtime.run({
       code: `
         const armed = new Promise(r => setTimeout(r, 1000))
         let x = 0
         for (let i = 0; i < 5e8; i++) x = (x + i) % 97
+        await burnt()
         await armed
         export default x
       `,
+      globals: {
+        burnt: async () => {
+          burnEnd = performance.now()
+          return 1
+        },
+      },
       limits: { cpuTimeMs: 15_000, wallTimeMs: 20_000 },
     })
+    const tail = performance.now() - burnEnd
     expect(result.ok, result.ok ? undefined : JSON.stringify(result.error)).toBe(true)
     if (!result.ok)
       return
     expect(result.cpuTimeMs).toBeGreaterThan(1000)
-    expect(result.durationMs - result.cpuTimeMs).toBeLessThan(500)
+    // Timed from the burn's end so time descheduled during the burn can't count.
+    expect(tail).toBeLessThan(500)
   }, 25_000)
 
   test('CPU burned inside a timer callback bills the run\'s budget', async () => {

@@ -10460,15 +10460,15 @@ mod tests {
     // or OOM the process. Un-ignore when the corresponding phase lands.
 
     #[test]
-    fn infinite_loop_hits_cpu_or_wall_timeout() {
-        // cpu_time_ms=200, wall_time_ms=1000: the CPU guard fires at ~200-210ms,
-        // the wall guard fires at 1000ms. CpuTimeout must always win by ~800ms.
+    fn infinite_loop_hits_cpu_timeout() {
+        // CPU is a thread clock: under contention 200 ms of it can take seconds
+        // of wall, so the wall limit is only a backstop against a dead CPU guard.
         let err = run_code(
             "while(true) {}",
             "<test>",
             Limits {
                 cpu_time_ms: 200,
-                wall_time_ms: 1_000,
+                wall_time_ms: 30_000,
                 ..Default::default()
             },
         )
@@ -10476,7 +10476,7 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(err, RunError::CpuTimeout),
-            "expected CpuTimeout (cpu=200ms fires ~800ms before wall=1000ms), got {err:?}"
+            "expected CpuTimeout, got {err:?}"
         );
     }
 
