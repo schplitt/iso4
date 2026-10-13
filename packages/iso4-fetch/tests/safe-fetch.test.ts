@@ -646,20 +646,43 @@ describe('header injection hardening', () => {
     ).rejects.toThrow(/illegal characters/)
   })
 
-  it('strips userinfo from URL — agent cannot inject Basic Auth via URL credentials', async () => {
-    await handler('https://user:s3cr3t@api.example.com/data', { method: 'GET' })
-    const calledUrl = mockFetch.mock.calls[0]?.[0] as string
-    expect(calledUrl).not.toContain('user')
-    expect(calledUrl).not.toContain('s3cr3t')
-    expect(calledUrl).toContain('api.example.com')
+  it.each([
+    ['user and password', 'https://user:s3cr3t@api.example.com/data?token=abc'],
+    ['user only', 'https://s3cr3t@api.example.com/data?token=abc'],
+  ])('refuses a URL with credentials (%s) without quoting it', async (_, url) => {
+    const err = await handler(url, { method: 'GET' }).catch((e: unknown) => e as Error)
+    expect(err).toBeInstanceOf(TypeError)
+    expect(err.message).toBe('fetch: URL must not contain credentials')
+    expect(err.message).not.toContain('s3cr3t')
+    expect(err.message).not.toContain('token')
+    expect(mockFetch).not.toHaveBeenCalled()
   })
 
-  it('URL with userinfo still matches origin rules correctly', async () => {
-    // The host extracted from https://user:pass@api.example.com is api.example.com
-    // so rules should still apply normally
-    await expect(
-      handler('https://user:pass@api.example.com/data', { method: 'GET' }),
-    ).resolves.toBeDefined()
+  it('refuses an invalid URL without quoting it', async () => {
+    const err = await handler('https://user:s3cr3t@[bad', { method: 'GET' }).catch((e: unknown) => e as Error)
+    expect(err.message).toBe('fetch: invalid URL')
+  })
+
+  it('refuses a header value above U+00FF without quoting it', async () => {
+    const err = await handler('https://api.example.com/data', {
+      method: 'GET',
+      headers: { authorization: 'Bearer s3cr3t\u0100' },
+    }).catch((e: unknown) => e as Error)
+    expect(err.message).toBe('fetch: invalid header name or value')
+    expect(err.message).not.toContain('s3cr3t')
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('refuses a redirect to a URL with credentials without quoting it', async () => {
+    const { handler: redirecting } = createSafeFetch({
+      rules: { host: 'api.example.com', routes: [{ path: '/**' }] },
+      pinDns: false,
+      maxRedirects: 1,
+    })
+    mockFetch.mockResolvedValueOnce(redirectResponse('https://user:s3cr3t@api.example.com/next'))
+    const err = await redirecting('https://api.example.com/data', { method: 'GET' }).catch((e: unknown) => e as Error)
+    expect(err.message).toBe('fetch: URL must not contain credentials')
+    expect(mockFetch).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -1395,6 +1418,55 @@ describe('createSafeFetcher', () => {
     const empty = await safeFetch('https://api.example.com/v1/none')
     expect(empty.status).toBe(204)
     expect(empty.body).toBeNull()
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['user and password', 'https://user:s3cr3t@api.example.com/v1/x?token=abc'],
+    ['user only', 'https://s3cr3t@api.example.com/v1/x?token=abc'],
+  ])('refuses a URL with credentials (%s) without quoting it', async (_, url) => {
+    const safeFetch = createSafeFetcher({ policy: () => true, pinDns: false })
+    for (const input of [url, new URL(url)]) {
+      const err = await safeFetch(input).catch((e: unknown) => e as Error)
+      expect(err).toBeInstanceOf(TypeError)
+      expect(err.message).toBe('fetch: URL must not contain credentials')
+      expect(err.message).not.toContain('s3cr3t')
+      expect(err.message).not.toContain('token')
+    }
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('refuses an invalid URL without quoting it', async () => {
+    const err = await createSafeFetcher({ rules, pinDns: false })('not a url s3cr3t').catch((e: unknown) => e as Error)
+    expect(err.message).toBe('fetch: invalid URL')
+    expect(err.cause).toBeUndefined()
+  })
+
+  it.each([
+    ['NUL', 'Bearer s3cr3t\0'],
+    ['CR', 'Bearer s3cr3t\rx'],
+    ['LF', 'Bearer s3cr3t\nx-injected: 1'],
+    ['a char above U+00FF', 'Bearer s3cr3t\u0100'],
+  ])('refuses a header value with %s without quoting it', async (_, value) => {
+    const err = await createSafeFetcher({ rules, pinDns: false })('https://api.example.com/v1/x', { headers: { authorization: value } })
+      .catch((e: unknown) => e as Error)
+    expect(err).toBeInstanceOf(TypeError)
+    expect(err.message).toBe('fetch: invalid header name or value')
+    expect(err.message).not.toContain('s3cr3t')
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('refuses a header value set by middleware without quoting it', async () => {
+    const safeFetch = createSafeFetcher({
+      rules,
+      pinDns: false,
+      middleware: (ctx, next) => {
+        ctx.req.header('authorization', 'Bearer s3cr3t\u0100')
+        return next()
+      },
+    })
+    const err = await safeFetch('https://api.example.com/v1/x').catch((e: unknown) => e as Error)
+    expect(err.message).toBe('fetch: invalid header name or value')
     expect(mockFetch).not.toHaveBeenCalled()
   })
 })

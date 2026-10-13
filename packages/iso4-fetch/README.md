@@ -249,16 +249,17 @@ middleware body that is not bytes or text is JSON-encoded. Each call to
 
 ## Security defaults
 
-| Threat                      | Mitigation                                                                                                                                      |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| SSRF / private IP           | DNS resolved at connection time (allowed requests only); loopback, RFC1918, link-local blocked; the connected socket's address is checked again |
-| DNS rebinding               | undici DNS interceptor pins the connection to the resolved IP                                                                                   |
-| Redirect bypass             | No auto-follow by default; allow/deny re-checked on each hop                                                                                    |
-| Credential leak on redirect | `authorization`/`cookie`/`proxy-authorization` dropped on a cross-origin hop                                                                    |
-| Response amplification      | Body streamed with `maxBodyBytes` cap                                                                                                           |
-| Host auth leakage           | Isolated undici `Agent` — no shared pool, cookies, or auth with the host app                                                                    |
-| Path traversal              | `.`/`..` (and the `%2e` forms) normalised by the URL parser before matching                                                                     |
-| Path/allowlist consistency  | Paths matched literally, never decoded, so the approved path is sent verbatim                                                                   |
+| Threat                        | Mitigation                                                                                                                                      |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| SSRF / private IP             | DNS resolved at connection time (allowed requests only); loopback, RFC1918, link-local blocked; the connected socket's address is checked again |
+| DNS rebinding                 | undici DNS interceptor pins the connection to the resolved IP                                                                                   |
+| Redirect bypass               | No auto-follow by default; allow/deny re-checked on each hop                                                                                    |
+| Credential leak on redirect   | `authorization`/`cookie`/`proxy-authorization` dropped on a cross-origin hop                                                                    |
+| Response amplification        | Body streamed with `maxBodyBytes` cap                                                                                                           |
+| Host auth leakage             | Isolated undici `Agent` — no shared pool, cookies, or auth with the host app                                                                    |
+| Path traversal                | `.`/`..` (and the `%2e` forms) normalised by the URL parser before matching                                                                     |
+| Path/allowlist consistency    | Paths matched literally, never decoded, so the approved path is sent verbatim                                                                   |
+| Credentials in error messages | URLs with credentials refused; URL and header-value errors use fixed messages that never quote the URL or value                                 |
 
 Paths are matched and forwarded **literally** — iso4 never percent-decodes
 them, so the path the allowlist approves is byte-for-byte the path that is sent.

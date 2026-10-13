@@ -244,6 +244,11 @@ async function readBody(body: ReadableStream<Uint8Array> | null, maxBytes: numbe
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 
+// Fixed messages: undici's own quote the URL or header value, which may be a secret.
+const INVALID_URL = 'fetch: invalid URL'
+const URL_CREDENTIALS = 'fetch: URL must not contain credentials'
+const INVALID_HEADER = 'fetch: invalid header name or value'
+
 async function httpRequest(
   url: string,
   method: string,
@@ -253,6 +258,19 @@ async function httpRequest(
   maxBodyBytes: number,
   signal: AbortSignal,
 ): Promise<{ response: Awaited<ReturnType<typeof undiciFetch>>, bodyBytes: Uint8Array | null }> {
+  // Re-checked here because middleware may have set the URL or headers.
+  const target = URL.parse(url)
+  if (target === null)
+    throw new TypeError(INVALID_URL)
+  if (target.username !== '' || target.password !== '')
+    throw new TypeError(URL_CREDENTIALS)
+  try {
+    // eslint-disable-next-line no-new
+    new Headers(headers)
+  } catch {
+    throw new TypeError(INVALID_HEADER)
+  }
+
   const response = await undiciFetch(url, {
     method,
     headers,
@@ -402,6 +420,19 @@ export function createSafeFetch(options: SafeFetchOptions): SafeFetchGlobal {
 export function createSafeFetcher(options: SafeFetchOptions): SafeFetcher {
   const run = buildSafeFetchHandler(options)
   return async (input, init) => {
+    if (!(input instanceof Request)) {
+      const target = URL.parse(input.toString())
+      if (target === null)
+        throw new TypeError(INVALID_URL)
+      if (target.username !== '' || target.password !== '')
+        throw new TypeError(URL_CREDENTIALS)
+    }
+    try {
+      // eslint-disable-next-line no-new
+      new Headers(init?.headers)
+    } catch {
+      throw new TypeError(INVALID_HEADER)
+    }
     const request = new Request(input, init)
     const headers: Record<string, string> = {}
     request.headers.forEach((value, key) => {
@@ -558,18 +589,12 @@ function buildSafeFetchHandler(options: SafeFetchOptions): (hostRequest: HostFet
   }
 
   return async (hostRequest: HostFetchRequest): Promise<HostFetchResponse> => {
-    let parsedUrl: URL
-    try {
-      parsedUrl = new URL(hostRequest.url)
-    } catch {
-      throw new Error(`fetch: invalid URL "${hostRequest.url}"`)
-    }
-
-    // Strip userinfo — agent cannot inject HTTP Basic Auth credentials via the URL
-    if (parsedUrl.username !== '' || parsedUrl.password !== '') {
-      parsedUrl.username = ''
-      parsedUrl.password = ''
-    }
+    const parsedUrl = URL.parse(hostRequest.url)
+    if (parsedUrl === null)
+      throw new TypeError(INVALID_URL)
+    // Refused, not stripped: silently dropping credentials would hide a config mistake.
+    if (parsedUrl.username !== '' || parsedUrl.password !== '')
+      throw new TypeError(URL_CREDENTIALS)
 
     const baseHeaders: Record<string, string> = { ...hostRequest.headers }
     if (!allowCompressed)
