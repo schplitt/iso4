@@ -258,7 +258,7 @@ async function httpRequest(
   maxBodyBytes: number,
   signal: AbortSignal,
 ): Promise<{ response: Awaited<ReturnType<typeof undiciFetch>>, bodyBytes: Uint8Array | null }> {
-  // Re-checked here because middleware may have set the URL or headers.
+  // Re-checked here: middleware or a redirect may have set the URL or headers.
   const target = URL.parse(url)
   if (target === null)
     throw new TypeError(INVALID_URL)
