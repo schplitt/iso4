@@ -1675,9 +1675,31 @@ describe('resource limits', () => {
         return
       // The real error survives, clamped — not swapped for a generic failure.
       expect(result.error.code).toBe('ERR_USER_CODE')
-      expect(result.error.message).toMatch(/truncated by iso4: \d+ bytes total/)
+      expect(result.error.message).toMatch(/truncated by iso4: \d+ (bytes|UTF-16 units) total/)
 
       // The point of the test: the one connection is still alive.
+      const next = await small.run({ code: 'export default 1 + 1' })
+      expect(next.ok).toBe(true)
+    } finally {
+      await small.dispose()
+    }
+  }, 30_000)
+
+  test('a 500 MB thrown message or console line is capped and the child survives', async () => {
+    const small = await createRuntime({ maxConcurrentRuns: 1 })
+    try {
+      const thrown = await small.run({ code: `throw new Error('a'.repeat(500 * 1024 * 1024))` })
+      expect(thrown.ok).toBe(false)
+      if (!thrown.ok) {
+        expect(thrown.error.code).toBe('ERR_USER_CODE')
+        expect(thrown.error.message).toMatch(/^a+… \[truncated by iso4: 524288000 UTF-16 units total\]$/)
+      }
+      const logged = await small.run({
+        code: `console.log('a'.repeat(500 * 1024 * 1024)); export default 1`,
+        limits: { maxStdoutBytes: 1024 * 1024 },
+      })
+      expect(logged.ok).toBe(true)
+      expect(logged.stdout[0]).toMatch(/truncated by iso4: 524288000 UTF-16 units total\]$/)
       const next = await small.run({ code: 'export default 1 + 1' })
       expect(next.ok).toBe(true)
     } finally {

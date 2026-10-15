@@ -8859,7 +8859,7 @@ fn render_console_arg(
     }
     // The common case: a logged string must not gain quotes.
     if let Ok(text) = v8::Local::<v8::String>::try_from(value) {
-        return text.to_rust_string_lossy(scope);
+        return capped_text_lossy(scope, text, usize::MAX);
     }
     if value.is_native_error() {
         return render_error_arg(scope, value);
@@ -8897,7 +8897,7 @@ fn render_json_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::Handle
     if scope.has_terminated() {
         return None;
     }
-    let text = v8::json::stringify(scope, value)?.to_rust_string_lossy(scope);
+    let text = capped_text_lossy(scope, v8::json::stringify(scope, value)?, usize::MAX);
     (text != "undefined").then_some(text)
 }
 
@@ -8908,7 +8908,7 @@ fn render_error_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::Handl
         if let Some(key) = v8::String::new(scope, "stack") {
             if let Some(stack) = object.get(scope, key.into()) {
                 if let Ok(text) = v8::Local::<v8::String>::try_from(stack) {
-                    return text.to_rust_string_lossy(scope);
+                    return capped_text_lossy(scope, text, usize::MAX);
                 }
             }
         }
@@ -8926,13 +8926,13 @@ fn display_string(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleS
     if value.is_symbol() {
         let rendered = value
             .to_detail_string(scope)
-            .map(|text| text.to_rust_string_lossy(scope));
+            .map(|text| capped_text_lossy(scope, text, usize::MAX));
         scope.reset();
         return rendered.unwrap_or_else(|| "[unprintable]".to_string());
     }
     let rendered = value
         .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope));
+        .map(|text| capped_text_lossy(scope, text, usize::MAX));
     scope.reset();
     rendered.unwrap_or_else(|| "[unprintable]".to_string())
 }
@@ -9197,6 +9197,35 @@ fn check_export_serializable(name: &str, value: v8::Local<v8::Value>) -> Result<
     Ok(())
 }
 
+/// Error text budget: leaves room for our marker under the wire clamp, so
+/// only one marker, with the true length, reaches the host.
+const ERROR_TEXT_BYTES: usize = wire::MAX_ERROR_TEXT_BYTES - 128;
+
+/// Copy at most 64 Ki UTF-16 units, then at most `max_bytes` of UTF-8, of
+/// guest text out of V8. `write_v2` reads a cons string in place;
+/// `to_rust_string_lossy` would flatten it first.
+fn capped_text_lossy(scope: &v8::Isolate, text: v8::Local<v8::String>, max_bytes: usize) -> String {
+    const MAX_UNITS: usize = 64 * 1024;
+    let len = text.length();
+    let mut out = if len <= MAX_UNITS {
+        text.to_rust_string_lossy(scope)
+    } else {
+        let mut units = vec![0u16; MAX_UNITS];
+        text.write_v2(scope, 0, &mut units, v8::WriteFlags::empty());
+        // A cut inside a surrogate pair would decode to U+FFFD.
+        if units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+            units.pop();
+        }
+        String::from_utf16_lossy(&units)
+    };
+    if len <= MAX_UNITS && out.len() <= max_bytes {
+        return out;
+    }
+    out.truncate(out.floor_char_boundary(max_bytes));
+    out.push_str(&format!("… [truncated by iso4: {len} UTF-16 units total]"));
+    out
+}
+
 fn runtime_error_from_value(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
@@ -9206,7 +9235,7 @@ fn runtime_error_from_value(
         .or_else(|| {
             value
                 .to_string(scope)
-                .map(|s| s.to_rust_string_lossy(scope))
+                .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
         })
         .unwrap_or_else(|| "JavaScript error".to_string());
     RunError::RuntimeError(Box::new(RuntimeErrorData {
@@ -9230,7 +9259,7 @@ fn error_message_from_value(
     if msg.is_undefined() || msg.is_null() {
         return None;
     }
-    msg.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
+    msg.to_string(scope).map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
 }
 
 fn stack_from_value(
@@ -9247,7 +9276,7 @@ fn stack_from_value(
     }
     stack
         .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
+        .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
 }
 
 fn exception_message(
@@ -9256,7 +9285,7 @@ fn exception_message(
     scope
         .exception()
         .and_then(|e| e.to_string(scope))
-        .map(|s| s.to_rust_string_lossy(scope))
+        .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
         .unwrap_or_else(|| "(no exception message)".to_string())
 }
 
@@ -9279,7 +9308,7 @@ fn error_name_from_value(
     }
     name_val
         .to_string(scope)
-        .map(|s| s.to_rust_string_lossy(scope))
+        .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
 }
 
 fn exception_name(
@@ -16614,5 +16643,73 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(expect_import(&err), DYN_IMPORT_MSG);
+    }
+
+    // ── Guest text copies ────────────────────────────────────────────────
+
+    #[test]
+    fn a_huge_thrown_message_is_capped_without_flattening() {
+        // A 32 MB heap cannot hold the 64 MB string flattened: any flatten
+        // would end the run with MemoryLimit instead.
+        let failure = run_code(
+            "throw new Error('a'.repeat(64 * 1024 * 1024))",
+            "<iso4>",
+            Limits {
+                hard_memory_mb: 32,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        let payload = wire::encode_run_completion_payload(
+            1,
+            wire::RunCompletion::Failure(wire::RunFailurePayload {
+                error: wire::run_error_to_payload(&failure.error),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                duration_ms: 0.0,
+                wall_time_ms: 0.0,
+                cpu_time_ms: 0.0,
+                bridge_calls: Vec::new(),
+                heap_used_bytes: None,
+            }),
+        );
+        let text = String::from_utf8_lossy(&payload);
+        // Message and stack each carry exactly one marker, with the true length.
+        assert_eq!(text.matches("[truncated by iso4: ").count(), 2, "{}", text.len());
+        assert_eq!(
+            text.matches("… [truncated by iso4: 67108864 UTF-16 units total]").count(),
+            1
+        );
+        assert!(!text.contains("bytes total]"), "the wire clamp added no marker");
+        assert!(payload.len() < 2 * wire::MAX_ERROR_TEXT_BYTES);
+        assert_eq!(get_default(&run_ok("export default 1")).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_text_cut_inside_a_surrogate_pair_leaves_no_replacement_char() {
+        let err = run_err("throw new Error('a' + '😀'.repeat(40 * 1024))");
+        let RunError::RuntimeError(data) = &err else {
+            panic!("expected RuntimeError, got {err:?}");
+        };
+        assert!(!data.message.contains('\u{FFFD}'));
+        assert!(data.message.ends_with("… [truncated by iso4: 81921 UTF-16 units total]"));
+        assert!(data.message.len() <= wire::MAX_ERROR_TEXT_BYTES);
+    }
+
+    #[test]
+    fn a_huge_console_line_is_capped_without_flattening() {
+        // Same heap-cap proof as the thrown-message test.
+        let out = run_code(
+            "console.log('a'.repeat(64 * 1024 * 1024))\nexport default 1",
+            "<iso4>",
+            Limits {
+                max_stdout_bytes: 1024 * 1024,
+                hard_memory_mb: 32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.stdout.len(), 1);
+        assert!(out.stdout[0].ends_with("… [truncated by iso4: 67108864 UTF-16 units total]"));
     }
 }

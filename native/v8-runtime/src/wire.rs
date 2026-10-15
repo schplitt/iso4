@@ -433,7 +433,7 @@ fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
 /// `throw new Error('A'.repeat(70e6))` used to build a Result frame past the
 /// 64 MiB frame ceiling, which could not be written and cost the connection.
 /// 64 KiB is far past any real message while keeping the payload small.
-const MAX_ERROR_TEXT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_ERROR_TEXT_BYTES: usize = 64 * 1024;
 
 /// Ceiling on the serialized own-properties blob attached to an error. Same
 /// reasoning as [`MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
