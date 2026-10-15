@@ -11,7 +11,7 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex};
@@ -112,27 +112,40 @@ enum TerminationReason {
 /// classification are per *call*, so a reused isolate (warm instances)
 /// needs one long-lived cell that resets between calls instead of a fresh
 /// `OnceLock` the isolate-lifetime consumers can never re-point to.
-struct ReasonCell(Mutex<Option<TerminationReason>>);
+struct ReasonCell {
+    reason: Mutex<Option<TerminationReason>>,
+    /// A fatal bridge violation terminated without a reason; no JS check may
+    /// ever consume that terminate, so the taint verdict reads this instead.
+    bare_terminate: AtomicBool,
+}
 
 impl ReasonCell {
     fn new() -> Self {
-        Self(Mutex::new(None))
+        Self {
+            reason: Mutex::new(None),
+            bare_terminate: AtomicBool::new(false),
+        }
     }
 
     /// First write wins; later writes are no-ops, matching `OnceLock::set`.
     fn set(&self, reason: TerminationReason) {
-        let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = self.reason.lock().unwrap_or_else(|p| p.into_inner());
         slot.get_or_insert(reason);
     }
 
     fn get(&self) -> Option<TerminationReason> {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+        *self.reason.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn bare_terminate(&self) -> bool {
+        self.bare_terminate.load(Ordering::Relaxed)
     }
 
     /// Clear the slot for the next call on a reused isolate. Only safe while
     /// no JS is executing and no guards are armed — i.e. between calls.
     fn reset(&self) {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.reason.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.bare_terminate.store(false, Ordering::Relaxed);
     }
 }
 
@@ -1730,6 +1743,7 @@ fn run_module_inner(
     // (see `build_host_module`); the callback consults the resolver context to
     // find the values array staged for the module being initialised.
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
+    isolate.set_slot(Arc::clone(&reason));
 
     // ── The limit guard ──────────────────────────────────────────────────
     // The instance's watchdog registration (#145) — a one-off run IS an
@@ -2320,6 +2334,16 @@ fn run_call_phase(
 
     // The run is suspended: drive it on events until it finishes.
     loop {
+        // A turn that suspended after a mid-turn kill ends here, as the
+        // instance loop's taint check does.
+        if facts.reason.get().is_some() {
+            let result = if matches!(rs.phase, RunPhase::Grace(_)) {
+                Ok(finish_post_phase(&mut rs))
+            } else {
+                Err(rs.fail(reason_error(facts.reason)))
+            };
+            return stamp_wall(&rs, result);
+        }
         // Deadlines are recomputed each pass; the touched-run stamps are
         // an instance-loop concern.
         TIMERS_TOUCHED.with(|v| v.borrow_mut().clear());
@@ -2894,7 +2918,7 @@ fn start_turn(
             Some(value) => value,
             None => {
                 if let Some(err) = rs.bridge_error.get() {
-                    return finished(Err(rs.fail(owned_bridge_error(err))));
+                    return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
                 }
                 let error = match facts.reason.get() {
                     Some(TerminationReason::Wall) => RunError::WallTimeout,
@@ -2911,7 +2935,9 @@ fn start_turn(
                         fields: exception_fields(scope),
                     })),
                 };
-                return finished(Err(rs.fail(error)));
+                // Reading the exception can run guest getters.
+                let error = rs.bridge_error.get().map_or(error, owned_bridge_error);
+                return finished(Err(rs.fail(termination_or(facts.reason, error))));
             }
         };
 
@@ -2921,6 +2947,9 @@ fn start_turn(
         // propagate now. For pending bridge calls nothing changes — the
         // resolvers aren't set yet.
         scope.perform_microtask_checkpoint();
+        if facts.reason.get().is_some() {
+            return finished(Err(rs.fail(reason_error(facts.reason))));
+        }
 
         // ESM Module::Evaluate() always returns a Promise. The try_from is a
         // belt-and-suspenders guard; failure would be an internal V8 bug.
@@ -2988,7 +3017,7 @@ fn invoke_requested_call(
             Some(e) => codec_error_to_run_error(e),
             None => RunError::Internal("failed to deserialize call arguments".to_string()),
         };
-        return Err(rs.fail(error));
+        return Err(rs.fail(termination_or(facts.reason, error)));
     };
     let Ok(args_array) = v8::Local::<v8::Array>::try_from(args_value) else {
         return Err(rs.fail(RunError::Internal(
@@ -3012,7 +3041,7 @@ fn invoke_requested_call(
             // promise, so sync and async throws report the same
             // name/message/stack/fields shape.
             if let Some(err) = rs.bridge_error.get() {
-                return Err(rs.fail(owned_bridge_error(err)));
+                return Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err))));
             }
             let error = match facts.reason.get() {
                 Some(TerminationReason::Wall) => RunError::WallTimeout,
@@ -3031,7 +3060,8 @@ fn invoke_requested_call(
                     })),
                 },
             };
-            return Err(rs.fail(error));
+            let error = rs.bridge_error.get().map_or(error, owned_bridge_error);
+            return Err(rs.fail(termination_or(facts.reason, error)));
         }
     };
 
@@ -3046,6 +3076,9 @@ fn invoke_requested_call(
             )));
         };
         scope.perform_microtask_checkpoint();
+        if facts.reason.get().is_some() {
+            return Err(rs.fail(reason_error(facts.reason)));
+        }
         if let Some(err) = rs.bridge_error.get() {
             return Err(rs.fail(owned_bridge_error(err)));
         }
@@ -3056,6 +3089,12 @@ fn invoke_requested_call(
             root_is_call_result: true,
         };
         return Ok(ScanOutcome::Continue);
+    }
+
+    // Microtasks the call queued settle inside this call, not the next one.
+    scope.perform_microtask_checkpoint();
+    if let Some(err) = rs.bridge_error.get() {
+        return Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err))));
     }
 
     // The call returned synchronously; the guards stay armed through
@@ -3077,6 +3116,10 @@ fn serialize_call_result(
     rs: &RunState,
     value: v8::Local<v8::Value>,
 ) -> Result<Vec<u8>, FailureOutput> {
+    // Serialization runs guest getters; nothing may run after a kill.
+    if facts.reason.get().is_some() {
+        return Err(rs.fail(reason_error(facts.reason)));
+    }
     let export_path = facts
         .call
         .map(|c| c.export_path.as_str())
@@ -3092,6 +3135,10 @@ fn serialize_call_result(
                 "call \"{export_path}\" result could not be serialized: {message}"
             )),
         };
+        // A getter's bridge violation is the real cause of the failure.
+        if let Some(err) = rs.bridge_error.get() {
+            return rs.fail(termination_or(facts.reason, owned_bridge_error(err)));
+        }
         rs.fail(termination_or(facts.reason, error))
     })
 }
@@ -3184,7 +3231,7 @@ fn frame_turn(
                                             "failed to deserialize response value".to_string(),
                                         ),
                                     };
-                                    return finished(Err(rs.fail(error)));
+                                    return finished(Err(rs.fail(termination_or(facts.reason, error))));
                                 };
                                 resolver.resolve(scope, v8_val);
                             }
@@ -3285,27 +3332,15 @@ fn frame_turn(
     finish_turn(scope, facts, rs, in_grace)
 }
 
-/// Shared turn tail (frame and timer turns): check for errors set during
-/// the checkpoint (inside bridge callbacks), then for a guard that fired
-/// during it — both win over the scan.
+/// Shared turn tail (frame and timer turns): check for a guard that fired
+/// during the checkpoint, then for errors set inside bridge callbacks — both
+/// win over the scan.
 fn finish_turn(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     facts: &RunFacts<'_>,
     rs: &mut RunState,
     in_grace: bool,
 ) -> ScanOutcome {
-    if let Some(err) = rs.bridge_error.get() {
-        if in_grace {
-            let msg = format!("{err:?}");
-            if let RunPhase::Grace(g) = &mut rs.phase {
-                if g.error.is_none() {
-                    g.error = Some(capped_grace_error("Error".to_string(), msg));
-                }
-            }
-            return finished(Ok(finish_post_phase(rs)));
-        }
-        return finished(Err(rs.fail(owned_bridge_error(err))));
-    }
     if let Some(r) = facts.reason.get() {
         if in_grace {
             // A mid-turn kill during grace: the caller's taint verdict sees
@@ -3320,6 +3355,18 @@ fn finish_turn(
             TerminationReason::Abort => RunError::Aborted,
         };
         return finished(Err(rs.fail(error)));
+    }
+    if let Some(err) = rs.bridge_error.get() {
+        if in_grace {
+            let msg = format!("{err:?}");
+            if let RunPhase::Grace(g) = &mut rs.phase {
+                if g.error.is_none() {
+                    g.error = Some(capped_grace_error("Error".to_string(), msg));
+                }
+            }
+            return finished(Ok(finish_post_phase(rs)));
+        }
+        return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
     }
 
     scan(scope, facts, rs)
@@ -3371,6 +3418,9 @@ fn timer_turn(
                     RunError::Internal("timer callback failed without an exception".to_string())
                 }
             };
+            if facts.reason.get().is_some() {
+                return finish_turn(scope, facts, rs, in_grace);
+            }
             if in_grace {
                 let (name, message) = match &err {
                     RunError::RuntimeError(d) => (d.name.clone(), d.message.clone()),
@@ -3417,7 +3467,7 @@ fn scan(
                 // BridgeResponse will ever arrive — fail now, not at the
                 // wall.
                 if let Some(err) = rs.bridge_error.get() {
-                    return finished(Err(rs.fail(owned_bridge_error(err))));
+                    return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
                 }
                 if rs.source.is_none() && earliest_timer(rs).is_none() {
                     // Pending with no socket and no pending timer —
@@ -3455,13 +3505,14 @@ fn scan(
                 // ERR_HOST_BRIDGE with the handler's name/message/fields
                 // intact.
                 if let Some(err) = host_bridge_error_from_rejection(scope, rejection) {
-                    return finished(Err(rs.fail(err)));
+                    return finished(Err(rs.fail(termination_or(facts.reason, err))));
                 }
                 if let Some(err) = rs.bridge_error.get() {
-                    return finished(Err(rs.fail(owned_bridge_error(err))));
+                    return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
                 }
                 let err = runtime_error_from_value(scope, rejection);
-                return finished(Err(rs.fail(err)));
+                let err = rs.bridge_error.get().map_or(err, owned_bridge_error);
+                return finished(Err(rs.fail(termination_or(facts.reason, err))));
             }
             v8::PromiseState::Fulfilled => {
                 if call_pending {
@@ -3508,6 +3559,10 @@ fn extract_module_exports(
     evaluated_module: v8::Local<v8::Module>,
 ) -> ScanOutcome {
     let reason = facts.reason;
+    // Serialization runs guest getters; nothing may run after a kill.
+    if reason.get().is_some() {
+        return finished(Err(rs.fail(reason_error(reason))));
+    }
 
     let Some(namespace) = evaluated_module.get_module_namespace().to_object(scope) else {
         return finished(Err(rs.fail(termination_or(
@@ -3591,6 +3646,13 @@ fn extract_module_exports(
     let exports = match blob::serialize_value(scope, exports_object.into()) {
         Ok(blob) => blob,
         Err(_first_message) => {
+            // A getter that ended the run must not get a per-export retry.
+            if reason.get().is_some() {
+                return finished(Err(rs.fail(reason_error(reason))));
+            }
+            if let Some(err) = rs.bridge_error.get() {
+                return finished(Err(rs.fail(owned_bridge_error(err))));
+            }
             // A registered host type that cannot cross keeps its dedicated
             // loud diagnostic (stream bodies etc. must not vanish
             // silently); only generic clone refusals are skippable.
@@ -3667,6 +3729,10 @@ fn build_output_and_maybe_grace(
             facts.reason,
             RunError::Internal("terminated during result serialization".to_string()),
         ))));
+    }
+    // A bridge violation inside a getter never makes the run a success.
+    if let Some(err) = rs.bridge_error.get() {
+        return finished(Err(rs.fail(owned_bridge_error(err))));
     }
 
     // ── Export size limit ────────────────────────────────────────────────
@@ -4323,6 +4389,10 @@ fn grace_scan(
         let empty = still.is_empty();
         // Re-arm the slot with whatever is still pending.
         unsafe { *(*rs.pending).slot.borrow_mut() = Some(still) };
+        // Reading a rejection can run guest getters.
+        if facts.reason.get().is_some() {
+            return finished(Ok(finish_post_phase(rs)));
+        }
 
         let grace_ms = rs.limits.grace_ms;
         let RunPhase::Grace(g) = &mut rs.phase else {
@@ -4489,9 +4559,9 @@ impl Drop for BudgetEpoch {
 fn capped_grace_error(name: String, message: String) -> (String, String) {
     let mut name = name;
     let mut message = message;
-    name.truncate(256);
+    name.truncate(name.floor_char_boundary(256));
     if message.len() > 2048 {
-        message.truncate(2048);
+        message.truncate(message.floor_char_boundary(2048));
         message.push_str("… [truncated]");
     }
     (name, message)
@@ -4605,6 +4675,7 @@ fn new_capped_isolate(
     isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
+    isolate.set_slot(Arc::clone(reason));
     // Same rationale as the one-off path: no blocking Atomics.wait, ever.
     isolate.set_allow_atomics_wait(false);
     isolate.set_allow_wasm_code_generation_callback(deny_wasm_codegen);
@@ -4949,7 +5020,9 @@ pub fn run_call_on_core(
     // a boundary wall expiry, a socket death, a direct-abandon abort, an
     // ordinary uncaught exception — leaves the instance trustworthy and
     // reusable.
-    let tainted = core.reason.get().is_some() || core.isolate.is_execution_terminating();
+    let tainted = instance_tainted(core);
+    // Nothing may carry an unconsumed terminate into the next call.
+    core.isolate.cancel_terminate_execution();
 
     CallOutcome {
         result,
@@ -4971,7 +5044,9 @@ struct LiveRun {
 /// Whether a turn was interrupted mid-JS — the instance-wide taint test
 /// (E1 ruling 3): a fired guard, or a termination flag still pending.
 fn instance_tainted(core: &mut InstanceCore) -> bool {
-    core.reason.get().is_some() || core.isolate.is_execution_terminating()
+    core.reason.get().is_some()
+        || core.reason.bare_terminate()
+        || core.isolate.is_execution_terminating()
 }
 
 /// Finish one run: stamp its telemetry, close its streams, drop its table
@@ -5007,6 +5082,8 @@ fn conclude_run(
     close_run_streams(live.rs.streams);
     close_out_streams(live.rs.out_streams, "run ended");
     run_table.runs.borrow_mut().remove(&live.rs.token);
+    // Between turns: nothing may carry an unconsumed terminate into later work.
+    isolate.cancel_terminate_execution();
     let outcome = CallOutcome {
         result,
         tainted,
@@ -5780,6 +5857,8 @@ fn owned_bridge_error(err: &RunError) -> RunError {
         RunError::BridgeCallPayloadTooLarge => RunError::BridgeCallPayloadTooLarge,
         RunError::BridgeCallLimitExceeded => RunError::BridgeCallLimitExceeded,
         RunError::Internal(m) => RunError::Internal(m.clone()),
+        RunError::ExportNotSerializable(m) => RunError::ExportNotSerializable(m.clone()),
+        RunError::TypeNotSerializable(m) => RunError::TypeNotSerializable(m.clone()),
         other => RunError::Internal(format!("unexpected bridge error: {other:?}")),
     }
 }
@@ -7218,6 +7297,9 @@ fn fatal_bridge_error(
     error: RunError,
 ) {
     bridge_error.set(error).ok();
+    if let Some(reason) = scope.get_slot::<Arc<ReasonCell>>() {
+        reason.bare_terminate.store(true, Ordering::Relaxed);
+    }
     scope.thread_safe_handle().terminate_execution();
 }
 
@@ -7425,6 +7507,16 @@ fn bridge_global_callback(
             &data.bridge_error,
             RunError::BridgeCallPayloadTooLarge,
         );
+        return;
+    }
+
+    // A getter in the arguments already ended the run: send nothing.
+    if data.bridge_error.get().is_some()
+        || scope
+            .get_slot::<Arc<ReasonCell>>()
+            .is_some_and(|reason| reason.get().is_some())
+    {
+        record_blocked(0);
         return;
     }
 
@@ -8646,14 +8738,17 @@ fn console_stderr_callback(
 fn render_console_line(
     scope: &mut v8::PinScope,
     args: &v8::FunctionCallbackArguments,
-) -> String {
+) -> Option<String> {
     v8::tc_scope!(let tc, scope);
     let mut parts = Vec::with_capacity(args.length() as usize);
     for i in 0..args.length() {
         parts.push(render_console_arg(tc, args.get(i)));
+        if tc.has_terminated() {
+            return None;
+        }
         tc.reset();
     }
-    parts.join(" ")
+    Some(parts.join(" "))
 }
 
 /// One console argument as text: JSON for plain data, `String(v)` otherwise.
@@ -8763,7 +8858,10 @@ fn append_console_line(
         return;
     }
 
-    let line = render_console_line(scope, &args);
+    // A kill mid-render drops the line; the termination stays pending.
+    let Some(line) = render_console_line(scope, &args) else {
+        return;
+    };
     // SAFETY: the External points at the instance-lifetime RunTable Box.
     let table = unsafe { &*table };
     let state = attributed_state(scope, table);
@@ -9171,6 +9269,13 @@ fn error_fields_from_value(
     let kept = v8::Object::new(scope);
     let mut any = false;
     for i in 0..names.length() {
+        // A getter that ended the run gets no per-property retry.
+        if scope
+            .get_slot::<Arc<ReasonCell>>()
+            .is_some_and(|reason| reason.get().is_some())
+        {
+            return None;
+        }
         let Some(key) = names.get_index(scope, i) else {
             continue;
         };
@@ -15828,5 +15933,242 @@ mod tests {
             assert!(check_not_reserved(name).is_ok(), "expected '{name}' to be allowed");
         }
         assert!(matches!(check_not_reserved("console"), Err(RunError::ReservedName(_))));
+    }
+
+    // ── Kills and bridge violations ──────────────────────────────────────
+
+    /// Execute `code` with bridge global `myTool` on a socket nobody answers.
+    fn run_with_silent_bridge(code: &str, limits: Limits) -> Result<Output, FailureOutput> {
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        let (_server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = ManuallyDrop::new(client);
+        execute(
+            code,
+            None,
+            limits,
+            &[HostGlobalDef::bridge("myTool")],
+            &[],
+            Some(client.as_raw_fd()),
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+    }
+
+    fn silent_limits() -> Limits {
+        Limits {
+            wall_time_ms: 5_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_error_field_getter_runs_after_a_cpu_kill() {
+        let failure = run_with_silent_bridge(
+            "const e = new Error('x')\n\
+             e.a = { get g() { for (;;) {} } }\n\
+             e.b = { get h() { myTool('after'); return 2 } }\n\
+             throw e",
+            Limits {
+                cpu_time_ms: 50,
+                ..silent_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(failure.error, RunError::CpuTimeout), "got {:?}", failure.error);
+        assert!(failure.bridge_calls.is_empty(), "got {:?}", failure.bridge_calls);
+    }
+
+    #[test]
+    fn a_cpu_kill_inside_a_bridge_argument_getter_wins_over_the_bridge_error() {
+        let failure = run_with_silent_bridge(
+            "await myTool({ get a() { for (;;) {} } })\nexport default 1",
+            Limits {
+                cpu_time_ms: 50,
+                ..silent_limits()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(failure.error, RunError::CpuTimeout), "got {:?}", failure.error);
+    }
+
+    #[test]
+    fn a_console_line_killed_mid_render_is_dropped() {
+        let failure = run_code(
+            "console.log({ toJSON() { for (;;) {} } })\n\
+             console.log('after')\n\
+             export default 1",
+            "<iso4>",
+            Limits {
+                cpu_time_ms: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(failure.error, RunError::CpuTimeout), "got {:?}", failure.error);
+        assert!(failure.stdout.is_empty(), "got {:?}", failure.stdout);
+    }
+
+    #[test]
+    fn an_uncloneable_bridge_argument_is_export_not_serializable() {
+        let failure = run_with_silent_bridge(
+            "await myTool(new Proxy({}, {}))\nexport default 1",
+            silent_limits(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failure.error, RunError::ExportNotSerializable(_)),
+            "got {:?}",
+            failure.error
+        );
+    }
+
+    #[test]
+    fn a_bridge_call_queued_by_a_sync_call_belongs_to_that_call() {
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        init_platform();
+        let defs = [HostGlobalDef::bridge("g")];
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "let n = 0\n\
+                       export function leak() { Promise.resolve().then(() => g('leak')); return 1 }\n\
+                       export function bump() { return ++n }",
+                filename: "<prefix>",
+                globals: &defs,
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up");
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = ManuallyDrop::new(client);
+        // Joined after the call: the frame must be written during it.
+        let responder = spawn_responder(server, |_| {});
+        let leak = call_spec("leak", &[]);
+        let first = run_call_on_core(
+            &mut core,
+            None,
+            "<iso4>",
+            &defs,
+            Limits::default(),
+            &defs,
+            &[],
+            Some(client.as_raw_fd()),
+            Arc::new(AtomicU32::new(0)),
+            Some(&leak),
+        );
+        responder.join().unwrap();
+        assert!(!first.tainted);
+        let out = first.result.expect("leak returns");
+        assert_eq!(out.bridge_calls.len(), 1, "the queued call is this call's");
+
+        let bump = call_spec("bump", &[]);
+        let second = run_call_on_core(
+            &mut core,
+            None,
+            "<iso4>",
+            &defs,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&bump),
+        );
+        assert!(!second.tainted);
+        let out = second.result.expect("the next call is clean");
+        assert_eq!(value_of(&out), WireValue::Number(1.0));
+        assert!(out.bridge_calls.is_empty());
+    }
+
+    #[test]
+    fn multibyte_grace_errors_are_capped_on_a_char_boundary() {
+        let out = execute(
+            "waitUntil(Promise.reject(Object.assign(new Error('€'.repeat(3000)), { name: '€'.repeat(100) })))\n\
+             export default 1",
+            None,
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .unwrap();
+        let (name, message) = out.background.expect("grace ran").error.expect("error kept");
+        assert_eq!(name, "€".repeat(85));
+        assert_eq!(message, format!("{}… [truncated]", "€".repeat(682)));
+    }
+
+    #[test]
+    fn a_bridge_violation_inside_a_getter_names_itself_and_leaks_no_terminate() {
+        use std::io::Read;
+        use std::mem::ManuallyDrop;
+        use std::os::unix::io::AsRawFd;
+        init_platform();
+        let defs = [HostGlobalDef::bridge("tool")];
+        let prefix = "let n = 0\n\
+            export function bump() { return ++n }\n\
+            export function oneGetter() { return { get a() { tool(() => 1); return 1 } } }\n\
+            export function twoGetters() { return { get a() { tool(() => 1); return 1 }, get b() { return 2 } } }\n\
+            export function errFields() { const e = new Error('x'); e.a = { get g() { tool(() => 1); return 1 } }; e.b = { get h() { return 2 } }; throw e }\n\
+            export function argGetter() { tool({ get a() { tool(() => 1); return 1 }, get b() { return 2 } }); return 1 }";
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: prefix,
+                filename: "<prefix>",
+                globals: &defs,
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up");
+        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let client = ManuallyDrop::new(client);
+        for export in ["oneGetter", "twoGetters", "errFields", "argGetter"] {
+            let call = call_spec(export, &[]);
+            let outcome = run_call_on_core(
+                &mut core,
+                None,
+                "<iso4>",
+                &defs,
+                Limits::default(),
+                &defs,
+                &[],
+                Some(client.as_raw_fd()),
+                Arc::new(AtomicU32::new(0)),
+                Some(&call),
+            );
+            assert!(outcome.tainted, "{export}: an interrupted instance is tainted");
+            let error = outcome.result.expect_err(export).error;
+            assert!(
+                matches!(error, RunError::FunctionArgumentNotSupported),
+                "{export}: got {error:?}"
+            );
+            let mut buf = [0u8; 1];
+            assert!(server.read(&mut buf).is_err(), "{export}: no bridge frame was sent");
+
+            // Even reused, the instance carries no terminate into the next call.
+            let bump = call_spec("bump", &[]);
+            let next = run_call_on_core(
+                &mut core,
+                None,
+                "<iso4>",
+                &defs,
+                Limits::default(),
+                &[],
+                &[],
+                None,
+                Arc::new(AtomicU32::new(0)),
+                Some(&bump),
+            );
+            assert!(!next.tainted, "{export}: the next call is clean");
+            assert!(next.result.is_ok(), "{export}: the next call succeeds");
+        }
     }
 }
