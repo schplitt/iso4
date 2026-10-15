@@ -528,6 +528,7 @@ describe('decodeRunCompletionPayload — failure', () => {
     'ERR_WALL_TIMEOUT',
     'ERR_MEMORY_LIMIT',
     'ERR_MODULE_NOT_FOUND',
+    'ERR_IMPORT',
     'ERR_EXPORT_NOT_SERIALIZABLE',
     'ERR_EXPORT_TOO_LARGE',
     'ERR_HOST_BRIDGE',
@@ -662,10 +663,10 @@ describe('decodeRunCompletionPayload — instance reset', () => {
     expect(result.error.culpritRunId).toBe(41)
   })
 
-  test('every wire cause byte maps to its name (wall is byte 4)', () => {
+  test('every wire cause byte maps to its name (wall is byte 4, unsupported 5)', () => {
     // Mirrors wire.rs `reset_cause_byte`: cpu=0 memory=1 abort=2 internal=3
-    // wall=4 — NOT the Rust enum's declaration order.
-    const causes = ['cpu', 'memory', 'abort', 'internal', 'wall'] as const
+    // wall=4 unsupported=5 — NOT the Rust enum's declaration order.
+    const causes = ['cpu', 'memory', 'abort', 'internal', 'wall', 'unsupported'] as const
     causes.forEach((expected, byte) => {
       const { result } = decodeRunCompletionPayload(
         encodeCompletionPayload(1, {

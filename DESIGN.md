@@ -716,7 +716,10 @@ imports: {
 Both flavors materialise as standard ESM source-text modules inside the
 isolate; the host-module template is Rust-emitted and contains no
 host-provided text. The runtime resolver looks up each specifier in
-`imports`. Anything missing surfaces as `ERR_MODULE_NOT_FOUND`.
+`imports`. A missing specifier surfaces as `ERR_MODULE_NOT_FOUND`, whose
+message names it and, for a nested import, the module that imported it.
+Every other linking failure (a missing named export, say) is `ERR_IMPORT`
+with V8's message; a source import that does not compile is `ERR_COMPILE`.
 
 The object form imposes these restrictions on the value tree:
 
@@ -1047,8 +1050,9 @@ holds. An already-aborted signal wins over validation and resolves as
 aborted, except disposal: using a disposed prefix always throws
 `ERR_PREFIX_DISPOSED`. Everything else — user code, limits,
 bridge failures, abort, capacity and queue refusals — stays a result. That
-includes `ERR_COMPILE`, `ERR_MODULE_NOT_FOUND`, `ERR_CALL_TARGET_NOT_FOUND`,
-`ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL` and `ERR_TYPE_NOT_SERIALIZABLE`.
+includes `ERR_COMPILE`, `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
+`ERR_CALL_TARGET_NOT_FOUND`, `ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL` and
+`ERR_TYPE_NOT_SERIALIZABLE`.
 
 ### 5.3 Host → sandbox calls
 
@@ -1324,7 +1328,7 @@ wait anyway.
 Documented up front so we don't drift into rebuilding secure-exec:
 
 1. **No `node:*` builtins** (one exception). If a user does
-   `import fs from "node:fs"`, it throws `ModuleNotFound` unless the host
+   `import fs from "node:fs"`, it fails with `ERR_MODULE_NOT_FOUND` unless the host
    explicitly provided it via `imports`. The host can ship a curated
    `node:fs` if they want; the runtime won't. The sole runtime-provided
    `node:*` module is `node:async_hooks`, which exposes a minimal
@@ -1448,6 +1452,18 @@ Documented up front so we don't drift into rebuilding secure-exec:
     `Atomics` itself stays, matching browsers and Node), and `performance`
     remains absent. Formatting an *explicit* date and all other
     `Date`/`Temporal` computation is untouched.
+
+12. **No dynamic `import()`.** Every module a run uses is declared up
+    front in `imports` and linked before any code runs. Calling `import()`
+    ends the whole run with `ERR_IMPORT` (`dynamic import() is not
+    supported: '<specifier>'`) through the same termination path as the
+    CPU/wall/memory guards: the reason is recorded, then execution is
+    terminated inside the call, so no `try`/`catch` or `.catch()` sees it.
+    It applies wherever sandbox code runs, prefix included (`prepare()`
+    rejects), and like any mid-turn kill it taints a warm instance;
+    co-resident runs fail with `ERR_INSTANCE_RESET`, cause `unsupported`.
+    An `import()` whose arguments fail V8's own checks (`import('x', 5)`,
+    a throwing `toString`) rejects catchably first and loads nothing.
 
 ---
 
@@ -2229,7 +2245,9 @@ its continuations never execute again; only a HARD abort's mid-turn kill is
 a forced terminate and taints. Ordinary uncaught exceptions are clean
 completions. When a reset does happen, the interrupted
 run fails with its own classified error and every co-resident run in flight
-fails with `ERR_INSTANCE_RESET` (cause class + culprit run id). The next
+fails with `ERR_INSTANCE_RESET` (cause class + culprit run id; the class
+describes the culprit: `cpu`, `memory`, `wall`, `abort`, `internal`, or
+`unsupported` for a dynamic `import()`). The next
 call pays a cold start; never reuse a tainted instance; never evict a
 running one.
 

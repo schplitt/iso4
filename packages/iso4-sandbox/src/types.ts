@@ -1692,9 +1692,13 @@ export interface RunError {
 
 /**
  * Why a shared instance was reset under an innocent victim — see
- * `RunError.resetCause`.
+ * `RunError.resetCause`. Every cause describes what the culprit run
+ * (`culpritRunId`) did, never this run.
+ *
+ * `'unsupported'`: the culprit used something the runtime does not support
+ * (today: dynamic `import()`), so the runtime ended it.
  */
-export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal'
+export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'unsupported'
 
 /**
  * Why a run's options were refused before anything ran. `sandbox.run()`,
@@ -1745,7 +1749,19 @@ export type RunErrorCode
     | 'ERR_CPU_TIMEOUT'
     | 'ERR_WALL_TIMEOUT'
     | 'ERR_ABORTED'
+    /**
+     * No module with this specifier. The message names it, and the importing
+     * module when that is not the run's own code.
+     */
     | 'ERR_MODULE_NOT_FOUND'
+    /**
+     * Any other import failure, with V8's message: a missing named export,
+     * or another module-linking error. Also a dynamic `import()`, which is
+     * not supported and ends the whole run; sandbox code cannot catch it.
+     * An `import()` whose arguments V8 itself rejects (`import(Symbol())`)
+     * throws a catchable error instead, and loads nothing.
+     */
+    | 'ERR_IMPORT'
     | 'ERR_COMPILE'
     | 'ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED'
     | 'ERR_EXPORT_NOT_SERIALIZABLE'
@@ -1768,9 +1784,10 @@ export type RunErrorCode
     | 'ERR_BRIDGE_CALL_LIMIT_EXCEEDED'
     /**
      * This run was an innocent victim: a co-resident run on the same shared
-     * instance was interrupted mid-execution (CPU/memory guard or a forced
-     * abort), so the instance could no longer be trusted and every run in
-     * flight on it failed. Carries `resetCause` and `culpritRunId`; the
+     * instance was interrupted mid-execution (CPU/memory guard, a forced
+     * abort, or a dynamic `import()`, reported as cause `unsupported`), so the
+     * instance could no longer be trusted and every run in flight on it
+     * failed. Carries `resetCause` and `culpritRunId`; the
      * telemetry fields are this run's real partial values. Never retried
      * automatically — the victim may have had side effects.
      */

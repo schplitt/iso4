@@ -685,6 +685,7 @@ describe('source imports', () => {
     if (result.ok)
       return
     expect(result.error.code).toBe('ERR_MODULE_NOT_FOUND')
+    expect(result.error.message).toBe(`Cannot find module 'not:registered'`)
   })
 })
 
@@ -5557,5 +5558,170 @@ describe('kills and bridge violations', () => {
     const report = await result.waitUntil!
     expect(report.status).toBe('failed')
     expect(report.error?.message).toBe(`${'€'.repeat(682)}… [truncated]`)
+  })
+})
+
+describe('import failures', () => {
+  let runtime: Runtime
+  const DYN = `dynamic import() is not supported: 'lodash'`
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('a nested unknown import names its importer', async () => {
+    const result = await runtime.run({
+      code: `import a from 'src:a'; export default a`,
+      imports: { 'src:a': `import b from 'missing:b'; export default b` },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_MODULE_NOT_FOUND')
+    expect(result.error.message).toBe(`Cannot find module 'missing:b' imported from 'src:a'`)
+  })
+
+  test('a missing named export is ERR_IMPORT with V8\'s message', async () => {
+    const result = await runtime.run({
+      code: `import { nope } from 'tools'; export default nope`,
+      imports: { tools: { yes: 1 } },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_IMPORT')
+    expect(result.error.message).toContain(`does not provide an export named 'nope'`)
+  })
+
+  test('dynamic import() ends the run; try/catch cannot swallow it', async () => {
+    const result = await runtime.run({
+      code: `
+        let caught = false
+        try { await import('lodash') } catch { caught = true }
+        console.log('after', caught)
+        export default caught
+      `,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_IMPORT')
+    expect(result.error.message).toBe(DYN)
+    expect(result.stdout).toEqual([])
+    expect(result.cpuTimeMs).toBeLessThanOrEqual(result.durationMs)
+  })
+
+  test('dynamic import() in a timer callback with .catch() still ends the run', async () => {
+    const result = await runtime.run({
+      code: `
+        export default await new Promise(r => setTimeout(() => {
+          import('lodash').catch(() => {})
+          r('swallowed')
+        }, 1))
+      `,
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_IMPORT')
+    expect(result.error.message).toBe(DYN)
+  })
+
+  test('dynamic import() after a bridge await ends the run', async () => {
+    const result = await runtime.run({
+      code: `
+        await tool()
+        try { await import('lodash') } catch {}
+        export default 'swallowed'
+      `,
+      globals: { tool: async () => 1 },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_IMPORT')
+    expect(result.error.message).toBe(DYN)
+    expect(result.bridgeCalls).toHaveLength(1)
+  })
+
+  test('prepare() rejects a prefix that calls import() or imports an unknown module', async () => {
+    await expect(runtime.prepare({ code: `try { await import('lodash') } catch {}` }))
+      .rejects
+      .toMatchObject({ code: 'ERR_IMPORT', message: DYN })
+    await expect(runtime.prepare({ code: `import x from 'lodash'` }))
+      .rejects
+      .toMatchObject({ code: 'ERR_MODULE_NOT_FOUND', message: `Cannot find module 'lodash'` })
+  })
+
+  test('dynamic import() in prefix.call and prefix.run fails that run; the next run is clean', async () => {
+    await using prefix = await runtime.prepare({
+      code: `
+        export function load() { try { import('lodash') } catch {} return 'swallowed' }
+        export function quick() { return 7 }
+      `,
+    })
+    const called = await prefix.call({ export: 'load' })
+    expect(called.ok).toBe(false)
+    if (!called.ok) {
+      expect(called.error.code).toBe('ERR_IMPORT')
+      expect(called.error.message).toBe(DYN)
+    }
+    const after = await prefix.call({ export: 'quick' })
+    expect(after.ok).toBe(true)
+    if (after.ok)
+      expect(after.value).toBe(7)
+
+    const ran = await prefix.run({ code: `import('lodash').catch(() => {}); export default 1` })
+    expect(ran.ok).toBe(false)
+    if (!ran.ok)
+      expect(ran.error.code).toBe('ERR_IMPORT')
+    const again = await prefix.run({ code: 'export default 2' })
+    expect(again.ok).toBe(true)
+  })
+
+  test('a sync prefix.call that queues import() fails itself; the next call is clean', async () => {
+    await using prefix = await runtime.prepare({
+      code: `
+        let n = 0
+        export function imp() { Promise.resolve().then(() => import('lodash')); return 'swallowed' }
+        export function bump() { return ++n }
+      `,
+    })
+    const imp = await prefix.call({ export: 'imp' })
+    expect(imp.ok).toBe(false)
+    if (!imp.ok)
+      expect(imp.error.code).toBe('ERR_IMPORT')
+    const clean = await prefix.call({ export: 'bump' })
+    expect(clean.ok && clean.value).toBe(1)
+  })
+
+  test('import() in a bridge-argument getter is ERR_IMPORT', async () => {
+    const getter = await runtime.run({
+      code: `await tool({ get g() { try { import('lodash') } catch {} return 1 } }); export default 1`,
+      globals: { tool: async () => 1 },
+    })
+    expect(getter.ok).toBe(false)
+    if (!getter.ok)
+      expect(getter.error.code).toBe('ERR_IMPORT')
+  })
+
+  test('dynamic import() in waitUntil work ends the grace phase with its message', async () => {
+    const result = await runtime.run({
+      code: `
+        waitUntil(new Promise(r => setTimeout(r, 1)).then(() => import('lodash')).catch(() => {}))
+        export default 'early'
+      `,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports.default).toBe('early')
+    const report = await result.waitUntil!
+    expect(report.status).toBe('truncated')
+    expect(report.error).toEqual({ name: 'Error', message: DYN })
   })
 })
