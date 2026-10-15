@@ -838,6 +838,10 @@ export class PayloadDecodeError extends Error {
 class PayloadReader {
   private readonly view: DataView
   private offset = 0
+  /**
+   * Byte length of the blob the last `readValueBlob()` consumed.
+   */
+  lastValueBlobBytes = 0
 
   constructor(buf: Uint8Array) {
     // Respect the byteOffset of sliced Uint8Arrays.
@@ -965,7 +969,8 @@ class PayloadReader {
    * Read a value slot: `u32 byteLength` + V8 serialization blob.
    */
   readValueBlob(): unknown {
-    return deserializeValue(this.readRawBytes(this.readU32()))
+    this.lastValueBlobBytes = this.readU32()
+    return deserializeValue(this.readRawBytes(this.lastValueBlobBytes))
   }
 
   /**
@@ -1303,7 +1308,74 @@ export function decodeBridgeCallPayload(buf: Uint8Array): BridgeCallInfo {
       }`,
     )
   }
+  assertNoArrayHoles(decoded, reader.lastValueBlobBytes)
   return { runId, callId, target, args: decoded }
+}
+
+/**
+ * Refuse bridge arguments holding an array with holes, at any depth
+ * (DESIGN.md §12.1). A dense slot costs at least one wire byte, so array
+ * lengths summing past the blob size prove a hole before any index is read.
+ * @param args the decoded argument list
+ * @param blobBytes byte length of the value blob the arguments arrived in
+ */
+function assertNoArrayHoles(args: unknown[], blobBytes: number): void {
+  const seen = new Set<object>()
+  const stack: object[] = [args]
+  let slots = 0
+  for (let v = stack.pop(); v !== undefined; v = stack.pop()) {
+    if (seen.has(v))
+      continue
+    seen.add(v)
+    if (Array.isArray(v)) {
+      slots += v.length
+      if (slots > blobBytes)
+        throw new PayloadDecodeError('bridge call argument contains an array with holes')
+      for (let i = 0; i < v.length; i++) {
+        if (!(i in v))
+          throw new PayloadDecodeError('bridge call argument contains an array with holes')
+        const item: unknown = v[i]
+        if (item !== null && typeof item === 'object')
+          stack.push(item)
+      }
+      // Named props follow the index keys, which the loop above already visited.
+      const keys = Object.keys(v)
+      for (let j = v.length; j < keys.length; j++) {
+        const item: unknown = (v as unknown as Record<string, unknown>)[keys[j]!]
+        if (item !== null && typeof item === 'object')
+          stack.push(item)
+      }
+      continue
+    }
+    const proto: unknown = Object.getPrototypeOf(v)
+    if (proto === Object.prototype || proto === null) {
+      // `for..in` over a decoded plain object allocates nothing per key.
+      for (const key in v) {
+        const item: unknown = (v as Record<string, unknown>)[key]
+        if (item !== null && typeof item === 'object')
+          stack.push(item)
+      }
+    } else if (v instanceof Map) {
+      for (const k of v.keys()) {
+        if (k !== null && typeof k === 'object')
+          stack.push(k)
+      }
+      for (const item of v.values()) {
+        if (item !== null && typeof item === 'object')
+          stack.push(item)
+      }
+    } else if (v instanceof Set) {
+      for (const item of v) {
+        if (item !== null && typeof item === 'object')
+          stack.push(item)
+      }
+    } else if (v instanceof Error) {
+      // A decoded Error carries only message, stack and cause.
+      if (v.cause !== null && typeof v.cause === 'object')
+        stack.push(v.cause)
+    }
+    // Anything else (Date, RegExp, buffers, host web types, boxed primitives) is a leaf.
+  }
 }
 
 // ── BridgeResponse encoder (TS → Rust) ──────────────────────────────────────
