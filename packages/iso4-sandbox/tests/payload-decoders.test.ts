@@ -781,6 +781,86 @@ describe('decodeBridgeCallPayload', () => {
   })
 })
 
+describe('decodeBridgeCallPayload — arrays with holes', () => {
+  function holey(): unknown[] {
+    const a: unknown[] = []
+    a.length = 2 ** 32 - 1
+    return a
+  }
+
+  test.each<[string, () => unknown]>([
+    ['a huge-length empty array', holey],
+    // eslint-disable-next-line no-sparse-arrays
+    ['a literal [1, , 3]', () => [1, , 3]],
+    ['an array with a deleted element', () => {
+      const a: unknown[] = [1, 2, 3]
+      delete a[1]
+      return a
+    }],
+    ['a hole inside a plain object', () => ({ list: holey() })],
+    ['a hole inside a Map value', () => new Map([['k', holey()]])],
+    ['a hole inside a Map key', () => new Map([[holey(), 1]])],
+    ['a hole inside a Set', () => new Set([holey()])],
+    ['a hole as Error.cause', () => new Error('x', { cause: holey() })],
+    ['a hole three levels down', () => [{ m: new Map([['s', new Set([{ a: holey() }])]]) }]],
+    ['a hole under a named property of an array', () => Object.assign([1, 2, 3], { foo: holey() })],
+  ])('refuses %s', (_name, make) => {
+    expect(() => decodeBridgeCallPayload(encodeBridgeCallPayload(0, 'f', [make()])))
+      .toThrow(/bridge call argument contains an array with holes/)
+  })
+
+  test('refuses many huge sparse arrays in one small payload via the byte budget', () => {
+    const arrays = Array.from({ length: 1000 }, () => {
+      const a: unknown[] = []
+      a.length = 1e8
+      return a
+    })
+    const buf = encodeBridgeCallPayload(0, 'f', arrays)
+    expect(buf.byteLength).toBeLessThan(32 * 1024)
+    const start = performance.now()
+    expect(() => decodeBridgeCallPayload(buf)).toThrow(/array with holes/)
+    expect(performance.now() - start).toBeLessThan(100)
+  })
+
+  test.each<[string, () => unknown]>([
+    ['an array with a named property', () => Object.assign([1, 2, 3], { foo: 'x' })],
+    ['an array with a named property holding a dense array', () => Object.assign([1, 2, 3], { foo: [4, 5] })],
+    ['a fully filled new Array(n)', () => {
+      const a = Array.from<number>({ length: 3 })
+      a[0] = 0
+      a[1] = 1
+      a[2] = 2
+      return a
+    }],
+    ['a dense array of undefined', () => [undefined, undefined, 1]],
+    ['dense arrays nested in Map, Set and object', () => ({ m: new Map([[[1], [2]]]), s: new Set([[3]]), o: { l: [4, [5]] } })],
+    ['typed arrays, ArrayBuffer and DataView', () => [new Uint8Array([1, 2]), new ArrayBuffer(8), new DataView(new ArrayBuffer(4)), new Float64Array(2)]],
+    ['Date, RegExp and an Error without a cause', () => [new Date(0), /x/g, new Error('e')]],
+    ['boxed String, Number and Boolean', () => [Object('abc'), Object(1), Object(true)]],
+    ['one dense array referenced twice', () => {
+      const d = [1, 2, 3]
+      return [d, d]
+    }],
+  ])('accepts %s', (_name, make) => {
+    expect(decodeBridgeCallPayload(encodeBridgeCallPayload(0, 'f', [make()])).args).toHaveLength(1)
+  })
+
+  test('accepts a cyclic structure', () => {
+    const o: { arr: unknown[], self?: unknown } = { arr: [1, 2] }
+    o.self = o
+    o.arr.push(o.arr)
+    const call = decodeBridgeCallPayload(encodeBridgeCallPayload(0, 'f', [o, o]))
+    expect((call.args[0] as typeof o).self).toBe(call.args[0])
+  })
+
+  test('accepts a large dense array of several MiB', () => {
+    const big = Array.from({ length: 400_000 }, (_, i) => i * 1.5)
+    const buf = encodeBridgeCallPayload(0, 'f', [big])
+    expect(buf.byteLength).toBeGreaterThan(3 * 1024 * 1024)
+    expect((decodeBridgeCallPayload(buf).args[0] as number[]).length).toBe(400_000)
+  })
+})
+
 describe('decodeStatsPayload (protocol.md §5.7)', () => {
   function u64(n: number): Buffer {
     const b = Buffer.alloc(8)

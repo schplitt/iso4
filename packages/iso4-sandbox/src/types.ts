@@ -526,7 +526,9 @@ export type HostExportData
  * Args and return are `unknown` — the bridge serialises/deserialises values
  * with V8 ValueSerializer; we don't try to model that at the type level.
  * The one invariant that matters (functions cannot cross the boundary as
- * argument values) is enforced at runtime by the V8 layer, not here.
+ * argument values) is enforced at runtime by the V8 layer, not here. Arrays
+ * with holes are refused as arguments too, host-side, and the sandbox call
+ * rejects with a catchable `TypeError` before the handler runs.
  *
  * Use specific function types for your handlers and let TypeScript infer
  * them through `HostGlobals`, `RebindGlobals<G>`, and `RebindImports<M>`.

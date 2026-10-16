@@ -231,6 +231,16 @@ give a catchable error instead, before anything loads.
 
 ---
 
+## Host bridge values
+
+Arguments to a bridge global or import must not contain an array with holes
+(`[1, , 3]`, `delete a[i]`, `a.length = n` past the last element), at any
+depth. The call rejects with a catchable `TypeError` before the host handler
+runs; uncaught, that is `ERR_HOST_BRIDGE`. Exports may still carry holes.
+`DESIGN.md` §12.1.
+
+---
+
 ## Language and engine
 
 | API                                   |     | Notes                                                                                               |

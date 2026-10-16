@@ -659,6 +659,242 @@ describe('globals bridge (Phase 4)', () => {
 // Concurrency is proven by overlap: every handler starts before any handler
 // ends, which is impossible if the bridge runs them one after another.
 
+describe('globals bridge — arrays with holes are refused', () => {
+  const HOLEY = 'const a = []; a.length = 2 ** 32 - 1'
+  const REFUSED = 'host could not decode bridge call arguments: bridge call argument contains an array with holes'
+
+  test('huge-length empty array: catchable TypeError, handler never runs, run finishes fast', async () => {
+    let handlerRan = false
+    const start = performance.now()
+    const result = await runtime.run({
+      code: `
+        ${HOLEY}
+        let out
+        try {
+          await hostTool(a)
+          out = 'no error'
+        } catch (e) {
+          out = { name: e.name, message: e.message, isTypeError: e instanceof TypeError }
+        }
+        export default out
+      `,
+      globals: {
+        hostTool: async (arg: unknown) => {
+          handlerRan = true
+          return [...(arg as unknown[])].length
+        },
+      },
+    })
+    const elapsed = performance.now() - start
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual({ name: 'TypeError', message: REFUSED, isTypeError: true })
+    expect(handlerRan).toBe(false)
+    expect(elapsed).toBeLessThan(5000)
+  })
+
+  test('left uncaught, the run fails with ERR_HOST_BRIDGE', async () => {
+    const result = await runtime.run({
+      code: `${HOLEY}; export default await hostTool(a)`,
+      globals: { hostTool: async () => 'unreachable' },
+    })
+    expect(result.ok).toBe(false)
+    if (result.ok)
+      return
+    expect(result.error.code).toBe('ERR_HOST_BRIDGE')
+    expect(result.error.name).toBe('TypeError')
+    expect(result.error.message).toBe(REFUSED)
+  })
+
+  test.each([
+    ['a literal [1, , 3]', '[1, , 3]'],
+    ['an array with a deleted element', '(() => { const d = [1, 2, 3]; delete d[1]; return d })()'],
+    ['a hole inside a plain object', '{ list: a }'],
+    ['a hole inside a Map value', 'new Map([["k", a]])'],
+    ['a hole inside a Set', 'new Set([a])'],
+    ['a hole as Error.cause', 'new Error("x", { cause: a })'],
+    ['1000 arrays of length 1e8 in one small payload', 'Array.from({ length: 1000 }, () => { const s = []; s.length = 1e8; return s })'],
+  ])('refuses %s', async (_name, expr) => {
+    let handlerRan = false
+    const start = performance.now()
+    const result = await runtime.run({
+      code: `
+        ${HOLEY}
+        let out
+        try {
+          await hostTool(${expr})
+          out = 'no error'
+        } catch (e) {
+          out = e.name
+        }
+        export default out
+      `,
+      globals: {
+        hostTool: async () => {
+          handlerRan = true
+          return 1
+        },
+      },
+    })
+    expect(performance.now() - start).toBeLessThan(5000)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe('TypeError')
+    expect(handlerRan).toBe(false)
+  })
+
+  test('refuses a hole through an import target too', async () => {
+    let handlerRan = false
+    const result = await runtime.run({
+      code: `
+        import { send } from 'host:tools'
+        ${HOLEY}
+        let out
+        try {
+          await send(a)
+          out = 'no error'
+        } catch (e) {
+          out = { name: e.name, message: e.message }
+        }
+        export default out
+      `,
+      imports: {
+        'host:tools': {
+          send: () => {
+            handlerRan = true
+            return 1
+          },
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toEqual({ name: 'TypeError', message: REFUSED })
+    expect(handlerRan).toBe(false)
+  })
+
+  test.each<[string, string, unknown]>([
+    ['a fully filled new Array(n)', '(() => { const d = new Array(3); d[0] = 0; d[1] = 1; d[2] = 2; return d })()', [0, 1, 2]],
+    ['a dense array with undefined elements', '[undefined, 1, undefined]', [undefined, 1, undefined]],
+    ['dense arrays nested in Map, Set and object', '{ m: new Map([[[1], [2]]]), s: new Set([[3]]), o: { l: [4, [5]] } }', { m: new Map([[[1], [2]]]), s: new Set([[3]]), o: { l: [4, [5]] } }],
+    ['typed arrays and ArrayBuffers', '[new Uint8Array([1, 2]), new ArrayBuffer(4)]', [new Uint8Array([1, 2]), new ArrayBuffer(4)]],
+  ])('accepts %s', async (_name, expr, expected) => {
+    const seen: unknown[] = []
+    const result = await runtime.run({
+      code: `export default await hostTool(${expr})`,
+      globals: {
+        hostTool: async (arg: unknown) => {
+          seen.push(arg)
+          return 'ok'
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe('ok')
+    expect(seen[0]).toEqual(expected)
+  })
+
+  test('accepts an array with a named property', async () => {
+    const seen: unknown[] = []
+    const result = await runtime.run({
+      code: 'const d = [1, 2]; d.foo = 1; export default await hostTool(d)',
+      globals: {
+        hostTool: async (arg: unknown) => {
+          seen.push(arg)
+          return 'ok'
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    expect(Array.from(seen[0] as unknown[])).toEqual([1, 2])
+    expect((seen[0] as { foo?: number }).foo).toBe(1)
+  })
+
+  test('refuses a hole under a named property of an array', async () => {
+    let handlerRan = false
+    const result = await runtime.run({
+      code: `
+        ${HOLEY}
+        const d = [1, 2, 3]
+        d.foo = a
+        let out
+        try {
+          await hostTool(d)
+          out = 'no error'
+        } catch (e) {
+          out = e.name
+        }
+        export default out
+      `,
+      globals: {
+        hostTool: async () => {
+          handlerRan = true
+          return 1
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe('TypeError')
+    expect(handlerRan).toBe(false)
+  })
+
+  test('accepts a cyclic structure', async () => {
+    const result = await runtime.run({
+      code: 'const o = { arr: [1, 2] }; o.self = o; o.arr.push(o.arr); export default await hostTool(o)',
+      globals: {
+        hostTool: async (arg: unknown) => {
+          const o = arg as { arr: unknown[], self: unknown }
+          return o.self === o && o.arr[2] === o.arr
+        },
+      },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe(true)
+  })
+
+  test('accepts a boxed multi-MB String without walking its characters', async () => {
+    let seen: unknown
+    const start = performance.now()
+    const result = await runtime.run({
+      code: 'export default await hostTool(new String("x".repeat(4e6)))',
+      globals: {
+        hostTool: async (arg: unknown) => {
+          seen = arg
+          return 'ok'
+        },
+      },
+    })
+    expect(performance.now() - start).toBeLessThan(1000)
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe('ok')
+    expect(seen).toBeInstanceOf(String)
+    expect(String(seen)).toHaveLength(4e6)
+  })
+
+  test('accepts a large dense array of several MiB', async () => {
+    const result = await runtime.run({
+      code: 'export default await hostTool(Array.from({ length: 400000 }, (_, i) => i * 1.5))',
+      globals: { hostTool: async (arg: unknown) => (arg as number[]).length },
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    expect(result.exports['default']).toBe(400_000)
+    expect(result.bridgeCalls[0]?.ok).toBe(true)
+  })
+})
+
 describe('concurrent host bridge callbacks (D11)', () => {
   test('Promise.all with two slow handlers runs them concurrently', async () => {
     const sleep = (ms: number) => new Promise<void>((r) => {
@@ -1526,6 +1762,18 @@ describe('export types — full coverage', () => {
     if (!result.ok)
       return
     expect(result.exports['default']).toEqual([1, 'two', true, null, undefined, 3n, { x: 5 }])
+  })
+
+  test('array with holes keeps its holes', async () => {
+    const result = await runtime.run({ code: 'export default [1, , 3]' })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const arr = result.exports['default'] as unknown[]
+    expect(arr.length).toBe(3)
+    expect(arr[0]).toBe(1)
+    expect(arr[2]).toBe(3)
+    expect(Object.hasOwn(arr, 1)).toBe(false)
   })
 
   test('large array — 1000 elements', async () => {

@@ -893,7 +893,8 @@ represent crosses as a **real instance**:
 - `Date`, `Map`, `Set`, `RegExp`, `Error` (and its subclasses)
 - `ArrayBuffer`, every `TypedArray`, `DataView` — element type preserved, and
   a `subarray` window carries only its window
-- Arrays (including sparse ones) and plain objects
+- Arrays (including sparse ones — except as bridge call arguments, §12.1)
+  and plain objects
 - Cyclic and shared references — object identity survives the round trip
 
 Behavior does not cross. These cannot be carried:
@@ -931,7 +932,8 @@ How a refusal surfaces depends on the position:
 
 The same value contract applies in both directions — bridge call arguments,
 bridge return values, host-module data leaves, call arguments/results, and
-exports.
+exports. The one carve-out is arrays with holes in bridge call arguments
+(§12.1).
 
 Two behaviours worth knowing:
 
@@ -951,7 +953,7 @@ The **typed** contract matches the runtime one: `HostExportData` describes
 exactly the list above, so what the type accepts is what V8's format carries.
 Nothing on the host walks a value to check it — the serializer is the single
 gate, and a value it refuses fails at encode time with its own data-clone
-error.
+error. The one exception is the hole check on bridge call arguments (§12.1).
 
 ### 5.2 Errors
 
@@ -1898,6 +1900,17 @@ fails the run as `ERR_HOST_BRIDGE` with the same identity preserved on
 they terminate V8 execution immediately via `terminate_execution()` — the
 violation is uncatchable, no sandbox code runs after it, and the run fails
 with the corresponding error code.
+
+**Arrays with holes are refused as bridge arguments**, at any nesting depth
+(`[1, , 3]`, `delete a[i]`, `a.length = 2 ** 32 - 1`). V8 serializes a holey
+array as its length plus the present elements, the one case where the wire
+bytes that `maxBridgeCallBytes` caps do not bound the host's work: a 15-byte
+payload would rebuild as a four-billion-slot array on the host and stall the
+Node event loop in any handler that iterates it. The check runs host-side, in the
+argument decoder, and the sandbox sees it like a handler failure — a
+catchable `TypeError` (`host could not decode bridge call arguments: …`),
+`ERR_HOST_BRIDGE` if left uncaught. Exports and host → sandbox values still
+carry holes (§5.1).
 
 ### 12.2 Attack categories and where each is mitigated
 
