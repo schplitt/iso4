@@ -1,5 +1,5 @@
 /**
- * Pins for globals the runtime deletes from every context (removals.js).
+ * Pins for globals the runtime deletes from every context.
  * SharedArrayBuffer's pin lives with the timing posture in clock.test.ts.
  */
 

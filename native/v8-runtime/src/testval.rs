@@ -39,7 +39,7 @@ pub enum TestValue {
 /// Run `body` inside a fresh isolate + context.
 fn with_scope<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
     init_platform();
-    let isolate = &mut v8::Isolate::new(Default::default());
+    let isolate = &mut v8::Isolate::new(crate::snapshot::create_params());
     v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);

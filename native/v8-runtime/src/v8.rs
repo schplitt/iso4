@@ -273,7 +273,8 @@ extern "C" fn near_heap_limit_cb(
 }
 
 /// Wasm is removed from the sandbox for now (DESIGN §7.5): the global is
-/// deleted by removals.js; this isolate-wide denial backstops codegen.
+/// deleted at every boot (`webtypes::delete_removed_globals`); this
+/// isolate-wide denial backstops codegen.
 unsafe extern "C" fn deny_wasm_codegen(
     _context: v8::Local<v8::Context>,
     _source: v8::Local<v8::String>,
@@ -1004,6 +1005,20 @@ impl TimerTable {
 // ([`CURRENT_RUN_TOKEN`], set at turn entry), and continuations created by a
 // run carry its token in the CPED rider (see `install_async_context`), so
 // work resumed during another run's turn still attributes to its creator.
+
+/// The instance's run table, held in an isolate slot so the natives baked
+/// into the startup snapshot carry no per-instance pointer.
+#[derive(Clone, Copy)]
+pub(crate) struct RunTableSlot(pub(crate) *const RunTable);
+
+fn slot_table<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<&'s RunTable> {
+    // SAFETY: the slot points at the instance-lifetime RunTable Box, which
+    // outlives every callback of its isolate.
+    scope
+        .get_slot::<RunTableSlot>()
+        .filter(|slot| !slot.0.is_null())
+        .map(|slot| unsafe { &*slot.0 })
+}
 
 thread_local! {
     /// The run whose turn is executing on this thread. 0 = none (between
@@ -1748,7 +1763,7 @@ fn run_module_inner(
     };
 
     let mut isolate = {
-        let params = v8::Isolate::create_params();
+        let params = crate::snapshot::create_params();
         // Cap the V8 heap (strings, plain objects). The near-heap callback
         // converts a heap-OOM into a clean terminate_execution().
         let params = if limits.hard_memory_mb > 0 {
@@ -1849,39 +1864,15 @@ fn run_module_inner(
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-    let table_ptr: *const RunTable = &*run_table;
-    // Every setup step below runs with the guards already armed, so each
-    // failure classifies through `termination_or` — a guard firing mid-setup
-    // (a very tight wall limit on a slow machine) must report the timeout,
-    // not the operation it happened to interrupt.
-    install_console(scope, table_ptr)
-        .map_err(|error| failure(termination_or(&reason, error), &unsafe { &*logs_ptr }.borrow(), start))?;
-
-    // Web globals (Headers/Request/Response/URL/TextEncoder/…), with the
-    // streamed-body natives wired to this run's table.
-    install_web_runtime(scope, table_ptr)
-        .map_err(|e| failure(termination_or(&reason, RunError::Internal(e)), &unsafe { &*logs_ptr }.borrow(), start))?;
-
-    // Install AsyncLocalStorage (importable via `node:async_hooks`) for this
-    // run. Always installed: it registers no promise hooks, so runs that never
-    // use it pay only for the class setup, not per-promise overhead.
-    install_async_context(scope)
-        .map_err(|error| failure(termination_or(&reason, error), &unsafe { &*logs_ptr }.borrow(), start))?;
-
-    // waitUntil: installed disarmed — run_call_phase arms it at the
-    // setup-to-run boundary.
-    install_wait_until(scope, table_ptr)
-        .map_err(|error| failure(termination_or(&reason, error), &unsafe { &*logs_ptr }.borrow(), start))?;
-
-        // setTimeout/clearTimeout over the attributed run's timer table.
-        install_timers(scope, table_ptr).map_err(|error| {
+        // Setup runs with the guards already armed: a guard firing mid-setup
+        // must report the timeout, not the step it interrupted.
+        crate::snapshot::boot_context(scope, &*run_table).map_err(|e| {
             failure(
-                termination_or(&reason, error),
+                termination_or(&reason, RunError::Internal(e)),
                 &unsafe { &*logs_ptr }.borrow(),
                 start,
             )
         })?;
-
         v8::Global::new(scope, context)
     };
 
@@ -4722,7 +4713,7 @@ fn new_capped_isolate(
     };
 
     let mut isolate = {
-        let params = v8::Isolate::create_params();
+        let params = crate::snapshot::create_params();
         let params = if hard_memory_mb > 0 {
             params.heap_limits(0, hard_memory_mb as usize * 1024 * 1024)
         } else {
@@ -4779,7 +4770,7 @@ fn warmup_error(reason: &ReasonCell, fallback: RunError) -> RunError {
     }
 }
 
-/// Build a fresh isolate + context, run the once-per-instance installs, and
+/// Build a fresh isolate + context, run the boot fixups, and
 /// evaluate the prefix — all under the fixed warm-up budget. This is the
 /// cold-start half of a warm instance; `run_call_on_core` is the per-call
 /// half. A guard fired during warm-up reports `ERR_WARMUP_LIMIT` (the
@@ -4813,14 +4804,10 @@ pub fn create_instance_core(
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        install_console(scope, table_ptr)?;
-        install_web_runtime(scope, table_ptr).map_err(RunError::Internal)?;
-        install_async_context(scope)?;
         // No run entry exists during prefix evaluation: a setup-time
         // waitUntil or setTimeout throws, and warm-up console output lands
         // in setup_logs.
-        install_wait_until(scope, table_ptr)?;
-        install_timers(scope, table_ptr)?;
+        crate::snapshot::boot_context(scope, table_ptr).map_err(RunError::Internal)?;
         let mut prefix_module: Option<v8::Global<v8::Module>> = None;
         if let Some(prefix) = &prefix {
             // Enter the CPU meter for compile + evaluate only — isolate boot
@@ -6311,32 +6298,11 @@ fn validate_prefix_module(
     v8::scope!(let scope, &mut isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
-    // Same environment as a run, so prefix code that touches a web global is
-    // validated here rather than failing on the first run.
-    crate::webtypes::install(scope).map_err(|e| {
-        failure(
-            termination_or(&reason, RunError::Internal(e)),
-            &logs,
-            start,
-        )
-    })?;
+    // Same environment as a run. Console lines land in this throwaway table
+    // and die with it; waitUntil and timers throw at setup time, as in a run.
     let validation_table = RunTable::boxed();
-    // Same console as a run, for surface parity. Lines land in this throwaway
-    // table and die with it — `prepare()` has no result frame to carry them.
-    install_console(scope, &*validation_table).map_err(|e| {
-        failure(termination_or(&reason, e), &logs, start)
-    })?;
-    // Disarmed waitUntil for surface parity: `typeof waitUntil` matches run
-    // code; calling it here throws the catchable setup-time error (no run
-    // entry exists in this throwaway table).
-    install_wait_until(scope, &*validation_table).map_err(|e| {
-        failure(termination_or(&reason, e), &logs, start)
-    })?;
-    // Disarmed timers for the same surface parity: `typeof setTimeout`
-    // matches run code; calling it at prefix top level throws the catchable
-    // setup-time error.
-    install_timers(scope, &*validation_table).map_err(|e| {
-        failure(termination_or(&reason, e), &logs, start)
+    crate::snapshot::boot_context(scope, &*validation_table).map_err(|e| {
+        failure(termination_or(&reason, RunError::Internal(e)), &logs, start)
     })?;
     v8::tc_scope!(let scope, scope);
     warmup_budget.enter();
@@ -8367,19 +8333,13 @@ pub fn make_body_stream<'s>(
     Some(stream)
 }
 
-/// Install the web runtime with streamed-body support: the two natives are
-/// built around this instance's stream table and handed to the JS factory.
-fn install_web_runtime(
-    scope: &mut v8::PinScope,
-    table: *const RunTable,
-) -> Result<(), String> {
-    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
+/// Install the web runtime with streamed-body support. Snapshot creation only;
+/// the stream natives find the run table through the isolate slot.
+pub(crate) fn install_web_runtime(scope: &mut v8::PinScope) -> Result<(), String> {
     let read = v8::Function::builder(stream_read_callback)
-        .data(data.into())
         .build(scope)
         .ok_or_else(|| "failed to create streamRead".to_string())?;
     let cancel = v8::Function::builder(stream_cancel_callback)
-        .data(data.into())
         .build(scope)
         .ok_or_else(|| "failed to create streamCancel".to_string())?;
     crate::webtypes::install_with_streams(scope, read.into(), cancel.into())
@@ -8388,13 +8348,15 @@ fn install_web_runtime(
 /// `streamRead(streamId)` — native pull for the sandbox body stream: resolves
 /// with a `Uint8Array` chunk, `null` at EOF, or rejects on a source failure.
 /// Consumed bytes replenish the host's credit window.
-fn stream_read_callback(
+pub(crate) fn stream_read_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    // SAFETY: the External points at the instance-lifetime RunTable Box.
-    let run_table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
+    let Some(run_table) = slot_table(scope) else {
+        throw_v8_error(scope, "[iso4] stream read outside an instance");
+        return;
+    };
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         throw_v8_error(scope, "[iso4] stream read could not allocate");
         return;
@@ -8473,13 +8435,15 @@ fn stream_read_callback(
 
 /// `streamCancel(streamId, reason)` — the sandbox is done with the body: the
 /// host is told to stop pumping and release the source; buffered chunks drop.
-fn stream_cancel_callback(
+pub(crate) fn stream_cancel_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    // SAFETY: the External points at the instance-lifetime RunTable Box.
-    let run_table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
+    let Some(run_table) = slot_table(scope) else {
+        rv.set_undefined();
+        return;
+    };
     let state = attributed_state(scope, run_table);
     if state.is_null() {
         rv.set_undefined();
@@ -8543,10 +8507,8 @@ fn bytes_to_uint8array<'s>(
 /// argument into the run's [`PendingWork`] set. Installed non-enumerable like
 /// the web classes (convention), reserved as a name, and additionally
 /// stashed under a registry symbol for the `iso4:runtime` re-export.
-fn install_wait_until(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
-    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
+pub(crate) fn install_wait_until(scope: &mut v8::PinScope) -> Result<(), RunError> {
     let function = v8::Function::builder(wait_until_callback)
-        .data(data.into())
         .build(scope)
         .ok_or_else(|| RunError::Internal("failed to create waitUntil".to_string()))?;
     define_global(scope, "waitUntil", function.into(), false)?;
@@ -8577,14 +8539,12 @@ fn install_wait_until(scope: &mut v8::PinScope, table: *const RunTable) -> Resul
 /// `waitUntil(value)` — register background work to be driven after the
 /// run's value settles. Non-promise values are accepted and count as
 /// already-settled work, mirroring `Promise.resolve` semantics.
-fn wait_until_callback(
+pub(crate) fn wait_until_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    // SAFETY: the External points at the instance-lifetime RunTable Box.
-    let table = unsafe { &*args.data().cast::<v8::External>().value().cast::<RunTable>() };
-    let state = attributed_state(scope, table);
+    let state = slot_table(scope).map_or(std::ptr::null(), |table| attributed_state(scope, table));
     if state.is_null() {
         throw_v8_error(
             scope,
@@ -8624,8 +8584,7 @@ fn wait_until_callback(
 /// Install `setTimeout`/`clearTimeout`: natives over the attributed run's
 /// [`TimerTable`] (the `waitUntil` pattern). Outside run code `setTimeout`
 /// throws a catchable error (workerd's explicit route).
-fn install_timers(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
-    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
+pub(crate) fn install_timers(scope: &mut v8::PinScope) -> Result<(), RunError> {
     for (name, builder) in [
         ("setTimeout", v8::Function::builder(set_timeout_callback)),
         (
@@ -8634,7 +8593,6 @@ fn install_timers(scope: &mut v8::PinScope, table: *const RunTable) -> Result<()
         ),
     ] {
         let function = builder
-            .data(data.into())
             .build(scope)
             .ok_or_else(|| RunError::Internal(format!("failed to create {name}")))?;
         define_global(scope, name, function.into(), false)?;
@@ -8645,20 +8603,13 @@ fn install_timers(scope: &mut v8::PinScope, table: *const RunTable) -> Result<()
 /// `setTimeout(callback, delay, ...args)` — arm a timer on the attributed
 /// run; returns a per-run numeric id. Scheduled from the frozen clock, so
 /// the guest-visible story is exactly "delay ms passed" (workerd model).
-fn set_timeout_callback(
+pub(crate) fn set_timeout_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    // SAFETY: the External points at the instance-lifetime RunTable Box.
-    let table = unsafe {
-        &*args
-            .data()
-            .cast::<v8::External>()
-            .value()
-            .cast::<RunTable>()
-    };
-    let (token, state) = attributed_token_and_state(scope, table);
+    let (token, state) = slot_table(scope)
+        .map_or((0, std::ptr::null()), |table| attributed_token_and_state(scope, table));
     if state.is_null() {
         throw_v8_error(
             scope,
@@ -8729,21 +8680,14 @@ fn set_timeout_callback(
 /// `clearTimeout(id)` — disarm one of the attributed run's own timers.
 /// Everything else (unknown/foreign ids, garbage, outside run code) is a
 /// silent no-op, web semantics.
-fn clear_timeout_callback(
+pub(crate) fn clear_timeout_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
     rv.set_undefined();
-    // SAFETY: the External points at the instance-lifetime RunTable Box.
-    let table = unsafe {
-        &*args
-            .data()
-            .cast::<v8::External>()
-            .value()
-            .cast::<RunTable>()
-    };
-    let (token, state) = attributed_token_and_state(scope, table);
+    let (token, state) = slot_table(scope)
+        .map_or((0, std::ptr::null()), |table| attributed_token_and_state(scope, table));
     if state.is_null() {
         return;
     }
@@ -8770,7 +8714,7 @@ fn clear_timeout_callback(
 /// Wrap five methods on V8's own `console` — replacing the object would delete
 /// 18 others. Unwrapped ones no-op: no `ConsoleDelegate` is registered.
 /// Table in `docs/conformance.md`.
-fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), RunError> {
+pub(crate) fn install_console(scope: &mut v8::PinScope) -> Result<(), RunError> {
     let global = scope.get_current_context().global(scope);
     let console_key = v8::String::new(scope, "console")
         .ok_or_else(|| RunError::Internal("failed to intern console".to_string()))?;
@@ -8778,13 +8722,11 @@ fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(
         .get(scope, console_key.into())
         .and_then(|value| value.try_into().ok())
         .ok_or_else(|| RunError::Internal("V8 console object is missing".to_string()))?;
-    let data = v8::External::new(scope, table.cast_mut().cast::<c_void>());
 
     for name in ["log", "debug", "info"] {
         let key = v8::String::new(scope, name)
             .ok_or_else(|| RunError::Internal(format!("failed to intern console.{name}")))?;
         let function = v8::Function::builder(console_stdout_callback)
-            .data(data.into())
             .build(scope)
             .ok_or_else(|| RunError::Internal(format!("failed to create console.{name}")))?;
         console
@@ -8796,7 +8738,6 @@ fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(
         let key = v8::String::new(scope, name)
             .ok_or_else(|| RunError::Internal(format!("failed to intern console.{name}")))?;
         let function = v8::Function::builder(console_stderr_callback)
-            .data(data.into())
             .build(scope)
             .ok_or_else(|| RunError::Internal(format!("failed to create console.{name}")))?;
         console
@@ -8807,7 +8748,7 @@ fn install_console(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(
     Ok(())
 }
 
-fn console_stdout_callback(
+pub(crate) fn console_stdout_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
@@ -8816,7 +8757,7 @@ fn console_stdout_callback(
     rv.set_undefined();
 }
 
-fn console_stderr_callback(
+pub(crate) fn console_stderr_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
@@ -8942,21 +8883,14 @@ fn append_console_line(
     args: v8::FunctionCallbackArguments,
     stdout: bool,
 ) {
-    let data = args.data();
-    let Ok(external) = v8::Local::<v8::External>::try_from(data) else {
+    let Some(table) = slot_table(scope) else {
         return;
     };
-    let table = external.value().cast::<RunTable>().cast_const();
-    if table.is_null() {
-        return;
-    }
 
     // A kill mid-render drops the line; the termination stays pending.
     let Some(line) = render_console_line(scope, &args) else {
         return;
     };
-    // SAFETY: the External points at the instance-lifetime RunTable Box.
-    let table = unsafe { &*table };
     let state = attributed_state(scope, table);
     if state.is_null() {
         // No run owns this line: prefix warm-up output, delivered on the
@@ -9017,7 +8951,7 @@ const ASYNC_HOOKS_SPECIFIER: &str = "node:async_hooks";
 /// is stashed. Must match `Symbol.for(...)` in [`ASYNC_HOOKS_MODULE_SRC`].
 const ASYNC_CONTEXT_SYMBOL: &str = "iso4.async_hooks.AsyncLocalStorage";
 
-/// Classic script evaluated once per run. Returns the `AsyncLocalStorage`
+/// Classic script evaluated once, into the startup snapshot. Returns the `AsyncLocalStorage`
 /// constructor, closing over the native `getContext`/`setContext` bindings.
 ///
 /// Contexts are singly-linked frames (`{ p: parent, k: instance, v: value }`)
@@ -9107,7 +9041,7 @@ fn install_cped_rider(scope: &mut v8::PinScope, token: u64) {
 
 /// Native getter for the continuation-preserved embedder data slot: the
 /// guest-visible value is the rider's inner frame.
-fn async_context_get_callback(
+pub(crate) fn async_context_get_callback(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
@@ -9123,7 +9057,7 @@ fn async_context_get_callback(
 /// guest frame in a rider carrying the creating run's token (taken from the
 /// current rider, so a cross-run continuation keeps ITS run, not the turn
 /// owner's).
-fn async_context_set_callback(
+pub(crate) fn async_context_set_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
@@ -9140,9 +9074,9 @@ fn async_context_set_callback(
 }
 
 /// Install the `AsyncLocalStorage` class on `globalThis` under
-/// `Symbol.for(ASYNC_CONTEXT_SYMBOL)`. Called once per run before module
-/// instantiation so the built-in `node:async_hooks` module can read it.
-fn install_async_context(scope: &mut v8::PinScope) -> Result<(), RunError> {
+/// `Symbol.for(ASYNC_CONTEXT_SYMBOL)`, at snapshot creation, so the built-in
+/// `node:async_hooks` module can read it.
+pub(crate) fn install_async_context(scope: &mut v8::PinScope) -> Result<(), RunError> {
     let get_fn = v8::Function::builder(async_context_get_callback)
         .build(scope)
         .ok_or_else(|| RunError::Internal("failed to build async-context getter".to_string()))?;
@@ -11796,8 +11730,8 @@ mod tests {
         assert_eq!(get_default(&out).as_deref(), Some("101"));
     }
 
-    /// The web classes are native `FunctionTemplate`s installed fresh into
-    /// every run's context; a closure the prefix creates over them must still
+    /// The web classes are native `FunctionTemplate`s restored into every
+    /// run's context; a closure the prefix creates over them must still
     /// work when the postfix stage of the same run calls it.
     #[test]
     fn web_globals_are_usable_from_prefix_code() {
