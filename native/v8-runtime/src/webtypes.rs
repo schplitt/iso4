@@ -52,13 +52,9 @@
 //! once into the context. A JS subclass of a shell keeps the internal field,
 //! which is what makes this split possible.
 //!
-//! There is no startup-snapshot coupling anymore: runtime snapshot creation
-//! was removed (V8 14.x cannot create snapshots safely in a live
-//! multi-isolate process), so the classes are installed fresh into every
-//! context and no external-references table exists. If snapshots ever return
-//! (e.g. via a public `IsolateGroup` API), the table must come back with
-//! them: native callbacks cannot cross a snapshot without it being supplied
-//! at **both** creation and restore.
+//! The classes are installed once, into the build-time startup snapshot
+//! (`snapshot.rs`). Every native callback here must be listed in its
+//! external-references table.
 
 use v8::MapFnTo;
 
@@ -139,7 +135,7 @@ fn stamp_tag(scope: &mut v8::PinScope, obj: v8::Local<v8::Object>, tag: u32) -> 
 /// template with one internal field — which is what V8 dispatches on (see the
 /// module docs on why the field carries no data) — and so that every
 /// construction path, including JS subclasses, passes through the stamp.
-fn headers_shell_ctor(
+pub(crate) fn headers_shell_ctor(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
@@ -150,7 +146,7 @@ fn headers_shell_ctor(
     let _ = stamp_tag(scope, args.this(), TAG_HEADERS);
 }
 
-fn request_shell_ctor(
+pub(crate) fn request_shell_ctor(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
@@ -161,7 +157,7 @@ fn request_shell_ctor(
     let _ = stamp_tag(scope, args.this(), TAG_REQUEST);
 }
 
-fn response_shell_ctor(
+pub(crate) fn response_shell_ctor(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
@@ -257,21 +253,75 @@ pub fn advance_frozen_clock_to(scope: &mut v8::PinScope, target_ms: f64) {
     cell.set(scope, prop.into(), value.into());
 }
 
-/// Install the web globals into the current context, without streamed-body
-/// support (unit tests): the stream natives are `undefined` and a streamed
-/// body read fails cleanly in JS.
-pub fn install(scope: &mut v8::PinScope) -> Result<(), String> {
-    let read = v8::undefined(scope).into();
-    let cancel = v8::undefined(scope).into();
-    install_with_streams(scope, read, cancel)
+/// The current isolate's frozen-clock cell, for the snapshot to carry.
+pub fn clock_cell<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let clock = scope.get_slot::<std::rc::Rc<FrozenClock>>()?.clone();
+    Some(v8::Local::new(scope, &clock.cell))
+}
+
+/// Point the isolate's frozen clock at `cell` and set it to the wall clock.
+/// A context restored from the snapshot needs this before any guest code runs:
+/// the cell otherwise still holds the build time.
+pub fn adopt_clock(scope: &mut v8::PinScope, cell: v8::Local<v8::Object>) -> Result<(), String> {
+    let now = wall_now_ms();
+    let prop = v8::String::new(scope, "t")
+        .ok_or_else(|| "intern frozen clock prop failed".to_string())?;
+    let value = v8::Number::new(scope, now);
+    cell.set(scope, prop.into(), value.into())
+        .ok_or_else(|| "init frozen clock failed".to_string())?;
+    let clock = std::rc::Rc::new(FrozenClock {
+        cell: v8::Global::new(scope, cell),
+        prop: v8::Global::new(scope, prop),
+        prev: std::cell::Cell::new(now),
+    });
+    scope.set_slot(clock);
+    Ok(())
+}
+
+/// Private key on the global object holding the `Temporal.Now` patch.
+const TEMPORAL_PATCH_KEY: &str = "iso4::patchTemporal";
+
+fn private_key<'s>(scope: &mut v8::PinScope<'s, '_>, name: &str) -> Result<v8::Local<'s, v8::Private>, String> {
+    let name = v8::String::new(scope, name).ok_or_else(|| format!("intern {name} failed"))?;
+    Ok(v8::Private::for_api(scope, Some(name)))
+}
+
+/// Point `Temporal.Now` at the frozen clock. Runs at every boot: V8 adds
+/// `Temporal` only after the context is restored, so the snapshot cannot
+/// carry the patched object.
+pub fn patch_temporal(scope: &mut v8::PinScope) -> Result<(), String> {
+    let global = scope.get_current_context().global(scope);
+    let key = private_key(scope, TEMPORAL_PATCH_KEY)?;
+    let patch: v8::Local<v8::Function> = global
+        .get_private(scope, key)
+        .and_then(|value| value.try_into().ok())
+        .ok_or_else(|| "Temporal patch missing".to_string())?;
+    v8::tc_scope!(let tc, scope);
+    let recv = v8::undefined(tc).into();
+    patch
+        .call(tc, recv, &[])
+        .ok_or_else(|| exception_text(tc, "patch Temporal"))?;
+    Ok(())
+}
+
+/// Delete the globals the sandbox does not offer (DESIGN.md §7.5). Runs at
+/// every boot: V8 re-installs both when a context is restored from a snapshot.
+pub fn delete_removed_globals(scope: &mut v8::PinScope) -> Result<(), String> {
+    let global = scope.get_current_context().global(scope);
+    for name in ["SharedArrayBuffer", "WebAssembly"] {
+        let key = v8::String::new(scope, name).ok_or_else(|| format!("intern {name} failed"))?;
+        if global.delete(scope, key.into()) != Some(true) {
+            return Err(format!("delete {name} failed"));
+        }
+    }
+    Ok(())
 }
 
 /// Install the web globals into the current context.
 ///
-/// Called at context creation on every path — prefix validation and every
-/// run — so prefix and postfix code see the same environment. `stream_read`
-/// and `stream_cancel` are the native callbacks backing streamed host bodies
-/// (built in `v8.rs` around the run's stream table).
+/// Runs once, at snapshot creation (`snapshot.rs`); every context boots with
+/// them already in place. `stream_read` and `stream_cancel` are the native
+/// callbacks backing streamed host bodies (built in `v8.rs`).
 pub fn install_with_streams(
     scope: &mut v8::PinScope,
     stream_read: v8::Local<v8::Value>,
@@ -318,26 +368,17 @@ pub fn install_with_streams(
         .ok_or_else(|| "create stampStreamBody failed".to_string())?;
     factory_args.push(v8::Local::<v8::Value>::from(stamp));
 
-    // The frozen-clock cell (see [`FrozenClock`]). Initialized to the wall
-    // clock at context creation, so prefix evaluation runs on a frozen "now"
-    // exactly like calls do.
-    let clock_init_ms = wall_now_ms();
+    // The frozen-clock cell (see [`FrozenClock`]), set to the wall clock so
+    // prefix evaluation runs on a frozen "now" exactly like calls do.
     let clock_cell = v8::Object::new(scope);
-    {
-        let prop = v8::String::new(scope, "t")
-            .ok_or_else(|| "intern frozen clock prop failed".to_string())?;
-        let value = v8::Number::new(scope, clock_init_ms);
-        clock_cell
-            .set(scope, prop.into(), value.into())
-            .ok_or_else(|| "init frozen clock failed".to_string())?;
-    }
+    adopt_clock(scope, clock_cell)?;
     factory_args.push(clock_cell.into());
 
     // The runtime source is an expression evaluating to a function; calling it
     // with the three shells, the two URL callbacks, the stream natives, and
     // the frozen-clock cell installs the classes and the clock shims. None of
     // the arguments are ever exposed on `globalThis`.
-    let source = v8::String::new(scope, RUNTIME_JS)
+    let source = v8::String::new_from_onebyte_const(scope, &RUNTIME_JS)
         .ok_or_else(|| "intern web runtime source failed".to_string())?;
     let origin_name = v8::String::new(scope, "iso4:web")
         .ok_or_else(|| "intern web runtime filename failed".to_string())?;
@@ -404,41 +445,15 @@ pub fn install_with_streams(
         .set_private(tc, factory_key, factory_fn)
         .ok_or_else(|| "store body-stream factory failed".to_string())?;
 
-    // Hand the frozen-clock cell to advance_frozen_clock: persistent handles
-    // in an isolate slot, so an advance never re-interns strings or resolves
-    // a private (carried item 6). The Globals also keep the cell reachable.
-    let clock_prop = v8::String::new(tc, "t")
-        .ok_or_else(|| "intern frozen clock prop failed".to_string())?;
-    let clock = std::rc::Rc::new(FrozenClock {
-        cell: v8::Global::new(tc, clock_cell),
-        prop: v8::Global::new(tc, clock_prop),
-        prev: std::cell::Cell::new(clock_init_ms),
-    });
-    tc.set_slot(clock);
+    let patch_fn = classes
+        .get_index(tc, 4)
+        .filter(|c| c.is_function())
+        .ok_or_else(|| "web runtime did not return the Temporal patch".to_string())?;
+    let patch_key = private_key(tc, TEMPORAL_PATCH_KEY)?;
+    global
+        .set_private(tc, patch_key, patch_fn)
+        .ok_or_else(|| "store Temporal patch failed".to_string())?;
 
-    // Last step: delete the removed globals (removals.js).
-    let source = v8::String::new(tc, REMOVALS_JS)
-        .ok_or_else(|| "intern removals source failed".to_string())?;
-    let origin_name = v8::String::new(tc, "iso4:removals")
-        .ok_or_else(|| "intern removals filename failed".to_string())?;
-    let origin = v8::ScriptOrigin::new(
-        tc,
-        origin_name.into(),
-        0,
-        0,
-        false,
-        0,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
-    let script = v8::Script::compile(tc, source, Some(&origin))
-        .ok_or_else(|| exception_text(tc, "compile removals"))?;
-    script
-        .run(tc)
-        .ok_or_else(|| exception_text(tc, "evaluate removals"))?;
     Ok(())
 }
 
@@ -473,18 +488,10 @@ fn exception_text(
 /// | Response | `_h`     | `Headers` instance                       |
 /// | Response | `_b`     | `null` \| `Uint8Array` \| string          |
 ///
-/// Startup cost: this source is compiled and evaluated into every fresh
-/// context. Deno avoids that by precompiling its JS runtime into a build-time
-/// V8 snapshot, and that stays on the table for static sources like this one
-/// (what was removed was *runtime* snapshot creation of live prefix state
-/// in a multi-isolate process). A build-time snapshot must carry the
-/// external-references table for every native callback above (see module
-/// docs); the nearer-term step is a process-wide code cache.
-const RUNTIME_JS: &str = include_str!("webtypes.js");
-
-/// Globals deleted from every context (SharedArrayBuffer, WebAssembly).
-/// Runs after `RUNTIME_JS` so nothing installed there resurrects one.
-const REMOVALS_JS: &str = include_str!("removals.js");
+/// An external string: V8 points at these bytes in the binary instead of
+/// copying the source into every isolate's heap. Must stay ASCII.
+pub(crate) static RUNTIME_JS: v8::OneByteConst =
+    v8::String::create_external_onebyte_const(include_str!("webtypes.js").as_bytes());
 
 // ── Adapter ──────────────────────────────────────────────────────────────────
 //
@@ -704,11 +711,11 @@ mod tests {
     /// Run `body` in a fresh isolate + context with the web globals installed.
     fn with_web<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
         crate::v8::init_platform();
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(crate::snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        install(scope).expect("install web globals");
+        crate::snapshot::boot_context(scope, std::ptr::null()).expect("boot context");
         body(scope)
     }
 

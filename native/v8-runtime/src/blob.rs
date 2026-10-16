@@ -294,7 +294,7 @@ static PROBE: OnceLock<(Vec<u8>, u8)> = OnceLock::new();
 fn probe_data() -> &'static (Vec<u8>, u8) {
     PROBE.get_or_init(|| {
         crate::v8::init_platform();
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(crate::snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -399,7 +399,7 @@ mod tests {
     /// Run `body` inside a fresh isolate + context.
     fn with_scope<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
         init_platform();
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(crate::snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -680,11 +680,11 @@ mod tests {
         // plain data (fail-closed), the second — after the key is installed —
         // must produce a real instance.
         crate::v8::init_platform();
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(crate::snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        crate::webtypes::install(scope).expect("install web globals");
+        crate::snapshot::boot_context(scope, std::ptr::null()).expect("boot context");
 
         let key = webcodec::brand_key_for_token(&[0xab; webcodec::DESCRIPTOR_TOKEN_LEN]);
         let value = eval(

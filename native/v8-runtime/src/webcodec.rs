@@ -801,11 +801,11 @@ mod tests {
     /// Fresh isolate + context with the web globals installed.
     fn with_web<R>(body: impl FnOnce(&mut v8::PinScope) -> R) -> R {
         crate::v8::init_platform();
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(crate::snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        crate::webtypes::install(scope).expect("install web globals");
+        crate::snapshot::boot_context(scope, std::ptr::null()).expect("boot context");
         body(scope)
     }
 

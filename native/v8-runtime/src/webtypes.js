@@ -2,7 +2,7 @@
 // lands in the prefix snapshot, so it costs nothing per run.
 //
 // Evaluates to a factory taking the three native shells. The shells are never
-// exposed on globalThis — only the classes that extend them are.
+// exposed on globalThis - only the classes that extend them are.
 //
 // Instance state lives in non-enumerable own properties with short names so the
 // Rust codec can read it with plain property gets. The names are wire contract:
@@ -27,7 +27,7 @@
       configurable: true,
     })
 
-  // ── UTF-8 ──────────────────────────────────────────────────────────────────
+  // -- UTF-8 ------------------------------------------------------------------
 
   function utf8Encode(str) {
     const len = str.length
@@ -52,7 +52,7 @@
           out[p++] = 0x80 | ((c >> 6) & 0x3F)
           out[p++] = 0x80 | (c & 0x3F)
         } else {
-          // Lone high surrogate → U+FFFD
+          // Lone high surrogate -> U+FFFD
           out[p++] = 0xEF; out[p++] = 0xBF; out[p++] = 0xBD
         }
       } else if (c >= 0xD800 && c <= 0xDFFF) {
@@ -68,7 +68,7 @@
 
   // Strict, per the WHATWG encoding spec. The earlier version checked only the
   // lead-byte pattern, so a malformed lead byte consumed the valid characters
-  // after it (`41 C3 41` decoded as "AÁ", losing the trailing "A") and overlong
+  // after it (`41 C3 41` decoded as "A\u00C1", losing the trailing "A") and overlong
   // and surrogate sequences were accepted. On any error we emit one U+FFFD and
   // advance a single byte, which is what stops the next character being eaten.
   function utf8Decode(bytes) {
@@ -193,7 +193,7 @@
     }
   }
 
-  // ── URLSearchParams ────────────────────────────────────────────────────────
+  // -- URLSearchParams --------------------------------------------------------
 
   // application/x-www-form-urlencoded: space is "+", not "%20".
   const encodeQueryComponent = (s) =>
@@ -340,11 +340,11 @@
     }
   }
 
-  // ── URL ────────────────────────────────────────────────────────────────────
+  // -- URL --------------------------------------------------------------------
 
   // Parsing and every component mutation happen natively in ada (url.rs);
   // this class only owns the object surface. `_c` caches the component
-  // strings in the order produced by url.rs — the U_* indices below are that
+  // strings in the order produced by url.rs - the U_* indices below are that
   // contract. A setter re-parses from `href`, applies the change natively and
   // swaps in the fresh array, so instances hold no native state.
 
@@ -510,7 +510,7 @@
     }
   }
 
-  // ── Headers ────────────────────────────────────────────────────────────────
+  // -- Headers ----------------------------------------------------------------
 
   const TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
 
@@ -539,7 +539,7 @@
   class Headers extends HeadersShell {
     constructor(init) {
       super()
-      // Flat [name, value, name, value, …] — see webtypes.rs for the contract.
+      // Flat [name, value, name, value, ...] - see webtypes.rs for the contract.
       def(this, '_l', [])
       if (init === undefined || init === null)
         return
@@ -621,7 +621,7 @@
         this._l.push(n, v)
     }
 
-    // Spec: iteration is sorted by name, with same-name values combined —
+    // Spec: iteration is sorted by name, with same-name values combined -
     // except set-cookie, which yields one entry per value.
     _sorted() {
       const names = []
@@ -665,7 +665,7 @@
     }
   }
 
-  // ── Body mixin ─────────────────────────────────────────────────────────────
+  // -- Body mixin -------------------------------------------------------------
   //
   // `_b` is null, a Uint8Array, or a string. Strings are kept as strings so a
   // text body survives the boundary without an encode/decode round trip.
@@ -691,13 +691,13 @@
       return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength))
     if (body instanceof ArrayBuffer)
       return new Uint8Array(body.slice(0))
-    // A hydrated body stream passes through as-is — the proxy pattern
+    // A hydrated body stream passes through as-is - the proxy pattern
     // (`new Response(request.body)`); serialization turns it into an
     // outbound stream handle (#128).
     if (body instanceof Iso4BodyStream)
       return body
     // An async iterable of Uint8Array/string chunks (Node accepts these as
-    // bodies too): wrapped in a body stream pulling the iterator — early
+    // bodies too): wrapped in a body stream pulling the iterator - early
     // termination calls `.return()`, so `finally` cleanup runs.
     if (typeof body === 'object' && typeof body[Symbol.asyncIterator] === 'function') {
       const iter = body[Symbol.asyncIterator]()
@@ -714,24 +714,24 @@
     }
     if (typeof body === 'object' && typeof body.getReader === 'function') {
       throw new TypeError(
-        'A ReadableStream body cannot cross the sandbox boundary — buffer it first',
+        'A ReadableStream body cannot cross the sandbox boundary \u2014 buffer it first',
       )
     }
     return String(body)
   }
 
-  // ── Streamed bodies ────────────────────────────────────────────────────────
+  // -- Streamed bodies --------------------------------------------------------
   //
   // A host body too large for the buffered path arrives as a stream handle;
   // this minimal reader surface is what `.body` exposes on such instances.
   // Chunks are pulled from the runtime on demand (`streamRead` resolves with
   // a Uint8Array, null at EOF, and rejects on a source failure); consuming a
   // chunk replenishes the host's flow-control credit. Not a full WHATWG
-  // ReadableStream — a reader, cancellation, and async iteration, which is
+  // ReadableStream - a reader, cancellation, and async iteration, which is
   // what body-processing code actually uses.
   class Iso4BodyStream {
     // `source` is either a numeric stream id (native-backed, hydrated by the
-    // runtime) or a { pull, cancel } pair (a tee branch — see teeBodyStream).
+    // runtime) or a { pull, cancel } pair (a tee branch - see teeBodyStream).
     constructor(source) {
       // Construction-time private stamp: the codec recognizes stream bodies
       // by it, never by prototype or shape.
@@ -932,7 +932,7 @@
     // `.body` is a stream only for instances that arrived with a streamed
     // host body; buffered bodies keep the historical shape (absent-as-null
     // would claim emptiness, so it stays null only when there is nothing to
-    // stream — use text()/bytes()/arrayBuffer() for those).
+    // stream - use text()/bytes()/arrayBuffer() for those).
     Object.defineProperty(proto, 'body', {
       get() {
         return this._b instanceof Iso4BodyStream ? this._b : null
@@ -961,7 +961,7 @@
     return body
   }
 
-  // ── Request ────────────────────────────────────────────────────────────────
+  // -- Request ----------------------------------------------------------------
 
   const FORBIDDEN_BODY_METHODS = new Set(['GET', 'HEAD'])
   const FORBIDDEN_METHODS = new Set(['CONNECT', 'TRACE', 'TRACK'])
@@ -982,7 +982,7 @@
       } else {
         const parsed = new URL(String(input))
         // Fetch spec: a Request URL may not carry credentials. The sandbox URL
-        // (ada) preserves them like any WHATWG URL, so the check lives here —
+        // (ada) preserves them like any WHATWG URL, so the check lives here -
         // and Node's Request rejects them too, so this keeps the error on the
         // user's line instead of failing host-side reconstruction.
         if (parsed.username !== '' || parsed.password !== '')
@@ -1052,7 +1052,7 @@
   }
   installBody(Request.prototype)
 
-  // ── Response ───────────────────────────────────────────────────────────────
+  // -- Response ---------------------------------------------------------------
 
   const NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304])
 
@@ -1156,14 +1156,15 @@
   }
   installBody(Response.prototype)
 
-  // ── Frozen clock ───────────────────────────────────────────────────────────
+  // -- Frozen clock -----------------------------------------------------------
   //
   // `frozenClock.t` is the run's notion of "now" (whole ms since the epoch).
-  // It only moves when the runtime regains control at a socket frame — run
-  // entry, bridge responses, stream frames — never while guest code executes
-  // (workerd's model; DESIGN.md §1.2). Every guest-visible clock below reads
+  // It only moves when the runtime regains control at a socket frame - run
+  // entry, bridge responses, stream frames - never while guest code executes
+  // (workerd's model; DESIGN.md section 1.2). Every guest-visible clock below reads
   // it; the natives it replaces survive only in this closure.
 
+  let patchTemporal
   {
     const now = () => frozenClock.t
 
@@ -1192,7 +1193,7 @@
     def(DateShim, 'now', shimNow)
     globalThis.Date = DateShim
 
-    // Intl.DateTimeFormat formats "now" when called without a date — default
+    // Intl.DateTimeFormat formats "now" when called without a date - default
     // the argument to the frozen clock instead of the real one. Formatting an
     // explicit date is pure computation and stays native.
     if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
@@ -1218,9 +1219,11 @@
     }
 
     // Temporal.Now: derive everything from the frozen instant. Existence
-    // checks per method — the Temporal surface is still moving between V8
-    // versions.
-    if (typeof Temporal !== 'undefined' && Temporal.Now) {
+    // checks per method - the Temporal surface is still moving between V8
+    // versions. Applied at every boot: V8 adds Temporal after snapshot restore.
+    patchTemporal = () => {
+      if (typeof Temporal === 'undefined' || !Temporal.Now)
+        return
       const Now = Temporal.Now
       const instant = () => Temporal.Instant.fromEpochMilliseconds(now())
       const zoned = (tz) => instant().toZonedDateTimeISO(tz === undefined ? Now.timeZoneId() : tz)
@@ -1237,7 +1240,7 @@
     }
   }
 
-  // ── Publish ────────────────────────────────────────────────────────────────
+  // -- Publish ----------------------------------------------------------------
 
   for (const [name, value] of [
     ['Headers', Headers],
@@ -1258,6 +1261,7 @@
 
   // Returned to `install()`, which keeps these references in private slots so
   // deserialization never depends on the (guest-mutable) globals above. The
-  // fourth entry builds the body-stream object for hydrated stream handles.
-  return [Headers, Request, Response, (id) => new Iso4BodyStream(id)]
+  // fourth entry builds the body-stream object for hydrated stream handles;
+  // the fifth patches Temporal.Now at boot.
+  return [Headers, Request, Response, (id) => new Iso4BodyStream(id), patchTemporal]
 })

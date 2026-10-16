@@ -8,7 +8,7 @@
 //! - `v8_value` — the value plane crossing into/out of V8: `blob::serialize_value`
 //!   / `blob::deserialize_value`, i.e. V8's own `ValueSerializer` /
 //!   `ValueDeserializer` (the only value codec in the protocol).
-//! - `exec` — per-run execution costs: fresh context, snapshot restore,
+//! - `exec` — per-run execution costs: fresh context, isolate boot,
 //!   unique-source compile, and direct `Function::call` per event.
 //! - `policy` — warm-registry eviction/pressure decisions (policy.rs).
 //! - `url` — the sandbox `URL` class end to end: JS call → native callback →
@@ -31,7 +31,7 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use iso4_v8_runtime::blob;
 use iso4_v8_runtime::v8::init_platform;
-use iso4_v8_runtime::webtypes;
+use iso4_v8_runtime::snapshot;
 
 // ── Deterministic payload fixtures ─────────────────────────────────────────
 
@@ -230,7 +230,7 @@ fn bench_v8_value(c: &mut Criterion) {
     for (name, shape) in &shapes() {
         // V8 value → v8-blob bytes (outbound leg).
         group.bench_function(BenchmarkId::new("value_serializer", name), |b| {
-            let isolate = &mut v8::Isolate::new(Default::default());
+            let isolate = &mut v8::Isolate::new(snapshot::create_params());
             v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -245,7 +245,7 @@ fn bench_v8_value(c: &mut Criterion) {
 
         // v8-blob bytes → V8 value (inbound leg).
         group.bench_function(BenchmarkId::new("value_deserializer", name), |b| {
-            let isolate = &mut v8::Isolate::new(Default::default());
+            let isolate = &mut v8::Isolate::new(snapshot::create_params());
             v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -278,15 +278,15 @@ const TRANSFORM_SRC: &str =
     "(e) => ({ id: e.id, tenant: e.tenant, revenue: e.value * 1.15, tag: e.name })";
 
 /// Per-run execution costs: the fixed tax decomposition from the backlog
-/// (context create dominates; snapshot restore, compile, call are the rest).
+/// (context create dominates; isolate boot, compile, call are the rest).
 fn bench_exec(c: &mut Criterion) {
     init_platform();
     let mut group = c.benchmark_group("exec");
 
-    // Fresh context in an existing isolate (~190 µs in the 2026-08 session;
-    // the dominant slice of the per-run tax — see backlog item 3).
+    // Fresh context in an existing isolate — the dominant slice of the
+    // per-run tax.
     group.bench_function("context_create", |b| {
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(snapshot::create_params());
         v8::scope!(let scope, isolate);
         b.iter(|| {
             v8::scope!(let scope, scope);
@@ -294,18 +294,15 @@ fn bench_exec(c: &mut Criterion) {
         });
     });
 
-    // Fresh isolate + context restored from a startup snapshot — the
-    // prefix.run() entry cost. blob.clone() (a ~few-hundred-KB memcpy) is
-    // part of the measured region; it is also part of the real per-run path
-    // since CreateParams takes an owned blob.
-    group.bench_function("snapshot_restore", |b| {
-        let blob = make_snapshot_blob();
+    // Fresh isolate + context booted from the embedded startup snapshot —
+    // the fixed boot every one-off run and cold start pays.
+    group.bench_function("isolate_boot", |b| {
         b.iter(|| {
-            let params = v8::Isolate::create_params().snapshot_blob(blob.clone().into());
-            let isolate = &mut v8::Isolate::new(params);
+            let isolate = &mut v8::Isolate::new(snapshot::create_params());
             v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
-            black_box(context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            snapshot::boot_context(scope, std::ptr::null()).unwrap();
         });
     });
 
@@ -313,7 +310,7 @@ fn bench_exec(c: &mut Criterion) {
     // per iteration: identical source hits V8's compile cache and reports
     // ~5x too fast (measured 2.9 µs cached vs 15.6 µs unique).
     group.bench_function("compile_run_unique_source", |b| {
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -333,7 +330,7 @@ fn bench_exec(c: &mut Criterion) {
     // Direct call of a pre-compiled function — the RunCall target pattern
     // (backlog item 2): no per-event compile, argument already materialised.
     group.bench_function("function_call", |b| {
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -349,7 +346,7 @@ fn bench_exec(c: &mut Criterion) {
     // (item 1 + item 2): argsBlob in → ValueDeserializer → call() →
     // ValueSerializer → result blob out.
     group.bench_function("call_per_event", |b| {
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -376,11 +373,11 @@ fn bench_url(c: &mut Criterion) {
     let mut group = c.benchmark_group("url");
 
     group.bench_function("parse", |b| {
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        webtypes::install(scope).unwrap();
+        snapshot::boot_context(scope, std::ptr::null()).unwrap();
         let (func, recv) = compile_fn(scope, "s => new URL(s)");
         let input: v8::Local<v8::Value> =
             v8::String::new(scope, "https://user@example.com:8443/a/b/../c?x=1&y=2#frag")
@@ -395,11 +392,11 @@ fn bench_url(c: &mut Criterion) {
     // Relative resolution against a base — the shape `Request` construction
     // and redirect handling produce.
     group.bench_function("parse_relative_with_base", |b| {
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        webtypes::install(scope).unwrap();
+        snapshot::boot_context(scope, std::ptr::null()).unwrap();
         let (func, recv) = compile_fn(
             scope,
             "s => new URL(s, 'https://example.com/base/dir/index.html')",
@@ -415,11 +412,11 @@ fn bench_url(c: &mut Criterion) {
     // One component setter: re-parse from href, apply the DOM setter
     // natively, swap in the fresh component array.
     group.bench_function("set_pathname", |b| {
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        webtypes::install(scope).unwrap();
+        snapshot::boot_context(scope, std::ptr::null()).unwrap();
         let (make, recv) = compile_fn(scope, "() => new URL('https://example.com/a?b=1')");
         let url = make.call(scope, recv, &[]).unwrap();
         let (func, recv) = compile_fn(scope, "u => { u.pathname = '/new/path'; return u }");
@@ -443,27 +440,6 @@ fn compile_fn<'s>(
     let func: v8::Local<v8::Function> = script.run(scope).unwrap().try_into().unwrap();
     let recv: v8::Local<v8::Value> = v8::undefined(scope).into();
     (func, recv)
-}
-
-/// Build a small startup snapshot the way `precompile` does: evaluate a
-/// prefix in a snapshot-creator isolate, mark its context as default,
-/// create the blob.
-fn make_snapshot_blob() -> Vec<u8> {
-    let mut isolate = v8::Isolate::snapshot_creator(None, None);
-    {
-        v8::scope!(let scope, &mut isolate);
-        let context = v8::Context::new(scope, Default::default());
-        let scope = &mut v8::ContextScope::new(scope, context);
-        scope.set_default_context(context);
-        let code =
-            v8::String::new(scope, "globalThis.__prefix = { ready: true, seq: 0 };").unwrap();
-        let script = v8::Script::compile(scope, code, None).unwrap();
-        script.run(scope).unwrap();
-    }
-    isolate
-        .create_blob(v8::FunctionCodeHandling::Keep)
-        .expect("snapshot blob")
-        .to_vec()
 }
 
 // ── policy: eviction scoring + watermark verdict (#66) ─────────────────────
@@ -523,7 +499,7 @@ fn configured() -> Criterion {
     let mut c = Criterion::default()
         // Bounded measurement windows keep the full suite in single-digit
         // minutes on CI; criterion warns when a heavy bench (dense2m,
-        // snapshot_restore) can't fit the sample count and proceeds anyway.
+        // isolate_boot) can't fit the sample count and proceeds anyway.
         .measurement_time(Duration::from_secs(3))
         .warm_up_time(Duration::from_secs(1));
     if std::env::var("ISO4_BENCH_PROFILE").as_deref() == Ok("pr") {

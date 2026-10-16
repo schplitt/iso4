@@ -7,8 +7,9 @@
 pattern: host code prepares setup (globals, data, tool bindings) once, then
 runs many agent-generated postfixes against it. The prefix is stored as
 validated source and evaluated per isolate — there is no runtime V8 snapshot
-(DESIGN.md §11.6) — and prefix runs are served by resident warm instances
-that skip that evaluation on reuse (DESIGN.md §13.2.1).
+(DESIGN.md §11.6); every isolate boots from one build-time snapshot of the
+runtime surface (§11.7) — and prefix runs are served by resident warm
+instances that skip that evaluation on reuse (DESIGN.md §13.2.1).
 
 The project is a pnpm monorepo. Architecture and rationale are documented
 exhaustively in four files:
@@ -55,11 +56,13 @@ iso4/                              ← workspace root
     iso4-v8-<platform>/            ← native Rust binaries (built in CI, not committed)
   native/
     v8-runtime/                    ← Rust source for the V8 host binary
+      build.rs                     ← builds the startup snapshot (compiles src/ modules in)
       src/
         main.rs                    ← arg parsing, UDS accept loop
         session.rs                 ← per-connection message loop, prefix store
         v8.rs                      ← isolates, contexts, prefix evaluation, limits
         warm.rs                    ← warm-instance registry
+        snapshot.rs                ← build-time startup snapshot: create, boot, external refs
         policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader
         ipc.rs, wire.rs, blob.rs   ← frames, payload codecs, V8 serialization
 ```
@@ -380,8 +383,15 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   must be deny-by-default.
 - Do not add ad-hoc inline JS preludes for `console`, `crypto`, or `fetch`.
   Runtime-owned surface is installed natively (`install_console`,
-  `webtypes::install`), and `fetch` is just a host-configured bridge
-  global/function rather than a special always-installed runtime stub.
+  `webtypes::install_with_streams`) into the build-time snapshot, and
+  `fetch` is just a host-configured bridge global/function rather than a
+  special always-installed runtime stub.
+- Do not create an isolate with V8's stock snapshot (`CreateParams::default()`,
+  `Isolate::create_params()`), even in tests: use
+  `snapshot::create_params()`. Mixing the two in one process corrupts V8's
+  shared read-only heap. A new native callback installed into the snapshot
+  context must be added to `snapshot.rs`'s external-references table, and it
+  reads per-instance state from an isolate slot, never from a baked `External`.
 - Do not forget to run `pnpm changeset` when a PR changes user-visible
   behavior in a published package. Internal-only changes (refactors,
   tests, docs) do not need one.
