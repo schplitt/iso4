@@ -413,7 +413,7 @@ interface RunError {
   message: string
   stack?: string
   fields?: Record<string, unknown> // all other own-enumerable props of the thrown error
-  resetCause?: 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' // ERR_INSTANCE_RESET only
+  resetCause?: 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'unsupported' // ERR_INSTANCE_RESET only
   culpritRunId?: number // ERR_INSTANCE_RESET only: the run whose interruption reset the instance
 }
 ```

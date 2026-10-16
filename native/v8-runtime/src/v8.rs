@@ -95,12 +95,14 @@ pub struct Limits {
 /// `ReasonCell::get()` returning `None`. The kill writes its reason BEFORE
 /// `terminate_execution`, so detection never rides on V8's transient
 /// terminate flag (which a microtask checkpoint can consume silently).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum TerminationReason {
     Wall,
     Cpu,
     Memory,
     Abort,
+    /// Sandbox code called dynamic `import()`; carries the run's message.
+    Import(Arc<str>),
 }
 
 /// First-writer-wins slot for the run's termination reason, shared between
@@ -134,7 +136,7 @@ impl ReasonCell {
     }
 
     fn get(&self) -> Option<TerminationReason> {
-        *self.reason.lock().unwrap_or_else(|p| p.into_inner())
+        self.reason.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     fn bare_terminate(&self) -> bool {
@@ -277,6 +279,54 @@ unsafe extern "C" fn deny_wasm_codegen(
     _source: v8::Local<v8::String>,
 ) -> bool {
     false
+}
+
+/// Dynamic `import()` ends the whole run: records the reason, then terminates
+/// so no guest `try`/`catch` can observe it. Reads the isolate's reason slot.
+fn dynamic_import_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    _resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    // Bounded copy: the specifier is guest-built and may be hundreds of MB.
+    let mut head = [0u16; 256];
+    let len = specifier.length().min(head.len());
+    specifier.write_v2(scope, 0, &mut head, v8::WriteFlags::empty());
+    let cut = specifier.length() > head.len();
+    let mut head = &head[..len];
+    // A cut inside a surrogate pair would decode to U+FFFD.
+    if cut && head.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+        head = &head[..len - 1];
+    }
+    let ellipsis = if cut { "…" } else { "" };
+    let message = format!(
+        "dynamic import() is not supported: '{}{ellipsis}'",
+        String::from_utf16_lossy(head)
+    );
+    if let Some(reason) = scope.get_slot::<Arc<ReasonCell>>() {
+        reason.set(TerminationReason::Import(message.into()));
+    }
+    scope.terminate_execution();
+    // A little JS lands the terminate inside this call (a TryCatch would eat it).
+    if let Some(script) = v8::String::new(scope, "for (let i = 0; i < 2; i++) {}")
+        .and_then(|src| v8::Script::compile(scope, src, None))
+    {
+        script.run(scope);
+    }
+    if scope.is_execution_terminating() {
+        return None;
+    }
+    // Not delivered yet: a never-settling promise; the pending terminate and
+    // the reason end the run at the next check.
+    v8::PromiseResolver::new(scope).map(|r| r.get_promise(scope))
+}
+
+/// Wire the dynamic `import()` handler and the reason slot it reports into.
+fn install_dynamic_import(isolate: &mut v8::OwnedIsolate, reason: &Arc<ReasonCell>) {
+    isolate.set_slot(Arc::clone(reason));
+    isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
 }
 
 /// Tracks how much CPU the guest's own thread has burned.
@@ -1313,6 +1363,9 @@ pub enum ResetCause {
     Wall,
     Abort,
     Internal,
+    /// The culprit used something the runtime does not support (today:
+    /// dynamic `import()`), so the runtime ended it.
+    Unsupported,
 }
 
 /// All the ways an execution can fail.
@@ -1326,8 +1379,11 @@ pub enum RunError {
     CompileError(String),
     /// Uncaught exception thrown during execution.
     RuntimeError(Box<RuntimeErrorData>),
-    /// `import` specifier not found in the host imports map.
+    /// No module with this specifier; the message names it.
     ModuleNotFound(String),
+    /// Any other import failure: a missing named export, another V8
+    /// instantiate failure, or a dynamic `import()` (which ends the run).
+    Import(String),
     /// An export value is a function or an unresolved Promise.
     ExportNotSerializable(String),
     /// A registered host type (`Request`, `Response`, …) cannot cross this
@@ -1743,7 +1799,7 @@ fn run_module_inner(
     // (see `build_host_module`); the callback consults the resolver context to
     // find the values array staged for the module being initialised.
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
-    isolate.set_slot(Arc::clone(&reason));
+    install_dynamic_import(&mut isolate, &reason);
 
     // ── The limit guard ──────────────────────────────────────────────────
     // The instance's watchdog registration (#145) — a one-off run IS an
@@ -2338,7 +2394,7 @@ fn run_call_phase(
         // instance loop's taint check does.
         if facts.reason.get().is_some() {
             let result = if matches!(rs.phase, RunPhase::Grace(_)) {
-                Ok(finish_post_phase(&mut rs))
+                Ok(finish_killed_grace(&facts, &mut rs))
             } else {
                 Err(rs.fail(reason_error(facts.reason)))
             };
@@ -2909,7 +2965,7 @@ fn start_turn(
         {
             let err = take_resolver()
                 .and_then(|ctx| ctx.resolve_error)
-                .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
+                .unwrap_or_else(|| RunError::Import(exception_message(scope)));
             return finished(Err(rs.fail(termination_or(facts.reason, err))));
         }
 
@@ -2926,6 +2982,7 @@ fn start_turn(
                     Some(TerminationReason::Memory) => RunError::MemoryLimit,
                     // A hard abort's mid-turn kill (`GuardCtl::abort_executing`).
                     Some(TerminationReason::Abort) => RunError::Aborted,
+                    Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
                     // Belt-and-suspenders: a terminate with no reason at all.
                     None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
                     None => RunError::RuntimeError(Box::new(RuntimeErrorData {
@@ -3049,6 +3106,7 @@ fn invoke_requested_call(
                 Some(TerminationReason::Memory) => RunError::MemoryLimit,
                 // A hard abort's mid-turn kill.
                 Some(TerminationReason::Abort) => RunError::Aborted,
+                Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
                 None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
                 None => match scope.exception() {
                     Some(exception) => runtime_error_from_value(scope, exception),
@@ -3346,13 +3404,14 @@ fn finish_turn(
             // A mid-turn kill during grace: the caller's taint verdict sees
             // the reason cell; end the phase now instead of idling out the
             // wall — the slot frees immediately.
-            return finished(Ok(finish_post_phase(rs)));
+            return finished(Ok(finish_killed_grace(facts, rs)));
         }
         let error = match r {
             TerminationReason::Wall => RunError::WallTimeout,
             TerminationReason::Cpu => RunError::CpuTimeout,
             TerminationReason::Memory => RunError::MemoryLimit,
             TerminationReason::Abort => RunError::Aborted,
+            TerminationReason::Import(m) => RunError::Import(m.to_string()),
         };
         return finished(Err(rs.fail(error)));
     }
@@ -3477,6 +3536,7 @@ fn scan(
                         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
                         Some(TerminationReason::Memory) => RunError::MemoryLimit,
                         Some(TerminationReason::Abort) => RunError::Aborted,
+                        Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
                         None => {
                             if root_is_call_result {
                                 let path = facts
@@ -4350,7 +4410,7 @@ fn grace_scan(
     // happened instead of idling out the wall — the instance is tainted
     // either way, but the slot frees now.
     if facts.reason.get().is_some() {
-        return finished(Ok(finish_post_phase(rs)));
+        return finished(Ok(finish_killed_grace(facts, rs)));
     }
 
     // Outbound streams: produce as far as host credit and the guest
@@ -4358,7 +4418,7 @@ fn grace_scan(
     // phase budgets.
     drive_out_streams(scope, rs);
     if facts.reason.get().is_some() {
-        return finished(Ok(finish_post_phase(rs)));
+        return finished(Ok(finish_killed_grace(facts, rs)));
     }
 
     // ── The waitUntil part, while undecided ──────────────────────────────
@@ -4391,7 +4451,7 @@ fn grace_scan(
         unsafe { *(*rs.pending).slot.borrow_mut() = Some(still) };
         // Reading a rejection can run guest getters.
         if facts.reason.get().is_some() {
-            return finished(Ok(finish_post_phase(rs)));
+            return finished(Ok(finish_killed_grace(facts, rs)));
         }
 
         let grace_ms = rs.limits.grace_ms;
@@ -4426,6 +4486,18 @@ fn grace_scan(
         return finished(Ok(finish_post_phase(rs)));
     }
     ScanOutcome::Continue
+}
+
+/// [`finish_post_phase`] after a mid-turn kill; a dynamic `import()` keeps
+/// its message on the grace report.
+fn finish_killed_grace(facts: &RunFacts<'_>, rs: &mut RunState) -> Output {
+    if let (Some(TerminationReason::Import(message)), RunPhase::Grace(g)) =
+        (facts.reason.get(), &mut rs.phase)
+    {
+        g.error
+            .get_or_insert_with(|| capped_grace_error("Error".to_string(), message.to_string()));
+    }
+    finish_post_phase(rs)
 }
 
 /// End the post-Result phase with the waitUntil part's recorded status
@@ -4675,7 +4747,7 @@ fn new_capped_isolate(
     isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
-    isolate.set_slot(Arc::clone(reason));
+    install_dynamic_import(&mut isolate, reason);
     // Same rationale as the one-off path: no blocking Atomics.wait, ever.
     isolate.set_allow_atomics_wait(false);
     isolate.set_allow_wasm_code_generation_callback(deny_wasm_codegen);
@@ -4701,6 +4773,7 @@ fn new_capped_isolate(
 fn warmup_error(reason: &ReasonCell, fallback: RunError) -> RunError {
     match reason.get() {
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
         Some(_) => RunError::WarmupLimit,
         None => fallback,
     }
@@ -5145,6 +5218,7 @@ fn reason_error(reason: &ReasonCell) -> RunError {
         Some(TerminationReason::Wall) => RunError::WallTimeout,
         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
+        Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
         Some(TerminationReason::Abort) | None => RunError::Aborted,
     }
 }
@@ -5791,6 +5865,7 @@ fn taint_sweep(
         Some(TerminationReason::Cpu) => ResetCause::Cpu,
         Some(TerminationReason::Memory) => ResetCause::Memory,
         Some(TerminationReason::Wall) => ResetCause::Wall,
+        Some(TerminationReason::Import(_)) => ResetCause::Unsupported,
         Some(TerminationReason::Abort) | None => ResetCause::Abort,
     };
     // The culprit was concluded by the caller before the sweep; its wire id
@@ -6125,7 +6200,7 @@ fn evaluate_prefix_module(
     {
         let err = take_resolver()
             .and_then(|ctx| ctx.resolve_error)
-            .unwrap_or_else(|| RunError::ModuleNotFound(exception_message(scope)));
+            .unwrap_or_else(|| RunError::Import(exception_message(scope)));
         return Err(err);
     }
 
@@ -6298,6 +6373,7 @@ fn termination_or(reason: &ReasonCell, fallback: RunError) -> RunError {
         Some(TerminationReason::Cpu) => RunError::CpuTimeout,
         Some(TerminationReason::Memory) => RunError::MemoryLimit,
         Some(TerminationReason::Abort) => RunError::Aborted,
+        Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
         None => fallback,
     }
 }
@@ -6473,13 +6549,13 @@ fn staged_base_id(specifier: &str) -> u32 {
 
 /// The module resolver V8 calls during `instantiate_module`.
 ///
-/// Returning `None` causes V8 to throw "Cannot find module …"; the outer
-/// instantiate path converts that into `RunError::ModuleNotFound`.
+/// An unknown specifier records `RunError::ModuleNotFound` and returns `None`
+/// without a V8 exception; the instantiate path reports the recorded error.
 fn module_resolver_callback<'a>(
     context: v8::Local<'a, v8::Context>,
     specifier: v8::Local<'a, v8::String>,
     _import_assertions: v8::Local<'a, v8::FixedArray>,
-    _referrer: v8::Local<'a, v8::Module>,
+    referrer: v8::Local<'a, v8::Module>,
 ) -> Option<v8::Local<'a, v8::Module>> {
     v8::callback_scope!(unsafe let callback_scope, context);
     // `NewEscapableHandleScope` is implemented for a pinned `HandleScope`, not
@@ -6508,7 +6584,24 @@ fn module_resolver_callback<'a>(
             specifier: specifier_str.clone(),
             module: ImportModule::Source(ISO4_RUNTIME_MODULE_SRC.to_string()),
         },
-        None => return None,
+        None => {
+            // The root module is never cached, so a cached referrer is an import.
+            let importer = RESOLVER_CTX.with(|c| {
+                c.borrow().as_ref().and_then(|ctx| {
+                    ctx.module_cache
+                        .iter()
+                        .find(|(_, m)| referrer == **m)
+                        .map(|(name, _)| name.clone())
+                })
+            });
+            record_resolve_error(RunError::ModuleNotFound(match importer {
+                Some(importer) => {
+                    format!("Cannot find module '{specifier_str}' imported from '{importer}'")
+                }
+                None => format!("Cannot find module '{specifier_str}'"),
+            }));
+            return None;
+        }
     };
     let module = match &binding.module {
         ImportModule::Source(source) => compile_source_module(scope, &specifier_str, source)?,
@@ -16170,5 +16263,356 @@ mod tests {
             assert!(!next.tainted, "{export}: the next call is clean");
             assert!(next.result.is_ok(), "{export}: the next call succeeds");
         }
+    }
+
+    // ── Import failures ──────────────────────────────────────────────────
+
+    const DYN_IMPORT_MSG: &str = "dynamic import() is not supported: 'lodash'";
+
+    fn expect_import(err: &RunError) -> &str {
+        match err {
+            RunError::Import(m) => m,
+            other => panic!("expected Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_import_names_the_specifier() {
+        match run_err("import x from 'lodash'; export default x") {
+            RunError::ModuleNotFound(m) => assert_eq!(m, "Cannot find module 'lodash'"),
+            other => panic!("expected ModuleNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_nested_import_names_its_importer() {
+        let imports = [source_import(
+            "src:a",
+            "import b from 'missing:b'; export default b",
+        )];
+        let err = run_with_source_imports("import a from 'src:a'; export default a", &imports)
+            .unwrap_err();
+        match err {
+            RunError::ModuleNotFound(m) => {
+                assert_eq!(m, "Cannot find module 'missing:b' imported from 'src:a'")
+            }
+            other => panic!("expected ModuleNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_named_export_is_an_import_error() {
+        let imports = [host_import(
+            "tools",
+            vec![("yes", HostModuleNode::Data(testval::to_blob(&WireValue::Number(1.0))))],
+        )];
+        let err = run_with_source_imports("import { nope } from 'tools'; export default nope", &imports)
+            .unwrap_err();
+        let m = expect_import(&err);
+        assert!(
+            m.contains("does not provide an export named 'nope'"),
+            "V8's message is kept: {m}"
+        );
+    }
+
+    #[test]
+    fn a_source_import_that_fails_to_compile_stays_a_compile_error() {
+        let imports = [source_import("src:bad", "export const = ;")];
+        let err = run_with_source_imports("import x from 'src:bad'; export default x", &imports)
+            .unwrap_err();
+        assert!(matches!(err, RunError::CompileError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn dynamic_import_at_top_level_ends_the_run_through_try_catch() {
+        let failure = run_code(
+            "let caught = false\n\
+             try { await import('lodash') } catch { caught = true }\n\
+             export default caught",
+            "<iso4>",
+            Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+        assert!(failure.cpu_time_ms <= failure.wall_time_ms + 0.001);
+        assert!(failure.cpu_time_ms <= failure.duration_ms);
+    }
+
+    #[test]
+    fn dynamic_import_without_await_cannot_be_swallowed() {
+        let failure = run_code(
+            "import('lodash').catch(() => {})\n\
+             console.log('after')\n\
+             export default 1",
+            "<iso4>",
+            Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+        assert!(failure.stdout.is_empty(), "nothing runs after the import() call");
+    }
+
+    #[test]
+    fn dynamic_import_in_an_async_function_ends_the_run() {
+        let err = run_err(
+            "async function load() { await 0; try { return await import('lodash') } catch { return 'swallowed' } }\n\
+             export default await load().catch(() => 'swallowed')",
+        );
+        assert_eq!(expect_import(&err), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn dynamic_import_in_a_timer_callback_ends_the_run() {
+        let err = run_err(
+            "export default await new Promise(r => setTimeout(() => {\n\
+               try { import('lodash') } catch {}\n\
+               r('swallowed')\n\
+             }, 1))",
+        );
+        assert_eq!(expect_import(&err), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn dynamic_import_in_a_called_export_ends_the_run() {
+        let err = run_call(
+            "export function f() { try { import('lodash') } catch {} return 1 }",
+            "f",
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&err), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn dynamic_import_after_a_bridge_await_ends_the_run() {
+        let (out, h) = run_with_bridge(
+            "await myTool()\n\
+             try { await import('lodash') } catch {}\n\
+             export default 'swallowed'",
+            "myTool",
+            Limits {
+                wall_time_ms: 10_000,
+                ..Default::default()
+            },
+            |s| {
+                ipc::write_ts_to_rust_frame(
+                    s,
+                    ipc::TsToRustMessageType::BridgeResponse,
+                    &bridge_resp_ok(0, &WireValue::Number(1.0)),
+                )
+                .unwrap();
+            },
+        );
+        h.join().unwrap();
+        let failure = out.unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+        assert_eq!(failure.bridge_calls.len(), 1, "the bridge record survives");
+    }
+
+    #[test]
+    fn dynamic_import_in_a_prefix_fails_validation() {
+        let failure = validate_prefix_module(
+            "try { await import('lodash') } catch {}\nexport default 1",
+            "<prefix>",
+            &[],
+            &[],
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn dynamic_import_in_a_prefix_fails_warm_up() {
+        init_platform();
+        let Err(failure) = create_instance_core(
+            Some(PrefixSpec {
+                code: "try { import('lodash') } catch {}",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        ) else {
+            panic!("a prefix calling import() cannot warm up");
+        };
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn dynamic_import_on_a_warm_core_taints_it() {
+        init_platform();
+        let mut core = create_instance_core(
+            Some(PrefixSpec {
+                code: "export function f() { try { import('lodash') } catch {} return 1 }",
+                filename: "<prefix>",
+                globals: &[],
+            }),
+            &[],
+            0,
+        )
+        .expect("prefix warms up");
+        let call = call_spec("f", &[]);
+        let outcome = run_call_on_core(
+            &mut core,
+            None,
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Some(&call),
+        );
+        assert!(outcome.tainted, "an interrupted instance must be discarded");
+        assert_eq!(expect_import(&outcome.result.unwrap_err().error), DYN_IMPORT_MSG);
+
+        let mut core = create_instance_core(None, &[], 0).expect("core");
+        let outcome = run_call_on_core(
+            &mut core,
+            Some("try { await import('lodash') } catch {}\nexport default 1"),
+            "<iso4>",
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        );
+        assert!(outcome.tainted);
+        assert_eq!(expect_import(&outcome.result.unwrap_err().error), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn dynamic_import_during_grace_ends_the_phase_with_its_message() {
+        init_platform();
+        let mut core = create_instance_core(None, &[], 0).expect("core");
+        let outcome = run_call_on_core(
+            &mut core,
+            Some(
+                "waitUntil(new Promise(r => setTimeout(r, 1)).then(() => import('lodash')).catch(() => {}))\n\
+                 export default 'early'",
+            ),
+            "<iso4>",
+            &[],
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        );
+        assert!(outcome.tainted);
+        let out = outcome.result.expect("the value settled before grace");
+        assert_eq!(get_default(&out).as_deref(), Some("early"));
+        let bg = out.background.expect("grace ran");
+        assert_eq!(bg.status, GraceStatus::Truncated);
+        assert_eq!(bg.error, Some(("Error".to_string(), DYN_IMPORT_MSG.to_string())));
+    }
+
+    #[test]
+    fn a_long_specifier_is_capped_in_the_message() {
+        let err = run_err("try { import('€'.repeat(100_000)) } catch {}\nexport default 1");
+        let expected = format!("dynamic import() is not supported: '{}…'", "€".repeat(256));
+        assert_eq!(expect_import(&err), expected);
+    }
+
+    #[test]
+    fn a_long_specifier_is_capped_on_the_grace_report() {
+        init_platform();
+        let mut core = create_instance_core(None, &[], 0).expect("core");
+        let outcome = run_call_on_core(
+            &mut core,
+            Some(
+                "waitUntil(new Promise(r => setTimeout(r, 1)).then(() => import('€'.repeat(3000))).catch(() => {}))\n\
+                 export default 1",
+            ),
+            "<iso4>",
+            &[],
+            grace_limits(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            None,
+        );
+        let bg = outcome.result.expect("value settled").background.expect("grace ran");
+        let expected = format!("dynamic import() is not supported: '{}…'", "€".repeat(256));
+        assert_eq!(bg.error, Some(("Error".to_string(), expected)));
+    }
+
+    #[test]
+    fn dynamic_import_in_a_bridge_argument_getter_is_an_import_error() {
+        let failure = run_with_silent_bridge(
+            "await myTool({ get g() { try { import('lodash') } catch {} return 1 } })\n\
+             export default 'swallowed'",
+            silent_limits(),
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn no_error_field_getter_runs_after_a_dynamic_import() {
+        let failure = run_with_silent_bridge(
+            "const e = new Error('x')\n\
+             e.a = { get g() { try { import('lodash') } catch {} return 1 } }\n\
+             e.b = { get h() { myTool('after'); return 2 } }\n\
+             throw e",
+            silent_limits(),
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+        assert!(failure.bridge_calls.is_empty(), "got {:?}", failure.bridge_calls);
+    }
+
+    #[test]
+    fn dynamic_import_in_a_thrown_errors_message_getter_is_an_import_error() {
+        let err = run_err(
+            "const e = new Error('x')\n\
+             Object.defineProperty(e, 'message', { get() { import('lodash'); return 'm' } })\n\
+             throw e",
+        );
+        assert_eq!(expect_import(&err), DYN_IMPORT_MSG);
+    }
+
+    #[test]
+    fn no_export_getter_runs_after_a_dynamic_import() {
+        let failure = run_code(
+            "export const a = { get g() { try { import('lodash') } catch {} return 1 } }\n\
+             export const b = { get h() { console.log('ran'); return 2 } }",
+            "<iso4>",
+            Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+        assert!(failure.stdout.is_empty(), "got {:?}", failure.stdout);
+    }
+
+    #[test]
+    fn nothing_runs_after_a_dynamic_import_inside_console_rendering() {
+        let failure = run_code(
+            "console.log({ toJSON() { try { import('lodash') } catch {} return 1 } })\n\
+             console.log('after')\n\
+             export default 1",
+            "<iso4>",
+            Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
+        assert!(failure.stdout.is_empty(), "got {:?}", failure.stdout);
+    }
+
+    #[test]
+    fn a_sync_call_that_queues_a_dynamic_import_fails_itself() {
+        let err = run_call(
+            "export function f() { Promise.resolve().then(() => import('lodash')); return 1 }",
+            "f",
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(expect_import(&err), DYN_IMPORT_MSG);
     }
 }

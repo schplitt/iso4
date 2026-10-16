@@ -16,6 +16,7 @@ because the distinction they draw is the one that matters to library code:
 | ⚪  | Present and inert. Callable, never throws, does nothing. Exists so feature-detecting libraries load. |
 | ❌  | Absent. `typeof` is `"undefined"`; touching it is a `ReferenceError`.                                |
 | 🔴  | Present and throws.                                                                                  |
+| ⛔  | Ends the whole run. Uncatchable, like a CPU or memory kill.                                          |
 
 ## The shape of the surface
 
@@ -211,10 +212,22 @@ recorded as future scope.
 | every other `node:*`                | ❌  | `ERR_MODULE_NOT_FOUND`. No stub modules                                                         |
 | bare specifiers (`fs`, `lodash`, …) | ❌  | `ERR_MODULE_NOT_FOUND`                                                                          |
 | host-declared imports               | ✅  | the host declares every specifier a run may import, as source or as a data-shaped module        |
+| dynamic `import()`                  | ⛔  | terminates the run with `ERR_IMPORT`; `try`/`catch` cannot intercept it                         |
 
 There is no resolver, no `node_modules`, and no `require`. Unlike Workers,
 iso4 ships **no non-functional stubs**: an unavailable module fails at import
 rather than at first call.
+
+`ERR_MODULE_NOT_FOUND` names the missing specifier, plus the importing module
+when that is not the run's own code: `Cannot find module 'missing:b' imported
+from 'src:a'`. Every other linking failure, such as a missing named export, is
+`ERR_IMPORT` with V8's message. A source import that does not compile is
+`ERR_COMPILE`. Dynamic `import()` is `ERR_IMPORT` too, with the message
+`dynamic import() is not supported: '<specifier>'`; it stops execution on the
+spot, in run code, timers, `waitUntil` work and prefix code alike, and a
+prefix that calls it fails `prepare()`. Arguments V8 itself rejects
+(`import(Symbol())`, `import('x', 5)`, a throwing `toString` or `with` getter)
+give a catchable error instead, before anything loads.
 
 ---
 
