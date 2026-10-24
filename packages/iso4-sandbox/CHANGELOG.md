@@ -1,5 +1,29 @@
 # @iso4/sandbox
 
+## 0.8.2
+
+### Patch Changes
+
+- f5e0561: fix(sandbox): refuse arrays with holes in bridge call arguments (#219)
+
+  A bridge global or import called with a holey array anywhere in its arguments now rejects with a catchable `TypeError` before the host handler runs.
+
+- ad5edf7: fix(native): cap error text copied out of V8 at 64 Ki UTF-16 units (#250)
+
+  A huge thrown message, stack or console line no longer crashes the runtime; the copied text ends with `… [truncated by iso4: N UTF-16 units total]`.
+
+- 77a45d5: fix(sandbox): name the missing module in `ERR_MODULE_NOT_FOUND` and report other import failures as the new `ERR_IMPORT`
+
+  Dynamic `import()` now ends the run with `ERR_IMPORT` instead of throwing a catchable error, and co-resident runs on the same instance get `ERR_INSTANCE_RESET` with the new cause `'unsupported'`.
+
+- a31c818: fix(sandbox): settle sync-call microtasks within the call, fix kill precedence and a multibyte grace crash
+
+  Microtasks a synchronous `prefix.call` queues now settle inside that call instead of the next one, a CPU/wall/memory kill wins over a bridge error raised in the same turn, and a multibyte `waitUntil` error no longer crashes the runtime. An uncloneable bridge argument is now `ERR_EXPORT_NOT_SERIALIZABLE` (was `ERR_INTERNAL`).
+
+- 802e246: perf(native): boot every sandbox from a build-time V8 snapshot (#83)
+
+  The runtime's built-in JavaScript is no longer compiled and run for each new sandbox, so one-off runs and cold starts are faster. Nothing changes for guest code.
+
 ## 0.8.1
 
 ### Patch Changes
