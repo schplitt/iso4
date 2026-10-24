@@ -153,6 +153,7 @@ fn reset_cause_byte(cause: crate::v8::ResetCause) -> u8 {
         crate::v8::ResetCause::Abort => 2,
         crate::v8::ResetCause::Internal => 3,
         crate::v8::ResetCause::Wall => 4,
+        crate::v8::ResetCause::Unsupported => 5,
     }
 }
 
@@ -556,6 +557,7 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             reset: None,
         },
         RunError::ModuleNotFound(msg) => plain("ERR_MODULE_NOT_FOUND", "Error", msg.clone()),
+        RunError::Import(msg) => plain("ERR_IMPORT", "Error", msg.clone()),
         RunError::ExportNotSerializable(msg) => {
             plain("ERR_EXPORT_NOT_SERIALIZABLE", "Error", msg.clone())
         }
@@ -633,6 +635,7 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
                     crate::v8::ResetCause::Wall => "wall deadline",
                     crate::v8::ResetCause::Abort => "mid-execution abort",
                     crate::v8::ResetCause::Internal => "internal failure",
+                    crate::v8::ResetCause::Unsupported => "unsupported operation",
                 },
             ),
             stack: None,

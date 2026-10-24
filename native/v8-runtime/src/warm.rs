@@ -1854,6 +1854,7 @@ mod tests {
                    export async function hangBump() { n++; await tool(); return n }\n\
                    export async function twoTools() { const a = await tool(); const b = await tool(); return a + b }\n\
                    export function spin() { for (;;) {} }\n\
+                   export function dynImport() { try { import('lodash') } catch {} return 1 }\n\
                    export async function spinAfterTool() { await tool(); for (;;) {} }\n\
                    export function busy(c) { let x = 0; for (let i = 0; i < c; i++) x = (x + i) & 1048575; return x }"
                 .to_string(),
@@ -2108,6 +2109,47 @@ mod tests {
             } => {
                 assert_eq!(cause, sandbox::ResetCause::Cpu);
                 assert_eq!(culprit_run_id, 7, "the culprit's wire run id is named");
+            }
+            other => panic!("expected InstanceReset, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dynamic_import_resets_innocent_co_resident_runs() {
+        sandbox::init_platform();
+        let (mut server, client) = UnixStream::pair().unwrap();
+        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let counter = Arc::new(AtomicU32::new(0));
+
+        let victim = submit_session_job(
+            &handle, 8, "viaTool", vec![TestValue::Number(1.0)],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let _ = read_bridge_call(&mut server);
+
+        let culprit = submit_session_job(
+            &handle, 7, "dynImport", vec![],
+            sink.clone(), &counter, sandbox::Limits::default(),
+        );
+        let culprit_out = culprit.outcome.recv().expect("culprit concludes");
+        assert!(culprit_out.tainted);
+        match culprit_out.result.unwrap_err().error {
+            sandbox::RunError::Import(m) => {
+                assert_eq!(m, "dynamic import() is not supported: 'lodash'")
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+
+        let victim_out = victim.outcome.recv().expect("victim concludes");
+        assert!(victim_out.tainted);
+        match victim_out.result.unwrap_err().error {
+            sandbox::RunError::InstanceReset {
+                cause,
+                culprit_run_id,
+            } => {
+                assert_eq!(cause, sandbox::ResetCause::Unsupported);
+                assert_eq!(culprit_run_id, 7);
             }
             other => panic!("expected InstanceReset, got {other:?}"),
         }
