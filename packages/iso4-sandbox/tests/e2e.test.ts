@@ -5499,3 +5499,63 @@ describe('refused runs release call arguments', () => {
     await prefix.dispose()
   })
 })
+
+describe('kills and bridge violations', () => {
+  let runtime: Runtime
+
+  beforeAll(async () => {
+    runtime = await createRuntime()
+  })
+
+  afterAll(async () => {
+    await runtime?.dispose()
+  })
+
+  test('a sync prefix.call owns the microtasks it queued', async () => {
+    const calls: unknown[] = []
+    await using prefix = await runtime.prepare({
+      code: `
+        let n = 0
+        export function leak() { Promise.resolve().then(() => tool('leak')); return 1 }
+        export function bump() { return ++n }
+      `,
+      globals: {
+        tool: async (x: unknown) => {
+          calls.push(x)
+          return 1
+        },
+      },
+    })
+    const leak = await prefix.call({ export: 'leak' })
+    expect(leak.ok).toBe(true)
+    expect(leak.bridgeCalls).toHaveLength(1)
+    const next = await prefix.call({ export: 'bump' })
+    expect(next.ok).toBe(true)
+    if (next.ok)
+      expect(next.value).toBe(1)
+    expect(next.bridgeCalls).toEqual([])
+    expect(calls).toEqual(['leak'])
+  })
+
+  test('a Proxy bridge argument is ERR_EXPORT_NOT_SERIALIZABLE', async () => {
+    const proxy = await runtime.run({
+      code: `await tool(new Proxy({}, {})); export default 1`,
+      globals: { tool: async () => 1 },
+    })
+    expect(proxy.ok).toBe(false)
+    if (!proxy.ok)
+      expect(proxy.error.code).toBe('ERR_EXPORT_NOT_SERIALIZABLE')
+  })
+
+  test('a multibyte waitUntil rejection is capped without crashing the runtime', async () => {
+    const result = await runtime.run({
+      code: `waitUntil(Promise.reject(new Error('€'.repeat(3000)))); export default 1`,
+    })
+    expect(result.ok).toBe(true)
+    if (!result.ok)
+      return
+    const report = await result.waitUntil!
+    expect(report.status).toBe('failed')
+    expect(report.error?.message).toBe(`${'€'.repeat(682)}… [truncated]`)
+  })
+})
