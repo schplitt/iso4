@@ -46,6 +46,15 @@ ada-url = "4"
 # Unicode XID tables for the host-module export name check (widened to ID in v8.rs).
 unicode-ident = "1"
 
+# build.rs compiles the runtime modules to create the startup snapshot, so it
+# needs every dependency they use.
+[build-dependencies]
+v8 = "152.2"
+crossbeam-channel = "0.5"
+libc = "0.2"
+ada-url = "4"
+unicode-ident = "1"
+
 [dev-dependencies]
 # Wall-time microbenchmarks (benches/micro.rs). Plots and rayon disabled:
 # CI only needs `--output-format bencher` text output.

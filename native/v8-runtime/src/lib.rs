@@ -13,6 +13,7 @@ pub mod oom;
 pub mod policy;
 pub mod rss;
 pub mod session;
+pub mod snapshot;
 #[cfg(test)]
 pub mod testval;
 pub mod url;
@@ -21,3 +22,6 @@ pub mod warm;
 pub mod webcodec;
 pub mod webtypes;
 pub mod wire;
+
+/// The startup snapshot `build.rs` creates (see `snapshot.rs`).
+pub static SNAPSHOT_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin"));

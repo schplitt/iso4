@@ -123,8 +123,8 @@ analytics use case is served by a separate package, not a backend swap.
 8. **Captured stdout/stderr** via a runtime-owned `console`.
 9. **Pre-validated prefix code**: `prepare()` validates the prefix once;
    each run re-evaluates the cached source (sub-ms for typical prefixes;
-   grows with prefix size). Runtime startup snapshots were removed — see
-   §11.6.
+   grows with prefix size). Per-prefix runtime snapshots were removed — see
+   §11.6; isolates boot from one build-time snapshot instead (§11.7).
 10. **Composable monorepo structure**: the runtime is one package (`iso4`);
     fetch hardening (`@iso4/fetch`), stdlib stubs (`@iso4/fs`,
     `@iso4/crypto`, …), and future extensions are siblings. Each one is a
@@ -187,7 +187,7 @@ host hands it over by name.
   │      │     v8::Context with curated globals             │    
   │      │     deadlines on the shared watchdog thread      │    
   │      │     per-run CPU budgets (enter/leave per turn)   │    
-  │      └─ stock V8 snapshot for sub-ms isolate boot       │    
+  │      └─ build-time snapshot for sub-ms isolate boot     │    
   └─────────────────────────────────────────────────────────┘    
 ```
 
@@ -612,7 +612,7 @@ internal field. The field is what makes serialization work: V8 routes objects
 with internal fields to `WriteHostObject` off a map field read, leaving
 `HasCustomHostObject()` `false` so no embedder callback fires for ordinary
 objects. workerd depends on the same property. Behaviour above the shell is JS,
-evaluated into every run's context at creation (~0.5 ms, measured). *Which*
+installed once into the build-time startup snapshot (§11.7). *Which*
 type an instance is comes from a private-symbol tag stamped at construction —
 never from `instanceof` or `globalThis` lookups, both of which guest code can
 redirect. Private symbols are unreachable from guest JS, so the identity can
@@ -1382,7 +1382,8 @@ Documented up front so we don't drift into rebuilding secure-exec:
    from per-run input. There is no override.
 
 5. **No WebAssembly — for now.** The `WebAssembly` global is deleted from
-   every context (`removals.js`, alongside `SharedArrayBuffer`), so guest
+   every context at boot (`webtypes::delete_removed_globals`, alongside
+   `SharedArrayBuffer`), so guest
    code sees `typeof WebAssembly === 'undefined'` and feature-detects like
    a browser without wasm. Deleting the global — not just denying codegen —
    also closes the `WebAssembly.Memory({ shared: true })` constructor, which
@@ -1674,8 +1675,9 @@ For an interactive agent doing N tool calls per turn, that compounds badly.
 
 `sandbox.prepare()` validates the prefix once (compile + instantiate +
 evaluate in a throwaway isolate) and stores its source and declared shape in
-the Rust process. A cold `prefix.execute()` boots a fresh isolate from V8's
-stock snapshot, re-evaluates the prefix, then runs the postfix. The
+the Rust process. A cold `prefix.execute()` boots a fresh isolate from the
+build-time startup snapshot (§11.7), re-evaluates the prefix, then runs the
+postfix. The
 expensive, error-prone part of the loop — authoring and validating the setup
 — is paid once; runs pay only the evaluation.
 
@@ -1691,9 +1693,9 @@ Flow:
        ▼                            ▼                      ▼
   one-time:                    per run:               per run:
   - validate in throwaway      - fresh isolate        - same
-    isolate (compile +           (stock snapshot,
-    instantiate + evaluate)      ~0.3 ms)
-  - cache source +             - web runtime install
+    isolate (compile +           (build-time snapshot)
+    instantiate + evaluate)
+  - cache source +             - boot fixups (§11.7)
     declared shape             - evaluate prefix
                                - bind per-run globals
                                  & imports
@@ -1852,6 +1854,37 @@ exposes it, snapshots can return behind the unchanged `prepare()` API as a
 pure optimization. Until then: prefix = validated source, re-evaluated per
 run; heavy prefixes and sub-ms calls belong to the warm-isolate model
 (the resident-instances work).
+
+### 11.7 The build-time startup snapshot
+
+The runtime surface (console, web types, `AsyncLocalStorage`, `waitUntil`,
+timers) is installed once, by `build.rs`, into a snapshot embedded in the
+binary (`native/v8-runtime/src/snapshot.rs`). Every isolate boots from it, so
+no runtime JS is compiled or evaluated per isolate. This is the mksnapshot
+workflow §11.6 calls supported: one snapshot, made in a separate process,
+never at runtime.
+
+Rules that follow from it:
+
+- **Every isolate in the process boots from this snapshot**, tests included.
+  Mixing it with V8's stock snapshot in one process corrupts the shared
+  read-only heap.
+- **Natives carry no per-instance state.** Each native callback is listed in
+  the snapshot's external-references table; per-instance data (the run
+  table) lives in an isolate slot set at boot.
+- **Boot fixups** run on every context: the frozen clock is reset to the
+  wall clock, and two steps touching globals V8 only adds after restore —
+  the `Temporal.Now` patch, and deleting `SharedArrayBuffer`/`WebAssembly`
+  (§7.5) — are redone.
+- **Late globals sort last.** The globals V8 adds only after restore
+  (`Temporal`, `Float16Array`, `DisposableStack`, `AsyncDisposableStack`,
+  `SuppressedError`) come after the runtime's own in
+  `Object.getOwnPropertyNames(globalThis)`. All are non-enumerable.
+- **Each platform's snapshot is built natively.** `build.rs` runs on the
+  build machine, so release binaries are built on their own architecture.
+- **V8 flags are set in `init_platform` only**, which both `build.rs` and
+  the runtime call: a snapshot must be restored under the flags it was made
+  with.
 
 ## 12. Security model — fetch hardening
 

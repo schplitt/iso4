@@ -168,11 +168,11 @@ mod tests {
     /// `corpus`.
     fn run_driver(corpus: &str, driver: &str) -> String {
         crate::v8::init_platform();
-        let isolate = &mut v8::Isolate::new(Default::default());
+        let isolate = &mut v8::Isolate::new(crate::snapshot::create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        crate::webtypes::install(scope).expect("install web globals");
+        crate::snapshot::boot_context(scope, std::ptr::null()).expect("boot context");
 
         let global = scope.get_current_context().global(scope);
         let key = v8::String::new(scope, "__corpus").unwrap();
