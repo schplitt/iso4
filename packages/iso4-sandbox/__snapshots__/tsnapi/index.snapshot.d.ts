@@ -69,6 +69,8 @@ export interface Prefix<G extends HostGlobals = {}, M extends Imports = {}> {
   dispose: () => Promise<void>;
   [Symbol.asyncDispose]: () => Promise<void>;
   readonly alive: boolean;
+  readonly status: PrefixStatus;
+  readonly error: RunError | undefined;
 }
 export interface PrefixCallOptions<G extends HostGlobals, M extends Imports> extends CallTarget {
   globals?: RebindGlobals<G>;
@@ -116,6 +118,7 @@ export interface RunError {
   fields?: Record<string, unknown>;
   resetCause?: ResetCause;
   culpritRunId?: number;
+  stage?: "prefix";
 }
 export interface RunFailure {
   status: "failed";
@@ -231,6 +234,7 @@ export type HostGlobalValue = HostExportFunction | string | BridgeWithShim<any> 
 export type HostModuleValue = HostExportFunction | HostExportData | HostModuleObject;
 export type Imports<M extends Record<string, ImportValue> = Record<string, ImportValue>> = M;
 export type ImportValue = string | HostModuleObject;
+export type PrefixStatus = "ready" | "broken" | "disposed";
 export type RebindGlobals<G extends HostGlobals> = { [K in keyof G as G[K] extends string | DataGlobal | StringGlobal ? never : K]?: RebindValue<G[K]> };
 export type RebindHostModule<T> = T extends HostExportFunction ? T : T extends HostModuleObject ? { [K in keyof T as T[K] extends HostExportFunction ? K : T[K] extends HostModuleObject ? K : never]?: T[K] extends HostExportFunction ? T[K] : T[K] extends HostModuleObject ? RebindHostModule<T[K]> : never } : never;
 export type RebindImports<M extends Record<string, ImportValue>> = Record<string, ImportValue> extends M ? Record<string, never> : { [K in keyof M as M[K] extends string ? never : K]?: M[K] extends HostModuleObject ? RebindHostModule<M[K]> : never };
@@ -243,7 +247,7 @@ export type SandboxExports = {
 } & {
   [name: string]: unknown;
 };
-export type SetupErrorCode = "ERR_PREFIX_DISPOSED" | "ERR_UNDECLARED_BINDING" | "ERR_RESERVED_NAME" | "ERR_FROZEN_BINDING" | "ERR_INVALID_REBIND";
+export type SetupErrorCode = "ERR_PREFIX_DISPOSED" | "ERR_PREFIX_BROKEN" | "ERR_UNDECLARED_BINDING" | "ERR_RESERVED_NAME" | "ERR_FROZEN_BINDING" | "ERR_INVALID_REBIND";
 // #endregion
 
 // #region Functions

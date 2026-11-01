@@ -126,6 +126,7 @@ fn read_value_blob(data: &[u8], offset: &mut usize) -> io::Result<Vec<u8>> {
 // ── Completion payload types ───────────────────────────────────────────────────
 
 /// Structured error fields for `RunCompletionPayload`.
+#[derive(Clone)]
 pub struct RunErrorPayload {
     pub code: String,
     pub name: String,
@@ -137,6 +138,12 @@ pub struct RunErrorPayload {
     /// Present only for `ERR_INSTANCE_RESET`: the cause class and the wire
     /// run id of the run whose mid-JS interruption reset the instance.
     pub reset: Option<ResetInfo>,
+    /// True when the failure happened while the prefix evaluated (a cold
+    /// start that broke the prefix), false for run code.
+    pub prefix_stage: bool,
+    /// Present only for `ERR_PREFIX_BROKEN`: the stored cold-start failure.
+    /// Only `code`, `name`, `message` and `stack` cross.
+    pub cause: Option<std::sync::Arc<RunErrorPayload>>,
 }
 
 /// The `ERR_INSTANCE_RESET` extras — see `RunErrorPayload::reset`.
@@ -442,7 +449,7 @@ const MAX_ERROR_FIELDS_BYTES: usize = 1024 * 1024;
 
 /// Clamp error text to [`MAX_ERROR_TEXT_BYTES`], on a UTF-8 boundary, and say
 /// so in the result rather than silently shortening it.
-fn clamp_error_text(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn clamp_error_text(text: &str) -> std::borrow::Cow<'_, str> {
     if text.len() <= MAX_ERROR_TEXT_BYTES {
         return std::borrow::Cow::Borrowed(text);
     }
@@ -486,6 +493,23 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
             out.push(1);
             out.push(reset_cause_byte(info.cause));
             encode_u32(info.culprit_run_id, out);
+        }
+        None => out.push(0),
+    }
+    out.push(u8::from(error.prefix_stage));
+    match &error.cause {
+        Some(cause) => {
+            out.push(1);
+            encode_string(&cause.code, out);
+            encode_string(&cause.name, out);
+            encode_string(&clamp_error_text(&cause.message), out);
+            match &cause.stack {
+                Some(s) => {
+                    out.push(1);
+                    encode_string(&clamp_error_text(s), out);
+                }
+                None => out.push(0),
+            }
         }
         None => out.push(0),
     }
@@ -543,6 +567,8 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: None,
             fields: None,
             reset: None,
+            prefix_stage: false,
+            cause: None,
         }
     }
     match error {
@@ -554,6 +580,8 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: inner.stack.clone(),
             fields: inner.fields.clone(),
             reset: None,
+            prefix_stage: false,
+            cause: None,
         },
         RunError::ModuleNotFound(msg) => plain("ERR_MODULE_NOT_FOUND", "Error", msg.clone()),
         RunError::Import(msg) => plain("ERR_IMPORT", "Error", msg.clone()),
@@ -587,6 +615,8 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
             stack: None,
             fields: err.fields.clone(),
             reset: None,
+            prefix_stage: false,
+            cause: None,
         },
         RunError::UndeclaredBinding(msg) => plain("ERR_UNDECLARED_BINDING", "Error", msg.clone()),
         RunError::ReservedName(msg) => plain("ERR_RESERVED_NAME", "Error", msg.clone()),
@@ -643,6 +673,8 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
                 cause: *cause,
                 culprit_run_id: *culprit_run_id,
             }),
+            prefix_stage: false,
+            cause: None,
         },
         RunError::WarmupLimit => plain(
             "ERR_WARMUP_LIMIT",
@@ -881,6 +913,8 @@ mod tests {
                     stack,
                     fields,
                     reset: None,
+                    prefix_stage: false,
+                    cause: None,
                 },
                 stdout: Vec::new(),
                 stderr: Vec::new(),

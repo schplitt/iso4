@@ -1098,7 +1098,8 @@ export interface Prefix<
   call: (options: PrefixCallOptions<G, M>) => Promise<CallResult>
 
   /**
-   * Release the prepared prefix. Subsequent run() calls reject. Idempotent.
+   * Release the prepared prefix. Subsequent run() calls reject with
+   * `ERR_PREFIX_DISPOSED`. Idempotent, and works on a broken prefix too.
    */
   dispose: () => Promise<void>
 
@@ -1107,8 +1108,39 @@ export interface Prefix<
    */
   [Symbol.asyncDispose]: () => Promise<void>
 
+  /**
+   * `true` until `dispose()`. A broken prefix is still alive: it is held
+   * by the runtime and the host still owns its disposal.
+   */
   readonly alive: boolean
+
+  /**
+   * `'ready'` until the runtime reports a prefix-stage failure, `'broken'`
+   * from then on (see {@link PrefixStatus}), `'disposed'` after
+   * `dispose()`. The client learns `'broken'` from the first run's
+   * `{ ok: false, error: { stage: 'prefix' } }` result, or from an
+   * `ERR_PREFIX_BROKEN` refusal if that result went to another client.
+   */
+  readonly status: PrefixStatus
+
+  /**
+   * The stored cold-start failure once the prefix is broken, `undefined`
+   * before. Kept through `dispose()`. Always has `code`, `name`, `message`
+   * and `stack`; `stage` and `fields` are present only when this client saw
+   * the failing run's own result rather than a later `ERR_PREFIX_BROKEN`
+   * refusal.
+   */
+  readonly error: RunError | undefined
 }
+
+/**
+ * Lifecycle of a {@link Prefix}. `'broken'` means the prefix failed to
+ * evaluate with one of its own, repeatable errors; every later run is
+ * refused with `ERR_PREFIX_BROKEN` and the only retry is a new `prepare()`.
+ * Load-dependent cold-start failures (`ERR_WARMUP_LIMIT`,
+ * `ERR_MEMORY_LIMIT`) never break a prefix — the next run cold-starts again.
+ */
+export type PrefixStatus = 'ready' | 'broken' | 'disposed'
 
 /**
  * Options for `prefix.run()`.
@@ -1718,6 +1750,16 @@ export interface RunError {
    * the victims of one reset, so they can be correlated.
    */
   culpritRunId?: number
+  /**
+   * `'prefix'` when the cold start this run paid for failed with one of the
+   * prefix's own, repeatable errors (`ERR_USER_CODE`, `ERR_MODULE_NOT_FOUND`,
+   * `ERR_IMPORT`, `ERR_PREFIX_BRIDGE_CALL`, `ERR_PREFIX_DID_NOT_SETTLE`), so
+   * the failure is the prefix's, not the run code's. Absent for run-code
+   * failures and for load-dependent cold-start failures (`ERR_WARMUP_LIMIT`,
+   * `ERR_MEMORY_LIMIT`), which do not break the prefix. The same run moves
+   * {@link Prefix.status} to `'broken'` (DESIGN.md §16.4).
+   */
+  stage?: 'prefix'
 }
 
 /**
@@ -1741,6 +1783,17 @@ export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'uns
  */
 export type SetupErrorCode
   = | 'ERR_PREFIX_DISPOSED'
+    /**
+     * The prefix is broken: its cold start failed with one of the prefix's
+     * own, repeatable errors (`ERR_USER_CODE`, `ERR_MODULE_NOT_FOUND`,
+     * `ERR_IMPORT`, `ERR_PREFIX_BRIDGE_CALL`, `ERR_PREFIX_DID_NOT_SETTLE`),
+     * so no later run on it can succeed. The thrown error's `cause` is that
+     * stored failure, also available as {@link Prefix.error}. The run that
+     * paid for the cold start got it as an `{ ok: false }` result with
+     * `stage: 'prefix'`; every run after that is refused without booting an
+     * isolate. The only retry is a new `prepare()`.
+     */
+    | 'ERR_PREFIX_BROKEN'
     /**
      * A `prefix.run()` / `prefix.call()` binding (global or import rebind)
      * names something that was never declared at `prepare()` time, a

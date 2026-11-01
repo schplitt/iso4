@@ -115,6 +115,14 @@ if (!check.ok)
   throw new Error(`broken prefix: ${check.error.message}`)
 ```
 
+A failure of the prefix itself carries `error.stage === 'prefix'`, so a
+host can tell it from a failure of the run code. The runtime remembers it:
+`prefix.status` becomes `'broken'`, `prefix.error` holds the failure, and
+every later `execute()`/`call()` rejects with `ERR_PREFIX_BROKEN` (its
+`cause` is that failure) without booting an isolate. `dispose()` still
+works; the only retry is a new `prepare()`. Failures that depend on load
+(`ERR_WARMUP_LIMIT`, `ERR_MEMORY_LIMIT`) never break a prefix.
+
 To check generated names before `prepare()` instead of getting a failed
 setup back, import the predicates from `@iso4/sandbox/utils`. That entry
 never loads the client or the native binary:
@@ -440,6 +448,7 @@ interface RunError {
   fields?: Record<string, unknown> // all other own-enumerable props of the thrown error
   resetCause?: 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'unsupported' // ERR_INSTANCE_RESET only
   culpritRunId?: number // ERR_INSTANCE_RESET only: the run whose interruption reset the instance
+  stage?: 'prefix' // the prefix itself failed to evaluate on this run's cold start
 }
 ```
 
@@ -449,8 +458,10 @@ crashed, binary not found) and for invalid options, the same way `prepare()`
 does. `sandbox.run()`, `prefix.run()` and `prefix.call()` reject with an
 `Error` whose `code` is a `SetupErrorCode`: `ERR_RESERVED_NAME` (a global
 name the runtime owns), `ERR_UNDECLARED_BINDING`, `ERR_FROZEN_BINDING` or
-`ERR_INVALID_REBIND` (a rebind the prefix does not allow), or
-`ERR_PREFIX_DISPOSED`. The client checks these before anything is sent, and
+`ERR_INVALID_REBIND` (a rebind the prefix does not allow),
+`ERR_PREFIX_DISPOSED`, or `ERR_PREFIX_BROKEN` (the prefix failed to
+evaluate on an earlier run; `cause` is that failure). The client checks
+these before anything is sent, and
 the runtime repeats the checks. A malformed option, such as a limit out of range or a
 global name that is not a well-formed string, rejects with a plain
 `TypeError`. Nothing ran, so retrying with the same options can never
@@ -466,6 +477,7 @@ const setupCodes: readonly string[] = [
   'ERR_FROZEN_BINDING',
   'ERR_INVALID_REBIND',
   'ERR_PREFIX_DISPOSED',
+  'ERR_PREFIX_BROKEN',
 ] satisfies SetupErrorCode[]
 
 try {

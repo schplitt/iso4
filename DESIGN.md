@@ -1040,7 +1040,8 @@ The result is _always_ an object; `status` (or the `ok` alias) discriminates.
 invalid before anything runs. Those reject `sandbox.run()`, `prefix.run()` and
 `prefix.call()` exactly as they reject `prepare()` — a plain `Error` whose
 `code` is a `SetupErrorCode` (`ERR_RESERVED_NAME`, `ERR_UNDECLARED_BINDING`,
-`ERR_FROZEN_BINDING`, `ERR_INVALID_REBIND`, `ERR_PREFIX_DISPOSED`), or an
+`ERR_FROZEN_BINDING`, `ERR_INVALID_REBIND`, `ERR_PREFIX_DISPOSED`,
+`ERR_PREFIX_BROKEN`), or an
 `Error` (`TypeError`, `ValueEncodeError`, …) without
 an iso4 code that the client raises for a malformed option (a limit,
 `memoryMb`, a global name that is not a well-formed string, host-module
@@ -1058,7 +1059,8 @@ the client throws the runtime's refusal in the same shape, which also covers
 what it cannot know in advance, such as a prefix the runtime no longer
 holds. An already-aborted signal wins over validation and resolves as
 aborted, except disposal: using a disposed prefix always throws
-`ERR_PREFIX_DISPOSED`. Everything else — user code, limits,
+`ERR_PREFIX_DISPOSED`, and using a broken one (§16.4) always throws
+`ERR_PREFIX_BROKEN`. Everything else — user code, limits,
 bridge failures, abort, capacity and queue refusals — stays a result. That
 includes `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
 `ERR_CALL_TARGET_NOT_FOUND`, `ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL` and
@@ -1763,7 +1765,10 @@ sees is exactly what the prefix produces deterministically:
   - `prepare()` evaluates nothing, so every failure above — and a syntax
     error, a throwing top level, an unresolved import — is reported on the
     first run that cold-starts an instance, as that run's `{ ok: false }`
-    result with the prefix's own code (§16.4).
+    result with the prefix's own code and `stage: 'prefix'` (§16.4). The
+    runtime then remembers the prefix as broken: every later run on it is
+    refused with the setup error `ERR_PREFIX_BROKEN`, whose `cause` is the
+    stored failure, and no isolate boots for it.
 
 ### 11.4 Rebinding rules
 
@@ -3051,10 +3056,29 @@ top-level code, a bridge call, a never-settling await, a blown warm-up
 budget) fails that run with the matching code: `ERR_USER_CODE`,
 `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`, `ERR_PREFIX_BRIDGE_CALL`,
 `ERR_PREFIX_DID_NOT_SETTLE`, `ERR_WARMUP_LIMIT`. Runs that joined the
-instance while it was cold-starting get the same failure. Every later run on
-that prefix cold-starts again and fails the same way. A syntax error's
-`stack` carries the prefix's file name and line, which is how a caller tells
-a broken prefix from broken run code.
+instance while it was cold-starting get the same failure. Every failure in
+that list except `ERR_WARMUP_LIMIT` (and `ERR_MEMORY_LIMIT` during warm-up)
+carries `stage: 'prefix'`, which is how a caller tells a broken prefix from
+broken run code without parsing the stack.
+
+**A broken prefix is remembered.** When the cold start fails with one of
+the prefix's own, repeatable errors — `ERR_USER_CODE`, `ERR_MODULE_NOT_FOUND`,
+`ERR_IMPORT`, `ERR_PREFIX_BRIDGE_CALL`, `ERR_PREFIX_DID_NOT_SETTLE` — the
+runtime's prefix store swaps the entry for the failure itself (source and
+global blobs are dropped, the stored message and stack are clamped like the
+wire's, any resident instances of the prefix are dropped) and refuses every
+later `PrefixRun` with the setup error `ERR_PREFIX_BROKEN`, `cause` = the
+stored failure, without booting an isolate. The mark lives in the runtime because only it knows the
+stage; the client caches it (`prefix.status === 'broken'`, `prefix.error`)
+from the first result or refusal it sees and throws locally after that. The
+prefix stays `alive` and host-owned: `dispose()` still works and wins over
+the mark, and the only retry is a new `prepare()`. Load-dependent failures —
+`ERR_WARMUP_LIMIT` (the 1 s wall half depends on load) and
+`ERR_MEMORY_LIMIT` — never mark; the next run cold-starts again. A prefix
+that fails on `Math.random()` is the one accepted false positive; §11.3
+already discourages nondeterministic prefixes. workerd keeps the same
+`permanentException` on a Worker whose startup failed; Node's
+`vm.SourceTextModule` keeps `status: 'errored'` plus `module.error`.
 
 Decision record (2026-10-16). Until then `prepare()` evaluated the prefix
 once in a throwaway isolate and rejected a bad one up front. That bought a

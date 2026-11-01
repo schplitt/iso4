@@ -137,6 +137,14 @@ interface FailureSpec {
    * The ERR_INSTANCE_RESET extras: wire cause byte + culprit run id.
    */
   reset?: { causeByte: number, culpritRunId: number }
+  /**
+   * The prefix-stage byte: this failure broke the prefix.
+   */
+  prefixStage?: boolean
+  /**
+   * The ERR_PREFIX_BROKEN extra: the stored cold-start failure.
+   */
+  cause?: { code: string, name: string, message: string, stack?: string }
   stdout?: readonly string[]
   stderr?: readonly string[]
   durationMs?: number
@@ -184,6 +192,16 @@ function encodeCompletionPayload(runId: number, spec: SuccessSpec | FailureSpec)
       : Buffer.concat([
           Buffer.from([1, spec.reset.causeByte]),
           u32(spec.reset.culpritRunId),
+        ]),
+    Buffer.from([spec.prefixStage ? 1 : 0]),
+    spec.cause === undefined
+      ? Buffer.from([0]) // cause absent (only ERR_PREFIX_BROKEN carries one)
+      : Buffer.concat([
+          Buffer.from([1]),
+          str(spec.cause.code),
+          str(spec.cause.name),
+          str(spec.cause.message),
+          optionalString(spec.cause.stack),
         ]),
     tail,
   ])
@@ -608,6 +626,8 @@ describe('decodePrecompileResultPayload', () => {
       optionalString(stack),
       Buffer.from([0]), // fields absent
       Buffer.from([0]), // reset info absent
+      Buffer.from([0]), // run stage
+      Buffer.from([0]), // cause absent
     ])
   }
 
@@ -709,6 +729,51 @@ describe('decodeRunCompletionPayload — instance reset', () => {
       return expect.unreachable('failure payload decoded as success')
     expect(result.error.resetCause).toBeUndefined()
     expect(result.error.culpritRunId).toBeUndefined()
+    expect(result.error.stage).toBeUndefined()
+  })
+})
+
+// ── Broken-prefix extras ───────────────────────────────────────────────────
+
+describe('decodeRunCompletionPayload — broken prefix', () => {
+  test('the prefix-stage byte decodes to stage: "prefix"', () => {
+    const decoded = decodeRunCompletionPayload(
+      encodeCompletionPayload(1, {
+        ok: false,
+        code: 'ERR_USER_CODE',
+        name: 'SyntaxError',
+        message: 'Unexpected token',
+        prefixStage: true,
+      }),
+    )
+    if (decoded.result.ok)
+      return expect.unreachable('failure payload decoded as success')
+    expect(decoded.result.error.stage).toBe('prefix')
+    expect(decoded.prefixCause).toBeUndefined()
+  })
+
+  test('an ERR_PREFIX_BROKEN refusal carries the stored failure as prefixCause', () => {
+    const decoded = decodeRunCompletionPayload(
+      encodeCompletionPayload(1, {
+        ok: false,
+        code: 'ERR_PREFIX_BROKEN',
+        name: 'Error',
+        message: 'prefix is broken',
+        cause: { code: 'ERR_MODULE_NOT_FOUND', name: 'Error', message: 'Cannot find module', stack: 'at <prefix>:1' },
+      }),
+    )
+    if (decoded.result.ok)
+      return expect.unreachable('failure payload decoded as success')
+    expect(decoded.result.error.stage).toBeUndefined()
+    expect(decoded.prefixCause).toEqual({ code: 'ERR_MODULE_NOT_FOUND', name: 'Error', message: 'Cannot find module', stack: 'at <prefix>:1' })
+  })
+
+  test('an invalid prefix-stage byte is a decode error', () => {
+    const buf = encodeCompletionPayload(1, { ok: false, code: 'ERR_USER_CODE', name: 'Error', message: 'x' })
+    // The stage byte follows the reset presence byte (0); find it from the tail.
+    const stageOffset = buf.length - (4 + 4 + 8 + 8 + 8 + 4 + 1) - 2
+    buf[stageOffset] = 7
+    expect(() => decodeRunCompletionPayload(buf)).toThrow(/invalid prefix-stage byte/)
   })
 })
 

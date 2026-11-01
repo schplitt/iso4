@@ -402,7 +402,9 @@ globalThis.retries = config.retries`,
   test('prefix that never settles fails the first run with ERR_PREFIX_DID_NOT_SETTLE', async () => {
     await using prefix = await runtime.prepare({ code: 'await new Promise(() => {})' })
     const check = await prefix.execute({ code: 'export default 0' })
-    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_DID_NOT_SETTLE' } })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_DID_NOT_SETTLE', stage: 'prefix' } })
+    expect(prefix.status).toBe('broken')
+    await expect(prefix.execute({ code: 'export default 0' })).rejects.toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_PREFIX_DID_NOT_SETTLE' } })
   })
 
   test('prefix calling a declared bridge global fails the first run with ERR_PREFIX_BRIDGE_CALL', async () => {
@@ -441,27 +443,36 @@ await search('dogs')`,
     expect(check.error.stack).toMatch(/^SyntaxError: Unexpected end of input\n {4}at setup\.js:2:\d+$/)
   })
 
-  test('a broken prefix fails every later run the same way, execute() and call() alike', async () => {
+  test('a broken prefix fails the first run and is refused after that, execute() and call() alike', async () => {
     await using prefix = await runtime.prepare({ code: 'throw new Error("broken prefix")' })
-    for (let i = 0; i < 2; i++) {
-      expect(await prefix.execute({ code: 'export default 0' }))
-        .toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
-    }
-    expect(await prefix.call({ export: 'default', args: [] }))
-      .toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
+    expect(await prefix.execute({ code: 'export default 0' }))
+      .toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix', stage: 'prefix' } })
+    await expect(prefix.execute({ code: 'export default 0' }))
+      .rejects
+      .toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
+    await expect(prefix.call({ export: 'default', args: [] }))
+      .rejects
+      .toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
   })
 
-  test('runs that join a broken prefix while it cold-starts all get the prefix error', async () => {
+  test('runs that join a broken prefix while it cold-starts all settle with the prefix error', async () => {
     // With more slots than cores, later runs join the cold-starting
     // instance instead of spawning their own; a failed warm-up has to
-    // answer every one of them, or they hang and leak their slots.
+    // answer every one of them, or they hang and leak their slots. A run
+    // that arrives after the mark is refused instead; none hangs.
     await using many = await createRuntime({ maxConcurrentRuns: 64 })
     await using prefix = await many.prepare({ code: 'throw new Error("broken prefix")' })
-    const results = await Promise.all(
+    const results = await Promise.allSettled(
       Array.from({ length: 48 }, () => prefix.execute({ code: 'export default 0' })),
     )
-    for (const result of results)
-      expect(result).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
+    for (const settled of results) {
+      if (settled.status === 'fulfilled')
+        expect(settled.value).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix', stage: 'prefix' } })
+      else
+        expect(settled.reason).toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
+    }
+    expect(results.some((r) => r.status === 'fulfilled')).toBe(true)
+    expect(prefix.status).toBe('broken')
     expect((await many.stats()).activeRuns).toBe(0)
   }, 30_000)
 

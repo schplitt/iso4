@@ -210,6 +210,14 @@ if (!check.ok)
   throw new Error(`broken prefix: ${check.error.message}`)
 ```
 
+A failure of the prefix itself carries `error.stage === 'prefix'`, so a
+host can tell it from a failure of the run code. The runtime remembers it:
+`prefix.status` becomes `'broken'`, `prefix.error` holds the failure, and
+every later `execute()`/`call()` rejects with `ERR_PREFIX_BROKEN` (its
+`cause` is that failure) without booting an isolate. `dispose()` still
+works; the only retry is a new `prepare()`. Failures that depend on load
+(`ERR_WARMUP_LIMIT`, `ERR_MEMORY_LIMIT`) never break a prefix.
+
 To check generated names before `prepare()` instead of getting a failed
 setup back, import the predicates from `@iso4/sandbox/utils`. That entry
 never loads the client or the native binary:
