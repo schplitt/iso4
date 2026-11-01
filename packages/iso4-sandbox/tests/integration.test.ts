@@ -253,12 +253,13 @@ describe('console capture', () => {
 // ── Phase 1: error handling ────────────────────────────────────────────────
 
 describe('error handling', () => {
-  test('syntax error → ERR_COMPILE', async () => {
+  test('syntax error → ERR_USER_CODE', async () => {
     const result = await runtime.run({ code: 'export default (((' })
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_COMPILE')
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('SyntaxError')
   })
 
   test('runtime error → ERR_USER_CODE with message and stack', async () => {
@@ -425,10 +426,10 @@ describe('precompile + prefix.run()', () => {
     await expect(prefix.run({ code: 'export default 1' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
   })
 
-  test('compile error in precompile throws', async () => {
-    await expect(
-      runtime.precompile({ code: 'export default (((' }),
-    ).rejects.toThrow()
+  test('a prefix syntax error fails the first run, not prepare()', async () => {
+    await using prefix = await runtime.prepare({ code: 'export default (((' })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', name: 'SyntaxError' } })
   })
 })
 
@@ -1459,7 +1460,7 @@ describe('imports rebinding enforcement (runtime)', () => {
 // must surface as a typed RunResult, not as a thrown promise.
 
 describe('imports failure paths', () => {
-  test('source module with a syntax error → ERR_COMPILE', async () => {
+  test('source module with a syntax error → ERR_USER_CODE', async () => {
     const result = await runtime.run({
       code: `import { x } from 'lib:broken'; export default x`,
       imports: {
@@ -1470,7 +1471,9 @@ describe('imports failure paths', () => {
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_COMPILE')
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('SyntaxError')
+    expect(result.error.message).toContain('lib:broken')
   })
 
   test('source module that throws at top level → ERR_USER_CODE', async () => {

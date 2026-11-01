@@ -197,6 +197,19 @@ it before installing them. `RESERVED_WORDS` is a `Set` of names that cannot be
 a binding in module source, such as `class` or `eval`; iso4 refuses
 host-module export names in it, except `default`.
 
+`prepare()` stores the prefix without running it, and checks only what needs
+no isolate: global names, the import shape, and option ranges. A prefix that
+does not compile, throws, or imports something unknown fails its first run
+instead. Validate it yourself where it matters — parse the source with a
+tool such as `oxc`, or do one trial run (its instance stays warm):
+
+```ts
+const prefix = await sandbox.prepare({ code })
+const check = await prefix.execute({ code: 'export default 0' })
+if (!check.ok)
+  throw new Error(`broken prefix: ${check.error.message}`)
+```
+
 To check generated names before `prepare()` instead of getting a failed
 setup back, import the predicates from `@iso4/sandbox/utils`. That entry
 never loads the client or the native binary:

@@ -1630,11 +1630,8 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
 /// Same fields as `RunPayload` but without `run_id`.
 #[derive(Debug)]
 pub struct PrecompilePayload {
-    /// Correlation id echoed on the `PrecompileResult`: precompiles are
-    /// answered on worker threads, so with several in flight on one
-    /// multiplexed connection the replies can return out of request order —
-    /// the id is what lets the host match them (the run frames' leading-id
-    /// pattern).
+    /// Correlation id echoed on the `PrecompileResult` so the host matches
+    /// replies by id, never by order (the run frames' leading-id pattern).
     pub request_id: u32,
     pub code: String,
     pub filename: Option<String>,
@@ -1647,7 +1644,8 @@ pub struct PrecompilePayload {
 pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload> {
     let mut r = PayloadReader::new(payload);
     let request_id = r.read_u32()?;
-    // Validation must match the instances this prefix will get: managed.
+    // Band-checked like the managed instances this prefix will get; the
+    // limits are otherwise unused at Precompile.
     let (code, filename, limits, globals) = parse_code_fields(&mut r, BandPolicy::Managed)?;
     let imports = r.read_import_bindings()?;
     r.assert_done()?;

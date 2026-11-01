@@ -144,16 +144,16 @@ There is **no tag byte**: there is exactly one value codec, so nothing needs
 discriminating. Where a slot is optional it keeps the usual `Optional<T>`
 presence byte in front (`u8 present`, then the slot).
 
-| Direction | Slot                      | Frame                          | Blob Content                        |
-| --------- | ------------------------- | ------------------------------ | ----------------------------------- |
-| TS → Rust | data-global value         | `Run`/`Precompile`/`PrefixRun` | the value                           |
-| TS → Rust | host-module data leaf     | `Run`/`Precompile`             | the value                           |
-| TS → Rust | bridge resolve value      | `BridgeResponse` (ok = 1)      | the value                           |
-| TS → Rust | bridge error `fields`     | `BridgeResponse` (ok = 0)      | the fields object                   |
-| Rust → TS | bridge call `args`        | `BridgeCall`                   | **one blob = the whole args array** |
-| Rust → TS | module exports            | `Result` (ok = 1)              | **one blob = one `{name: value}`**  |
-| Rust → TS | run error `fields`        | `Result` (ok = 0)              | the fields object                   |
-| Rust → TS | precompile error `fields` | `PrecompileResult`             | the fields object                   |
+| Direction | Slot                      | Frame                          | Blob Content                                                               |
+| --------- | ------------------------- | ------------------------------ | -------------------------------------------------------------------------- |
+| TS → Rust | data-global value         | `Run`/`Precompile`/`PrefixRun` | the value                                                                  |
+| TS → Rust | host-module data leaf     | `Run`/`Precompile`             | the value                                                                  |
+| TS → Rust | bridge resolve value      | `BridgeResponse` (ok = 1)      | the value                                                                  |
+| TS → Rust | bridge error `fields`     | `BridgeResponse` (ok = 0)      | the fields object                                                          |
+| Rust → TS | bridge call `args`        | `BridgeCall`                   | **one blob = the whole args array**                                        |
+| Rust → TS | module exports            | `Result` (ok = 1)              | **one blob = one `{name: value}`**                                         |
+| Rust → TS | run error `fields`        | `Result` (ok = 0)              | the fields object                                                          |
+| Rust → TS | precompile error `fields` | `PrecompileResult`             | the fields object (reserved: the runtime never fails a `Precompile` today) |
 
 One blob per crossing, never one blob per value: serializing N values together
 is measurably faster than N blobs, produces the same total bytes, and
@@ -659,14 +659,14 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 
 `PrecompilePayload`:
 
-| Field       | Encoding              | Notes                                                                                                                                                                 |
-| ----------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`. Precompiles are answered on worker threads, so replies to a multiplexed connection can return out of request order. |
-| `code`      | `String`              | ESM prefix source.                                                                                                                                                    |
-| `filename`  | `Optional<String>`    | Used in stack traces.                                                                                                                                                 |
-| `limits`    | `ResourceLimits`      | Currently unused at precompile (validation is unlimited).                                                                                                             |
-| `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                                                                                        |
-| `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                                                                                            |
+| Field       | Encoding              | Notes                                                                                             |
+| ----------- | --------------------- | ------------------------------------------------------------------------------------------------- |
+| `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`; the host matches replies by id, never by order. |
+| `code`      | `String`              | ESM prefix source.                                                                                |
+| `filename`  | `Optional<String>`    | Used in stack traces.                                                                             |
+| `limits`    | `ResourceLimits`      | Currently unused: nothing is evaluated at `Precompile`.                                           |
+| `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                    |
+| `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                        |
 
 `ResourceLimits`:
 
@@ -1096,12 +1096,12 @@ afterwards, so later calls report only their own lines.
 
 `PrecompileResultPayload`:
 
-| Field       | Encoding                    | Notes                                      |
-| ----------- | --------------------------- | ------------------------------------------ |
-| `requestId` | `u32`                       | Echo of the `Precompile`'s correlation id. |
-| `ok`        | `bool`                      | Success or failure.                        |
-| `prefixId`  | `Optional<PrefixId>`        | Present when `ok = true`.                  |
-| `error`     | `Optional<RunErrorPayload>` | Present when `ok = false`.                 |
+| Field       | Encoding                    | Notes                                                                                                                                        |
+| ----------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `requestId` | `u32`                       | Echo of the `Precompile`'s correlation id.                                                                                                   |
+| `ok`        | `bool`                      | Success or failure.                                                                                                                          |
+| `prefixId`  | `Optional<PrefixId>`        | Present when `ok = true`.                                                                                                                    |
+| `error`     | `Optional<RunErrorPayload>` | Present when `ok = false`. Reserved: the runtime stores without evaluating, so it never sends `ok = false` today; the host still decodes it. |
 
 ### 5.8 RunComplete payloads
 
@@ -1243,11 +1243,12 @@ the instance — co-resident runs fail with `ERR_INSTANCE_RESET` (cause
 executing degrades to the soft abandon.
 
 `Precompile` uses the same authenticated connection but is not a run. It
-validates the prefix (compile + instantiate + evaluate in a throwaway
-isolate, under the fixed warm-up budget) and stores the **source and declared
-shape** in the Rust process under a `PrefixId`. There is no runtime snapshot
-(V8 cannot create startup snapshots safely in a live multi-isolate
-process; see DESIGN.md on the removal).
+boots no isolate and evaluates nothing: the runtime stores the **source and
+declared shape** under a `PrefixId` and answers inline on the connection's
+reader thread. A broken prefix fails the first `PrefixRun` that cold-starts
+an instance, with the prefix's own code. There is no runtime snapshot (V8
+cannot create startup snapshots safely in a live multi-isolate process; see
+DESIGN.md on the removal).
 
 `PrefixRun` is served by **warm instances**: the runtime keeps a
 registry of resident isolates per prefix, each owned by a dedicated runtime
@@ -1286,20 +1287,18 @@ host-detected never cross the wire. `ERR_RESERVED_NAME`,
 `ERR_PREFIX_DISPOSED` are **setup errors**. They stay on the wire and the
 runtime keeps sending them, but the TS host checks the same rules before
 sending, so for it a runtime-sent setup code is a fallback. For a `Run` or
-`PrefixRun` the host throws a setup code as an `Error` carrying it, like
-`PrecompileResult` failures, and returns every other code as a failed
-result.
+`PrefixRun` the host throws a setup code as an `Error` carrying it, and
+returns every other code as a failed result.
 
 | Code                                  | Cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS, in run or prefix code. A syntax error too: `name` is `SyntaxError`, `stack` carries the file and line (`<prefix>` or the prefix `filename` for a broken prefix), and for a source import the message names the specifier.                                                                                                                                                                                                                                        |
 | `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's **hard** heap line (`memoryMb` plus its headroom band, or an explicit `hardMemoryMb` — a Runtime-level setting, carried in the limits slot of every frame by the host). Crossing the soft line produces no error at all.                                                                                                                                                                                                                                                          |
 | `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `ERR_WALL_TIMEOUT`                    | The run's own logic time (execution + async waits, counted to arrival — the result's `wallTimeMs`) exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                               |
 | `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `ERR_MODULE_NOT_FOUND`                | No module with this specifier in the resolved import set. The message names the specifier, plus the importing module when it is not the run's own code (`Cannot find module 'missing:b' imported from 'src:a'`).                                                                                                                                                                                                                                                                                                               |
-| `ERR_IMPORT`                          | Any other import failure, with V8's message: a missing named export or another module-linking error. Also a dynamic `import()`, which terminates the run (`dynamic import() is not supported: '<specifier>'`) so sandbox code cannot catch it. A source import that fails to compile is `ERR_COMPILE`. Arguments V8 itself rejects (`import(Symbol())`) throw catchably instead.                                                                                                                                               |
-| `ERR_COMPILE`                         | Syntax/module compile error.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `ERR_IMPORT`                          | Any other import failure, with V8's message: a missing named export or another module-linking error. Also a dynamic `import()`, which terminates the run (`dynamic import() is not supported: '<specifier>'`) so sandbox code cannot catch it. A source import that fails to compile is `ERR_USER_CODE`. Arguments V8 itself rejects (`import(Symbol())`) throw catchably instead.                                                                                                                                             |
 | `ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED` | Function argument attempted to cross the host bridge.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `ERR_EXPORT_NOT_SERIALIZABLE`         | A call's return value (or bridge value) holds something V8 cannot clone — see §4.2. Non-serializable _exports_ are no longer fatal: they are skipped and reported in `skippedExports` (§5.7).                                                                                                                                                                                                                                                                                                                                  |
 | `ERR_CALL_TARGET_NOT_FOUND`           | A `call.exportPath` (§5.2) does not resolve against the module's exports, or resolves to a value that is not callable. The message says which and names the path.                                                                                                                                                                                                                                                                                                                                                              |
@@ -1312,9 +1311,9 @@ result.
 | `ERR_RESERVED_NAME`                   | A host global (or bridge stub) uses a name the runtime owns (`console`, `setTimeout`, `Response`, …) and may not shadow, or one of the non-writable `NaN`, `undefined`, `Infinity`, or `__proto__`. Shaped to also cover runtime-owned module specifiers if one ever becomes non-overridable.                                                                                                                                                                                                                                  |
 | `ERR_FROZEN_BINDING`                  | A `PrefixRun` rebind targets a declared location that is frozen with the prefix: a source module, a data leaf, or a data or string global. Only function leaves and bridge stubs can be rebound.                                                                                                                                                                                                                                                                                                                               |
 | `ERR_INVALID_REBIND`                  | **Host-detected, never sent by the runtime.** A rebind offered a value of the wrong type for its declared location: a function leaf or a function global (plain, bridge or shim) can only be rebound with a function, a host module or object node only with a plain object.                                                                                                                                                                                                                                                   |
-| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise at `Precompile` time.                                                                                                                                                                                                                                                                                                                                                                    |
-| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates — at `Precompile` validation or at a run's prefix stage.                                                                                                                                                                                                                                                                                                                        |
-| `ERR_WARMUP_LIMIT`                    | Prefix evaluation (plus the per-instance runtime installs) exceeded its fixed warm-up budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model). Isolate boot itself precedes the budget. Enforced at `Precompile` and at instance cold-start. Move expensive setup into the handler (lazy init on first call).                                                                                                                                                                                        |
+| `ERR_PREFIX_DID_NOT_SETTLE`           | Prefix top-level evaluation stayed pending after the microtask queue drained — nothing in the isolate can resolve the awaited promise while a prefix evaluates. Reported on the `PrefixRun` that cold-started the instance.                                                                                                                                                                                                                                                                                                    |
+| `ERR_PREFIX_BRIDGE_CALL`              | Prefix code called a bridge callable (bridge global, shim global, or host-import function). The bridge does not exist while a prefix evaluates. Reported on the `PrefixRun` that cold-started the instance.                                                                                                                                                                                                                                                                                                                    |
+| `ERR_WARMUP_LIMIT`                    | Prefix evaluation (plus the per-instance runtime installs) exceeded its fixed warm-up budget (1 s wall / 1 s CPU, not configurable — Cloudflare's script-startup model). Isolate boot itself precedes the budget. Enforced at instance cold start and reported on the `PrefixRun` that paid for it. Move expensive setup into the handler (lazy init on first call).                                                                                                                                                           |
 | `ERR_PREFIX_DISPOSED`                 | Prefix was disposed or evicted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `ERR_INSTANCE_RESET`                  | The run was an innocent victim: a co-resident run on the same shared instance was interrupted mid-execution (a CPU/memory/wall guard fired, a forced abort landed on running code, or it called dynamic `import()`, cause `unsupported`), so the instance could no longer be trusted and every run in flight on it failed. Carries `ResetInfo` (§5.6): the cause class and the culprit's wire run id. Telemetry fields are this run's real partial values. Never retried automatically — the victim may have had side effects. |
 | `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.7.                                                                                                                                                                             |

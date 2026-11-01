@@ -34,10 +34,10 @@ code against it. Three consequences run through everything below:
    value for the whole of a turn and advances only when the runtime lets it.
    Anything whose only purpose is to measure elapsed time is therefore either
    absent or inert.
-3. **Two stages, one environment.** Prefix code runs at `prepare()` for
-   validation and again on each cold start; run code runs per call. The two
-   stages are kept surface-identical on purpose, so a prefix cannot validate
-   against something a run does not have. Where they differ, it is stated.
+3. **Two stages, one environment.** Prefix code runs once per cold start;
+   run code runs per call. `prepare()` runs nothing, so a broken prefix
+   fails its first run with the prefix's own code. The two stages see the
+   same surface on purpose. Where they differ, it is stated.
 
 ---
 
@@ -96,7 +96,6 @@ Cloudflare ships.
 
 | Stage                                     | Destination                                                                          |
 | ----------------------------------------- | ------------------------------------------------------------------------------------ |
-| `prepare()` validation                    | discarded — there is no result frame to carry it                                     |
 | warm-up (prefix evaluation on cold start) | delivered once, on the result of the call that paid for the cold start, then cleared |
 | per call                                  | that call's own `stdout`/`stderr`                                                    |
 
@@ -224,10 +223,10 @@ rather than at first call.
 when that is not the run's own code: `Cannot find module 'missing:b' imported
 from 'src:a'`. Every other linking failure, such as a missing named export, is
 `ERR_IMPORT` with V8's message. A source import that does not compile is
-`ERR_COMPILE`. Dynamic `import()` is `ERR_IMPORT` too, with the message
+`ERR_USER_CODE` named `SyntaxError`. Dynamic `import()` is `ERR_IMPORT` too, with the message
 `dynamic import() is not supported: '<specifier>'`; it stops execution on the
 spot, in run code, timers, `waitUntil` work and prefix code alike, and a
-prefix that calls it fails `prepare()`. Arguments V8 itself rejects
+prefix that calls it fails its first run. Arguments V8 itself rejects
 (`import(Symbol())`, `import('x', 5)`, a throwing `toString` or `with` getter)
 give a catchable error instead, before anything loads.
 
@@ -256,7 +255,7 @@ runs; uncaught, that is `ERR_HOST_BRIDGE`. Exports may still carry holes.
 | `process` `Buffer` `require` `global` | ❌  | Node globals are not provided                                                                       |
 | `navigator` `self` `caches` `crypto`  | ❌  |                                                                                                     |
 
-**Code generation** is a `prepare()`-time capability on purpose: setup code
+**Code generation** is a prefix-stage capability on purpose: setup code
 may compile fast paths from strings (the zod pattern), and the moment per-run
 code starts, `eval` and `new Function` throw a catchable `EvalError` at the
 call site. There is no override. This is the same line workerd draws.
@@ -265,10 +264,7 @@ call site. There is no override. This is the same line workerd draws.
 
 ## Known deviations
 
-**Prefix console output at `prepare()` is discarded.** Validation runs in a
-throwaway isolate with no result frame to carry the bytes. Prefix logging is
-still not an error. Tracked as
-[#86](https://github.com/schplitt/iso4/issues/86).
+None at present.
 
 ---
 
@@ -302,6 +298,6 @@ The behavior above is pinned by tests, not by prose:
 - Frozen clock, including console timing inertness:
   `packages/iso4-sandbox/tests/clock.test.ts`.
 - Timers: `DESIGN.md` §7.8 and the timer tests in `src/v8.rs`.
-- Prefix/run environment parity: `the_console_surface_is_identical_at_prepare_and_at_run`.
+- Prefix/run environment parity: `the_console_surface_is_identical_in_prefix_and_run_code`.
 
 If you change what the sandbox exposes, update this file in the same commit.

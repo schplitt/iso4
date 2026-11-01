@@ -65,12 +65,17 @@ describe('the predicates agree with the runtime', () => {
     expect((await sandbox.run({ code: 'export const default = 1' })).ok).toBe(false)
   })
 
-  it.each(CANDIDATES)('prepare() takes host-module export %s iff isValidExportName', async (name) => {
+  it.each(CANDIDATES)('prepare() takes host-module export %s iff isValidExportName, and the runtime builds the module', async (name) => {
     const prepared = sandbox.prepare({ code: '', imports: { 'host:t': { [name]: () => 1 } } })
-    if (isValidExportName(name))
-      await expect(prepared).resolves.toBeDefined()
-    else
+    if (!isValidExportName(name)) {
       await expect(prepared).rejects.toThrow(/is not a valid JavaScript identifier/)
+      return
+    }
+    // prepare() checks the name host-side only; the first run is where the
+    // runtime emits it into a real synthetic module.
+    await using prefix = await prepared
+    const result = await prefix.execute({ code: `import * as t from 'host:t'\nexport default typeof t[${JSON.stringify(name)}]` })
+    expect(result.ok && result.exports['default']).toBe('function')
   })
 
   it('a default host-module key is the module\'s default export', async () => {
@@ -79,12 +84,15 @@ describe('the predicates agree with the runtime', () => {
     expect(result.ok && result.exports['default']).toBe(7)
   })
 
-  it.each(CANDIDATES)('prepare() takes global %s iff isValidGlobalName', async (name) => {
+  it.each(CANDIDATES)('prepare() takes global %s iff isValidGlobalName, and the runtime installs it', async (name) => {
     const prepared = sandbox.prepare({ code: '', globals: { [name]: { kind: 'data', value: 1 } } as never })
-    if (isValidGlobalName(name))
-      await expect(prepared).resolves.toBeDefined()
-    else
+    if (!isValidGlobalName(name)) {
       await expect(prepared).rejects.toMatchObject({ code: globalCode(name) })
+      return
+    }
+    await using prefix = await prepared
+    const result = await prefix.execute({ code: `export default globalThis[${JSON.stringify(name)}]` })
+    expect(result.ok && result.exports['default']).toBe(1)
   })
 
   it('prepare() refuses a global name that is not a well-formed string, like isValidGlobalName', async () => {
