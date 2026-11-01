@@ -393,9 +393,9 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
 - Do not read the clock from JS shims. The frozen clock is V8's own
   platform clock (`clock_platform.cc` → `webtypes::FrozenClock`, data slot
   0); `Date`, `Intl` and `Temporal` stay the unmodified builtins.
-- Do not build with `V8_FORCE_DEBUG`: `clock_platform.cc` sizes
-  `DefaultPlatform` from the release headers, and a debug V8 lays
-  `base::Mutex` out differently.
+- Do not build a debug V8 (`V8_FORCE_DEBUG`, or `V8_FROM_SOURCE` under a
+  debug cargo profile): `clock_platform.cc` sizes `DefaultPlatform` from
+  the release headers, and a debug V8 lays `base::Mutex` out differently.
 - Do not create an isolate with V8's stock snapshot (`CreateParams::default()`,
   `Isolate::create_params()`), even in tests: use
   `snapshot::create_params()`. Mixing the two in one process corrupts V8's

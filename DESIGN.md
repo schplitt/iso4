@@ -1893,8 +1893,8 @@ Rules that follow from it:
   libc++ so it matches the prebuilt `librusty_v8.a`; Linux therefore builds
   with `clang++`. The subclass adds no members, and `new` sizes the object
   from those headers: they must describe the same build as the archive
-  (release; `V8_FORCE_DEBUG` changes `base::Mutex`'s layout and is
-  unsupported). `build.rs` itself runs on the stock platform.
+  (release; a debug V8 — `V8_FORCE_DEBUG`, or `V8_FROM_SOURCE` under a
+  debug cargo profile — changes `base::Mutex`'s layout and is unsupported). `build.rs` itself runs on the stock platform.
 
 ## 12. Security model — fetch hardening
 

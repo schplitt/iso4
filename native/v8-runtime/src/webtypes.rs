@@ -181,6 +181,16 @@ pub const BODY_STREAM_FACTORY_KEY: &str = "iso4::bodyStreamFactory";
 /// Only Rust writes it, at run entry, received frames and timer fires.
 pub struct FrozenClock {
     now: Box<std::cell::Cell<f64>>,
+    isolate: v8::UnsafeRawIsolatePtr,
+}
+
+impl Drop for FrozenClock {
+    // Slots drop before V8's teardown, which re-enters the isolate: clear
+    // the raw slot so the platform never reads the freed cell.
+    fn drop(&mut self) {
+        let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(self.isolate) };
+        isolate.set_data(CLOCK_SLOT, std::ptr::null_mut());
+    }
 }
 
 /// rusty_v8 data slot holding the pointer to the frozen value; the C++ side
@@ -200,9 +210,12 @@ pub(crate) fn wall_now_ms() -> f64 {
 /// Give the isolate its frozen clock, started at the wall clock. Runs at
 /// every boot, before any guest code.
 pub fn install_clock(scope: &mut v8::PinScope) {
+    // Drop a previous clock first: its Drop nulls the slot.
+    scope.remove_slot::<FrozenClock>();
     let now = Box::new(std::cell::Cell::new(wall_now_ms()));
+    let isolate = unsafe { scope.as_raw_isolate_ptr() };
     scope.set_data(CLOCK_SLOT, now.as_ptr().cast());
-    scope.set_slot(FrozenClock { now });
+    scope.set_slot(FrozenClock { now, isolate });
 }
 
 /// Advance the current isolate's frozen clock to `max(current, wall now)`.

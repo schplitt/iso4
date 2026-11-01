@@ -4,7 +4,7 @@
 // Compiled against the vendored V8 headers and Chromium's libc++ (the `__Cr`
 // ABI namespace of the prebuilt librusty_v8.a). The subclass adds no members:
 // `new` allocates sizeof(DefaultPlatform) as these headers see it, so the
-// headers must match the prebuilt build (release, no V8_FORCE_DEBUG).
+// headers must match the prebuilt build (release; a debug V8 is unsupported).
 
 #include <algorithm>
 #include <cstdint>
