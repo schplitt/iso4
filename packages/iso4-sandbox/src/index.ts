@@ -33,6 +33,7 @@ import type {
   RebindGlobals,
   RebindImports,
   Prefix,
+  PrefixStatus,
   ReadExportsOptions,
   ReadExportsResult,
   ResourceLimits,
@@ -97,6 +98,7 @@ export type {
   Prefix,
   PrefixCallOptions,
   PrefixRunOptions,
+  PrefixStatus,
   ReadExportsOptions,
   ReadExportsResult,
   RunCallOptions,
@@ -698,6 +700,7 @@ const SETUP_ERROR_CODES: ReadonlySet<SetupErrorCode> = new Set<SetupErrorCode>([
   'ERR_FROZEN_BINDING',
   'ERR_INVALID_REBIND',
   'ERR_PREFIX_DISPOSED',
+  'ERR_PREFIX_BROKEN',
 ])
 
 /**
@@ -1068,7 +1071,12 @@ implements Prefix<G, M> {
    * Session brand key for host-type descriptors — see `SandboxImpl`.
    */
   private readonly brandKey: string
-  private _alive = true
+  private _status: PrefixStatus = 'ready'
+  /**
+   * The cold-start failure that broke this prefix, cached from the first
+   * result or refusal that reported it; later runs throw it without a round trip.
+   */
+  private _error: RunError | undefined
 
   constructor(
     id: string,
@@ -1091,7 +1099,39 @@ implements Prefix<G, M> {
   }
 
   get alive(): boolean {
-    return this._alive
+    return this._status !== 'disposed'
+  }
+
+  get status(): PrefixStatus {
+    return this._status
+  }
+
+  get error(): RunError | undefined {
+    return this._error
+  }
+
+  /**
+   * Remember the prefix-stage failure that broke this prefix. Disposal wins.
+   * @param error the stored cold-start failure
+   */
+  private markBroken(error: RunError): void {
+    if (this._status !== 'ready')
+      return
+    this._status = 'broken'
+    this._error = error
+  }
+
+  /**
+   * The `ERR_PREFIX_BROKEN` refusal, with the cold-start failure as `cause`.
+   * @param cause the stored failure, or the one a runtime refusal carried
+   */
+  private brokenError(cause: RunError | undefined = this._error): Error {
+    const err = setupError(
+      'ERR_PREFIX_BROKEN',
+      `prefix '${this.id}' is broken: its cold start failed with ${cause?.code}: ${cause?.message}`,
+    )
+    err.cause = cause
+    return err
   }
 
   /**
@@ -1159,8 +1199,10 @@ implements Prefix<G, M> {
       { code: string, call?: undefined } | { code?: undefined, call: CallPayload }
     >,
   ): Promise<RunResult | CallResult> {
-    if (!this._alive)
+    if (this._status === 'disposed')
       throw setupError('ERR_PREFIX_DISPOSED', `prefix '${this.id}' has been disposed or never existed`)
+    if (this._status === 'broken')
+      throw this.brokenError()
 
     if (options.signal?.aborted) {
       return abortedResult(options.signal.reason)
@@ -1216,12 +1258,21 @@ implements Prefix<G, M> {
         // `call` present ⇒ the value blob is the function's return value;
         // absent ⇒ the exports object. Never both. Streamed result bodies
         // hydrate through the run's outbound registry (#128).
-        const decoded = withBodyStreamBinder(
+        const completion = withBodyStreamBinder(
           (id) => raw.outStreams.attach(id),
           () => payload.call === undefined
-            ? decodeRunCompletionPayload(raw.result, undefined, raw.droppedCallIds).result
-            : decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds).result,
+            ? decodeRunCompletionPayload(raw.result, undefined, raw.droppedCallIds)
+            : decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds),
         )
+        const decoded = completion.result
+        if (decoded.status === 'failed' && (decoded.error.code as string) === 'ERR_PREFIX_BROKEN') {
+          // The runtime remembered a cold start this client did not see.
+          if (completion.prefixCause !== undefined)
+            this.markBroken(completion.prefixCause)
+          throw this.brokenError(completion.prefixCause ?? this._error)
+        }
+        if (decoded.status === 'failed' && decoded.error.stage === 'prefix')
+          this.markBroken(decoded.error)
         if (decoded.status === 'failed' && (SETUP_ERROR_CODES as ReadonlySet<string>).has(decoded.error.code))
           throw thrownRunError({ ...decoded.error, code: decoded.error.code as string as SetupErrorCode })
         // waitUntil — see the note in SandboxImpl.run.
@@ -1250,9 +1301,9 @@ implements Prefix<G, M> {
   }
 
   async dispose(): Promise<void> {
-    if (!this._alive)
+    if (this._status === 'disposed')
       return
-    this._alive = false
+    this._status = 'disposed'
     this.declaredGlobals = new Map()
     this.defaultImportHandlers = new Map()
     this.declaredImports = []

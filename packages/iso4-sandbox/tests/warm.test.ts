@@ -109,6 +109,11 @@ describe('warm instances', () => {
     await using prefix = await single.prepare({ code: 'for (;;) {}' })
     const check = await prefix.execute({ code: 'export default 0' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_WARMUP_LIMIT' } })
+    // Load-dependent: the budget never breaks the prefix, the next run cold-starts again.
+    expect(check.ok || check.error.stage).toBeUndefined()
+    expect(prefix.status).toBe('ready')
+    const again = await prefix.execute({ code: 'export default 0' })
+    expect(again).toMatchObject({ ok: false, error: { code: 'ERR_WARMUP_LIMIT' } })
   }, 15_000)
 
   test('one-off runs never share state', async () => {

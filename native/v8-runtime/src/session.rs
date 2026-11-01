@@ -225,6 +225,14 @@ pub struct PrefixData {
     pub declared_imports: Vec<ipc::ImportBinding>,
 }
 
+/// One stored prefix: runnable, or broken by a deterministic cold-start
+/// failure. A broken entry keeps only the clamped failure; the source is
+/// dropped and refusals share it by refcount.
+pub enum PrefixEntry {
+    Ready(Arc<PrefixData>),
+    Broken(Arc<wire::RunErrorPayload>),
+}
+
 /// State shared across all connection threads in the same Rust process.
 ///
 /// Using a single shared store means a prefix compiled on connection 0 is
@@ -232,7 +240,7 @@ pub struct PrefixData {
 /// pool to route any run to any free slot.
 pub struct SharedState {
     /// Prefix data keyed by their string PrefixId.
-    pub prefix_store: Mutex<HashMap<String, Arc<PrefixData>>>,
+    pub prefix_store: Mutex<HashMap<String, PrefixEntry>>,
     /// Monotonically increasing counter for generating unique PrefixIds.
     pub next_prefix_id: AtomicU64,
     /// Warm instance registry: every PrefixRun is served by a resident
@@ -347,6 +355,8 @@ fn write_result_frame(sink: &ipc::FrameSink, run_id: u32, payload: Vec<u8>) -> s
                         stack: None,
                         fields: None,
                         reset: None,
+                        prefix_stage: false,
+                        cause: None,
                     },
                     // Dropped deliberately: stdout/stderr are unbounded too, and
                     // this payload has to be small by construction.
@@ -414,6 +424,7 @@ fn write_completion(
     run_id: u32,
     outcome_result: &Result<sandbox::Output, sandbox::FailureOutput>,
     heap_used_bytes: Option<u64>,
+    prefix_stage: bool,
 ) {
     let (frame_is_run_complete, payload) = match outcome_result {
         Ok(output) => match &output.background {
@@ -446,7 +457,10 @@ fn write_completion(
             wire::encode_run_completion_payload(
                 run_id,
                 wire::RunCompletion::Failure(wire::RunFailurePayload {
-                    error: wire::run_error_to_payload(&failure.error),
+                    error: wire::RunErrorPayload {
+                        prefix_stage,
+                        ..wire::run_error_to_payload(&failure.error)
+                    },
                     stdout: failure.stdout.clone(),
                     stderr: failure.stderr.clone(),
                     duration_ms: failure.duration_ms,
@@ -960,6 +974,8 @@ fn refuse_duplicate_run(sink: &ipc::FrameSink, run_id: u32) {
                 stack: None,
                 fields: None,
                 reset: None,
+                prefix_stage: false,
+                cause: None,
             },
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -1006,7 +1022,7 @@ fn dispatch_oneoff_run(
     // the route exists so a refusal leaves nothing to unwind.
     let run_cap_bytes = u64::from(payload.limits.hard_memory_mb) * 1024 * 1024;
     if let Err(refusal) = shared.warm.reserve_oneoff(run_cap_bytes) {
-        write_completion(sink, run_id, &Err(capacity_failure(refusal)), None);
+        write_completion(sink, run_id, &Err(capacity_failure(refusal)), None, false);
         return;
     }
 
@@ -1084,7 +1100,7 @@ fn dispatch_oneoff_run(
             shared
                 .warm
                 .release_oneoff(result.is_err(), wall_time_ms, cpu_time_ms);
-            write_completion(&sink, run_id, &result, None);
+            write_completion(&sink, run_id, &result, None, false);
         });
     if let Err(e) = spawned {
         eprintln!("[iso4-v8] failed to spawn one-off worker: {e}");
@@ -1103,7 +1119,7 @@ fn dispatch_oneoff_run(
             cpu_time_ms: 0.0,
             bridge_calls: Vec::new(),
         };
-        write_completion(sink, run_id, &Err(failure), None);
+        write_completion(sink, run_id, &Err(failure), None, false);
     }
 }
 
@@ -1139,17 +1155,37 @@ fn dispatch_precompile(
         .unwrap_or_else(|p| p.into_inner())
         .insert(
             prefix_id.clone(),
-            Arc::new(PrefixData {
+            PrefixEntry::Ready(Arc::new(PrefixData {
                 code: payload.code,
                 filename: payload.filename,
                 globals: payload.globals,
                 declared_globals,
                 declared_imports: payload.imports,
-            }),
+            })),
         );
     let result = wire::encode_precompile_result_payload(payload.request_id, Some(&prefix_id), None);
     if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, result) {
         eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
+    }
+}
+
+/// Answer a `PrefixRun` refused before dispatch: nothing ran, telemetry is zero.
+fn write_setup_refusal(sink: &ipc::FrameSink, run_id: u32, error: wire::RunErrorPayload) {
+    let payload = wire::encode_run_completion_payload(
+        run_id,
+        wire::RunCompletion::Failure(wire::RunFailurePayload {
+            error,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            duration_ms: 0.0,
+            wall_time_ms: 0.0,
+            cpu_time_ms: 0.0,
+            bridge_calls: Vec::new(),
+            heap_used_bytes: None,
+        }),
+    );
+    if let Err(e) = write_result_frame(sink, run_id, payload) {
+        eprintln!("[iso4-v8] failed to write completion frame: {e}");
     }
 }
 
@@ -1167,46 +1203,63 @@ fn dispatch_prefix_run(
     let run_id = payload.run_id;
 
     // An `Arc` handle, so the store lock is held for one refcount bump — not
-    // for a deep clone of the source and global defs on every run.
-    let prefix_data = shared
+    // for a deep clone of the source and global defs on every run. A broken
+    // prefix is refused with its stored cold-start failure as the cause.
+    let entry = shared
         .prefix_store
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(&payload.prefix_id)
-        .map(Arc::clone);
+        .map(|entry| match entry {
+            PrefixEntry::Ready(data) => Ok(Arc::clone(data)),
+            PrefixEntry::Broken(cause) => Err(Arc::clone(cause)),
+        });
 
-    let Some(prefix_data) = prefix_data else {
-        eprintln!(
-            "[iso4-v8] PrefixRun {} — prefix_id={} not found",
-            run_id, payload.prefix_id
-        );
-        let payload = wire::encode_run_completion_payload(
-            run_id,
-            wire::RunCompletion::Failure(wire::RunFailurePayload {
-                error: wire::RunErrorPayload {
-                    code: "ERR_PREFIX_DISPOSED".to_string(),
-                    name: "Error".to_string(),
-                    message: format!(
-                        "prefix '{}' has been disposed or never existed",
-                        payload.prefix_id
-                    ),
-                    stack: None,
-                    fields: None,
-                    reset: None,
-                },
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                duration_ms: 0.0,
-                wall_time_ms: 0.0,
-                cpu_time_ms: 0.0,
-                bridge_calls: Vec::new(),
-                heap_used_bytes: None,
-            }),
-        );
-        if let Err(e) = write_result_frame(sink, run_id, payload) {
-            eprintln!("[iso4-v8] failed to write completion frame: {e}");
+    let prefix_data = match entry {
+        Some(Ok(data)) => data,
+        Some(Err(cause)) => {
+            eprintln!(
+                "[iso4-v8] PrefixRun {run_id} — ERR_PREFIX_BROKEN: prefix_id={} cold start \
+                 failed with {}: {}",
+                payload.prefix_id, cause.code, cause.message
+            );
+            let error = wire::RunErrorPayload {
+                code: "ERR_PREFIX_BROKEN".to_string(),
+                name: "Error".to_string(),
+                message: format!(
+                    "prefix '{}' is broken: its cold start failed with {}: {}",
+                    payload.prefix_id, cause.code, cause.message
+                ),
+                stack: None,
+                fields: None,
+                reset: None,
+                prefix_stage: false,
+                cause: Some(cause),
+            };
+            write_setup_refusal(sink, run_id, error);
+            return;
         }
-        return;
+        None => {
+            eprintln!(
+                "[iso4-v8] PrefixRun {} — prefix_id={} not found",
+                run_id, payload.prefix_id
+            );
+            let error = wire::RunErrorPayload {
+                code: "ERR_PREFIX_DISPOSED".to_string(),
+                name: "Error".to_string(),
+                message: format!(
+                    "prefix '{}' has been disposed or never existed",
+                    payload.prefix_id
+                ),
+                stack: None,
+                fields: None,
+                reset: None,
+                prefix_stage: false,
+                cause: None,
+            };
+            write_setup_refusal(sink, run_id, error);
+            return;
+        }
     };
 
     // ── Binding checks ───────────────────────────────────────────────────
@@ -1227,22 +1280,7 @@ fn dispatch_prefix_run(
             "[iso4-v8] PrefixRun {run_id} — {}: {}",
             error.code, error.message
         );
-        let payload = wire::encode_run_completion_payload(
-            run_id,
-            wire::RunCompletion::Failure(wire::RunFailurePayload {
-                error,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                duration_ms: 0.0,
-                wall_time_ms: 0.0,
-                cpu_time_ms: 0.0,
-                bridge_calls: Vec::new(),
-                heap_used_bytes: None,
-            }),
-        );
-        if let Err(e) = write_result_frame(sink, run_id, payload) {
-            eprintln!("[iso4-v8] failed to write completion frame: {e}");
-        }
+        write_setup_refusal(sink, run_id, error);
         return;
     }
 
@@ -1295,7 +1333,7 @@ fn dispatch_prefix_run(
         crate::warm::Acquired::Cold(handle) => Taken::Cold(handle),
         crate::warm::Acquired::Refused(refusal) => {
             // No registry state taken, no route inserted — just answer.
-            write_completion(sink, run_id, &Err(capacity_failure(refusal)), None);
+            write_completion(sink, run_id, &Err(capacity_failure(refusal)), None, false);
             return;
         }
         crate::warm::Acquired::SpawnFailed(e) => {
@@ -1311,7 +1349,7 @@ fn dispatch_prefix_run(
                 cpu_time_ms: 0.0,
                 bridge_calls: Vec::new(),
             };
-            write_completion(sink, run_id, &Err(failure), None);
+            write_completion(sink, run_id, &Err(failure), None, false);
             return;
         }
     };
@@ -1349,13 +1387,48 @@ fn dispatch_prefix_run(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&run_id);
+            // A deterministic cold-start failure marks the prefix broken:
+            // the entry keeps only the failure, later runs are refused with
+            // it. A prefix disposed meanwhile stays gone.
+            if outcome.prefix_failed {
+                if let Err(failure) = &outcome.result {
+                    let mut store = shared
+                        .prefix_store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if let Some(entry @ PrefixEntry::Ready(_)) = store.get_mut(&prefix_id) {
+                        // Stored for the prefix's lifetime: clamp like the
+                        // wire does and drop the fields blob it never carries.
+                        let raw = wire::run_error_to_payload(&failure.error);
+                        let cause = wire::RunErrorPayload {
+                            message: wire::clamp_error_text(&raw.message).into_owned(),
+                            stack: raw
+                                .stack
+                                .as_deref()
+                                .map(|s| wire::clamp_error_text(s).into_owned()),
+                            fields: None,
+                            ..raw
+                        };
+                        eprintln!(
+                            "[iso4-v8] prefix_id={prefix_id} marked broken: cold start \
+                             failed with {}: {}",
+                            cause.code, cause.message
+                        );
+                        *entry = PrefixEntry::Broken(Arc::new(cause));
+                        // Healthy instances of a broken prefix never serve
+                        // again; drop them like DisposePrefix does.
+                        shared.warm.dispose_prefix(&prefix_id);
+                    }
+                }
+            }
             match taken {
                 Taken::Pooled(att) => {
                     let store = shared
                         .prefix_store
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    let prefix_alive = store.contains_key(&prefix_id);
+                    let prefix_alive =
+                        matches!(store.get(&prefix_id), Some(PrefixEntry::Ready(_)));
                     let (wall_time_ms, cpu_time_ms) = match &outcome.result {
                         Ok(output) => (output.wall_time_ms, output.cpu_time_ms),
                         Err(failure) => (failure.wall_time_ms, failure.cpu_time_ms),
@@ -1396,7 +1469,13 @@ fn dispatch_prefix_run(
                     failure.error
                 ),
             }
-            write_completion(&sink, run_id, &outcome.result, Some(outcome.heap_used_bytes));
+            write_completion(
+                &sink,
+                run_id,
+                &outcome.result,
+                Some(outcome.heap_used_bytes),
+                outcome.prefix_failed,
+            );
         })
     };
 

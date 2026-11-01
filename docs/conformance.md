@@ -36,7 +36,8 @@ code against it. Three consequences run through everything below:
    absent or inert.
 3. **Two stages, one environment.** Prefix code runs once per cold start;
    run code runs per call. `prepare()` runs nothing, so a broken prefix
-   fails its first run with the prefix's own code. The two stages see the
+   fails its first run with the prefix's own code (`stage: 'prefix'`) and
+   is refused with `ERR_PREFIX_BROKEN` after that. The two stages see the
    same surface on purpose. Where they differ, it is stated.
 
 ---

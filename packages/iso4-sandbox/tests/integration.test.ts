@@ -18,7 +18,8 @@
 
 import * as http from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { afterAll, beforeAll, describe, expect, test } from 'vitest'
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
+import { RuntimeIpcClient } from '../src/client.js'
 import { createSandbox as createRuntime } from '../src/index.js'
 import type { Sandbox as Runtime } from '../src/types.js'
 import { SANDBOX_GLOBALS } from '../src/utils.js'
@@ -428,8 +429,54 @@ describe('precompile + prefix.run()', () => {
 
   test('a prefix syntax error fails the first run, not prepare()', async () => {
     await using prefix = await runtime.prepare({ code: 'export default (((' })
+    expect(prefix.status).toBe('ready')
     const check = await prefix.execute({ code: 'export default 0' })
-    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', name: 'SyntaxError' } })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', name: 'SyntaxError', stage: 'prefix' } })
+  })
+
+  test('a broken prefix is remembered: later runs are refused with ERR_PREFIX_BROKEN', async () => {
+    const prefix = await runtime.prepare({ code: 'throw new TypeError("setup failed")' })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', name: 'TypeError', stage: 'prefix' } })
+    // The failed cold start already marks the handle.
+    expect(prefix.status).toBe('broken')
+    expect(prefix.alive).toBe(true)
+    expect(prefix.error).toMatchObject({ code: 'ERR_USER_CODE', name: 'TypeError', message: 'setup failed' })
+
+    // Refused on the client, no round trip, with the stored failure as cause.
+    const spy = vi.spyOn(RuntimeIpcClient.prototype, 'prefixRun')
+    const refused = await prefix.call({ export: 'default' }).then(() => undefined, (e: unknown) => e as Error & { code: string })
+    expect(refused).toMatchObject({ code: 'ERR_PREFIX_BROKEN', message: /is broken: its cold start failed with ERR_USER_CODE: setup failed/ })
+    expect(refused?.cause).toBe(prefix.error)
+    expect(spy).not.toHaveBeenCalled()
+
+    // The runtime holds the mark too: a client that missed the first result
+    // is refused with the same cause and marks itself.
+    ;(prefix as unknown as { _status: string, _error: unknown })._status = 'ready'
+    ;(prefix as unknown as { _status: string, _error: unknown })._error = undefined
+    const fromRuntime = await prefix.execute({ code: 'export default 0' }).then(() => undefined, (e: unknown) => e as Error & { code: string })
+    expect(spy).toHaveBeenCalledTimes(1)
+    expect(fromRuntime).toMatchObject({ code: 'ERR_PREFIX_BROKEN' })
+    expect(fromRuntime?.cause).toMatchObject({ code: 'ERR_USER_CODE', name: 'TypeError', message: 'setup failed' })
+    expect(prefix.status).toBe('broken')
+    spy.mockRestore()
+
+    // dispose() still works and wins.
+    await prefix.dispose()
+    expect(prefix.status).toBe('disposed')
+    expect(prefix.alive).toBe(false)
+    expect(prefix.error).toMatchObject({ code: 'ERR_USER_CODE' })
+    await expect(prefix.execute({ code: 'export default 0' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+  })
+
+  test('a run that fails in run code leaves the prefix ready', async () => {
+    await using prefix = await runtime.prepare({ code: 'export const ok = 1' })
+    const failed = await prefix.execute({ code: 'throw new Error("run code")' })
+    expect(failed).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'run code' } })
+    expect(failed.ok || failed.error.stage).toBeUndefined()
+    expect(prefix.status).toBe('ready')
+    const next = await prefix.execute({ code: 'export default 2' })
+    expect(next.ok).toBe(true)
   })
 })
 

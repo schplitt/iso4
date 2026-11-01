@@ -4886,6 +4886,9 @@ pub struct CallOutcome {
     /// `used_heap_size` after the call — reported on the Result frame and
     /// the input to eviction scoring.
     pub heap_used_bytes: u64,
+    /// True only for a cold start whose prefix failed deterministically:
+    /// the store marks the prefix broken and the result says `prefix_stage`.
+    pub prefix_failed: bool,
 }
 
 /// Run one call (postfix or export call) on a retained instance: fresh
@@ -5059,6 +5062,7 @@ pub fn run_call_on_core(
         result,
         tainted,
         heap_used_bytes: heap_used(&mut core.isolate),
+        prefix_failed: false,
     }
 }
 
@@ -5119,6 +5123,7 @@ fn conclude_run(
         result,
         tainted,
         heap_used_bytes: heap_used(isolate),
+        prefix_failed: false,
     };
     // The hook and the respond channel are mutually exclusive consumers
     // (session jobs carry a hook; direct callers a channel) — whichever
@@ -5857,6 +5862,7 @@ fn taint_sweep(
             )),
             tainted: true,
             heap_used_bytes: 0,
+            prefix_failed: false,
         };
         if let Some(complete) = job.complete.take() {
             complete(outcome);

@@ -150,6 +150,7 @@ pub(crate) fn dead_instance_outcome() -> sandbox::CallOutcome {
         }),
         tainted: true,
         heap_used_bytes: 0,
+        prefix_failed: false,
     }
 }
 
@@ -227,10 +228,21 @@ fn instance_main(
             // Warm-up failed — report it as this call's outcome, then answer
             // every run that joined this instance the same way until the
             // registry drops the handle on taint and the channel closes.
+            // Only the prefix's own, repeatable failures mark it broken;
+            // the warm-up budget and the heap cap depend on load.
+            let prefix_failed = matches!(
+                f.error,
+                sandbox::RunError::RuntimeError(_)
+                    | sandbox::RunError::ModuleNotFound(_)
+                    | sandbox::RunError::Import(_)
+                    | sandbox::RunError::PrefixBridgeCall(_)
+                    | sandbox::RunError::PrefixDidNotSettle(_)
+            );
             let outcome = |f: &sandbox::FailureOutput| sandbox::CallOutcome {
                 result: Err(f.clone()),
                 tainted: true,
                 heap_used_bytes: 0,
+                prefix_failed,
             };
             if let Some(complete) = first_job.complete.take() {
                 complete(outcome(&f));
@@ -2950,6 +2962,29 @@ mod tests {
     }
 
     #[test]
+    fn a_prefix_that_throws_at_top_level_marks_the_outcome_prefix_failed() {
+        sandbox::init_platform();
+        let throwing = Arc::new(PrefixData {
+            code: "throw new Error('setup failed')".to_string(),
+            filename: None,
+            globals: Vec::new(),
+            declared_globals: Vec::new(),
+            declared_imports: Vec::new(),
+        });
+        let dead = spawn_instance(throwing, 0, test_brand_key()).expect("spawn instance");
+        let first = dead.call(bump_job());
+        assert!(first.tainted);
+        assert!(first.prefix_failed);
+        assert!(matches!(
+            first.result.unwrap_err().error,
+            sandbox::RunError::RuntimeError(_)
+        ));
+        // Joiners get the same answer, flag included.
+        let second = dead.call(bump_job());
+        assert!(second.prefix_failed);
+    }
+
+    #[test]
     fn a_failed_warm_up_answers_every_queued_job_with_the_failure() {
         sandbox::init_platform();
         // A prefix that cannot warm up: the owner thread responds with the
@@ -2965,6 +3000,8 @@ mod tests {
         let dead = spawn_instance(looping, 0, test_brand_key()).expect("spawn instance");
         let first = dead.call(bump_job());
         assert!(first.tainted);
+        // The budget is load-dependent: it never marks the prefix broken.
+        assert!(!first.prefix_failed);
         assert!(matches!(
             first.result.unwrap_err().error,
             sandbox::RunError::WarmupLimit

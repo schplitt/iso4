@@ -7,6 +7,7 @@ import type {
   CallResult,
   ResourceLimits,
   ResetCause,
+  RunError,
   RunErrorCode,
   RunResult,
   SandboxExports,
@@ -1514,6 +1515,11 @@ export interface DecodedRunCompletion {
    * frame follows on this connection. Always 0 on failures.
    */
   backgroundFlags: number
+  /**
+   * Present only on an `ERR_PREFIX_BROKEN` refusal: the stored cold-start
+   * failure the runtime refused the run with.
+   */
+  prefixCause?: RunError
 }
 
 /**
@@ -1532,6 +1538,10 @@ export interface DecodedCallCompletion {
    * See {@link DecodedRunCompletion.backgroundFlags}.
    */
   backgroundFlags: number
+  /**
+   * See {@link DecodedRunCompletion.prefixCause}.
+   */
+  prefixCause?: RunError
 }
 
 /**
@@ -1905,6 +1915,8 @@ export function decodeRunCompletionPayload(
   const stack = stackPresent === 1 ? reader.readString() : undefined
   const fields = reader.readOptionalValueBlob() as Record<string, unknown> | undefined
   const reset = readResetInfo(reader)
+  const stage = readPrefixStage(reader)
+  const prefixCause = readErrorCause(reader)
   const stdout = reader.readStringList()
   const stderr = reader.readStringList()
   const durationMs = reader.readF64()
@@ -1921,7 +1933,7 @@ export function decodeRunCompletionPayload(
     result: {
       status: 'failed',
       ok: false,
-      error: { code, name, message, stack, fields, ...reset },
+      error: { code, name, message, stack, fields, ...reset, ...stage },
       stdout,
       stderr,
       durationMs,
@@ -1930,7 +1942,43 @@ export function decodeRunCompletionPayload(
       bridgeCalls,
       heapUsedBytes,
     },
+    ...(prefixCause === undefined ? {} : { prefixCause }),
   }
+}
+
+/**
+ * The stage byte trailing every `RunErrorPayload`: `1` when the prefix failed
+ * to evaluate on this run's cold start. A spreadable fragment, so run-stage
+ * errors add nothing.
+ * @param reader
+ */
+function readPrefixStage(reader: PayloadReader): { stage: 'prefix' } | Record<never, never> {
+  const byte = reader.readU8()
+  if (byte === 0)
+    return {}
+  if (byte !== 1)
+    throw new PayloadDecodeError(`invalid prefix-stage byte: ${byte}`)
+  return { stage: 'prefix' }
+}
+
+/**
+ * The optional cause trailing every `RunErrorPayload`, present only on an
+ * `ERR_PREFIX_BROKEN` refusal: the stored cold-start failure's code, name,
+ * message and stack.
+ * @param reader
+ */
+function readErrorCause(reader: PayloadReader): RunError | undefined {
+  const present = reader.readU8()
+  if (present === 0)
+    return undefined
+  if (present !== 1)
+    throw new PayloadDecodeError(`invalid error-cause presence byte: ${present}`)
+  const code = reader.readString() as RunErrorCode
+  const name = reader.readString()
+  const message = reader.readString()
+  const stackPresent = reader.readU8()
+  const stack = stackPresent === 1 ? reader.readString() : undefined
+  return stack === undefined ? { code, name, message } : { code, name, message, stack }
 }
 
 /**
@@ -2071,6 +2119,8 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   const stack = stackPresent === 1 ? reader.readString() : undefined
   reader.readOptionalValueBlob() // consume; precompile errors never carry fields
   readResetInfo(reader) // consume; precompile errors never carry one
+  readPrefixStage(reader) // consume; never set before a run
+  readErrorCause(reader) // consume; only ERR_PREFIX_BROKEN carries one
   reader.assertDone()
   return { ok: false, requestId, error: { code, name, message, stack } }
 }
