@@ -544,6 +544,7 @@ name = "iso4-v8-runtime"
 version = "0.0.0"
 dependencies = [
  "ada-url",
+ "cc",
  "codspeed-criterion-compat",
  "crossbeam-channel",
  "libc",

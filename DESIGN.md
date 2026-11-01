@@ -1441,8 +1441,11 @@ Documented up front so we don't drift into rebuilding secure-exec:
 
 11. **The clock is frozen while sandbox code executes.** `Date.now()`,
     no-arg `new Date()` / `Date()`, no-arg `Intl.DateTimeFormat`
-    `format()`/`formatToParts()`, and `Temporal.Now.*` all read one frozen
-    per-context value that advances — monotone, whole milliseconds — only
+    `format()`/`formatToParts()`, and `Temporal.Now.*` are V8's unmodified
+    builtins; what is frozen is the wall clock V8 itself reads from its
+    platform (`clock_platform.cc` overrides `CurrentClockTimeMillis`, the
+    one entry point behind all of them, the workerd model). The per-isolate
+    value advances — monotone, whole milliseconds — only
     when the runtime regains control at an event: run entry, each bridge
     response, each stream frame (all to real wall time), and each native
     timer fire (to the timer's *scheduled* time only — item 8 — so a
@@ -1872,10 +1875,9 @@ Rules that follow from it:
 - **Natives carry no per-instance state.** Each native callback is listed in
   the snapshot's external-references table; per-instance data (the run
   table) lives in an isolate slot set at boot.
-- **Boot fixups** run on every context: the frozen clock is reset to the
-  wall clock, and two steps touching globals V8 only adds after restore —
-  the `Temporal.Now` patch, and deleting `SharedArrayBuffer`/`WebAssembly`
-  (§7.5) — are redone.
+- **Boot fixups** run on every context: the isolate gets its frozen clock
+  (started at the wall clock), and `SharedArrayBuffer`/`WebAssembly` are
+  deleted again (§7.5) because V8 adds them only after restore.
 - **Late globals sort last.** The globals V8 adds only after restore
   (`Temporal`, `Float16Array`, `DisposableStack`, `AsyncDisposableStack`,
   `SuppressedError`) come after the runtime's own in
@@ -1885,6 +1887,14 @@ Rules that follow from it:
 - **V8 flags are set in `init_platform` only**, which both `build.rs` and
   the runtime call: a snapshot must be restored under the flags it was made
   with.
+- **The platform is ours.** `src/clock_platform.cc` subclasses V8's
+  `DefaultPlatform` and overrides only `CurrentClockTimeMillis` (§7.11).
+  `build.rs` compiles it against the vendored V8 headers and Chromium's
+  libc++ so it matches the prebuilt `librusty_v8.a`; Linux therefore builds
+  with `clang++`. The subclass adds no members, and `new` sizes the object
+  from those headers: they must describe the same build as the archive
+  (release; `V8_FORCE_DEBUG` changes `base::Mutex`'s layout and is
+  unsupported). `build.rs` itself runs on the stock platform.
 
 ## 12. Security model — fetch hardening
 

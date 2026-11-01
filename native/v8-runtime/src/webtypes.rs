@@ -175,25 +175,17 @@ pub(crate) fn response_shell_ctor(
 /// codec's rehydration path in `v8.rs`.
 pub const BODY_STREAM_FACTORY_KEY: &str = "iso4::bodyStreamFactory";
 
-/// Per-isolate handles to the frozen-clock cell — the plain object whose `t`
-/// property backs every guest-visible clock (`Date`, no-arg
-/// `Intl.DateTimeFormat` formatting, `Temporal.Now`). The shims capture the
-/// cell in closures at install time, so guest code can neither reach the
-/// cell nor observe time passing while it executes; the Rust side advances
-/// it through these handles, stashed in an isolate slot at install (every
-/// isolate holds exactly one context, so the slot is 1:1 with the cell).
-///
-/// The handles exist so an advance costs no per-turn V8 allocations: the old
-/// path re-interned the key and property strings and re-resolved the private
-/// on EVERY turn (~1.5–2 µs, the E2 review's carried item 6).
+/// The isolate's frozen clock: the value V8 returns for `Date.now()`, no-arg
+/// `Date`/`Intl.DateTimeFormat` and `Temporal.Now` while this isolate is
+/// entered (`clock_platform.cc` reads it through data slot `CLOCK_SLOT`).
+/// Only Rust writes it, at run entry, received frames and timer fires.
 pub struct FrozenClock {
-    cell: v8::Global<v8::Object>,
-    prop: v8::Global<v8::String>,
-    /// The value last written to the cell. Only Rust ever writes it, so this
-    /// mirror lets an advance within the same wall millisecond return
-    /// without touching V8 at all.
-    prev: std::cell::Cell<f64>,
+    now: Box<std::cell::Cell<f64>>,
 }
+
+/// rusty_v8 data slot holding the pointer to the frozen value; the C++ side
+/// reads the raw slot behind rusty_v8's one internal slot.
+const CLOCK_SLOT: u32 = 0;
 
 /// Wall clock in whole ms since the epoch — the value the frozen clock
 /// advances to. Truncation to ms is deliberate: the guest never sees sub-ms
@@ -205,33 +197,28 @@ pub(crate) fn wall_now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Give the isolate its frozen clock, started at the wall clock. Runs at
+/// every boot, before any guest code.
+pub fn install_clock(scope: &mut v8::PinScope) {
+    let now = Box::new(std::cell::Cell::new(wall_now_ms()));
+    scope.set_data(CLOCK_SLOT, now.as_ptr().cast());
+    scope.set_slot(FrozenClock { now });
+}
+
 /// Advance the current isolate's frozen clock to `max(current, wall now)`.
 ///
 /// Called only where the runtime regains control from the socket — run entry
 /// and each received frame in the poll loop — never while guest code is on
-/// the stack. Monotone by construction; an isolate without the slot (web
-/// runtime never installed) is left alone.
+/// the stack. Monotone by construction; an isolate without a clock is left
+/// alone.
 pub fn advance_frozen_clock(scope: &mut v8::PinScope) {
-    let Some(clock) = scope.get_slot::<std::rc::Rc<FrozenClock>>().cloned() else {
-        return;
-    };
-    let now = wall_now_ms();
-    if now <= clock.prev.get() {
-        return;
-    }
-    clock.prev.set(now);
-    let cell = v8::Local::new(scope, &clock.cell);
-    let prop = v8::Local::new(scope, &clock.prop);
-    let value = v8::Number::new(scope, now);
-    cell.set(scope, prop.into(), value.into());
+    advance_frozen_clock_to(scope, wall_now_ms());
 }
 
 /// The current isolate's frozen-clock value (epoch ms), or `None` when the
-/// web runtime was never installed. `setTimeout` schedules FROM this value.
+/// isolate has no clock. `setTimeout` schedules FROM this value.
 pub fn frozen_now_ms(scope: &mut v8::PinScope) -> Option<f64> {
-    scope
-        .get_slot::<std::rc::Rc<FrozenClock>>()
-        .map(|clock| clock.prev.get())
+    scope.get_slot::<FrozenClock>().map(|clock| clock.now.get())
 }
 
 /// Advance the current isolate's frozen clock to `max(current, target_ms)`
@@ -239,69 +226,13 @@ pub fn frozen_now_ms(scope: &mut v8::PinScope) -> Option<f64> {
 /// SCHEDULED time, never the real wall (which would undo the S0 freeze).
 /// The target never exceeds the real wall at fire time by construction.
 pub fn advance_frozen_clock_to(scope: &mut v8::PinScope, target_ms: f64) {
-    let Some(clock) = scope.get_slot::<std::rc::Rc<FrozenClock>>().cloned() else {
+    let Some(clock) = scope.get_slot::<FrozenClock>() else {
         return;
     };
     let target = target_ms.trunc();
-    if target <= clock.prev.get() {
-        return;
+    if target > clock.now.get() {
+        clock.now.set(target);
     }
-    clock.prev.set(target);
-    let cell = v8::Local::new(scope, &clock.cell);
-    let prop = v8::Local::new(scope, &clock.prop);
-    let value = v8::Number::new(scope, target);
-    cell.set(scope, prop.into(), value.into());
-}
-
-/// The current isolate's frozen-clock cell, for the snapshot to carry.
-pub fn clock_cell<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
-    let clock = scope.get_slot::<std::rc::Rc<FrozenClock>>()?.clone();
-    Some(v8::Local::new(scope, &clock.cell))
-}
-
-/// Point the isolate's frozen clock at `cell` and set it to the wall clock.
-/// A context restored from the snapshot needs this before any guest code runs:
-/// the cell otherwise still holds the build time.
-pub fn adopt_clock(scope: &mut v8::PinScope, cell: v8::Local<v8::Object>) -> Result<(), String> {
-    let now = wall_now_ms();
-    let prop = v8::String::new(scope, "t")
-        .ok_or_else(|| "intern frozen clock prop failed".to_string())?;
-    let value = v8::Number::new(scope, now);
-    cell.set(scope, prop.into(), value.into())
-        .ok_or_else(|| "init frozen clock failed".to_string())?;
-    let clock = std::rc::Rc::new(FrozenClock {
-        cell: v8::Global::new(scope, cell),
-        prop: v8::Global::new(scope, prop),
-        prev: std::cell::Cell::new(now),
-    });
-    scope.set_slot(clock);
-    Ok(())
-}
-
-/// Private key on the global object holding the `Temporal.Now` patch.
-const TEMPORAL_PATCH_KEY: &str = "iso4::patchTemporal";
-
-fn private_key<'s>(scope: &mut v8::PinScope<'s, '_>, name: &str) -> Result<v8::Local<'s, v8::Private>, String> {
-    let name = v8::String::new(scope, name).ok_or_else(|| format!("intern {name} failed"))?;
-    Ok(v8::Private::for_api(scope, Some(name)))
-}
-
-/// Point `Temporal.Now` at the frozen clock. Runs at every boot: V8 adds
-/// `Temporal` only after the context is restored, so the snapshot cannot
-/// carry the patched object.
-pub fn patch_temporal(scope: &mut v8::PinScope) -> Result<(), String> {
-    let global = scope.get_current_context().global(scope);
-    let key = private_key(scope, TEMPORAL_PATCH_KEY)?;
-    let patch: v8::Local<v8::Function> = global
-        .get_private(scope, key)
-        .and_then(|value| value.try_into().ok())
-        .ok_or_else(|| "Temporal patch missing".to_string())?;
-    v8::tc_scope!(let tc, scope);
-    let recv = v8::undefined(tc).into();
-    patch
-        .call(tc, recv, &[])
-        .ok_or_else(|| exception_text(tc, "patch Temporal"))?;
-    Ok(())
 }
 
 /// Delete the globals the sandbox does not offer (DESIGN.md §7.5). Runs at
@@ -327,7 +258,7 @@ pub fn install_with_streams(
     stream_read: v8::Local<v8::Value>,
     stream_cancel: v8::Local<v8::Value>,
 ) -> Result<(), String> {
-    let mut factory_args = Vec::with_capacity(9);
+    let mut factory_args = Vec::with_capacity(8);
     for (name, ctor) in [
         ("HeadersShell", headers_shell_ctor.map_fn_to()),
         ("RequestShell", request_shell_ctor.map_fn_to()),
@@ -368,16 +299,10 @@ pub fn install_with_streams(
         .ok_or_else(|| "create stampStreamBody failed".to_string())?;
     factory_args.push(v8::Local::<v8::Value>::from(stamp));
 
-    // The frozen-clock cell (see [`FrozenClock`]), set to the wall clock so
-    // prefix evaluation runs on a frozen "now" exactly like calls do.
-    let clock_cell = v8::Object::new(scope);
-    adopt_clock(scope, clock_cell)?;
-    factory_args.push(clock_cell.into());
-
     // The runtime source is an expression evaluating to a function; calling it
-    // with the three shells, the two URL callbacks, the stream natives, and
-    // the frozen-clock cell installs the classes and the clock shims. None of
-    // the arguments are ever exposed on `globalThis`.
+    // with the three shells, the two URL callbacks and the stream natives
+    // installs the classes. None of the arguments are ever exposed on
+    // `globalThis`.
     let source = v8::String::new_from_onebyte_const(scope, &RUNTIME_JS)
         .ok_or_else(|| "intern web runtime source failed".to_string())?;
     let origin_name = v8::String::new(scope, "iso4:web")
@@ -444,15 +369,6 @@ pub fn install_with_streams(
     global
         .set_private(tc, factory_key, factory_fn)
         .ok_or_else(|| "store body-stream factory failed".to_string())?;
-
-    let patch_fn = classes
-        .get_index(tc, 4)
-        .filter(|c| c.is_function())
-        .ok_or_else(|| "web runtime did not return the Temporal patch".to_string())?;
-    let patch_key = private_key(tc, TEMPORAL_PATCH_KEY)?;
-    global
-        .set_private(tc, patch_key, patch_fn)
-        .ok_or_else(|| "store Temporal patch failed".to_string())?;
 
     Ok(())
 }

@@ -13,9 +13,6 @@ use v8::MapFnTo;
 
 use crate::v8::{RunTable, RunTableSlot};
 
-/// Context-data index of the frozen-clock cell.
-const CLOCK_CELL_INDEX: usize = 0;
-
 /// Function addresses only, written once.
 struct References(Vec<v8::ExternalReference>);
 // SAFETY: the table holds code addresses and is never mutated after init.
@@ -75,15 +72,11 @@ pub fn create_params() -> v8::CreateParams {
 }
 
 /// Per-isolate setup of a context fresh from the snapshot: route the natives
-/// to `table`, restart the frozen clock at the wall clock, and redo the two
-/// steps that touch globals V8 adds only after restore.
+/// to `table`, start the frozen clock at the wall clock, and delete the
+/// globals V8 adds only after restore.
 pub fn boot_context(scope: &mut v8::PinScope, table: *const RunTable) -> Result<(), String> {
     scope.set_slot(RunTableSlot(table));
-    let cell = scope
-        .get_context_data_from_snapshot_once::<v8::Object>(CLOCK_CELL_INDEX)
-        .map_err(|e| format!("snapshot clock cell missing: {e}"))?;
-    crate::webtypes::adopt_clock(scope, cell)?;
-    crate::webtypes::patch_temporal(scope)?;
+    crate::webtypes::install_clock(scope);
     crate::webtypes::delete_removed_globals(scope)
 }
 
@@ -102,11 +95,6 @@ pub fn create() -> Vec<u8> {
         crate::v8::install_async_context(scope).expect("install AsyncLocalStorage");
         crate::v8::install_wait_until(scope).expect("install waitUntil");
         crate::v8::install_timers(scope).expect("install timers");
-        let cell = crate::webtypes::clock_cell(scope).expect("frozen clock cell");
-        let index = scope.add_context_data(context, cell);
-        assert_eq!(index, CLOCK_CELL_INDEX);
-        // A live Global handle aborts blob creation; restore re-adopts the cell.
-        scope.remove_slot::<std::rc::Rc<crate::webtypes::FrozenClock>>();
         scope.set_default_context(context);
     }
     let blob = isolate

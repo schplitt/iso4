@@ -50,6 +50,8 @@ unicode-ident = "1"
 # needs every dependency they use.
 [build-dependencies]
 v8 = "152.2"
+# Compiles src/clock_platform.cc against the vendored V8 headers.
+cc = "1"
 crossbeam-channel = "0.5"
 libc = "0.2"
 ada-url = "4"
