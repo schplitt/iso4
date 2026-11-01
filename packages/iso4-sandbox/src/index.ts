@@ -1006,7 +1006,7 @@ class SandboxImpl implements Sandbox {
       if (!result.ok)
         throw thrownRunError(result.error)
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, prefixMemoryMb)
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, prefixMemoryMb, wireLimits(options.limits))
     })
   }
 
@@ -1061,6 +1061,10 @@ implements Prefix<G, M> {
    */
   private readonly memoryMb: number | MemoryLimit | undefined
   /**
+   * `prepare({ limits })` snapshot: the per-run defaults, overridden field by field.
+   */
+  private readonly defaultLimits: WireResourceLimits
+  /**
    * Session brand key for host-type descriptors — see `SandboxImpl`.
    */
   private readonly brandKey: string
@@ -1074,6 +1078,7 @@ implements Prefix<G, M> {
     declaredImports: readonly ImportBindingPayload[],
     brandKey: string,
     memoryMb?: number | MemoryLimit,
+    defaultLimits: WireResourceLimits = {},
   ) {
     this.id = id
     this.pool = pool
@@ -1082,6 +1087,7 @@ implements Prefix<G, M> {
     this.declaredImports = declaredImports
     this.brandKey = brandKey
     this.memoryMb = memoryMb
+    this.defaultLimits = defaultLimits
   }
 
   get alive(): boolean {
@@ -1197,7 +1203,7 @@ implements Prefix<G, M> {
           prefixId: this.id,
           code: payload.code,
           filename: options.filename,
-          limits: { ...wireLimits(options.limits), ...heapCapsForWire(this.memoryMb) },
+          limits: { ...this.defaultLimits, ...wireLimits(options.limits), ...heapCapsForWire(this.memoryMb) },
           globals: defs,
           dispatch,
           importRebinds: merged.rebinds,

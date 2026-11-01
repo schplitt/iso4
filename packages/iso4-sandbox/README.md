@@ -158,7 +158,16 @@ prefix.execute({ globals: { unknown: handler } }) // ❌ TS error
 
 ## Resource limits
 
+`prepare({ limits })` sets the defaults for every run on that prefix. A run's
+own `limits` overrides them field by field; anything set in neither place
+takes the runtime default.
+
 ```ts
+const prefix = await sandbox.prepare({ code: prefixCode, limits: { cpuTimeMs: 200, maxBridgeCalls: 10 } })
+
+prefix.execute({ code: agentCode }) // cpuTimeMs 200, maxBridgeCalls 10
+prefix.execute({ code: agentCode, limits: { cpuTimeMs: 50 } }) // cpuTimeMs 50, maxBridgeCalls 10
+
 prefix.execute({
   code: agentCode,
   limits: {
