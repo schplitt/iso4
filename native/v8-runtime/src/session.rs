@@ -204,6 +204,8 @@ fn find_host_node<'a>(
 /// runtime snapshot (V8 14.x cannot create snapshots safely in a live
 /// multi-isolate process).
 pub struct PrefixData {
+    /// The numeric half of the wire `prefix_id`, named by the fatal OOM line.
+    pub id: u64,
     /// The prefix module source, exactly as validated at precompile time.
     pub code: String,
     /// Filename the prefix was declared with (module origin in stacks).
@@ -1049,6 +1051,7 @@ fn dispatch_oneoff_run(
         .spawn(move || {
             let (shared, sink, conn_runs) = (worker_shared, worker_sink, worker_conn_runs);
             crate::webcodec::set_session_brand_key(brand_key);
+            sandbox::set_oom_run(sandbox::OomRun::Run(run_id));
             sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
                 run_id,
                 report_heap: false,
@@ -1130,10 +1133,8 @@ fn dispatch_precompile(
     shared: &Arc<SharedState>,
     sink: &ipc::FrameSink,
 ) {
-    let prefix_id = shared
-        .next_prefix_id
-        .fetch_add(1, Ordering::Relaxed)
-        .to_string();
+    let id = shared.next_prefix_id.fetch_add(1, Ordering::Relaxed);
+    let prefix_id = id.to_string();
     // Only bridge-backed globals are re-installable per run (string/data
     // globals and shim wrappers are replayed from the stored prefix defs).
     // The declared set is the bridge stub names a PrefixRun may re-bind.
@@ -1156,6 +1157,7 @@ fn dispatch_precompile(
         .insert(
             prefix_id.clone(),
             PrefixEntry::Ready(Arc::new(PrefixData {
+                id,
                 code: payload.code,
                 filename: payload.filename,
                 globals: payload.globals,
