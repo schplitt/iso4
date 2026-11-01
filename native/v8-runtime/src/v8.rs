@@ -272,15 +272,42 @@ extern "C" fn near_heap_limit_cb(
     current_heap_limit + 32 * 1024 * 1024
 }
 
-thread_local! {
-    /// The run executing on this thread right now: wire run id and prefix
-    /// id (`None` = a one-off run). Named by the fatal OOM line.
-    static CURRENT_RUN: RefCell<Option<(u32, Option<String>)>> = const { RefCell::new(None) };
+/// What this thread is executing for the fatal OOM line's benefit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OomRun {
+    None,
+    /// A run's turn (wire run id).
+    Run(u32),
+    /// The prefix evaluating for the run that triggered this instance.
+    ColdStart(u32),
 }
 
-/// Mark the run executing on this thread; `None` once no run is executing.
-pub fn set_current_run(run: Option<(u32, Option<String>)>) {
-    CURRENT_RUN.with(|c| *c.borrow_mut() = run);
+/// Copy and destructor-free on purpose: read inside the OOM handler, where
+/// the thread-local must neither allocate nor register anything.
+#[derive(Clone, Copy)]
+pub struct OomRunLabel {
+    /// The instance thread's prefix; `None` on a one-off run's thread.
+    pub prefix_id: Option<u64>,
+    pub run: OomRun,
+}
+
+thread_local! {
+    static OOM_RUN_LABEL: std::cell::Cell<OomRunLabel> = const {
+        std::cell::Cell::new(OomRunLabel {
+            prefix_id: None,
+            run: OomRun::None,
+        })
+    };
+}
+
+/// Set once per instance thread, before the prefix evaluates.
+pub fn set_oom_prefix_id(prefix_id: Option<u64>) {
+    OOM_RUN_LABEL.with(|c| c.set(OomRunLabel { prefix_id, ..c.get() }));
+}
+
+/// Mark what this thread executes now; `OomRun::None` between runs.
+pub fn set_oom_run(run: OomRun) {
+    OOM_RUN_LABEL.with(|c| c.set(OomRunLabel { run, ..c.get() }));
 }
 
 /// The fatal OOM line, written into `buf` without allocating (the abort
@@ -299,11 +326,18 @@ fn format_oom_line(
         "[iso4-v8] fatal: V8 out of memory ({})",
         if is_heap_oom { "heap" } else { "non-heap" }
     );
-    let _ = CURRENT_RUN.with(|c| match &*c.borrow() {
-        Some((run_id, Some(prefix_id))) => write!(cur, " in run {run_id} of prefix {prefix_id}"),
-        Some((run_id, None)) => write!(cur, " in one-off run {run_id}"),
-        None => write!(cur, " with no run executing on this thread"),
-    });
+    let label = OOM_RUN_LABEL.with(|c| c.get());
+    let _ = match (label.run, label.prefix_id) {
+        (OomRun::None, _) => write!(cur, " with no run executing on this thread"),
+        (OomRun::Run(run_id), Some(p)) => write!(cur, " in run {run_id} of prefix {p}"),
+        (OomRun::Run(run_id), None) => write!(cur, " in one-off run {run_id}"),
+        (OomRun::ColdStart(run_id), Some(p)) => {
+            write!(cur, " during cold start of prefix {p} (triggered by run {run_id})")
+        }
+        (OomRun::ColdStart(run_id), None) => {
+            write!(cur, " during cold start (triggered by run {run_id})")
+        }
+    };
     // V8 passes its message ("Reached heap limit") as `location`.
     if let Some(l) = location.and_then(|l| l.to_str().ok()) {
         let _ = write!(cur, ": {l}");
@@ -4911,8 +4945,6 @@ pub struct CallJob {
     pub call: Option<ipc::CallSpec>,
     /// Per-run identity for the early Result frame.
     pub epilogue: Option<EpilogueSpec>,
-    /// The prefix this run belongs to, named by the fatal OOM line.
-    pub prefix_id: Option<String>,
     /// Session completion hook, run on the instance thread when the run
     /// finishes: writes the Result/RunComplete frames through the shared
     /// writer and releases registry state. `None` for direct callers, which
@@ -5482,7 +5514,7 @@ pub fn serve_instance(
         if live.is_empty() && retired {
             return;
         }
-        set_current_run(None);
+        set_oom_run(OomRun::None);
 
         let received = {
             let timeout = peek_valid_deadline(&live, &mut deadlines)
@@ -5679,6 +5711,7 @@ fn dispatch_job(
     if let Some(slot) = &job.ctl_slot {
         slot.set(core.guard.ctl()).ok();
     }
+    note_turn_owner(&job);
 
     // Direct-fd jobs run inline to completion — this thread is the fd's
     // only reader for the duration, the pre-demux discipline. They must
@@ -5725,7 +5758,6 @@ fn dispatch_job(
     } else {
         alloc_run_token()
     };
-    note_turn_owner(&job);
     let start = std::time::Instant::now();
     let cpu_budget = Arc::new(CpuBudget::new());
     let bridge_log: Arc<Mutex<BridgeCallLog>> = Arc::new(Mutex::new(BridgeCallLog::default()));
@@ -5948,7 +5980,7 @@ thread_local! {
 pub fn note_turn_owner(job: &CallJob) {
     let run_id = job.epilogue.map(|e| e.run_id).unwrap_or(0);
     LAST_CULPRIT_RUN_ID.with(|c| c.set(run_id));
-    set_current_run(Some((run_id, job.prefix_id.clone())));
+    set_oom_run(OomRun::Run(run_id));
 }
 
 fn heap_used(isolate: &mut v8::OwnedIsolate) -> u64 {
@@ -10718,16 +10750,19 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).into_owned()
         };
         let mut buf = [0u8; 256];
-        set_current_run(Some((17, Some("abc123".to_string()))));
+        set_oom_prefix_id(Some(123));
+        set_oom_run(OomRun::Run(17));
         assert_eq!(
             line(&mut buf),
-            "[iso4-v8] fatal: V8 out of memory (heap) in run 17 of prefix abc123: \
+            "[iso4-v8] fatal: V8 out of memory (heap) in run 17 of prefix 123: \
              Reached heap limit (more) — aborting the process\n"
         );
-        set_current_run(Some((18, None)));
+        set_oom_run(OomRun::ColdStart(17));
+        assert!(line(&mut buf).contains(" during cold start of prefix 123 (triggered by run 17): "));
+        set_oom_prefix_id(None);
+        set_oom_run(OomRun::Run(18));
         assert!(line(&mut buf).contains(" in one-off run 18: "));
-        set_current_run(None);
-        assert!(line(&mut buf).contains(" with no run executing on this thread: "));
+        set_oom_run(OomRun::None);
         // Null detail and location are left out; a full buffer cuts, never grows.
         let n = format_oom_line(&mut buf, false, None, None);
         assert_eq!(

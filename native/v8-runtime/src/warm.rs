@@ -218,8 +218,10 @@ fn instance_main(
         filename: prefix.filename.as_deref().unwrap_or("<prefix>"),
         globals: &prefix.globals,
     };
-    // The prefix evaluates before any turn: name the triggering run meanwhile.
-    sandbox::note_turn_owner(&first_job);
+    sandbox::set_oom_prefix_id(Some(prefix.id));
+    sandbox::set_oom_run(sandbox::OomRun::ColdStart(
+        first_job.epilogue.map(|e| e.run_id).unwrap_or(0),
+    ));
     let mut core = match sandbox::create_instance_core(
         Some(spec),
         &prefix.declared_imports,
@@ -277,6 +279,7 @@ fn instance_main(
     // The loop ended — the registry evicted this instance (taint, eviction,
     // dispose) or the process is shutting down. The isolate drops here, on
     // the thread that created it, as rusty_v8 requires.
+    sandbox::set_oom_run(sandbox::OomRun::None);
     drop(core);
     // Disposal is where the memory actually comes back; glibc holds the
     // freed arenas until asked.
@@ -1135,6 +1138,7 @@ mod tests {
 
     fn counter_prefix() -> Arc<PrefixData> {
         Arc::new(PrefixData {
+            id: 0,
             code: "let n = 0\nexport function bump() { return ++n }".to_string(),
             filename: None,
             globals: Vec::new(),
@@ -1168,7 +1172,6 @@ mod tests {
                 args_blob: testval::to_blob(&TestValue::Array(Vec::new())),
             }),
             epilogue: None,
-            prefix_id: None,
             complete: None,
             ctl_slot: None,
         }
@@ -1784,6 +1787,7 @@ mod tests {
         // `kept` is warmth, `junk` is garbage: the settle must take one and
         // leave the other.
         let garbage = Arc::new(PrefixData {
+            id: 0,
             code: "const kept = []\n\
                    export function churn() {\n\
                      kept.push(new Array(1000).fill(kept.length))\n\
@@ -1873,6 +1877,7 @@ mod tests {
 
     fn interleave_prefix() -> Arc<PrefixData> {
         Arc::new(PrefixData {
+            id: 0,
             code: "let n = 0\n\
                    export function bump() { return ++n }\n\
                    export async function viaTool(x) { console.log('run-' + x); const v = await tool(); return [x, v] }\n\
@@ -1892,6 +1897,7 @@ mod tests {
 
     fn timer_order_prefix() -> Arc<PrefixData> {
         Arc::new(PrefixData {
+            id: 0,
             code: "const marks = []\n\
                    export async function sleepMark(ms) { await new Promise(r => setTimeout(() => { marks.push('t'); r() }, ms)); return marks.join(',') }\n\
                    export function mark() { marks.push('j'); return marks.join(',') }\n\
@@ -1906,6 +1912,7 @@ mod tests {
 
     fn stream_prefix() -> Arc<PrefixData> {
         Arc::new(PrefixData {
+            id: 0,
             code: "let n = 0\n\
                    export function bump() { return ++n }\n\
                    export async function streamSmall() {\n\
@@ -1999,7 +2006,6 @@ mod tests {
                 run_id,
                 report_heap: false,
             }),
-            prefix_id: None,
             complete: None,
             ctl_slot,
         });
@@ -2969,6 +2975,7 @@ mod tests {
     fn a_prefix_that_throws_at_top_level_marks_the_outcome_prefix_failed() {
         sandbox::init_platform();
         let throwing = Arc::new(PrefixData {
+            id: 0,
             code: "throw new Error('setup failed')".to_string(),
             filename: None,
             globals: Vec::new(),
@@ -2995,6 +3002,7 @@ mod tests {
         // warm-up failure to the triggering job and to every job that joins
         // before the handle drops; after the drop a call is dead-instance.
         let looping = Arc::new(PrefixData {
+            id: 0,
             code: "for (;;) {}".to_string(),
             filename: None,
             globals: Vec::new(),
