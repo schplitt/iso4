@@ -623,7 +623,7 @@ time. Never per run, never per value.
 | `prefixId` | `PrefixId`           | Prefix handle returned by `Precompile`.                                                                                    |
 | `code`     | `Optional<String>`   | ESM postfix source. A frame carries a postfix **or** a call — exactly one; both parser and encoder enforce this.           |
 | `filename` | `Optional<String>`   | Used in stack traces.                                                                                                      |
-| `limits`   | `ResourceLimits`     | Fully normalized by TS before sending.                                                                                     |
+| `limits`   | `ResourceLimits`     | Prefix defaults (`prepare({ limits })`) merged with the run's own, field by field; absent fields take runtime defaults.    |
 | `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs). |
 | `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                          |
 | `call`     | `Optional<CallSpec>` | Host → sandbox call resolved against the prefix module's exports.                                                          |
@@ -659,14 +659,14 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 
 `PrecompilePayload`:
 
-| Field       | Encoding              | Notes                                                                                             |
-| ----------- | --------------------- | ------------------------------------------------------------------------------------------------- |
-| `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`; the host matches replies by id, never by order. |
-| `code`      | `String`              | ESM prefix source.                                                                                |
-| `filename`  | `Optional<String>`    | Used in stack traces.                                                                             |
-| `limits`    | `ResourceLimits`      | Currently unused: nothing is evaluated at `Precompile`.                                           |
-| `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                    |
-| `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                        |
+| Field       | Encoding              | Notes                                                                                                               |
+| ----------- | --------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`; the host matches replies by id, never by order.                   |
+| `code`      | `String`              | ESM prefix source.                                                                                                  |
+| `filename`  | `Optional<String>`    | Used in stack traces.                                                                                               |
+| `limits`    | `ResourceLimits`      | Ignored by the runtime: nothing is evaluated at `Precompile`. The host keeps them as the prefix's per-run defaults. |
+| `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                                      |
+| `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                                          |
 
 `ResourceLimits`:
 

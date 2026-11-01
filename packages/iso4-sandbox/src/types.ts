@@ -1015,13 +1015,14 @@ export interface PrecompileOptions<
   imports?: M
 
   /**
-   * Resource limits applied to prefix code evaluation.
+   * Default limits for every `execute()`/`call()` on this prefix. A run's
+   * own `limits` overrides them field by field, so a run can change one
+   * knob without restating the rest; a field set in neither place takes the
+   * runtime default. Checked here like per-run limits (a `TypeError` for a
+   * bad value). The heap cap is not part of this: set it with `memoryMb`.
    *
-   * **Currently a no-op placeholder.** Pass limits directly to each
-   * `prefix.execute()` call. The one budget that applies to prefix
-   * evaluation is not configurable: a cold start runs under the fixed
-   * warm-up budget (1 s wall / 1 s CPU), and a prefix that cannot evaluate
-   * inside it fails that run with `ERR_WARMUP_LIMIT`.
+   * Prefix evaluation itself runs under the fixed warm-up budget
+   * (1 s wall / 1 s CPU), not these limits.
    */
   limits?: ResourceLimits
 
@@ -1148,6 +1149,10 @@ export interface PrefixRunOptions<
    */
   imports?: RebindImports<M>
 
+  /**
+   * Limits for this run, applied field by field on top of the prefix's
+   * `prepare({ limits })` defaults. `memoryMb` is not a per-run option here.
+   */
   limits?: ResourceLimits
   /**
    * Abort the run. Firing this is always SOFT: while queued the caller is
@@ -1193,6 +1198,10 @@ export interface PrefixCallOptions<
    * rules as {@link PrefixRunOptions.imports}.
    */
   imports?: RebindImports<M>
+  /**
+   * Limits for this call, applied field by field on top of the prefix's
+   * `prepare({ limits })` defaults. `memoryMb` is not a per-run option here.
+   */
   limits?: ResourceLimits
   /**
    * Abort the run. Firing this is always SOFT: while queued the caller is

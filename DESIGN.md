@@ -298,6 +298,14 @@ checks every field at `sandbox.run()`, `readExports()`, `prepare()`,
 fractional, non-finite, non-number or out-of-range value. That is a setup
 error (§5.2), so nothing is sent.
 
+`prepare({ limits })` is the default for every run on that prefix. The
+client merges a run's `limits` over it field by field before building the
+`PrefixRun` frame, so a run can tighten or loosen one knob without restating
+the rest; a field set in neither place stays absent on the wire and the
+runtime fills its own default. The merge is host-side only. `memoryMb` is
+outside it: the heap cap is fixed per prefix (`prepare({ memoryMb })`), see
+below.
+
 **Memory** is two lines for a REUSED instance, one for a one-off (#169).
 
 On a prefix, `memoryMb` is the **soft** line and the terminating cap sits a

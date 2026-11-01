@@ -53,7 +53,7 @@ const result = await prefix.run({
     const users = res.json()
     export default { count: users.length }
   `,
-  limits: { cpuTimeMs: 200 }, // memoryMb is set on createSandbox, not per run
+  limits: { cpuTimeMs: 200 }, // overrides prepare({ limits }) field by field; memoryMb is per prefix, not per run
 })
 
 if (result.ok) {
