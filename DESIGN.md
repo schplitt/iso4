@@ -325,6 +325,23 @@ The **hard** line is enforced by:
 - `add_near_heap_limit_callback` converts OOM into a clean
   `terminate_execution` instead of a Rust-process abort.
 
+The conversion only holds for gradual growth. An allocation that crosses the
+cap in one step (a flattened 300 MB string, a huge `Array.prototype.fill`)
+still ends in V8's fatal out-of-memory abort, which takes the whole runtime
+child and every run in flight on it. The child registers V8's OOM error
+handler on every user-code isolate, so before that abort it writes one line
+on its stderr naming the culprit:
+`[iso4-v8] fatal: V8 out of memory (heap|non-heap) in run <id> of prefix
+<prefix_id>: <V8 message> — aborting the process`, with `in one-off run <id>`
+for `sandbox.run()` and `with no run executing on this thread` when the
+aborting thread is between runs. Attribution holds when the allocation
+happens on the run's own thread; V8 helper threads (concurrent allocation,
+background compile) report no run. The iso4 line replaces V8's own
+`# Fatal JavaScript out of memory: Reached heap limit` block, which V8 skips
+once a handler is installed; the process then aborts with
+`API fatal error handler returned after process out of memory`. The host
+inherits the child's stderr and sees the line unparsed.
+
 Crossing it terminates, taints and fails co-residents with
 `ERR_INSTANCE_RESET`, so only a runaway allocation gets there. The **soft**
 line is checked in the registry when a run completes — the heap figure is

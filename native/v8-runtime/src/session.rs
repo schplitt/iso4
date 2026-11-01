@@ -1049,6 +1049,7 @@ fn dispatch_oneoff_run(
         .spawn(move || {
             let (shared, sink, conn_runs) = (worker_shared, worker_sink, worker_conn_runs);
             crate::webcodec::set_session_brand_key(brand_key);
+            sandbox::set_current_run(Some((run_id, None)));
             sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
                 run_id,
                 report_heap: false,
@@ -1503,6 +1504,7 @@ fn dispatch_prefix_run(
             run_id,
             report_heap: true,
         }),
+        prefix_id: Some(payload.prefix_id.clone()),
         complete: Some(complete),
         ctl_slot: Some(ctl),
     });

@@ -218,6 +218,8 @@ fn instance_main(
         filename: prefix.filename.as_deref().unwrap_or("<prefix>"),
         globals: &prefix.globals,
     };
+    // The prefix evaluates before any turn: name the triggering run meanwhile.
+    sandbox::note_turn_owner(&first_job);
     let mut core = match sandbox::create_instance_core(
         Some(spec),
         &prefix.declared_imports,
@@ -1166,6 +1168,7 @@ mod tests {
                 args_blob: testval::to_blob(&TestValue::Array(Vec::new())),
             }),
             epilogue: None,
+            prefix_id: None,
             complete: None,
             ctl_slot: None,
         }
@@ -1996,6 +1999,7 @@ mod tests {
                 run_id,
                 report_heap: false,
             }),
+            prefix_id: None,
             complete: None,
             ctl_slot,
         });
