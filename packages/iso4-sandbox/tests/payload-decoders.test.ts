@@ -438,11 +438,11 @@ describe('decodeRunCompletionPayload — success', () => {
 // ── decodeRunCompletionPayload — failure ───────────────────────────────────
 
 describe('decodeRunCompletionPayload — failure', () => {
-  test('compile error with no stack', () => {
+  test('syntax error with no stack', () => {
     const { result } = decodeRunCompletionPayload(
       encodeCompletionPayload(0, {
         ok: false,
-        code: 'ERR_COMPILE',
+        code: 'ERR_USER_CODE',
         name: 'SyntaxError',
         message: 'bad syntax',
       }),
@@ -451,7 +451,7 @@ describe('decodeRunCompletionPayload — failure', () => {
     if (result.ok)
       return
     expect(result.error).toEqual({
-      code: 'ERR_COMPILE',
+      code: 'ERR_USER_CODE',
       name: 'SyntaxError',
       message: 'bad syntax',
       stack: undefined,
@@ -523,7 +523,6 @@ describe('decodeRunCompletionPayload — failure', () => {
 
   test.each([
     'ERR_USER_CODE',
-    'ERR_COMPILE',
     'ERR_CPU_TIMEOUT',
     'ERR_WALL_TIMEOUT',
     'ERR_MEMORY_LIMIT',
@@ -623,12 +622,12 @@ describe('decodePrecompileResultPayload', () => {
 
   test('failure decodes error fields', () => {
     const result = decodePrecompileResultPayload(
-      encodeFailure('ERR_COMPILE', 'bad syntax', 'at line 1'),
+      encodeFailure('ERR_USER_CODE', 'bad syntax', 'at line 1'),
     )
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_COMPILE')
+    expect(result.error.code).toBe('ERR_USER_CODE')
     expect(result.error.message).toBe('bad syntax')
     expect(result.error.stack).toBe('at line 1')
   })

@@ -294,10 +294,8 @@ export class RuntimeIpcClient {
   private readonly controlWaiters: ControlWaiter[] = []
 
   /**
-   * Pending `precompile()` requests keyed by their wire `requestId`.
-   * Precompiles are answered on runtime worker threads, so with several in
-   * flight on one connection the replies can return out of request order —
-   * FIFO matching would cross-assign prefix ids between callers.
+   * Pending `precompile()` requests keyed by their wire `requestId`, so a
+   * reply is matched by id and never by arrival order.
    */
   private readonly precompileWaiters = new Map<number, {
     resolve: (payload: Uint8Array) => void

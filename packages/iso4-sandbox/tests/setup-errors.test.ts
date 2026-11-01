@@ -136,6 +136,14 @@ describe('ERR_INVALID_REBIND', () => {
 })
 
 describe('malformed options', () => {
+  test('prepare() throws a TypeError when code is not a string, without a round trip', async () => {
+    for (const code of [undefined, null, 5, ['export default 1']]) {
+      await expect(sandbox.prepare({ code: code as never })).rejects.toThrow(TypeError)
+    }
+    for (const spy of wire)
+      expect(spy).not.toHaveBeenCalled()
+  })
+
   test.each(['run', 'call'] as const)('prefix.%s() throws a TypeError for a bad limit without a round trip', async (kind) => {
     const promise = kind === 'run' ? run({ limits: { cpuTimeMs: -1 } }) : call({ limits: { cpuTimeMs: 1.5 } })
     await expect(promise).rejects.toThrow(TypeError)

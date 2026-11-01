@@ -396,35 +396,74 @@ globalThis.retries = config.retries`,
     await prefix.dispose()
   })
 
-  test('prefix that never settles rejects with ERR_PREFIX_DID_NOT_SETTLE', async () => {
-    await expect(
-      runtime.precompile({ code: 'await new Promise(() => {})' }),
-    ).rejects.toMatchObject({ code: 'ERR_PREFIX_DID_NOT_SETTLE' })
+  // prepare() evaluates nothing: a broken prefix fails its first run with
+  // the prefix code, and the trial run below is how a host validates one.
+
+  test('prefix that never settles fails the first run with ERR_PREFIX_DID_NOT_SETTLE', async () => {
+    await using prefix = await runtime.prepare({ code: 'await new Promise(() => {})' })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_DID_NOT_SETTLE' } })
   })
 
-  test('prefix calling a declared bridge global rejects with ERR_PREFIX_BRIDGE_CALL', async () => {
-    // No host session exists at prepare() time — the declared global is
-    // visible (typeof matches run() code) but calling it must fail with the
-    // dedicated code, not a misleading ReferenceError.
-    await expect(
-      runtime.precompile({
-        code: 'await fetch("https://example.com")',
-        globals: { fetch: async () => ({ status: 200 }) },
-      }),
-    ).rejects.toMatchObject({ code: 'ERR_PREFIX_BRIDGE_CALL' })
+  test('prefix calling a declared bridge global fails the first run with ERR_PREFIX_BRIDGE_CALL', async () => {
+    // No host session exists while a prefix evaluates — the declared global
+    // is visible (typeof matches run() code) but calling it must fail with
+    // the dedicated code, not a misleading ReferenceError.
+    await using prefix = await runtime.prepare({
+      code: 'await fetch("https://example.com")',
+      globals: { fetch: async () => ({ status: 200 }) },
+    })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_BRIDGE_CALL' } })
   })
 
-  test('prefix calling a host-import function rejects with ERR_PREFIX_BRIDGE_CALL', async () => {
-    await expect(
-      runtime.precompile({
-        code: `import { search } from 'tools:web'
+  test('prefix calling a host-import function fails the first run with ERR_PREFIX_BRIDGE_CALL', async () => {
+    await using prefix = await runtime.prepare({
+      code: `import { search } from 'tools:web'
 await search('dogs')`,
-        imports: {
-          'tools:web': { search: async () => [] },
-        },
-      }),
-    ).rejects.toMatchObject({ code: 'ERR_PREFIX_BRIDGE_CALL' })
+      imports: {
+        'tools:web': { search: async () => [] },
+      },
+    })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_BRIDGE_CALL' } })
   })
+
+  test('a prefix syntax error fails the first run with ERR_USER_CODE, named by file and line', async () => {
+    await using prefix = await runtime.prepare({ code: '\nexport default (((', filename: 'setup.js' })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({
+      ok: false,
+      error: { code: 'ERR_USER_CODE', name: 'SyntaxError', message: 'Unexpected end of input' },
+    })
+    if (check.ok)
+      return
+    expect(check.error.stack).toMatch(/^SyntaxError: Unexpected end of input\n {4}at setup\.js:2:\d+$/)
+  })
+
+  test('a broken prefix fails every later run the same way, execute() and call() alike', async () => {
+    await using prefix = await runtime.prepare({ code: 'throw new Error("broken prefix")' })
+    for (let i = 0; i < 2; i++) {
+      expect(await prefix.execute({ code: 'export default 0' }))
+        .toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
+    }
+    expect(await prefix.call({ export: 'default', args: [] }))
+      .toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
+  })
+
+  test('runs that join a broken prefix while it cold-starts all get the prefix error', async () => {
+    // With more slots than cores, later runs join the cold-starting
+    // instance instead of spawning their own; a failed warm-up has to
+    // answer every one of them, or they hang and leak their slots.
+    await using many = await createRuntime({ maxConcurrentRuns: 64 })
+    await using prefix = await many.prepare({ code: 'throw new Error("broken prefix")' })
+    const results = await Promise.all(
+      Array.from({ length: 48 }, () => prefix.execute({ code: 'export default 0' })),
+    )
+    for (const result of results)
+      expect(result).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
+    expect((await many.stats()).activeRuns).toBe(0)
+  }, 30_000)
 
   test('prefix.alive is false after dispose', async () => {
     const prefix = await runtime.precompile({ code: '' })
@@ -949,12 +988,13 @@ describe('error handling', () => {
     await runtime?.dispose()
   })
 
-  test('syntax error → ERR_COMPILE', async () => {
+  test('syntax error → ERR_USER_CODE named SyntaxError', async () => {
     const result = await runtime.run({ code: 'export default (((' })
     expect(result.ok).toBe(false)
     if (result.ok)
       return
-    expect(result.error.code).toBe('ERR_COMPILE')
+    expect(result.error.code).toBe('ERR_USER_CODE')
+    expect(result.error.name).toBe('SyntaxError')
   })
 
   test('thrown Error → ERR_USER_CODE with message', async () => {
@@ -3398,12 +3438,15 @@ describe('native timers', () => {
       expect(result.exports.default).toEqual(['number', 2])
   })
 
-  test('setTimeout at prefix top level fails prepare() with a clear error', async () => {
+  test('setTimeout at prefix top level fails the first run with a clear error', async () => {
     // No loop exists while a prefix evaluates — the call throws instead of
-    // hanging (workerd's explicit route). Uncaught, it fails prepare().
-    await expect(
-      runtime.prepare({ code: 'setTimeout(() => {}, 5)' }),
-    ).rejects.toThrow(/only available to run code/)
+    // hanging (workerd's explicit route). Uncaught, it fails the cold start.
+    await using prefix = await runtime.prepare({ code: 'setTimeout(() => {}, 5)' })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({
+      ok: false,
+      error: { code: 'ERR_USER_CODE', message: expect.stringMatching(/only available to run code/) },
+    })
   })
 
   test('timers work on warm prefix runs, and grace work may sleep', async () => {
@@ -4033,32 +4076,31 @@ describe('async context — node:async_hooks', () => {
     await prefix.dispose()
   })
 
-  // ── DOES NOT WORK: async context in prefix (snapshot) code ──────────────────
-  // The native bindings can't be captured in a V8 startup snapshot, so
-  // `node:async_hooks` does not resolve during precompile(). It fails cleanly
-  // with ERR_MODULE_NOT_FOUND (a rejected precompile) — not a crash.
+  // ── DOES NOT WORK: async context in prefix code ─────────────────────────────
+  // `node:async_hooks` does not resolve while a prefix evaluates. The first
+  // run fails cleanly with ERR_MODULE_NOT_FOUND — not a crash.
 
   test('DOES NOT WORK: importing node:async_hooks in prefix code', async () => {
-    await expect(
-      runtime.precompile({
-        code: /* js */ `
-          import { AsyncLocalStorage } from 'node:async_hooks'
-          globalThis.als = new AsyncLocalStorage()
-        `,
-      }),
-    ).rejects.toMatchObject({ code: 'ERR_MODULE_NOT_FOUND' })
+    await using prefix = await runtime.prepare({
+      code: /* js */ `
+        import { AsyncLocalStorage } from 'node:async_hooks'
+        globalThis.als = new AsyncLocalStorage()
+      `,
+    })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_MODULE_NOT_FOUND' } })
   })
 
   test('DOES NOT WORK: baking the step shim into the prefix (prefix imports it)', async () => {
     // Same reason: if the PREFIX imports the shim, the shim's own
-    // `import ... from 'node:async_hooks'` must resolve at snapshot time, which
-    // it can't. Keep the shim as a postfix import instead.
-    await expect(
-      runtime.precompile({
-        code: `import { step } from 'workflow:steps'; globalThis.step = step`,
-        imports: { 'workflow:steps': STEP_SHIM_SOURCE },
-      }),
-    ).rejects.toMatchObject({ code: 'ERR_MODULE_NOT_FOUND' })
+    // `import ... from 'node:async_hooks'` must resolve at the prefix stage,
+    // which it can't. Keep the shim as a postfix import instead.
+    await using prefix = await runtime.prepare({
+      code: `import { step } from 'workflow:steps'; globalThis.step = step`,
+      imports: { 'workflow:steps': STEP_SHIM_SOURCE },
+    })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_MODULE_NOT_FOUND' } })
   })
 
   // ── BOUNDARY: only run + getStore are implemented ───────────────────────────
@@ -5371,10 +5413,10 @@ describe('readExports', () => {
     expect(skippedExports).toEqual(['default'])
   })
 
-  test('rejects on a broken module, like prepare()', async () => {
+  test('rejects on a broken module', async () => {
     await expect(runtime.readExports({ code: 'export default (((' }))
       .rejects
-      .toMatchObject({ code: 'ERR_COMPILE' })
+      .toMatchObject({ code: 'ERR_USER_CODE', name: 'SyntaxError' })
   })
 
   test('rejects when the module top level throws', async () => {
@@ -5670,13 +5712,13 @@ describe('import failures', () => {
     expect(result.bridgeCalls).toHaveLength(1)
   })
 
-  test('prepare() rejects a prefix that calls import() or imports an unknown module', async () => {
-    await expect(runtime.prepare({ code: `try { await import('lodash') } catch {}` }))
-      .rejects
-      .toMatchObject({ code: 'ERR_IMPORT', message: DYN })
-    await expect(runtime.prepare({ code: `import x from 'lodash'` }))
-      .rejects
-      .toMatchObject({ code: 'ERR_MODULE_NOT_FOUND', message: `Cannot find module 'lodash'` })
+  test('a prefix that calls import() or imports an unknown module fails its first run', async () => {
+    await using dynamic = await runtime.prepare({ code: `try { await import('lodash') } catch {}` })
+    expect(await dynamic.execute({ code: 'export default 0' }))
+      .toMatchObject({ ok: false, error: { code: 'ERR_IMPORT', message: DYN } })
+    await using unknown = await runtime.prepare({ code: `import x from 'lodash'` })
+    expect(await unknown.execute({ code: 'export default 0' }))
+      .toMatchObject({ ok: false, error: { code: 'ERR_MODULE_NOT_FOUND', message: `Cannot find module 'lodash'` } })
   })
 
   test('dynamic import() in prefix.call and prefix.run fails that run; the next run is clean', async () => {

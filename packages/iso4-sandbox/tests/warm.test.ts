@@ -103,13 +103,12 @@ describe('warm instances', () => {
     expect(oneOff.heapUsedBytes).toBeUndefined()
   })
 
-  test('prepare() rejects a prefix that blows the warm-up budget', async () => {
-    // A synchronously looping prefix used to hang prepare() forever; the
-    // fixed warm-up budget (1s, Cloudflare's script-startup model) now
-    // rejects it at deploy time with its own code.
-    await expect(
-      single.prepare({ code: 'for (;;) {}' }),
-    ).rejects.toMatchObject({ code: 'ERR_WARMUP_LIMIT' })
+  test('a prefix that blows the warm-up budget fails its first run with ERR_WARMUP_LIMIT', async () => {
+    // prepare() evaluates nothing. The fixed warm-up budget (1s, Cloudflare's
+    // script-startup model) fails the cold start with its own code.
+    await using prefix = await single.prepare({ code: 'for (;;) {}' })
+    const check = await prefix.execute({ code: 'export default 0' })
+    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_WARMUP_LIMIT' } })
   }, 15_000)
 
   test('one-off runs never share state', async () => {

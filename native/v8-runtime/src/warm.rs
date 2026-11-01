@@ -224,17 +224,27 @@ fn instance_main(
     ) {
         Ok(c) => c,
         Err(f) => {
-            // Warm-up failed — report it as this call's outcome and exit;
-            // the registry drops the handle on taint.
-            let outcome = sandbox::CallOutcome {
-                result: Err(f),
+            // Warm-up failed — report it as this call's outcome, then answer
+            // every run that joined this instance the same way until the
+            // registry drops the handle on taint and the channel closes.
+            let outcome = |f: &sandbox::FailureOutput| sandbox::CallOutcome {
+                result: Err(f.clone()),
                 tainted: true,
                 heap_used_bytes: 0,
             };
             if let Some(complete) = first_job.complete.take() {
-                complete(outcome);
+                complete(outcome(&f));
             } else if let Some(respond) = first_respond {
-                respond.send(outcome).ok();
+                respond.send(outcome(&f)).ok();
+            }
+            while let Ok(routed) = events.recv() {
+                if let sandbox::RunEvent::Job((mut job, respond)) = routed.event {
+                    if let Some(complete) = job.complete.take() {
+                        complete(outcome(&f));
+                    } else if let Some(respond) = respond {
+                        respond.send(outcome(&f)).ok();
+                    }
+                }
             }
             return;
         }
@@ -2940,10 +2950,11 @@ mod tests {
     }
 
     #[test]
-    fn dead_instance_thread_reports_a_tainted_internal_failure() {
+    fn a_failed_warm_up_answers_every_queued_job_with_the_failure() {
         sandbox::init_platform();
         // A prefix that cannot warm up: the owner thread responds with the
-        // warm-up failure and exits.
+        // warm-up failure to the triggering job and to every job that joins
+        // before the handle drops; after the drop a call is dead-instance.
         let looping = Arc::new(PrefixData {
             code: "for (;;) {}".to_string(),
             filename: None,
@@ -2958,13 +2969,26 @@ mod tests {
             first.result.unwrap_err().error,
             sandbox::RunError::WarmupLimit
         ));
-        // The thread exited after the warm-up failure — a second call on the
-        // same handle reports the dead-instance outcome instead of hanging.
         let second = dead.call(bump_job());
         assert!(second.tainted);
         assert!(matches!(
             second.result.unwrap_err().error,
-            sandbox::RunError::Internal(_)
+            sandbox::RunError::WarmupLimit
+        ));
+        let sender = dead.sender();
+        drop(dead);
+        // The registry dropped the handle: the thread drains and exits, and a
+        // leaked sender gets the dead-instance outcome instead of hanging.
+        std::thread::sleep(Duration::from_millis(50));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job((Box::new(bump_job()), Some(tx))));
+        let late = match sender.send(msg) {
+            Err(_) => dead_instance_outcome(),
+            Ok(()) => rx.recv().unwrap_or_else(|_| dead_instance_outcome()),
+        };
+        assert!(matches!(
+            late.result.unwrap_err().error,
+            sandbox::RunError::Internal(_) | sandbox::RunError::WarmupLimit
         ));
     }
 }

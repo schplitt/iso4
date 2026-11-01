@@ -15,9 +15,9 @@ The execution model is always the same:
 precompile prefix once  →  call a function with some input  →  get a value back
 ```
 
-The prefix is validated once at `prepare()` and cached (source + declared
-shape); every execution evaluates it into a fresh isolate and then runs a
-function, returning its result.
+The prefix is stored once at `prepare()` (source + declared shape, nothing
+evaluated); every execution evaluates it into a fresh isolate and then runs
+a function, returning its result.
 The function body and the input differ between deployments; the machinery
 is identical.
 
@@ -53,7 +53,7 @@ change between calls. Only the input data varies. The prefix exports the
 function by name; the host calls it with each new input:
 
 ```js
-// Prefix code (validated once at prepare())
+// Prefix code (stored once at prepare(), evaluated on each cold start)
 export async function transform(row) {
   return { revenue: row.price * row.qty }
 }
@@ -121,7 +121,8 @@ analytics use case is served by a separate package, not a backend swap.
    as a V8 serialization blob, which restricts results to data
    (no functions, no methods — see §5.1).
 8. **Captured stdout/stderr** via a runtime-owned `console`.
-9. **Pre-validated prefix code**: `prepare()` validates the prefix once;
+9. **Stored prefix code**: `prepare()` stores the prefix once, without
+   evaluating it (§16.4);
    each run re-evaluates the cached source (sub-ms for typical prefixes;
    grows with prefix size). Per-prefix runtime snapshots were removed — see
    §11.6; isolates boot from one build-time snapshot instead (§11.7).
@@ -244,9 +245,7 @@ Every call to `runtime.run(opts)`:
    - For host-implemented modules: builds a synthetic module whose
      exports are stubs that bridge to the host.
 5. Rust evaluates the module. Top-level `await` works. (In a prefix it works
-   as long as the evaluation promise settles without host I/O — the same rule
-   at `prepare()` validation and at every prefix evaluation afterwards; see
-   §11.3.)
+   as long as the evaluation promise settles without host I/O; see §11.3.)
 6. Once evaluation settles, Rust copies the module namespace into a plain
    object and serializes it **once** as a V8 blob — `default` and every named
    export in one payload. Functions, promises, symbols, `WeakMap`s, and
@@ -466,8 +465,8 @@ deliberate, one cap per run.
 non-enumerable like the web classes) and is also importable as
 `import { waitUntil } from 'iso4:runtime'` — the second runtime-owned module
 specifier after `node:async_hooks`. It is available to run code only: setup
-code evaluated at `prepare()` time gets a catchable error, since setup must
-finish inside the warm-up budget. Registered values that are not promises
+code (the prefix) gets a catchable error, since setup must finish inside the
+warm-up budget. Registered values that are not promises
 count as already-settled work. The host sees the outcome as
 `result.waitUntil?: Promise<WaitUntilResult>` — present only when work was
 registered, always resolving (never rejecting) with the grace status
@@ -719,7 +718,8 @@ host-provided text. The runtime resolver looks up each specifier in
 `imports`. A missing specifier surfaces as `ERR_MODULE_NOT_FOUND`, whose
 message names it and, for a nested import, the module that imported it.
 Every other linking failure (a missing named export, say) is `ERR_IMPORT`
-with V8's message; a source import that does not compile is `ERR_COMPILE`.
+with V8's message; a source import that does not compile is `ERR_USER_CODE`
+with `name: 'SyntaxError'`, like any other syntax error.
 
 The object form imposes these restrictions on the value tree:
 
@@ -1052,7 +1052,7 @@ holds. An already-aborted signal wins over validation and resolves as
 aborted, except disposal: using a disposed prefix always throws
 `ERR_PREFIX_DISPOSED`. Everything else — user code, limits,
 bridge failures, abort, capacity and queue refusals — stays a result. That
-includes `ERR_COMPILE`, `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
+includes `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
 `ERR_CALL_TARGET_NOT_FOUND`, `ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL` and
 `ERR_TYPE_NOT_SERIALIZABLE`.
 
@@ -1166,7 +1166,7 @@ direction. Both tables start at `0x01`.
 | ------ | ---------------- | ---------------------------------------------------------------------- |
 | `0x01` | `Authenticate`   | First message on connect: protocol version + V8 format probe           |
 | `0x02` | `Run`            | Start a sandboxed execution in a fresh isolate                         |
-| `0x03` | `Precompile`     | Validate prefix code and store it under a `PrefixId`                   |
+| `0x03` | `Precompile`     | Store prefix code under a `PrefixId` (nothing is evaluated, §16.4)      |
 | `0x04` | `PrefixRun`      | Execute against a prepared prefix (served by a warm instance, §13.2.1) |
 | `0x05` | `DisposePrefix`  | Drop a stored prefix and its instances                                 |
 | `0x06` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                                      |
@@ -1421,8 +1421,8 @@ Documented up front so we don't drift into rebuilding secure-exec:
    dies as `ERR_WALL_TIMEOUT`. Timers work during the `waitUntil` grace
    phase and `graceMs` caps them. A run that settles with timers pending
    drops them — they never fire into a later run. At prefix top level
-   `setTimeout` throws a catchable error (no loop exists at prepare()
-   time; workerd rejects the analogous case the same way); functions the
+   `setTimeout` throws a catchable error (no loop exists while a prefix
+   evaluates; workerd rejects the analogous case the same way); functions the
    prefix *defines* may use it freely when called from run code. The
    clock interaction is deliberate (limitation 11): delays are scheduled
    from the frozen clock and a firing timer advances the clock to exactly
@@ -1676,13 +1676,13 @@ For an interactive agent doing N tool calls per turn, that compounds badly.
 
 ### 11.2 What we do about it
 
-`sandbox.prepare()` validates the prefix once (compile + instantiate +
-evaluate in a throwaway isolate) and stores its source and declared shape in
-the Rust process. A cold `prefix.execute()` boots a fresh isolate from the
-build-time startup snapshot (§11.7), re-evaluates the prefix, then runs the
-postfix. The
-expensive, error-prone part of the loop — authoring and validating the setup
-— is paid once; runs pay only the evaluation.
+`sandbox.prepare()` checks the declared shape host-side (names, import
+shape, options) and stores the prefix source in the Rust process. It
+evaluates nothing: there is no validation isolate (§16.4). A cold
+`prefix.execute()` boots a fresh isolate from the build-time startup
+snapshot (§11.7), evaluates the prefix, then runs the postfix. Authoring the
+setup is paid once; runs pay only the evaluation, and a broken prefix fails
+its first run.
 
 That per-run evaluation is itself skipped whenever an idle warm
 instance of the prefix is available: the flow below is what a **cold start**
@@ -1691,14 +1691,13 @@ costs, and §13.2.1 is what happens on reuse.
 Flow:
 
 ```
-  precompile(prefix)            run(postfix)          run(postfix)
+  prepare(prefix)               run(postfix)          run(postfix)
        │                            │                      │
        ▼                            ▼                      ▼
   one-time:                    per run:               per run:
-  - validate in throwaway      - fresh isolate        - same
-    isolate (compile +           (build-time snapshot)
-    instantiate + evaluate)
-  - cache source +             - boot fixups (§11.7)
+  - check names, import        - fresh isolate        - same
+    shape, options (host)        (build-time snapshot)
+  - store source +             - boot fixups (§11.7)
     declared shape             - evaluate prefix
                                - bind per-run globals
                                  & imports
@@ -1742,22 +1741,21 @@ sees is exactly what the prefix produces deterministically:
     be referenced, stashed, or closed over, but calling it fails with
     `ERR_PREFIX_BRIDGE_CALL`. Whether prefix-stage bridge calls ever become
     supported is a deliberate future decision; the error code is the gate.
-  - `console.*` in prefix code works and is captured, but *where it lands*
-    depends on the stage: at `prepare()` validation the output is discarded
-    (that isolate is a throwaway and `prepare()` returns no streams), while
-    the output of the evaluation that warms an instance is delivered once, on
-    the result of the call that paid for the cold start (§13.2.1). The console
-    *surface* is identical at both stages — the validation isolate installs the
-    same shim — so a prefix cannot validate against a method a run lacks
-    (`docs/conformance.md`). Whether discarding is the right contract for the
-    `prepare()` stage is an open question; the behavior above is what ships
-    today.
+  - `console.*` in prefix code works and is captured. The output of the
+    evaluation that warms an instance is delivered once, on the result of
+    the call that paid for the cold start (§13.2.1). The console *surface*
+    is the same for prefix and run code (`docs/conformance.md`).
   - A nondeterministic prefix (`Math.random()`, `Date.now()`) produces
-    per-run state that differs between runs — validated once, evaluated
-    many times. This was impossible in the snapshot era and is permitted
-    but not encouraged; determinism keeps runs reproducible.
-  - Prefix evaluation runs under the run's wall/CPU limits. A prefix that
-    loops costs the run its budget instead of hanging `prepare()`.
+    per-run state that differs between runs — stored once, evaluated many
+    times. This was impossible in the snapshot era and is permitted but not
+    encouraged; determinism keeps runs reproducible.
+  - Prefix evaluation runs under the fixed warm-up budget (§13.2.1), never
+    the caller's limits. A prefix that loops fails the cold-starting run
+    with `ERR_WARMUP_LIMIT`; `prepare()` never waits on it.
+  - `prepare()` evaluates nothing, so every failure above — and a syntax
+    error, a throwing top level, an unresolved import — is reported on the
+    first run that cold-starts an instance, as that run's `{ ok: false }`
+    result with the prefix's own code (§16.4).
 
 ### 11.4 Rebinding rules
 
@@ -1854,7 +1852,7 @@ v8".
 groups own separate read-only heaps, which would legitimize per-snapshot
 groups. If that (or an equivalent) becomes public embedder API and rusty_v8
 exposes it, snapshots can return behind the unchanged `prepare()` API as a
-pure optimization. Until then: prefix = validated source, re-evaluated per
+pure optimization. Until then: prefix = stored source, re-evaluated per
 run; heavy prefixes and sub-ms calls belong to the warm-isolate model
 (the resident-instances work).
 
@@ -2262,11 +2260,12 @@ installs) runs under a fixed 1 s wall / 1 s CPU budget — isolate boot itself
 (~0.2 ms, not sandbox-controllable) precedes it — never the triggering request's limits
 (Cloudflare's separate script-startup limit is the model; theirs is 1 s
 since 2025-10 and likewise not configurable). Blowing it reports
-`ERR_WARMUP_LIMIT`. `prepare()` enforces the same budget, so an un-warmable
-prefix fails at deploy time, not on every cold start. (Bonus: a prefix with
-a synchronous infinite loop used to hang `prepare()` forever.) Prefix
-evaluation stays bridge-less: `ERR_PREFIX_BRIDGE_CALL` /
-`ERR_PREFIX_DID_NOT_SETTLE` fire at warm-up exactly as at `prepare()`.
+`ERR_WARMUP_LIMIT`, reported on the call that paid for the cold start;
+`prepare()` evaluates nothing (§16.4), so an un-warmable prefix fails every
+cold start the same way. Prefix evaluation stays bridge-less:
+`ERR_PREFIX_BRIDGE_CALL` / `ERR_PREFIX_DID_NOT_SETTLE` fire at warm-up.
+Runs that joined an instance while it was still cold-starting get the same
+warm-up failure as the run that triggered it; none of them hangs.
 
 **Per-call semantics on a warm instance** are identical to a one-off run:
 fresh wall/CPU guards and a fresh CPU meter from dispatch to settle, bridge
@@ -2280,9 +2279,9 @@ on the result of the **cold-start call** — the call that paid for the warm-up
 — and the buffers are cleared afterwards, so later calls on that instance see
 only their own output. Previously the prefix re-evaluated per run and its output
 appeared on every result; the one-off delivery is the closest equivalent.
-Prefix output produced at `prepare()` validation is discarded (throwaway
-isolate, no result frame). Whether prefix logs should instead be dropped,
-tagged, or repeated is an open question — the text here records what ships today.
+`prepare()` evaluates nothing, so no prefix output exists before the first
+cold start. Whether prefix logs should instead be dropped, tagged, or
+repeated is an open question — the text here records what ships today.
 
 The shim wraps five methods on V8's own `console` object rather than replacing
 it, so the rest of V8's console surface survives as callable no-ops — a
@@ -3023,9 +3022,9 @@ per-`await` cost of using it is small in-sandbox JS time, billed to
 - **Only `await`-based async is covered.** CPED propagates across promise
   continuations, not timers/callbacks — and the sandbox has neither
   (limitations §7.2, §7.8), so this covers the entire async surface.
-- **Not available in prefix/precompile code.** `node:async_hooks` does not
-  resolve while a prefix evaluates (at `precompile()` validation or at a
-  run's prefix stage); it fails cleanly with `ERR_MODULE_NOT_FOUND` — a
+- **Not available in prefix code.** `node:async_hooks` does not
+  resolve while a prefix evaluates; the cold-starting run fails cleanly
+  with `ERR_MODULE_NOT_FOUND` — a
   contract kept from the snapshot era so prefixes behave identically. Setup
   code is the prefix; async context is for the postfix (agent/workflow code).
   The durable-workflow pattern is to keep the `step`/`AsyncLocalStorage` shim
@@ -3033,12 +3032,34 @@ per-`await` cost of using it is small in-sandbox JS time, billed to
   `node:async_hooks` is available), while the expensive tool/data setup lives
   in the prefix. See §7.1.
 
-### 16.4 Precompile validates ahead of runs
+### 16.4 `prepare()` does not validate the prefix
 
-`precompile()` compiles, instantiates, and evaluates the prefix in a
-throwaway regular isolate, in exactly the environment a run's prefix stage
-provides. Any bad prefix (syntax error, unresolved import such as
-`node:async_hooks`, throwing top-level code) returns a clean error at
-`prepare()` time instead of failing every subsequent run. Prefix code is
-host-authored setup with no bridge/network side effects, so evaluating it at
-validation and again on every run is safe.
+`prepare()` boots no isolate. It checks what the host can check without
+running anything — global names (`names.ts`), the import shape, option
+ranges — and stores the source. The prefix is first compiled, instantiated
+and evaluated when a run cold-starts an instance, and a broken prefix
+(syntax error, unresolved import such as `node:async_hooks`, throwing
+top-level code, a bridge call, a never-settling await, a blown warm-up
+budget) fails that run with the matching code: `ERR_USER_CODE`,
+`ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`, `ERR_PREFIX_BRIDGE_CALL`,
+`ERR_PREFIX_DID_NOT_SETTLE`, `ERR_WARMUP_LIMIT`. Runs that joined the
+instance while it was cold-starting get the same failure. Every later run on
+that prefix cold-starts again and fails the same way. A syntax error's
+`stack` carries the prefix's file name and line, which is how a caller tells
+a broken prefix from broken run code.
+
+Decision record (2026-10-16). Until then `prepare()` evaluated the prefix
+once in a throwaway isolate and rejected a bad one up front. That bought a
+clean error at deploy time for the price of a full isolate boot per
+`prepare()` whose result nothing reused — the first run booted again and
+evaluated the prefix again. Checking that code is valid is an application
+concern (a save pipeline parses with `oxc`; a deploy step does one trial
+run), not the engine's: the trial run's instance stays warm, so it is the
+cheaper check as well. The same codes surface either way; only where they
+surface moved.
+
+```ts
+const prefix = await sandbox.prepare({ code })
+const check = await prefix.execute({ code: 'export default 0' })
+if (!check.ok) throw new Error(`broken prefix: ${check.error.message}`)
+```

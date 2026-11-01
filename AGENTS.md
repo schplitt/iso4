@@ -6,7 +6,8 @@
 `fetch` and pluggable modules. Built primarily for the AI-agent prefix/postfix
 pattern: host code prepares setup (globals, data, tool bindings) once, then
 runs many agent-generated postfixes against it. The prefix is stored as
-validated source and evaluated per isolate — there is no runtime V8 snapshot
+source (`prepare()` evaluates nothing, DESIGN.md §16.4) and evaluated per
+isolate — there is no runtime V8 snapshot
 (DESIGN.md §11.6); every isolate boots from one build-time snapshot of the
 runtime surface (§11.7) — and prefix runs are served by resident warm
 instances that skip that evaluation on reuse (DESIGN.md §13.2.1).

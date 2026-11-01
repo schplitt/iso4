@@ -35,7 +35,7 @@ import { createSafeFetch } from '@iso4/fetch'
 
 const sandbox = await createSandbox({ memoryMb: 128 }) // per-isolate heap cap
 
-// Validate and prepare host setup once
+// Store host setup once; it is evaluated on each cold start
 const prefix = await sandbox.prepare({
   code: `
     const config = { apiBase: 'https://api.example.com' }
@@ -98,6 +98,22 @@ of every name a fresh sandbox already defines. Check generated names against
 it before installing them. `RESERVED_WORDS` is a `Set` of names that cannot be
 a binding in module source, such as `class` or `eval`; iso4 refuses
 host-module export names in it, except `default`.
+
+`prepare()` stores the prefix without running it, and checks only what needs
+no isolate: global names, the import shape, and option ranges. A prefix that
+does not compile, throws, or imports something unknown fails its first run
+with the prefix's own code (`ERR_USER_CODE`, `ERR_MODULE_NOT_FOUND`,
+`ERR_IMPORT`, `ERR_PREFIX_BRIDGE_CALL`, `ERR_PREFIX_DID_NOT_SETTLE`,
+`ERR_WARMUP_LIMIT`). Validate it yourself where it matters — parse the
+source with a tool such as `oxc`, or do one trial run (its instance stays
+warm, so nothing is wasted):
+
+```ts
+const prefix = await sandbox.prepare({ code })
+const check = await prefix.execute({ code: 'export default 0' })
+if (!check.ok)
+  throw new Error(`broken prefix: ${check.error.message}`)
+```
 
 To check generated names before `prepare()` instead of getting a failed
 setup back, import the predicates from `@iso4/sandbox/utils`. That entry
@@ -190,7 +206,7 @@ one call at a time, so concurrency means more instances (the engine can
 already interleave several runs on one instance — that switches on with
 wire multiplexing). Top-level names never collide across runs
 (each run is its own module). A prefix that can't finish evaluating under
-the fixed warm-up budget is rejected by `prepare()` with
+the fixed warm-up budget fails the cold-starting call with
 `ERR_WARMUP_LIMIT`. `console.*` from prefix evaluation arrives on the
 cold-starting call's result.
 
@@ -429,8 +445,8 @@ name the runtime owns), `ERR_UNDECLARED_BINDING`, `ERR_FROZEN_BINDING` or
 the runtime repeats the checks. A malformed option, such as a limit out of range or a
 global name that is not a well-formed string, rejects with a plain
 `TypeError`. Nothing ran, so retrying with the same options can never
-succeed. Every other code, including `ERR_COMPILE`, is a
-result.
+succeed. Every other code, including a syntax error (`ERR_USER_CODE`
+named `SyntaxError`), is a result.
 
 ```ts
 import type { SetupErrorCode } from '@iso4/sandbox'

@@ -859,13 +859,33 @@ export interface Sandbox {
    * deploy/registration path (IaC-style declaration exports read when a
    * function is created, never per request). Builds no prefix and retains
    * nothing. Function exports are skipped and reported, so a module that
-   * also exports handlers reads cleanly. Rejects on compile/runtime errors,
-   * like `prepare()`.
+   * also exports handlers reads cleanly. Rejects on a syntax or runtime
+   * error (`ERR_USER_CODE`), a missing import, or any other run failure.
    */
   readExports: (options: ReadExportsOptions) => Promise<ReadExportsResult>
 
   /**
-   * Validate and prepare a prefix of code for repeated runs.
+   * Prepare a prefix of code for repeated runs.
+   *
+   * `prepare()` stores the source and declared shape; it does not evaluate
+   * the prefix. It rejects only for options it can check without running
+   * anything: a reserved or malformed global name, an invalid import shape,
+   * a bad limit or `memoryMb`. A prefix that does not compile, throws at top
+   * level, imports something unknown, calls the bridge, never settles, or
+   * exceeds the warm-up budget fails on its first `execute()`/`call()` as an
+   * `{ ok: false }` result with the matching {@link RunErrorCode}
+   * (`ERR_USER_CODE`, `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
+   * `ERR_PREFIX_BRIDGE_CALL`, `ERR_PREFIX_DID_NOT_SETTLE`,
+   * `ERR_WARMUP_LIMIT`). Validating a prefix is the caller's job: parse the
+   * source yourself (an `oxc`/`acorn` pass catches syntax errors), or do one
+   * trial run after `prepare()` — its instance stays warm, so nothing is
+   * wasted:
+   *
+   * ```ts
+   * const prefix = await sandbox.prepare({ code })
+   * const check = await prefix.execute({ code: 'export default 0' })
+   * if (!check.ok) throw new Error(`broken prefix: ${check.error.message}`)
+   * ```
    *
    * The type parameter `G` is inferred from the `globals` you pass and flows
    * into the returned `Prefix<G>`. This lets TypeScript enforce at the call
@@ -998,11 +1018,10 @@ export interface PrecompileOptions<
    * Resource limits applied to prefix code evaluation.
    *
    * **Currently a no-op placeholder.** Pass limits directly to each
-   * `prefix.run()` call. The one budget that DOES apply here is not
-   * configurable: prefix evaluation runs under the fixed warm-up budget
-   * (1 s wall / 1 s CPU) — a prefix that cannot evaluate inside it is
-   * rejected with `ERR_WARMUP_LIMIT` at `prepare()` time, because it could
-   * never cold-start a warm instance either.
+   * `prefix.execute()` call. The one budget that applies to prefix
+   * evaluation is not configurable: a cold start runs under the fixed
+   * warm-up budget (1 s wall / 1 s CPU), and a prefix that cannot evaluate
+   * inside it fails that run with `ERR_WARMUP_LIMIT`.
    */
   limits?: ResourceLimits
 
@@ -1289,8 +1308,8 @@ export interface ReadExportsOptions {
 
 /**
  * What `sandbox.readExports()` resolves to. Unlike `run()`, failures reject
- * the returned promise (like `prepare()`), since the deploy path treats a
- * broken module as exceptional rather than as a result variant.
+ * the returned promise, since the deploy path treats a broken module as
+ * exceptional rather than as a result variant.
  */
 export interface ReadExportsResult {
   exports: SandboxExports
@@ -1742,11 +1761,19 @@ export type SetupErrorCode
 
 /**
  * Why a run failed, in a `{ ok: false }` result. Setup refusals are thrown
- * instead and carry a {@link SetupErrorCode}. `prepare()` and
- * `readExports()` reject on any failure.
+ * instead and carry a {@link SetupErrorCode}. `readExports()` rejects on
+ * any failure; `prepare()` never runs anything, so a broken prefix reports
+ * these on its first run.
  */
 export type RunErrorCode
-  = | 'ERR_USER_CODE'
+  = | /**
+       * Uncaught exception or rejected top-level await in sandbox JS, in run
+       * or prefix code. A syntax error is one too: `name` is `SyntaxError`,
+       * `stack` carries the file and line (`<prefix>` or the prefix's
+       * `filename` when the prefix is broken), and for a source import the
+       * message names the specifier.
+       */
+    'ERR_USER_CODE'
     | 'ERR_MEMORY_LIMIT'
     | 'ERR_CPU_TIMEOUT'
     | 'ERR_WALL_TIMEOUT'
@@ -1764,7 +1791,6 @@ export type RunErrorCode
      * throws a catchable error instead, and loads nothing.
      */
     | 'ERR_IMPORT'
-    | 'ERR_COMPILE'
     | 'ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED'
     | 'ERR_EXPORT_NOT_SERIALIZABLE'
     /**
@@ -1812,23 +1838,24 @@ export type RunErrorCode
     | 'ERR_QUEUE_FULL'
     /**
      * Prefix top-level evaluation never settled — nothing in the isolate
-     * can resolve the awaited promise while a prefix evaluates (at
-     * `prepare()` validation or at a run's prefix stage).
+     * can resolve the awaited promise while a prefix evaluates. Reported on
+     * the run that cold-started the instance.
      */
     | 'ERR_PREFIX_DID_NOT_SETTLE'
     /**
      * Prefix code called a bridge callable (bridge global, shim global, or
      * host-import function). The bridge does not exist while a prefix
      * evaluates, so bridge calls in a prefix are not supported (yet) — do
-     * the call in `run()` code instead.
+     * the call in `run()` code instead. Reported on the run that
+     * cold-started the instance.
      */
     | 'ERR_PREFIX_BRIDGE_CALL'
     /**
      * Warm-up (prefix evaluation + per-instance runtime installs) exceeded its fixed budget
      * (1 s wall / 1 s CPU — not configurable; Cloudflare's script-startup
-     * model). Enforced at `prepare()` and again at every instance
-     * cold-start. Move expensive setup into the handler: lazy init on first
-     * call runs under that call's budget and survives warm reuse.
+     * model). Enforced at every instance cold start and reported on the run
+     * that paid for it. Move expensive setup into the handler: lazy init on
+     * first call runs under that call's budget and survives warm reuse.
      */
     | 'ERR_WARMUP_LIMIT'
     /**

@@ -547,7 +547,6 @@ pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
     }
     match error {
         RunError::InvalidPayload(msg) => plain("ERR_INTERNAL", "Error", msg.clone()),
-        RunError::CompileError(msg) => plain("ERR_COMPILE", "SyntaxError", msg.clone()),
         RunError::RuntimeError(inner) => RunErrorPayload {
             code: "ERR_USER_CODE".to_string(),
             name: inner.name.clone(),

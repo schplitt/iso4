@@ -1322,7 +1322,7 @@ fn send_stream_cancel(state: &StreamTableState, stream_id: u32, reason: &str) {
 ///
 /// Logs are preserved on failures too: if user code logs and then throws, the
 /// caller still receives the log output produced before the throw.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FailureOutput {
     pub error: RunError,
     pub stdout: Vec<String>,
@@ -1342,7 +1342,7 @@ pub struct FailureOutput {
 /// Payload carried by `RunError::RuntimeError`. Kept in a separate struct so
 /// the variant can be boxed and the enum stays small (avoids
 /// `clippy::result_large_err` on callers).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RuntimeErrorData {
     pub name: String,
     pub message: String,
@@ -1384,14 +1384,12 @@ pub enum ResetCause {
 }
 
 /// All the ways an execution can fail.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RunError {
     /// Payload bytes are not valid UTF-8.
     /// Raised in session.rs when ipc parsing fails — not yet wired up.
     #[allow(dead_code)]
     InvalidPayload(String),
-    /// JS syntax error or compile-time error.
-    CompileError(String),
     /// Uncaught exception thrown during execution.
     RuntimeError(Box<RuntimeErrorData>),
     /// No module with this specifier; the message names it.
@@ -1426,12 +1424,12 @@ pub enum RunError {
     /// the prefix: a source module or a data leaf.
     FrozenBinding(String),
     /// Prefix top-level evaluation stayed pending after draining the
-    /// microtask queue — it awaits something that can never resolve at
-    /// precompile time (a never-settling promise).
+    /// microtask queue — it awaits something that can never resolve while a
+    /// prefix evaluates (a never-settling promise).
     PrefixDidNotSettle(String),
     /// Prefix code called a bridge callable (bridge global, shim handler, or
-    /// host-import function) at precompile time. No host session exists while
-    /// the snapshot is built, so the call can never be served.
+    /// host-import function). No host session exists while a prefix
+    /// evaluates, so the call can never be served.
     PrefixBridgeCall(String),
     /// Warm-up (isolate boot + prefix evaluation) blew its fixed budget
     /// ([`WARMUP_WALL_MS`]/[`WARMUP_CPU_MS`]). Not a per-request timeout —
@@ -1601,33 +1599,6 @@ pub fn execute_with_prefix(
         call,
     )
     .result
-}
-
-/// Validate prefix code: compile, instantiate, and evaluate it exactly as a
-/// run will, in a throwaway isolate, so `prepare()` rejects a broken prefix
-/// (syntax error, unresolved import, throwing top-level code) before any run
-/// pays for it.
-///
-/// The caller's per-run limits do not apply — prefix code is host-authored —
-/// but validation is not unbounded: it runs under the same heap cap as a real
-/// instance and the fixed warm-up budget (`WARMUP_WALL_MS` / `WARMUP_CPU_MS`,
-/// per instance), so a looping or heap-hungry prefix fails here instead of on every
-/// cold start.
-pub fn precompile(
-    code: &str,
-    filename: Option<&str>,
-    globals: &[HostGlobalDef],
-    imports: &[ImportBinding],
-    hard_memory_mb: u32,
-) -> Result<(), FailureOutput> {
-    init_platform();
-    validate_prefix_module(
-        code,
-        filename.unwrap_or("<prefix>"),
-        globals,
-        imports,
-        hard_memory_mb,
-    )
 }
 
 /// ESM path: compile source as a module, instantiate it, evaluate it, then
@@ -2933,7 +2904,7 @@ fn start_turn(
             None => {
                 return finished(Err(rs.fail(termination_or(
                     facts.reason,
-                    RunError::CompileError(exception_message(scope)),
+                    syntax_error(scope),
                 ))));
             }
         };
@@ -6170,7 +6141,7 @@ fn evaluate_prefix_module(
 
     let module = match v8::script_compiler::compile_module(scope, &mut source) {
         Some(m) => m,
-        None => return Err(RunError::CompileError(exception_message(scope))),
+        None => return Err(syntax_error(scope)),
     };
 
     let _resolver_guard = install_resolver(ResolverContext {
@@ -6237,7 +6208,7 @@ fn evaluate_prefix_module(
             v8::PromiseState::Pending => {
                 return Err(RunError::PrefixDidNotSettle(
                     "prefix top-level await never settled: nothing in the isolate can \
-                     resolve the awaited promise at precompile time"
+                     resolve the awaited promise while a prefix evaluates"
                         .to_string(),
                 ));
             }
@@ -6245,78 +6216,6 @@ fn evaluate_prefix_module(
     }
 
     Ok(v8::Global::new(scope, module))
-}
-
-/// Validate prefix code in a throwaway regular isolate: compile, instantiate
-/// and evaluate exactly as a run will. Any failure (syntax error, unresolved
-/// import, throwing top-level code) returns a clean error at `prepare()` time
-/// instead of on the first run.
-///
-/// The environment matches a run's prefix stage — web globals installed,
-/// value globals + throwing bridge placeholders, no `node:async_hooks` — so
-/// what validates here evaluates identically per run. Prefix code is
-/// host-authored setup with no bridge/network side effects, so evaluating it
-/// here and again on every run is safe.
-///
-/// Runs under the same fixed warm-up budget as a cold start: a prefix
-/// that cannot evaluate inside [`WARMUP_WALL_MS`]/[`WARMUP_CPU_MS`] would
-/// fail *every* instance creation with `ERR_WARMUP_LIMIT`, so it is rejected
-/// here, at deploy time — the same reason wrangler enforces Cloudflare's
-/// startup limit at upload.
-fn validate_prefix_module(
-    code: &str,
-    filename: &str,
-    globals: &[HostGlobalDef],
-    imports: &[ImportBinding],
-    hard_memory_mb: u32,
-) -> Result<(), FailureOutput> {
-    let start = std::time::Instant::now();
-    let logs = LogBuffers::default();
-
-    // A regular isolate requires the platform to be initialized.
-    // `precompile()` already does this, but call it here too so direct
-    // callers (tests) work; it is idempotent.
-    init_platform();
-
-    // Validation runs under the same heap cap as a real instance: a prefix
-    // that blows the cap would fail every cold start, and an *uncapped*
-    // validation isolate would let it OOM the runtime process at prepare()
-    // time instead of failing cleanly.
-    let reason = Arc::new(ReasonCell::new());
-    let (mut isolate, _alloc_state, _near_heap) =
-        new_capped_isolate(hard_memory_mb, &reason);
-
-    let warmup_budget = Arc::new(CpuBudget::new());
-    let handle = isolate.thread_safe_handle();
-    let guard = InstanceGuard::new(handle, Arc::clone(&reason));
-    guard.set(GuardTarget {
-        budget: Arc::clone(&warmup_budget),
-        cpu_cap_ms: WARMUP_CPU_MS,
-        wall_deadline: Some(start + Duration::from_millis(WARMUP_WALL_MS as u64)),
-    });
-
-    v8::scope!(let scope, &mut isolate);
-    let context = v8::Context::new(scope, Default::default());
-    let scope = &mut v8::ContextScope::new(scope, context);
-    // Same environment as a run. Console lines land in this throwaway table
-    // and die with it; waitUntil and timers throw at setup time, as in a run.
-    let validation_table = RunTable::boxed();
-    crate::snapshot::boot_context(scope, &*validation_table).map_err(|e| {
-        failure(termination_or(&reason, RunError::Internal(e)), &logs, start)
-    })?;
-    v8::tc_scope!(let scope, scope);
-    warmup_budget.enter();
-    let result = evaluate_prefix_module(scope, code, filename, globals, imports);
-    warmup_budget.leave();
-    match result {
-        Ok(_) if reason.get().is_some() => Err(failure(
-            warmup_error(&reason, RunError::WarmupLimit),
-            &logs,
-            start,
-        )),
-        Ok(_) => Ok(()),
-        Err(error) => Err(failure(warmup_error(&reason, error), &logs, start)),
-    }
 }
 
 /// Wall-clock elapsed time since `start` in milliseconds, rounded to
@@ -6330,7 +6229,7 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
 /// the web runtime, evaluating the prefix, compiling the postfix. V8 then
 /// fails the interrupted operation, and classifying that failure would
 /// misreport the timeout as `ERR_INTERNAL` ("evaluate web runtime: null") or
-/// `ERR_COMPILE`. The guard stores its reason *before* it calls
+/// a `SyntaxError`. The guard stores its reason *before* it calls
 /// `terminate_execution`, so a set reason here is always the real cause;
 /// otherwise the fallback stands.
 fn termination_or(reason: &ReasonCell, fallback: RunError) -> RunError {
@@ -6409,7 +6308,7 @@ struct ResolverContext {
     /// When true, the reserved specifier `node:async_hooks` resolves to the
     /// built-in `AsyncLocalStorage` module (see [`install_async_context`]).
     /// Enabled for postfix code (`run_module`), disabled while a prefix
-    /// evaluates (`validate_prefix_module` and the prefix stage of a run) —
+    /// evaluates (the cold-start prefix stage of a run) —
     /// prefix code predates the per-run async-context machinery, a contract
     /// kept from the snapshot era so prefixes behave identically.
     async_context_builtin: bool,
@@ -6604,10 +6503,12 @@ fn compile_source_module<'s>(
     match v8::script_compiler::compile_module(tc, &mut source) {
         Some(m) => Some(m),
         None => {
-            record_resolve_error(RunError::CompileError(format!(
-                "failed to compile source import '{specifier}': {}",
-                exception_message(tc)
-            )));
+            let RunError::RuntimeError(mut data) = syntax_error(tc) else {
+                record_resolve_error(syntax_error(tc));
+                return None;
+            };
+            data.message = format!("failed to compile source import '{specifier}': {}", data.message);
+            record_resolve_error(RunError::RuntimeError(data));
             None
         }
     }
@@ -6656,7 +6557,7 @@ fn build_host_module<'s>(
     // owns the final check.
     for (name, _) in exports {
         if !is_valid_export_identifier(name) {
-            record_resolve_error(RunError::CompileError(format!(
+            record_resolve_error(RunError::Import(format!(
                 "host module '{specifier}': top-level key '{name}' is not a valid \
                  JavaScript identifier and cannot be exported as a named ESM export"
             )));
@@ -7757,7 +7658,7 @@ const PREFIX_BRIDGE_CALL_MARKER: &str = "__iso4_prefix_bridge_call";
 /// dispatch target, whose callable names are not known at install time.
 const PREFIX_BRIDGE_PLACEHOLDER_FACTORY_SRC: &str = r#"(name, kind) => (...args) => {
   const what = kind === 0 ? `bridge global '${name}'` : 'a host import function'
-  const e = new Error(`${what} cannot be called during prepare(): no host session exists at precompile time. Do the call in run() code instead.`)
+  const e = new Error(`${what} cannot be called while a prefix evaluates: no host session exists at that stage. Do the call in run() code instead.`)
   e.__iso4_prefix_bridge_call = true
   throw e
 }"#;
@@ -8089,7 +7990,7 @@ fn eval_script<'s>(
     v8::tc_scope!(let tc, scope);
     let script = match v8::Script::compile(tc, source_str, Some(&origin)) {
         Some(s) => s,
-        None => return Err(RunError::CompileError(exception_message(tc))),
+        None => return Err(syntax_error(tc)),
     };
     match script.run(tc) {
         Some(v) => Ok(v),
@@ -9160,6 +9061,37 @@ fn capped_text_lossy(scope: &v8::Isolate, text: v8::Local<v8::String>, max_bytes
     out
 }
 
+/// A compile failure is user code too: the pending `SyntaxError` as a run
+/// error. Parse errors carry no frame, so the stack is built from V8's
+/// message location — that is what names the file (`<prefix>`, a source
+/// import, the run's own code).
+fn syntax_error(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> RunError {
+    let Some(exception) = scope.exception() else {
+        return RunError::Internal("compile failed without an exception".to_string());
+    };
+    let RunError::RuntimeError(mut data) = runtime_error_from_value(scope, exception) else {
+        unreachable!("runtime_error_from_value always builds a RuntimeError");
+    };
+    // V8 gives a SyntaxError a header-only stack; add the frame it lacks.
+    if !data.stack.as_deref().is_some_and(|s| s.contains("\n    at ")) {
+        let location = scope.message().and_then(|m| {
+            let file = m
+                .get_script_resource_name(scope)
+                .and_then(|n| n.to_string(scope))
+                .map(|s| s.to_rust_string_lossy(scope))
+                .unwrap_or_else(|| "<anonymous>".to_string());
+            let line = m.get_line_number(scope)?;
+            Some(format!("{file}:{line}:{}", m.get_start_column() + 1))
+        });
+        if let Some(location) = location {
+            data.stack = Some(format!("{}: {}\n    at {location}", data.name, data.message));
+        }
+    }
+    RunError::RuntimeError(data)
+}
+
 fn runtime_error_from_value(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     value: v8::Local<v8::Value>,
@@ -9907,47 +9839,25 @@ mod tests {
         );
     }
 
-    /// The validation isolate installs the same console as a run, so a prefix
-    /// cannot pass `prepare()` on a method that is missing at run time.
+    /// A prefix evaluates against the same console as run code.
     #[test]
-    fn the_console_surface_is_identical_at_prepare_and_at_run() {
+    fn the_console_surface_is_identical_in_prefix_and_run_code() {
         let at_run = get_default(&run_ok(&format!("export default {CONSOLE_SURFACE}")))
             .expect("run surface");
-        let err = precompile(
-            &format!("throw new Error({CONSOLE_SURFACE})"),
-            None,
-            &[],
-            &[],
-            0,
-        )
-        .unwrap_err();
+        let err = evaluate_prefix(&format!("throw new Error({CONSOLE_SURFACE})"), &[], &[])
+            .unwrap_err();
         let RunError::RuntimeError(data) = &err.error else {
             panic!("expected the probe to throw, got {:?}", err.error);
         };
         assert_eq!(data.message, at_run);
     }
 
-    /// The unpinned third stage (GH #86): `prepare()` has no result frame, so
-    /// prefix console output is captured into the throwaway table and dropped.
-    /// Validation still succeeds — logging is not a prefix error.
-    #[test]
-    fn prefix_console_output_at_prepare_is_discarded() {
-        precompile(
-            r#"console.log("validation noise"); console.error("more noise")"#,
-            None,
-            &[],
-            &[],
-            0,
-        )
-        .expect("logging in a prefix must not fail validation");
-    }
-
     // ── Error handling ────────────────────────────────────────────────────
 
     #[test]
-    fn syntax_error_is_compile_error() {
+    fn syntax_error_is_user_code() {
         let err = run_err("export default (((");
-        assert!(matches!(err, RunError::CompileError(_)));
+        assert!(matches!(&err, RunError::RuntimeError(d) if d.name == "SyntaxError"), "got {err:?}");
     }
 
     #[test]
@@ -11016,17 +10926,36 @@ mod tests {
         assert!(out.duration_ms < 5_000.0);
     }
 
-    // ── Precompile / prefixes ───────────────────────────────────────────────
+    // ── Prefixes ────────────────────────────────────────────────────────────
 
-    /// prepare()-shaped helper: validate `code` exactly as `precompile` does,
-    /// then hand back the spec a run replays — mirroring what session.rs
-    /// stores per prefix.
+    /// Evaluate `code` as a prefix on a cold-starting instance — the first
+    /// run's prefix stage, now that `prepare()` evaluates nothing.
+    fn evaluate_prefix(
+        code: &str,
+        globals: &[HostGlobalDef],
+        imports: &[ImportBinding],
+    ) -> Result<(), FailureOutput> {
+        init_platform();
+        create_instance_core(
+            Some(PrefixSpec {
+                code,
+                filename: "<prefix>",
+                globals,
+            }),
+            imports,
+            0,
+        )
+        .map(|_| ())
+    }
+
+    /// The spec a run replays — mirroring what session.rs stores per prefix —
+    /// after checking that it evaluates.
     fn prepared<'a>(
         code: &'a str,
         globals: &'a [HostGlobalDef],
         imports: &[ImportBinding],
     ) -> PrefixSpec<'a> {
-        precompile(code, None, globals, imports, 0).expect("prefix must validate");
+        evaluate_prefix(code, globals, imports).expect("prefix must evaluate");
         PrefixSpec {
             code,
             filename: "<prefix>",
@@ -11035,19 +10964,19 @@ mod tests {
     }
 
     #[test]
-    fn precompile_accepts_a_valid_prefix() {
-        precompile("const x = 1", None, &[], &[], 0).unwrap();
+    fn prefix_evaluates_a_valid_prefix() {
+        evaluate_prefix("const x = 1", &[], &[]).unwrap();
     }
 
     #[test]
-    fn precompile_compile_error_is_reported() {
-        let err = precompile("export default (((", None, &[], &[], 0).unwrap_err();
-        assert!(matches!(err.error, RunError::CompileError(_)));
+    fn prefix_syntax_error_is_user_code() {
+        let err = evaluate_prefix("export default (((", &[], &[]).unwrap_err();
+        assert!(matches!(&err.error, RunError::RuntimeError(d) if d.name == "SyntaxError"), "got {:?}", err.error);
     }
 
     #[test]
-    fn precompile_runtime_error_is_reported() {
-        let err = precompile(r#"throw new Error("prefix failed")"#, None, &[], &[], 0).unwrap_err();
+    fn prefix_runtime_error_is_reported() {
+        let err = evaluate_prefix(r#"throw new Error("prefix failed")"#, &[], &[]).unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
@@ -11368,14 +11297,8 @@ mod tests {
     }
 
     #[test]
-    fn precompile_validation_permits_codegen() {
-        precompile(
-            "globalThis.f = new Function('return 1'); eval('2')",
-            None,
-            &[],
-            &[],
-            0,
-        )
+    fn prefix_code_may_use_codegen() {
+        evaluate_prefix("globalThis.f = new Function('return 1'); eval('2')", &[], &[])
         .unwrap();
     }
 
@@ -11383,7 +11306,7 @@ mod tests {
     // drained the microtask queue after module evaluation.
 
     #[test]
-    fn precompile_top_level_await_settles() {
+    fn prefix_top_level_await_settles() {
         let prefix = prepared(
             "globalThis.a = await Promise.resolve(40)\n\
              globalThis.b = await new Response('x').text()",
@@ -11406,7 +11329,7 @@ mod tests {
     }
 
     #[test]
-    fn precompile_top_level_await_in_plain_exports_settles() {
+    fn prefix_top_level_await_in_plain_exports_settles() {
         // The common bundled-handler shapes: the awaited value lands in a
         // module binding (or is discarded), not on globalThis. A prefix's
         // namespace is discarded by design, so there is nothing for a postfix
@@ -11420,7 +11343,7 @@ mod tests {
             "await 1",
             "export default await (async () => 1)()",
         ] {
-            let result = precompile(code, None, &[], &[], 0);
+            let result = evaluate_prefix(code, &[], &[]);
             assert!(
                 result.is_ok(),
                 "prefix {code:?} failed: {:?}",
@@ -11430,7 +11353,7 @@ mod tests {
     }
 
     #[test]
-    fn precompile_imported_module_with_top_level_await_settles() {
+    fn prefix_imported_module_with_top_level_await_settles() {
         // Top-level await inside an *imported* source module resolves as part
         // of the same module-graph evaluation promise as the prefix itself.
         let imports = [source_import(
@@ -11458,7 +11381,7 @@ mod tests {
     }
 
     #[test]
-    fn precompile_chained_top_level_awaits_settle() {
+    fn prefix_chained_top_level_awaits_settle() {
         // Chained awaits all resolve within one checkpoint — a checkpoint
         // drains the whole queue, newly enqueued microtasks included.
         let prefix = prepared(
@@ -11483,28 +11406,23 @@ mod tests {
     }
 
     #[test]
-    fn precompile_rejected_top_level_await_is_runtime_error() {
-        let err = precompile(
-            r#"await Promise.reject(new Error("prefix rejected"))"#,
-            None,
-            &[],
-            &[],
-        0)
-        .unwrap_err();
+    fn prefix_rejected_top_level_await_is_runtime_error() {
+        let err = evaluate_prefix(r#"await Promise.reject(new Error("prefix rejected"))"#, &[], &[])
+            .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
     #[test]
-    fn precompile_never_settling_prefix_fails_with_did_not_settle() {
-        let err = precompile("await new Promise(() => {})", None, &[], &[], 0).unwrap_err();
+    fn prefix_never_settling_prefix_fails_with_did_not_settle() {
+        let err = evaluate_prefix("await new Promise(() => {})", &[], &[]).unwrap_err();
         assert!(matches!(err.error, RunError::PrefixDidNotSettle(_)));
     }
 
-    // Bridge callables exist at prepare() time as throwing placeholders:
+    // Bridge callables exist while a prefix evaluates as throwing placeholders:
     // referencing them works, calling them is ERR_PREFIX_BRIDGE_CALL.
 
     #[test]
-    fn precompile_calling_bridge_global_fails_with_prefix_bridge_call() {
+    fn prefix_calling_bridge_global_fails_with_prefix_bridge_call() {
         let globals = [HostGlobalDef::bridge("fetch")];
         // Awaited and fire-and-forget-at-top-level both throw synchronously
         // inside the placeholder, before any await could park the module.
@@ -11512,7 +11430,7 @@ mod tests {
             "await fetch('https://example.com')",
             "fetch('https://example.com')",
         ] {
-            let err = precompile(code, None, &globals, &[], 0).unwrap_err();
+            let err = evaluate_prefix(code, &globals, &[]).unwrap_err();
             match err.error {
                 RunError::PrefixBridgeCall(msg) => {
                     assert!(msg.contains("bridge global 'fetch'"), "message: {msg}");
@@ -11653,7 +11571,7 @@ mod tests {
     }
 
     #[test]
-    fn precompile_calling_shim_global_fails_with_prefix_bridge_call() {
+    fn prefix_calling_shim_global_fails_with_prefix_bridge_call() {
         let globals = [HostGlobalDef::Shim {
             name: "fetch".to_string(),
             shim: "(raw) => raw".to_string(),
@@ -11661,7 +11579,7 @@ mod tests {
             enumerable: true,
         }];
         let err =
-            precompile("await fetch('https://example.com')", None, &globals, &[], 0).unwrap_err();
+            evaluate_prefix("await fetch('https://example.com')", &globals, &[]).unwrap_err();
         match err.error {
             // The placeholder sits under the handler name but reports the
             // public name — the user called `fetch`, not `__iso4_fetch_h`.
@@ -11673,24 +11591,18 @@ mod tests {
     }
 
     #[test]
-    fn precompile_calling_host_import_function_fails_with_prefix_bridge_call() {
+    fn prefix_calling_host_import_function_fails_with_prefix_bridge_call() {
         let imports = [host_import(
             "tools:search",
             vec![("query", HostModuleNode::Function)],
         )];
-        let err = precompile(
-            "import { query } from 'tools:search'; await query('dogs')",
-            None,
-            &[],
-            &imports,
-            0,
-        )
+        let err = evaluate_prefix("import { query } from 'tools:search'; await query('dogs')", &[], &imports)
         .unwrap_err();
         assert!(matches!(err.error, RunError::PrefixBridgeCall(_)));
     }
 
     #[test]
-    fn precompile_bridge_global_is_visible_but_not_callable() {
+    fn prefix_bridge_global_is_visible_but_not_callable() {
         // typeof matches run() code, and stashing a reference is fine — only
         // the call is rejected.
         let globals = [HostGlobalDef::bridge("fetch")];
@@ -11768,8 +11680,8 @@ mod tests {
             "new Headers([['content-type', 'text/plain']])",
         ] {
             let prefix_src = format!("globalThis.v = {expr}");
-            precompile(&prefix_src, None, &[], &[], 0)
-                .unwrap_or_else(|_| panic!("precompile with a live {expr} must not fail"));
+            evaluate_prefix(&prefix_src, &[], &[])
+                .unwrap_or_else(|_| panic!("a prefix with a live {expr} must evaluate"));
             let out = execute_with_prefix(
                 PrefixSpec {
                     code: &prefix_src,
@@ -13948,13 +13860,7 @@ mod tests {
         // importing `node:async_hooks` from a prefix does not resolve — a
         // contract kept from the snapshot era (see ResolverContext::
         // async_context_builtin). It returns a clean ModuleNotFound.
-        let err = validate_prefix_module(
-            "import { AsyncLocalStorage } from 'node:async_hooks'; export default 1;",
-            "<prefix>",
-            &[],
-            &[],
-            0,
-        )
+        let err = evaluate_prefix("import { AsyncLocalStorage } from 'node:async_hooks'; export default 1;", &[], &[])
         .unwrap_err();
         assert!(
             matches!(err.error, RunError::ModuleNotFound(_)),
@@ -13964,17 +13870,11 @@ mod tests {
     }
 
     #[test]
-    fn precompile_unresolved_import_is_clean_error_not_crash() {
+    fn prefix_unresolved_import_is_clean_error_not_crash() {
         // Regression (snapshot era): an unresolvable import used to segfault
-        // (unconditional create_blob after a failed instantiate). Validation
-        // must return a clean ModuleNotFound.
-        let err = validate_prefix_module(
-            "import x from 'totally-nonexistent-xyz'; export default x;",
-            "<prefix>",
-            &[],
-            &[],
-            0,
-        )
+        // (unconditional create_blob after a failed instantiate). The cold
+        // start must return a clean ModuleNotFound.
+        let err = evaluate_prefix("import x from 'totally-nonexistent-xyz'; export default x;", &[], &[])
         .unwrap_err();
         assert!(
             matches!(err.error, RunError::ModuleNotFound(_)),
@@ -13984,14 +13884,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_prefix_module_accepts_valid_prefix() {
-        validate_prefix_module(
-            "globalThis.base = 100; export default 1;",
-            "<prefix>",
-            &[],
-            &[],
-            0,
-        )
+    fn prefix_with_globalthis_state_evaluates() {
+        evaluate_prefix("globalThis.base = 100; export default 1;", &[], &[])
         .unwrap();
     }
 
@@ -14287,7 +14181,7 @@ mod tests {
     }
 
     #[test]
-    fn host_module_invalid_export_name_is_compile_error() {
+    fn host_module_invalid_export_name_is_import_error() {
         let imports = [host_import(
             "bad:name",
             vec![(
@@ -14301,8 +14195,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(&err, RunError::CompileError(m) if m.contains("not a name")),
-            "expected CompileError about the invalid key, got {err:?}"
+            matches!(&err, RunError::Import(m) if m.contains("not a name")),
+            "expected Import about the invalid key, got {err:?}"
         );
     }
 
@@ -14406,7 +14300,7 @@ mod tests {
             globalThis.maxResults = limit;
             export default 1;
             "#;
-        validate_prefix_module(prefix_src, "<prefix>", &[], &imports, 0).unwrap();
+        evaluate_prefix(prefix_src, &[], &imports).unwrap();
 
         let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let client = ManuallyDrop::new(client);
@@ -14460,7 +14354,7 @@ mod tests {
             vec![("f", HostModuleNode::Function)],
         )];
         let prefix_src = "globalThis.ready = true;";
-        validate_prefix_module(prefix_src, "<prefix>", &[], &imports, 0).unwrap();
+        evaluate_prefix(prefix_src, &[], &imports).unwrap();
 
         let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let client = ManuallyDrop::new(client);
@@ -15245,16 +15139,6 @@ mod tests {
         let Err(failure) = result else {
             panic!("a looping prefix cannot warm up");
         };
-        assert!(matches!(failure.error, RunError::WarmupLimit));
-    }
-
-    #[test]
-    fn prepare_validation_rejects_a_looping_prefix() {
-        // Same budget at prepare() (validate_prefix_module), so an
-        // un-warmable prefix fails at deploy time, not on the first call.
-        // Before warm instances this hung prepare() forever.
-        let failure =
-            validate_prefix_module("for (;;) {}", "<prefix>", &[], &[], 0).expect_err("must reject");
         assert!(matches!(failure.error, RunError::WarmupLimit));
     }
 
@@ -16279,11 +16163,14 @@ mod tests {
     }
 
     #[test]
-    fn a_source_import_that_fails_to_compile_stays_a_compile_error() {
+    fn a_source_import_that_fails_to_compile_is_user_code() {
         let imports = [source_import("src:bad", "export const = ;")];
         let err = run_with_source_imports("import x from 'src:bad'; export default x", &imports)
             .unwrap_err();
-        assert!(matches!(err, RunError::CompileError(_)), "got {err:?}");
+        assert!(
+            matches!(&err, RunError::RuntimeError(d) if d.name == "SyntaxError" && d.message.contains("src:bad")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -16373,14 +16260,8 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_import_in_a_prefix_fails_validation() {
-        let failure = validate_prefix_module(
-            "try { await import('lodash') } catch {}\nexport default 1",
-            "<prefix>",
-            &[],
-            &[],
-            0,
-        )
+    fn dynamic_import_in_a_prefix_fails_evaluation() {
+        let failure = evaluate_prefix("try { await import('lodash') } catch {}\nexport default 1", &[], &[])
         .unwrap_err();
         assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
     }

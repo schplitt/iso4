@@ -932,8 +932,8 @@ class SandboxImpl implements Sandbox {
 
   /**
    * Load a module once and read its serializable exports — the deploy path.
-   * Function exports are skipped and reported; failures reject, like
-   * `prepare()`. See {@link Sandbox.readExports}.
+   * Function exports are skipped and reported; failures reject. See
+   * {@link Sandbox.readExports}.
    * @param options
    */
   async readExports(options: ReadExportsOptions): Promise<ReadExportsResult> {
@@ -963,7 +963,7 @@ class SandboxImpl implements Sandbox {
   }
 
   /**
-   * Validate and prepare a prefix for repeated runs. See
+   * Store a prefix for repeated runs; nothing is evaluated. See
    * {@link Sandbox.prepare}.
    * @param options
    */
@@ -975,6 +975,8 @@ class SandboxImpl implements Sandbox {
   >(
     options: PrecompileOptions<G, M>,
   ): Promise<Prefix<G, M>> {
+    if (typeof options.code !== 'string')
+      throw new TypeError(`prepare({ code }) must be a string, got ${options.code === null ? 'null' : typeof options.code}`)
     validateMemoryMb(options.memoryMb, 'memoryMb')
     validateLimits(options.limits)
     // Per-prefix heap cap (#77): baked into every instance serving this

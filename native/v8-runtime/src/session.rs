@@ -611,7 +611,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
 
     // Brand key for host-emitted host-type descriptors (docs/protocol.md
     // §4.4.6): derived from the handshake token, installed for this session
-    // thread (one-off runs, precompile) and handed to every warm instance this
+    // thread (one-off runs) and handed to every warm instance this
     // connection spawns. Only descriptors stamped with it rehydrate.
     let brand_key = crate::webcodec::brand_key_for_token(&auth.descriptor_token);
     crate::webcodec::set_session_brand_key(brand_key.clone());
@@ -631,8 +631,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // channel; runs execute on worker/instance threads and write their
     // outbound frames through ONE serialized writer, so frames from
     // concurrent runs never interleave mid-frame. Control frames
-    // (Precompile, DisposePrefix, Stats) are handled here or on short-lived
-    // workers.
+    // (Precompile, DisposePrefix, Stats) are handled inline here.
     let outbox = match ipc::Outbox::spawn(&stream) {
         Ok(o) => o,
         Err(e) => {
@@ -725,7 +724,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         break;
                     }
                 };
-                dispatch_precompile(payload, &shared, &sink, &brand_key);
+                dispatch_precompile(payload, &shared, &sink);
             }
             ipc::TsToRustMessageType::PrefixRun => {
                 let payload = match ipc::parse_prefix_run_payload(&frame.payload) {
@@ -1108,97 +1107,49 @@ fn dispatch_oneoff_run(
     }
 }
 
-/// A `Precompile`: validated on a short-lived worker so a slow prefix does
-/// not stall the demux; the result frame goes through the shared writer.
+/// A `Precompile`: the prefix is stored, not evaluated — a broken prefix
+/// fails its first run instead. Answered inline on the demux thread.
 fn dispatch_precompile(
     payload: ipc::PrecompilePayload,
     shared: &Arc<SharedState>,
     sink: &ipc::FrameSink,
-    brand_key: &str,
 ) {
-    let shared = Arc::clone(shared);
-    let worker_sink = sink.clone();
-    let brand_key = brand_key.to_string();
-    let request_id = payload.request_id;
-    let spawned = std::thread::Builder::new()
-        .name("iso4-precompile".to_string())
-        .spawn(move || {
-            let sink = worker_sink;
-            crate::webcodec::set_session_brand_key(brand_key);
-            let result_payload = match sandbox::precompile(
-                &payload.code,
-                payload.filename.as_deref(),
-                &payload.globals,
-                &payload.imports,
-                payload.limits.hard_memory_mb,
-            ) {
-                Ok(()) => {
-                    let prefix_id = shared
-                        .next_prefix_id
-                        .fetch_add(1, Ordering::Relaxed)
-                        .to_string();
-                    // Only bridge-backed globals are re-installable per run
-                    // (string/data globals and shim wrappers are replayed
-                    // from the stored prefix defs). The declared set is the
-                    // bridge stub names a PrefixRun may re-bind; the
-                    // undeclared-binding check validates against it.
-                    let declared_globals: Vec<String> = payload
-                        .globals
-                        .iter()
-                        .filter_map(|g| g.bridge_stub_name().map(str::to_string))
-                        .collect();
-                    eprintln!(
-                        "[iso4-v8] precompile succeeded — prefix_id={prefix_id} \
-                             ({} source bytes, {} declared globals, {} declared imports)",
-                        payload.code.len(),
-                        declared_globals.len(),
-                        payload.imports.len(),
-                    );
-                    shared
-                        .prefix_store
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(
-                            prefix_id.clone(),
-                            Arc::new(PrefixData {
-                                code: payload.code,
-                                filename: payload.filename,
-                                globals: payload.globals,
-                                declared_globals,
-                                declared_imports: payload.imports,
-                            }),
-                        );
-                    wire::encode_precompile_result_payload(request_id, Some(&prefix_id), None)
-                }
-                Err(failure) => {
-                    eprintln!(
-                        "[iso4-v8] precompile failed in {:.3}ms: {:?}",
-                        failure.duration_ms, failure.error
-                    );
-                    wire::encode_precompile_result_payload(
-                        request_id,
-                        None,
-                        Some(&wire::run_error_to_payload(&failure.error)),
-                    )
-                }
-            };
-            if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, result_payload)
-            {
-                eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
-            }
-        });
-    if let Err(e) = spawned {
-        eprintln!("[iso4-v8] failed to spawn precompile worker: {e}");
-        let payload = wire::encode_precompile_result_payload(
-            request_id,
-            None,
-            Some(&wire::run_error_to_payload(&sandbox::RunError::Internal(
-                format!("failed to spawn precompile worker: {e}"),
-            ))),
+    let prefix_id = shared
+        .next_prefix_id
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
+    // Only bridge-backed globals are re-installable per run (string/data
+    // globals and shim wrappers are replayed from the stored prefix defs).
+    // The declared set is the bridge stub names a PrefixRun may re-bind.
+    let declared_globals: Vec<String> = payload
+        .globals
+        .iter()
+        .filter_map(|g| g.bridge_stub_name().map(str::to_string))
+        .collect();
+    eprintln!(
+        "[iso4-v8] prefix stored — prefix_id={prefix_id} \
+         ({} source bytes, {} declared globals, {} declared imports)",
+        payload.code.len(),
+        declared_globals.len(),
+        payload.imports.len(),
+    );
+    shared
+        .prefix_store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            prefix_id.clone(),
+            Arc::new(PrefixData {
+                code: payload.code,
+                filename: payload.filename,
+                globals: payload.globals,
+                declared_globals,
+                declared_imports: payload.imports,
+            }),
         );
-        if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, payload) {
-            eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
-        }
+    let result = wire::encode_precompile_result_payload(payload.request_id, Some(&prefix_id), None);
+    if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, result) {
+        eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
     }
 }
 
