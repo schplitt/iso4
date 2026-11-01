@@ -142,7 +142,9 @@ behavior:
 The clock advances at run entry and on every frame received from the host, in
 whole milliseconds, monotonically. Inside a single stretch of JavaScript it
 does not move — a busy loop cannot observe time passing. This is the workerd
-model, one step stricter.
+model, one step stricter. `Date`, `Intl.DateTimeFormat` and `Temporal.Now`
+are V8's own builtins (`[native code]`, native names and property
+attributes); the freeze sits in the wall clock V8 reads from its platform.
 
 ---
 

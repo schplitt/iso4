@@ -115,10 +115,11 @@ describe('frozen clock — Date', () => {
     expect(ok).toBe(true)
   })
 
-  test('the shim is shaped like the built-in (name, whole-ms, no enumerable statics)', async () => {
+  test('Date is the real builtin (name, whole-ms, no enumerable statics)', async () => {
     const ok = await evalDefault(`
       export default Date.name === 'Date'
         && Date.now.name === 'now'
+        && Date.toString() === 'function Date() { [native code] }'
         && Date.now() % 1 === 0
         && Object.keys(Date).length === 0
     `)

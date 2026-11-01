@@ -25,3 +25,15 @@ pub mod wire;
 
 /// The startup snapshot `build.rs` creates (see `snapshot.rs`).
 pub static SNAPSHOT_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin"));
+
+extern "C" {
+    fn iso4_new_frozen_clock_platform(thread_pool_size: std::ffi::c_int) -> *mut ::v8::Platform;
+}
+
+/// The default platform with V8's wall clock routed to the entered isolate's
+/// frozen clock (`src/clock_platform.cc`). `build.rs` defines its own stock
+/// version of this function.
+pub(crate) fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
+    // SAFETY: a fresh heap-allocated platform the caller now owns.
+    unsafe { ::v8::UniquePtr::from_raw(iso4_new_frozen_clock_platform(0)) }.unwrap()
+}
