@@ -56,12 +56,18 @@ iso4/                              ← workspace root
       tsdown.config.ts
     iso4-fetch/                    ← @iso4/fetch
     iso4-v8-<platform>/            ← native Rust binaries (built in CI, not committed)
-  native/
-    v8-runtime/                    ← Rust source for the V8 host binary
-      build.rs                     ← builds the startup snapshot (compiles src/ modules in)
+  crates/                          ← Rust workspace (Cargo.toml, rust-toolchain.toml)
+    Cargo.toml                     ← members + [profile.release] + [patch.crates-io] v8
+    vendor/v8/                     ← gitignored, unpacked by scripts/prepare-v8.ts
+    patches/                       ← patches applied to the vendored v8 crate
+    types/                         ← iso4-types (lib): plain shared types, no V8, no sockets
+      src/lib.rs                   ← limits, prefix shape, calls, bridge records, error payloads
+    core/                          ← iso4-core (lib): the engine
+      build.rs                     ← builds the startup snapshot (compiles the core modules in) + clock_platform.cc
+      benches/micro.rs             ← criterion micro suite
+      tests/wpt/                   ← vendored WPT URL corpus
       src/
-        main.rs                    ← arg parsing, UDS accept loop
-        session.rs                 ← per-connection frame glue: handshake, demux, the connection's HostLink
+        lib.rs                     ← module list, SNAPSHOT_BLOB, new_platform
         engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
         prefix.rs                  ← stored prefix shape, rebind validation
         v8.rs                      ← isolates, contexts, prefix evaluation, limits
@@ -70,9 +76,31 @@ iso4/                              ← workspace root
         snapshot.rs                ← build-time startup snapshot: create, boot, external refs
         clock_platform.cc          ← V8 platform whose wall clock is the isolate's frozen clock
         policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader
-        types.rs, errors.rs        ← plain shared types (limits, prefix shape, calls, records), error codes
-        ipc.rs, wire.rs, blob.rs   ← frames, payload codecs, V8 serialization
+        types.rs, errors.rs        ← re-export of iso4-types; RunError codes/names/messages
+        blob.rs, webcodec.rs       ← V8 serialization, host-type descriptors
+        webtypes.rs, webtypes.js   ← web globals installed into the snapshot
+    server/                        ← iso4-server (bin iso4-v8): the socket frontend for Node
+      src/
+        main.rs                    ← arg parsing, UDS accept loop
+        session.rs                 ← per-connection frame glue: handshake, demux, the connection's HostLink
+        ipc.rs, wire.rs            ← frames, payload parsers and encoders
 ```
+
+### `crates/`
+
+Three crates, one dependency direction: `server` → `core` → `types`.
+
+- **`iso4-core`** owns isolates, limits, the turn loop, the warm registry,
+  the prefix store, web globals, console, the value codec, the cgroup meter,
+  the policy functions and the startup snapshot. It encodes no frame and
+  owns no socket: it answers through the `HostLink` trait in
+  `link.rs`, and frontends decide who answers a bridge call.
+- **`iso4-types`** owns the plain shared types: limits, prefix spec, bridge
+  targets, error payloads. No V8, no sockets. `core/src/types.rs` re-exports
+  it.
+- **`iso4-server`** owns the Unix socket, the frame protocol in
+  `docs/protocol.md`, the handshake, the per-connection demux and writer. It
+  is the only crate that knows the Node wire. It has no lib target.
 
 ### `packages/iso4-sandbox`
 
@@ -149,10 +177,11 @@ Toolchain:
 - **@changesets/cli** for per-package versioning + changelogs. See
   `.changeset/README.md` for the workflow.
 - **mise** pins the Node version (`mise.toml`).
-- **cargo** (Rust stable) for the V8 host binary under `native/v8-runtime/`.
-  `build.rs` also compiles `src/clock_platform.cc` against the vendored V8
-  headers and Chromium's libc++; on Linux that needs `clang++` (g++ cannot
-  compile those headers).
+- **cargo** (Rust stable) for the workspace under `crates/`. Every `pnpm
+  *:native` script passes `--manifest-path crates/Cargo.toml`; the binary is
+  built with `--package iso4-server`. `crates/core/build.rs` also compiles
+  `src/clock_platform.cc` against the vendored V8 headers and Chromium's
+  libc++; on Linux that needs `clang++` (g++ cannot compile those headers).
 
 ## Code Style
 
@@ -281,8 +310,8 @@ learned during development.
   `cargo test`) before the TS vitest run. The Rust unit tests use the debug
   profile and are fast; no separate `cargo test` call is needed.
 - The `v8` crate is patched: `scripts/prepare-v8.ts` unpacks the pinned
-  crate into the gitignored `native/v8-runtime/vendor/v8` and applies
-  `native/v8-runtime/patches/`. Every `pnpm *:native` script runs it first;
+  crate into the gitignored `crates/vendor/v8` and applies
+  `crates/patches/`. Every `pnpm *:native` script runs it first;
   plain `cargo` and rust-analyzer fail until `pnpm prepare:v8` has run once.
   Bumping `v8` means updating `VERSION` + `SHA256` in the script.
 - Prefer `pnpm lint:fix` before manual lint cleanup.

@@ -1,8 +1,7 @@
 //! Rust-side microbenchmarks (criterion, wall time).
 //!
-//! Run: `cargo bench --manifest-path native/v8-runtime/Cargo.toml`
-//! CI runs with `-- --output-format bencher` so `scripts/bench-compare.ts`
-//! can parse the results (see .github/workflows/bench.yml).
+//! Run: `cargo bench --manifest-path crates/Cargo.toml -p iso4-core`
+//! CI measures the same groups under `cargo codspeed` (.github/workflows/codspeed.yml).
 //!
 //! Groups:
 //! - `v8_value` — the value plane crossing into/out of V8: `blob::serialize_value`
@@ -29,9 +28,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use iso4_v8_runtime::blob;
-use iso4_v8_runtime::v8::init_platform;
-use iso4_v8_runtime::snapshot;
+use iso4_core::blob;
+use iso4_core::v8::init_platform;
+use iso4_core::snapshot;
 
 // ── Deterministic payload fixtures ─────────────────────────────────────────
 
@@ -452,7 +451,7 @@ fn compile_fn<'s>(
 // shed-pass walk shows up as a PR diff.
 
 fn bench_policy(c: &mut Criterion) {
-    use iso4_v8_runtime::policy::{
+    use iso4_core::policy::{
         pick_victim, watermark_action, PassOutcome, PressureFacts, VictimFact,
     };
     use std::time::Instant;

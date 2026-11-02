@@ -16,7 +16,8 @@ use crate::warm;
 /// Per-run trace lines (`Run`/`PrefixRun` received / succeeded / failed) are
 /// off by default: two unbuffered `eprintln!`s cost 2-4 % of a hot
 /// `prefix.call()`. `ISO4_V8_TRACE=1` turns them on.
-pub(crate) fn trace_enabled() -> bool {
+#[doc(hidden)]
+pub fn trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         matches!(
@@ -28,14 +29,14 @@ pub(crate) fn trace_enabled() -> bool {
 
 /// `eprintln!` gated on [`trace_enabled`]; arguments are only evaluated when
 /// tracing is on.
+#[macro_export]
 macro_rules! trace {
     ($($arg:tt)*) => {
-        if crate::engine::trace_enabled() {
+        if $crate::engine::trace_enabled() {
             eprintln!($($arg)*);
         }
     };
 }
-pub(crate) use trace;
 
 /// What a frontend hands every run it starts.
 pub struct Caller {
@@ -266,7 +267,7 @@ impl Engine {
         let spawned = std::thread::Builder::new()
             .name("iso4-oneoff-run".to_string())
             .spawn(move || {
-                crate::webcodec::set_session_brand_key(brand_key);
+                crate::webcodec::set_thread_brand_key(brand_key);
                 sandbox::set_oom_run(sandbox::OomRun::Run(run_id));
                 sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
                     run_id,
@@ -278,7 +279,7 @@ impl Engine {
                     sandbox::Limits::from(&req.limits),
                     &req.globals,
                     &req.imports,
-                    sandbox::RunIo::Session {
+                    sandbox::RunIo::Channel {
                         events,
                         link: Arc::clone(&link),
                     },

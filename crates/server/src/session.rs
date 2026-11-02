@@ -14,10 +14,12 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::engine::{trace, Caller, Engine, Refusal, RunHandle};
+use iso4_core::engine::{Caller, Engine, Refusal, RunHandle};
+use iso4_core::link::{Addr, HostLink, Inbound, LinkError, NoopObserver, Outbound};
+use iso4_core::trace;
+use iso4_types as types;
+
 use crate::ipc;
-use crate::link::{Addr, HostLink, Inbound, LinkError, NoopObserver, Outbound};
-use crate::types;
 use crate::wire;
 
 /// How long a freshly accepted connection has to deliver its whole
@@ -70,7 +72,7 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
     if let Err(e) = ipc::write_rust_to_ts_frame(
         stream,
         ipc::RustToTsMessageType::Hello,
-        &ipc::encode_hello_payload(status, crate::blob::probe(), message),
+        &ipc::encode_hello_payload(status, iso4_core::blob::probe(), message),
     ) {
         eprintln!("[iso4-v8] failed to write rejection Hello frame: {e}");
     }
@@ -305,8 +307,8 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     // emits — the Hello probe included — carries the relabelled WRITE version
     // (see `blob::relabel_write_version`). One binary spans Node lines on
     // either side of V8's 15→16 format bump.
-    let host_version = crate::blob::probe_format_version(&auth.probe);
-    let read_version = crate::blob::read_format_version();
+    let host_version = iso4_core::blob::probe_format_version(&auth.probe);
+    let read_version = iso4_core::blob::read_format_version();
     match host_version {
         Some(v) if v <= read_version => {}
         _ => {
@@ -327,7 +329,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     if let Err(e) = ipc::write_rust_to_ts_frame(
         &mut stream,
         ipc::RustToTsMessageType::Hello,
-        &ipc::encode_hello_payload(ipc::HelloStatus::Ok, crate::blob::probe(), ""),
+        &ipc::encode_hello_payload(ipc::HelloStatus::Ok, iso4_core::blob::probe(), ""),
     ) {
         eprintln!("[iso4-v8] failed to write Hello frame: {e}");
         return;
@@ -361,7 +363,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
         call_ids: Arc::new(AtomicU32::new(0)),
         // Only host-type descriptors stamped with this key rehydrate
         // (docs/protocol.md §4.4.6).
-        brand_key: crate::webcodec::brand_key_for_token(&auth.descriptor_token),
+        brand_key: iso4_core::webcodec::brand_key_for_token(&auth.descriptor_token),
     };
 
     // However the demux ends, a panic included, every run in flight on this
@@ -603,7 +605,7 @@ fn start_run(
         eprintln!(
             "[iso4-v8] run {run_id} is already in flight on this connection — refusing the duplicate"
         );
-        let error = crate::v8::RunError::Internal(format!(
+        let error = iso4_core::v8::RunError::Internal(format!(
             "run id {run_id} is already in flight on this connection; every \
              concurrent run needs a distinct id"
         ));
@@ -629,7 +631,7 @@ fn start_run(
 /// Answer a run refused before it started: nothing ran, telemetry is zero.
 fn refuse(link: &dyn HostLink, run_id: u32, error: types::RunErrorPayload) {
     let completion = types::RunCompletion::Failure(types::RunFailurePayload::bare(error));
-    crate::v8::send_completion(link, run_id, Outbound::Result { completion });
+    iso4_core::v8::send_completion(link, run_id, Outbound::Result { completion });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -728,7 +730,7 @@ mod tests {
         // refused purely for its size, which is what the pre-handshake ceiling
         // is for: how much an unproven peer can make the runtime buffer. A
         // real probe is a few bytes, so nothing legitimate comes near 4 KiB.
-        let mut probe = crate::blob::probe().to_vec();
+        let mut probe = iso4_core::blob::probe().to_vec();
         probe.resize(5_000, 0);
         let (mut host, done) = spawn_session();
 
@@ -752,7 +754,7 @@ mod tests {
         ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
             probe,
-            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
+            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
         })
     }
 
@@ -771,11 +773,11 @@ mod tests {
     #[test]
     fn valid_handshake_is_acknowledged_with_the_runtime_probe() {
         let frame =
-            handshake(authenticate(crate::blob::probe().to_vec())).expect("expected a Hello frame");
+            handshake(authenticate(iso4_core::blob::probe().to_vec())).expect("expected a Hello frame");
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Hello);
         let (status, probe, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
-        assert_eq!(probe, crate::blob::probe());
+        assert_eq!(probe, iso4_core::blob::probe());
         assert_eq!(message, "");
     }
 
@@ -784,7 +786,7 @@ mod tests {
     /// even though it relabels its own writes to 15.
     #[test]
     fn a_format_16_probe_is_accepted() {
-        let mut probe = crate::blob::probe().to_vec();
+        let mut probe = iso4_core::blob::probe().to_vec();
         probe[1] = 0x10;
         let frame = handshake(authenticate(probe)).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
@@ -798,10 +800,10 @@ mod tests {
     #[test]
     fn the_hello_probe_advertises_write_format_15() {
         let frame =
-            handshake(authenticate(crate::blob::probe().to_vec())).expect("expected a Hello frame");
+            handshake(authenticate(iso4_core::blob::probe().to_vec())).expect("expected a Hello frame");
         let (status, probe, _) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
-        assert_eq!(probe[0], crate::blob::V8_BLOB_HEADER_TAG);
+        assert_eq!(probe[0], iso4_core::blob::V8_BLOB_HEADER_TAG);
         assert_eq!(probe[1], 0x0F);
     }
 
@@ -809,7 +811,7 @@ mod tests {
     fn impossible_v8_format_version_is_refused_loudly() {
         // A probe claiming a serialization format far newer than anything this
         // V8 can read. The old protocol closed the socket silently here.
-        let probe = vec![crate::blob::V8_BLOB_HEADER_TAG, 0x63, 0x30];
+        let probe = vec![iso4_core::blob::V8_BLOB_HEADER_TAG, 0x63, 0x30];
         let frame = handshake(authenticate(probe)).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::V8FormatMismatch as u8);
@@ -831,8 +833,8 @@ mod tests {
     fn protocol_version_mismatch_is_refused_loudly() {
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION + 1,
-            probe: crate::blob::probe().to_vec(),
-            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
+            probe: iso4_core::blob::probe().to_vec(),
+            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
         });
         let frame = handshake(payload).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
@@ -842,7 +844,7 @@ mod tests {
 
     // ── The demux: several runs on one connection ─────────────────────────
 
-    use crate::testval::{self, TestValue};
+    use iso4_core::testval::{self, TestValue};
 
     fn pstr(out: &mut Vec<u8>, s: &str) {
         out.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -947,7 +949,7 @@ mod tests {
         ipc::write_ts_to_rust_frame(
             &mut host,
             ipc::TsToRustMessageType::Authenticate,
-            &authenticate(crate::blob::probe().to_vec()),
+            &authenticate(iso4_core::blob::probe().to_vec()),
         )
         .unwrap();
         let hello = ipc::read_rust_to_ts_frame(&mut host).expect("a Hello frame");
@@ -971,7 +973,7 @@ mod tests {
 
     #[test]
     fn two_runs_interleave_on_one_connection_with_correct_routing() {
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, _done) = open_session();
 
         // Two runs in flight at once on one connection, each suspended on a
@@ -1044,7 +1046,7 @@ mod tests {
         // frame within the ceiling but over ONE run's own inbound allowance
         // (its memoryMb budget) fails that run cleanly — the connection and
         // its other runs keep going.
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, _done) = open_session();
 
         let code = "export default await tool()";
@@ -1106,7 +1108,7 @@ mod tests {
         // (routed) Terminate would sit unread forever, and the wall here is
         // 10 s. The prompt ERR_ABORTED (not ERR_WALL_TIMEOUT, not a hang)
         // proves the route's token reaches the one-off's guard.
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1140,7 +1142,7 @@ mod tests {
         // The kill lands inside a microtask-checkpoint continuation, where
         // V8's terminate flag used to be consumed silently: prompt
         // ERR_ABORTED, never a hang to the wall.
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1188,7 +1190,7 @@ mod tests {
         // The continuation here burns briefly and then suspends forever on
         // a fresh promise — the abort must land right after that turn, as
         // a clean abandon, not hang and not interrupt.
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1231,7 +1233,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_run_id_is_refused_and_the_first_run_survives() {
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, _done) = open_session();
 
         // Run 1 suspends on its bridge call…
@@ -1285,7 +1287,7 @@ mod tests {
 
     #[test]
     fn a_finished_runs_id_can_be_used_again() {
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, _done) = open_session();
         for _ in 0..2 {
             ipc::write_ts_to_rust_frame(
@@ -1301,7 +1303,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_frame_fails_the_connections_runs_loudly() {
-        crate::v8::init_platform();
+        iso4_core::v8::init_platform();
         let (mut host, done) = open_session();
 
         // One run in flight, suspended on its bridge call…
@@ -1345,7 +1347,7 @@ mod tests {
         // as any other malformed Authenticate.
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
-            probe: crate::blob::probe().to_vec(),
+            probe: iso4_core::blob::probe().to_vec(),
             descriptor_token: vec![0xab; 8],
         });
         assert!(

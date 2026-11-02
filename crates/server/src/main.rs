@@ -3,9 +3,12 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{
-    blob, container, engine, oom, policy, rss, session, types, v8 as sandbox, warm,
-};
+mod ipc;
+mod session;
+mod wire;
+
+use iso4_core::{blob, container, engine, oom, policy, rss, v8 as sandbox, warm};
+use iso4_types as types;
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;

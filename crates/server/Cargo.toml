@@ -1,0 +1,22 @@
+[package]
+name = "iso4-server"
+version = "0.0.0"
+edition = "2021"
+description = "V8 host process for iso4 — serves the engine to the Node host over a Unix domain socket"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "iso4-v8"
+path = "src/main.rs"
+bench = false
+
+[dependencies]
+iso4-core = { path = "../core" }
+iso4-types = { path = "../types" }
+
+# Lock-free channels between the demux thread and the connection's writer
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+iso4-core = { path = "../core", features = ["test-support"] }

@@ -17,14 +17,9 @@ if (targetArgIndex !== -1 && !target) {
 }
 
 const platformPackage = currentPlatformPackage()
-const manifestPath = join(
-  repoRoot,
-  'native',
-  'v8-runtime',
-  'Cargo.toml',
-)
+const manifestPath = join(repoRoot, 'crates', 'Cargo.toml')
 
-const cargoArgs = ['build', '--manifest-path', manifestPath]
+const cargoArgs = ['build', '--manifest-path', manifestPath, '--package', 'iso4-server']
 if (release)
   cargoArgs.push('--release')
 if (target)
@@ -42,8 +37,8 @@ if (cargo.status !== 0) {
 
 const profile = release ? 'release' : 'debug'
 const targetDir = target
-  ? join(repoRoot, 'native', 'v8-runtime', 'target', target, profile)
-  : join(repoRoot, 'native', 'v8-runtime', 'target', profile)
+  ? join(repoRoot, 'crates', 'target', target, profile)
+  : join(repoRoot, 'crates', 'target', profile)
 const sourceBinary = join(targetDir, 'iso4-v8')
 
 if (!existsSync(sourceBinary)) {

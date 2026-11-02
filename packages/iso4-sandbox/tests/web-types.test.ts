@@ -2,7 +2,7 @@
  * End-to-end tests for `Request`/`Response`/`Headers` crossing the boundary.
  *
  * These run against the real Rust binary, so they are the only place the two
- * copies of the wire format (`native/v8-runtime/src/webcodec.rs` and
+ * copies of the wire format (`crates/core/src/webcodec.rs` and
  * `src/web-codec.ts`) are checked against each other. Unit tests on either side
  * can agree with themselves and still be incompatible.
  */

@@ -63,7 +63,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: native/v8-runtime
+          workspaces: crates
           key: release-${{ matrix.platform }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -82,13 +82,13 @@ jobs:
           echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
       - run: |
           cargo build --release \
-            --manifest-path native/v8-runtime/Cargo.toml
+            --manifest-path crates/Cargo.toml --package iso4-server
       - if: runner.os == 'macOS'
-        run: codesign --sign - --force native/v8-runtime/target/release/iso4-v8
+        run: codesign --sign - --force crates/target/release/iso4-v8
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: iso4-v8-${{ matrix.platform }}
-          path: native/v8-runtime/target/release/iso4-v8
+          path: crates/target/release/iso4-v8
           if-no-files-found: error
 
   publish:

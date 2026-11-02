@@ -197,7 +197,7 @@ pub fn deserialize_value_with_web_types<'s>(
     bytes: &[u8],
 ) -> Option<v8::Local<'s, v8::Value>> {
     let value = deserialize_value(scope, bytes)?;
-    let Some(brand_key) = webcodec::session_brand_key() else {
+    let Some(brand_key) = webcodec::thread_brand_key() else {
         return Some(value);
     };
     if !webcodec::might_contain_web_types(bytes, &brand_key) {
@@ -217,7 +217,8 @@ pub fn deserialize_value_with_web_types<'s>(
 /// `None` means the bytes are truncated, corrupt, written by a newer V8
 /// serialization format than this binary can read, or nested past V8's
 /// reader stack — then `take_codec_error` carries the reason. The format
-/// version is checked once per connection at handshake time (`session.rs`).
+/// version is checked once per connection at handshake time (the server's
+/// `session.rs`).
 pub fn deserialize_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
@@ -700,7 +701,7 @@ mod tests {
         let probe = eval(scope, "String(__rt instanceof Headers)");
         assert_eq!(probe.to_rust_string_lossy(scope), "false");
 
-        webcodec::set_session_brand_key(key);
+        webcodec::set_thread_brand_key(key);
         let instance = deserialize_value_with_web_types(scope, &bytes).expect("deserialize");
         global.set(scope, name.into(), instance);
         let probe = eval(

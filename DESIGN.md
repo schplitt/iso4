@@ -171,13 +171,19 @@ host hands it over by name.
                                │  length-prefixed binary frames    
                                ▼                                   
   ┌─────────────────────────────────────────────────────────┐    
-  │ iso4-v8 (Rust binary, ships per-platform via npm)         │  
+  │ iso4-v8 (Rust binary, ships per-platform via npm)       │    
   │                                                         │    
-  │   main.rs  ─ UDS accept loop, handshake, signal handling │   
+  │  iso4-server (socket frontend)                          │    
+  │   main.rs  ─ UDS accept loop, arg parsing               │    
   │      │                                                  │    
-  │      ├─ one demux thread per connection (only reader;   │    
-  │      │     decodes and routes messages per run; the     │    
-  │      │     HostLink impl is the serialized writer)      │    
+  │      └─ one demux thread per connection (only reader;   │    
+  │            handshake, decodes and routes frames per     │    
+  │            run; its HostLink impl is the serialized     │    
+  │            writer)                                      │    
+  │                    │  Engine / HostLink / Outbound /    │    
+  │                    ▼  Inbound (plain Rust, no frames)   │    
+  │  iso4-core (the engine; iso4-types for shared types)    │    
+  │      ├─ prefix store + warm-instance registry           │    
   │      ├─ one OS thread per isolate — the turn loop       │    
   │      │     v8::Isolate (heap_limits + custom allocator) │    
   │      │     v8::Context with curated globals             │    
@@ -659,7 +665,7 @@ be neither forged nor destroyed by a run.
 ada (the parser Node.js uses, vendored into the runtime binary via the
 `ada-url` crate), so component semantics — IDNA, relative resolution,
 non-special schemes — match Node by construction. The class is gated end to
-end on the WPT URL corpus (`native/v8-runtime/tests/wpt/`), and the `URL.parse`
+end on the WPT URL corpus (`crates/core/tests/wpt/`), and the `URL.parse`
 and `URL.canParse` statics are included. `URLSearchParams` remains JS.
 
 Widening this set is additive and does not change the wire format
@@ -1519,16 +1525,37 @@ iso4/
     iso4-v8-linux-arm64-gnu/           binaries are built in CI, not committed)
     iso4-v8-linux-x64-gnu/
     iso4-fs/, iso4-crypto/          ← (future) node:* stub factories
-  native/
-    v8-runtime/                     ← Rust source for the V8 host binary
+  crates/
+    Cargo.toml                      ← workspace root; [patch.crates-io] v8 lives here
+    rust-toolchain.toml
+    vendor/v8/                      ← gitignored, unpacked by scripts/prepare-v8.ts
+    patches/                        ← patches applied to the vendored v8 crate
+    types/                          ← iso4-types (lib): plain shared types, no V8, no sockets
+    core/                           ← iso4-core (lib): the engine
+      build.rs                      ← snapshot + clock_platform.cc, core modules only
+      src/
+    server/                         ← iso4-server (bin iso4-v8): socket frontend for Node
+      src/
+  scripts/
+    prepare-v8.ts                   ← unpacks + patches the v8 crate into crates/vendor
+    build-native.ts                 ← cargo build + copy the binary into the platform package
 ```
 
-Target sizes (when complete):
+Dependency direction: `server` depends on `core` and `types`; `core` depends
+on `types`; `types` depends on nothing in the repository. What each crate
+owns:
 
-- `@iso4/sandbox`: <1500 LoC TypeScript.
-- `@iso4/fetch`: <500 LoC TypeScript.
-- `native/v8-runtime`: <3000 LoC Rust.
-- JS injected into each isolate: <300 LoC.
+- `iso4-core` owns isolates, limits, the turn loop, the warm registry, the
+  prefix store, web globals, console, the value codec, the cgroup meter, the
+  policy functions and the startup snapshot. It encodes no frame and owns
+  no socket.
+- `iso4-types` owns the plain shared types: limits, prefix spec, bridge
+  targets, error payloads. No V8, no sockets.
+- `iso4-server` owns the Unix socket, the frame protocol in
+  `docs/protocol.md`, the handshake, the per-connection demux and writer. It
+  is the only crate that knows the Node wire.
+- The bridge is the `HostLink` trait (`core/src/link.rs`); frontends decide
+  who answers a call.
 
 ---
 
@@ -1889,7 +1916,7 @@ run; heavy prefixes and sub-ms calls belong to the warm-isolate model
 
 The runtime surface (console, web types, `AsyncLocalStorage`, `waitUntil`,
 timers) is installed once, by `build.rs`, into a snapshot embedded in the
-binary (`native/v8-runtime/src/snapshot.rs`). Every isolate boots from it, so
+binary (`crates/core/src/snapshot.rs`). Every isolate boots from it, so
 no runtime JS is compiled or evaluated per isolate. This is the mksnapshot
 workflow §11.6 calls supported: one snapshot, made in a separate process,
 never at runtime.

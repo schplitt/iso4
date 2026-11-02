@@ -1,0 +1,16 @@
+[package]
+name = "iso4-types"
+version = "0.0.0"
+edition = "2021"
+description = "Plain types shared by the iso4 engine and its frontends: limits, prefix shape, bridge records, error codes"
+license = "MIT"
+publish = false
+
+[lib]
+name = "iso4_types"
+path = "src/lib.rs"
+bench = false
+
+[features]
+# Test constructors for other crates' tests; never on in a build.
+test-support = []

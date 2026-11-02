@@ -198,7 +198,7 @@ fn instance_main(
     // Host-type descriptors deserialized on this thread — call args, bridge
     // responses, and the cold-start replay of stored data globals — rehydrate
     // only when stamped with this key.
-    crate::webcodec::set_session_brand_key(brand_key);
+    crate::webcodec::set_thread_brand_key(brand_key);
 
     // The isolate is created lazily on the first job so a creation failure
     // surfaces as that call's result. The first message is always a job:

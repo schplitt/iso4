@@ -14,8 +14,8 @@
 
 use std::io;
 
-use crate::errors::clamp_error_text;
-use crate::types::{
+use iso4_core::errors::clamp_error_text;
+use iso4_types::{
     BridgeCallRecord, BridgeErrorPayload, BridgeTarget, RunCompletion, RunErrorPayload,
 };
 
@@ -129,14 +129,14 @@ fn read_value_blob(data: &[u8], offset: &mut usize) -> io::Result<Vec<u8>> {
 
 // ── Reset cause byte ─────────────────────────────────────────────────────────
 
-fn reset_cause_byte(cause: crate::v8::ResetCause) -> u8 {
+fn reset_cause_byte(cause: iso4_core::v8::ResetCause) -> u8 {
     match cause {
-        crate::v8::ResetCause::Cpu => 0,
-        crate::v8::ResetCause::Memory => 1,
-        crate::v8::ResetCause::Abort => 2,
-        crate::v8::ResetCause::Internal => 3,
-        crate::v8::ResetCause::Wall => 4,
-        crate::v8::ResetCause::Unsupported => 5,
+        iso4_core::v8::ResetCause::Cpu => 0,
+        iso4_core::v8::ResetCause::Memory => 1,
+        iso4_core::v8::ResetCause::Abort => 2,
+        iso4_core::v8::ResetCause::Internal => 3,
+        iso4_core::v8::ResetCause::Wall => 4,
+        iso4_core::v8::ResetCause::Unsupported => 5,
     }
 }
 
@@ -177,7 +177,7 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
     // The runtime's current concurrency allowance, on every completion:
     // four bytes on a frame the host already reads, instead of a poll or a
     // second channel. Zero = no opinion yet (before the cold-start seed).
-    encode_u32(crate::warm::slot_allowance(), &mut out);
+    encode_u32(iso4_core::warm::slot_allowance(), &mut out);
 
     match completion {
         RunCompletion::Success(s) => {
@@ -228,13 +228,13 @@ pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> 
 /// List<BridgeCallRecord>  bridgeCalls  (attempted during grace)
 /// Optional<(String name, String message)>  error
 /// ```
-pub fn encode_run_complete_payload(run_id: u32, report: &crate::v8::GraceReport) -> Vec<u8> {
+pub fn encode_run_complete_payload(run_id: u32, report: &iso4_core::v8::GraceReport) -> Vec<u8> {
     let mut out = Vec::new();
     encode_u32(run_id, &mut out);
     out.push(match report.status {
-        crate::v8::GraceStatus::Settled => 0,
-        crate::v8::GraceStatus::Truncated => 1,
-        crate::v8::GraceStatus::Failed => 2,
+        iso4_core::v8::GraceStatus::Settled => 0,
+        iso4_core::v8::GraceStatus::Truncated => 1,
+        iso4_core::v8::GraceStatus::Failed => 2,
     });
     encode_f64(report.duration_ms, &mut out);
     encode_f64(report.wall_time_ms, &mut out);
@@ -287,7 +287,7 @@ fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
 }
 
 /// Ceiling on the serialized own-properties blob attached to an error. Same
-/// reasoning as [`crate::errors::MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
+/// reasoning as [`iso4_core::errors::MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
 /// cannot be truncated meaningfully, so an oversized one is dropped whole.
 const MAX_ERROR_FIELDS_BYTES: usize = 1024 * 1024;
 
@@ -400,7 +400,7 @@ pub fn encode_precompile_result_payload(
 ///   u32     idle
 ///   u32     busy
 /// ```
-pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
+pub fn encode_stats_payload(stats: &iso4_core::warm::RegistryStats) -> Vec<u8> {
     // Counts saturate at u32::MAX instead of wrapping: a live cap that is a
     // multiple of 2^32 (seen with cgroup v1's "unlimited" memory sentinel
     // before the host clamped its budget) would otherwise truncate to 0.
@@ -564,8 +564,8 @@ pub fn parse_bridge_response_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::MAX_ERROR_TEXT_BYTES;
-    use crate::types::RunFailurePayload;
+    use iso4_core::errors::MAX_ERROR_TEXT_BYTES;
+    use iso4_types::RunFailurePayload;
 
     fn failure_payload(message: String, stack: Option<String>, fields: Option<Vec<u8>>) -> Vec<u8> {
         encode_run_completion_payload(
@@ -630,5 +630,19 @@ mod tests {
             String::from_utf8_lossy(&payload).contains("ERR_USER_CODE"),
             "error code did not survive clamping"
         );
+    }
+
+    #[test]
+    fn a_guest_capped_text_gets_no_second_marker() {
+        // The engine caps message and stack at the UTF-16 marker below the
+        // byte cap, so the wire clamp must leave them alone.
+        let marker = "… [truncated by iso4: 67108864 UTF-16 units total]";
+        let text = format!("{}{marker}", "a".repeat(MAX_ERROR_TEXT_BYTES - 128));
+        let payload = failure_payload(text.clone(), Some(text), None);
+        let encoded = String::from_utf8_lossy(&payload);
+
+        assert_eq!(encoded.matches("[truncated by iso4: ").count(), 2);
+        assert!(!encoded.contains("bytes total]"), "the wire clamp added a marker");
+        assert!(payload.len() < 2 * MAX_ERROR_TEXT_BYTES + 256);
     }
 }

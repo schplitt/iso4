@@ -9,11 +9,11 @@ use crate::v8::{RunError, WARMUP_CPU_MS, WARMUP_WALL_MS};
 /// Ceiling on each piece of error text (message, stack): `max_export_bytes`
 /// bounds only the success path, and an unbounded message once built a
 /// Result frame past the 64 MiB frame ceiling.
-pub(crate) const MAX_ERROR_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_ERROR_TEXT_BYTES: usize = 64 * 1024;
 
 /// Clamp error text to [`MAX_ERROR_TEXT_BYTES`], on a UTF-8 boundary, and say
 /// so in the result rather than silently shortening it.
-pub(crate) fn clamp_error_text(text: &str) -> Cow<'_, str> {
+pub fn clamp_error_text(text: &str) -> Cow<'_, str> {
     if text.len() <= MAX_ERROR_TEXT_BYTES {
         return Cow::Borrowed(text);
     }

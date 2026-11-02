@@ -131,6 +131,10 @@ console.log(skippedExports) // ['default']        — the handler object, skippe
 | `@iso4/crypto`                             | future  | `node:crypto` stub factory (safe subset)                                                                                  |
 | `@iso4/v8-<platform>`                      | working | Per-platform Rust binaries for `@iso4/sandbox` (built in CI, not committed)                                               |
 
+The Rust side lives in [`crates/`](./crates): `types` (shared plain types),
+`core` (the engine) and `server` (the `iso4-v8` binary that serves the
+engine over a Unix socket). Its README explains the split.
+
 ## Development
 
 Requires Node 24+ and pnpm. Mise pins the toolchain (`mise.toml`).

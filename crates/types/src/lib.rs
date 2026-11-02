@@ -1,7 +1,7 @@
-//! Plain types shared by the engine and the socket frontend: limits, the
-//! prefix shape (globals, imports, rebinds), calls, bridge records and run
-//! completions. Depends on nothing else in the crate: no V8, no sockets, no
-//! encoding.
+//! Plain types shared by the engine and its frontends: limits, the prefix
+//! shape (globals, imports, rebinds), calls, bridge records and run
+//! completions. Depends on nothing else in the repository: no V8, no
+//! sockets, no encoding.
 
 /// Default resource limits. The runtime owns its safety posture: the TS client
 /// sends only the limits the caller explicitly set (each wire field is
@@ -81,7 +81,7 @@ pub enum BandPolicy {
 
 /// Resolve the advertised cap plus optional hard override into the two
 /// enforced lines. Truth table: `docs/protocol.md` §5.2.
-pub(crate) fn resolve_heap_lines(
+pub fn resolve_heap_lines(
     cap_mb: u32,
     hard_override: Option<u32>,
     band: BandPolicy,
@@ -176,7 +176,7 @@ impl HostGlobalDef {
     }
 
     /// A convenience constructor for tests: a plain bridge global.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn bridge(name: &str) -> Self {
         HostGlobalDef::Bridge {
             name: name.to_string(),
@@ -187,7 +187,7 @@ impl HostGlobalDef {
 
 /// Deepest host-module shape node accepted, as a path length from a top-level
 /// export. Mirrors the TS client's constant (`docs/protocol.md` §5.2).
-pub(crate) const MAX_HOST_MODULE_DEPTH: usize = 64;
+pub const MAX_HOST_MODULE_DEPTH: usize = 64;
 
 /// One node in a host-module shape tree. The tree is plain data — the client
 /// never generates sandbox source from it; the runtime builds the module
@@ -306,7 +306,7 @@ pub struct RunErrorPayload {
 
 /// Why a shared instance was reset under an innocent victim — the cause
 /// class carried on `ERR_INSTANCE_RESET`. Wire byte values are assigned in
-/// `wire::reset_cause_byte` (NOT this declaration order) and mirrored by the
+/// the server's `wire::reset_cause_byte` (NOT this declaration order) and mirrored by the
 /// TS decoder's cause table; change all three together or victims get
 /// mislabelled causes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
