@@ -115,6 +115,10 @@ impl fmt::Display for LinkError {
 /// outbox discipline.
 pub trait HostLink: Send + Sync {
     fn send(&self, to: Addr, msg: Outbound) -> Result<(), LinkError>;
+
+    /// A started run at `to` is over: called once, before its final message.
+    /// A frontend drops its routing state for the run here.
+    fn finished(&self, _to: Addr) {}
 }
 
 /// Which console stream a line went to.

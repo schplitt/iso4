@@ -87,6 +87,23 @@ pub struct Limits {
     pub grace_ms: u32,
 }
 
+impl From<&types::ResourceLimits> for Limits {
+    fn from(l: &types::ResourceLimits) -> Self {
+        Limits {
+            wall_time_ms: l.wall_time_ms,
+            cpu_time_ms: l.cpu_time_ms,
+            soft_memory_mb: l.soft_memory_mb,
+            hard_memory_mb: l.hard_memory_mb,
+            max_export_bytes: l.max_export_bytes,
+            max_stdout_bytes: l.max_stdout_bytes,
+            max_stderr_bytes: l.max_stderr_bytes,
+            max_bridge_call_bytes: l.max_bridge_call_bytes,
+            max_bridge_calls: l.max_bridge_calls,
+            grace_ms: l.grace_ms,
+        }
+    }
+}
+
 /// Termination reason set by the first enforcer to fire — a limit guard, or
 /// a hard abort's mid-turn kill ([`GuardCtl::abort_executing`]).
 ///
@@ -1600,13 +1617,9 @@ pub fn execute(
     )
 }
 
-/// [`execute`] with an explicit run I/O mode — the session's one-off worker
-/// path, where frames arrive demux-routed over a channel and outbound frames
-/// go through the connection's serialized writer.
-/// `token` is the run's table token; 0 = allocate one internally. The
-/// session demux allocates it up front and registers it in the run's route,
-/// so `GuardCtl::abort_executing(token)` can match this run's turns — pass
-/// the SAME token here or mid-turn aborts silently never land.
+/// [`execute`] with an explicit run I/O mode: the engine's one-off worker
+/// path. `token` is the run's table token (0 = allocate one internally);
+/// pass the token the run's handle carries, or mid-turn aborts never land.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_with_io(
     code: &str,
@@ -1981,11 +1994,9 @@ fn run_module_inner(
 
 // ── Run I/O ──────────────────────────────────────────────────────────────────
 
-/// One message on an instance's single ordered channel. Jobs and the events
-/// of in-flight runs share ONE queue (#170): the demux enqueues a run's job
-/// before it can route any of that run's frames, so channel FIFO makes
-/// "frame beats its own job" unrepresentable — an event whose token is not
-/// live can only be LATE (its run concluded), never early.
+/// One message on an instance's single ordered channel. A run's job is
+/// enqueued before any of its events can be, so an event whose token is not
+/// live can only be late, never early.
 pub enum RunEvent {
     /// A new run for the instance's turn loop. One-off runs never see this
     /// variant (their private channel carries only their own events).
@@ -2860,7 +2871,7 @@ fn start_turn(
     }
 
     // Install the value globals (string exprs, constants, shim wrappers)
-    // natively. A PrefixRun carrying one is refused in session.rs, so for it
+    // natively. A PrefixRun carrying one is refused by the engine, so for it
     // this is a no-op; its value globals were replayed from the prefix defs.
     if let Err(e) = install_value_globals(scope, ctx.globals) {
         return finished(Err(rs.fail(termination_or(facts.reason, e))));
@@ -4860,8 +4871,7 @@ pub struct CallJob {
     /// outcome; direct callers use it to receive the outcome.
     pub release: Option<ReleaseHook>,
     /// Filled with the instance guard's cross-thread face once the isolate
-    /// exists, so the session demux can terminate this run mid-turn
-    /// (Terminate for a CPU-bound run — E1 ruling 5's fallback).
+    /// exists, so the run's handle can terminate it mid-turn.
     pub ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
 }
 
@@ -5123,9 +5133,8 @@ fn conclude_run(
     finish_job(&mut live.job, live.rs.link.take(), outcome);
 }
 
-/// Conclude a job: the release hook first (the instance is back in the
-/// registry before the host can see the answer), then the completion
-/// through the run's link.
+/// Conclude a job through [`finish_run`], its release hook as the
+/// bookkeeping.
 pub fn finish_job(job: &mut CallJob, link: Option<Arc<dyn HostLink>>, outcome: CallOutcome) {
     let run_id = job.epilogue.map(|e| e.run_id).unwrap_or(0);
     let msg = link.as_ref().map(|_| {
@@ -5135,11 +5144,29 @@ pub fn finish_job(job: &mut CallJob, link: Option<Arc<dyn HostLink>>, outcome: C
             outcome.prefix_failed,
         )
     });
-    if let Some(release) = job.release.take() {
-        release(outcome);
+    let release = job.release.take();
+    finish_run(link.as_deref(), run_id, msg, || {
+        if let Some(release) = release {
+            release(outcome);
+        }
+    });
+}
+
+/// Conclude a run: the frontend drops its route, the registry bookkeeping
+/// runs (the instance is back before the host can see the answer), then the
+/// completion goes out.
+pub fn finish_run(
+    link: Option<&dyn HostLink>,
+    run_id: u32,
+    msg: Option<Outbound>,
+    release: impl FnOnce(),
+) {
+    if let Some(link) = link {
+        link.finished(Addr::Run(run_id));
     }
+    release();
     if let (Some(link), Some(msg)) = (link, msg) {
-        send_completion(&*link, run_id, msg);
+        send_completion(link, run_id, msg);
     }
 }
 
@@ -5201,31 +5228,16 @@ pub fn send_completion(link: &dyn HostLink, run_id: u32, msg: Outbound) {
                 "[iso4-v8] Result for run {run_id} too large to send ({detail}) — \
                  replacing it with ERR_INTERNAL"
             );
-            let completion = types::RunCompletion::Failure(types::RunFailurePayload {
-                error: types::RunErrorPayload {
-                    code: "ERR_INTERNAL".to_string(),
-                    name: "Error".to_string(),
-                    message: format!(
-                        "the run's result was too large to send to the host ({detail}). \
-                         A thrown error's message, stack and properties are reported \
-                         verbatim, so a very large one cannot be delivered."
-                    ),
-                    stack: None,
-                    fields: None,
-                    reset: None,
-                    prefix_stage: false,
-                    cause: None,
-                },
-                // Dropped deliberately: stdout/stderr are unbounded too, and
-                // this payload has to be small by construction.
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                duration_ms: 0.0,
-                wall_time_ms: 0.0,
-                cpu_time_ms: 0.0,
-                bridge_calls: Vec::new(),
-                heap_used_bytes: None,
-            });
+            // stdout/stderr are dropped too: unbounded, and this payload has
+            // to be small by construction.
+            let completion = types::RunCompletion::Failure(types::RunFailurePayload::bare(
+                RunError::Internal(format!(
+                    "the run's result was too large to send to the host ({detail}). \
+                     A thrown error's message, stack and properties are reported \
+                     verbatim, so a very large one cannot be delivered."
+                ))
+                .to_payload(),
+            ));
             link.send(Addr::Run(run_id), Outbound::Result { completion })
         }
         Err(LinkError::TooLarge(detail)) => {
@@ -6873,9 +6885,8 @@ struct GuardShared {
     /// (a clean boundary failure), never the watchdog's.
     target: Mutex<Option<GuardTarget>>,
     /// The token of the run whose turn is executing right now (0 = none).
-    /// Written under the target lock, so it serializes with turn exit — the
-    /// session demux consults it to decide gentle-abandon vs mid-turn
-    /// terminate for a Terminate frame (E1 ruling 5's fallback).
+    /// Written under the target lock, so it serializes with turn exit; a hard
+    /// Terminate consults it to choose abandon vs mid-turn kill.
     executing: AtomicU64,
     /// Arm generation, bumped under the target lock by every arm and clear.
     /// A watchdog entry fires only when the generation it was pushed under
@@ -11086,7 +11097,7 @@ mod tests {
         .map(|_| ())
     }
 
-    /// The spec a run replays — mirroring what session.rs stores per prefix —
+    /// The spec a run replays — mirroring what prefix.rs stores per prefix —
     /// after checking that it evaluates.
     fn prepared<'a>(
         code: &'a str,

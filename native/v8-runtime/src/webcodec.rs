@@ -481,8 +481,8 @@ pub fn brand_key_for_token(token: &[u8]) -> String {
 
 thread_local! {
     /// The brand key for descriptors deserialized on this thread. Set from the
-    /// connection's handshake token on the session thread, and on each warm
-    /// instance owner thread at spawn. Unset (e.g. unit tests driving the run
+    /// connection's handshake token on each one-off worker thread and on each
+    /// warm instance owner thread at spawn. Unset (e.g. unit tests driving the run
     /// paths directly) is fail-closed: nothing rehydrates and branded-looking
     /// objects pass through as the plain data they are.
     static SESSION_BRAND_KEY: RefCell<Option<String>> = const { RefCell::new(None) };

@@ -30,10 +30,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::types::{
     resolve_heap_lines, BandPolicy, CallSpec, HostGlobalDef, HostModuleNode, ImportBinding,
-    ImportModule, ImportRebind, ResourceLimits, TerminateMode, DEFAULT_CPU_TIME_MS,
-    DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS, DEFAULT_MAX_BRIDGE_CALL_BYTES,
-    DEFAULT_MAX_EXPORT_BYTES, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
-    DEFAULT_MEMORY_MB, DEFAULT_WALL_TIME_MS, MAX_HOST_MODULE_DEPTH, STREAM_CHUNK_MAX_BYTES,
+    ImportModule, ImportRebind, PrefixRunRequest, ResourceLimits, RunRequest, TerminateMode,
+    DEFAULT_CPU_TIME_MS, DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS,
+    DEFAULT_MAX_BRIDGE_CALL_BYTES, DEFAULT_MAX_EXPORT_BYTES, DEFAULT_MAX_STDERR_BYTES,
+    DEFAULT_MAX_STDOUT_BYTES, DEFAULT_MEMORY_MB, DEFAULT_WALL_TIME_MS, MAX_HOST_MODULE_DEPTH,
+    STREAM_CHUNK_MAX_BYTES,
 };
 
 /// Current wire protocol version.
@@ -895,22 +896,6 @@ pub fn encode_hello_payload(status: HelloStatus, probe: &[u8], message: &str) ->
     payload
 }
 
-// ── RunPayload types ─────────────────────────────────────────────────────────
-
-/// Fully parsed `Run` frame payload per `docs/protocol.md` §5.2.
-#[derive(Debug)]
-pub struct RunPayload {
-    pub run_id: u32,
-    pub code: String,
-    pub filename: Option<String>,
-    pub limits: ResourceLimits,
-    pub globals: Vec<HostGlobalDef>,
-    pub imports: Vec<ImportBinding>,
-    /// When present, the result is the called function's return value instead
-    /// of the exports. Resolved against the freshly evaluated module.
-    pub call: Option<CallSpec>,
-}
-
 // ── Payload reader ────────────────────────────────────────────────────────────
 
 /// Minimal cursor used for parsing fixed-format payloads.
@@ -1264,7 +1249,7 @@ impl<'a> PayloadReader<'a> {
 // ── Payload parsers ──────────────────────────────────────────────────────────────
 
 /// Parse the shared code + filename + limits + globals fields that appear in
-/// `RunPayload`, `PrecompilePayload`, and `PrefixRunPayload`. The `imports`
+/// `RunRequest`, `PrecompilePayload`, and `PrefixRunRequest`. The `imports`
 /// block that follows differs per message type (`ImportBinding` declarations
 /// for Run/Precompile, `ImportRebind` entries for PrefixRun) and is read by
 /// the individual parsers.
@@ -1280,7 +1265,7 @@ fn parse_code_fields(
 }
 
 /// Parse the payload bytes of a `Run` frame per `docs/protocol.md` §5.2.
-pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
+pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunRequest> {
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
     // A one-off gets a fresh isolate: strict cap, no band.
@@ -1288,7 +1273,7 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
     let imports = r.read_import_bindings()?;
     let call = r.read_optional_call()?;
     r.assert_done()?;
-    Ok(RunPayload {
+    Ok(RunRequest {
         run_id,
         code,
         filename,
@@ -1300,7 +1285,7 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunPayload> {
 }
 
 /// Fully parsed `Precompile` frame payload per `docs/protocol.md` §5.2.
-/// Same fields as `RunPayload` but without `run_id`.
+/// Same fields as `RunRequest` but without `run_id`.
 #[derive(Debug)]
 pub struct PrecompilePayload {
     /// Correlation id echoed on the `PrecompileResult` so the host matches
@@ -1332,26 +1317,8 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
     })
 }
 
-/// Fully parsed `PrefixRun` frame payload per `docs/protocol.md` §5.2.
-///
-/// Unlike `Run`/`Precompile`, the imports block carries `ImportRebind`
-/// entries — the declared module shapes are frozen with the snapshot and
-/// re-used from the prefix store; only host function leaves may be re-pointed
-/// at new TS handlers per run.
-#[derive(Debug)]
-pub struct PrefixRunPayload {
-    pub run_id: u32,
-    pub prefix_id: String,
-    pub limits: ResourceLimits,
-    pub globals: Vec<HostGlobalDef>,
-    pub import_rebinds: Vec<ImportRebind>,
-    /// The call into the prefix module's exports; the result is the
-    /// function's return value.
-    pub call: CallSpec,
-}
-
 /// Parse the payload bytes of a `PrefixRun` frame per `docs/protocol.md` §5.2.
-pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> {
+pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunRequest> {
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
     let prefix_id = r.read_string()?;
@@ -1360,7 +1327,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunPayload> 
     let import_rebinds = r.read_import_rebinds()?;
     let call = r.read_call()?;
     r.assert_done()?;
-    Ok(PrefixRunPayload {
+    Ok(PrefixRunRequest {
         run_id,
         prefix_id,
         limits,
@@ -1936,7 +1903,7 @@ mod tests {
 
     // ── parse_run_payload ──────────────────────────────────────────────
 
-    /// Build a minimal valid RunPayload byte vector.
+    /// Build a minimal valid Run payload byte vector.
     fn encode_run_payload(run_id: u32, code: &str, filename: Option<&str>) -> Vec<u8> {
         let mut v = Vec::new();
         push_u32(&mut v, run_id);

@@ -61,7 +61,9 @@ iso4/                              ← workspace root
       build.rs                     ← builds the startup snapshot (compiles src/ modules in)
       src/
         main.rs                    ← arg parsing, UDS accept loop
-        session.rs                 ← per-connection message loop, prefix store
+        session.rs                 ← per-connection frame glue: handshake, demux, the connection's HostLink
+        engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
+        prefix.rs                  ← stored prefix shape, rebind validation
         v8.rs                      ← isolates, contexts, prefix evaluation, limits
         warm.rs                    ← warm-instance registry
         link.rs                    ← HostLink/Observer traits, Outbound/Inbound messages (the engine's only way out)
