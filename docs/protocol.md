@@ -621,12 +621,10 @@ time. Never per run, never per value.
 | ---------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | `runId`    | `u32`                | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.7.                |
 | `prefixId` | `PrefixId`           | Prefix handle returned by `Precompile`.                                                                                    |
-| `code`     | `Optional<String>`   | ESM postfix source. A frame carries a postfix **or** a call — exactly one; both parser and encoder enforce this.           |
-| `filename` | `Optional<String>`   | Used in stack traces.                                                                                                      |
 | `limits`   | `ResourceLimits`     | Prefix defaults (`prepare({ limits })`) merged with the run's own, field by field; absent fields take runtime defaults.    |
 | `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs). |
 | `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                          |
-| `call`     | `Optional<CallSpec>` | Host → sandbox call resolved against the prefix module's exports.                                                          |
+| `call`     | `CallSpec`           | Host → sandbox call resolved against the prefix module's exports. Not optional: a prefix run always calls an export.       |
 
 `CallSpec`:
 
@@ -647,7 +645,8 @@ never both. The completion payload is unchanged: it carries exactly one value
 blob either way, and the host knows which it asked for. `maxExportBytes`
 applies to the value blob; a sync return value completes inside the run's
 start turn, while an async one suspends on the same turn machinery as the
-module promise (bridge calls included).
+module promise (bridge calls included). A `PrefixRun` always carries a
+call, so its value is always the call's return value.
 
 | Field        | Encoding    | Notes                                                                                                                                               |
 | ------------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |

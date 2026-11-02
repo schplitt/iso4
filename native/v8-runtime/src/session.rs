@@ -34,7 +34,7 @@ use crate::wire;
 /// **off by default**. They are two unbuffered `eprintln!`s on the hot path,
 /// and the runtime's stderr is inherited by the host process, so they cost
 /// ~13 µs per run when stderr is discarded and ~23 µs when it is a real file or
-/// pipe — 2-4 % of a hot `prefix.execute()` (measured 2026-08-10, release
+/// pipe — 2-4 % of a hot `prefix.call()` (measured 2026-08-10, release
 /// build, 10-core Apple Silicon).
 ///
 /// Set `ISO4_V8_TRACE=1` to get them back. Everything else the runtime logs —
@@ -137,7 +137,7 @@ fn validate_import_rebinds(
             ipc::ImportModule::Source(_) => {
                 return Err(sandbox::RunError::FrozenBinding(format!(
                     "import '{}' is a source module — source imports are frozen \
-                     with the prefix and cannot be rebound at prefix.run() time",
+                     with the prefix and cannot be rebound at prefix.call() time",
                     rb.specifier
                 )))
             }
@@ -1287,17 +1287,12 @@ fn dispatch_prefix_run(
     }
 
     trace!(
-        "[iso4-v8] PrefixRun {} (prefix_id={}, {} code bytes, {} globals, {} imports, call={})",
+        "[iso4-v8] PrefixRun {} (prefix_id={}, {} globals, {} imports, call={})",
         run_id,
         payload.prefix_id,
-        payload.code.as_deref().map(str::len).unwrap_or(0),
         payload.globals.len(),
         prefix_data.declared_imports.len(),
-        payload
-            .call
-            .as_ref()
-            .map(|c| c.export_path.as_str())
-            .unwrap_or("-"),
+        payload.call.export_path,
     );
 
     // Refuse a duplicate before anything is acquired — nothing to release.
@@ -1483,8 +1478,6 @@ fn dispatch_prefix_run(
 
     let job = Box::new(sandbox::CallJob {
         token,
-        code: payload.code,
-        filename: payload.filename,
         limits: sandbox::Limits {
             wall_time_ms: payload.limits.wall_time_ms,
             cpu_time_ms: payload.limits.cpu_time_ms,

@@ -66,7 +66,10 @@ describe('the predicates agree with the runtime', () => {
   })
 
   it.each(CANDIDATES)('prepare() takes host-module export %s iff isValidExportName, and the runtime builds the module', async (name) => {
-    const prepared = sandbox.prepare({ code: '', imports: { 'host:t': { [name]: () => 1 } } })
+    const prepared = sandbox.prepare({
+      code: `import * as t from 'host:t'\nexport default () => typeof t[${JSON.stringify(name)}]`,
+      imports: { 'host:t': { [name]: () => 1 } },
+    })
     if (!isValidExportName(name)) {
       await expect(prepared).rejects.toThrow(/is not a valid JavaScript identifier/)
       return
@@ -74,25 +77,28 @@ describe('the predicates agree with the runtime', () => {
     // prepare() checks the name host-side only; the first run is where the
     // runtime emits it into a real synthetic module.
     await using prefix = await prepared
-    const result = await prefix.execute({ code: `import * as t from 'host:t'\nexport default typeof t[${JSON.stringify(name)}]` })
-    expect(result.ok && result.exports['default']).toBe('function')
+    const result = await prefix.call({ export: 'default' })
+    expect(result.ok && result.value).toBe('function')
   })
 
   it('a default host-module key is the module\'s default export', async () => {
-    const prefix = await sandbox.prepare({ code: '', imports: { 'host:t': { default: () => 7 } } })
-    const result = await prefix.execute({ code: `import t from 'host:t'\nexport default await t()` })
-    expect(result.ok && result.exports['default']).toBe(7)
+    const prefix = await sandbox.prepare({ code: `import t from 'host:t'\nexport default () => t()`, imports: { 'host:t': { default: () => 7 } } })
+    const result = await prefix.call({ export: 'default' })
+    expect(result.ok && result.value).toBe(7)
   })
 
   it.each(CANDIDATES)('prepare() takes global %s iff isValidGlobalName, and the runtime installs it', async (name) => {
-    const prepared = sandbox.prepare({ code: '', globals: { [name]: { kind: 'data', value: 1 } } as never })
+    const prepared = sandbox.prepare({
+      code: `export default () => globalThis[${JSON.stringify(name)}]`,
+      globals: { [name]: { kind: 'data', value: 1 } } as never,
+    })
     if (!isValidGlobalName(name)) {
       await expect(prepared).rejects.toMatchObject({ code: globalCode(name) })
       return
     }
     await using prefix = await prepared
-    const result = await prefix.execute({ code: `export default globalThis[${JSON.stringify(name)}]` })
-    expect(result.ok && result.exports['default']).toBe(1)
+    const result = await prefix.call({ export: 'default' })
+    expect(result.ok && result.value).toBe(1)
   })
 
   it('prepare() refuses a global name that is not a well-formed string, like isValidGlobalName', async () => {

@@ -162,7 +162,7 @@ describe('processGlobals', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────
-// extractBridgeGlobals — rebinding for prefix.run()
+// extractBridgeGlobals — rebinding for prefix.call()
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('extractBridgeGlobals', () => {

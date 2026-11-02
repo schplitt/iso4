@@ -175,22 +175,24 @@ describe('frozen clock — the other clock surfaces', () => {
 })
 
 describe('frozen clock — warm prefix path', () => {
-  test('prefix.run() calls are frozen and advance per call', async () => {
-    const prefix = await runtime.precompile({
-      code: 'globalThis.bootTime = Date.now()',
-    })
-    const first = await prefix.run({
+  test('prefix.call() runs are frozen and advance per call', async () => {
+    const prefix = await runtime.prepare({
       code: `
-        const a = Date.now()
-        let x = 0
-        for (let i = 0; i < 5e6; i++) x += i
-        export default { delta: Date.now() - a, now: Date.now(), bootTime: globalThis.bootTime }
+        globalThis.bootTime = Date.now()
+        export function probe() {
+          const a = Date.now()
+          let x = 0
+          for (let i = 0; i < 5e6; i++) x += i
+          return { delta: Date.now() - a, now: Date.now(), bootTime: globalThis.bootTime }
+        }
+        export const now = () => Date.now()
       `,
     })
+    const first = await prefix.call({ export: 'probe' })
     expect(first.ok).toBe(true)
     if (!first.ok)
       return
-    const one = first.exports.default as { delta: number, now: number, bootTime: number }
+    const one = first.value as { delta: number, now: number, bootTime: number }
     expect(one.delta).toBe(0)
     // A call starts at run entry time, at or after the prefix's warm-up time.
     expect(one.now).toBeGreaterThanOrEqual(one.bootTime)
@@ -198,11 +200,11 @@ describe('frozen clock — warm prefix path', () => {
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 25)
     })
-    const second = await prefix.run({ code: 'export default Date.now()' })
+    const second = await prefix.call({ export: 'now' })
     expect(second.ok).toBe(true)
     if (!second.ok)
       return
-    expect((second.exports.default as number) - one.now).toBeGreaterThanOrEqual(20)
+    expect((second.value as number) - one.now).toBeGreaterThanOrEqual(20)
     await prefix.dispose()
   })
 })

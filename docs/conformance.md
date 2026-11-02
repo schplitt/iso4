@@ -208,13 +208,13 @@ recorded as future scope.
 
 ## Modules
 
-| Specifier                           |     | Notes                                                                                           |
-| ----------------------------------- | --- | ----------------------------------------------------------------------------------------------- |
-| `node:async_hooks`                  | 🟡  | `AsyncLocalStorage` only. **Run code only** — a prefix importing it gets `ERR_MODULE_NOT_FOUND` |
-| every other `node:*`                | ❌  | `ERR_MODULE_NOT_FOUND`. No stub modules                                                         |
-| bare specifiers (`fs`, `lodash`, …) | ❌  | `ERR_MODULE_NOT_FOUND`                                                                          |
-| host-declared imports               | ✅  | the host declares every specifier a run may import, as source or as a data-shaped module        |
-| dynamic `import()`                  | ⛔  | terminates the run with `ERR_IMPORT`; `try`/`catch` cannot intercept it                         |
+| Specifier                           |     | Notes                                                                                       |
+| ----------------------------------- | --- | ------------------------------------------------------------------------------------------- |
+| `node:async_hooks`                  | 🟡  | `AsyncLocalStorage` only (`run`, `getStore`). Available in prefix code and one-off run code |
+| every other `node:*`                | ❌  | `ERR_MODULE_NOT_FOUND`. No stub modules                                                     |
+| bare specifiers (`fs`, `lodash`, …) | ❌  | `ERR_MODULE_NOT_FOUND`                                                                      |
+| host-declared imports               | ✅  | the host declares every specifier a run may import, as source or as a data-shaped module    |
+| dynamic `import()`                  | ⛔  | terminates the run with `ERR_IMPORT`; `try`/`catch` cannot intercept it                     |
 
 There is no resolver, no `node_modules`, and no `require`. Unlike Workers,
 iso4 ships **no non-functional stubs**: an unavailable module fails at import

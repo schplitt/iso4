@@ -223,7 +223,7 @@ fn instance_main(
         first_job.epilogue.map(|e| e.run_id).unwrap_or(0),
     ));
     let mut core = match sandbox::create_instance_core(
-        Some(spec),
+        spec,
         &prefix.declared_imports,
         hard_memory_mb,
     ) {
@@ -1161,16 +1161,14 @@ mod tests {
     fn bump_job() -> CallJob {
         CallJob {
             token: 0,
-            code: None,
-            filename: None,
             limits: sandbox::Limits::default(),
             globals: Vec::new(),
             io: sandbox::RunIo::None,
             call_id_counter: Arc::new(AtomicU32::new(0)),
-            call: Some(crate::ipc::CallSpec {
+            call: crate::ipc::CallSpec {
                 export_path: "bump".to_string(),
                 args_blob: testval::to_blob(&TestValue::Array(Vec::new())),
-            }),
+            },
             epilogue: None,
             complete: None,
             ctl_slot: None,
@@ -1803,7 +1801,7 @@ mod tests {
         });
         let churn_job = || {
             let mut job = bump_job();
-            job.call.as_mut().expect("call spec").export_path = "churn".to_string();
+            job.call.export_path = "churn".to_string();
             job
         };
         let registry = WarmRegistry::new(0, 0);
@@ -1992,16 +1990,14 @@ mod tests {
         let (otx, orx) = crossbeam_channel::bounded(1);
         let job = Box::new(CallJob {
             token,
-            code: None,
-            filename: None,
             limits,
             globals: vec![crate::ipc::HostGlobalDef::bridge("tool")],
             io: sandbox::RunIo::Instance { sink },
             call_id_counter: Arc::clone(counter),
-            call: Some(crate::ipc::CallSpec {
+            call: crate::ipc::CallSpec {
                 export_path: export_path.to_string(),
                 args_blob: testval::to_blob(&TestValue::Array(args)),
-            }),
+            },
             epilogue: Some(sandbox::EpilogueSpec {
                 run_id,
                 report_heap: false,

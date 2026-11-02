@@ -54,7 +54,7 @@ signal for failures the host cannot see in a `Result` frame.
 
 Per-run trace lines (`Run`/`PrefixRun` received / succeeded / failed) are **off
 by default**: they are two unbuffered `eprintln!`s on the hot path, and cost
-2–4 % of a hot `prefix.execute()`. Turn them on with:
+2–4 % of a hot `prefix.call()`. Turn them on with:
 
 ```sh
 ISO4_V8_TRACE=1   # accepted values: 1, true

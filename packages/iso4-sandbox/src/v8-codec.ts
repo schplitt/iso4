@@ -109,7 +109,7 @@ export async function serializeHostValue(
  *
  * This is one of the two host → sandbox legs — how a real `Request` gets *into*
  * the sandbox before the call API exists. Bodies are async and payload encoding
- * is not, so the read happens here; both `prepare()` and `execute()` are already
+ * is not, so the read happens here; both `prepare()` and `call()` are already
  * async, so it costs no API change.
  *
  * Nested host types are handled, at any depth.

@@ -2,12 +2,11 @@
 /**
  * \@iso4/sandbox — public API types.
  *
- * Execution model: prepare a prefix once (validated and cached by the
- * runtime), then run many dynamic postfixes against it (typically
- * agent-generated) with `prefix.execute({ code })` or invoke one of its
- * exports with `prefix.call({ export, args })`. Prefix runs are served by
- * resident warm instances, which skip isolate boot and prefix evaluation on
- * reuse; a one-off `sandbox.run({ code })` always gets a fresh isolate.
+ * Execution model: prepare a prefix once (stored by the runtime), then
+ * invoke its exports many times with `prefix.call({ export, args })`.
+ * Prefix runs are served by resident warm instances, which skip isolate
+ * boot and prefix evaluation on reuse; a one-off `sandbox.run({ code })`
+ * always gets a fresh isolate.
  * Multiple concurrent callers each get their own pool slot and run in
  * parallel. See DESIGN.md §1 and §13.
  */
@@ -238,7 +237,7 @@ export type HostGlobals = Record<string, HostGlobalValue>
  * - `DataGlobal` — a plain constant carried as data and installed natively;
  *   no code text, no host involvement.
  * - `BridgeWithShim` — bridge call + in-sandbox result wrapper. The handler
- *   can be rebound per `prefix.run()`; the shim is part of the prefix state.
+ *   can be rebound per `prefix.call()`; the shim is part of the prefix state.
  *
  * Every **object** form accepts `enumerable?: boolean` (default `true`).
  * The bare-function and bare-string shorthands are always enumerable.
@@ -280,7 +279,7 @@ export interface BridgeGlobal<
   kind: 'bridge'
   /**
    * Bridge handler — every sandbox invocation dispatches to it. Can be
-   * rebound per `prefix.run()` like a shorthand bridge global.
+   * rebound per `prefix.call()` like a shorthand bridge global.
    */
   handler: H
 }
@@ -312,7 +311,7 @@ export interface StringGlobal extends GlobalOptions {
  * `value` accepts the same set as host-module data leaves (`HostExportData`):
  * primitives, `bigint`, `string`, `Uint8Array`, and plain objects/arrays.
  * Like string globals, a data global is a constant — it cannot be rebound per
- * `prefix.run()`.
+ * `prefix.call()`.
  */
 export interface DataGlobal extends GlobalOptions {
   kind: 'data'
@@ -340,7 +339,7 @@ export interface DataGlobal extends GlobalOptions {
  * The shim is a JS function expression `(result) => transformedResult` (sync
  * or async). Sandbox built-ins (TextDecoder, JSON, …) are available in scope.
  * The private stub `__iso4_<name>_h` stays on globalThis so the handler can
- * be rebound per `prefix.run()` while the shim itself stays fixed.
+ * be rebound per `prefix.call()` while the shim itself stays fixed.
  */
 /**
  * `H` is the specific handler function type. Carried through the type system
@@ -643,9 +642,9 @@ export interface SandboxOptions {
    * and `run({ limits: { memoryMb } })` per one-off run (fresh isolate).
    * What stays impossible is a per-run value on a warm instance — the cap
    * is baked into the isolate at creation and instances are shared across
-   * runs of their prefix, which is why prefix `execute()`/`call()` limits
-   * reject it. Memory accumulates across calls on a warm instance —
-   * hitting the cap taints the instance and the next call cold-starts.
+   * runs of their prefix, which is why `prefix.call()` limits reject it.
+   * Memory accumulates across calls on a warm instance — hitting the cap
+   * taints the instance and the next call cold-starts.
    *
    * A plain number is the MANAGED form for a prefix's reused instances: it
    * is the retirement line, and the terminating cap sits a headroom band
@@ -829,7 +828,7 @@ export interface SandboxStats {
 export interface Sandbox {
   /**
    * Execute a piece of JavaScript in a fresh V8 isolate.
-   * For repeated use with a shared context, prefer prepare() + prefix.execute().
+   * For repeated use with a shared context, prefer prepare() + prefix.call().
    *
    * With `call`, the freshly evaluated module's export at `call.export` is
    * invoked and the result carries its return `value` instead of `exports`:
@@ -872,7 +871,7 @@ export interface Sandbox {
    * anything: a reserved or malformed global name, an invalid import shape,
    * a bad limit or `memoryMb`. A prefix that does not compile, throws at top
    * level, imports something unknown, calls the bridge, never settles, or
-   * exceeds the warm-up budget fails on its first `execute()`/`call()` as an
+   * exceeds the warm-up budget fails on its first `call()` as an
    * `{ ok: false }` result with the matching {@link RunErrorCode}
    * (`ERR_USER_CODE`, `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
    * `ERR_PREFIX_BRIDGE_CALL`, `ERR_PREFIX_DID_NOT_SETTLE`,
@@ -882,27 +881,28 @@ export interface Sandbox {
    * wasted:
    *
    * ```ts
-   * const prefix = await sandbox.prepare({ code })
-   * const check = await prefix.execute({ code: 'export default 0' })
-   * if (!check.ok) throw new Error(`broken prefix: ${check.error.message}`)
+   * const prefix = await sandbox.prepare({ code: 'export const ready = () => true' })
+   * const check = await prefix.call({ export: 'ready' }) // a side-effect-free export
+   * if (!check.ok && check.error.stage === 'prefix') throw new Error(`broken prefix: ${check.error.message}`)
    * ```
    *
    * The type parameter `G` is inferred from the `globals` you pass and flows
    * into the returned `Prefix<G>`. This lets TypeScript enforce at the call
-   * site that `prefix.run()` can only rebind names declared here:
+   * site that `prefix.call()` can only rebind names declared here:
    *
    * ```ts
-   * const prefix = await sandbox.precompile({
+   * const prefix = await sandbox.prepare({
+   *   code,
    *   globals: { fetch: myHandler, myTool: otherHandler },
    * })
    * // prefix: Prefix<{ fetch: ..., myTool: ... }>
    *
-   * prefix.run({ globals: { fetch: newHandler } })          // ✅
-   * prefix.run({ globals: { undeclared: someHandler } })    // ❌ TS error
+   * prefix.call({ export: 'default', globals: { fetch: newHandler } })          // ✅
+   * prefix.call({ export: 'default', globals: { undeclared: someHandler } })    // ❌ TS error
    * ```
    *
    * Globals declared here serve as **default** implementations for all runs.
-   * `prefix.run()` may override any subset; omitted names reuse the default.
+   * `prefix.call()` may override any subset; omitted names reuse the default.
    */
 
   /**
@@ -958,7 +958,7 @@ export type CreateSandbox = (options?: SandboxOptions) => Promise<Sandbox>
  *
  * `G` is the shape of globals this prefix declares. TypeScript infers it
  * from the `globals` field, so the returned `Prefix<G>` is typed to allow
- * only those names to be rebound in subsequent `prefix.run()` calls.
+ * only those names to be rebound in subsequent `prefix.call()` calls.
  */
 export interface PrecompileOptions<
   G extends HostGlobals,
@@ -996,26 +996,26 @@ export interface PrecompileOptions<
    * This defines the **bridge surface shape** — the full set of names the
    * sandbox may invoke as globals. Names declared here:
    *
-   * - Become bridge stubs in the V8 context on every `prefix.run()` call.
-   * - Can be rebound per-run via `prefix.run({ globals })`.
+   * - Become bridge stubs in the V8 context on every `prefix.call()`.
+   * - Can be rebound per call via `prefix.call({ globals })`.
    * - Cannot be supplemented at run time — a name not declared here will
-   *   cause `ERR_UNDECLARED_BINDING` if passed to `prefix.run()`.
+   *   cause `ERR_UNDECLARED_BINDING` if passed to `prefix.call()`.
    *
    * The handlers provided here are the **default** implementations reused by
-   * any `prefix.run()` call that does not override them.
+   * any `prefix.call()` that does not override them.
    */
   globals?: G
 
   /**
    * Declares the imports the sandbox code may resolve.
    *
-   * The inferred shape feeds `Prefix<G, M>` so `prefix.run()` knows which
+   * The inferred shape feeds `Prefix<G, M>` so `prefix.call()` knows which
    * specifiers exist and which exports may be rebound.
    */
   imports?: M
 
   /**
-   * Default limits for every `execute()`/`call()` on this prefix. A run's
+   * Default limits for every `call()` on this prefix. A call's
    * own `limits` overrides them field by field, so a run can change one
    * knob without restating the rest; a field set in neither place takes the
    * runtime default. Checked here like per-run limits (a `TypeError` for a
@@ -1035,10 +1035,10 @@ export interface PrecompileOptions<
 /**
  * Handle to a precompiled prefix.
  *
- * `G` is the shape of globals declared at precompile time. `prefix.run()`
+ * `G` is the shape of globals declared at prepare time. `prefix.call()`
  * accepts only `Partial<G>` for its `globals` field — you may override any
- * declared global's implementation per run, but you cannot add names that
- * were not declared at precompile time.
+ * declared global's implementation per call, but you cannot add names that
+ * were not declared at prepare time.
  *
  * **Warm instances.** Runs on a prefix are served by resident
  * isolates: the first run cold-starts one (prefix evaluated once, under the
@@ -1061,27 +1061,6 @@ export interface Prefix<
   readonly id: string
 
   /**
-   * Execute dynamic code against this prefix's declared state.
-   *
-   * Globals declared at precompile time are active. You may rebind any subset
-   * of them via `options.globals`; the precompile-time handler is used for
-   * any name not overridden here. Same rule for `imports`, restricted to
-   * host-import function exports declared in `I`.
-   *
-   * @example
-   *   const result = await prefix.execute({
-   *     code: `export default await (${agentFn})()`,
-   *   })
-   */
-  execute: (options: PrefixRunOptions<G, M>) => Promise<RunResult>
-
-  /**
-   * @deprecated Renamed to {@link Prefix.execute}. `run` stays as an alias
-   * (identical behavior) and is slated for removal in a future major.
-   */
-  run: (options: PrefixRunOptions<G, M>) => Promise<RunResult>
-
-  /**
    * Call a function exported by this prefix's module — nothing is compiled
    * per request. On a warm instance the prefix is not even re-evaluated:
    * `export` resolves against the retained module and the result carries
@@ -1092,13 +1071,15 @@ export interface Prefix<
    * const result = await prefix.call({ export: 'default.fetch', args: [request] })
    * ```
    *
-   * `globals` / `imports` rebind per call exactly as they do for
-   * {@link Prefix.execute}.
+   * Globals declared at prepare time are active. You may rebind any subset
+   * of them per call via `options.globals`; the prepare-time handler is used
+   * for any name not overridden here. Same rule for `imports`, restricted to
+   * host-import function exports declared in `M`.
    */
   call: (options: PrefixCallOptions<G, M>) => Promise<CallResult>
 
   /**
-   * Release the prepared prefix. Subsequent run() calls reject with
+   * Release the prepared prefix. Subsequent call() calls reject with
    * `ERR_PREFIX_DISPOSED`. Idempotent, and works on a broken prefix too.
    */
   dispose: () => Promise<void>
@@ -1143,91 +1124,36 @@ export interface Prefix<
 export type PrefixStatus = 'ready' | 'broken' | 'disposed'
 
 /**
- * Options for `prefix.run()`.
+ * Options for `prefix.call()` — a {@link CallTarget} plus the per-call
+ * rebinding surface.
  *
- * `G` is the declared-globals shape from the matching `precompile()` call.
+ * `G` is the declared-globals shape from the matching `prepare()` call.
  * The `globals` field is typed as `Partial<G>` — only names present in `G`
  * may be overridden. Passing any other name is a TypeScript error at compile
  * time and rejects with `ERR_UNDECLARED_BINDING` at runtime. Every rebind
  * refusal rejects; nothing runs.
- */
-export interface PrefixRunOptions<
-  G extends HostGlobals,
-  M extends Imports,
-> {
-  /**
-   * Dynamic ESM source code to compile and run against the prefix state.
-   */
-  code: string
-
-  /**
-   * Override implementations for a **subset** of globals declared at
-   * precompile time. Only names present in `G` are accepted (TypeScript
-   * error + a runtime rejection with `ERR_UNDECLARED_BINDING` for anything
-   * else), but the
-   * function signature does not need to match the precompile-time handler
-   * exactly — any `HostExportFunction`-compatible value is accepted.
-   */
-  globals?: RebindGlobals<G>
-
-  /**
-   * Rebind host-module function exports declared at precompile time.
-   * Source module imports are frozen at prepare() time and cannot be rebound;
-   * data exports are baked into the synthetic module. TypeScript enforces
-   * this at the type level via `RebindImports<M>`; anything that slips
-   * through rejects the run at runtime — `ERR_UNDECLARED_BINDING` for locations
-   * never declared, `ERR_FROZEN_BINDING` for source modules and data leaves,
-   * `ERR_INVALID_REBIND` for a non-function override value.
-   */
-  imports?: RebindImports<M>
-
-  /**
-   * Limits for this run, applied field by field on top of the prefix's
-   * `prepare({ limits })` defaults. `memoryMb` is not a per-run option here.
-   */
-  limits?: ResourceLimits
-  /**
-   * Abort the run. Firing this is always SOFT: while queued the caller is
-   * dequeued; a running run is abandoned at its next execution boundary —
-   * nothing is interrupted mid-execution, the warm instance survives, and
-   * co-resident runs are untouched. The result resolves with
-   * `status: 'aborted'` carrying the runtime's real partial telemetry.
-   *
-   * A soft abort cannot reach code that never yields: a synchronous loop
-   * with no `cpuTimeMs` cap keeps its thread until a hard abort
-   * ({@link hardAbortSignal}) or dispose. Bound such code with `cpuTimeMs`.
-   */
-  signal?: AbortSignal
-  /**
-   * HARD abort — the opt-in escalation. Firing this interrupts the run
-   * wherever it is: executing JS is terminated immediately, and when that
-   * lands mid-execution the shared instance is discarded and co-resident
-   * runs fail with `ERR_INSTANCE_RESET` (cause `abort`). On a run that is
-   * queued or suspended it degrades to the same clean abandon as `signal`,
-   * so firing it is never worse than a soft abort. Typical use: fire
-   * `signal` first, then this after your own patience runs out.
-   */
-  hardAbortSignal?: AbortSignal
-  filename?: string
-}
-
-/**
- * Options for `prefix.call()` — a {@link CallTarget} plus the same per-call
- * rebinding surface as {@link PrefixRunOptions}, minus `code`: a call frame
- * carries a postfix *or* a call, never both.
  */
 export interface PrefixCallOptions<
   G extends HostGlobals,
   M extends Imports,
 > extends CallTarget {
   /**
-   * Override implementations for a subset of globals declared at
-   * prepare() time — same rules as {@link PrefixRunOptions.globals}.
+   * Override implementations for a **subset** of globals declared at
+   * prepare() time. Only names present in `G` are accepted (TypeScript
+   * error + a runtime rejection with `ERR_UNDECLARED_BINDING` for anything
+   * else), but the function signature does not need to match the
+   * prepare-time handler exactly — any `HostExportFunction`-compatible value
+   * is accepted.
    */
   globals?: RebindGlobals<G>
   /**
-   * Rebind host-module function exports declared at prepare() time — same
-   * rules as {@link PrefixRunOptions.imports}.
+   * Rebind host-module function exports declared at prepare() time.
+   * Source module imports are frozen at prepare() time and cannot be rebound;
+   * data exports are baked into the synthetic module. TypeScript enforces
+   * this at the type level via `RebindImports<M>`; anything that slips
+   * through rejects the call at runtime — `ERR_UNDECLARED_BINDING` for
+   * locations never declared, `ERR_FROZEN_BINDING` for source modules and
+   * data leaves, `ERR_INVALID_REBIND` for a non-function override value.
    */
   imports?: RebindImports<M>
   /**
@@ -1582,9 +1508,10 @@ export interface RunSuccess {
   skippedExports: string[]
   /**
    * Lines this run wrote to `console.log` / `.debug` / `.info`, capped by
-   * `limits.maxStdoutBytes`. Prefix code shares the same console: when a run
-   * cold-starts a warm instance, what the prefix logged while evaluating
-   * arrives here once, on that run's result, ahead of the run's own lines.
+   * `limits.maxStdoutBytes`. On a {@link CallResult}, prefix code shares the
+   * same console: when a call cold-starts a warm instance, what the prefix
+   * logged while evaluating arrives once, on that call's result, ahead of
+   * the call's own lines.
    *
    * Only `log`/`debug`/`info`/`warn`/`error` are captured. The rest of the
    * sandbox's `console` is callable but emits nothing — see
@@ -1636,7 +1563,7 @@ export interface RunSuccess {
   bridgeCalls: BridgeCallEntry[]
   /**
    * `used_heap_size` of the isolate that served this run, measured after the
-   * run settled. Reported for prefix runs — warm instances keep their
+   * run settled. Present on a {@link CallResult} — warm instances keep their
    * heap between calls, and this number feeds eviction. `undefined` for
    * one-off `sandbox.run()` runs, whose isolate is disposed with the run.
    */
@@ -1774,7 +1701,7 @@ export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'uns
 
 /**
  * Why a run's options were refused before anything ran. `sandbox.run()`,
- * `prefix.run()`, `prefix.call()` and `prepare()` reject with an `Error`
+ * `prefix.call()` and `prepare()` reject with an `Error`
  * whose `code` is one of these; a run never returns them as a result. The
  * client checks first and throws without a runtime round trip; the runtime
  * repeats every check (except `ERR_INVALID_REBIND`) and the client throws its
@@ -1795,7 +1722,7 @@ export type SetupErrorCode
      */
     | 'ERR_PREFIX_BROKEN'
     /**
-     * A `prefix.run()` / `prefix.call()` binding (global or import rebind)
+     * A `prefix.call()` binding (global or import rebind)
      * names something that was never declared at `prepare()` time, a
      * runtime-owned name included. Declared-but-locked locations are
      * `ERR_FROZEN_BINDING`.

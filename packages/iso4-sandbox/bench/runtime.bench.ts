@@ -4,10 +4,10 @@
  * Four measurements across two describe blocks:
  *
  * cold / direct  — full cycle: spawn binary → connect pool → run → dispose.
- * cold / prefix  — full cycle: spawn → connect → precompile → prefix.run → dispose.
+ * cold / prefix  — full cycle: spawn → connect → prepare → prefix.call → dispose.
  *
  * hot  / direct  — binary already running, pool connected. runtime.run() only.
- * hot  / prefix  — binary running, prefix compiled. prefix.run() only.
+ * hot  / prefix  — binary running, prefix warm. prefix.call() only.
  *
  * Run with:
  * pnpm bench
@@ -15,15 +15,16 @@
 
 import { afterAll, bench, describe } from 'vitest'
 import { createSandbox as createRuntime } from '../src/index.js'
-import type { Prefix as DynamicPrefix, RunResult, Sandbox as Runtime } from '../src/index.js'
+import type { CallResult, Prefix as DynamicPrefix, RunResult, Sandbox as Runtime } from '../src/index.js'
 import { HEAVY_OPTS } from './profile.js'
 
 const SAMPLE_CODE = 'export default 42'
+const SAMPLE_PREFIX = 'export default () => 42'
 
 // Run failures resolve with `ok: false` instead of throwing, and a failure
 // return is far cheaper than a real run — left unchecked, runs failing
 // mid-loop would be recorded as a speedup.
-function assertOk(result: RunResult, what: string): void {
+function assertOk(result: RunResult | CallResult, what: string): void {
   if (!result.ok) {
     throw new Error(
       `[bench sanity] ${what} did not complete ok: ${JSON.stringify(result.error)}`,
@@ -40,7 +41,7 @@ function assertOk(result: RunResult, what: string): void {
 
 const hotDirectRt: Runtime = await createRuntime({ maxConcurrentRuns: 1 })
 const hotPrefixRt: Runtime = await createRuntime({ maxConcurrentRuns: 1 })
-const hotPrefix: DynamicPrefix = await hotPrefixRt.precompile({ code: '' })
+const hotPrefix: DynamicPrefix = await hotPrefixRt.prepare({ code: SAMPLE_PREFIX })
 
 afterAll(async () => {
   await hotDirectRt.dispose()
@@ -65,11 +66,11 @@ describe('cold start', () => {
   )
 
   bench(
-    'prefix  (createRuntime → precompile → prefix.run → dispose)',
+    'prefix  (createRuntime → prepare → prefix.call → dispose)',
     async () => {
       const rt = await createRuntime({ maxConcurrentRuns: 1 })
-      const prefix = await rt.precompile({ code: '' })
-      assertOk(await prefix.run({ code: SAMPLE_CODE }), 'bench cold prefix run')
+      const prefix = await rt.prepare({ code: SAMPLE_PREFIX })
+      assertOk(await prefix.call({ export: 'default' }), 'bench cold prefix run')
       await rt.dispose()
     },
     HEAVY_OPTS,
@@ -83,7 +84,7 @@ describe('hot run', () => {
     assertOk(await hotDirectRt.run({ code: SAMPLE_CODE }), 'bench hot direct run')
   }, HEAVY_OPTS)
 
-  bench('prefix  (prefix.run — from snapshot)', async () => {
-    assertOk(await hotPrefix.run({ code: SAMPLE_CODE }), 'bench hot prefix run')
+  bench('prefix  (prefix.call — warm instance)', async () => {
+    assertOk(await hotPrefix.call({ export: 'default' }), 'bench hot prefix run')
   }, HEAVY_OPTS)
 })
