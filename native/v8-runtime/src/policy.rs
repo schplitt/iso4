@@ -170,16 +170,7 @@ pub fn watermark_action(facts: &PressureFacts) -> PressureVerdict {
     }
 }
 
-/// Headroom above the advertised cap before the terminating line: the
-/// geometric mean of the cap and 8 MB (8 → +8, 128 → +32, 512 → +64).
-/// Monotonic, so a bigger cap never yields a smaller ceiling.
-pub fn heap_band_mb(cap_mb: u32) -> u32 {
-    if cap_mb == 0 {
-        return 0;
-    }
-    let band = ((8.0 * f64::from(cap_mb)).sqrt()).round();
-    band as u32
-}
+pub use crate::types::heap_band_mb;
 
 /// Consecutive over-the-soft-line finishes before an instance is retired.
 /// One crossing is a spike; two in a row is growth.

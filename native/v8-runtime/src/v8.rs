@@ -18,8 +18,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::blob;
+use crate::errors;
 use crate::ipc;
-use crate::ipc::{HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
+use crate::types;
+use crate::types::{HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
 use crate::wire::{self, BridgeErrorPayload};
 
 static INIT: Once = Once::new();
@@ -621,7 +623,7 @@ fn round_micro(ms: f64) -> f64 {
 /// Send for the Arc, mirroring `PendingResolvers`.
 #[derive(Default)]
 struct BridgeCallLog {
-    records: Vec<wire::BridgeCallRecord>,
+    records: Vec<types::BridgeCallRecord>,
     /// callId → index into `records`, for calls awaiting their response.
     in_flight: HashMap<u32, usize>,
 }
@@ -630,14 +632,14 @@ impl BridgeCallLog {
     /// An attempt blocked runtime-side (limit, oversized payload, function
     /// argument, transport failure) — never reached the host.
     fn record_blocked(&mut self, name: &str, start_ms: f64, arg_bytes: u32) {
-        self.records.push(wire::BridgeCallRecord {
+        self.records.push(types::BridgeCallRecord {
             name: name.to_string(),
             start_ms,
             duration_ms: 0.0,
             arg_bytes,
             response_bytes: 0,
             call_id: u32::MAX,
-            outcome: wire::BridgeCallOutcome::Blocked,
+            outcome: types::BridgeCallOutcome::Blocked,
         });
     }
 
@@ -646,14 +648,14 @@ impl BridgeCallLog {
     /// `name` is already the public name — the runtime owns both the import
     /// handle table and the shim naming convention.
     fn record_sent(&mut self, call_id: u32, name: &str, start_ms: f64, arg_bytes: u32) {
-        self.records.push(wire::BridgeCallRecord {
+        self.records.push(types::BridgeCallRecord {
             name: name.to_string(),
             start_ms,
             duration_ms: 0.0,
             arg_bytes,
             response_bytes: 0,
             call_id,
-            outcome: wire::BridgeCallOutcome::Unanswered,
+            outcome: types::BridgeCallOutcome::Unanswered,
         });
         self.in_flight.insert(call_id, self.records.len() - 1);
     }
@@ -665,9 +667,9 @@ impl BridgeCallLog {
             let r = &mut self.records[idx];
             r.duration_ms = round_micro((now_ms - r.start_ms).max(0.0));
             r.outcome = if ok {
-                wire::BridgeCallOutcome::Ok
+                types::BridgeCallOutcome::Ok
             } else {
-                wire::BridgeCallOutcome::Error
+                types::BridgeCallOutcome::Error
             };
             r.response_bytes = response_bytes;
         }
@@ -677,7 +679,7 @@ impl BridgeCallLog {
     /// the records so far, in-flight entries stamped with their
     /// duration-until-now, in-flight tracking untouched so grace-time
     /// settlement keeps working.
-    fn snapshot(&self, now_ms: f64) -> Vec<wire::BridgeCallRecord> {
+    fn snapshot(&self, now_ms: f64) -> Vec<types::BridgeCallRecord> {
         let mut records = self.records.clone();
         for idx in self.in_flight.values() {
             let r = &mut records[*idx];
@@ -688,7 +690,7 @@ impl BridgeCallLog {
 
     /// Snapshot the records for the run result. Calls still in flight get
     /// their duration set to "until run end" and stay `Unanswered`.
-    fn finalize(&mut self, now_ms: f64) -> Vec<wire::BridgeCallRecord> {
+    fn finalize(&mut self, now_ms: f64) -> Vec<types::BridgeCallRecord> {
         for idx in self.in_flight.values() {
             let r = &mut self.records[*idx];
             r.duration_ms = round_micro((now_ms - r.start_ms).max(0.0));
@@ -747,7 +749,7 @@ pub struct Output {
     /// One record per bridge call the sandbox attempted, in attempt order —
     /// including attempts blocked Rust-side (limit exceeded, oversized
     /// payload, function arguments) that never reached the host.
-    pub bridge_calls: Vec<wire::BridgeCallRecord>,
+    pub bridge_calls: Vec<types::BridgeCallRecord>,
 }
 
 // ── waitUntil ─────────────────────────────────────────────────
@@ -780,7 +782,7 @@ pub struct GraceReport {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     /// Bridge calls attempted during grace.
-    pub bridge_calls: Vec<wire::BridgeCallRecord>,
+    pub bridge_calls: Vec<types::BridgeCallRecord>,
     /// `name`/`message` of the first rejection when `status == Failed`, or of
     /// the fatal error that ended a truncated phase, when one exists.
     pub error: Option<(String, String)>,
@@ -990,7 +992,7 @@ pub fn register_out_stream(
             id,
             OutStream {
                 body: v8::Global::new(scope, body),
-                credit: ipc::STREAM_CREDIT_WINDOW_BYTES,
+                credit: types::STREAM_CREDIT_WINDOW_BYTES,
                 pending: None,
                 backlog: Vec::new(),
                 backlog_sent: 0,
@@ -1428,7 +1430,7 @@ pub struct FailureOutput {
     pub cpu_time_ms: f64,
 
     /// Bridge call records — see `Output::bridge_calls`.
-    pub bridge_calls: Vec<wire::BridgeCallRecord>,
+    pub bridge_calls: Vec<types::BridgeCallRecord>,
 }
 
 /// Payload carried by `RunError::RuntimeError`. Kept in a separate struct so
@@ -1456,24 +1458,7 @@ fn codec_error_to_run_error(error: crate::webcodec::CodecError) -> RunError {
     }
 }
 
-/// Why a shared instance was reset under an innocent victim — the cause
-/// class carried on `ERR_INSTANCE_RESET`. Wire byte values are assigned in
-/// `wire::reset_cause_byte` (NOT this declaration order) and mirrored by the
-/// TS decoder's cause table; change all three together or victims get
-/// mislabelled causes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResetCause {
-    Cpu,
-    Memory,
-    /// The culprit's wall deadline fired mid-turn (possible when its CPU is
-    /// uncapped — the guard enforces min(cpu, wall) inside a turn).
-    Wall,
-    Abort,
-    Internal,
-    /// The culprit used something the runtime does not support (today:
-    /// dynamic `import()`), so the runtime ended it.
-    Unsupported,
-}
+pub use crate::types::ResetCause;
 
 /// All the ways an execution can fail.
 #[derive(Debug, Clone)]
@@ -1583,7 +1568,7 @@ pub fn execute(
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
-    call: Option<&ipc::CallSpec>,
+    call: Option<&types::CallSpec>,
 ) -> Result<Output, FailureOutput> {
     execute_with_io(
         code,
@@ -1616,7 +1601,7 @@ pub fn execute_with_io(
     io: RunIo,
     token: u64,
     call_id_counter: Arc<AtomicU32>,
-    call: Option<&ipc::CallSpec>,
+    call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
@@ -1659,7 +1644,7 @@ pub fn execute_with_prefix(
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
-    call: &ipc::CallSpec,
+    call: &types::CallSpec,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     // Cold start of a warm-capable instance: warm-up (isolate boot + prefix
@@ -1701,7 +1686,7 @@ fn run_module(
     io: RunIo,
     token: u64,
     call_id_counter: Arc<AtomicU32>,
-    call: Option<&ipc::CallSpec>,
+    call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
 ) -> Result<Output, FailureOutput> {
     // The run clock, CPU budget, and bridge-call log live here (not inside
@@ -1759,7 +1744,7 @@ fn run_module_inner(
     // run's orphaned handler from being accepted as a valid response by the
     // next run's bridge_global_callback.
     call_id_counter: Arc<AtomicU32>,
-    call: Option<&ipc::CallSpec>,
+    call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
     start: std::time::Instant,
     cpu_budget: Arc<CpuBudget>,
@@ -2080,7 +2065,7 @@ struct CallPhaseCtx<'a> {
     imports: &'a [ImportBinding],
     io: RunIo,
     call_id_counter: Arc<AtomicU32>,
-    call: Option<&'a ipc::CallSpec>,
+    call: Option<&'a types::CallSpec>,
     start: std::time::Instant,
     cpu_budget: &'a Arc<CpuBudget>,
     bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
@@ -2277,7 +2262,7 @@ fn dur_ms(d: Duration) -> f64 {
 
 /// Borrowed per-run facts the turn functions need beside the mutable state.
 struct RunFacts<'a> {
-    call: Option<&'a ipc::CallSpec>,
+    call: Option<&'a types::CallSpec>,
     reason: &'a Arc<ReasonCell>,
     guard: &'a InstanceGuard,
     cancel_handle: &'a v8::IsolateHandle,
@@ -3945,7 +3930,7 @@ fn build_output_and_maybe_grace(
             });
             let payload = wire::encode_run_completion_payload(
                 spec.run_id,
-                wire::RunCompletion::Success(wire::RunSuccessPayload {
+                types::RunCompletion::Success(types::RunSuccessPayload {
                     exports: output.exports.clone(),
                     skipped_exports: output.skipped_exports.clone(),
                     stdout: output.stdout.clone(),
@@ -4308,7 +4293,7 @@ fn drive_out_stream(
             let remaining = stream.backlog.len() - stream.backlog_sent;
             let n = remaining
                 .min(stream.credit as usize)
-                .min(ipc::STREAM_CHUNK_MAX_BYTES as usize);
+                .min(types::STREAM_CHUNK_MAX_BYTES as usize);
             let Some(sink) = &sink else {
                 stream.done = true;
                 return Step::Idle;
@@ -4909,12 +4894,12 @@ pub struct CallJob {
     pub token: u64,
     pub limits: Limits,
     /// Bridge-stub defs for this call (re-installed per call).
-    pub globals: Vec<ipc::HostGlobalDef>,
+    pub globals: Vec<types::HostGlobalDef>,
     /// The run's frame source and outbound sink.
     pub io: RunIo,
     /// The connection's monotonically increasing bridge call-ID counter.
     pub call_id_counter: Arc<AtomicU32>,
-    pub call: ipc::CallSpec,
+    pub call: types::CallSpec,
     /// Per-run identity for the early Result frame.
     pub epilogue: Option<EpilogueSpec>,
     /// Session completion hook, run on the instance thread when the run
@@ -4970,7 +4955,7 @@ pub fn run_call_on_core(
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
-    call: &ipc::CallSpec,
+    call: &types::CallSpec,
 ) -> CallOutcome {
     let start = std::time::Instant::now();
     let cpu_budget = Arc::new(CpuBudget::new());
@@ -5448,8 +5433,8 @@ pub(crate) fn idle_settle_after() -> Option<Duration> {
 /// id (E1 rulings 3+4). The instance dies with the loop either way.
 pub fn serve_instance(
     core: &mut InstanceCore,
-    prefix_globals: &[ipc::HostGlobalDef],
-    imports: &[ipc::ImportBinding],
+    prefix_globals: &[types::HostGlobalDef],
+    imports: &[types::ImportBinding],
     first: JobMsg,
     events: &crossbeam_channel::Receiver<RoutedEvent>,
     load: &InstanceLoad,
@@ -5670,8 +5655,8 @@ pub fn serve_instance(
 /// queued on `deadlines`.
 fn dispatch_job(
     core: &mut InstanceCore,
-    prefix_globals: &[ipc::HostGlobalDef],
-    imports: &[ipc::ImportBinding],
+    prefix_globals: &[types::HostGlobalDef],
+    imports: &[types::ImportBinding],
     live: &mut Vec<LiveRun>,
     deadlines: &mut DeadlineHeap,
     (mut job, respond): JobMsg,
@@ -6026,8 +6011,8 @@ fn deliver_stream_frame(
             // Buffered: the host must stay inside the credit window; a small
             // slack of one max chunk absorbs frames in flight when a cancel
             // races the pump.
-            let cap = ipc::STREAM_CREDIT_WINDOW_BYTES as usize
-                + ipc::STREAM_CHUNK_MAX_BYTES as usize;
+            let cap = types::STREAM_CREDIT_WINDOW_BYTES as usize
+                + types::STREAM_CHUNK_MAX_BYTES as usize;
             if stream.buffered_bytes + chunk.data.len() > cap {
                 return Err(RunError::Internal(
                     "stream credit window violated by the host".to_string(),
@@ -7417,7 +7402,7 @@ fn bridge_global_callback(
     // leaf path (targetKind = 1) and the ID never leaves the process.
     let (target, first_arg, record_name) = match &data.import_handles {
         None => (
-            wire::BridgeTarget::Global(data.stub_name.as_str()),
+            types::BridgeTarget::Global(data.stub_name.as_str()),
             0,
             data.record_name.clone(),
         ),
@@ -7439,7 +7424,7 @@ fn bridge_global_callback(
             };
             let entry = &table[handle as usize];
             (
-                wire::BridgeTarget::Import {
+                types::BridgeTarget::Import {
                     specifier: entry.specifier.as_str(),
                     path: &entry.path,
                 },
@@ -9088,7 +9073,7 @@ fn check_export_serializable(name: &str, value: v8::Local<v8::Value>) -> Result<
 
 /// Error text budget: leaves room for our marker under the wire clamp, so
 /// only one marker, with the true length, reaches the host.
-const ERROR_TEXT_BYTES: usize = wire::MAX_ERROR_TEXT_BYTES - 128;
+const ERROR_TEXT_BYTES: usize = errors::MAX_ERROR_TEXT_BYTES - 128;
 
 /// Copy at most 64 Ki UTF-16 units, then at most `max_bytes` of UTF-8, of
 /// guest text out of V8. `write_v2` reads a cons string in place;
@@ -12366,7 +12351,7 @@ mod tests {
         // (unsettled → ok=false), not dropped.
         assert_eq!(failure.bridge_calls.len(), 1);
         assert_eq!(failure.bridge_calls[0].name, "myTool");
-        assert_eq!(failure.bridge_calls[0].outcome, wire::BridgeCallOutcome::Unanswered);
+        assert_eq!(failure.bridge_calls[0].outcome, types::BridgeCallOutcome::Unanswered);
         // Timings are stamped from the shared run state, not left as zeros.
         assert!(failure.duration_ms >= 0.0);
         assert!(failure.cpu_time_ms >= 0.0);
@@ -13283,7 +13268,7 @@ mod tests {
         assert_eq!(out.bridge_calls.len(), 3);
         for record in &out.bridge_calls {
             assert_eq!(record.name, "myTool");
-            assert_eq!(record.outcome, wire::BridgeCallOutcome::Ok, "served call must settle ok");
+            assert_eq!(record.outcome, types::BridgeCallOutcome::Ok, "served call must settle ok");
             assert!(record.arg_bytes > 0, "call payload has at least the header");
             assert!(record.response_bytes > 0, "number response has bytes");
             assert!(record.duration_ms >= 0.0);
@@ -13330,9 +13315,9 @@ mod tests {
         handle.join().unwrap();
         assert!(matches!(failure.error, RunError::BridgeCallLimitExceeded));
         assert_eq!(failure.bridge_calls.len(), 4);
-        assert!(failure.bridge_calls[..3].iter().all(|r| r.outcome == wire::BridgeCallOutcome::Ok));
+        assert!(failure.bridge_calls[..3].iter().all(|r| r.outcome == types::BridgeCallOutcome::Ok));
         let violating = &failure.bridge_calls[3];
-        assert_eq!(violating.outcome, wire::BridgeCallOutcome::Blocked);
+        assert_eq!(violating.outcome, types::BridgeCallOutcome::Blocked);
         assert_eq!(violating.response_bytes, 0);
     }
 
@@ -14097,7 +14082,7 @@ mod tests {
         // The bridge record carries the resolved public name.
         assert_eq!(out.bridge_calls.len(), 1);
         assert_eq!(out.bridge_calls[0].name, "tools:search.query");
-        assert_eq!(out.bridge_calls[0].outcome, wire::BridgeCallOutcome::Ok);
+        assert_eq!(out.bridge_calls[0].outcome, types::BridgeCallOutcome::Ok);
     }
 
     #[test]
@@ -14264,7 +14249,7 @@ mod tests {
         );
         // One blocked record for the refused attempt.
         assert_eq!(out.bridge_calls.len(), 1);
-        assert_eq!(out.bridge_calls[0].outcome, wire::BridgeCallOutcome::Blocked);
+        assert_eq!(out.bridge_calls[0].outcome, types::BridgeCallOutcome::Blocked);
         // The responder thread never got a frame; drop it by closing our end.
         drop(h);
     }
@@ -14446,8 +14431,8 @@ mod tests {
     // ── Host → sandbox calls ───────────────────────────────────────────
 
     /// Build a `CallSpec` with the args encoded as one blob holding an array.
-    fn call_spec(path: &str, args: &[WireValue]) -> ipc::CallSpec {
-        ipc::CallSpec {
+    fn call_spec(path: &str, args: &[WireValue]) -> types::CallSpec {
+        types::CallSpec {
             export_path: path.to_string(),
             args_blob: testval::to_blob(&WireValue::Array(args.to_vec())),
         }
@@ -14855,7 +14840,7 @@ mod tests {
     fn run_code_bounded(
         code: &'static str,
         limits: Limits,
-        call: Option<ipc::CallSpec>,
+        call: Option<types::CallSpec>,
     ) -> Result<Output, FailureOutput> {
         init_platform();
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -16397,8 +16382,8 @@ mod tests {
         .unwrap_err();
         let payload = wire::encode_run_completion_payload(
             1,
-            wire::RunCompletion::Failure(wire::RunFailurePayload {
-                error: wire::run_error_to_payload(&failure.error),
+            types::RunCompletion::Failure(types::RunFailurePayload {
+                error: failure.error.to_payload(),
                 stdout: Vec::new(),
                 stderr: Vec::new(),
                 duration_ms: 0.0,
@@ -16416,7 +16401,7 @@ mod tests {
             1
         );
         assert!(!text.contains("bytes total]"), "the wire clamp added no marker");
-        assert!(payload.len() < 2 * wire::MAX_ERROR_TEXT_BYTES);
+        assert!(payload.len() < 2 * errors::MAX_ERROR_TEXT_BYTES);
         assert_eq!(get_default(&run_ok("export default 1")).as_deref(), Some("1"));
     }
 
@@ -16428,7 +16413,7 @@ mod tests {
         };
         assert!(!data.message.contains('\u{FFFD}'));
         assert!(data.message.ends_with("… [truncated by iso4: 81921 UTF-16 units total]"));
-        assert!(data.message.len() <= wire::MAX_ERROR_TEXT_BYTES);
+        assert!(data.message.len() <= errors::MAX_ERROR_TEXT_BYTES);
     }
 
     #[test]

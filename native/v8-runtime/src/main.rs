@@ -3,7 +3,7 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, container, ipc, oom, policy, rss, session, v8 as sandbox, warm};
+use iso4_v8_runtime::{blob, container, oom, policy, rss, session, types, v8 as sandbox, warm};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
@@ -66,7 +66,7 @@ fn main() {
     } else {
         format!("{} MB", warm_budget_bytes / MB)
     };
-    let default_heap_mb = ipc::DEFAULT_MEMORY_MB;
+    let default_heap_mb = types::DEFAULT_MEMORY_MB;
     let warm_ceiling_mb = default_heap_mb + policy::heap_band_mb(default_heap_mb);
     match container::limit_info() {
         Some((limit, source)) => eprintln!(

@@ -1165,7 +1165,7 @@ mod tests {
             globals: Vec::new(),
             io: sandbox::RunIo::None,
             call_id_counter: Arc::new(AtomicU32::new(0)),
-            call: crate::ipc::CallSpec {
+            call: crate::types::CallSpec {
                 export_path: "bump".to_string(),
                 args_blob: testval::to_blob(&TestValue::Array(Vec::new())),
             },
@@ -1991,10 +1991,10 @@ mod tests {
         let job = Box::new(CallJob {
             token,
             limits,
-            globals: vec![crate::ipc::HostGlobalDef::bridge("tool")],
+            globals: vec![crate::types::HostGlobalDef::bridge("tool")],
             io: sandbox::RunIo::Instance { sink },
             call_id_counter: Arc::clone(counter),
-            call: crate::ipc::CallSpec {
+            call: crate::types::CallSpec {
                 export_path: export_path.to_string(),
                 args_blob: testval::to_blob(&TestValue::Array(args)),
             },
@@ -2246,14 +2246,14 @@ mod tests {
 
         // Exactly the initial window arrives eagerly, in max-size chunks.
         let mut received = 0usize;
-        while received < crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize {
+        while received < crate::types::STREAM_CREDIT_WINDOW_BYTES as usize {
             let frame = read_frame(&mut server);
             assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
             let chunk = crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap();
-            assert!(chunk.data.len() <= crate::ipc::STREAM_CHUNK_MAX_BYTES as usize);
+            assert!(chunk.data.len() <= crate::types::STREAM_CHUNK_MAX_BYTES as usize);
             received += chunk.data.len();
         }
-        assert_eq!(received, crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize);
+        assert_eq!(received, crate::types::STREAM_CREDIT_WINDOW_BYTES as usize);
 
         // Nothing more until credit is granted.
         server
@@ -2272,7 +2272,7 @@ mod tests {
 
         let frame = read_frame(&mut server);
         let chunk = crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap();
-        assert_eq!(chunk.data.len(), TOTAL - crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize);
+        assert_eq!(chunk.data.len(), TOTAL - crate::types::STREAM_CREDIT_WINDOW_BYTES as usize);
 
         let end = read_frame(&mut server);
         assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
@@ -2328,7 +2328,7 @@ mod tests {
         // its `finally` (a generator blocked mid-await queues the return
         // instead, exactly like Node).
         let mut received = 0usize;
-        while received < crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize {
+        while received < crate::types::STREAM_CREDIT_WINDOW_BYTES as usize {
             let frame = read_frame(&mut server);
             assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
             received += crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap().data.len();
@@ -2367,7 +2367,7 @@ mod tests {
         let result = read_frame(&mut server);
         assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
         let mut received = 0usize;
-        while received < crate::ipc::STREAM_CREDIT_WINDOW_BYTES as usize {
+        while received < crate::types::STREAM_CREDIT_WINDOW_BYTES as usize {
             let frame = read_frame(&mut server);
             received += crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap().data.len();
         }

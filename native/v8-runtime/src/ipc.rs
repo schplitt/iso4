@@ -27,7 +27,16 @@ use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+
 use std::sync::{Arc, Mutex};
+
+use crate::types::{
+    resolve_heap_lines, BandPolicy, CallSpec, HostGlobalDef, HostModuleNode, ImportBinding,
+    ImportModule, ImportRebind, ResourceLimits, TerminateMode, DEFAULT_CPU_TIME_MS,
+    DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS, DEFAULT_MAX_BRIDGE_CALL_BYTES,
+    DEFAULT_MAX_EXPORT_BYTES, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
+    DEFAULT_MEMORY_MB, DEFAULT_WALL_TIME_MS, MAX_HOST_MODULE_DEPTH, STREAM_CHUNK_MAX_BYTES,
+};
 
 /// Current wire protocol version.
 ///
@@ -996,239 +1005,6 @@ pub fn encode_hello_payload(status: HelloStatus, probe: &[u8], message: &str) ->
 
 // ── RunPayload types ─────────────────────────────────────────────────────────
 
-/// Default resource limits. The runtime owns its safety posture: the TS client
-/// sends only the limits the caller explicitly set (each wire field is
-/// `Optional<u32>`), and any absent field is filled from these constants. An
-/// explicit `0` on the wire is preserved as-is and disables that limit.
-///
-/// The public `ResourceLimits` jsdoc in `packages/iso4-sandbox/src/types.ts`
-/// documents these same numbers, pointing here as the source of truth.
-pub const DEFAULT_MEMORY_MB: u32 = 128;
-pub const DEFAULT_CPU_TIME_MS: u32 = 5_000;
-pub const DEFAULT_WALL_TIME_MS: u32 = 30_000;
-pub const DEFAULT_MAX_EXPORT_BYTES: u32 = 16 * 1024 * 1024;
-pub const DEFAULT_MAX_STDOUT_BYTES: u32 = 1024 * 1024;
-pub const DEFAULT_MAX_STDERR_BYTES: u32 = 1024 * 1024;
-pub const DEFAULT_MAX_BRIDGE_CALL_BYTES: u32 = 16 * 1024 * 1024;
-pub const DEFAULT_MAX_BRIDGE_CALLS: u32 = 10;
-/// Grace budget for `waitUntil` background work after the Result frame,
-/// Cloudflare's number. Zero disables the epilogue entirely.
-pub const DEFAULT_GRACE_MS: u32 = 30_000;
-
-/// Streaming bodies: hard cap on one `StreamChunk`'s byte length. The host
-/// splits larger reads; the runtime rejects a violation as malformed.
-pub const STREAM_CHUNK_MAX_BYTES: u32 = 64 * 1024;
-/// Streaming bodies: the credit window — how many un-consumed bytes may be in
-/// flight per stream. Granted implicitly at hydration; replenished by
-/// `StreamPull` as the sandbox consumes. Bounds runtime-side buffering.
-pub const STREAM_CREDIT_WINDOW_BYTES: u32 = 256 * 1024;
-
-/// Resource limits applied to a `Run` request, with runtime defaults already
-/// resolved: each field is the caller's explicit value or, when the caller left
-/// it unset on the wire, the corresponding `DEFAULT_*` constant. A field of
-/// zero means the limit is explicitly disabled (no cap).
-#[derive(Debug, Clone)]
-pub struct ResourceLimits {
-    /// The retirement line: a warm instance whose heap sits above this at
-    /// two consecutive finishes is retired (no run fails). Zero = none.
-    pub soft_memory_mb: u32,
-    /// The terminating V8 cap (`heap_limits` + the near-heap callback) and
-    /// the ArrayBuffer budget. Zero = uncapped.
-    pub hard_memory_mb: u32,
-    pub cpu_time_ms: u32,
-    pub wall_time_ms: u32,
-    pub max_export_bytes: u32,
-    pub max_stdout_bytes: u32,
-    pub max_stderr_bytes: u32,
-    /// Maximum bytes the sandbox may send as arguments in a single bridge call
-    /// (sandbox → host). Zero means no per-call cap.
-    pub max_bridge_call_bytes: u32,
-    /// Maximum number of bridge calls (globals + host imports combined) allowed
-    /// per run. Zero means no limit.
-    pub max_bridge_calls: u32,
-    /// Wall budget for `waitUntil` background work after the Result frame
-    ///. Zero disables the epilogue: registered work dies at settle.
-    pub grace_ms: u32,
-}
-
-/// Whether an absent hard override earns a headroom band — the band is for
-/// reuse, so a one-off (nothing to retire) does not get one. DESIGN §4.1.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BandPolicy {
-    /// Reused instances: cap is the soft line, a band above it terminates.
-    Managed,
-    /// Fresh isolate per run: the cap terminates, no soft line.
-    Strict,
-}
-
-/// Resolve the advertised cap plus optional hard override into the two
-/// enforced lines. Truth table: `docs/protocol.md` §5.2.
-fn resolve_heap_lines(cap_mb: u32, hard_override: Option<u32>, band: BandPolicy) -> (u32, u32) {
-    match (hard_override, band) {
-        // No soft line on a one-off: nothing is ever retired there.
-        (None, BandPolicy::Strict) => (0, cap_mb),
-        (None, BandPolicy::Managed) => (
-            cap_mb,
-            cap_mb.saturating_add(crate::policy::heap_band_mb(cap_mb)),
-        ),
-        (Some(0), _) => (0, 0),
-        (Some(hard), BandPolicy::Strict) => (0, hard),
-        (Some(hard), BandPolicy::Managed) if cap_mb >= hard => (0, hard),
-        (Some(hard), BandPolicy::Managed) => (cap_mb, hard),
-    }
-}
-
-impl Default for ResourceLimits {
-    /// The runtime defaults — the posture applied when the client sends no
-    /// explicit limits at all.
-    fn default() -> Self {
-        Self {
-            soft_memory_mb: DEFAULT_MEMORY_MB,
-            hard_memory_mb: DEFAULT_MEMORY_MB
-                + crate::policy::heap_band_mb(DEFAULT_MEMORY_MB),
-            cpu_time_ms: DEFAULT_CPU_TIME_MS,
-            wall_time_ms: DEFAULT_WALL_TIME_MS,
-            max_export_bytes: DEFAULT_MAX_EXPORT_BYTES,
-            max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
-            max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
-            max_bridge_call_bytes: DEFAULT_MAX_BRIDGE_CALL_BYTES,
-            max_bridge_calls: DEFAULT_MAX_BRIDGE_CALLS,
-            grace_ms: DEFAULT_GRACE_MS,
-        }
-    }
-}
-
-/// A host global the sandbox is allowed to reference, tagged by how the
-/// runtime installs it natively. Mirrors `GlobalDefPayload` on the TS side
-/// (`ipc.ts`); see `docs/protocol.md` §5.2.
-/// Every variant carries `enumerable`: whether the installed public name
-/// shows up in `for...in` / `Object.keys`. Host shorthands always send
-/// `true`; the object global forms may opt out. Runtime-internal names
-/// (`__iso4_*`) install non-enumerable regardless.
-#[derive(Debug, Clone)]
-pub enum HostGlobalDef {
-    /// A plain host function — installed as a bridge stub under `name`.
-    Bridge { name: String, enumerable: bool },
-    /// A JS expression the runtime evaluates as its own script and sets on
-    /// `globalThis[name]`.
-    StringExpr {
-        name: String,
-        expr: String,
-        enumerable: bool,
-    },
-    /// A constant carried as a V8 serialization blob, materialised natively.
-    Data {
-        name: String,
-        blob: Vec<u8>,
-        enumerable: bool,
-    },
-    /// A bridge handler (installed as a stub under `handler_name`) plus a shim
-    /// expression the runtime wraps and sets on `globalThis[name]`.
-    Shim {
-        name: String,
-        shim: String,
-        handler_name: String,
-        enumerable: bool,
-    },
-}
-
-impl HostGlobalDef {
-    /// The wire-level bridge stub name to install for this def, if any. Plain
-    /// bridge globals install under their own name; shims install a hidden
-    /// handler stub under `handler_name`. String/data globals need no stub.
-    ///
-    /// This is also the set of names that a `PrefixRun` may re-install and that
-    /// the `ERR_UNDECLARED_BINDING` check validates against.
-    pub fn bridge_stub_name(&self) -> Option<&str> {
-        match self {
-            HostGlobalDef::Bridge { name, .. } => Some(name),
-            HostGlobalDef::Shim { handler_name, .. } => Some(handler_name),
-            HostGlobalDef::StringExpr { .. } | HostGlobalDef::Data { .. } => None,
-        }
-    }
-
-    /// Whether the installed public name is enumerable.
-    pub fn enumerable(&self) -> bool {
-        match self {
-            HostGlobalDef::Bridge { enumerable, .. }
-            | HostGlobalDef::StringExpr { enumerable, .. }
-            | HostGlobalDef::Data { enumerable, .. }
-            | HostGlobalDef::Shim { enumerable, .. } => *enumerable,
-        }
-    }
-
-    /// A convenience constructor for tests: a plain bridge global.
-    #[cfg(test)]
-    pub fn bridge(name: &str) -> Self {
-        HostGlobalDef::Bridge {
-            name: name.to_string(),
-            enumerable: true,
-        }
-    }
-}
-
-/// Deepest host-module shape node accepted, as a path length from a top-level
-/// export. Mirrors the TS client's constant (`docs/protocol.md` §5.2).
-const MAX_HOST_MODULE_DEPTH: usize = 64;
-
-/// One node in a host-module shape tree. The tree is plain data — the client
-/// never generates sandbox source from it; the runtime builds the module
-/// natively (see `v8.rs`). Mirrors `HostModuleNodePayload` on the TS side.
-#[derive(Debug, Clone)]
-pub enum HostModuleNode {
-    /// A host function leaf. The runtime assigns it a handle ID (tree-walk
-    /// order over the declared bindings) and installs an async trampoline
-    /// that dispatches through the reserved `__iso4_call` bridge stub.
-    Function,
-    /// A constant data leaf carried as a V8 serialization blob, materialised
-    /// natively via `blob::deserialize_value`.
-    Data(Vec<u8>),
-    /// A nested object of named children (may mix functions and data).
-    Object(Vec<(String, HostModuleNode)>),
-}
-
-/// The two flavors of import module per DESIGN.md §4.3, now discriminated on
-/// the wire instead of being lowered to source text by the client.
-#[derive(Debug, Clone)]
-pub enum ImportModule {
-    /// Host-provided ESM source, compiled verbatim inside the isolate.
-    Source(String),
-    /// A host-module shape: named top-level exports, each a tree of function
-    /// leaves and data leaves. The runtime builds the module from this data.
-    Host(Vec<(String, HostModuleNode)>),
-}
-
-/// One entry in the `imports` list of a `Run` / `Precompile` request.
-#[derive(Debug, Clone)]
-pub struct ImportBinding {
-    pub specifier: String,
-    pub module: ImportModule,
-}
-
-/// One host-import function-leaf rebinding requested by a `PrefixRun`. Only
-/// the location crosses the wire — the replacement handler stays on the TS
-/// side (bridge dispatch is name-addressed). The runtime validates each entry
-/// against the shape declared at `Precompile` and rejects undeclared locations
-/// with `ERR_UNDECLARED_BINDING`, frozen ones with `ERR_FROZEN_BINDING`.
-#[derive(Debug, Clone)]
-pub struct ImportRebind {
-    pub specifier: String,
-    /// Key segments of the function leaf inside the host module; a key may
-    /// itself contain dots.
-    pub path: Vec<String>,
-}
-
-/// A host → sandbox function call requested by a `Run` / `PrefixRun` frame
-///. `export_path` addresses a callable relative to the module's exports
-/// (`"named"`, `"default.fetch"`); `args_blob` is **one** V8 serialization
-/// blob holding an array of arguments — the same convention as `BridgeCall`
-/// args, identity between arguments preserved.
-#[derive(Debug)]
-pub struct CallSpec {
-    pub export_path: String,
-    pub args_blob: Vec<u8>,
-}
-
 /// Fully parsed `Run` frame payload per `docs/protocol.md` §5.2.
 #[derive(Debug)]
 pub struct RunPayload {
@@ -1730,13 +1506,6 @@ pub fn parse_terminate_payload(payload: &[u8]) -> io::Result<(u32, TerminateMode
     };
     r.assert_done()?;
     Ok((run_id, mode))
-}
-
-/// How a `Terminate` stops its run — see [`parse_terminate_payload`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TerminateMode {
-    Soft = 0,
-    Hard = 1,
 }
 
 /// Convert a raw type byte into a known TS->Rust message type.
@@ -2479,7 +2248,7 @@ mod tests {
         assert_eq!(prefix.limits.soft_memory_mb, DEFAULT_MEMORY_MB);
         assert_eq!(
             prefix.limits.hard_memory_mb,
-            DEFAULT_MEMORY_MB + crate::policy::heap_band_mb(DEFAULT_MEMORY_MB),
+            DEFAULT_MEMORY_MB + crate::types::heap_band_mb(DEFAULT_MEMORY_MB),
             "a reused instance is retired at the cap and terminates above it",
         );
 
