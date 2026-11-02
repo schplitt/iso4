@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::errors;
 use crate::ipc;
+use crate::link::{Addr, HostLink, Inbound, LinkError, NoopObserver, Outbound};
 use crate::types;
 use crate::v8 as sandbox;
 use crate::wire;
@@ -322,86 +323,120 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
     }
 }
 
-/// Write a `Result` frame, substituting a minimal one when the assembled
-/// payload is too large to frame.
-///
-/// `max_export_bytes` bounds the *success* payload, but nothing bounds a
-/// failure: the error's message, stack and own properties are cloned verbatim
-/// out of the isolate, so `throw new Error('A'.repeat(70e6))` builds a payload
-/// past the 64 MiB frame ceiling under default limits. Writing it used to fail,
-/// and the caller treated that as fatal and closed the connection with no frame
-/// sent at all — which the host then recycled, one dead pool slot per run, until
-/// the sandbox served nothing. Guest code could do that deliberately.
-///
-/// Substituting is safe because the length check in `write_frame_with_limit`
-/// runs before any byte reaches the socket, so the stream is still frame-aligned
-/// and the run can be answered properly. Only a genuine I/O failure (a
-/// different `ErrorKind`) may have written a partial frame, and that stays
-/// fatal (the demux observes the dead socket on its next read).
-fn write_result_frame(sink: &ipc::FrameSink, run_id: u32, payload: Vec<u8>) -> std::io::Result<()> {
-    match sink.write(ipc::RustToTsMessageType::Result, payload) {
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            eprintln!(
-                "[iso4-v8] Result frame for run {run_id} too large to send ({e}) — \
-                 replacing it with ERR_INTERNAL"
-            );
-            let replacement = wire::encode_run_completion_payload(
-                run_id,
-                types::RunCompletion::Failure(types::RunFailurePayload {
-                    error: types::RunErrorPayload {
-                        code: "ERR_INTERNAL".to_string(),
-                        name: "Error".to_string(),
-                        message: format!(
-                            "the run's result was too large to send to the host ({e}). \
-                             A thrown error's message, stack and properties are reported \
-                             verbatim, so a very large one cannot be delivered."
-                        ),
-                        stack: None,
-                        fields: None,
-                        reset: None,
-                        prefix_stage: false,
-                        cause: None,
-                    },
-                    // Dropped deliberately: stdout/stderr are unbounded too, and
-                    // this payload has to be small by construction.
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                    duration_ms: 0.0,
-                    wall_time_ms: 0.0,
-                    cpu_time_ms: 0.0,
-                    bridge_calls: Vec::new(),
-                    heap_used_bytes: None,
-                }),
-            );
-            sink.write(ipc::RustToTsMessageType::Result, replacement)
-        }
-        other => other,
+/// The connection's writer as the engine sees it: one frame per message,
+/// the run's wire id from the address. A frame over the protocol ceiling is
+/// refused synchronously as `TooLarge`, so the sender can substitute.
+impl HostLink for ipc::Outbox {
+    fn send(&self, to: Addr, msg: Outbound) -> Result<(), LinkError> {
+        let Addr::Run(run_id) = to;
+        let (message_type, head, tail) = match msg {
+            Outbound::BridgeCall {
+                call_id,
+                target,
+                args,
+            } => {
+                let header = wire::encode_bridge_call_header(
+                    run_id,
+                    call_id,
+                    &target,
+                    args.len() as u32,
+                );
+                (ipc::RustToTsMessageType::BridgeCall, header, args)
+            }
+            Outbound::StreamPull { stream_id, credit } => (
+                ipc::RustToTsMessageType::StreamPull,
+                ipc::encode_stream_pull_payload(run_id, stream_id, credit),
+                Vec::new(),
+            ),
+            Outbound::StreamCancel { stream_id, reason } => (
+                ipc::RustToTsMessageType::StreamCancel,
+                ipc::encode_stream_cancel_payload(run_id, stream_id, &reason),
+                Vec::new(),
+            ),
+            Outbound::StreamChunk { stream_id, data } => {
+                // Header as head, the chunk as tail: the data is not copied
+                // again here.
+                let mut head = Vec::with_capacity(12);
+                head.extend_from_slice(&run_id.to_be_bytes());
+                head.extend_from_slice(&stream_id.to_be_bytes());
+                head.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                (ipc::RustToTsMessageType::StreamChunk, head, data)
+            }
+            Outbound::StreamEnd { stream_id, error } => (
+                ipc::RustToTsMessageType::StreamEnd,
+                ipc::encode_stream_end_payload(run_id, stream_id, error.as_deref()),
+                Vec::new(),
+            ),
+            Outbound::Result { completion } => (
+                ipc::RustToTsMessageType::Result,
+                wire::encode_run_completion_payload(run_id, completion),
+                Vec::new(),
+            ),
+            Outbound::RunComplete { report } => (
+                ipc::RustToTsMessageType::RunComplete,
+                wire::encode_run_complete_payload(run_id, &report),
+                Vec::new(),
+            ),
+        };
+        self.send_frame(message_type, head, tail).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::InvalidInput {
+                LinkError::TooLarge(e.to_string())
+            } else {
+                LinkError::Closed(e.to_string())
+            }
+        })
     }
 }
 
-/// Write a `RunComplete` frame, substituting a minimal one when the
-/// grace report is too large to frame — same recovery `write_result_frame`
-/// gives Result frames, so a guest-authored oversized rejection message (or
-/// an unbounded record list under `maxBridgeCalls: 0`) costs its telemetry,
-/// never the connection. The status byte survives (payload offset 4).
-fn write_run_complete_frame(
-    sink: &ipc::FrameSink,
-    run_id: u32,
-    payload: Vec<u8>,
-) -> std::io::Result<()> {
-    // Captured before the payload moves into the send — the substitute path
-    // below needs it after a refused write.
-    let status_byte = payload.get(4).copied().unwrap_or(1);
-    match sink.write(ipc::RustToTsMessageType::RunComplete, payload) {
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            eprintln!(
-                "[iso4-v8] RunComplete frame for run {run_id} too large to send ({e}) — \
-                 substituting a minimal report"
-            );
-            let minimal = wire::encode_minimal_run_complete(run_id, status_byte);
-            sink.write(ipc::RustToTsMessageType::RunComplete, minimal)
+/// Decode a run-tagged frame into the engine's message. The leading run id
+/// is routing state the caller already consumed; a malformed payload is
+/// reported as the run's own connection loss (the frame cannot be
+/// delivered, the connection stays usable for its other runs).
+fn inbound_of(frame: ipc::TsToRustFrame) -> Result<Inbound, String> {
+    match frame.message_type {
+        ipc::TsToRustMessageType::BridgeResponse => {
+            wire::parse_bridge_response_payload(&frame.payload)
+                .map(|(_run_id, call_id, result)| Inbound::BridgeResponse { call_id, result })
+                .map_err(|e| format!("response decode: {e}"))
         }
-        other => other,
+        ipc::TsToRustMessageType::StreamChunk => {
+            let mut payload = frame.payload;
+            let chunk = ipc::parse_stream_chunk_payload(&payload)
+                .map_err(|e| format!("stream chunk decode: {e}"))?;
+            let stream_id = chunk.stream_id;
+            // The data is the payload's tail: shift it down in place rather
+            // than copying it out.
+            let header = payload.len() - chunk.data.len();
+            payload.drain(..header);
+            Ok(Inbound::StreamChunk {
+                stream_id,
+                data: payload,
+            })
+        }
+        ipc::TsToRustMessageType::StreamEnd => ipc::parse_stream_end_payload(&frame.payload)
+            .map(|end| Inbound::StreamEnd {
+                stream_id: end.stream_id,
+                error: (!end.ok).then(|| {
+                    end.error
+                        .unwrap_or_else(|| "the host body source failed".to_string())
+                }),
+            })
+            .map_err(|e| format!("stream end decode: {e}")),
+        ipc::TsToRustMessageType::StreamPull => ipc::parse_stream_pull_payload(&frame.payload)
+            .map(|pull| Inbound::StreamPull {
+                stream_id: pull.stream_id,
+                credit: pull.credit,
+            })
+            .map_err(|e| format!("stream pull decode: {e}")),
+        ipc::TsToRustMessageType::StreamCancel => {
+            ipc::parse_stream_cancel_payload(&frame.payload)
+                .map(|cancel| Inbound::StreamCancel {
+                    stream_id: cancel.stream_id,
+                    reason: cancel.reason,
+                })
+                .map_err(|e| format!("stream cancel decode: {e}"))
+        }
+        other => Err(format!("{other:?} is not a run message")),
     }
 }
 
@@ -416,73 +451,6 @@ fn capacity_failure(refusal: String) -> sandbox::FailureOutput {
         wall_time_ms: 0.0,
         cpu_time_ms: 0.0,
         bridge_calls: Vec::new(),
-    }
-}
-
-/// Encode and write a run's completion (the final Result, or the RunComplete
-/// when the early Result already shipped during grace). Shared by the
-/// one-off worker and the warm completion hook. Write failures are logged:
-/// the demux observes the dead socket on its own next read.
-fn write_completion(
-    sink: &ipc::FrameSink,
-    run_id: u32,
-    outcome_result: &Result<sandbox::Output, sandbox::FailureOutput>,
-    heap_used_bytes: Option<u64>,
-    prefix_stage: bool,
-) {
-    let (frame_is_run_complete, payload) = match outcome_result {
-        Ok(output) => match &output.background {
-            // The run flow already wrote the early Result and drove the
-            // grace phase; what remains is the final RunComplete frame.
-            Some(bg) if bg.early_result_sent => {
-                (true, wire::encode_run_complete_payload(run_id, bg))
-            }
-            _ => (
-                false,
-                wire::encode_run_completion_payload(
-                    run_id,
-                    types::RunCompletion::Success(types::RunSuccessPayload {
-                        exports: output.exports.clone(),
-                        skipped_exports: output.skipped_exports.clone(),
-                        stdout: output.stdout.clone(),
-                        stderr: output.stderr.clone(),
-                        duration_ms: output.duration_ms,
-                        wall_time_ms: output.wall_time_ms,
-                        cpu_time_ms: output.cpu_time_ms,
-                        bridge_calls: output.bridge_calls.clone(),
-                        heap_used_bytes,
-                        background_flags: 0,
-                    }),
-                ),
-            ),
-        },
-        Err(failure) => (
-            false,
-            wire::encode_run_completion_payload(
-                run_id,
-                types::RunCompletion::Failure(types::RunFailurePayload {
-                    error: types::RunErrorPayload {
-                        prefix_stage,
-                        ..failure.error.to_payload()
-                    },
-                    stdout: failure.stdout.clone(),
-                    stderr: failure.stderr.clone(),
-                    duration_ms: failure.duration_ms,
-                    wall_time_ms: failure.wall_time_ms,
-                    cpu_time_ms: failure.cpu_time_ms,
-                    bridge_calls: failure.bridge_calls.clone(),
-                    heap_used_bytes,
-                }),
-            ),
-        ),
-    };
-    let write_outcome = if frame_is_run_complete {
-        write_run_complete_frame(sink, run_id, payload)
-    } else {
-        write_result_frame(sink, run_id, payload)
-    };
-    if let Err(e) = write_outcome {
-        eprintln!("[iso4-v8] failed to write completion frame for run {run_id}: {e}");
     }
 }
 
@@ -503,7 +471,7 @@ struct RunRoute {
 }
 
 /// This connection's in-flight runs, shared between the demux reader and the
-/// completion hooks (which remove their run when it finishes).
+/// release hooks (which remove their run when it finishes).
 type ConnRuns = Arc<Mutex<HashMap<u32, RunRoute>>>;
 
 /// The per-run inbound frame allowance, enforced during routing (a frame
@@ -657,7 +625,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
             return;
         }
     };
-    let sink = ipc::FrameSink::Shared(outbox);
+    let link: Arc<dyn HostLink> = Arc::new(outbox.clone());
     let conn_runs: ConnRuns = Arc::new(Mutex::new(HashMap::new()));
 
     // ── Teardown guard ────────────────────────────────────────────────────
@@ -670,7 +638,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
     // channel is shared and outlives any one connection, so a panicked demux
     // dropping its routes would otherwise strand runs waiting on it forever.
     // The outbox needs no explicit close: it drains and exits when the last
-    // sink clone drops — a run concluding after this teardown still gets its
+    // clone drops — a run concluding after this teardown still gets its
     // failure Result out, exactly like the old direct-write socket clone.
     struct FailRunsOnDrop(ConnRuns);
     impl Drop for FailRunsOnDrop {
@@ -684,7 +652,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                     .frames
                     .send(sandbox::RoutedEvent::new(
                         route.token,
-                        sandbox::RunEvent::ConnLost(None),
+                        sandbox::RunEvent::Host(Inbound::ConnectionLost { detail: None }),
                     ))
                     .ok();
             }
@@ -728,7 +696,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 dispatch_oneoff_run(
                     payload,
                     &shared,
-                    &sink,
+                    &link,
                     &conn_runs,
                     &call_id_counter,
                     &brand_key,
@@ -742,7 +710,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         break;
                     }
                 };
-                dispatch_precompile(payload, &shared, &sink);
+                dispatch_precompile(payload, &shared, &outbox);
             }
             ipc::TsToRustMessageType::PrefixRun => {
                 let payload = match ipc::parse_prefix_run_payload(&frame.payload) {
@@ -755,7 +723,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 dispatch_prefix_run(
                     payload,
                     &shared,
-                    &sink,
+                    &link,
                     &conn_runs,
                     &call_id_counter,
                     &brand_key,
@@ -795,9 +763,10 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 // control connection, so it never queues behind runs; the
                 // payload is empty and the reply is one StatsResult frame.
                 let stats = shared.warm.stats();
-                if let Err(e) = sink.write(
+                if let Err(e) = outbox.send_frame(
                     ipc::RustToTsMessageType::StatsResult,
                     wire::encode_stats_payload(&stats),
+                    Vec::new(),
                 ) {
                     eprintln!("[iso4-v8] failed to write StatsResult frame: {e}");
                     break;
@@ -829,10 +798,11 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
 /// Route one run-tagged frame (BridgeResponse / stream frames) to its run.
 /// Every such payload leads with the wire run id. Unknown runs get the
 /// late-frame discard (the run completed while the frame was in flight);
-/// a frame over its run's inbound allowance fails that run alone. A payload
-/// too short to carry a run id is CORRUPT — `Err` closes the connection
-/// (the blast-radius rule: unparseable framing fails this connection's runs
-/// loudly rather than leaving one waiting forever).
+/// a frame over its run's inbound allowance, or one whose payload does not
+/// decode, fails that run alone. A payload too short to carry a run id is
+/// CORRUPT — `Err` closes the connection (the blast-radius rule:
+/// unparseable framing fails this connection's runs loudly rather than
+/// leaving one waiting forever).
 fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<(), String> {
     let Some(run_id) = peek_run_id(&frame.payload) else {
         return Err(format!(
@@ -853,24 +823,28 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
     // Per-run inbound cap — demux policy (the read itself is bounded by the
     // connection-wide ceiling; this enforces the RUN's own allowance).
     let frame_len = frame.payload.len().saturating_add(1);
-    if frame_len > route.frame_cap as usize {
-        let cap = route.frame_cap;
-        route
-            .frames
-            .send(sandbox::RoutedEvent::new(
-                route.token,
-                sandbox::RunEvent::ConnLost(Some(format!(
-                    "frame length {frame_len} exceeds max frame length {cap}"
-                ))),
-            ))
-            .ok();
-        return Ok(());
-    }
-    route
-        .frames
+    let cap = route.frame_cap;
+    let (frames, token) = (route.frames.clone(), route.token);
+    // Decoding copies the payload; release hooks take this lock to finish.
+    drop(runs);
+    let msg = if frame_len > cap as usize {
+        Inbound::ConnectionLost {
+            detail: Some(format!(
+                "frame length {frame_len} exceeds max frame length {cap}"
+            )),
+        }
+    } else {
+        match inbound_of(frame) {
+            Ok(msg) => msg,
+            Err(detail) => Inbound::ConnectionLost {
+                detail: Some(detail),
+            },
+        }
+    };
+    frames
         .send(sandbox::RoutedEvent::new(
-            route.token,
-            sandbox::RunEvent::Frame(frame),
+            token,
+            sandbox::RunEvent::Host(msg),
         ))
         .ok();
     Ok(())
@@ -911,7 +885,7 @@ fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
         .frames
         .send(sandbox::RoutedEvent::new(
             route.token,
-            sandbox::RunEvent::Frame(frame),
+            sandbox::RunEvent::Host(Inbound::Terminate { mode }),
         ))
         .ok();
     Ok(())
@@ -961,38 +935,33 @@ fn insert_run_route(
 }
 
 /// Answer a run the demux refused before dispatch (duplicate run id).
-fn refuse_duplicate_run(sink: &ipc::FrameSink, run_id: u32) {
+fn refuse_duplicate_run(link: &dyn HostLink, run_id: u32) {
     eprintln!(
         "[iso4-v8] run {run_id} is already in flight on this connection — refusing the duplicate"
     );
-    let payload = wire::encode_run_completion_payload(
-        run_id,
-        types::RunCompletion::Failure(types::RunFailurePayload {
-            error: types::RunErrorPayload {
-                code: "ERR_INTERNAL".to_string(),
-                name: "Error".to_string(),
-                message: format!(
-                    "run id {run_id} is already in flight on this connection; every \
-                     concurrent run needs a distinct id"
-                ),
-                stack: None,
-                fields: None,
-                reset: None,
-                prefix_stage: false,
-                cause: None,
-            },
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms: 0.0,
-            wall_time_ms: 0.0,
-            cpu_time_ms: 0.0,
-            bridge_calls: Vec::new(),
-            heap_used_bytes: None,
-        }),
-    );
-    if let Err(e) = write_result_frame(sink, run_id, payload) {
-        eprintln!("[iso4-v8] failed to write completion frame: {e}");
-    }
+    let completion = types::RunCompletion::Failure(types::RunFailurePayload {
+        error: types::RunErrorPayload {
+            code: "ERR_INTERNAL".to_string(),
+            name: "Error".to_string(),
+            message: format!(
+                "run id {run_id} is already in flight on this connection; every \
+                 concurrent run needs a distinct id"
+            ),
+            stack: None,
+            fields: None,
+            reset: None,
+            prefix_stage: false,
+            cause: None,
+        },
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        duration_ms: 0.0,
+        wall_time_ms: 0.0,
+        cpu_time_ms: 0.0,
+        bridge_calls: Vec::new(),
+        heap_used_bytes: None,
+    });
+    sandbox::send_completion(link, run_id, Outbound::Result { completion });
 }
 
 /// A one-off `Run`: executed on its own worker thread (a fresh isolate every
@@ -1000,7 +969,7 @@ fn refuse_duplicate_run(sink: &ipc::FrameSink, run_id: u32) {
 fn dispatch_oneoff_run(
     payload: ipc::RunPayload,
     shared: &Arc<SharedState>,
-    sink: &ipc::FrameSink,
+    link: &Arc<dyn HostLink>,
     conn_runs: &ConnRuns,
     call_id_counter: &Arc<AtomicU32>,
     brand_key: &str,
@@ -1019,14 +988,18 @@ fn dispatch_oneoff_run(
 
     let run_id = payload.run_id;
     if run_id_in_flight(conn_runs, run_id) {
-        refuse_duplicate_run(sink, run_id);
+        refuse_duplicate_run(&**link, run_id);
         return;
     }
     // Fresh isolate per one-off, shared ledger; admission-checked before
     // the route exists so a refusal leaves nothing to unwind.
     let run_cap_bytes = u64::from(payload.limits.hard_memory_mb) * 1024 * 1024;
     if let Err(refusal) = shared.warm.reserve_oneoff(run_cap_bytes) {
-        write_completion(sink, run_id, &Err(capacity_failure(refusal)), None, false);
+        sandbox::send_completion(
+            &**link,
+            run_id,
+            sandbox::completion_message(&Err(capacity_failure(refusal)), None, false),
+        );
         return;
     }
 
@@ -1044,14 +1017,14 @@ fn dispatch_oneoff_run(
     );
 
     let worker_shared = Arc::clone(shared);
-    let worker_sink = sink.clone();
+    let worker_link = Arc::clone(link);
     let worker_conn_runs = Arc::clone(conn_runs);
     let call_id_counter = Arc::clone(call_id_counter);
     let brand_key = brand_key.to_string();
     let spawned = std::thread::Builder::new()
         .name("iso4-oneoff-run".to_string())
         .spawn(move || {
-            let (shared, sink, conn_runs) = (worker_shared, worker_sink, worker_conn_runs);
+            let (shared, link, conn_runs) = (worker_shared, worker_link, worker_conn_runs);
             crate::webcodec::set_session_brand_key(brand_key);
             sandbox::set_oom_run(sandbox::OomRun::Run(run_id));
             sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
@@ -1077,12 +1050,13 @@ fn dispatch_oneoff_run(
                 &payload.imports,
                 sandbox::RunIo::Session {
                     events,
-                    sink: sink.clone(),
+                    link: Arc::clone(&link),
                 },
                 token,
                 call_id_counter,
                 payload.call.as_ref(),
                 Some(ctl),
+                Arc::new(NoopObserver),
             );
             match &result {
                 Ok(output) => {
@@ -1105,7 +1079,11 @@ fn dispatch_oneoff_run(
             shared
                 .warm
                 .release_oneoff(result.is_err(), wall_time_ms, cpu_time_ms);
-            write_completion(&sink, run_id, &result, None, false);
+            sandbox::send_completion(
+                &*link,
+                run_id,
+                sandbox::completion_message(&result, None, false),
+            );
         });
     if let Err(e) = spawned {
         eprintln!("[iso4-v8] failed to spawn one-off worker: {e}");
@@ -1124,7 +1102,11 @@ fn dispatch_oneoff_run(
             cpu_time_ms: 0.0,
             bridge_calls: Vec::new(),
         };
-        write_completion(sink, run_id, &Err(failure), None, false);
+        sandbox::send_completion(
+            &**link,
+            run_id,
+            sandbox::completion_message(&Err(failure), None, false),
+        );
     }
 }
 
@@ -1133,7 +1115,7 @@ fn dispatch_oneoff_run(
 fn dispatch_precompile(
     payload: ipc::PrecompilePayload,
     shared: &Arc<SharedState>,
-    sink: &ipc::FrameSink,
+    outbox: &ipc::Outbox,
 ) {
     let id = shared.next_prefix_id.fetch_add(1, Ordering::Relaxed);
     let prefix_id = id.to_string();
@@ -1168,38 +1150,33 @@ fn dispatch_precompile(
             })),
         );
     let result = wire::encode_precompile_result_payload(payload.request_id, Some(&prefix_id), None);
-    if let Err(e) = sink.write(ipc::RustToTsMessageType::PrecompileResult, result) {
+    if let Err(e) = outbox.send_frame(ipc::RustToTsMessageType::PrecompileResult, result, Vec::new()) {
         eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
     }
 }
 
 /// Answer a `PrefixRun` refused before dispatch: nothing ran, telemetry is zero.
-fn write_setup_refusal(sink: &ipc::FrameSink, run_id: u32, error: types::RunErrorPayload) {
-    let payload = wire::encode_run_completion_payload(
-        run_id,
-        types::RunCompletion::Failure(types::RunFailurePayload {
-            error,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms: 0.0,
-            wall_time_ms: 0.0,
-            cpu_time_ms: 0.0,
-            bridge_calls: Vec::new(),
-            heap_used_bytes: None,
-        }),
-    );
-    if let Err(e) = write_result_frame(sink, run_id, payload) {
-        eprintln!("[iso4-v8] failed to write completion frame: {e}");
-    }
+fn write_setup_refusal(link: &dyn HostLink, run_id: u32, error: types::RunErrorPayload) {
+    let completion = types::RunCompletion::Failure(types::RunFailurePayload {
+        error,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        duration_ms: 0.0,
+        wall_time_ms: 0.0,
+        cpu_time_ms: 0.0,
+        bridge_calls: Vec::new(),
+        heap_used_bytes: None,
+    });
+    sandbox::send_completion(link, run_id, Outbound::Result { completion });
 }
 
 /// A `PrefixRun`: validated here (cheap map lookups), then dispatched to a
-/// warm instance whose completion hook writes the frames and releases the
-/// registry state — the demux never parks.
+/// warm instance; its release hook gives the registry state back and the
+/// engine answers through the link — the demux never parks.
 fn dispatch_prefix_run(
     payload: ipc::PrefixRunPayload,
     shared: &Arc<SharedState>,
-    sink: &ipc::FrameSink,
+    link: &Arc<dyn HostLink>,
     conn_runs: &ConnRuns,
     call_id_counter: &Arc<AtomicU32>,
     brand_key: &str,
@@ -1240,7 +1217,7 @@ fn dispatch_prefix_run(
                 prefix_stage: false,
                 cause: Some(cause),
             };
-            write_setup_refusal(sink, run_id, error);
+            write_setup_refusal(&**link, run_id, error);
             return;
         }
         None => {
@@ -1261,7 +1238,7 @@ fn dispatch_prefix_run(
                 prefix_stage: false,
                 cause: None,
             };
-            write_setup_refusal(sink, run_id, error);
+            write_setup_refusal(&**link, run_id, error);
             return;
         }
     };
@@ -1284,7 +1261,7 @@ fn dispatch_prefix_run(
             "[iso4-v8] PrefixRun {run_id} — {}: {}",
             error.code, error.message
         );
-        write_setup_refusal(sink, run_id, error);
+        write_setup_refusal(&**link, run_id, error);
         return;
     }
 
@@ -1302,7 +1279,7 @@ fn dispatch_prefix_run(
     // the acquired instance's event channel; the demux thread is the only
     // inserter, so the check holds through the dispatch below.)
     if run_id_in_flight(conn_runs, run_id) {
-        refuse_duplicate_run(sink, run_id);
+        refuse_duplicate_run(&**link, run_id);
         return;
     }
     let token = sandbox::alloc_run_token();
@@ -1332,7 +1309,11 @@ fn dispatch_prefix_run(
         crate::warm::Acquired::Cold(handle) => Taken::Cold(handle),
         crate::warm::Acquired::Refused(refusal) => {
             // No registry state taken, no route inserted — just answer.
-            write_completion(sink, run_id, &Err(capacity_failure(refusal)), None, false);
+            sandbox::send_completion(
+                &**link,
+                run_id,
+                sandbox::completion_message(&Err(capacity_failure(refusal)), None, false),
+            );
             return;
         }
         crate::warm::Acquired::SpawnFailed(e) => {
@@ -1348,7 +1329,11 @@ fn dispatch_prefix_run(
                 cpu_time_ms: 0.0,
                 bridge_calls: Vec::new(),
             };
-            write_completion(sink, run_id, &Err(failure), None, false);
+            sandbox::send_completion(
+                &**link,
+                run_id,
+                sandbox::completion_message(&Err(failure), None, false),
+            );
             return;
         }
     };
@@ -1370,16 +1355,16 @@ fn dispatch_prefix_run(
         msgs_tx.clone(),
     );
 
-    // The completion hook, run on the instance thread when the run finishes:
-    // release the instance FIRST (so the host's next run on this prefix
-    // reuses it deterministically), then write the completion frames.
-    // An instance of a since-disposed prefix must not return to the pool:
-    // the aliveness check and the release are atomic w.r.t. DisposePrefix
-    // under the prefix_store lock (lock order prefix_store → warm).
-    let complete: sandbox::CompletionHook = {
+    // The release hook, run on the instance thread when the run finishes
+    // and before the completion goes out: the instance is back in the pool
+    // first, so the host's next run on this prefix reuses it
+    // deterministically. An instance of a since-disposed prefix must not
+    // return to the pool: the aliveness check and the release are atomic
+    // w.r.t. DisposePrefix under the prefix_store lock (lock order
+    // prefix_store → warm).
+    let release: sandbox::ReleaseHook = {
         let shared = Arc::clone(shared);
         let conn_runs = Arc::clone(conn_runs);
-        let sink = sink.clone();
         let prefix_id = payload.prefix_id.clone();
         Box::new(move |outcome: sandbox::CallOutcome| {
             conn_runs
@@ -1468,13 +1453,6 @@ fn dispatch_prefix_run(
                     failure.error
                 ),
             }
-            write_completion(
-                &sink,
-                run_id,
-                &outcome.result,
-                Some(outcome.heap_used_bytes),
-                outcome.prefix_failed,
-            );
         })
     };
 
@@ -1493,27 +1471,28 @@ fn dispatch_prefix_run(
             grace_ms: payload.limits.grace_ms,
         },
         globals: payload.globals,
-        io: sandbox::RunIo::Instance { sink: sink.clone() },
+        io: sandbox::RunIo::Instance {
+            link: Arc::clone(link),
+        },
+        observer: Arc::new(NoopObserver),
         call_id_counter: Arc::clone(call_id_counter),
         call: payload.call,
         epilogue: Some(sandbox::EpilogueSpec {
             run_id,
             report_heap: true,
         }),
-        complete: Some(complete),
+        release: Some(release),
         ctl_slot: Some(ctl),
     });
 
-    let msg = sandbox::RoutedEvent::new(token, sandbox::RunEvent::Job((job, None)));
+    let msg = sandbox::RoutedEvent::new(token, sandbox::RunEvent::Job(job));
     if let Err(e) = msgs_tx.send(msg) {
-        // The instance thread died before accepting the job: answer the run
-        // through the completion hook, which also releases the registry
-        // state it captured.
+        // The instance thread died before accepting the job: finish it here,
+        // which runs the release hook and answers the run on its link.
         eprintln!("[iso4-v8] PrefixRun {run_id} — instance thread dead before dispatch");
-        if let sandbox::RunEvent::Job((mut job, _)) = e.0.event {
-            if let Some(complete) = job.complete.take() {
-                complete(crate::warm::dead_instance_outcome());
-            }
+        if let sandbox::RunEvent::Job(mut job) = e.0.event {
+            let link = job.io.link();
+            sandbox::finish_job(&mut job, link, crate::warm::dead_instance_outcome());
         }
     }
 }
@@ -1524,6 +1503,46 @@ fn dispatch_prefix_run(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn run_frame(message_type: ipc::TsToRustMessageType, payload: Vec<u8>) -> ipc::TsToRustFrame {
+        ipc::TypedFrame {
+            message_type,
+            payload,
+        }
+    }
+
+    #[test]
+    fn run_frames_decode_into_engine_messages() {
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&9u32.to_be_bytes());
+        chunk.extend_from_slice(&2u32.to_be_bytes());
+        chunk.extend_from_slice(&3u32.to_be_bytes());
+        chunk.extend_from_slice(b"abc");
+        match inbound_of(run_frame(ipc::TsToRustMessageType::StreamChunk, chunk)).unwrap() {
+            Inbound::StreamChunk { stream_id, data } => {
+                assert_eq!((stream_id, data.as_slice()), (2, &b"abc"[..]));
+            }
+            other => panic!("expected a chunk, got {other:?}"),
+        }
+
+        // ok = false with no message names the host source.
+        let mut end = Vec::new();
+        end.extend_from_slice(&9u32.to_be_bytes());
+        end.extend_from_slice(&2u32.to_be_bytes());
+        end.push(0);
+        end.push(0);
+        match inbound_of(run_frame(ipc::TsToRustMessageType::StreamEnd, end)).unwrap() {
+            Inbound::StreamEnd { stream_id, error } => {
+                assert_eq!(stream_id, 2);
+                assert_eq!(error.as_deref(), Some("the host body source failed"));
+            }
+            other => panic!("expected an end, got {other:?}"),
+        }
+
+        let short = vec![0u8; 6];
+        let err = inbound_of(run_frame(ipc::TsToRustMessageType::StreamChunk, short)).unwrap_err();
+        assert!(err.contains("stream chunk decode"), "{err}");
+    }
 
     #[test]
     fn import_rebind_paths_match_whole_key_segments() {

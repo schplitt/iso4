@@ -676,18 +676,18 @@ owns the default safety posture — the numbers below live in
 means "apply the runtime default"; an **explicit `0`** means "no limit" and is
 distinct from absent.
 
-| Field                | Encoding        | Default  | Notes                                                                                                                                                            |
-| -------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memoryMb`           | `Optional<u32>` | `128`    | The **soft line** — the retirement trigger, not a kill. Zero = no soft line (and, with `hardMemoryMb` absent, no cap at all).                                    |
-| `cpuTimeMs`          | `Optional<u32>` | `5000`   | Zero = no limit.                                                                                                                                                 |
-| `wallTimeMs`         | `Optional<u32>` | `30000`  | Caps the run's own logic time (the result's `wallTimeMs`): execution + async waits, each counted to its answer's arrival. Zero = no limit.                       |
-| `maxExportBytes`     | `Optional<u32>` | `16 MiB` | Max byte length of the exports value blob. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                                  |
-| `maxStdoutBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stdout lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
-| `maxStderrBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                               |
-| `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of a single `BridgeCallPayload` (sandbox → host args). Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`. |
-| `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.               |
-| `graceMs`            | `Optional<u32>` | `30000`  | Wall budget for `waitUntil` background work after the Result ships, one budget for the whole registered set. Zero disables the grace phase entirely.             |
-| `hardMemoryMb`       | `Optional<u32>` | derived  | The **hard line** — V8's terminating heap cap. Absent = derived from `memoryMb` (see below). Zero = uncapped. Block's last field.                                |
+| Field                | Encoding        | Default  | Notes                                                                                                                                                |
+| -------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memoryMb`           | `Optional<u32>` | `128`    | The **soft line** — the retirement trigger, not a kill. Zero = no soft line (and, with `hardMemoryMb` absent, no cap at all).                        |
+| `cpuTimeMs`          | `Optional<u32>` | `5000`   | Zero = no limit.                                                                                                                                     |
+| `wallTimeMs`         | `Optional<u32>` | `30000`  | Caps the run's own logic time (the result's `wallTimeMs`): execution + async waits, each counted to its answer's arrival. Zero = no limit.           |
+| `maxExportBytes`     | `Optional<u32>` | `16 MiB` | Max byte length of the exports value blob. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                      |
+| `maxStdoutBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stdout lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                   |
+| `maxStderrBytes`     | `Optional<u32>` | `1 MiB`  | Max bytes captured across all stderr lines. Zero = no limit. Lines that would exceed the cap are silently dropped.                                   |
+| `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of one bridge call's serialized args. Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`.      |
+| `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.   |
+| `graceMs`            | `Optional<u32>` | `30000`  | Wall budget for `waitUntil` background work after the Result ships, one budget for the whole registered set. Zero disables the grace phase entirely. |
+| `hardMemoryMb`       | `Optional<u32>` | derived  | The **hard line** — V8's terminating heap cap. Absent = derived from `memoryMb` (see below). Zero = uncapped. Block's last field.                    |
 
 **The two heap lines (#169).** `memoryMb` and `hardMemoryMb` resolve together
 in `read_resource_limits`, so nothing downstream sees a half-decided cap. What
@@ -901,15 +901,13 @@ responses route back by `callId` in any order. Across runs, one connection can
 carry several runs' bridge traffic simultaneously: the runtime's session demux
 routes every run-tagged frame by its leading `runId`.
 
-**`maxBridgeCallBytes` enforcement:** When non-zero, Rust checks the encoded
-`BridgeCallPayload` byte length before writing it to the socket. If the payload
-exceeds the limit the run terminates with `ERR_BRIDGE_PAYLOAD_TOO_LARGE` without
-performing any I/O. That length is computed rather than materialized: every
-field ahead of the args blob is fixed or already known, so the payload is
-measured as header + blob and the two are written in sequence. The bytes on the
-wire are exactly as laid out above; the args blob is never copied into a second
-buffer, which would otherwise double the peak memory of every bridge call and
-place that allocation before the check meant to bound it.
+**`maxBridgeCallBytes` enforcement:** When non-zero, the runtime checks the
+serialized args blob's byte length before the call leaves the engine. If it
+exceeds the limit the run terminates with `ERR_BRIDGE_PAYLOAD_TOO_LARGE`
+without performing any I/O. The header ahead of the blob is the frame's own
+and is not counted. The args blob is never copied into a second buffer, which
+would otherwise double the peak memory of every bridge call and place that
+allocation before the check meant to bound it.
 
 **BridgeResponse frame cap:** the sandbox cannot hold a response larger than
 its own memory budget, so `memoryMb × 1 MiB` is the natural and only limit —
@@ -1070,7 +1068,7 @@ afterwards, so later calls report only their own lines.
 | `name`          | `String` | Public call name, resolved by the runtime: plain globals as-is (`fetch`), shims under their public name, host-module import leaves as `<specifier>.<path>` with the path dot-joined (display only; a key may contain dots).             |
 | `startMs`       | `f64`    | Offset from run start (same clock as `durationMs`).                                                                                                                                                                                     |
 | `durationMs`    | `f64`    | Round-trip the sandbox waited; time-until-run-end for calls that never settled.                                                                                                                                                         |
-| `argBytes`      | `u32`    | Serialized call payload size in bytes (envelope + args blob) — what `maxBridgeCallBytes` is enforced against.                                                                                                                           |
+| `argBytes`      | `u32`    | Serialized args blob size in bytes — what `maxBridgeCallBytes` is enforced against.                                                                                                                                                     |
 | `responseBytes` | `u32`    | Serialized response value size in bytes (the blob); `0` on handler error or unsettled.                                                                                                                                                  |
 | `callId`        | `u32`    | The `BridgeCall` frame's callId; `0xFFFFFFFF` for blocked attempts, which never got one. Lets the client mark calls it skipped after an abort as `dropped`.                                                                             |
 | `outcome`       | `u8`     | `0` ok (response reached the sandbox); `1` blocked runtime-side (limit, oversized payload, function argument, invalid import handle, failed write), never sent; `2` the host answered with an error; `3` unanswered when the run ended. |

@@ -1426,9 +1426,9 @@ export interface BridgeCallEntryBase {
    */
   durationMs: number
   /**
-   * Serialized size of the call payload (callId + target + arguments) in
-   * bytes — the same size `maxBridgeCallBytes` is enforced against. `0` for
-   * attempts blocked before argument serialization.
+   * Serialized size of the call's arguments in bytes — the same size
+   * `maxBridgeCallBytes` is enforced against. `0` for attempts blocked
+   * before argument serialization.
    */
   argBytes: number
   /**
