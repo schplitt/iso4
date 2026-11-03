@@ -52,12 +52,12 @@ fn main() {
 }
 
 // Built against the vendored V8 headers and Chromium's libc++ so the object
-// matches the prebuilt librusty_v8.a (release profile). g++ cannot compile
-// those headers, so Linux needs clang++.
+// matches the prebuilt librusty_v8.a (release profile). Those headers need a
+// recent clang++ (not g++), taken from PATH unless CXX is set.
 fn compile_clock_platform() {
     let vendor = std::path::Path::new("vendor/v8");
     let mut build = cc::Build::new();
-    if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "linux" && std::env::var_os("CXX").is_none() {
+    if std::env::var_os("CXX").is_none() {
         build.compiler("clang++");
     }
     build
