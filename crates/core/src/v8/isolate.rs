@@ -14,7 +14,8 @@ use crate::v8::bridge::StubSlots;
 use crate::v8::guard::{GuardTarget, InstanceGuard};
 use crate::v8::modules::{evaluate_prefix_module, host_import_meta_callback};
 use crate::v8::oom_label::oom_error_cb;
-use crate::v8::{FailureOutput, PrefixSpec, RunError, RunTable, WARMUP_CPU_MS, WARMUP_WALL_MS};
+use crate::v8::runtable::RunTable;
+use crate::v8::{FailureOutput, PrefixSpec, RunError, WARMUP_CPU_MS, WARMUP_WALL_MS};
 
 static INIT: Once = Once::new();
 

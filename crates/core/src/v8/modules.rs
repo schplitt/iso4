@@ -12,14 +12,17 @@ use crate::v8::bridge::{
     host_module_base_id, install_prefix_bridge_placeholders, owned_bridge_error,
     prefix_bridge_call_from_value,
 };
+use crate::v8::exceptions::{
+    exception_fields, exception_message, exception_name, exception_stack, runtime_error_from_value,
+    syntax_error,
+};
 use crate::v8::globals::{
     ISO4_RUNTIME_MODULE_SRC, ISO4_RUNTIME_SPECIFIER, eval_script, install_value_globals,
 };
 use crate::v8::node::async_hooks::{ASYNC_HOOKS_MODULE_SRC, ASYNC_HOOKS_SPECIFIER};
 use crate::v8::{
     RunError, RunFacts, RunState, RuntimeErrorData, ScanOutcome, build_output_and_maybe_grace,
-    exception_fields, exception_message, exception_name, exception_stack, finished,
-    runtime_error_from_value, syntax_error,
+    finished,
 };
 
 /// Extract and serialize a settled module's exports, then finish (or start

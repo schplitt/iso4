@@ -1,7 +1,8 @@
 //! `node:async_hooks`: a minimal `AsyncLocalStorage` over V8's
 //! continuation-preserved embedder data.
 
-use crate::v8::{CURRENT_RUN_TOKEN, RunError, make_rider, rider_parts};
+use crate::v8::RunError;
+use crate::v8::runtable::{CURRENT_RUN_TOKEN, make_rider, rider_parts};
 
 // A minimal, Node-compatible `AsyncLocalStorage` (`run` + `getStore`), surfaced
 // to run and prefix code via `import { AsyncLocalStorage } from 'node:async_hooks'`.

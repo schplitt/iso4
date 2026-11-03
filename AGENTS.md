@@ -73,6 +73,8 @@ iso4/                              ← workspace root
         v8/                        ← the engine core
           mod.rs                   ← run entry points, contexts, the turn loop
           isolate.rs               ← isolate creation: platform, limits, budgets, warm InstanceCore
+          runtable.rs              ← per-run state table, run tokens, attribution, the load meter, the CPED rider
+          exceptions.rs            ← thrown V8 values to RunError: capped text, syntax errors, error fields
           oom_label.rs             ← the fatal OOM line: what this thread was running when V8 aborts
           console.rs               ← console.* capture: wrapped methods, rendering, per-run buffers
           timers.rs                ← setTimeout/clearTimeout natives and the timer turn

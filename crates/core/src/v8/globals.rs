@@ -5,11 +5,12 @@
 use crate::blob;
 use crate::errors::codec_error_to_run_error;
 use crate::types::HostGlobalDef;
-use crate::v8::streams::{stream_cancel_callback, stream_read_callback};
-use crate::v8::{
-    RunError, RuntimeErrorData, attributed_state, exception_fields, exception_message,
-    exception_name, exception_stack, slot_table, syntax_error,
+use crate::v8::exceptions::{
+    exception_fields, exception_message, exception_name, exception_stack, syntax_error,
 };
+use crate::v8::runtable::{attributed_state, slot_table};
+use crate::v8::streams::{stream_cancel_callback, stream_read_callback};
+use crate::v8::{RunError, RuntimeErrorData};
 
 // ── Value globals (native install) ────────────────────────────────────────────
 

@@ -11,11 +11,10 @@ use std::time::Duration;
 
 use crate::link::{Addr, HostLink, Inbound, Outbound};
 use crate::types;
+use crate::v8::exceptions::error_message_from_value;
 use crate::v8::globals::{throw_v8_error, v8_error_value};
-use crate::v8::{
-    CURRENT_RUN_TOKEN, RUN_TABLE_PTR, RunError, RunState, attributed_state,
-    error_message_from_value, slot_table,
-};
+use crate::v8::runtable::{CURRENT_RUN_TOKEN, RUN_TABLE_PTR, attributed_state, slot_table};
+use crate::v8::{RunError, RunState};
 
 // ── Streamed host-type bodies ────────────────────────────────────────────────
 

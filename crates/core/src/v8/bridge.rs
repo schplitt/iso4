@@ -14,15 +14,18 @@ use crate::types;
 use crate::types::{
     BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule,
 };
+use crate::v8::exceptions::{
+    RESERVED_ERROR_KEYS, copy_own_properties_except, error_fields_from_value,
+    error_message_from_value, error_name_from_value, exception_fields, exception_message,
+    exception_name, exception_stack, runtime_error_from_value,
+};
 use crate::v8::globals::{check_not_reserved, define_global, eval_script, throw_v8_error};
 use crate::v8::isolate::{ReasonCell, TerminationReason};
+use crate::v8::runtable::{RunTable, attributed_state};
 use crate::v8::streams::ResultStreamMode;
 use crate::v8::{
-    FailureOutput, RESERVED_ERROR_KEYS, RunError, RunFacts, RunPhase, RunState, RunTable,
-    RuntimeErrorData, ScanOutcome, attributed_state, build_output_and_maybe_grace,
-    copy_own_properties_except, elapsed_ms, error_fields_from_value, error_message_from_value,
-    error_name_from_value, exception_fields, exception_message, exception_name, exception_stack,
-    runtime_error_from_value,
+    FailureOutput, RunError, RunFacts, RunPhase, RunState, RuntimeErrorData, ScanOutcome,
+    build_output_and_maybe_grace, elapsed_ms,
 };
 
 // ── Bridge call log ──────────────────────────────────────────────────────────
@@ -511,7 +514,7 @@ pub(super) type PendingResolvers = Arc<Mutex<HashMap<u32, PendingResolver>>>;
 /// instance (`globalThis.saved = fetch`) — so the pointee must outlive every
 /// call, not just the one that installed it. The slot carries only identity:
 /// the stub name and the instance's run table. The per-run half (link,
-/// counters, limits) lives in the calling run's [`super::RunCallState::stubs`] map,
+/// counters, limits) lives in the calling run's [`super::runtable::RunCallState::stubs`] map,
 /// resolved per invocation by the attributed token — so one Function object
 /// serves every run that binds the name, each with its own state, and a run
 /// that did not bind it gets a catchable error instead of a stale dispatch.
