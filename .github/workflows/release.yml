@@ -69,6 +69,15 @@ jobs:
         with:
           node-version: 26
       - run: node scripts/prepare-v8.ts
+      # V8's bundled libc++ headers need a newer clang than these images default to.
+      - if: matrix.platform == 'darwin-x64'
+        run: |
+          brew install llvm@21
+          echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
+      - if: matrix.platform == 'linux-arm64-gnu'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
       - run: |
           cargo build --release \
             --manifest-path native/v8-runtime/Cargo.toml
