@@ -14,10 +14,10 @@ differently or not at all.
 
 Inside, the engine owns:
 
-- **Isolates and limits** (`v8/mod.rs`, `v8/isolate.rs`, `v8/guard.rs`): one OS
-  thread per isolate, heap limits, CPU budgets that stop counting while the
-  run waits on the host, wall deadlines on a shared watchdog thread, the
-  turn loop that drives a run.
+- **Isolates and limits** (`v8/runloop.rs`, `v8/instance.rs`, `v8/isolate.rs`,
+  `v8/guard.rs`): one OS thread per isolate, heap limits, CPU budgets that
+  stop counting while the run waits on the host, wall deadlines on a shared
+  watchdog thread, the turn loop that drives a run.
 - **The prefix store and warm instances** (`prefix.rs`, `warm.rs`,
   `engine.rs`): a prepared prefix is kept as source, evaluated per isolate,
   and served by resident warm instances that skip that evaluation on reuse.
@@ -46,8 +46,10 @@ network policy; `fetch` is a host-configured bridge global like any other.
 - `src/types.rs` re-exports `iso4-types`, so the modules keep saying
   `crate::types`.
 - `src/errors.rs` holds `RunError`, the failure output and the error codes.
-- `src/v8/` is the engine: `mod.rs` holds the run entry points and the turn
-  loop; `isolate.rs` creates isolates and warm instance cores;
+- `src/v8/` is the engine: `mod.rs` only lists the modules and re-exports;
+  `runloop.rs` holds the run entry points and the turn loop; `instance.rs`
+  the owner thread that serves a warm instance; `isolate.rs` creates
+  isolates and warm instance cores;
   `runtable.rs` keys everything a native callback reaches by the owning run
   and carries that run's token through its continuations; `exceptions.rs`
   turns thrown V8 values into `RunError`s;

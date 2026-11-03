@@ -2,6 +2,8 @@
 //! the reserved-name check, script evaluation helpers, and the `waitUntil`
 //! native with its `iso4:runtime` module.
 
+use std::cell::RefCell;
+
 use crate::blob;
 use crate::errors::codec_error_to_run_error;
 use crate::types::HostGlobalDef;
@@ -341,8 +343,28 @@ pub(super) fn v8_error_value<'s>(
     v8::Exception::type_error(scope, msg)
 }
 
+/// Background work registered by `waitUntil`.
+///
+/// Instance-lifetime storage with a stable heap address (same pattern as the
+/// console's `LogBuffers`): the native callback reaches it through an
+/// `External`. `slot` is `None` outside run code — setup evaluation, between
+/// calls — so a prepare()-time `waitUntil` throws a catchable error; it is
+/// armed with an empty set at the setup-to-run boundary (the same line where
+/// codegen-from-strings switches off) and disarmed after the run.
+pub struct PendingWork {
+    pub(super) slot: RefCell<Option<Vec<v8::Global<v8::Promise>>>>,
+}
+
+impl PendingWork {
+    pub(super) fn boxed() -> Box<Self> {
+        Box::new(Self {
+            slot: RefCell::new(None),
+        })
+    }
+}
+
 /// Install the `waitUntil` global: a native function pushing its
-/// argument into the run's [`super::PendingWork`] set. Installed non-enumerable like
+/// argument into the run's [`PendingWork`] set. Installed non-enumerable like
 /// the web classes (convention), reserved as a name, and additionally
 /// stashed under a registry symbol for the `iso4:runtime` re-export.
 pub(crate) fn install_wait_until(scope: &mut v8::PinScope) -> Result<(), RunError> {

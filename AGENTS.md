@@ -71,7 +71,9 @@ iso4/                              ← workspace root
         engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
         prefix.rs                  ← stored prefix shape, rebind validation
         v8/                        ← the engine core
-          mod.rs                   ← run entry points, contexts, the turn loop
+          mod.rs                   ← module list and re-exports only
+          runloop.rs               ← run entry points, run I/O, the turn loop, output assembly, run_call_on_core
+          instance.rs              ← the owner thread serving a warm instance: queue, deadlines, completions, taint sweep
           isolate.rs               ← isolate creation: platform, limits, budgets, warm InstanceCore
           runtable.rs              ← per-run state table, run tokens, attribution, the load meter, the CPED rider
           exceptions.rs            ← thrown V8 values to RunError: capped text, syntax errors, error fields
@@ -79,7 +81,7 @@ iso4/                              ← workspace root
           console.rs               ← console.* capture: wrapped methods, rendering, per-run buffers
           timers.rs                ← setTimeout/clearTimeout natives and the timer turn
           guard.rs                 ← limit guard: per-turn CPU/wall deadlines on one watchdog thread
-          globals.rs               ← host globals installed natively, reserved names, waitUntil + iso4:runtime
+          globals.rs               ← host globals installed natively, reserved names, waitUntil + PendingWork, iso4:runtime
           modules.rs               ← prefix evaluation, module resolver, native host modules, export extraction
           bridge.rs                ← bridge globals and trampolines, stubs, bridge errors, host → sandbox calls
           streams.rs               ← streamed bodies both ways: hydration, credit, pulls, delivery

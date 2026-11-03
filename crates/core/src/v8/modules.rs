@@ -20,10 +20,8 @@ use crate::v8::globals::{
     ISO4_RUNTIME_MODULE_SRC, ISO4_RUNTIME_SPECIFIER, eval_script, install_value_globals,
 };
 use crate::v8::node::async_hooks::{ASYNC_HOOKS_MODULE_SRC, ASYNC_HOOKS_SPECIFIER};
-use crate::v8::{
-    RunError, RunFacts, RunState, RuntimeErrorData, ScanOutcome, build_output_and_maybe_grace,
-    finished,
-};
+use crate::v8::runloop::{RunFacts, RunState, ScanOutcome, build_output_and_maybe_grace, finished};
+use crate::v8::{RunError, RuntimeErrorData};
 
 /// Extract and serialize a settled module's exports, then finish (or start
 /// grace). The guards stay armed through extraction and serialization: V8's
