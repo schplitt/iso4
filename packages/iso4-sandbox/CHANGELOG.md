@@ -1,51 +1,5 @@
 # @iso4/sandbox
 
-## 0.9.0
-
-### Minor Changes
-
-- 40d5af6: feat(sandbox): prepare() no longer evaluates the prefix, and `ERR_COMPILE` is gone
-
-  `prepare()` stores the prefix without booting an isolate; a broken prefix now fails its first `execute()`/`call()` as an `{ ok: false }` result with the same codes it used to reject with. A syntax error anywhere reports as `ERR_USER_CODE` with `name: 'SyntaxError'` instead of `ERR_COMPILE`, with the file and line in `stack`. Runs that joined an instance whose cold start failed now get that failure instead of hanging.
-
-- da58eef: feat(native): name the run and prefix on stderr before a fatal V8 OOM abort
-
-  The runtime child now prints `[iso4-v8] fatal: V8 out of memory … in run <id> of prefix <id> …` before V8 aborts the process. V8's own `Fatal JavaScript out of memory` block no longer appears; the line above carries its message.
-
-- 3a17960: feat(sandbox): remember a prefix whose cold start failed and refuse later runs with `ERR_PREFIX_BROKEN`
-
-  The failing run's error now carries `stage: 'prefix'`, `Prefix` gains `status` and `error`, and later runs reject with `ERR_PREFIX_BROKEN` (`cause` = the stored failure) instead of booting an isolate that fails again. Only the prefix's own repeatable errors mark it; `ERR_WARMUP_LIMIT` and `ERR_MEMORY_LIMIT` do not.
-
-- f22f390: feat(sandbox): `prepare({ limits })` is the default limits for every run on that prefix
-
-  A run's own `limits` overrides them field by field. The option used to be ignored.
-
-### Patch Changes
-
-- f5e0561: fix(sandbox): refuse arrays with holes in bridge call arguments (#219)
-
-  A bridge global or import called with a holey array anywhere in its arguments now rejects with a catchable `TypeError` before the host handler runs.
-
-- ad5edf7: fix(native): cap error text copied out of V8 at 64 Ki UTF-16 units (#250)
-
-  A huge thrown message, stack or console line no longer crashes the runtime; the copied text ends with `… [truncated by iso4: N UTF-16 units total]`.
-
-- 77a45d5: fix(sandbox): name the missing module in `ERR_MODULE_NOT_FOUND` and report other import failures as the new `ERR_IMPORT`
-
-  Dynamic `import()` now ends the run with `ERR_IMPORT` instead of throwing a catchable error, and co-resident runs on the same instance get `ERR_INSTANCE_RESET` with the new cause `'unsupported'`.
-
-- a31c818: fix(sandbox): settle sync-call microtasks within the call, fix kill precedence and a multibyte grace crash
-
-  Microtasks a synchronous `prefix.call` queues now settle inside that call instead of the next one, a CPU/wall/memory kill wins over a bridge error raised in the same turn, and a multibyte `waitUntil` error no longer crashes the runtime. An uncloneable bridge argument is now `ERR_EXPORT_NOT_SERIALIZABLE` (was `ERR_INTERNAL`).
-
-- 8f76953: perf(native): freeze V8's own clock instead of shimming Date, Intl and Temporal
-
-  `Date`, `Intl.DateTimeFormat` and `Temporal.Now` are now the unmodified V8 builtins (`[native code]`); the frozen-clock behavior is unchanged.
-
-- 802e246: perf(native): boot every sandbox from a build-time V8 snapshot (#83)
-
-  The runtime's built-in JavaScript is no longer compiled and run for each new sandbox, so one-off runs and cold starts are faster. Nothing changes for guest code.
-
 ## 0.8.1
 
 ### Patch Changes
