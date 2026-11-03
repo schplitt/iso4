@@ -71,12 +71,14 @@ iso4/                              ← workspace root
         engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
         prefix.rs                  ← stored prefix shape, rebind validation
         v8/                        ← the engine core
-          mod.rs                   ← isolates, contexts, the turn loop, bridge, streams
+          mod.rs                   ← isolates, contexts, the turn loop
           console.rs               ← console.* capture: wrapped methods, rendering, per-run buffers
           timers.rs                ← setTimeout/clearTimeout natives and the timer turn
           guard.rs                 ← limit guard: per-turn CPU/wall deadlines on one watchdog thread
           globals.rs               ← host globals installed natively, reserved names, waitUntil + iso4:runtime
           modules.rs               ← prefix evaluation, module resolver, native host modules, export extraction
+          bridge.rs                ← bridge globals and trampolines, stubs, bridge errors, host → sandbox calls
+          streams.rs               ← streamed bodies both ways: hydration, credit, pulls, delivery
           testsupport.rs           ← test-only run shorthands + the in-memory host end of a link
         warm.rs                    ← warm-instance registry
         link.rs                    ← HostLink/Observer traits, Outbound/Inbound messages (the engine's only way out)

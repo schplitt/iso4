@@ -172,7 +172,7 @@ pub(crate) fn response_shell_ctor(
 
 /// Private-symbol key under which `install` stashes the body-stream factory
 /// the web runtime returns (for hydrating streamed host bodies). Read by the
-/// codec's rehydration path in `v8.rs`.
+/// codec's rehydration path in `v8/streams.rs`.
 pub const BODY_STREAM_FACTORY_KEY: &str = "iso4::bodyStreamFactory";
 
 /// The isolate's frozen clock: the value V8 returns for `Date.now()`, no-arg
@@ -265,7 +265,7 @@ pub fn delete_removed_globals(scope: &mut v8::PinScope) -> Result<(), String> {
 ///
 /// Runs once, at snapshot creation (`snapshot.rs`); every context boots with
 /// them already in place. `stream_read` and `stream_cancel` are the native
-/// callbacks backing streamed host bodies (built in `v8.rs`).
+/// callbacks backing streamed host bodies (built in `v8/streams.rs`).
 pub fn install_with_streams(
     scope: &mut v8::PinScope,
     stream_read: v8::Local<v8::Value>,
@@ -307,7 +307,7 @@ pub fn install_with_streams(
 
     // The construction-time stream-body stamp (context-free, so it is built
     // here for every install path — prefix validation included).
-    let stamp = v8::Function::builder(crate::v8::stamp_stream_body_callback)
+    let stamp = v8::Function::builder(crate::v8::streams::stamp_stream_body_callback)
         .build(scope)
         .ok_or_else(|| "create stampStreamBody failed".to_string())?;
     factory_args.push(v8::Local::<v8::Value>::from(stamp));
