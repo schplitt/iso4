@@ -16,13 +16,14 @@ pub use instance::{
     completion_message, finish_job, finish_run, note_turn_owner, send_completion, serve_instance,
 };
 pub use isolate::{
-    CpuBudget, InstanceCore, Limits, create_instance_core, init_platform, set_idle_settle_secs,
+    CpuBudget, InstanceCore, Limits, PrefixSpec, WARMUP_CPU_MS, WARMUP_WALL_MS,
+    create_instance_core, init_platform, set_idle_settle_secs,
 };
 pub use oom_label::{OomRun, OomRunLabel, set_oom_prefix_id, set_oom_run};
 pub use runloop::{
-    CallJob, CallOutcome, EpilogueSpec, GraceReport, GraceStatus, Output, PrefixSpec, ReleaseHook,
-    RoutedEvent, RunEvent, RunEventSender, RunIo, WARMUP_CPU_MS, WARMUP_WALL_MS, execute,
-    execute_with_io, execute_with_prefix, run_call_on_core, set_run_epilogue_spec,
+    CallJob, CallOutcome, EpilogueSpec, GraceReport, GraceStatus, Output, ReleaseHook, RoutedEvent,
+    RunEvent, RunEventSender, RunIo, execute, execute_with_io, execute_with_prefix,
+    run_call_on_core, set_run_epilogue_spec,
 };
 pub use runtable::{InstanceLoad, RunTable, alloc_run_token, load_now_ms};
 pub use streams::{

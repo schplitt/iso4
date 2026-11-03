@@ -18,10 +18,8 @@ use crate::v8::exceptions::{
     exception_name, exception_stack, runtime_error_from_value,
 };
 use crate::v8::globals::{check_not_reserved, define_global, eval_script, throw_v8_error};
-use crate::v8::isolate::{ReasonCell, TerminationReason};
-use crate::v8::runloop::{
-    RunFacts, RunPhase, RunState, ScanOutcome, build_output_and_maybe_grace, elapsed_ms,
-};
+use crate::v8::isolate::{ReasonCell, TerminationReason, elapsed_ms};
+use crate::v8::runloop::{RunFacts, RunPhase, RunState, ScanOutcome, build_output_and_maybe_grace};
 use crate::v8::runtable::{RunTable, attributed_state};
 use crate::v8::streams::ResultStreamMode;
 use crate::v8::{FailureOutput, RunError, RuntimeErrorData};
