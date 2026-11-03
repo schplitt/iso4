@@ -39,7 +39,7 @@ libc = "0.2"
 # time (C++20; every toolchain we build on qualifies).
 ada-url = "4"
 
-# Unicode XID tables for the host-module export name check (widened to ID in v8.rs).
+# Unicode XID tables for the host-module export name check (widened to ID in v8/modules.rs).
 unicode-ident = "1"
 
 # build.rs compiles the runtime modules to create the startup snapshot, so it
