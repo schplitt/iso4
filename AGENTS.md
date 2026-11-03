@@ -71,7 +71,9 @@ iso4/                              ← workspace root
         engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
         prefix.rs                  ← stored prefix shape, rebind validation
         v8/                        ← the engine core
-          mod.rs                   ← isolates, contexts, the turn loop
+          mod.rs                   ← run entry points, contexts, the turn loop
+          isolate.rs               ← isolate creation: platform, limits, budgets, warm InstanceCore
+          oom_label.rs             ← the fatal OOM line: what this thread was running when V8 aborts
           console.rs               ← console.* capture: wrapped methods, rendering, per-run buffers
           timers.rs                ← setTimeout/clearTimeout natives and the timer turn
           guard.rs                 ← limit guard: per-turn CPU/wall deadlines on one watchdog thread
@@ -85,7 +87,7 @@ iso4/                              ← workspace root
         snapshot.rs                ← build-time startup snapshot: create, boot, external refs
         clock_platform.cc          ← V8 platform whose wall clock is the isolate's frozen clock
         policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader
-        types.rs, errors.rs        ← re-export of iso4-types; RunError codes/names/messages
+        types.rs, errors.rs        ← re-export of iso4-types; RunError, FailureOutput, codes/names/messages
         blob.rs, webcodec.rs       ← V8 serialization, host-type descriptors
         webtypes.rs, webtypes.js   ← web globals installed into the snapshot
     server/                        ← iso4-server (bin iso4-v8): the socket frontend for Node
@@ -269,7 +271,7 @@ When working on this project:
 11. **Keep protocol docs in sync with code** — Whenever a new `RunError`
     variant or `ERR_*` code is added, all four of the following must be
     updated in the same commit:
-    - `RunError` enum in `v8/mod.rs` (+ `RunError::code`/`name`/`message` in `errors.rs`)
+    - `RunError` enum and `RunError::code`/`name`/`message` in `errors.rs`
     - `RunErrorCode` union in `packages/iso4-sandbox/src/types.ts`
     - Error-code table in `docs/protocol.md` §7
     - Any relevant limits/semantics prose in `DESIGN.md` §4.1 (for limit

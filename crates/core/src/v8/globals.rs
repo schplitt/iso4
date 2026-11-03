@@ -3,11 +3,12 @@
 //! native with its `iso4:runtime` module.
 
 use crate::blob;
+use crate::errors::codec_error_to_run_error;
 use crate::types::HostGlobalDef;
 use crate::v8::streams::{stream_cancel_callback, stream_read_callback};
 use crate::v8::{
-    RunError, RuntimeErrorData, attributed_state, codec_error_to_run_error, exception_fields,
-    exception_message, exception_name, exception_stack, slot_table, syntax_error,
+    RunError, RuntimeErrorData, attributed_state, exception_fields, exception_message,
+    exception_name, exception_stack, slot_table, syntax_error,
 };
 
 // ── Value globals (native install) ────────────────────────────────────────────
