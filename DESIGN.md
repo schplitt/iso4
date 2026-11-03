@@ -587,7 +587,7 @@ The `RESERVED_WORDS` set (same entry) is the other half: names that cannot be
 a binding in module source (reserved words plus strict-mode `eval` and
 `arguments`). A host-module key under one is refused before the run, except
 `default`, which maps to the module's default export (iso4 emits
-`export default`). `is_valid_export_identifier` in `v8.rs` mirrors
+`export default`). `is_valid_export_identifier` in `v8/mod.rs` mirrors
 the list.
 
 Any string is a valid host global name; `ERR_RESERVED_NAME` is the only
@@ -1534,6 +1534,7 @@ iso4/
     core/                           ← iso4-core (lib): the engine
       build.rs                      ← snapshot + clock_platform.cc, core modules only
       src/
+        v8/                         ← the engine core: isolates, turn loop, bridge, console, timers, guard
     server/                         ← iso4-server (bin iso4-v8): socket frontend for Node
       src/
   scripts/

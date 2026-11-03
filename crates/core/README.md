@@ -14,17 +14,18 @@ differently or not at all.
 
 Inside, the engine owns:
 
-- **Isolates and limits** (`v8.rs`): one OS thread per isolate, heap limits,
-  CPU budgets that stop counting while the run waits on the host, wall
-  deadlines on a shared watchdog thread, the turn loop that drives a run.
+- **Isolates and limits** (`v8/mod.rs`, `v8/guard.rs`): one OS thread per
+  isolate, heap limits, CPU budgets that stop counting while the run waits
+  on the host, wall deadlines on a shared watchdog thread, the turn loop that
+  drives a run.
 - **The prefix store and warm instances** (`prefix.rs`, `warm.rs`,
   `engine.rs`): a prepared prefix is kept as source, evaluated per isolate,
   and served by resident warm instances that skip that evaluation on reuse.
 - **Capacity policy** (`policy.rs`, `container.rs`, `rss.rs`): eviction and
   admission decisions against the container's memory, measured from the
   cgroup where one exists.
-- **The web runtime** (`webtypes.rs`, `webtypes.js`, `url.rs`, console and
-  timers in `v8.rs`): the globals every isolate gets, installed natively into
+- **The web runtime** (`webtypes.rs`, `webtypes.js`, `url.rs`, `v8/console.rs`,
+  `v8/timers.rs`): the globals every isolate gets, installed natively into
   the build-time snapshot (`snapshot.rs`, built by `build.rs`).
 - **The value codec** (`blob.rs`, `webcodec.rs`): V8 serialization for
   everything that crosses the sandbox boundary, plus the descriptors for
@@ -43,6 +44,11 @@ network policy; `fetch` is a host-configured bridge global like any other.
 - `src/lib.rs` lists the modules and embeds the snapshot `build.rs` makes.
 - `src/types.rs` re-exports `iso4-types`, so the modules keep saying
   `crate::types`.
+- `src/v8/` is the engine: `mod.rs` holds isolates, the turn loop, the
+  bridge and streams; `console.rs`, `timers.rs` and `guard.rs` hold the
+  console capture, the guest timers and the limit guard; `testsupport.rs`
+  (test only) holds the run shorthands and the in-memory host end of a
+  link that every engine test module uses.
 - `benches/micro.rs` is the criterion suite CodSpeed runs in CI.
 - `tests/wpt/` is the vendored web-platform-tests URL corpus the `URL` tests
   run against.
@@ -51,9 +57,10 @@ network policy; `fetch` is a host-configured bridge global like any other.
 
 `pnpm test:native` from the repo root, or
 `cargo test --manifest-path crates/Cargo.toml -p iso4-core`. The tests drive
-runs through an in-memory `HostLink` (`ChannelLink`) and never touch a
-socket. The `test-support` feature exposes `testval`, a test-only value tree
-for asserting on serialized blobs from other crates' tests.
+runs through an in-memory `HostLink` (`ChannelLink` in `link.rs`, wired up
+by `test_io` in `v8/testsupport.rs`) and never touch a socket. The
+`test-support` feature exposes `testval`, a test-only value tree for
+asserting on serialized blobs from other crates' tests.
 
 ## Read next
 

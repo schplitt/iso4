@@ -70,7 +70,12 @@ iso4/                              ← workspace root
         lib.rs                     ← module list, SNAPSHOT_BLOB, new_platform
         engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
         prefix.rs                  ← stored prefix shape, rebind validation
-        v8.rs                      ← isolates, contexts, prefix evaluation, limits
+        v8/                        ← the engine core
+          mod.rs                   ← isolates, contexts, prefix evaluation, the turn loop, bridge, streams
+          console.rs               ← console.* capture: wrapped methods, rendering, per-run buffers
+          timers.rs                ← setTimeout/clearTimeout natives and the timer turn
+          guard.rs                 ← limit guard: per-turn CPU/wall deadlines on one watchdog thread
+          testsupport.rs           ← test-only run shorthands + the in-memory host end of a link
         warm.rs                    ← warm-instance registry
         link.rs                    ← HostLink/Observer traits, Outbound/Inbound messages (the engine's only way out)
         snapshot.rs                ← build-time startup snapshot: create, boot, external refs
@@ -115,7 +120,7 @@ The two-process dynamic runtime package (`@iso4/sandbox`). Owns:
   header/URL/method validation, body size cap, no-auto-redirect default.
   Anything that is not policy.
 - Runtime-owned sandbox shims where explicitly designed. `console.*` capture
-  is one of them and it ships as native V8 callbacks in `v8.rs`
+  is one of them and it ships as native V8 callbacks in `v8/console.rs`
   (`install_console`), buffered per call and returned with the run's result —
   never an inline JS prelude.
 
@@ -260,7 +265,7 @@ When working on this project:
 11. **Keep protocol docs in sync with code** — Whenever a new `RunError`
     variant or `ERR_*` code is added, all four of the following must be
     updated in the same commit:
-    - `RunError` enum in `v8.rs` (+ `RunError::code`/`name`/`message` in `errors.rs`)
+    - `RunError` enum in `v8/mod.rs` (+ `RunError::code`/`name`/`message` in `errors.rs`)
     - `RunErrorCode` union in `packages/iso4-sandbox/src/types.ts`
     - Error-code table in `docs/protocol.md` §7
     - Any relevant limits/semantics prose in `DESIGN.md` §4.1 (for limit
@@ -319,7 +324,7 @@ learned during development.
   for dev-dep versions. Reference deps as `"catalog:"` in package.json,
   not hard-coded versions.
 - Node 24+ is required; `mise.toml` pins to 26 for development. CI uses 26.
-- Engine tests never touch a socket: `test_io()` in `v8.rs` tests gives a run an in-memory `HostLink` (`ChannelLink`) plus a `TestHost` that reads its `Outbound` messages and sends `Inbound` ones. `spawn_responder` receives and discards one message before calling the `respond` closure; a responder that must answer several calls uses `drain_bridge_calls` instead (see `bridge_call_exactly_at_limit_succeeds`). Every `CallJob` with a link also answers on it (`Outbound::Result`, or `Outbound::RunComplete` after an early Result), so a test that reads messages after another run finished must consume that run's completion first.
+- Engine tests never touch a socket: `test_io()` in `v8/testsupport.rs` gives a run an in-memory `HostLink` (`ChannelLink`) plus a `TestHost` that reads its `Outbound` messages and sends `Inbound` ones. `spawn_responder` receives and discards one message before calling the `respond` closure; a responder that must answer several calls uses `drain_bridge_calls` instead (see `bridge_call_exactly_at_limit_succeeds`). Every `CallJob` with a link also answers on it (`Outbound::Result`, or `Outbound::RunComplete` after an early Result), so a test that reads messages after another run finished must consume that run's completion first.
 - The TS test suite should be green with zero failing tests. Run
   `pnpm test:run` for the live pass/skip counts — do not trust a hard-coded
   number here, it goes stale as PRs land. Any failure after a change is a

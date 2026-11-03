@@ -27,8 +27,8 @@ fn external_references() -> &'static [v8::ExternalReference] {
     &REFS
         .get_or_init(|| {
             let functions: [v8::FunctionCallback; 15] = [
-                crate::v8::console_stdout_callback.map_fn_to(),
-                crate::v8::console_stderr_callback.map_fn_to(),
+                crate::v8::console::console_stdout_callback.map_fn_to(),
+                crate::v8::console::console_stderr_callback.map_fn_to(),
                 crate::webtypes::headers_shell_ctor.map_fn_to(),
                 crate::webtypes::request_shell_ctor.map_fn_to(),
                 crate::webtypes::response_shell_ctor.map_fn_to(),
@@ -40,8 +40,8 @@ fn external_references() -> &'static [v8::ExternalReference] {
                 crate::v8::async_context_get_callback.map_fn_to(),
                 crate::v8::async_context_set_callback.map_fn_to(),
                 crate::v8::wait_until_callback.map_fn_to(),
-                crate::v8::set_timeout_callback.map_fn_to(),
-                crate::v8::clear_timeout_callback.map_fn_to(),
+                crate::v8::timers::set_timeout_callback.map_fn_to(),
+                crate::v8::timers::clear_timeout_callback.map_fn_to(),
             ];
             // The webtypes.js source restores as an external string pointing
             // into the binary. Null-terminated up front, so CreateParams never
@@ -90,11 +90,11 @@ pub fn create() -> Vec<u8> {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        crate::v8::install_console(scope).expect("install console");
+        crate::v8::console::install_console(scope).expect("install console");
         crate::v8::install_web_runtime(scope).expect("install web runtime");
         crate::v8::install_async_context(scope).expect("install AsyncLocalStorage");
         crate::v8::install_wait_until(scope).expect("install waitUntil");
-        crate::v8::install_timers(scope).expect("install timers");
+        crate::v8::timers::install_timers(scope).expect("install timers");
         scope.set_default_context(context);
     }
     let blob = isolate
