@@ -90,7 +90,7 @@ jobs:
         run: cd native/v8-runtime && cargo codspeed build
 
       - name: Run benchmarks
-        uses: CodSpeedHQ/action@d4c3ecc6c52771046d80d8575a8d9e6487fda279 # v5.0.3
+        uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
           mode: simulation
           run: |
