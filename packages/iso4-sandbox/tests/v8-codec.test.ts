@@ -5,7 +5,7 @@
  *
  * These are the bytes that cross the socket in both directions, so what this
  * file asserts is the value contract of the protocol (`docs/protocol.md` §4).
- * The Rust mirror of this suite lives in `native/v8-runtime/src/blob.rs`.
+ * The Rust mirror of this suite lives in `crates/core/src/blob.rs`.
  */
 
 import { Buffer } from 'node:buffer'

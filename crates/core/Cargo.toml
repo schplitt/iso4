@@ -1,22 +1,15 @@
 [package]
-name = "iso4-v8-runtime"
+name = "iso4-core"
 version = "0.0.0"
 edition = "2021"
-description = "V8 host process for iso4 — runs sandboxed JavaScript with memory/CPU limits over a Unix domain socket"
+description = "The iso4 engine: V8 isolates with memory/CPU limits, the warm registry, the prefix store. Encodes nothing, owns no socket"
 license = "MIT"
 publish = false
 
-[[bin]]
-name = "iso4-v8"
-path = "src/main.rs"
-# `cargo bench` must run only the criterion target below — the default
-# libtest harness rejects criterion's `--output-format bencher` flag.
-bench = false
-
-# Lib target so `benches/` can reach the wire codec and V8 helpers.
-# Nothing outside this repository links it (publish = false above).
+# Lib target: `server` links it; `benches/` reaches the value codec and V8
+# helpers. Nothing outside this repository links it (publish = false above).
 [lib]
-name = "iso4_v8_runtime"
+name = "iso4_core"
 path = "src/lib.rs"
 bench = false
 
@@ -24,15 +17,18 @@ bench = false
 name = "micro"
 harness = false
 
+[features]
+# Test values for other crates' tests (`testval.rs`); never on in a build.
+test-support = ["iso4-types/test-support"]
+
 [dependencies]
+iso4-types = { path = "../types" }
+
 # Embedded V8 via the official rusty_v8 crate
 v8 = "152.2"
 
-# Lock-free channels between session, writer, and timeout threads
+# Lock-free channels between the run threads and the watchdog
 crossbeam-channel = "0.5"
-
-# Async-signal-safe SIGTERM/SIGINT handling via self-pipe
-signal-hook = "0.3"
 
 # POSIX bits: fcntl, pipe, poll, FD_CLOEXEC
 libc = "0.2"
@@ -49,6 +45,7 @@ unicode-ident = "1"
 # build.rs compiles the runtime modules to create the startup snapshot, so it
 # needs every dependency they use.
 [build-dependencies]
+iso4-types = { path = "../types" }
 v8 = "152.2"
 # Compiles src/clock_platform.cc against the vendored V8 headers.
 cc = "1"
@@ -58,20 +55,10 @@ ada-url = "4"
 unicode-ident = "1"
 
 [dev-dependencies]
+iso4-types = { path = "../types", features = ["test-support"] }
 # Wall-time microbenchmarks (benches/micro.rs). Plots and rayon disabled:
 # CI only needs `--output-format bencher` text output.
-# CodSpeed drop-in layer: plain `cargo bench` behaves like criterion (so
-# bench.yml's bencher output is unchanged); under `cargo codspeed run` in CI
-# the same benches are measured by instrumentation (.github/workflows/codspeed.yml).
+# CodSpeed drop-in layer: plain `cargo bench` behaves like criterion; under
+# `cargo codspeed run` in CI the same benches are measured by instrumentation
+# (.github/workflows/codspeed.yml).
 criterion = { package = "codspeed-criterion-compat", version = "5.0", default-features = false, features = ["cargo_bench_support"] }
-
-[profile.release]
-# LTO and panic=abort produce a smaller, faster binary with no unwinding tables
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-
-# Patched v8, unpacked by scripts/prepare-v8.ts (run `pnpm prepare:v8` first).
-[patch.crates-io]
-v8 = { path = "vendor/v8" }

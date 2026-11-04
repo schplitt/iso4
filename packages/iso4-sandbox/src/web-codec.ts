@@ -2,7 +2,7 @@
  * Host-side codec for host types — `Headers`, `Request`, `Response`.
  *
  * Wire format: `docs/protocol.md` §4.4. The Rust counterpart is
- * `native/v8-runtime/src/webcodec.rs`.
+ * `crates/core/src/webcodec.rs`.
  *
  * ## The two directions use different mechanisms
  *
@@ -77,7 +77,7 @@ export class HostTypeError extends TypeError {
  * runtime rehydrates only descriptors this host actually stamped: inbound
  * structured data that happens to carry a brand-shaped key passes through as
  * the plain data it is. Wire contract: kept in sync with `BRAND_PREFIX` in
- * `native/v8-runtime/src/webcodec.rs`.
+ * `crates/core/src/webcodec.rs`.
  */
 export const BRAND_PREFIX = '__iso4_ht_'
 

@@ -2,7 +2,7 @@
  * Deterministic benchmark payloads, shared by all bench suites.
  *
  * Codec cost tracks **value count, not byte size**, so the matrix is chosen
- * by shape rather than size alone (mirrored by `native/v8-runtime/benches/`):
+ * by shape rather than size alone (mirrored by `crates/core/benches/`):
  *
  * - `sparse1k` — ~10 keys, long strings, ~750 B. A realistic analytics event.
  * - `dense1k`  — ~200 values, ~1.3 KB. Value-dense but small.

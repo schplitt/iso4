@@ -1,33 +1,17 @@
 //! Builds the V8 startup snapshot (`src/snapshot.rs`) into `OUT_DIR`, where
 //! `src/lib.rs` embeds it, and compiles the frozen-clock platform
-//! (`src/clock_platform.cc`). The runtime modules are compiled into this
-//! script so the snapshot's native callbacks are the binary's own.
+//! (`src/clock_platform.cc`). The engine modules the snapshot reaches are
+//! compiled into this script so its native callbacks are the crate's own.
 #![allow(warnings)]
 
 #[path = "src/blob.rs"]
 mod blob;
-#[path = "src/container.rs"]
-mod container;
 #[path = "src/cpuclock.rs"]
 mod cpuclock;
-#[path = "src/engine.rs"]
-mod engine;
 #[path = "src/errors.rs"]
 mod errors;
-#[path = "src/ipc.rs"]
-mod ipc;
 #[path = "src/link.rs"]
 mod link;
-#[path = "src/oom.rs"]
-mod oom;
-#[path = "src/policy.rs"]
-mod policy;
-#[path = "src/prefix.rs"]
-mod prefix;
-#[path = "src/rss.rs"]
-mod rss;
-#[path = "src/session.rs"]
-mod session;
 #[path = "src/snapshot.rs"]
 mod snapshot;
 #[path = "src/types.rs"]
@@ -36,14 +20,10 @@ mod types;
 mod url;
 #[path = "src/v8.rs"]
 mod v8;
-#[path = "src/warm.rs"]
-mod warm;
 #[path = "src/webcodec.rs"]
 mod webcodec;
 #[path = "src/webtypes.rs"]
 mod webtypes;
-#[path = "src/wire.rs"]
-mod wire;
 
 // Read only when an isolate boots, which never happens in this script.
 static SNAPSHOT_BLOB: &[u8] = &[];
@@ -65,7 +45,7 @@ fn main() {
 // matches the prebuilt librusty_v8.a (release profile). Those headers need a
 // recent clang++ (not g++), taken from PATH unless CXX is set.
 fn compile_clock_platform() {
-    let vendor = std::path::Path::new("vendor/v8");
+    let vendor = std::path::Path::new("../vendor/v8");
     let mut build = cc::Build::new();
     if std::env::var_os("CXX").is_none() {
         build.compiler("clang++");

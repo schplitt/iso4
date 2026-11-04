@@ -1496,7 +1496,7 @@ pub use crate::types::ResetCause;
 #[derive(Debug, Clone)]
 pub enum RunError {
     /// Payload bytes are not valid UTF-8.
-    /// Raised in session.rs when ipc parsing fails — not yet wired up.
+    /// For a frontend whose payload parsing fails — not yet wired up.
     #[allow(dead_code)]
     InvalidPayload(String),
     /// Uncaught exception thrown during execution.
@@ -2049,7 +2049,7 @@ pub type RunEventSender = crossbeam_channel::Sender<RoutedEvent>;
 pub enum RunIo {
     /// A private event channel (one-off runs): the frontend feeds this
     /// run's events; outbound messages go through its link.
-    Session {
+    Channel {
         events: crossbeam_channel::Receiver<RoutedEvent>,
         link: Arc<dyn HostLink>,
     },
@@ -2063,7 +2063,7 @@ pub enum RunIo {
 impl RunIo {
     pub fn link(&self) -> Option<Arc<dyn HostLink>> {
         match self {
-            RunIo::Session { link, .. } | RunIo::Instance { link } => Some(Arc::clone(link)),
+            RunIo::Channel { link, .. } | RunIo::Instance { link } => Some(Arc::clone(link)),
             RunIo::None => None,
         }
     }
@@ -2502,7 +2502,7 @@ fn begin_call(
         cancel_handle: ctx.cancel_handle,
     };
     let (source, link) = match std::mem::replace(&mut ctx.io, RunIo::None) {
-        RunIo::Session { events, link } => (Some(RunSource::Channel(events)), Some(link)),
+        RunIo::Channel { events, link } => (Some(RunSource::Channel(events)), Some(link)),
         RunIo::Instance { link } => (Some(RunSource::Instance), Some(link)),
         RunIo::None => (None, None),
     };
@@ -12291,7 +12291,7 @@ mod tests {
         let (link, out) = crate::link::channel_link();
         let (events_tx, events) = crossbeam_channel::unbounded();
         (
-            RunIo::Session { events, link },
+            RunIo::Channel { events, link },
             TestHost {
                 out,
                 events: events_tx,
@@ -12785,8 +12785,8 @@ mod tests {
     #[test]
     fn bridge_call_inbound_response_too_large_is_rejected() {
         // The per-run inbound allowance (soft_memory_mb) is enforced by the
-        // frontend before a message reaches the engine; session.rs tests
-        // cover the refusal. Here: a small response under a small budget
+        // frontend before a message reaches the engine; the server's
+        // session.rs tests cover the refusal. Here: a small response under a small budget
         // still arrives and the run succeeds.
         let (out, h) = run_with_bridge(
             "export default await myTool()",
@@ -16135,28 +16135,23 @@ mod tests {
             },
         )
         .unwrap_err();
-        let payload = crate::wire::encode_run_completion_payload(
-            1,
-            types::RunCompletion::Failure(types::RunFailurePayload {
-                error: failure.error.to_payload(),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                duration_ms: 0.0,
-                wall_time_ms: 0.0,
-                cpu_time_ms: 0.0,
-                bridge_calls: Vec::new(),
-                heap_used_bytes: None,
-            }),
-        );
-        let text = String::from_utf8_lossy(&payload);
+        let payload = failure.error.to_payload();
+        let stack = payload.stack.as_deref().unwrap_or_default();
         // Message and stack each carry exactly one marker, with the true length.
-        assert_eq!(text.matches("[truncated by iso4: ").count(), 2, "{}", text.len());
-        assert_eq!(
-            text.matches("… [truncated by iso4: 67108864 UTF-16 units total]").count(),
-            1
-        );
-        assert!(!text.contains("bytes total]"), "the wire clamp added no marker");
-        assert!(payload.len() < 2 * errors::MAX_ERROR_TEXT_BYTES);
+        assert_eq!(payload.message.matches("[truncated by iso4: ").count(), 1);
+        assert_eq!(stack.matches("[truncated by iso4: ").count(), 1);
+        assert!(payload
+            .message
+            .ends_with("… [truncated by iso4: 67108864 UTF-16 units total]"));
+        assert!(!stack.contains("67108864 UTF-16 units total"));
+        // Both fit the wire cap, so the frontend's clamp adds no marker.
+        for text in [payload.message.as_str(), stack] {
+            assert!(
+                matches!(errors::clamp_error_text(text), std::borrow::Cow::Borrowed(_)),
+                "{}",
+                text.len()
+            );
+        }
         assert_eq!(get_default(&run_ok("export default 1")).as_deref(), Some("1"));
     }
 

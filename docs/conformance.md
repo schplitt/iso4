@@ -295,7 +295,7 @@ be missed, and none is blocked by anything architectural.
 The behavior above is pinned by tests, not by prose:
 
 - Console surface, wrapped-versus-inert split, and prepare/run parity:
-  `native/v8-runtime/src/v8.rs`, the `Console capture` test block.
+  `crates/core/src/v8.rs`, the `Console capture` test block.
 - Frozen clock, including console timing inertness:
   `packages/iso4-sandbox/tests/clock.test.ts`.
 - Timers: `DESIGN.md` §7.8 and the timer tests in `src/v8.rs`.

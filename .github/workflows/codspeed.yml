@@ -4,7 +4,7 @@ name: CodSpeed
 # measurement, immune to runner noise. This is the only benchmark workflow:
 #
 #   - Covered here: everything that runs IN-PROCESS in the measured process —
-#     the Rust criterion micro suite (native/v8-runtime/benches/) and the
+#     the Rust criterion micro suite (crates/core/benches/) and the
 #     host-side codec benches (bench/codec.bench.ts). Push to main sets the
 #     baseline; every PR push gets a diff comment from the CodSpeed GitHub
 #     app, with ~1-2 % regression resolution.
@@ -57,7 +57,7 @@ jobs:
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: native/v8-runtime
+          workspaces: crates
 
       - name: Install cargo-codspeed
         uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # v2.9.4
@@ -87,12 +87,12 @@ jobs:
 
       # Build outside the instrumented step so compilation isn't measured.
       - name: Build benches (codspeed profile)
-        run: cd native/v8-runtime && cargo codspeed build
+        run: cd crates && cargo codspeed build
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@af75f77f17a054769abefaa42fe8dc2975469b5f # v5.6.3
         with:
           mode: simulation
           run: |
-            cd native/v8-runtime && cargo codspeed run && cd ../..
+            cd crates && cargo codspeed run && cd ..
             pnpm --filter @iso4/sandbox exec vitest bench --run codec

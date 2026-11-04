@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
-// Unpacks the pinned v8 crate into native/v8-runtime/vendor/v8 and applies
-// patches/v8-liveness.patch; Cargo.toml's [patch.crates-io] points there.
+// Unpacks the pinned v8 crate into crates/vendor/v8 and applies
+// crates/patches/v8-liveness.patch; the workspace [patch.crates-io] points there.
 import { Buffer } from 'node:buffer'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -13,11 +13,11 @@ import process from 'node:process'
 const VERSION = '152.2.0'
 const SHA256 = 'a10fe1a92da5c32c7c7f838ce36c0ccfcfd5edf0865b58bdde820aa64cea9888'
 
-const runtimeDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'native', 'v8-runtime')
-const vendorDir = join(runtimeDir, 'vendor')
+const cratesDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'crates')
+const vendorDir = join(cratesDir, 'vendor')
 const crateDir = join(vendorDir, 'v8')
 const stampPath = join(vendorDir, 'v8.stamp')
-const patchPath = join(runtimeDir, 'patches', 'v8-liveness.patch')
+const patchPath = join(cratesDir, 'patches', 'v8-liveness.patch')
 
 const stamp = `${VERSION} ${createHash('sha256').update(readFileSync(patchPath)).digest('hex')}`
 if (existsSync(crateDir) && existsSync(stampPath) && readFileSync(stampPath, 'utf8') === stamp)

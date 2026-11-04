@@ -398,7 +398,7 @@ describe('payload encoders', () => {
   // ── imports field wire encoding ────────────────────────────────────────
   // Each binding is `String specifier` + `u8 kind`: source modules (kind 0)
   // carry ESM text; host modules (kind 1) carry their shape as a data tree.
-  // The Rust parser is in `native/v8-runtime/src/ipc.rs`; the round-trip
+  // The Rust parser is in `crates/server/src/ipc.rs`; the round-trip
   // tests there mirror the layout asserted below.
 
   test('encodeRunPayload with one source import lays out specifier, kind, source', () => {

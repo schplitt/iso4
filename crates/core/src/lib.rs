@@ -1,24 +1,22 @@
-//! iso4-v8 library target.
+//! iso4-core: the engine behind the `iso4-v8` binary.
 //!
-//! The product is the `iso4-v8` binary (`src/main.rs`); this lib target
-//! exists so `benches/` (criterion, `cargo bench`) can reach the value codec
-//! and the V8 conversion helpers. It is `publish = false` and has no public
-//! API stability guarantees — nothing outside this repository links it.
+//! Isolates, limits, the turn loop, the warm registry, the prefix store, the
+//! web globals and the value codec. It encodes no frame and owns no socket:
+//! a frontend (`crates/server`) drives [`engine::Engine`] and answers through
+//! [`link::HostLink`]. `publish = false`, no API stability guarantees.
 
 pub mod blob;
 pub mod container;
 pub mod cpuclock;
 pub mod engine;
 pub mod errors;
-pub mod ipc;
 pub mod link;
 pub mod oom;
 pub mod policy;
 pub mod prefix;
 pub mod rss;
-pub mod session;
 pub mod snapshot;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod testval;
 pub mod types;
 pub mod url;
@@ -26,7 +24,6 @@ pub mod v8;
 pub mod warm;
 pub mod webcodec;
 pub mod webtypes;
-pub mod wire;
 
 /// The startup snapshot `build.rs` creates (see `snapshot.rs`).
 pub static SNAPSHOT_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin"));

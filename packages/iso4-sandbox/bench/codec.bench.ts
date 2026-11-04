@@ -4,7 +4,7 @@
  * costs.
  *
  * The Rust legs of the same codec live in
- * `native/v8-runtime/benches/micro.rs` (`v8_value` group).
+ * `crates/core/benches/micro.rs` (`v8_value` group).
  */
 
 import { Buffer } from 'node:buffer'

@@ -28,7 +28,7 @@ use std::os::unix::net::UnixStream;
 
 use std::sync::{Arc, Mutex};
 
-use crate::types::{
+use iso4_types::{
     resolve_heap_lines, BandPolicy, CallSpec, HostGlobalDef, HostModuleNode, ImportBinding,
     ImportModule, ImportRebind, PrefixRunRequest, ResourceLimits, RunRequest, TerminateMode,
     DEFAULT_CPU_TIME_MS, DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS,
@@ -111,7 +111,9 @@ pub enum RustToTsMessageType {
     Result = 0x02,
     /// Result of a `Precompile` request.
     PrecompileResult = 0x03,
-    /// Internal runtime diagnostic log (not sandbox stdout/stderr).
+    /// Internal runtime diagnostic log (not sandbox stdout/stderr). The
+    /// server never emits it; the byte stays reserved.
+    #[allow(dead_code)]
     Log = 0x04,
     /// Handshake acknowledgement — the first frame sent on a new connection,
     /// answering `Authenticate`.
@@ -170,6 +172,7 @@ pub struct TypedFrame<MessageType> {
 }
 
 pub type TsToRustFrame = TypedFrame<TsToRustMessageType>;
+#[cfg(test)]
 pub type RustToTsFrame = TypedFrame<RustToTsMessageType>;
 
 /// Parsed contents of an `Authenticate` payload.
@@ -188,12 +191,13 @@ pub struct AuthenticatePayload {
     /// Random per-sandbox descriptor token (`docs/protocol.md` §5.1). Host-
     /// emitted host-type descriptors are stamped with a brand key derived from
     /// it; the runtime rehydrates only descriptors carrying that key. Exactly
-    /// [`crate::webcodec::DESCRIPTOR_TOKEN_LEN`] bytes; the host sends the
+    /// [`iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN`] bytes; the host sends the
     /// same token on every connection of one sandbox.
     pub descriptor_token: Vec<u8>,
 }
 
 /// Read a single raw frame from `reader` using the default frame-length cap.
+#[cfg(test)]
 pub fn read_frame(reader: &mut impl Read) -> io::Result<Frame> {
     read_frame_with_limit(reader, DEFAULT_MAX_FRAME_LENGTH)
 }
@@ -264,6 +268,7 @@ fn read_until_eof(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// Read a single TS->Rust frame and validate its message type byte.
+#[cfg(test)]
 pub fn read_ts_to_rust_frame(reader: &mut impl Read) -> io::Result<TsToRustFrame> {
     let frame = read_frame(reader)?;
     Ok(TypedFrame {
@@ -273,6 +278,7 @@ pub fn read_ts_to_rust_frame(reader: &mut impl Read) -> io::Result<TsToRustFrame
 }
 
 /// Read a single Rust->TS frame and validate its message type byte.
+#[cfg(test)]
 pub fn read_rust_to_ts_frame(reader: &mut impl Read) -> io::Result<RustToTsFrame> {
     let frame = read_frame(reader)?;
     Ok(TypedFrame {
@@ -327,6 +333,7 @@ pub fn write_frame_with_limit(
 }
 
 /// Write a single TS->Rust frame using a validated message type.
+#[cfg(test)]
 pub fn write_ts_to_rust_frame(
     writer: &mut impl Write,
     message_type: TsToRustMessageType,
@@ -840,12 +847,12 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
             .try_into()
             .expect("bounds checked above"),
     ) as usize;
-    if token_len != crate::webcodec::DESCRIPTOR_TOKEN_LEN {
+    if token_len != iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "descriptor token must be exactly {} bytes, got {token_len}",
-                crate::webcodec::DESCRIPTOR_TOKEN_LEN
+                iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN
             ),
         ));
     }
@@ -871,6 +878,7 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
 
 /// Encode an `Authenticate` payload from structured fields — the inverse of
 /// `parse_authenticate_payload`, used by tests.
+#[cfg(test)]
 pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
     let mut payload =
         Vec::with_capacity(6 + auth.probe.len() + 4 + auth.descriptor_token.len());
@@ -1293,7 +1301,6 @@ pub struct PrecompilePayload {
     pub request_id: u32,
     pub code: String,
     pub filename: Option<String>,
-    pub limits: ResourceLimits,
     pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
 }
@@ -1304,14 +1311,13 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
     let request_id = r.read_u32()?;
     // Band-checked like the managed instances this prefix will get; the
     // limits are otherwise unused at Precompile.
-    let (code, filename, limits, globals) = parse_code_fields(&mut r, BandPolicy::Managed)?;
+    let (code, filename, _limits, globals) = parse_code_fields(&mut r, BandPolicy::Managed)?;
     let imports = r.read_import_bindings()?;
     r.assert_done()?;
     Ok(PrecompilePayload {
         request_id,
         code,
         filename,
-        limits,
         globals,
         imports,
     })
@@ -1373,7 +1379,6 @@ pub fn parse_terminate_payload(payload: &[u8]) -> io::Result<(u32, TerminateMode
 /// Unknown bytes should return `InvalidData`.
 /// Parsed `StreamChunk` payload: `u32 runId, u32 streamId, Bytes data`.
 pub struct StreamChunkPayload<'a> {
-    pub run_id: u32,
     pub stream_id: u32,
     pub data: &'a [u8],
 }
@@ -1386,7 +1391,7 @@ pub fn parse_stream_chunk_payload(payload: &[u8]) -> io::Result<StreamChunkPaylo
             "payload too short for StreamChunk",
         ));
     }
-    let run_id = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+    // Bytes 0..4 are the run id, routed from the raw frame.
     let stream_id = u32::from_be_bytes(payload[4..8].try_into().unwrap());
     let len = u32::from_be_bytes(payload[8..12].try_into().unwrap());
     if len > STREAM_CHUNK_MAX_BYTES {
@@ -1402,7 +1407,6 @@ pub fn parse_stream_chunk_payload(payload: &[u8]) -> io::Result<StreamChunkPaylo
         ));
     }
     Ok(StreamChunkPayload {
-        run_id,
         stream_id,
         data: &payload[12..],
     })
@@ -1411,7 +1415,6 @@ pub fn parse_stream_chunk_payload(payload: &[u8]) -> io::Result<StreamChunkPaylo
 /// Parsed `StreamEnd` payload: `u32 runId, u32 streamId, bool ok,
 /// Optional<String> error` (present when `ok = false`).
 pub struct StreamEndPayload {
-    pub run_id: u32,
     pub stream_id: u32,
     pub ok: bool,
     pub error: Option<String>,
@@ -1420,7 +1423,7 @@ pub struct StreamEndPayload {
 /// Parse a `StreamEnd` frame payload.
 pub fn parse_stream_end_payload(payload: &[u8]) -> io::Result<StreamEndPayload> {
     let mut r = PayloadReader::new(payload);
-    let run_id = r.read_u32()?;
+    r.read_u32()?; // run id, routed from the raw frame
     let stream_id = r.read_u32()?;
     let ok = r.read_bool()?;
     let error = if ok {
@@ -1439,7 +1442,6 @@ pub fn parse_stream_end_payload(payload: &[u8]) -> io::Result<StreamEndPayload> 
     };
     r.assert_done()?;
     Ok(StreamEndPayload {
-        run_id,
         stream_id,
         ok,
         error,
@@ -1490,7 +1492,6 @@ pub fn encode_stream_end_payload(
 /// Parsed `StreamPull` payload (host-granted outbound credit):
 /// `u32 runId, u32 streamId, u32 credit`.
 pub struct StreamPullPayload {
-    pub run_id: u32,
     pub stream_id: u32,
     pub credit: u32,
 }
@@ -1498,12 +1499,11 @@ pub struct StreamPullPayload {
 /// Parse a `StreamPull` frame payload.
 pub fn parse_stream_pull_payload(payload: &[u8]) -> io::Result<StreamPullPayload> {
     let mut r = PayloadReader::new(payload);
-    let run_id = r.read_u32()?;
+    r.read_u32()?; // run id, routed from the raw frame
     let stream_id = r.read_u32()?;
     let credit = r.read_u32()?;
     r.assert_done()?;
     Ok(StreamPullPayload {
-        run_id,
         stream_id,
         credit,
     })
@@ -1512,7 +1512,6 @@ pub fn parse_stream_pull_payload(payload: &[u8]) -> io::Result<StreamPullPayload
 /// Parsed `StreamCancel` payload (host cancelled an outbound stream):
 /// `u32 runId, u32 streamId, String reason`.
 pub struct StreamCancelPayload {
-    pub run_id: u32,
     pub stream_id: u32,
     pub reason: String,
 }
@@ -1520,12 +1519,11 @@ pub struct StreamCancelPayload {
 /// Parse a `StreamCancel` frame payload.
 pub fn parse_stream_cancel_payload(payload: &[u8]) -> io::Result<StreamCancelPayload> {
     let mut r = PayloadReader::new(payload);
-    let run_id = r.read_u32()?;
+    r.read_u32()?; // run id, routed from the raw frame
     let stream_id = r.read_u32()?;
     let reason = r.read_string()?;
     r.assert_done()?;
     Ok(StreamCancelPayload {
-        run_id,
         stream_id,
         reason,
     })
@@ -1556,6 +1554,7 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
 /// Convert a raw type byte into a known Rust->TS message type.
 ///
 /// This is mainly useful in tests and when validating outbound message tables.
+#[cfg(test)]
 pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType> {
     match byte {
         0x01 => Ok(RustToTsMessageType::BridgeCall),
@@ -1601,7 +1600,7 @@ mod tests {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
             probe: vec![0xff, 0x0f, 0x30],
-            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
+            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
         };
 
         let payload = encode_authenticate_payload(&auth);
@@ -1615,7 +1614,7 @@ mod tests {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
             probe: vec![0xff, 0x0f, 0x30],
-            descriptor_token: vec![0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN],
+            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
         };
         let mut v = encode_authenticate_payload(&auth);
         v.extend_from_slice(b"extra");
@@ -1647,8 +1646,8 @@ mod tests {
         payload.extend_from_slice(&[1, 2, 3, 4]);
         let chunk = parse_stream_chunk_payload(&payload).unwrap();
         assert_eq!(
-            (chunk.run_id, chunk.stream_id, chunk.data),
-            (7, 3, &[1u8, 2, 3, 4][..])
+            (chunk.stream_id, chunk.data),
+            (3, &[1u8, 2, 3, 4][..])
         );
 
         // Oversized chunk claim → malformed, before any allocation.
@@ -2037,7 +2036,7 @@ mod tests {
         assert_eq!(prefix.limits.soft_memory_mb, DEFAULT_MEMORY_MB);
         assert_eq!(
             prefix.limits.hard_memory_mb,
-            DEFAULT_MEMORY_MB + crate::types::heap_band_mb(DEFAULT_MEMORY_MB),
+            DEFAULT_MEMORY_MB + iso4_types::heap_band_mb(DEFAULT_MEMORY_MB),
             "a reused instance is retired at the cap and terminates above it",
         );
 

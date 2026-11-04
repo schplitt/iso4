@@ -6,7 +6,7 @@ node_modules
 target
 
 # Patched v8 crate, unpacked by scripts/prepare-v8.ts
-native/v8-runtime/vendor
+crates/vendor
 
 # Benchmark outputs (vitest bench --outputJson / criterion)
 bench-results.json

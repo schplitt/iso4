@@ -485,17 +485,17 @@ thread_local! {
     /// warm instance owner thread at spawn. Unset (e.g. unit tests driving the run
     /// paths directly) is fail-closed: nothing rehydrates and branded-looking
     /// objects pass through as the plain data they are.
-    static SESSION_BRAND_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+    static THREAD_BRAND_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Install the brand key for host-type descriptors handled on this thread.
-pub fn set_session_brand_key(key: String) {
-    SESSION_BRAND_KEY.with(|slot| *slot.borrow_mut() = Some(key));
+pub fn set_thread_brand_key(key: String) {
+    THREAD_BRAND_KEY.with(|slot| *slot.borrow_mut() = Some(key));
 }
 
 /// The brand key installed on this thread, if any.
-pub fn session_brand_key() -> Option<String> {
-    SESSION_BRAND_KEY.with(|slot| slot.borrow().clone())
+pub fn thread_brand_key() -> Option<String> {
+    THREAD_BRAND_KEY.with(|slot| slot.borrow().clone())
 }
 
 /// Cheap pre-check: could this blob contain a stamped descriptor at all?
