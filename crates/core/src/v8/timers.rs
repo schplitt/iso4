@@ -5,11 +5,12 @@ use std::cell::RefCell;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
+use crate::v8::globals::{define_global, throw_v8_error};
 use crate::v8::{
     BudgetEpoch, CURRENT_RUN_TOKEN, RUN_TABLE_PTR, RunError, RunFacts, RunPhase, RunState,
     ScanOutcome, TIMERS_TOUCHED, TurnGuard, attributed_token_and_state, capped_grace_error,
-    define_global, finish_post_phase, finish_turn, finished, install_cped_rider,
-    runtime_error_from_value, slot_table, throw_v8_error,
+    finish_post_phase, finish_turn, finished, install_cped_rider, runtime_error_from_value,
+    slot_table,
 };
 
 /// Cap on pending timers per run (workerd's number). The entries live

@@ -25,8 +25,8 @@ Inside, the engine owns:
   admission decisions against the container's memory, measured from the
   cgroup where one exists.
 - **The web runtime** (`webtypes.rs`, `webtypes.js`, `url.rs`, `v8/console.rs`,
-  `v8/timers.rs`): the globals every isolate gets, installed natively into
-  the build-time snapshot (`snapshot.rs`, built by `build.rs`).
+  `v8/timers.rs`, `v8/globals.rs`): the globals every isolate gets, installed
+  natively into the build-time snapshot (`snapshot.rs`, built by `build.rs`).
 - **The value codec** (`blob.rs`, `webcodec.rs`): V8 serialization for
   everything that crosses the sandbox boundary, plus the descriptors for
   host types like `Request` and `Response`.
@@ -46,9 +46,11 @@ network policy; `fetch` is a host-configured bridge global like any other.
   `crate::types`.
 - `src/v8/` is the engine: `mod.rs` holds isolates, the turn loop, the
   bridge and streams; `console.rs`, `timers.rs` and `guard.rs` hold the
-  console capture, the guest timers and the limit guard; `testsupport.rs`
-  (test only) holds the run shorthands and the in-memory host end of a
-  link that every engine test module uses.
+  console capture, the guest timers and the limit guard; `globals.rs`
+  installs host globals and `waitUntil`; `modules.rs` evaluates prefixes,
+  resolves imports and extracts exports; `testsupport.rs` (test only)
+  holds the run shorthands and the in-memory host end of a link that
+  every engine test module uses.
 - `benches/micro.rs` is the criterion suite CodSpeed runs in CI.
 - `tests/wpt/` is the vendored web-platform-tests URL corpus the `URL` tests
   run against.

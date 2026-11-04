@@ -587,7 +587,7 @@ The `RESERVED_WORDS` set (same entry) is the other half: names that cannot be
 a binding in module source (reserved words plus strict-mode `eval` and
 `arguments`). A host-module key under one is refused before the run, except
 `default`, which maps to the module's default export (iso4 emits
-`export default`). `is_valid_export_identifier` in `v8/mod.rs` mirrors
+`export default`). `is_valid_export_identifier` in `v8/modules.rs` mirrors
 the list.
 
 Any string is a valid host global name; `ERR_RESERVED_NAME` is the only
