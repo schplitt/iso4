@@ -37,8 +37,8 @@ fn external_references() -> &'static [v8::ExternalReference] {
                 crate::v8::streams::stream_read_callback.map_fn_to(),
                 crate::v8::streams::stream_cancel_callback.map_fn_to(),
                 crate::v8::streams::stamp_stream_body_callback.map_fn_to(),
-                crate::v8::async_context_get_callback.map_fn_to(),
-                crate::v8::async_context_set_callback.map_fn_to(),
+                crate::v8::node::async_hooks::async_context_get_callback.map_fn_to(),
+                crate::v8::node::async_hooks::async_context_set_callback.map_fn_to(),
                 crate::v8::globals::wait_until_callback.map_fn_to(),
                 crate::v8::timers::set_timeout_callback.map_fn_to(),
                 crate::v8::timers::clear_timeout_callback.map_fn_to(),
@@ -92,7 +92,8 @@ pub fn create() -> Vec<u8> {
         let scope = &mut v8::ContextScope::new(scope, context);
         crate::v8::console::install_console(scope).expect("install console");
         crate::v8::globals::install_web_runtime(scope).expect("install web runtime");
-        crate::v8::install_async_context(scope).expect("install AsyncLocalStorage");
+        crate::v8::node::async_hooks::install_async_context(scope)
+            .expect("install AsyncLocalStorage");
         crate::v8::globals::install_wait_until(scope).expect("install waitUntil");
         crate::v8::timers::install_timers(scope).expect("install timers");
         scope.set_default_context(context);

@@ -53,9 +53,10 @@ network policy; `fetch` is a host-configured bridge global like any other.
   guard; `globals.rs` installs host globals and
   `waitUntil`; `modules.rs` evaluates prefixes, resolves imports and
   extracts exports; `bridge.rs` carries calls in both directions;
-  `streams.rs` moves streamed bodies; `testsupport.rs` (test only) holds
-  the run shorthands and the in-memory host end of a link that every engine
-  test module uses.
+  `streams.rs` moves streamed bodies; `node/` holds the `node:*` modules the
+  sandbox mirrors, one file per specifier, starting with `async_hooks.rs`;
+  `testsupport.rs` (test only) holds the run shorthands and the in-memory
+  host end of a link that every engine test module uses.
 - `benches/micro.rs` is the criterion suite CodSpeed runs in CI.
 - `tests/wpt/` is the vendored web-platform-tests URL corpus the `URL` tests
   run against.

@@ -15,10 +15,11 @@ use crate::v8::bridge::{
 use crate::v8::globals::{
     ISO4_RUNTIME_MODULE_SRC, ISO4_RUNTIME_SPECIFIER, eval_script, install_value_globals,
 };
+use crate::v8::node::async_hooks::{ASYNC_HOOKS_MODULE_SRC, ASYNC_HOOKS_SPECIFIER};
 use crate::v8::{
-    ASYNC_HOOKS_MODULE_SRC, ASYNC_HOOKS_SPECIFIER, RunError, RunFacts, RunState, RuntimeErrorData,
-    ScanOutcome, build_output_and_maybe_grace, exception_fields, exception_message, exception_name,
-    exception_stack, finished, runtime_error_from_value, syntax_error,
+    RunError, RunFacts, RunState, RuntimeErrorData, ScanOutcome, build_output_and_maybe_grace,
+    exception_fields, exception_message, exception_name, exception_stack, finished,
+    runtime_error_from_value, syntax_error,
 };
 
 /// Extract and serialize a settled module's exports, then finish (or start
@@ -1155,6 +1156,26 @@ mod tests {
     fn prefix_runtime_error_is_reported() {
         let err = evaluate_prefix(r#"throw new Error("prefix failed")"#, &[], &[]).unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
+    }
+
+    #[test]
+    fn prefix_unresolved_import_is_clean_error_not_crash() {
+        // Regression (snapshot era): an unresolvable import used to segfault
+        // (unconditional create_blob after a failed instantiate). The cold
+        // start must return a clean ModuleNotFound.
+        let err = evaluate_prefix("import x from 'totally-nonexistent-xyz'; export default x;", &[], &[])
+        .unwrap_err();
+        assert!(
+            matches!(err.error, RunError::ModuleNotFound(_)),
+            "expected ModuleNotFound, got {:?}",
+            err.error
+        );
+    }
+
+    #[test]
+    fn prefix_with_globalthis_state_evaluates() {
+        evaluate_prefix("globalThis.base = 100; export default 1;", &[], &[])
+        .unwrap();
     }
 
     // ── Host modules built natively from shape data ────────────────────

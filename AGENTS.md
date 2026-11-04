@@ -81,6 +81,8 @@ iso4/                              ← workspace root
           modules.rs               ← prefix evaluation, module resolver, native host modules, export extraction
           bridge.rs                ← bridge globals and trampolines, stubs, bridge errors, host → sandbox calls
           streams.rs               ← streamed bodies both ways: hydration, credit, pulls, delivery
+          node/                    ← the node:* modules the sandbox mirrors, one file per specifier
+            async_hooks.rs         ← node:async_hooks: AsyncLocalStorage over V8's CPED slot
           testsupport.rs           ← test-only run shorthands + the in-memory host end of a link
         warm.rs                    ← warm-instance registry
         link.rs                    ← HostLink/Observer traits, Outbound/Inbound messages (the engine's only way out)
