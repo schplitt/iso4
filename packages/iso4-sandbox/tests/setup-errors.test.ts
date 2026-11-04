@@ -17,7 +17,12 @@ let wire: MockInstance[]
 beforeAll(async () => {
   sandbox = await createSandbox()
   prefix = await sandbox.prepare({
-    code: 'export default () => 1',
+    code: `
+      import { add, nested, dotted } from 'host:tools'
+      export default () => 1
+      export const rebinds = async () => [await tool(), await shimmed(), await add(1), await nested.fn()]
+      export const dottedPair = async () => [await dotted['a.b'](), await dotted.a.b()]
+    `,
     globals: {
       tool: async () => 1,
       shimmed: { kind: 'bridge-with-shim', shim: '(h) => h', handler: async () => 1 },
@@ -75,7 +80,6 @@ async function expectClientRefusal(promise: Promise<unknown>, code: string, mess
 }
 
 const call = (options: object): Promise<unknown> => prefix.call({ export: 'default', ...options } as never)
-const run = (options: object): Promise<unknown> => prefix.run({ code: 'export default 1', ...options } as never)
 
 describe('ERR_RESERVED_NAME', () => {
   test.each(['console', 'Response', 'NaN', '__proto__'])('run() and prepare() refuse %s without a round trip', async (name) => {
@@ -97,8 +101,7 @@ describe('ERR_UNDECLARED_BINDING', () => {
     ['an undeclared specifier as a string', { imports: { 'host:nope': 'x' } }, `import 'host:nope' was not declared at precompile time`],
     ['an undeclared specifier as null', { imports: { 'host:nope': null } }, `import 'host:nope' was not declared at precompile time`],
     ['an undeclared path with a non-function', { imports: { 'host:tools': { nope: 42 } } }, `import 'host:tools'.nope was not declared at precompile time`],
-  ])('prefix.run() and prefix.call() refuse %s without a round trip', async (_kind, options, message) => {
-    await expectClientRefusal(run(options), 'ERR_UNDECLARED_BINDING', message)
+  ])('prefix.call() refuses %s without a round trip', async (_kind, options, message) => {
     await expectClientRefusal(call(options), 'ERR_UNDECLARED_BINDING', message)
   })
 })
@@ -112,8 +115,7 @@ describe('ERR_FROZEN_BINDING', () => {
     ['a source module rebound as a host module', { imports: { 'lib:math': { x: () => 2 } } }, /source imports are frozen/],
     ['a data leaf rebound with a function', { imports: { 'host:tools': { version: () => '2' } } }, /is a data leaf, not a function/],
     ['a data leaf rebound with data', { imports: { 'host:tools': { version: '2.0.0' } } }, /is a data leaf, not a function/],
-  ])('prefix.run() and prefix.call() refuse %s without a round trip', async (_kind, options, message) => {
-    await expectClientRefusal(run(options), 'ERR_FROZEN_BINDING', message)
+  ])('prefix.call() refuses %s without a round trip', async (_kind, options, message) => {
     await expectClientRefusal(call(options), 'ERR_FROZEN_BINDING', message)
   })
 })
@@ -129,8 +131,7 @@ describe('ERR_INVALID_REBIND', () => {
     ['a function leaf rebound with undefined', { imports: { 'host:tools': { add: undefined } } }, `import 'host:tools'.add can only be rebound with a function; got undefined`],
     ['an object node rebound with a function', { imports: { 'host:tools': { nested: () => 1 } } }, `import 'host:tools'.nested can only be rebound with a plain object; got function`],
     ['a function leaf rebound with an object', { imports: { 'host:tools': { add: { deeper: () => 1 } } } }, `import 'host:tools'.add can only be rebound with a function; got object`],
-  ])('prefix.run() and prefix.call() refuse %s without a round trip', async (_kind, options, message) => {
-    await expectClientRefusal(run(options), 'ERR_INVALID_REBIND', message)
+  ])('prefix.call() refuses %s without a round trip', async (_kind, options, message) => {
     await expectClientRefusal(call(options), 'ERR_INVALID_REBIND', message)
   })
 })
@@ -144,21 +145,19 @@ describe('malformed options', () => {
       expect(spy).not.toHaveBeenCalled()
   })
 
-  test.each(['run', 'call'] as const)('prefix.%s() throws a TypeError for a bad limit without a round trip', async (kind) => {
-    const promise = kind === 'run' ? run({ limits: { cpuTimeMs: -1 } }) : call({ limits: { cpuTimeMs: 1.5 } })
-    await expect(promise).rejects.toThrow(TypeError)
+  test.each([-1, 1.5])('prefix.call() throws a TypeError for a bad limit (%s) without a round trip', async (cpuTimeMs) => {
+    await expect(call({ limits: { cpuTimeMs } })).rejects.toThrow(TypeError)
     for (const spy of wire)
       expect(spy).not.toHaveBeenCalled()
   })
 })
 
 describe('ERR_PREFIX_DISPOSED', () => {
-  test('prefix.run() and prefix.call() on a disposed prefix refuse without a round trip', async () => {
+  test('prefix.call() on a disposed prefix refuses without a round trip', async () => {
     const disposed = await sandbox.prepare({ code: 'export default () => 1' })
     await disposed.dispose()
     vi.clearAllMocks()
     const message = `prefix '${disposed.id}' has been disposed or never existed`
-    await expectClientRefusal(disposed.run({ code: 'export default 1' }), 'ERR_PREFIX_DISPOSED', message)
     await expectClientRefusal(disposed.call({ export: 'default' }), 'ERR_PREFIX_DISPOSED', message)
   })
 
@@ -167,43 +166,41 @@ describe('ERR_PREFIX_DISPOSED', () => {
     await disposed.dispose()
     vi.clearAllMocks()
     const signal = AbortSignal.abort('stop')
-    await expectClientRefusal(disposed.run({ code: 'export default 1', signal }), 'ERR_PREFIX_DISPOSED')
     await expectClientRefusal(disposed.call({ export: 'default', signal }), 'ERR_PREFIX_DISPOSED')
   })
 
   test('an already-aborted signal wins over the other setup checks', async () => {
     const signal = AbortSignal.abort('stop')
-    expect(await prefix.run({ code: 'export default 1', signal, globals: { zzz: async () => 1 } } as never)).toMatchObject({ status: 'aborted' })
+    expect(await prefix.call({ export: 'default', signal, globals: { zzz: async () => 1 } } as never)).toMatchObject({ status: 'aborted' })
   })
 })
 
 describe('allowed rebinds still reach the runtime', () => {
   test('a shim global rebound by name with a function runs through its shim', async () => {
     const shimmedPrefix = await sandbox.prepare({
-      code: '',
+      code: `export default async () => await greet('ada')`,
       globals: { greet: { kind: 'bridge-with-shim', shim: '(s) => s.toUpperCase()', handler: async (n: string) => `default ${n}` } },
     })
-    const run = await shimmedPrefix.run({ code: `export default await greet('ada')`, globals: { greet: async (n: string) => `rebound ${n}` } } as never)
-    expect(run).toMatchObject({ ok: true, exports: { default: 'REBOUND ADA' } })
+    const run = await shimmedPrefix.call({ export: 'default', globals: { greet: async (n: string) => `rebound ${n}` } } as never)
+    expect(run).toMatchObject({ ok: true, value: 'REBOUND ADA' })
     expect(RuntimeIpcClient.prototype.prefixRun).toHaveBeenCalled()
     await shimmedPrefix.dispose()
   })
 
   test('function rebinds of bridge, shim and import leaves run', async () => {
-    const result = await prefix.run({
-      code: `import { add, nested } from 'host:tools'\nexport default [await tool(), await shimmed(), await add(1), await nested.fn()]`,
+    const result = await prefix.call({
+      export: 'rebinds',
       globals: { tool: async () => 'tool', shimmed: async () => 'shim' },
       imports: { 'host:tools': { add: () => 'add', nested: { fn: () => 'nested' } } },
     } as never)
-    expect(result).toMatchObject({ ok: true, exports: { default: ['tool', 'shim', 'add', 'nested'] } })
+    expect(result).toMatchObject({ ok: true, value: ['tool', 'shim', 'add', 'nested'] })
   })
 
   test('a dotted key and its nested twin dispatch and rebind separately', async () => {
-    const code = `import { dotted } from 'host:tools'\nexport default [await dotted['a.b'](), await dotted.a.b()]`
-    const at = async (imports?: object): Promise<unknown> => prefix.run({ code, ...(imports && { imports: { 'host:tools': { dotted: imports } } }) } as never)
-    expect(await at()).toMatchObject({ ok: true, exports: { default: ['dotted', 'nested'] } })
-    expect(await at({ 'a.b': () => 'rebound' })).toMatchObject({ ok: true, exports: { default: ['rebound', 'nested'] } })
-    expect(await at({ a: { b: () => 'rebound' } })).toMatchObject({ ok: true, exports: { default: ['dotted', 'rebound'] } })
+    const at = async (imports?: object): Promise<unknown> => prefix.call({ export: 'dottedPair', ...(imports && { imports: { 'host:tools': { dotted: imports } } }) } as never)
+    expect(await at()).toMatchObject({ ok: true, value: ['dotted', 'nested'] })
+    expect(await at({ 'a.b': () => 'rebound' })).toMatchObject({ ok: true, value: ['rebound', 'nested'] })
+    expect(await at({ a: { b: () => 'rebound' } })).toMatchObject({ ok: true, value: ['dotted', 'rebound'] })
   })
 })
 
@@ -265,7 +262,7 @@ describe('the client mirrors the runtime', () => {
     ['an undeclared specifier', { imports: { 'host:nope': { f: fn } } }, { imports: [...declaredImports, { specifier: 'host:nope', module: [['f', { kind: 'function' }]] }] }, 'ERR_UNDECLARED_BINDING', `import 'host:nope' was not declared at precompile time`],
     ['an undeclared path', { imports: { 'host:tools': { nope: fn } } }, { imports: asFunction('host:tools', 'nope') }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.nope was not declared at precompile time`],
     ['a data leaf', { imports: { 'host:tools': { version: fn } } }, { imports: asFunction('host:tools', 'version') }, 'ERR_FROZEN_BINDING', `import 'host:tools'.version is a data leaf, not a function — data leaves cannot be rebound`],
-    ['a source module', { imports: { 'lib:math': { x: fn } } }, { imports: asFunction('lib:math', 'x') }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`],
+    ['a source module', { imports: { 'lib:math': { x: fn } } }, { imports: asFunction('lib:math', 'x') }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.call() time`],
     ['a dotted key rebound as nesting', { imports: { 'host:tools': { flat: { c: { d: fn } } } } }, { imports: widenTools('flat', [['c.d', fnNode], ['c', { kind: 'object', entries: [['d', fnNode]] }]]) }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.flat.c was not declared at precompile time`],
     ['a nested path rebound as a dotted key', { imports: { 'host:tools': { deep: { 'c.d': fn } } } }, { imports: widenTools('deep', [['c', { kind: 'object', entries: [['d', fnNode]] }], ['c.d', fnNode]]) }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.deep.c.d was not declared at precompile time`],
     ['a data leaf under a dotted key', { imports: { 'host:tools': { dotted: { 'v.x': fn } } } }, { imports: widenTools('dotted', [['v.x', fnNode]]) }, 'ERR_FROZEN_BINDING', `import 'host:tools'.dotted.v.x is a data leaf, not a function — data leaves cannot be rebound`],

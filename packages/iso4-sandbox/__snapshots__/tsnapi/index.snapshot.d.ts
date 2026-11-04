@@ -63,8 +63,6 @@ export interface PrecompileOptions<G extends HostGlobals, M extends Imports> {
 }
 export interface Prefix<G extends HostGlobals = {}, M extends Imports = {}> {
   readonly id: string;
-  execute: (_: PrefixRunOptions<G, M>) => Promise<RunResult>;
-  run: (_: PrefixRunOptions<G, M>) => Promise<RunResult>;
   call: (_: PrefixCallOptions<G, M>) => Promise<CallResult>;
   dispose: () => Promise<void>;
   [Symbol.asyncDispose]: () => Promise<void>;
@@ -78,15 +76,6 @@ export interface PrefixCallOptions<G extends HostGlobals, M extends Imports> ext
   limits?: ResourceLimits;
   signal?: AbortSignal;
   hardAbortSignal?: AbortSignal;
-}
-export interface PrefixRunOptions<G extends HostGlobals, M extends Imports> {
-  code: string;
-  globals?: RebindGlobals<G>;
-  imports?: RebindImports<M>;
-  limits?: ResourceLimits;
-  signal?: AbortSignal;
-  hardAbortSignal?: AbortSignal;
-  filename?: string;
 }
 export interface ReadExportsOptions {
   code: string;

@@ -348,15 +348,20 @@ describe('payload encoders', () => {
     expect(code).toBe('x')
   })
 
-  test('encodePrefixRunPayload encodes runId, prefixId, and code', () => {
-    const buf = encodePrefixRunPayload({ runId: 3, prefixId: '42', code: 'y' })
+  test('encodePrefixRunPayload encodes runId, prefixId, and the call', () => {
+    const argsBlob = serializeValue([1, 'a'])
+    const buf = encodePrefixRunPayload({ runId: 3, prefixId: '42', call: { exportPath: 'handler', argsBlob } })
     expect(readU32BE(buf, 0)).toBe(3) // runId
     const { value: prefixId, end } = readString(buf, 4)
     expect(prefixId).toBe('42')
-    expect(buf[end]).toBe(1) // code: present (Optional<String>)
-    const { value: code } = readString(buf, end + 1)
-    expect(code).toBe('y')
-    expect(buf[buf.byteLength - 1]).toBe(0) // call: absent
+    // limits(10) + globals count(4) + rebinds count(4), then the CallSpec
+    // with no presence byte: String exportPath + value slot.
+    const off = end + 10 + 4 + 4
+    const { value: path, end: pathEnd } = readString(buf, off)
+    expect(path).toBe('handler')
+    const argsLength = readU32BE(buf, pathEnd)
+    expect(deserializeValue(buf.subarray(pathEnd + 4, pathEnd + 4 + argsLength))).toEqual([1, 'a'])
+    expect(pathEnd + 4 + argsLength).toBe(buf.byteLength)
   })
 
   test('encodeRunPayload without a call ends with an absent-call byte', () => {
@@ -381,30 +386,6 @@ describe('payload encoders', () => {
     const argsLength = readU32BE(buf, end)
     expect(deserializeValue(buf.subarray(end + 4, end + 4 + argsLength))).toEqual([1, 'a'])
     expect(end + 4 + argsLength).toBe(buf.byteLength)
-  })
-
-  test('encodePrefixRunPayload with a call carries no code', () => {
-    const argsBlob = serializeValue([])
-    const buf = encodePrefixRunPayload({
-      runId: 2,
-      prefixId: 'p',
-      call: { exportPath: 'handler', argsBlob },
-    })
-    const { end } = readString(buf, 4) // prefixId
-    expect(buf[end]).toBe(0) // code: absent
-  })
-
-  test('encodePrefixRunPayload rejects code and call together, and neither', () => {
-    const argsBlob = serializeValue([])
-    expect(() => encodePrefixRunPayload({
-      runId: 1,
-      prefixId: 'p',
-      code: 'x',
-      call: { exportPath: 'f', argsBlob },
-    })).toThrow(/exactly one of code or call/)
-    expect(() => encodePrefixRunPayload({ runId: 1, prefixId: 'p' })).toThrow(
-      /exactly one of code or call/,
-    )
   })
 
   test('encodeDisposePrefixPayload encodes just the prefixId string', () => {
@@ -519,20 +500,21 @@ describe('payload encoders', () => {
     const pre = encodePrecompilePayload({ code: 'x', imports })
     expect(pre.toString('utf8')).toContain('lib:zod')
 
+    const argsBlob = serializeValue([])
     const pref = encodePrefixRunPayload({
       runId: 1,
       prefixId: 'p',
-      code: 'x',
       importRebinds: [{ specifier: 'tools:search', path: ['a.b', 'inner'] }],
+      call: { exportPath: 'f', argsBlob },
     })
-    // Tail: u32 count, String specifier, List<String> path, call absent.
+    // Tail: u32 count, String specifier, List<String> path, then the call.
     const u32be = (n: number): Buffer => {
       const b = Buffer.alloc(4)
       b.writeUInt32BE(n)
       return b
     }
     const str = (v: string): Buffer => Buffer.concat([u32be(Buffer.byteLength(v)), Buffer.from(v)])
-    const tail = Buffer.concat([u32be(1), str('tools:search'), u32be(2), str('a.b'), str('inner'), Buffer.from([0])])
+    const tail = Buffer.concat([u32be(1), str('tools:search'), u32be(2), str('a.b'), str('inner'), str('f'), u32be(argsBlob.byteLength), argsBlob])
     expect(pref.subarray(pref.byteLength - tail.byteLength).equals(tail)).toBe(true)
   })
 

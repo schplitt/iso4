@@ -4,11 +4,12 @@ Fast, sandboxed V8 isolate runtime for agent-generated JavaScript. Runs user
 code in a separate Rust process for full crash isolation — an OOM or panic in
 the sandbox kills only the subprocess, not your host application.
 
-Built for the AI-agent prefix/postfix pattern: prepare host setup (globals,
-libraries, tool bindings) once, then run many agent-generated code strings
-against it in parallel. Every run gets its own limits, guards, and bridge
-bindings; one-off `sandbox.run()` always gets a fresh isolate, while prefix
-runs reuse resident warm instances when one is free (see below).
+Built for the prepare-once, call-many pattern: prepare host setup (globals,
+libraries, tool bindings) together with the code that uses them once, then
+call its exports many times in parallel. Every run gets its own limits,
+guards, and bridge bindings; one-off `sandbox.run()` always gets a fresh
+isolate, while prefix runs reuse resident warm instances when one is free
+(see below).
 
 > **Status:** core execution works end-to-end. Not yet at 1.0 — every API,
 > option, and observability surface (including `stats()`) may still change.
@@ -35,28 +36,28 @@ import { createSafeFetch } from '@iso4/fetch'
 
 const sandbox = await createSandbox({ memoryMb: 128 }) // per-isolate heap cap
 
-// Store host setup once; it is evaluated on each cold start
+// Store the code once; it is evaluated on each cold start
 const prefix = await sandbox.prepare({
   code: `
     const config = { apiBase: 'https://api.example.com' }
-    globalThis.config = config
+    export default async () => {
+      const res = await fetch(config.apiBase + '/users')
+      return { count: res.length }
+    }
   `,
   globals: {
     fetch: createSafeFetch({ policy: ({ host }) => host === 'api.example.com' }),
   },
 })
 
-// Run agent-generated code against the prefix — as many times as needed
-const result = await prefix.execute({
-  code: `
-    const res = await fetch(config.apiBase + '/users')
-    export default { count: res.length }
-  `,
+// Call its exports — as many times as needed
+const result = await prefix.call({
+  export: 'default',
   limits: { cpuTimeMs: 200, wallTimeMs: 5_000 }, // heap cap: prepare({ memoryMb }) or the sandbox default
 })
 
 if (result.ok) {
-  console.log(result.exports.default) // { count: 42 }
+  console.log(result.value) // { count: 42 }
 } else {
   console.error(result.error.code, result.error.message)
 }
@@ -64,9 +65,9 @@ if (result.ok) {
 await sandbox.dispose()
 ```
 
-> `sandbox.prepare()` and `prefix.execute()` are the current names. The former
-> names — `sandbox.precompile()` and `prefix.run()` — remain as deprecated
-> aliases with identical behavior and will be removed in a future major.
+> `sandbox.prepare()` is the current name. The former name,
+> `sandbox.precompile()`, remains as a deprecated alias with identical
+> behavior and will be removed in a future major.
 
 ## How globals work
 
@@ -110,15 +111,16 @@ warm, so nothing is wasted):
 
 ```ts
 const prefix = await sandbox.prepare({ code })
-const check = await prefix.execute({ code: 'export default 0' })
-if (!check.ok)
+// Call a side-effect-free export; a failure of the prefix itself carries `stage: 'prefix'`.
+const check = await prefix.call({ export: 'ready' })
+if (!check.ok && check.error.stage === 'prefix')
   throw new Error(`broken prefix: ${check.error.message}`)
 ```
 
 A failure of the prefix itself carries `error.stage === 'prefix'`, so a
 host can tell it from a failure of the run code. The runtime remembers it:
 `prefix.status` becomes `'broken'`, `prefix.error` holds the failure, and
-every later `execute()`/`call()` rejects with `ERR_PREFIX_BROKEN` (its
+every later `call()` rejects with `ERR_PREFIX_BROKEN` (its
 `cause` is that failure) without booting an isolate. `dispose()` still
 works; the only retry is a new `prepare()`. Failures that depend on load
 (`ERR_WARMUP_LIMIT`, `ERR_MEMORY_LIMIT`) never break a prefix.
@@ -153,31 +155,32 @@ host global there may be silently overwritten or dropped, and
 ## TypeScript-checked rebinding
 
 `prepare()` infers the globals shape `G` from what you pass, and the
-returned `Prefix<G>` only allows rebinding those names at run time:
+returned `Prefix<G>` only allows rebinding those names at call time:
 
 ```ts
 const prefix = await sandbox.prepare({
+  code,
   globals: { fetch: defaultFetch, myTool: defaultTool },
 })
 
-prefix.execute({ globals: { fetch: perUserFetch } }) // ✅ rebind one
-prefix.execute({ globals: { unknown: handler } }) // ❌ TS error
+prefix.call({ export: 'default', globals: { fetch: perUserFetch } }) // ✅ rebind one
+prefix.call({ export: 'default', globals: { unknown: handler } }) // ❌ TS error
 ```
 
 ## Resource limits
 
-`prepare({ limits })` sets the defaults for every run on that prefix. A run's
+`prepare({ limits })` sets the defaults for every call on that prefix. A call's
 own `limits` overrides them field by field; anything set in neither place
 takes the runtime default.
 
 ```ts
-const prefix = await sandbox.prepare({ code: prefixCode, limits: { cpuTimeMs: 200, maxBridgeCalls: 10 } })
+const prefix = await sandbox.prepare({ code, limits: { cpuTimeMs: 200, maxBridgeCalls: 10 } })
 
-prefix.execute({ code: agentCode }) // cpuTimeMs 200, maxBridgeCalls 10
-prefix.execute({ code: agentCode, limits: { cpuTimeMs: 50 } }) // cpuTimeMs 50, maxBridgeCalls 10
+prefix.call({ export: 'default' }) // cpuTimeMs 200, maxBridgeCalls 10
+prefix.call({ export: 'default', limits: { cpuTimeMs: 50 } }) // cpuTimeMs 50, maxBridgeCalls 10
 
-prefix.execute({
-  code: agentCode,
+prefix.call({
+  export: 'default',
   limits: {
     cpuTimeMs: 200, // active JS execution only (await time excluded)
     wallTimeMs: 5_000, // hard cap including async waits
@@ -316,7 +319,7 @@ slow, your own request handling included.
 
 Neither side refuses on that. The runtime grants without enforcing and never
 looks at your event loop, so the ceiling is yours to impose: keep your own
-in-flight bound upstream of `execute()` and reject or defer past it —
+in-flight bound upstream of `call()` and reject or defer past it —
 `perf_hooks.monitorEventLoopDelay()` is the signal to set it by — or pin
 `maxConcurrentRuns` to a number you have measured this host at. A pin is a
 fixed number, not a cap on the derived one: it opts out of derivation for
@@ -324,27 +327,27 @@ every workload the sandbox serves.
 
 ## Async context (`AsyncLocalStorage`)
 
-Run/postfix code can import a minimal, Node-compatible `AsyncLocalStorage` to
+Sandbox code can import a minimal, Node-compatible `AsyncLocalStorage` to
 carry an ambient value across `await` points — concurrency-safe, unlike a
-module variable:
+module variable. Create it at module scope, use it in the handler:
 
 ```ts
-prefix.execute({
+const prefix = await sandbox.prepare({
   code: `
     import { AsyncLocalStorage } from 'node:async_hooks'
     const als = new AsyncLocalStorage()
-    export default await als.run('trace-42', async () => {
+    export default (traceId) => als.run(traceId, async () => {
       await somethingAsync()
-      return als.getStore()   // 'trace-42', even several awaits deep
+      return als.getStore()   // traceId, even several awaits deep
     })
   `,
 })
+await prefix.call({ export: 'default', args: ['trace-42'] })
 ```
 
 Only `run(store, callback, ...args)` and `getStore()` are provided. Built on
 V8's continuation-preserved embedder data; no promise hooks, so it's free
-unless used. Not available in `prepare()` (prefix) code — it's for the
-postfix. See DESIGN.md §16.
+unless used. See DESIGN.md §16.
 
 ## Calling into the sandbox
 
@@ -369,8 +372,8 @@ module. With `call` the success result carries the function's return `value`
 instead of `exports` — never both. The receiver is the exported object
 (`this` works); prototype methods resolve (`export default new Worker()`),
 and a path that does not reach a callable fails with
-`ERR_CALL_TARGET_NOT_FOUND`. `prefix.call()` accepts the same per-call
-`globals` / `imports` rebinds as `prefix.execute()`.
+`ERR_CALL_TARGET_NOT_FOUND`. `prefix.call()` also takes per-call
+`globals` / `imports` rebinds of the names declared at `prepare()`.
 
 Non-serializable **exports** no longer fail a plain run: they are absent from
 `exports` and reported in `skippedExports`, so a module that exports handlers
@@ -455,7 +458,7 @@ interface RunError {
 `run()` never throws for sandboxed failures. `ok: false` with an error code is
 the normal failure path. It throws only for infrastructure errors (subprocess
 crashed, binary not found) and for invalid options, the same way `prepare()`
-does. `sandbox.run()`, `prefix.run()` and `prefix.call()` reject with an
+does. `sandbox.run()` and `prefix.call()` reject with an
 `Error` whose `code` is a `SetupErrorCode`: `ERR_RESERVED_NAME` (a global
 name the runtime owns), `ERR_UNDECLARED_BINDING`, `ERR_FROZEN_BINDING` or
 `ERR_INVALID_REBIND` (a rebind the prefix does not allow),
@@ -527,7 +530,7 @@ rest queue FIFO — an `AbortSignal`, e.g. `AbortSignal.timeout()`, bounds the
 wait);
 connections to the subprocess open on demand and are reused, and `stats()`
 reports the live count as `openConnections`. Five concurrent
-`prefix.execute()` calls each get their own run slot and execute in
+`prefix.call()` calls each get their own run slot and execute in
 parallel.
 
 ## License

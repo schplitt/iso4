@@ -16,37 +16,33 @@ precompile prefix once  →  call a function with some input  →  get a value b
 ```
 
 The prefix is stored once at `prepare()` (source + declared shape, nothing
-evaluated); every execution evaluates it into a fresh isolate and then runs
-a function, returning its result.
-The function body and the input differ between deployments; the machinery
-is identical.
+evaluated); a cold start evaluates it into a fresh isolate, and every run
+calls one of its exports, returning the result. A prefix is full code: the
+functions it exports and the input they get differ between deployments; the
+machinery is identical.
 
 Two independent axes control the trade-off:
 
 ### 1.1 Code variability
 
-**Dynamic code** — the function body is provided at call time and changes
-per call. The caller (an AI agent, an MCP client, a script host) provides
-an async arrow function body; the host wraps it before running:
+**Dynamic code** — the code changes per deployment or per agent turn. The
+caller (an AI agent, an MCP client, a script host) provides a module that
+exports what the host will call; the host prepares it and calls it:
 
 ```js
-// What the caller provides:
-async () => {
+// What the caller provides, prepared as the prefix:
+export default async (query) => {
   const data = await fetchTool('search', query)
   return data.results
 }
-
-// What the host runs:
-export default await (async () => {
-  const data = await fetchTool('search', query)
-  return data.results
-})()
 ```
 
-`prefix.run({ code })` handles this. A fresh isolate is created per call
-and the prefix is re-evaluated into it, so each caller starts from a clean
-state regardless of what previous callers did. Multiple callers running simultaneously each get
-their own pool slot and run in parallel.
+`prefix.call({ export: 'default', args: [query] })` handles this. The
+first call cold-starts an instance (isolate boot plus prefix evaluation);
+later calls reuse it while it is warm. Code that runs once and is thrown
+away goes through `sandbox.run({ code })`, which always gets a fresh
+isolate. Multiple callers running simultaneously each get their own pool
+slot and run in parallel.
 
 **Static code** — the function is compiled into the prefix and does not
 change between calls. Only the input data varies. The prefix exports the
@@ -59,10 +55,8 @@ export async function transform(row) {
 }
 ```
 
-The static-code shape above is achievable in `@iso4/sandbox` via
-`prefix.run()` with a per-run host import that provides the input data —
-at the cost of a fresh isolate + prefix evaluation per call. A persistent-session API
-(`session.call('transform', row)`) that reuses the isolate across calls
+Both shapes are the same `prefix.call()` to the runtime. A persistent-session
+API (`session.call('transform', row)`) with a host-visible isolate lifetime
 is **not** part of `@iso4/sandbox`; it belongs to the future analytics
 product (see §9.1 and §13.1).
 
@@ -144,9 +138,9 @@ Explicitly **out of scope**:
 - ~~Streaming `Response` / `ReadableStream`~~ — shipped: inbound bodies over
   the 64 KiB probe stream in (#96), and a session call's result body streams
   out (#128); see §7 item 3 and `docs/protocol.md` §5.5.
-- Sharing live state between runs. Each `prefix.run()` is a fresh isolate
-  the prefix is re-evaluated into — the _prefix's declared shape_ is shared,
-  not live mutable state.
+- Sharing live state between runs. Warmth is a cache (§13.2.1): a
+  `prefix.call()` may land on a fresh isolate the prefix is re-evaluated
+  into — the _prefix's declared shape_ is shared, not live mutable state.
 - TypeScript / JSX compilation. Host's responsibility to ship pre-compiled JS.
 - POSIX surface (sockets, FDs, pipes, PTY, process tables). None of it.
 
@@ -294,7 +288,7 @@ Every field is an integer from 0 to 2³²−1, because the wire carries each as 
 then do not arm their guard), `graceMs: 0` turns off the grace phase, and
 `memoryMb: 0` is uncapped. The client
 checks every field at `sandbox.run()`, `readExports()`, `prepare()`,
-`prefix.run()` and `prefix.call()` and throws a `TypeError` for a negative,
+and `prefix.call()` and throws a `TypeError` for a negative,
 fractional, non-finite, non-number or out-of-range value. That is a setup
 error (§5.2), so nothing is sent.
 
@@ -788,7 +782,7 @@ The object form imposes these restrictions on the value tree:
   are *not* discovered by the walker (own enumerable properties only).
   Copy methods onto the instance explicitly if you want them exposed.
 
-Rebinding on `prefix.run()` is keyed on the same shape: only function
+Rebinding on `prefix.call()` is keyed on the same shape: only function
 leaves declared at `precompile()` time may be rebound, and only with the
 same signature. TypeScript enforces this via `RebindImports<I>` at compile
 time. At run time the client checks the rebind **locations**
@@ -1059,7 +1053,7 @@ to `AbortController.abort(reason)`:
 The result is _always_ an object; `status` (or the `ok` alias) discriminates.
 `run()` does not throw for sandboxed failures — only for infrastructure failures
 (e.g., the Rust process crashed) and for **setup errors**: options that are
-invalid before anything runs. Those reject `sandbox.run()`, `prefix.run()` and
+invalid before anything runs. Those reject `sandbox.run()` and
 `prefix.call()` exactly as they reject `prepare()` — a plain `Error` whose
 `code` is a `SetupErrorCode` (`ERR_RESERVED_NAME`, `ERR_UNDECLARED_BINDING`,
 `ERR_FROZEN_BINDING`, `ERR_INVALID_REBIND`, `ERR_PREFIX_DISPOSED`,
@@ -1072,7 +1066,7 @@ outcome: nothing ran and retrying the same options can never succeed, so it
 does not belong next to `ERR_USER_CODE`, and `RunErrorCode` does not list it.
 
 The TS client checks first: reserved global names on `run()`/`prepare()`,
-and on `prefix.run()`/`prefix.call()` every global and import rebind
+and on `prefix.call()` every global and import rebind
 against the shape it kept from `prepare()`. A refusal throws before a pool
 slot is taken or a frame is sent. The Rust runtime is the authority and
 repeats every check except `ERR_INVALID_REBIND` (it never sees the value),
@@ -1145,7 +1139,7 @@ The decided semantics:
   mid-request bridge calls work for free and turns track bridge round
   trips, not `await`s. Path resolution and the call run inside the CPU
   budget, under the run's guards.
-- A throw inside the handler is `ERR_USER_CODE`, exactly like postfix code.
+- A throw inside the handler is `ERR_USER_CODE`, exactly like one-off run code.
 
 This is a **capability, not a perf win** (recorded so it is not re-argued):
 against the pull-over-the-bridge baseline a call frame saves ~2 % of a
@@ -1261,7 +1255,7 @@ Runtime (TypeScript)
       ...opened when all are at the cap; count ≈ foreground concurrency / cap
 ```
 
-When `prefix.execute()` or `sandbox.run()` is called:
+When `prefix.call()` or `sandbox.run()` is called:
 
 1. Take a run slot (or queue FIFO if `maxConcurrentRuns` are executing —
    the caller's `AbortSignal` is honoured while queued).
@@ -1275,7 +1269,7 @@ When `prefix.execute()` or `sandbox.run()` is called:
    grace frames ride the shared connection, routed by run id, until its
    `RunComplete`.
 
-This means five agents calling `prefix.execute()` simultaneously each get
+This means five agents calling `prefix.call()` simultaneously each get
 their own run slot and run truly in parallel on separate isolate
 threads inside the Rust process — the fifth call does not wait on the first.
 
@@ -1366,7 +1360,7 @@ Documented up front so we don't drift into rebuilding secure-exec:
    explicitly provided it via `imports`. The host can ship a curated
    `node:fs` if they want; the runtime won't. The sole runtime-provided
    `node:*` module is `node:async_hooks`, which exposes a minimal
-   `AsyncLocalStorage` (run/postfix code only). See §16. A host-declared
+   `AsyncLocalStorage`. See §16. A host-declared
    import of the same specifier takes precedence over the built-in.
 
 2. **No callbacks across the boundary.** No host-shipped callbacks, no
@@ -1610,7 +1604,7 @@ What is shared with `@iso4/sandbox`:
 
 What is **not** shared:
 
-- The runtime API. `Sandbox` / `Prefix` / `prefix.run()` solves a different
+- The runtime API. `Sandbox` / `Prefix` / `prefix.call()` solves a different
   problem than analytics' eventual `Pipeline` / `Session` / `processBatch`.
 - The transport.
 - The lifecycle and concurrency model.
@@ -1620,7 +1614,7 @@ Open design questions that can only be answered once Phases 1–13 ship:
 - How does the host hand row batches to the sandbox without copy? Shared
   `ArrayBuffer` + a typed schema description? Apache Arrow? A custom
   zero-copy view layer?
-- What replaces `prefix.run()` for an analytics loop —
+- What replaces `prefix.call()` for an analytics loop —
   `pipeline.process(batch)`? `session.call(fn, args)`?
 - Are bridge calls even the right primitive, or does direct V8 function
   pointer invocation (possible in NAPI) replace them?
@@ -1689,21 +1683,20 @@ To be resolved as we build, not blocking the start:
   to Node's V8 headers is possible but undocumented territory. Decide
   when the analytics product is designed (§9.1).
 
-## 11. Performance and the prefix/postfix pattern
+## 11. Performance and the prefix/call pattern
 
 ### 11.1 Why this matters
 
 The canonical AI-agent loop is:
 
 ```
-host  : prepare context + tools     ← fixed across many runs
-agent : generate code that uses them
-host  : execute (host prefix + agent postfix), get result
+host  : prepare context + tools, plus the code that uses them   ← fixed across many runs
+host  : call an export per request, get result
 ```
 
 If every iteration of this loop pays a full V8 cold start (compile bridge
 shims, set up globals, parse user code), the human-visible latency is
-dominated by ~30–80 ms of V8 boot regardless of how short the postfix is.
+dominated by ~30–80 ms of V8 boot regardless of how short the call is.
 For an interactive agent doing N tool calls per turn, that compounds badly.
 
 ### 11.2 What we do about it
@@ -1711,10 +1704,10 @@ For an interactive agent doing N tool calls per turn, that compounds badly.
 `sandbox.prepare()` checks the declared shape host-side (names, import
 shape, options) and stores the prefix source in the Rust process. It
 evaluates nothing: there is no validation isolate (§16.4). A cold
-`prefix.execute()` boots a fresh isolate from the build-time startup
-snapshot (§11.7), evaluates the prefix, then runs the postfix. Authoring the
-setup is paid once; runs pay only the evaluation, and a broken prefix fails
-its first run.
+`prefix.call()` boots a fresh isolate from the build-time startup
+snapshot (§11.7), evaluates the prefix, then invokes the export. Authoring
+the setup is paid once; runs pay only the evaluation, and a broken prefix
+fails its first call.
 
 That per-run evaluation is itself skipped whenever an idle warm
 instance of the prefix is available: the flow below is what a **cold start**
@@ -1723,7 +1716,7 @@ costs, and §13.2.1 is what happens on reuse.
 Flow:
 
 ```
-  prepare(prefix)               run(postfix)          run(postfix)
+  prepare(prefix)               call(export)          call(export)
        │                            │                      │
        ▼                            ▼                      ▼
   one-time:                    per run:               per run:
@@ -1733,11 +1726,11 @@ Flow:
     declared shape             - evaluate prefix
                                - bind per-run globals
                                  & imports
-                               - compile + run postfix
+                               - invoke the export
 ```
 
 Steady-state cold start target (after the first call): **<5 ms** from
-`prefix.execute()` to user code executing, for typical (small) prefixes.
+`prefix.call()` to user code executing, for typical (small) prefixes.
 Cold-start cost grows with prefix size — a prefix that takes 20 ms to
 evaluate costs 20 ms on every cold start. Heavy prefixes are the reason for
 the resident-isolate model (§13.2.1), which pays that cost once per
@@ -1745,7 +1738,7 @@ instance instead of once per run.
 
 ### 11.3 The prefix contract
 
-Each run re-evaluates the prefix into a fresh context, so what a postfix
+A cold start evaluates the prefix into a fresh context, so what a call
 sees is exactly what the prefix produces deterministically:
 
 - **Provided by prefix evaluation (identical across runs, assuming the
@@ -1756,7 +1749,7 @@ sees is exactly what the prefix produces deterministically:
   - Source-module and host-module imports, rebuilt from the declared shape.
 - **Bound per run:**
   - Bridge function stubs. While the prefix evaluates they are throwing
-    placeholders; before the postfix runs the runtime overwrites the same
+    placeholders; before each call the runtime overwrites the same
     names with live stubs bound to the run's socket and handlers.
 - **Constraints (identical to the snapshot era, by design):**
   - The prefix's evaluation promise must settle without host I/O. Top-level
@@ -1794,7 +1787,7 @@ sees is exactly what the prefix produces deterministically:
 
 ### 11.4 Rebinding rules
 
-When `prefix.run()` provides `globals` or `imports`, the replacement
+When `prefix.call()` provides `globals` or `imports`, the replacement
 handlers stay on the TS side — bridge dispatch is name-addressed, so a
 rebind just re-points the per-run dispatch entry (global name, or
 host-import `specifier` + leaf path segments, §4.3). The client and then the Rust runtime
@@ -1810,8 +1803,8 @@ string globals are frozen at declaration (`ERR_FROZEN_BINDING`). A
 refused by the runtime: `ERR_FROZEN_BINDING` for a declared data or string
 name, `ERR_UNDECLARED_BINDING` otherwise.
 
-If `prefix.run()` passes a name that wasn't declared at `precompile()`
-time, `prefix.run()` rejects before anything runs with
+If `prefix.call()` passes a name that wasn't declared at `prepare()`
+time, `prefix.call()` rejects before anything runs with
 `ERR_UNDECLARED_BINDING`. This is intentional:
 we could silently install new globals into the run's context, but that
 breaks the invariant that the declared prefix shape represents the full
@@ -2034,11 +2027,11 @@ the generic host-bridge error path.
   import { createSafeFetch } from "@iso4/fetch";
 
   const runtime = await createSandbox();
-  const prefix = await runtime.precompile({
-    code: prefixSource,
+  const prefix = await runtime.prepare({
+    code: agentCode,
     globals: { fetch: createSafeFetch({ allowedHosts: [...] }) },
   });
-  const result = await prefix.run({ code: agentCode });
+  const result = await prefix.call({ export: 'default' });
   ```
 
 A host author who knows what they're doing can pass any `FetchHandler` they
@@ -2052,15 +2045,22 @@ want. A host author who isn't an HTTP-security expert should reach for
 `@iso4/sandbox` ships one call shape — **independent runs**:
 
 ```
-prefix.execute({ code }) / prefix.call({ export, args }) → RunResult / CallResult
+prefix.call({ export, args }) → CallResult
+sandbox.run({ code })         → RunResult
 ```
 
 Each run executes against the prefix and returns its result in one IPC round
-trip (Run → … → Result). One-off `sandbox.run()` creates a fresh isolate per
-run and tears it down. Prefix runs are served by **warm instances** (§13.2.1): resident isolates that skip boot and prefix re-evaluation on
-reuse — a transparent cache, not a semantic change; state carryover between
-runs is permitted but never guaranteed. This is the AI-agent prefix/postfix
-pattern described in §11 and the request-handler pattern from §5.3.
+trip (PrefixRun → … → Result). One-off `sandbox.run()` creates a fresh
+isolate per run and tears it down; inside the engine a one-off and a prefix
+are the same path (evaluate a module in a fresh isolate, read its exports)
+with two lifetimes (keep warm, or throw away). Prefix runs are served by
+**warm instances** (§13.2.1): resident isolates that skip boot and prefix
+re-evaluation on reuse — a transparent cache, not a semantic change; state
+carryover between runs is permitted but never guaranteed. This is the
+prefix/call pattern described in §11 and the request-handler pattern from
+§5.3. There is no second kind of prefix run: a prefix is full code and every
+run on it calls one of its exports. The former `prefix.execute({ code })`,
+which compiled a per-run module against the prefix, was removed in 0.9.
 
 ### 13.1 Persistent sessions are a separate product
 
@@ -2086,8 +2086,8 @@ needs to beat:
 
 |                        | `@iso4/sandbox` (this product) | Analytics runtime (future)  |
 | ---------------------- | ------------------------------ | --------------------------- |
-| Call shape             | `prefix.run({ code })`         | TBD (`pipeline.process`?)   |
-| Isolate lifetime       | per-call                       | persistent                  |
+| Call shape             | `prefix.call({ export, args })` | TBD (`pipeline.process`?)   |
+| Isolate lifetime       | warm instances, a cache        | persistent                  |
 | Async / fetch          | ✅                             | TBD                         |
 | Imports (host modules) | ✅                             | shared declaration shape    |
 | Transport              | UDS subprocess                 | NAPI / napi-rs in-process   |
@@ -2249,7 +2249,7 @@ no async I/O.
 ### 13.2.1 Warm instances (shipped)
 
 Every prepared prefix is served by **warm instances**: resident isolates
-with the prefix already evaluated. The first `execute()`/`call()` on a
+with the prefix already evaluated. The first `call()` on a
 prefix cold-starts an instance; later runs reuse it, skipping isolate boot
 (~190 µs), context creation (~115 µs), the runtime installs, prefix
 evaluation (scales with prefix size), and teardown (~180 µs). This is
@@ -2352,7 +2352,7 @@ only there, because the soft line retires a warm instance and a one-off's
 isolate is never reused. What stays
 structurally impossible is a per-run value on a WARM instance: the cap is
 baked into `Isolate::new` and instances are shared across a prefix's runs,
-so prefix `execute()`/`call()` limits reject it. Heap and ArrayBuffer usage
+so `prefix.call()` limits reject it. Heap and ArrayBuffer usage
 accumulate across calls on an instance — hitting the cap taints it. The
 old uniform-cap rationale ("capacity math `slots × cap`") is gone: capacity
 is measured, not multiplied (see below).
@@ -2660,9 +2660,9 @@ const runtime = await createSandbox({ backend: 'inprocess' })
 ```
 
 Both produce the same `Runtime`, `PrecompiledPrefix`, and `Session` objects.
-The one-shot `prefix.run()` also works with the in-process backend (it
-creates a session, runs the code as the session's body, returns exports,
-closes the session).
+The one-shot `prefix.call()` also works with the in-process backend (it
+creates a session, invokes the export as the session's body, returns the
+value, closes the session).
 
 ### 13.6 Choosing between the models (archived)
 
@@ -2725,10 +2725,10 @@ globals: {
 
 Callable return values are planned in Phase 13 (callable handles). See §15.
 
-### 14.3 `prefix.run()` globals are rebind-only
+### 14.3 `prefix.call()` globals are rebind-only
 
-`prefix.run({ globals })` may only **rebind** globals declared at
-`precompile({ globals })` time. Adding a new name at run time, of any kind
+`prefix.call({ globals })` may only **rebind** globals declared at
+`prepare({ globals })` time. Adding a new name at call time, of any kind
 and runtime-owned names included, rejects with `ERR_UNDECLARED_BINDING` and
 is a TypeScript compile-time error (when the `Prefix<G>` type parameter is
 specific). Rebinding a declared data or string global rejects with
@@ -2987,7 +2987,7 @@ per-run table.
   handles exist for cases where the returned shape is out of the host
   author's control (e.g. wrapping an existing library that returns a cursor
   or a stream handle).
-- **Not persistent across runs.** Two `prefix.run()` calls cannot share
+- **Not persistent across runs.** Two `prefix.call()` runs cannot share
   callable handles. Each run has its own isolated handle table.
 
 ---
@@ -3057,15 +3057,14 @@ per-`await` cost of using it is small in-sandbox JS time, billed to
 - **Only `await`-based async is covered.** CPED propagates across promise
   continuations, not timers/callbacks — and the sandbox has neither
   (limitations §7.2, §7.8), so this covers the entire async surface.
-- **Not available in prefix code.** `node:async_hooks` does not
-  resolve while a prefix evaluates; the cold-starting run fails cleanly
-  with `ERR_MODULE_NOT_FOUND` — a
-  contract kept from the snapshot era so prefixes behave identically. Setup
-  code is the prefix; async context is for the postfix (agent/workflow code).
-  The durable-workflow pattern is to keep the `step`/`AsyncLocalStorage` shim
-  in a **run-time import** the postfix pulls in (resolved per run, where
-  `node:async_hooks` is available), while the expensive tool/data setup lives
-  in the prefix. See §7.1.
+- **Available in prefix code too.** `node:async_hooks` resolves while a
+  prefix evaluates, so the workerd shape works: create the instance at
+  module scope, call `run()` inside the exported handler. The class lives
+  in the build-time startup snapshot; a frame set during cold start, outside
+  any run, carries token 0, so a continuation created there and resumed
+  later attributes to whichever run's turn executes it. Only prefix-authored
+  state is visible that way, which module scope shares anyway. (The old
+  prefix-stage refusal was a leftover of the runtime-snapshot era.)
 
 ### 16.4 `prepare()` does not validate the prefix
 
@@ -3073,7 +3072,7 @@ per-`await` cost of using it is small in-sandbox JS time, billed to
 running anything — global names (`names.ts`), the import shape, option
 ranges — and stores the source. The prefix is first compiled, instantiated
 and evaluated when a run cold-starts an instance, and a broken prefix
-(syntax error, unresolved import such as `node:async_hooks`, throwing
+(syntax error, unresolved import such as `node:fs`, throwing
 top-level code, a bridge call, a never-settling await, a blown warm-up
 budget) fails that run with the matching code: `ERR_USER_CODE`,
 `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`, `ERR_PREFIX_BRIDGE_CALL`,
@@ -3114,6 +3113,7 @@ surface moved.
 
 ```ts
 const prefix = await sandbox.prepare({ code })
-const check = await prefix.execute({ code: 'export default 0' })
-if (!check.ok) throw new Error(`broken prefix: ${check.error.message}`)
+// Call a side-effect-free export; a prefix failure carries `stage: 'prefix'`.
+const check = await prefix.call({ export: 'ready' })
+if (!check.ok && check.error.stage === 'prefix') throw new Error(`broken prefix: ${check.error.message}`)
 ```

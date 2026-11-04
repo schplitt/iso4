@@ -520,12 +520,6 @@ export class RuntimeIpcClient {
   async prefixRun(
     options: {
       prefixId: string
-      /**
-       * Postfix source, or absent for a call-only run — exactly one of
-       * `code` / `call` must be present.
-       */
-      code?: string
-      filename?: string
       limits?: WireResourceLimits
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
@@ -533,7 +527,7 @@ export class RuntimeIpcClient {
       importDispatch?: ImportHandlerMap
       signal?: AbortSignal
       hardAbortSignal?: AbortSignal
-      call?: CallPayload
+      call: CallPayload
       streams?: StreamSourceRegistry
     },
   ): Promise<RawRunResult> {
@@ -547,8 +541,6 @@ export class RuntimeIpcClient {
         TsToRustMessageTypes.PrefixRun,
         encodePrefixRunPayload({
           prefixId: options.prefixId,
-          code: options.code,
-          filename: options.filename,
           limits: options.limits,
           globals: options.globals,
           importRebinds: options.importRebinds,

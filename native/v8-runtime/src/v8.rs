@@ -1621,7 +1621,7 @@ pub fn execute_with_io(
 ) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
-        Some(code),
+        code,
         filename.unwrap_or("<iso4>"),
         limits,
         globals,
@@ -1634,15 +1634,8 @@ pub fn execute_with_io(
     )
 }
 
-/// The prefix a run evaluates before its postfix: validated source plus the
+/// The prefix an instance evaluates at cold start: validated source plus the
 /// globals declared at `prepare()` time, replayed into the fresh context.
-///
-/// Runtime snapshots used to carry this state (prefix heap frozen once,
-/// restored per run). V8 14.x removed the ground that stood on: snapshot
-/// creation mutates the process-shared read-only heap and the shared
-/// artifacts die with the last isolate, so runtime `create_blob` is only
-/// safe in the single-isolate, single-shot workflow V8 itself uses
-/// The prefix is now re-evaluated per run.
 #[derive(Clone, Copy)]
 pub struct PrefixSpec<'a> {
     pub code: &'a str,
@@ -1652,23 +1645,21 @@ pub struct PrefixSpec<'a> {
     pub globals: &'a [HostGlobalDef],
 }
 
-/// Execute a postfix against a prepared prefix.
+/// Call an export of a prepared prefix on a fresh, throwaway instance.
 ///
 /// The prefix source is evaluated into the fresh context first (under the
-/// run's limits), then `globals` — all `HostGlobalDef::Bridge` stubs bound to
-/// `stream_fd` for this run — overwrite the prefix-time placeholders, then
-/// the postfix runs. String/data globals and shim wrappers are replayed from
+/// warm-up budget), then `globals` — all `HostGlobalDef::Bridge` stubs bound
+/// to `stream_fd` for this run — overwrite the prefix-time placeholders, then
+/// the call runs. String/data globals and shim wrappers are replayed from
 /// `prefix.globals` and are not re-sent per run.
 pub fn execute_with_prefix(
     prefix: PrefixSpec<'_>,
-    code: Option<&str>,
-    filename: Option<&str>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
-    call: Option<&ipc::CallSpec>,
+    call: &ipc::CallSpec,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     // Cold start of a warm-capable instance: warm-up (isolate boot + prefix
@@ -1677,11 +1668,9 @@ pub fn execute_with_prefix(
     // timeout. The call itself then gets fresh guards from dispatch to
     // settle. The warm registry keeps the core alive between calls; this
     // one-shot wrapper drops it.
-    let mut core = create_instance_core(Some(prefix), imports, limits.hard_memory_mb)?;
+    let mut core = create_instance_core(prefix, imports, limits.hard_memory_mb)?;
     run_call_on_core(
         &mut core,
-        code,
-        filename.unwrap_or("<iso4>"),
         prefix.globals,
         limits,
         globals,
@@ -1693,23 +1682,18 @@ pub fn execute_with_prefix(
     .result
 }
 
-/// ESM path: compile source as a module, instantiate it, evaluate it, then
-/// inspect the module namespace object for `default` and named exports.
-///
-/// When `prefix` is `Some`, its source is evaluated into the fresh context
-/// (value globals + throwing bridge placeholders first) before postfix code
-/// runs. When `globals` is non-empty, live bridge stubs are installed for
-/// each name, overwriting any same-named prefix placeholder.
-/// `stream_fd` is the raw file-descriptor of the session socket; it is used
-/// only during bridge calls and is never closed by this function.
+/// One-off ESM path: compile source as a module, instantiate it, evaluate
+/// it, then inspect the module namespace object for `default` and named
+/// exports. When `globals` is non-empty, live bridge stubs are installed for
+/// each name. `stream_fd` is the raw file-descriptor of the session socket;
+/// it is used only during bridge calls and is never closed by this function.
 ///
 /// When `call` is `Some`, the run's value is the called function's return
-/// value instead of the exports: the export path resolves against the
-/// postfix module when `code` is `Some`, or against the prefix module for a
-/// call-only prefix run (`code` = `None`, only valid with a prefix).
+/// value instead of the exports, resolved against the freshly evaluated
+/// module.
 #[allow(clippy::too_many_arguments)]
 fn run_module(
-    code: Option<&str>,
+    code: &str,
     filename: &str,
     limits: Limits,
     globals: &[HostGlobalDef],
@@ -1762,7 +1746,7 @@ fn run_module(
 
 #[allow(clippy::too_many_arguments)] // internal; parameters mirror run_module + shared run state
 fn run_module_inner(
-    code: Option<&str>,
+    code: &str,
     filename: &str,
     limits: Limits,
     globals: &[HostGlobalDef],
@@ -1950,9 +1934,7 @@ fn run_module_inner(
     let result = run_call_phase(
         &mut isolate,
         &context_global,
-        None,
-        code,
-        filename,
+        RunEntry::Module { code, filename },
         &mut stub_slots,
         &guard,
         CallPhaseCtx {
@@ -2403,8 +2385,17 @@ fn wait_frame_on_fd(fd: RawFd, timeout: Option<Duration>, limit: u32) -> LoopEve
     }
 }
 
-/// The per-call half of a run: bridge stubs in, postfix/call executed and
-/// settled, value blob out, grace driven — as turns over [`RunState`].
+/// What a run executes: a one-off module compiled in its start turn, or an
+/// export of the instance's prefix module.
+#[derive(Clone, Copy)]
+enum RunEntry<'a> {
+    Module { code: &'a str, filename: &'a str },
+    Prefix(&'a v8::Global<v8::Module>),
+}
+
+/// The per-call half of a run: bridge stubs in, the one-off module evaluated
+/// or the prefix export called and settled, value blob out, grace driven — as
+/// turns over [`RunState`].
 /// Everything before this (isolate boot, web runtime, prefix evaluation) is
 /// instance-lifetime state that one-off runs rebuild per run and warm
 /// instances retain across calls.
@@ -2416,9 +2407,7 @@ fn wait_frame_on_fd(fd: RawFd, timeout: Option<Duration>, limit: u32) -> LoopEve
 fn run_call_phase(
     isolate: &mut v8::OwnedIsolate,
     context: &v8::Global<v8::Context>,
-    prefix_module: Option<&v8::Global<v8::Module>>,
-    code: Option<&str>,
-    filename: &str,
+    entry: RunEntry<'_>,
     stub_slots: &mut StubSlots,
     guard: &InstanceGuard,
     mut ctx: CallPhaseCtx<'_>,
@@ -2426,9 +2415,7 @@ fn run_call_phase(
     let (mut rs, start_outcome) = begin_call(
         isolate,
         context,
-        prefix_module,
-        code,
-        filename,
+        entry,
         stub_slots,
         guard,
         &mut ctx,
@@ -2514,17 +2501,15 @@ fn stamp_wall(
 }
 
 /// Build the run's state and execute its start turn: install this call's
-/// bridge surface, evaluate the postfix (or invoke the call), checkpoint,
-/// scan. Finishes the run outright in the common no-bridge case. The caller
+/// bridge surface, evaluate the one-off module (or invoke the call),
+/// checkpoint, scan. Finishes the run outright in the common no-bridge case. The caller
 /// pre-armed the guard target (it must cover the placeholder install);
 /// this releases it — and the budget epoch — however the turn ends.
 #[allow(clippy::too_many_arguments)]
 fn begin_call(
     isolate: &mut v8::OwnedIsolate,
     context: &v8::Global<v8::Context>,
-    prefix_module: Option<&v8::Global<v8::Module>>,
-    code: Option<&str>,
-    filename: &str,
+    entry: RunEntry<'_>,
     stub_slots: &mut StubSlots,
     guard: &InstanceGuard,
     ctx: &mut CallPhaseCtx<'_>,
@@ -2566,9 +2551,7 @@ fn begin_call(
     let start_outcome = start_turn(
         isolate,
         context,
-        prefix_module,
-        code,
-        filename,
+        entry,
         stub_slots,
         ctx,
         &facts,
@@ -2822,9 +2805,7 @@ fn next_deadline(rs: &RunState) -> Option<std::time::Instant> {
 fn start_turn(
     isolate: &mut v8::OwnedIsolate,
     context: &v8::Global<v8::Context>,
-    prefix_module: Option<&v8::Global<v8::Module>>,
-    code: Option<&str>,
-    filename: &str,
+    entry: RunEntry<'_>,
     stub_slots: &mut StubSlots,
     ctx: &CallPhaseCtx<'_>,
     facts: &RunFacts<'_>,
@@ -2963,136 +2944,133 @@ fn start_turn(
 
     v8::tc_scope!(let scope, scope);
 
-    // Compile, instantiate, and evaluate the postfix module when the frame
-    // carries one. A call-only prefix run (`code` = None) has no postfix —
-    // the prefix module evaluated at instance creation is the call target.
-    if let Some(code) = code {
-        let Some(source_string) = v8::String::new(scope, code) else {
-            return finished(Err(rs.fail(RunError::Internal(
-                "failed to intern module source".to_string(),
-            ))));
-        };
-        let Some(filename_str) = v8::String::new(scope, filename) else {
-            return finished(Err(rs.fail(RunError::Internal(
-                "failed to intern filename".to_string(),
-            ))));
-        };
-        let origin = v8::ScriptOrigin::new(
-            scope,
-            filename_str.into(),
-            0,
-            0,
-            false,
-            0,
-            None,
-            false,
-            false,
-            true,
-            None,
-        );
-        let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
-
-        let module = match v8::script_compiler::compile_module(scope, &mut source) {
-            Some(m) => m,
-            None => {
-                return finished(Err(rs.fail(termination_or(
-                    facts.reason,
-                    syntax_error(scope),
+    // A one-off compiles, instantiates and evaluates its module here; a
+    // prefix run calls into the module evaluated at instance creation.
+    match entry {
+        RunEntry::Module { code, filename } => {
+            let Some(source_string) = v8::String::new(scope, code) else {
+                return finished(Err(rs.fail(RunError::Internal(
+                    "failed to intern module source".to_string(),
                 ))));
-            }
-        };
+            };
+            let Some(filename_str) = v8::String::new(scope, filename) else {
+                return finished(Err(rs.fail(RunError::Internal(
+                    "failed to intern filename".to_string(),
+                ))));
+            };
+            let origin = v8::ScriptOrigin::new(
+                scope,
+                filename_str.into(),
+                0,
+                0,
+                false,
+                0,
+                None,
+                false,
+                false,
+                true,
+                None,
+            );
+            let mut source = v8::script_compiler::Source::new(source_string, Some(&origin));
 
-        // Install the module resolver for this run. After
-        // `instantiate_module` returns we inspect `resolve_error` for any
-        // non-V8-throwable error recorded inside the resolver (e.g. a source
-        // module that failed to compile).
-        let _resolver_guard = install_resolver(ResolverContext {
-            bindings: ctx.imports.to_vec(),
-            module_cache: HashMap::new(),
-            pending_meta: Vec::new(),
-            resolve_error: None,
-            async_context_builtin: true,
-        });
-
-        if module
-            .instantiate_module(scope, module_resolver_callback)
-            .is_none()
-        {
-            let err = take_resolver()
-                .and_then(|ctx| ctx.resolve_error)
-                .unwrap_or_else(|| RunError::Import(exception_message(scope)));
-            return finished(Err(rs.fail(termination_or(facts.reason, err))));
-        }
-
-        rs.cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
-        let evaluation = match module.evaluate(scope) {
-            Some(value) => value,
-            None => {
-                if let Some(err) = rs.bridge_error.get() {
-                    return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
+            let module = match v8::script_compiler::compile_module(scope, &mut source) {
+                Some(m) => m,
+                None => {
+                    return finished(Err(rs.fail(termination_or(
+                        facts.reason,
+                        syntax_error(scope),
+                    ))));
                 }
-                let error = match facts.reason.get() {
-                    Some(TerminationReason::Wall) => RunError::WallTimeout,
-                    Some(TerminationReason::Cpu) => RunError::CpuTimeout,
-                    Some(TerminationReason::Memory) => RunError::MemoryLimit,
-                    // A hard abort's mid-turn kill (`GuardCtl::abort_executing`).
-                    Some(TerminationReason::Abort) => RunError::Aborted,
-                    Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
-                    // Belt-and-suspenders: a terminate with no reason at all.
-                    None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
-                    None => RunError::RuntimeError(Box::new(RuntimeErrorData {
-                        name: exception_name(scope),
-                        message: exception_message(scope),
-                        stack: exception_stack(scope),
-                        fields: exception_fields(scope),
-                    })),
-                };
-                // Reading the exception can run guest getters.
-                let error = rs.bridge_error.get().map_or(error, owned_bridge_error);
-                return finished(Err(rs.fail(termination_or(facts.reason, error))));
+            };
+
+            // Install the module resolver for this run. After
+            // `instantiate_module` returns we inspect `resolve_error` for any
+            // non-V8-throwable error recorded inside the resolver (e.g. a source
+            // module that failed to compile).
+            let _resolver_guard = install_resolver(ResolverContext {
+                bindings: ctx.imports.to_vec(),
+                module_cache: HashMap::new(),
+                pending_meta: Vec::new(),
+                resolve_error: None,
+            });
+
+            if module
+                .instantiate_module(scope, module_resolver_callback)
+                .is_none()
+            {
+                let err = take_resolver()
+                    .and_then(|ctx| ctx.resolve_error)
+                    .unwrap_or_else(|| RunError::Import(exception_message(scope)));
+                return finished(Err(rs.fail(termination_or(facts.reason, err))));
             }
-        };
 
-        // One checkpoint immediately after evaluate() so that purely
-        // synchronous results settle now, synchronous bridge errors propagate
-        // to the module's top-level promise now, and termination exceptions
-        // propagate now. For pending bridge calls nothing changes — the
-        // resolvers aren't set yet.
-        scope.perform_microtask_checkpoint();
-        if facts.reason.get().is_some() {
-            return finished(Err(rs.fail(reason_error(facts.reason))));
+            rs.cpu_budget.enter(); // start measuring active CPU time (compile + scope setup excluded)
+            let evaluation = match module.evaluate(scope) {
+                Some(value) => value,
+                None => {
+                    if let Some(err) = rs.bridge_error.get() {
+                        return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
+                    }
+                    let error = match facts.reason.get() {
+                        Some(TerminationReason::Wall) => RunError::WallTimeout,
+                        Some(TerminationReason::Cpu) => RunError::CpuTimeout,
+                        Some(TerminationReason::Memory) => RunError::MemoryLimit,
+                        // A hard abort's mid-turn kill (`GuardCtl::abort_executing`).
+                        Some(TerminationReason::Abort) => RunError::Aborted,
+                        Some(TerminationReason::Import(m)) => RunError::Import(m.to_string()),
+                        // Belt-and-suspenders: a terminate with no reason at all.
+                        None if facts.cancel_handle.is_execution_terminating() => RunError::Aborted,
+                        None => RunError::RuntimeError(Box::new(RuntimeErrorData {
+                            name: exception_name(scope),
+                            message: exception_message(scope),
+                            stack: exception_stack(scope),
+                            fields: exception_fields(scope),
+                        })),
+                    };
+                    // Reading the exception can run guest getters.
+                    let error = rs.bridge_error.get().map_or(error, owned_bridge_error);
+                    return finished(Err(rs.fail(termination_or(facts.reason, error))));
+                }
+            };
+
+            // One checkpoint immediately after evaluate() so that purely
+            // synchronous results settle now, synchronous bridge errors propagate
+            // to the module's top-level promise now, and termination exceptions
+            // propagate now. For pending bridge calls nothing changes — the
+            // resolvers aren't set yet.
+            scope.perform_microtask_checkpoint();
+            if facts.reason.get().is_some() {
+                return finished(Err(rs.fail(reason_error(facts.reason))));
+            }
+
+            // ESM Module::Evaluate() always returns a Promise. The try_from is a
+            // belt-and-suspenders guard; failure would be an internal V8 bug.
+            let Ok(promise) = v8::Local::<v8::Promise>::try_from(evaluation) else {
+                return finished(Err(rs.fail(RunError::Internal(
+                    "module evaluation did not return a Promise".into(),
+                ))));
+            };
+
+            rs.phase = RunPhase::Settling {
+                root: v8::Global::new(scope, promise),
+                module: Some(v8::Global::new(scope, module)),
+                call_pending: facts.call.is_some(),
+                root_is_call_result: false,
+            };
+            scan(scope, facts, rs)
         }
-
-        // ESM Module::Evaluate() always returns a Promise. The try_from is a
-        // belt-and-suspenders guard; failure would be an internal V8 bug.
-        let Ok(promise) = v8::Local::<v8::Promise>::try_from(evaluation) else {
-            return finished(Err(rs.fail(RunError::Internal(
-                "module evaluation did not return a Promise".into(),
-            ))));
-        };
-
-        rs.phase = RunPhase::Settling {
-            root: v8::Global::new(scope, promise),
-            module: Some(v8::Global::new(scope, module)),
-            call_pending: facts.call.is_some(),
-            root_is_call_result: false,
-        };
-        scan(scope, facts, rs)
-    } else {
-        // Call-only prefix run: the prefix module evaluated at instance
-        // creation is the call target. Enter the CPU budget here — the
-        // postfix path enters it right before evaluate() — so path
-        // resolution and the call itself are measured (a path segment can
-        // be an accessor).
-        rs.cpu_budget.enter();
-        let module = v8::Local::new(
-            scope,
-            prefix_module.expect("call-only run without a prefix module"),
-        );
-        match invoke_requested_call(scope, facts, rs, module) {
-            Ok(ScanOutcome::Continue) => scan(scope, facts, rs),
-            Ok(done) => done,
-            Err(f) => finished(Err(f)),
+        RunEntry::Prefix(prefix_module) => {
+            // Prefix run: the prefix module evaluated at instance creation is
+            // the call target. Enter the CPU budget here — the one-off path
+            // enters it right before evaluate() — so path resolution and the
+            // call itself are measured (a path segment can be an accessor).
+            rs.cpu_budget.enter();
+            let module = v8::Local::new(scope, prefix_module);
+            match invoke_requested_call(scope, facts, rs, module) {
+                Ok(ScanOutcome::Continue) => scan(scope, facts, rs),
+                Ok(done) => done,
+                Err(f) => finished(Err(f)),
+            }
         }
     }
 }
@@ -4716,7 +4694,7 @@ pub const WARMUP_CPU_MS: u32 = 1_000;
 pub struct InstanceCore {
     // Field order is drop order: the Globals must die before the isolate.
     context: v8::Global<v8::Context>,
-    prefix_module: Option<v8::Global<v8::Module>>,
+    prefix_module: v8::Global<v8::Module>,
     isolate: v8::OwnedIsolate,
     /// Per-run state table. The once-per-instance native installs (console,
     /// web runtime, waitUntil, bridge stubs) hold a raw pointer into this
@@ -4842,7 +4820,7 @@ fn warmup_error(reason: &ReasonCell, fallback: RunError) -> RunError {
 /// caller's limits are not armed, so neither timeout code would be honest);
 /// blowing the heap cap keeps `ERR_MEMORY_LIMIT`.
 pub fn create_instance_core(
-    prefix: Option<PrefixSpec<'_>>,
+    prefix: PrefixSpec<'_>,
     imports: &[ImportBinding],
     hard_memory_mb: u32,
 ) -> Result<InstanceCore, FailureOutput> {
@@ -4865,7 +4843,7 @@ pub fn create_instance_core(
     });
 
     let table_ptr: *const RunTable = &*run_table;
-    let setup = (|| -> Result<(v8::Global<v8::Context>, Option<v8::Global<v8::Module>>), RunError> {
+    let setup = (|| -> Result<(v8::Global<v8::Context>, v8::Global<v8::Module>), RunError> {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -4873,17 +4851,14 @@ pub fn create_instance_core(
         // waitUntil or setTimeout throws, and warm-up console output lands
         // in setup_logs.
         crate::snapshot::boot_context(scope, table_ptr).map_err(RunError::Internal)?;
-        let mut prefix_module: Option<v8::Global<v8::Module>> = None;
-        if let Some(prefix) = &prefix {
-            // Enter the CPU meter for compile + evaluate only — isolate boot
-            // is ours, the prefix's code is what the budget polices.
-            warmup_budget.enter();
+        // Enter the CPU meter for compile + evaluate only — isolate boot
+        // is ours, the prefix's code is what the budget polices.
+        warmup_budget.enter();
+        let prefix_module = {
             v8::tc_scope!(let tc, scope);
-            let module =
-                evaluate_prefix_module(tc, prefix.code, prefix.filename, prefix.globals, imports)?;
-            prefix_module = Some(module);
-            warmup_budget.leave();
-        }
+            evaluate_prefix_module(tc, prefix.code, prefix.filename, prefix.globals, imports)?
+        };
+        warmup_budget.leave();
         Ok((v8::Global::new(scope, context), prefix_module))
     })();
     warmup_budget.leave();
@@ -4932,9 +4907,6 @@ pub struct CallJob {
     /// demux allocates it up front (via [`alloc_run_token`]) so it can route
     /// mid-turn aborts before the instance has even started the run.
     pub token: u64,
-    /// Postfix source (`execute`) — `None` for a call-only run.
-    pub code: Option<String>,
-    pub filename: Option<String>,
     pub limits: Limits,
     /// Bridge-stub defs for this call (re-installed per call).
     pub globals: Vec<ipc::HostGlobalDef>,
@@ -4942,7 +4914,7 @@ pub struct CallJob {
     pub io: RunIo,
     /// The connection's monotonically increasing bridge call-ID counter.
     pub call_id_counter: Arc<AtomicU32>,
-    pub call: Option<ipc::CallSpec>,
+    pub call: ipc::CallSpec,
     /// Per-run identity for the early Result frame.
     pub epilogue: Option<EpilogueSpec>,
     /// Session completion hook, run on the instance thread when the run
@@ -4985,22 +4957,20 @@ pub struct CallOutcome {
     pub prefix_failed: bool,
 }
 
-/// Run one call (postfix or export call) on a retained instance: fresh
-/// guards and CPU budget from dispatch to settle, per-call bridge stubs,
-/// per-call console caps — the same per-request semantics a one-off run has,
-/// minus the isolate boot and prefix evaluation.
+/// Run one export call on a retained instance: fresh guards and CPU budget
+/// from dispatch to settle, per-call bridge stubs, per-call console caps —
+/// the same per-request semantics a one-off run has, minus the isolate boot
+/// and prefix evaluation.
 #[allow(clippy::too_many_arguments)] // mirrors run_module; bundled state is the instance itself
 pub fn run_call_on_core(
     core: &mut InstanceCore,
-    code: Option<&str>,
-    filename: &str,
     prefix_globals: &[HostGlobalDef],
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
     stream_fd: Option<RawFd>,
     call_id_counter: Arc<AtomicU32>,
-    call: Option<&ipc::CallSpec>,
+    call: &ipc::CallSpec,
 ) -> CallOutcome {
     let start = std::time::Instant::now();
     let cpu_budget = Arc::new(CpuBudget::new());
@@ -5039,7 +5009,7 @@ pub fn run_call_on_core(
     // The placeholder re-arm below runs `define_own_property` — which never
     // invokes user accessors — but defence in depth: any path that can
     // execute sandbox-authored code on this thread must be under a budget,
-    // or a hostile prefix/postfix could hang the owner thread forever.
+    // or hostile prefix or run code could hang the owner thread forever.
     // (run_call_phase re-arms this target per turn and clears it while the
     // run is parked.)
     let cancel_handle = core.isolate.thread_safe_handle();
@@ -5073,9 +5043,7 @@ pub fn run_call_on_core(
         Ok(()) => run_call_phase(
             &mut core.isolate,
             &core.context,
-            core.prefix_module.as_ref(),
-            code,
-            filename,
+            RunEntry::Prefix(&core.prefix_module),
             &mut core.stub_slots,
             &core.guard,
             CallPhaseCtx {
@@ -5086,7 +5054,7 @@ pub fn run_call_on_core(
                 imports,
                 io: stream_fd.map_or(RunIo::None, RunIo::Fd),
                 call_id_counter,
-                call,
+                call: Some(call),
                 start,
                 cpu_budget: &cpu_budget,
                 bridge_log: &bridge_log,
@@ -5318,7 +5286,7 @@ fn sweep_expired_deadlines(
             enter_turn(&mut l.rs, at);
             let outcome = {
                 let facts = RunFacts {
-                    call: l.job.call.as_ref(),
+                    call: Some(&l.job.call),
                     reason: &core.reason,
                     guard: &core.guard,
                     cancel_handle: core.guard.handle(),
@@ -5360,7 +5328,7 @@ fn sweep_expired_deadlines(
                 enter_turn(&mut l.rs, d);
                 let outcome = {
                     let facts = RunFacts {
-                        call: l.job.call.as_ref(),
+                        call: Some(&l.job.call),
                         reason: &core.reason,
                         guard: &core.guard,
                         cancel_handle: core.guard.handle(),
@@ -5643,7 +5611,7 @@ pub fn serve_instance(
                 enter_turn(&mut l.rs, at);
                 let outcome = {
                     let facts = RunFacts {
-                        call: l.job.call.as_ref(),
+                        call: Some(&l.job.call),
                         reason: &core.reason,
                         guard: &core.guard,
                         cancel_handle: core.guard.handle(),
@@ -5729,15 +5697,13 @@ fn dispatch_job(
         set_run_epilogue_spec(job.epilogue);
         let outcome = run_call_on_core(
             core,
-            job.code.as_deref(),
-            job.filename.as_deref().unwrap_or("<iso4>"),
             prefix_globals,
             job.limits,
             &job.globals,
             imports,
             Some(fd),
             Arc::clone(&job.call_id_counter),
-            job.call.as_ref(),
+            &job.call,
         );
         if let Some(complete) = job.complete.take() {
             complete(outcome);
@@ -5819,7 +5785,7 @@ fn dispatch_job(
                 imports,
                 io,
                 call_id_counter: Arc::clone(&job.call_id_counter),
-                call: job.call.as_ref(),
+                call: Some(&job.call),
                 start,
                 cpu_budget: &cpu_budget,
                 bridge_log: &bridge_log,
@@ -5843,9 +5809,7 @@ fn dispatch_job(
             Ok(begin_call(
                 isolate,
                 context,
-                prefix_module.as_ref(),
-                job.code.as_deref(),
-                job.filename.as_deref().unwrap_or("<iso4>"),
+                RunEntry::Prefix(prefix_module),
                 stub_slots,
                 guard,
                 &mut ctx,
@@ -6209,12 +6173,9 @@ const PREFIX_SETTLE_MAX_CHECKPOINTS: usize = 1000;
 /// Compile, instantiate, and evaluate prefix `code` as an ESM module in the
 /// current context, returning the settled module once evaluation succeeds.
 ///
-/// Shared by `prepare()` validation and every run's prefix stage so their
-/// behavior — crucially, *which imports resolve* — is identical. Bridge
-/// globals are not installed here (bridge stubs are recreated per
-/// `execute_with_prefix`), and `node:async_hooks` is not resolvable while a
-/// prefix evaluates. The returned handle is what a `prefix.call()` resolves
-/// its export path against; validation callers drop it.
+/// Bridge globals are not installed here (bridge stubs are recreated per
+/// call). The returned handle is what a `prefix.call()` resolves its export
+/// path against.
 fn evaluate_prefix_module(
     scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
     code: &str,
@@ -6225,7 +6186,7 @@ fn evaluate_prefix_module(
     // Install the value globals (string exprs, constants, shim wrappers)
     // before evaluating the prefix, so prefix code sees them. Bridge stubs
     // are NOT installed here — they are created against a live socket only
-    // for the postfix stage. Their names get throwing placeholders instead,
+    // per call. Their names get throwing placeholders instead,
     // so a prefix that calls one fails with ERR_PREFIX_BRIDGE_CALL rather
     // than an accidental ReferenceError/TypeError.
     install_value_globals(scope, globals)?;
@@ -6260,7 +6221,6 @@ fn evaluate_prefix_module(
         module_cache: HashMap::new(),
         pending_meta: Vec::new(),
         resolve_error: None,
-        async_context_builtin: false,
     });
 
     if module
@@ -6337,7 +6297,7 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
 }
 
 /// A guard can fire while the run is still in setup — installing globals or
-/// the web runtime, evaluating the prefix, compiling the postfix. V8 then
+/// the web runtime, evaluating the prefix, compiling a one-off module. V8 then
 /// fails the interrupted operation, and classifying that failure would
 /// misreport the timeout as `ERR_INTERNAL` ("evaluate web runtime: null") or
 /// a `SyntaxError`. The guard stores its reason *before* it calls
@@ -6416,13 +6376,6 @@ struct ResolverContext {
     /// First resolver error wins. V8's callback ABI can't carry a
     /// `RunError`, so the caller inspects this after `instantiate_module`.
     resolve_error: Option<RunError>,
-    /// When true, the reserved specifier `node:async_hooks` resolves to the
-    /// built-in `AsyncLocalStorage` module (see [`install_async_context`]).
-    /// Enabled for postfix code (`run_module`), disabled while a prefix
-    /// evaluates (the cold-start prefix stage of a run) —
-    /// prefix code predates the per-run async-context machinery, a contract
-    /// kept from the snapshot era so prefixes behave identically.
-    async_context_builtin: bool,
 }
 
 thread_local! {
@@ -6464,15 +6417,6 @@ fn lookup_binding(specifier: &str) -> Option<ImportBinding> {
                 .find(|b| b.specifier == specifier)
                 .cloned()
         })
-    })
-}
-
-fn async_context_builtin_enabled() -> bool {
-    RESOLVER_CTX.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|ctx| ctx.async_context_builtin)
-            .unwrap_or(false)
     })
 }
 
@@ -6550,7 +6494,7 @@ fn module_resolver_callback<'a>(
     // binding matches do we fall back to the built-in async-context module.
     let binding = match lookup_binding(&specifier_str) {
         Some(b) => b,
-        None if specifier_str == ASYNC_HOOKS_SPECIFIER && async_context_builtin_enabled() => {
+        None if specifier_str == ASYNC_HOOKS_SPECIFIER => {
             ImportBinding {
                 specifier: specifier_str.clone(),
                 module: ImportModule::Source(ASYNC_HOOKS_MODULE_SRC.to_string()),
@@ -7750,7 +7694,7 @@ fn install_bridge_globals(
 /// string, passed as data — never interpolated into code). The wrapper looks
 /// the handler stub up on `globalThis` at call time, so the same wrapper works
 /// whether it is built for a direct run (stub installed alongside it) or baked
-/// into a snapshot (stub re-installed per `prefix.run()`).
+/// into the instance (stub re-installed per call).
 const SHIM_FACTORY_SRC: &str =
     "(shim, handlerName) => (async (...args) => await shim(await globalThis[handlerName](...args)))";
 
@@ -8936,7 +8880,7 @@ fn append_capped_line(buffers: &mut LogBuffers, stdout: bool, line: String) {
 // ── Async context (AsyncLocalStorage) ────────────────────────────────────────
 //
 // A minimal, Node-compatible `AsyncLocalStorage` (`run` + `getStore`), surfaced
-// to run/postfix code via `import { AsyncLocalStorage } from 'node:async_hooks'`.
+// to run and prefix code via `import { AsyncLocalStorage } from 'node:async_hooks'`.
 //
 // Mechanism: V8's *continuation-preserved embedder data* (CPED) — the same
 // primitive modern Node's `AsyncContextFrame` rides on. V8 automatically saves
@@ -8952,9 +8896,8 @@ fn append_capped_line(buffers: &mut LogBuffers, stdout: bool, line: String) {
 //
 // No promise hooks are registered, so runs that never construct an
 // `AsyncLocalStorage` pay nothing beyond V8's own (cheap) CPED bookkeeping.
-// State resets between runs naturally (fresh isolate per run). CPED is runtime
-// state, not part of the snapshot, which is why the feature is unavailable to
-// prefix/precompile code (see `async_context_builtin` on `ResolverContext`).
+// The class is installed into the build-time startup snapshot, so prefix code
+// may import it too; a frame set outside any run carries token 0.
 
 /// Reserved module specifier that resolves to the built-in async-context module.
 const ASYNC_HOOKS_SPECIFIER: &str = "node:async_hooks";
@@ -9427,7 +9370,7 @@ mod tests {
     fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
         init_platform();
         run_module(
-            Some(code),
+            code,
             filename,
             limits,
             &[],
@@ -9485,7 +9428,7 @@ mod tests {
     fn run_with_source_imports(code: &str, imports: &[ImportBinding]) -> Result<Output, RunError> {
         init_platform();
         run_module(
-            Some(code),
+            code,
             "<iso4>",
             Limits::default(),
             &[],
@@ -10665,11 +10608,9 @@ mod tests {
 
     #[test]
     fn execute_with_prefix_infinite_loop_is_killed() {
-        let prefix = prepared("globalThis.base = 10", &[], &[]);
+        let prefix = prepared("export function spin() { while (true) {} }", &[], &[]);
         let err = execute_with_prefix(
             prefix,
-            Some("while (true) {}"),
-            None,
             Limits {
                 cpu_time_ms: 200,
                 wall_time_ms: 1_000,
@@ -10679,7 +10620,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("spin", &[]),
         )
         .map_err(|f| f.error)
         .unwrap_err();
@@ -11081,11 +11022,11 @@ mod tests {
     ) -> Result<(), FailureOutput> {
         init_platform();
         create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code,
                 filename: "<prefix>",
                 globals,
-            }),
+            },
             imports,
             0,
         )
@@ -11137,25 +11078,24 @@ mod tests {
         // Deleted before prefix evaluation too: no reference can be captured
         // at prepare() time and handed to run code.
         let prefix = prepared(
-            "globalThis.atSetup = [typeof WebAssembly, typeof SharedArrayBuffer].join('|')",
+            "globalThis.atSetup = [typeof WebAssembly, typeof SharedArrayBuffer].join('|')\n\
+             export default () => atSetup + '|' + typeof WebAssembly",
             &[],
             &[],
         );
         let out = execute_with_prefix(
             prefix,
-            Some("export default atSetup + '|' + typeof WebAssembly"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
         assert_eq!(
-            get_default(&out).as_deref(),
-            Some("undefined|undefined|undefined")
+            value_of(&out),
+            WireValue::String("undefined|undefined|undefined".to_string())
         );
     }
 
@@ -11191,27 +11131,25 @@ mod tests {
         // generate code of its own.
         let prefix = prepared(
             "globalThis.double = new Function('a', 'return a * 2')\n\
-             globalThis.viaEval = eval('(x) => x + 1')",
+             globalThis.viaEval = eval('(x) => x + 1')\n\
+             export default () => { \
+               const denied = (() => { try { eval('1'); return 'allowed' } \
+                 catch (e) { return e instanceof EvalError } })(); \
+               return [double(21), viaEval(41), denied].join('|') }",
             &[],
             &[],
         );
         let out = execute_with_prefix(
             prefix,
-            Some(
-                "const denied = (() => { try { eval('1'); return 'allowed' } \
-                   catch (e) { return e instanceof EvalError } })()\n\
-                 export default [double(21), viaEval(41), denied].join('|')",
-            ),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("42|42|true"));
+        assert_eq!(value_of(&out), WireValue::String("42|42|true".to_string()));
     }
 
     // ── waitUntil grace phase (hold mode — no epilogue spec/socket) ─────────
@@ -11311,23 +11249,24 @@ mod tests {
     fn wait_until_throws_a_catchable_error_in_setup_code() {
         let prefix = prepared(
             "globalThis.setupMsg = (() => { \
-               try { waitUntil(1); return 'allowed' } catch (e) { return e.message } })()",
+               try { waitUntil(1); return 'allowed' } catch (e) { return e.message } })()\n\
+             export default () => [globalThis.setupMsg, typeof waitUntil].join('|')",
             &[],
             &[],
         );
         let out = execute_with_prefix(
             prefix,
-            Some("export default [globalThis.setupMsg, typeof waitUntil].join('|')"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        let got = get_default(&out).unwrap();
+        let WireValue::String(got) = value_of(&out) else {
+            panic!("expected a string value");
+        };
         assert!(
             got.contains("only available to run code") && got.ends_with("|function"),
             "{got}"
@@ -11403,18 +11342,26 @@ mod tests {
         // Boundary truncation (nothing to drive, no socket) is not a taint:
         // no JS was interrupted, the instance keeps serving calls.
         init_platform();
-        let mut core = create_instance_core(None, &[], 0).expect("core");
+        let mut core = create_instance_core(
+            PrefixSpec {
+                code: "export function park() { waitUntil(new Promise(() => {})); return 1 }\n\
+                       export function probe() { return typeof waitUntil }",
+                filename: "<prefix>",
+                globals: &[],
+            },
+            &[],
+            0,
+        )
+        .expect("core");
         let outcome = run_call_on_core(
             &mut core,
-            Some("waitUntil(new Promise(() => {}))\nexport default 1"),
-            "<iso4>",
             &[],
             grace_limits(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("park", &[]),
         );
         assert!(!outcome.tainted, "boundary truncation must not taint");
         let out = outcome.result.expect("run succeeded");
@@ -11425,18 +11372,16 @@ mod tests {
 
         let second = run_call_on_core(
             &mut core,
-            Some("export default typeof waitUntil"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("probe", &[]),
         );
         let out = second.result.expect("instance reusable after clean truncation");
-        assert_eq!(get_default(&out).as_deref(), Some("function"));
+        assert_eq!(value_of(&out), WireValue::String("function".to_string()));
         assert!(out.background.is_none());
     }
 
@@ -11453,31 +11398,30 @@ mod tests {
     fn prefix_top_level_await_settles() {
         let prefix = prepared(
             "globalThis.a = await Promise.resolve(40)\n\
-             globalThis.b = await new Response('x').text()",
+             globalThis.b = await new Response('x').text()\n\
+             export default () => [globalThis.a + 1, globalThis.b].join('|')",
             &[],
             &[],
         );
         let out = execute_with_prefix(
             prefix,
-            Some("export default [globalThis.a + 1, globalThis.b].join('|')"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("41|x"));
+        assert_eq!(value_of(&out), WireValue::String("41|x".to_string()));
     }
 
     #[test]
     fn prefix_top_level_await_in_plain_exports_settles() {
         // The common bundled-handler shapes: the awaited value lands in a
         // module binding (or is discarded), not on globalThis. A prefix's
-        // namespace is discarded by design, so there is nothing for a postfix
-        // to observe — the point is that precompile itself succeeds. The
+        // namespace is where calls resolve, so nothing else observes these
+        // bindings — the point is that precompile itself succeeds. The
         // failure never depended on where the value lands, only on the
         // module evaluation promise.
         for code in [
@@ -11505,23 +11449,22 @@ mod tests {
             "export const config = await Promise.resolve({ level: 3 })",
         )];
         let prefix = prepared(
-            "import { config } from 'lib:config'; globalThis.level = config.level",
+            "import { config } from 'lib:config'; globalThis.level = config.level\n\
+             export default () => globalThis.level",
             &[],
             &imports,
         );
         let out = execute_with_prefix(
             prefix,
-            Some("export default globalThis.level"),
-            None,
             Limits::default(),
             &[],
             &imports,
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("3"));
+        assert_eq!(value_of(&out), WireValue::Number(3.0));
     }
 
     #[test]
@@ -11530,23 +11473,22 @@ mod tests {
         // drains the whole queue, newly enqueued microtasks included.
         let prefix = prepared(
             "let n = 0; for (let i = 0; i < 10; i++) { n = await Promise.resolve(n + 1) } \
-             globalThis.n = n",
+             globalThis.n = n\n\
+             export default () => globalThis.n",
             &[],
             &[],
         );
         let out = execute_with_prefix(
             prefix,
-            Some("export default globalThis.n"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("10"));
+        assert_eq!(value_of(&out), WireValue::Number(10.0));
     }
 
     #[test]
@@ -11688,29 +11630,26 @@ mod tests {
         }];
         let prefix = prepared(
             "globalThis.prefixEnumerated = Object.keys(globalThis).includes('tool')\n\
-             globalThis.prefixType = typeof tool",
+             globalThis.prefixType = typeof tool\n\
+             export default () => [prefixEnumerated, prefixType, \
+               Object.keys(globalThis).includes('tool'), typeof tool].join('|')",
             &globals,
             &[],
         );
         let out = execute_with_prefix(
             prefix,
-            Some(
-                "export default [prefixEnumerated, prefixType, \
-                   Object.keys(globalThis).includes('tool'), typeof tool].join('|')",
-            ),
-            None,
             Limits::default(),
             &globals,
             &[],
             Some(client.as_raw_fd()),
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
         drop(server);
         assert_eq!(
-            get_default(&out).as_deref(),
-            Some("false|function|false|function")
+            value_of(&out),
+            WireValue::String("false|function|false|function".to_string())
         );
     }
 
@@ -11750,80 +11689,62 @@ mod tests {
         // typeof matches run() code, and stashing a reference is fine — only
         // the call is rejected.
         let globals = [HostGlobalDef::bridge("fetch")];
-        let prefix = prepared("globalThis.kind = typeof fetch", &globals, &[]);
+        let prefix = prepared(
+            "globalThis.kind = typeof fetch\nexport default () => globalThis.kind",
+            &globals,
+            &[],
+        );
         let out = execute_with_prefix(
             prefix,
-            Some("export default globalThis.kind"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("function"));
-    }
-
-    #[test]
-    fn execute_with_prefix_basic_postfix() {
-        // Module-scoped `const` stays in the prefix module's scope.
-        // Use globalThis to share values with the postfix module.
-        let prefix = prepared("globalThis.base = 100", &[], &[]);
-        let out = execute_with_prefix(
-            prefix,
-            Some("export default globalThis.base + 1"),
-            None,
-            Limits::default(),
-            &[],
-            &[],
-            None,
-            Arc::new(AtomicU32::new(0)),
-            None,
-        )
-        .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("101"));
+        assert_eq!(value_of(&out), WireValue::String("function".to_string()));
     }
 
     /// The web classes are native `FunctionTemplate`s restored into every
     /// run's context; a closure the prefix creates over them must still
-    /// work when the postfix stage of the same run calls it.
+    /// work when a call on the same instance invokes it.
     #[test]
     fn web_globals_are_usable_from_prefix_code() {
         let prefix = prepared(
-            "globalThis.mk = () => new Response('hi', { status: 201 })",
+            "globalThis.mk = () => new Response('hi', { status: 201 })\n\
+             export default () => { const r = globalThis.mk(); \
+               return [r instanceof Response, r.status, r.headers.get('content-type')].join('|') }",
             &[],
             &[],
         );
         let out = execute_with_prefix(
-            prefix, Some("const r = globalThis.mk(); \
-             export default [r instanceof Response, r.status, r.headers.get('content-type')].join('|')"),
-            None,
+            prefix,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
         assert_eq!(
-            get_default(&out).as_deref(),
-            Some("true|201|text/plain;charset=UTF-8")
+            value_of(&out),
+            WireValue::String("true|201|text/plain;charset=UTF-8".to_string())
         );
     }
 
     /// A live web-type instance created by prefix code must be visible to
-    /// the postfix stage of the run (and validate cleanly at prepare() time).
+    /// a call on the instance (and validate cleanly at prepare() time).
     #[test]
-    fn a_live_instance_in_the_prefix_is_visible_to_the_postfix() {
+    fn a_live_instance_in_the_prefix_is_visible_to_a_call() {
         for expr in [
             "new Response('x', { status: 201 })",
             "new Request('https://ex.com/a')",
             "new Headers([['content-type', 'text/plain']])",
         ] {
-            let prefix_src = format!("globalThis.v = {expr}");
+            let prefix_src = format!("globalThis.v = {expr}\nexport default () => typeof globalThis.v");
             evaluate_prefix(&prefix_src, &[], &[])
                 .unwrap_or_else(|_| panic!("a prefix with a live {expr} must evaluate"));
             let out = execute_with_prefix(
@@ -11832,35 +11753,35 @@ mod tests {
                     filename: "<prefix>",
                     globals: &[],
                 },
-                Some("export default typeof globalThis.v"),
-                None,
                 Limits::default(),
                 &[],
                 &[],
                 None,
                 Arc::new(AtomicU32::new(0)),
-                None,
+                &call_spec("default", &[]),
             )
             .unwrap_or_else(|_| panic!("run with a prefix holding {expr} must not fail"));
-            assert_eq!(get_default(&out).as_deref(), Some("object"), "{expr}");
+            assert_eq!(value_of(&out), WireValue::String("object".to_string()), "{expr}");
         }
     }
 
-    /// A postfix constructing a `Response` in a prefix run must still
+    /// A call constructing a `Response` in a prefix run must still
     /// serialize through the host-object path on the way out.
     #[test]
     fn a_response_built_in_a_prefix_run_still_serializes() {
-        let prefix = prepared("", &[], &[]);
+        let prefix = prepared(
+            "export default () => new Response('body', { status: 418, headers: { 'x-a': 'b' } })",
+            &[],
+            &[],
+        );
         let out = execute_with_prefix(
             prefix,
-            Some("export default new Response('body', { status: 418, headers: { 'x-a': 'b' } })"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
         // The export blob carries a host object; the host decodes it. Here we
@@ -11870,151 +11791,93 @@ mod tests {
     }
 
     #[test]
-    fn execute_with_prefix_global_mutation_visible_in_postfix() {
-        let prefix = prepared("globalThis.answer = 42", &[], &[]);
-        let out = execute_with_prefix(
-            prefix,
-            Some("export default globalThis.answer"),
-            None,
-            Limits::default(),
+    fn execute_with_prefix_runs_on_fresh_instances_do_not_share_mutations() {
+        let prefix = prepared(
+            "globalThis.counter = 0\n\
+             export function bump() { globalThis.counter = 99; return 1 }\n\
+             export function read() { return globalThis.counter }",
             &[],
             &[],
-            None,
-            Arc::new(AtomicU32::new(0)),
-            None,
-        )
-        .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("42"));
-    }
-
-    #[test]
-    fn execute_with_prefix_multiple_postfixes_are_independent() {
-        let prefix = prepared("globalThis.base = 10", &[], &[]);
-        let b = "globalThis.base";
-        let out1 = execute_with_prefix(
-            prefix,
-            Some(&format!("export default {b} * 2")),
-            None,
-            Limits::default(),
-            &[],
-            &[],
-            None,
-            Arc::new(AtomicU32::new(0)),
-            None,
-        )
-        .unwrap();
-        let out2 = execute_with_prefix(
-            prefix,
-            Some(&format!("export default {b} * 3")),
-            None,
-            Limits::default(),
-            &[],
-            &[],
-            None,
-            Arc::new(AtomicU32::new(0)),
-            None,
-        )
-        .unwrap();
-        let out3 = execute_with_prefix(
-            prefix,
-            Some(&format!("export default {b} * 4")),
-            None,
-            Limits::default(),
-            &[],
-            &[],
-            None,
-            Arc::new(AtomicU32::new(0)),
-            None,
-        )
-        .unwrap();
-        assert_eq!(get_default(&out1).as_deref(), Some("20"));
-        assert_eq!(get_default(&out2).as_deref(), Some("30"));
-        assert_eq!(get_default(&out3).as_deref(), Some("40"));
-    }
-
-    #[test]
-    fn execute_with_prefix_postfix_mutations_do_not_leak_between_runs() {
-        let prefix = prepared("globalThis.counter = 0", &[], &[]);
+        );
         execute_with_prefix(
             prefix,
-            Some("globalThis.counter = 99; export default 1"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("bump", &[]),
         )
         .unwrap();
         let out = execute_with_prefix(
             prefix,
-            Some("export default globalThis.counter"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("read", &[]),
         )
         .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("0"));
+        assert_eq!(value_of(&out), WireValue::Number(0.0));
     }
 
     #[test]
     fn execute_with_prefix_complex_prefix_computation() {
         let prefix = prepared(
-            r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;"#,
+            r#"const sq = {}; for (let i = 0; i <= 10; i++) sq[i] = i * i; globalThis.sq = sq;
+               export default () => globalThis.sq[7]"#,
             &[],
             &[],
         );
         let out = execute_with_prefix(
             prefix,
-            Some("export default globalThis.sq[7]"),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("49"));
+        assert_eq!(value_of(&out), WireValue::Number(49.0));
     }
 
     #[test]
-    fn execute_with_prefix_console_is_available_in_postfix() {
-        let prefix = prepared("const x = 1", &[], &[]);
+    fn execute_with_prefix_console_is_available_in_run_code() {
+        let prefix = prepared(
+            r#"export default () => { console.log("hello from run code"); return 1 }"#,
+            &[],
+            &[],
+        );
         let out = execute_with_prefix(
             prefix,
-            Some(r#"console.log("hello from postfix"); export default 1"#),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
-        assert!(out.stdout.iter().any(|l| l.contains("hello from postfix")));
+        assert!(out.stdout.iter().any(|l| l.contains("hello from run code")));
     }
 
     #[test]
-    fn execute_with_prefix_postfix_runtime_error_is_reported() {
-        let prefix = prepared("", &[], &[]);
+    fn execute_with_prefix_run_code_runtime_error_is_reported() {
+        let prefix = prepared(
+            r#"export default () => { throw new Error("run code failed") }"#,
+            &[],
+            &[],
+        );
         let err = execute_with_prefix(
             prefix,
-            Some(r#"throw new Error("postfix failed")"#),
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
@@ -12164,10 +12027,10 @@ mod tests {
     #[test]
     #[ignore = "requires snapshot/precompile (Phase 2)"]
     fn run_with_undeclared_binding_is_error() {
-        // prefix.run() passes a global name that was not declared at
-        // precompile() time. Must fail with ERR_UNDECLARED_BINDING instead
-        // of silently installing an unexpected global into the restored
-        // snapshot context.
+        // prefix.call() passes a global name that was not declared at
+        // prepare() time. Must fail with ERR_UNDECLARED_BINDING instead
+        // of silently installing an unexpected global into the instance's
+        // context.
         todo!()
     }
 
@@ -13999,18 +13862,27 @@ mod tests {
     }
 
     #[test]
-    fn async_context_not_available_in_prefix_code() {
-        // Prefix code predates the per-run async-context machinery, so
-        // importing `node:async_hooks` from a prefix does not resolve — a
-        // contract kept from the snapshot era (see ResolverContext::
-        // async_context_builtin). It returns a clean ModuleNotFound.
-        let err = evaluate_prefix("import { AsyncLocalStorage } from 'node:async_hooks'; export default 1;", &[], &[])
-        .unwrap_err();
-        assert!(
-            matches!(err.error, RunError::ModuleNotFound(_)),
-            "expected ModuleNotFound, got {:?}",
-            err.error
+    fn async_context_is_available_to_prefix_code_and_its_exports() {
+        // workerd's shape: the instance is created at module scope and used
+        // inside the handler, with the ambient value following awaits.
+        let prefix = prepared(
+            "import { AsyncLocalStorage } from 'node:async_hooks'\n\
+             const als = new AsyncLocalStorage()\n\
+             export default (key) => als.run(key, async () => { await Promise.resolve(); return als.getStore() })",
+            &[],
+            &[],
         );
+        let out = execute_with_prefix(
+            prefix,
+            Limits::default(),
+            &[],
+            &[],
+            None,
+            Arc::new(AtomicU32::new(0)),
+            &call_spec("default", &[WireValue::String("wf".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(value_of(&out), WireValue::String("wf".to_string()));
     }
 
     #[test]
@@ -14423,7 +14295,7 @@ mod tests {
     fn prefix_with_host_module_data_and_stored_trampoline_works_per_run() {
         // The documented pattern: prefix imports a host module and stashes a
         // function leaf on globalThis. The trampoline and data leaves are
-        // plain JS re-created at each run's prefix stage; the postfix call
+        // plain JS created at the instance's prefix stage; the call
         // dispatches through the fresh per-run `__iso4_call` stub.
         use std::mem::ManuallyDrop;
         use std::os::unix::io::AsRawFd;
@@ -14442,7 +14314,7 @@ mod tests {
             import { query, limit } from "tools:search";
             globalThis.search = query;
             globalThis.maxResults = limit;
-            export default 1;
+            export default async () => (await globalThis.search('dogs')) + globalThis.maxResults;
             "#;
         evaluate_prefix(prefix_src, &[], &imports).unwrap();
 
@@ -14471,25 +14343,23 @@ mod tests {
                 filename: "<prefix>",
                 globals: &[],
             },
-            Some("export default (await globalThis.search('dogs')) + globalThis.maxResults"),
-            None,
             Limits::default(),
             &[],
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
         handle.join().unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("8"));
+        assert_eq!(value_of(&out), WireValue::Number(8.0));
         assert_eq!(out.bridge_calls[0].name, "tools:search.query");
     }
 
     #[test]
-    fn postfix_can_import_host_module_declared_at_precompile() {
-        // The postfix itself may also import the declared specifier — the
-        // module is rebuilt in the run isolate from the same declared shape.
+    fn a_prefix_export_can_call_a_host_module_function_directly() {
+        // The import binding itself (not a globalThis stash) is the call
+        // path; the module is built in the instance from the declared shape.
         use std::mem::ManuallyDrop;
         use std::os::unix::io::AsRawFd;
 
@@ -14497,7 +14367,7 @@ mod tests {
             "tools:t",
             vec![("f", HostModuleNode::Function)],
         )];
-        let prefix_src = "globalThis.ready = true;";
+        let prefix_src = r#"import { f } from "tools:t"; export default async () => await f()"#;
         evaluate_prefix(prefix_src, &[], &imports).unwrap();
 
         let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -14522,18 +14392,16 @@ mod tests {
                 filename: "<prefix>",
                 globals: &[],
             },
-            Some(r#"import { f } from "tools:t"; export default await f()"#),
-            None,
             Limits::default(),
             &[],
             &imports,
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .unwrap();
         handle.join().unwrap();
-        assert_eq!(get_default(&out).as_deref(), Some("true"));
+        assert_eq!(value_of(&out), WireValue::Bool(true));
     }
 
     #[test]
@@ -14590,7 +14458,7 @@ mod tests {
         init_platform();
         let call = call_spec(path, args);
         run_module(
-            Some(code),
+            code,
             "<iso4>",
             Limits::default(),
             &[],
@@ -14723,9 +14591,8 @@ mod tests {
 
     #[test]
     fn call_against_prefix_exports() {
-        // prefix.call(): no postfix at all — the export path resolves against
-        // the prefix module's live namespace, module-scope closure state
-        // included.
+        // prefix.call(): the export path resolves against the prefix
+        // module's live namespace, module-scope closure state included.
         let prefix = prepared(
             "let hits = 0\n\
              export default { tag: 'worker-a', fetch(m) { hits += 1; return `${this.tag}|${hits}|${m}` } }\n\
@@ -14736,14 +14603,12 @@ mod tests {
         let call = call_spec("default.fetch", &[WireValue::String("POST".to_string())]);
         let out = execute_with_prefix(
             prefix,
-            None,
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            Some(&call),
+            &call,
         )
         .unwrap();
         assert_eq!(
@@ -14758,14 +14623,12 @@ mod tests {
         let call = call_spec("named", &[WireValue::String("X".to_string())]);
         let out = execute_with_prefix(
             prefix,
-            None,
-            None,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            Some(&call),
+            &call,
         )
         .unwrap();
         assert_eq!(value_of(&out), WireValue::String("named|X".to_string()));
@@ -14887,7 +14750,7 @@ mod tests {
     fn call_result_respects_max_export_bytes() {
         let call = call_spec("f", &[]);
         let failure = run_module(
-            Some("export function f() { return 'x'.repeat(1024 * 1024) }"),
+            "export function f() { return 'x'.repeat(1024 * 1024) }",
             "<iso4>",
             Limits {
                 max_export_bytes: 1024,
@@ -14963,7 +14826,7 @@ mod tests {
         // forever is stopped by the CPU budget, not the wall clock.
         let call = call_spec("f", &[]);
         let failure = run_module(
-            Some("export function f() { for (;;) {} }"),
+            "export function f() { for (;;) {} }",
             "<iso4>",
             Limits {
                 cpu_time_ms: 100,
@@ -14998,7 +14861,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
             let result = run_module(
-                Some(code),
+                code,
                 "<test>",
                 limits,
                 &[],
@@ -15097,11 +14960,11 @@ mod tests {
     fn counter_core() -> InstanceCore {
         init_platform();
         create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: COUNTER_PREFIX,
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
@@ -15113,15 +14976,13 @@ mod tests {
         let call = call_spec("bump", &[]);
         run_call_on_core(
             core,
-            None,
-            "<iso4>",
             &[],
             limits,
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            Some(&call),
+            &call,
         )
     }
 
@@ -15143,11 +15004,15 @@ mod tests {
         // setup compiled at warm-up keep working.
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "globalThis.mk = new Function('return 7')",
+            PrefixSpec {
+                code: "globalThis.mk = new Function('return 7')\n\
+                       export default () => { \
+                         const denied = (() => { try { new Function('1'); return 'allowed' } \
+                           catch (e) { return e instanceof EvalError } })(); \
+                         return [mk(), denied].join('|') }",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
@@ -15155,23 +15020,17 @@ mod tests {
         for _ in 0..2 {
             let outcome = run_call_on_core(
                 &mut core,
-                Some(
-                    "const denied = (() => { try { new Function('1'); return 'allowed' } \
-                       catch (e) { return e instanceof EvalError } })()\n\
-                     export default [mk(), denied].join('|')",
-                ),
-                "<iso4>",
                 &[],
                 Limits::default(),
                 &[],
                 &[],
                 None,
                 Arc::new(AtomicU32::new(0)),
-                None,
+                &call_spec("default", &[]),
             );
             assert!(!outcome.tainted);
             let out = outcome.result.expect("call succeeds");
-            assert_eq!(get_default(&out).as_deref(), Some("7|true"));
+            assert_eq!(value_of(&out), WireValue::String("7|true".to_string()));
         }
     }
 
@@ -15190,11 +15049,11 @@ mod tests {
     fn fired_guard_taints_the_core() {
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: "export function spin() { for (;;) {} }",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
@@ -15202,8 +15061,6 @@ mod tests {
         let call = call_spec("spin", &[]);
         let outcome = run_call_on_core(
             &mut core,
-            None,
-            "<iso4>",
             &[],
             Limits {
                 cpu_time_ms: 50,
@@ -15214,7 +15071,7 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            Some(&call),
+            &call,
         );
         assert!(outcome.tainted, "a fired guard must taint the instance");
         let failure = outcome.result.unwrap_err();
@@ -15228,13 +15085,13 @@ mod tests {
     fn clean_exception_does_not_taint_and_state_survives() {
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: "let n = 0\n\
                        export function bump() { return ++n }\n\
                        export function boom() { throw new Error('x') }",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
@@ -15244,15 +15101,13 @@ mod tests {
         let call = call_spec("boom", &[]);
         let outcome = run_call_on_core(
             &mut core,
-            None,
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            Some(&call),
+            &call,
         );
         assert!(
             !outcome.tainted,
@@ -15272,11 +15127,11 @@ mod tests {
     fn warmup_budget_rejects_a_looping_prefix() {
         init_platform();
         let result = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: "for (;;) {}",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         );
@@ -15284,49 +15139,6 @@ mod tests {
             panic!("a looping prefix cannot warm up");
         };
         assert!(matches!(failure.error, RunError::WarmupLimit));
-    }
-
-    #[test]
-    fn postfix_runs_on_a_warm_core_share_prefix_state() {
-        // prefix.execute() on a warm instance: each postfix is a fresh module
-        // but evaluates in the retained context.
-        init_platform();
-        let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "globalThis.counter = (globalThis.counter ?? 0)",
-                filename: "<prefix>",
-                globals: &[],
-            }),
-            &[],
-            0,
-        )
-        .expect("prefix warms up");
-        for expected in 1..=2 {
-            let outcome = run_call_on_core(
-                &mut core,
-                Some("globalThis.counter += 1\nexport default globalThis.counter"),
-                "<iso4>",
-                &[],
-                Limits::default(),
-                &[],
-                &[],
-                None,
-                Arc::new(AtomicU32::new(0)),
-                None,
-            );
-            assert!(!outcome.tainted);
-            let out = outcome.result.expect("postfix run succeeds");
-            let WireValue::Object(entries) = testval::from_blob(&out.exports) else {
-                panic!("exports must decode to an object");
-            };
-            assert_eq!(
-                entries,
-                vec![(
-                    "default".to_string(),
-                    WireValue::Number(f64::from(expected))
-                )]
-            );
-        }
     }
 
     // ── Review fixes from the warm-instances review ──────────────────────────
@@ -15342,11 +15154,14 @@ mod tests {
         use std::os::unix::io::AsRawFd;
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "",
+            PrefixSpec {
+                code: "export function stash() { globalThis.saved = g; return 1 }\n\
+                       export function poke() { \
+                         let r; try { globalThis.saved(); r = 'called' } catch (e) { r = 'threw' } \
+                         return r }",
                 filename: "<prefix>",
                 globals: &[HostGlobalDef::bridge("g")],
-            }),
+            },
             &[],
             0,
         )
@@ -15360,15 +15175,13 @@ mod tests {
         let fd = client.as_raw_fd();
         let out1 = run_call_on_core(
             &mut core,
-            Some("globalThis.saved = g; export default 1"),
-            "<iso4>",
             &[HostGlobalDef::bridge("g")],
             Limits::default(),
             &[HostGlobalDef::bridge("g")],
             &[],
             Some(fd),
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("stash", &[]),
         );
         assert!(!out1.tainted);
         assert!(out1.result.is_ok());
@@ -15377,25 +15190,20 @@ mod tests {
         // disarmed. Invoking it must throw catchably, not crash.
         let out2 = run_call_on_core(
             &mut core,
-            Some(
-                "let r; try { globalThis.saved(); r = 'called' } \
-                 catch (e) { r = 'threw' } export default r",
-            ),
-            "<iso4>",
             &[HostGlobalDef::bridge("g")],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("poke", &[]),
         );
         assert!(!out2.tainted, "a caught throw is a clean completion");
         let out = out2.result.expect("call 2 completes");
-        assert_eq!(get_default(&out).as_deref(), Some("threw"));
+        assert_eq!(value_of(&out), WireValue::String("threw".to_string()));
     }
 
-    /// Finding 2: a postfix can plant a hostile accessor under a bridge-global name;
+    /// Finding 2: run code can plant a hostile accessor under a bridge-global name;
     /// the next call's placeholder re-arm must overwrite it WITHOUT invoking
     /// the setter. Pre-fix the re-arm went through `[[Set]]`, so a
     /// looping setter hung the owner thread (only bounded, post-guards-move,
@@ -15404,11 +15212,15 @@ mod tests {
     fn hostile_setter_under_a_bridge_name_does_not_hijack_rearm() {
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "",
+            PrefixSpec {
+                code: "export function plant() { \
+                         Object.defineProperty(globalThis, 'g', \
+                           { configurable: true, set() { for (;;) {} }, get() { return 1 } }); \
+                         return 1 }\n\
+                       export function seven() { return 7 }",
                 filename: "<prefix>",
                 globals: &[HostGlobalDef::bridge("g")],
-            }),
+            },
             &[],
             0,
         )
@@ -15417,19 +15229,13 @@ mod tests {
         // Call 1 replaces `g` with a setter that would loop forever if invoked.
         let out1 = run_call_on_core(
             &mut core,
-            Some(
-                "Object.defineProperty(globalThis, 'g', \
-                 { configurable: true, set() { for (;;) {} }, get() { return 1 } }); \
-                 export default 1",
-            ),
-            "<iso4>",
             &[HostGlobalDef::bridge("g")],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("plant", &[]),
         );
         assert!(!out1.tainted);
         assert!(out1.result.is_ok());
@@ -15439,8 +15245,6 @@ mod tests {
         // and quickly instead of hanging / CPU-timing-out.
         let out2 = run_call_on_core(
             &mut core,
-            Some("export default 7"),
-            "<iso4>",
             &[HostGlobalDef::bridge("g")],
             Limits {
                 cpu_time_ms: 2_000,
@@ -15451,10 +15255,10 @@ mod tests {
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("seven", &[]),
         );
         assert!(!out2.tainted, "the setter must not run during re-arm");
-        assert_eq!(get_default(&out2.result.unwrap()).as_deref(), Some("7"));
+        assert_eq!(value_of(&out2.result.unwrap()), WireValue::Number(7.0));
     }
 
     /// Finding 7: blowing the heap cap during warm-up reports `ERR_MEMORY_LIMIT`,
@@ -15463,12 +15267,12 @@ mod tests {
     fn warmup_memory_blowout_reports_memory_limit() {
         init_platform();
         let result = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 // ~64 MB backing store under an 8 MB cap.
                 code: "globalThis.hog = new Uint8Array(64 * 1024 * 1024)",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             8,
         );
@@ -15488,11 +15292,11 @@ mod tests {
     fn warmup_console_output_appears_on_the_first_call_only() {
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "console.log('boot diagnostics')",
+            PrefixSpec {
+                code: "console.log('boot diagnostics')\nexport default () => 1",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
@@ -15500,15 +15304,13 @@ mod tests {
 
         let first = run_call_on_core(
             &mut core,
-            Some("export default 1"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .result
         .expect("first call");
@@ -15520,15 +15322,13 @@ mod tests {
 
         let second = run_call_on_core(
             &mut core,
-            Some("export default 2"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .result
         .expect("second call");
@@ -15551,11 +15351,16 @@ mod tests {
     fn stale_continuation_runs_in_the_next_call_and_sees_its_state() {
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "",
+            PrefixSpec {
+                code: "export function arm() { \
+                         const p = new Promise(r => { globalThis.res = r }); \
+                         p.then(() => { globalThis.leaked = globalThis.marker }); \
+                         return 1 }\n\
+                       export function fire() { globalThis.marker = 'run2-secret'; globalThis.res(); return 1 }\n\
+                       export function read() { return globalThis.leaked ?? 'not-set' }",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
@@ -15566,19 +15371,13 @@ mod tests {
         // settles this run, so the continuation stays queued into the isolate.
         let run1 = run_call_on_core(
             &mut core,
-            Some(
-                "const p = new Promise(r => { globalThis.res = r }); \
-                 p.then(() => { globalThis.leaked = globalThis.marker }); \
-                 export default 1",
-            ),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("arm", &[]),
         );
         assert!(!run1.tainted);
         assert!(run1.result.is_ok());
@@ -15588,15 +15387,13 @@ mod tests {
         // marker — run 1's code executing inside run 2's call.
         let run2 = run_call_on_core(
             &mut core,
-            Some("globalThis.marker = 'run2-secret'; globalThis.res(); export default 1"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("fire", &[]),
         );
         assert!(!run2.tainted);
         assert!(run2.result.is_ok());
@@ -15604,21 +15401,19 @@ mod tests {
         // Run 3: observe what run 1's continuation captured — run 2's marker.
         let run3 = run_call_on_core(
             &mut core,
-            Some("export default globalThis.leaked ?? 'not-set'"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("read", &[]),
         )
         .result
         .expect("run 3");
         assert_eq!(
-            get_default(&run3).as_deref(),
-            Some("run2-secret"),
+            value_of(&run3),
+            WireValue::String("run2-secret".to_string()),
             "run 1's continuation ran during run 2 and observed run 2's state \
              (cross-run confused-deputy)"
         );
@@ -15870,51 +15665,46 @@ mod tests {
         // table entry, so the callback can never fire into run 2.
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "globalThis.hit = 'untouched'",
+            PrefixSpec {
+                code: "globalThis.hit = 'untouched'\n\
+                       export function arm() { setTimeout(() => { globalThis.hit = 'FIRED' }, 20); return 'armed' }\n\
+                       export async function read() { await new Promise(r => setTimeout(r, 30)); return globalThis.hit }",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
         .expect("prefix warms up");
         let run1 = run_call_on_core(
             &mut core,
-            Some("setTimeout(() => { globalThis.hit = 'FIRED' }, 20)\nexport default 'armed'"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("arm", &[]),
         );
         assert!(!run1.tainted);
         assert_eq!(
-            get_default(&run1.result.expect("run 1 succeeds")).as_deref(),
-            Some("armed")
+            value_of(&run1.result.expect("run 1 succeeds")),
+            WireValue::String("armed".to_string())
         );
         std::thread::sleep(Duration::from_millis(60));
         let run2 = run_call_on_core(
             &mut core,
-            Some(
-                "await new Promise(r => setTimeout(r, 30))\n\
-                 export default globalThis.hit",
-            ),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("read", &[]),
         );
         assert_eq!(
-            get_default(&run2.result.expect("run 2 succeeds")).as_deref(),
-            Some("untouched"),
+            value_of(&run2.result.expect("run 2 succeeds")),
+            WireValue::String("untouched".to_string()),
             "run 1's pending timer must not fire on run 2's turns"
         );
     }
@@ -15925,32 +15715,33 @@ mod tests {
         // while a prefix evaluates, so the error is thrown, not a hang.
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: "let msg = 'no error'\n\
                        try { setTimeout(() => {}, 5) } catch (e) { msg = e.message }\n\
-                       globalThis.prefixTimerError = msg",
+                       globalThis.prefixTimerError = msg\n\
+                       export default () => globalThis.prefixTimerError",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
         .expect("prefix warms up despite the refused setTimeout");
         let out = run_call_on_core(
             &mut core,
-            Some("export default globalThis.prefixTimerError"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .result
         .expect("run succeeds");
-        let msg = get_default(&out).unwrap_or_default();
+        let WireValue::String(msg) = value_of(&out) else {
+            panic!("expected a string value");
+        };
         assert!(
             msg.contains("only available to run code"),
             "prefix-time setTimeout must throw the setup-time error, got: {msg}"
@@ -15961,30 +15752,29 @@ mod tests {
     fn a_prefix_defined_sleep_helper_works_during_a_run() {
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
-                code: "globalThis.sleep = (ms) => new Promise(r => setTimeout(r, ms))",
+            PrefixSpec {
+                code: "globalThis.sleep = (ms) => new Promise(r => setTimeout(r, ms))\n\
+                       export default async () => { await sleep(20); return 'slept' }",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
         .expect("prefix warms up");
         let out = run_call_on_core(
             &mut core,
-            Some("await sleep(20)\nexport default 'slept'"),
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         )
         .result
         .expect("run succeeds");
-        assert_eq!(get_default(&out).as_deref(), Some("slept"));
+        assert_eq!(value_of(&out), WireValue::String("slept".to_string()));
     }
 
     #[test]
@@ -16114,13 +15904,13 @@ mod tests {
         init_platform();
         let defs = [HostGlobalDef::bridge("g")];
         let mut core = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: "let n = 0\n\
                        export function leak() { Promise.resolve().then(() => g('leak')); return 1 }\n\
                        export function bump() { return ++n }",
                 filename: "<prefix>",
                 globals: &defs,
-            }),
+            },
             &[],
             0,
         )
@@ -16135,15 +15925,13 @@ mod tests {
         let leak = call_spec("leak", &[]);
         let first = run_call_on_core(
             &mut core,
-            None,
-            "<iso4>",
             &defs,
             Limits::default(),
             &defs,
             &[],
             Some(client.as_raw_fd()),
             Arc::new(AtomicU32::new(0)),
-            Some(&leak),
+            &leak,
         );
         responder.join().unwrap();
         assert!(!first.tainted);
@@ -16153,15 +15941,13 @@ mod tests {
         let bump = call_spec("bump", &[]);
         let second = run_call_on_core(
             &mut core,
-            None,
-            "<iso4>",
             &defs,
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            Some(&bump),
+            &bump,
         );
         assert!(!second.tainted);
         let out = second.result.expect("the next call is clean");
@@ -16202,11 +15988,11 @@ mod tests {
             export function errFields() { const e = new Error('x'); e.a = { get g() { tool(() => 1); return 1 } }; e.b = { get h() { return 2 } }; throw e }\n\
             export function argGetter() { tool({ get a() { tool(() => 1); return 1 }, get b() { return 2 } }); return 1 }";
         let mut core = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: prefix,
                 filename: "<prefix>",
                 globals: &defs,
-            }),
+            },
             &[],
             0,
         )
@@ -16218,15 +16004,13 @@ mod tests {
             let call = call_spec(export, &[]);
             let outcome = run_call_on_core(
                 &mut core,
-                None,
-                "<iso4>",
                 &defs,
                 Limits::default(),
                 &defs,
                 &[],
                 Some(client.as_raw_fd()),
                 Arc::new(AtomicU32::new(0)),
-                Some(&call),
+                &call,
             );
             assert!(outcome.tainted, "{export}: an interrupted instance is tainted");
             let error = outcome.result.expect_err(export).error;
@@ -16241,15 +16025,13 @@ mod tests {
             let bump = call_spec("bump", &[]);
             let next = run_call_on_core(
                 &mut core,
-                None,
-                "<iso4>",
                 &defs,
                 Limits::default(),
                 &[],
                 &[],
                 None,
                 Arc::new(AtomicU32::new(0)),
-                Some(&bump),
+                &bump,
             );
             assert!(!next.tainted, "{export}: the next call is clean");
             assert!(next.result.is_ok(), "{export}: the next call succeeds");
@@ -16414,11 +16196,11 @@ mod tests {
     fn dynamic_import_in_a_prefix_fails_warm_up() {
         init_platform();
         let Err(failure) = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: "try { import('lodash') } catch {}",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         ) else {
@@ -16431,11 +16213,11 @@ mod tests {
     fn dynamic_import_on_a_warm_core_taints_it() {
         init_platform();
         let mut core = create_instance_core(
-            Some(PrefixSpec {
+            PrefixSpec {
                 code: "export function f() { try { import('lodash') } catch {} return 1 }",
                 filename: "<prefix>",
                 globals: &[],
-            }),
+            },
             &[],
             0,
         )
@@ -16443,58 +16225,46 @@ mod tests {
         let call = call_spec("f", &[]);
         let outcome = run_call_on_core(
             &mut core,
-            None,
-            "<iso4>",
             &[],
             Limits::default(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            Some(&call),
+            &call,
         );
         assert!(outcome.tainted, "an interrupted instance must be discarded");
-        assert_eq!(expect_import(&outcome.result.unwrap_err().error), DYN_IMPORT_MSG);
-
-        let mut core = create_instance_core(None, &[], 0).expect("core");
-        let outcome = run_call_on_core(
-            &mut core,
-            Some("try { await import('lodash') } catch {}\nexport default 1"),
-            "<iso4>",
-            &[],
-            Limits::default(),
-            &[],
-            &[],
-            None,
-            Arc::new(AtomicU32::new(0)),
-            None,
-        );
-        assert!(outcome.tainted);
         assert_eq!(expect_import(&outcome.result.unwrap_err().error), DYN_IMPORT_MSG);
     }
 
     #[test]
     fn dynamic_import_during_grace_ends_the_phase_with_its_message() {
         init_platform();
-        let mut core = create_instance_core(None, &[], 0).expect("core");
+        let mut core = create_instance_core(
+            PrefixSpec {
+                code: "export default () => { \
+                         waitUntil(new Promise(r => setTimeout(r, 1)).then(() => import('lodash')).catch(() => {})); \
+                         return 'early' }",
+                filename: "<prefix>",
+                globals: &[],
+            },
+            &[],
+            0,
+        )
+        .expect("core");
         let outcome = run_call_on_core(
             &mut core,
-            Some(
-                "waitUntil(new Promise(r => setTimeout(r, 1)).then(() => import('lodash')).catch(() => {}))\n\
-                 export default 'early'",
-            ),
-            "<iso4>",
             &[],
             grace_limits(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         );
         assert!(outcome.tainted);
         let out = outcome.result.expect("the value settled before grace");
-        assert_eq!(get_default(&out).as_deref(), Some("early"));
+        assert_eq!(value_of(&out), WireValue::String("early".to_string()));
         let bg = out.background.expect("grace ran");
         assert_eq!(bg.status, GraceStatus::Truncated);
         assert_eq!(bg.error, Some(("Error".to_string(), DYN_IMPORT_MSG.to_string())));
@@ -16510,21 +16280,27 @@ mod tests {
     #[test]
     fn a_long_specifier_is_capped_on_the_grace_report() {
         init_platform();
-        let mut core = create_instance_core(None, &[], 0).expect("core");
+        let mut core = create_instance_core(
+            PrefixSpec {
+                code: "export default () => { \
+                         waitUntil(new Promise(r => setTimeout(r, 1)).then(() => import('€'.repeat(3000))).catch(() => {})); \
+                         return 1 }",
+                filename: "<prefix>",
+                globals: &[],
+            },
+            &[],
+            0,
+        )
+        .expect("core");
         let outcome = run_call_on_core(
             &mut core,
-            Some(
-                "waitUntil(new Promise(r => setTimeout(r, 1)).then(() => import('€'.repeat(3000))).catch(() => {}))\n\
-                 export default 1",
-            ),
-            "<iso4>",
             &[],
             grace_limits(),
             &[],
             &[],
             None,
             Arc::new(AtomicU32::new(0)),
-            None,
+            &call_spec("default", &[]),
         );
         let bg = outcome.result.expect("value settled").background.expect("grace ran");
         let expected = format!("dynamic import() is not supported: '{}…'", "€".repeat(256));

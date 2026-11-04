@@ -29,9 +29,7 @@ import type {
   MemoryLimit,
   PrecompileOptions,
   PrefixCallOptions,
-  PrefixRunOptions,
   RebindGlobals,
-  RebindImports,
   Prefix,
   PrefixStatus,
   ReadExportsOptions,
@@ -40,6 +38,8 @@ import type {
   RunCallOptions,
   RunError,
   SetupErrorCode,
+  RunAborted,
+  RunFailure,
   RunOptions,
   RunResult,
   Sandbox,
@@ -97,7 +97,6 @@ export type {
   PrecompileOptions,
   Prefix,
   PrefixCallOptions,
-  PrefixRunOptions,
   PrefixStatus,
   ReadExportsOptions,
   ReadExportsResult,
@@ -642,7 +641,7 @@ function heapCapsForWire(
  * this wall is queue depth, that one is memory.
  * @param error the pool's refusal, carrying the bound in its message
  */
-function queueFullResult(error: QueueFullError): RunResult {
+function queueFullResult(error: QueueFullError): RunFailure {
   return {
     status: 'failed',
     ok: false,
@@ -662,16 +661,16 @@ function queueFullResult(error: QueueFullError): RunResult {
  * @param result the run's outcome
  * @param queueWaitMs the wait the pool measured
  */
-function withQueueWait(
-  result: RunResult | CallResult,
+function withQueueWait<T extends RunResult | CallResult>(
+  result: T,
   queueWaitMs: number | undefined,
-): RunResult | CallResult {
+): T {
   if (queueWaitMs !== undefined && result.status !== 'aborted')
     result.queueWaitMs = queueWaitMs
   return result
 }
 
-function desyncResult(error: ProtocolDesyncError): RunResult {
+function desyncResult(error: ProtocolDesyncError): RunFailure {
   return {
     status: 'failed',
     ok: false,
@@ -717,7 +716,7 @@ function thrownRunError<C extends string>(error: Pick<RunError, 'name' | 'messag
   return err
 }
 
-function abortedResult(reason?: unknown, from?: RunResult): RunResult {
+function abortedResult(reason?: unknown, from?: RunResult | CallResult): RunAborted {
   return {
     status: 'aborted',
     ok: false,
@@ -1135,70 +1134,13 @@ implements Prefix<G, M> {
   }
 
   /**
-   * Execute dynamic code against this prefix. See
-   * {@link Prefix.execute}.
-   * @param options
-   */
-  async execute(options: PrefixRunOptions<G, M>): Promise<RunResult> {
-    return this.run(options)
-  }
-
-  /**
-   * @param options
-   * @deprecated Renamed to {@link PrefixImpl.execute}; kept as an alias.
-   */
-  async run(options: PrefixRunOptions<G, M>): Promise<RunResult> {
-    const result = await this.dispatch(options, async () => ({ code: options.code }))
-    return result as RunResult
-  }
-
-  /**
-   * Call a function exported by this prefix's module — no postfix compiled.
-   * See {@link Prefix.call}.
+   * Call a function exported by this prefix's module. See {@link Prefix.call}.
+   * Disposal/abort guards, bridge-global extraction and import-rebind merging
+   * run first; the args are serialized only after those checks pass, so a
+   * refused call never registers a stream source.
    * @param options
    */
   async call(options: PrefixCallOptions<G, M>): Promise<CallResult> {
-    // Same host-type-aware args leg as SandboxImpl.run — a real `Request`
-    // (async body drain) works at any depth, as one blob holding the array.
-    // The stream registry covers both the args and this run's bridge
-    // responses. Serialized only after dispatch's checks pass.
-    const result = await this.dispatch(options, async (streams) => ({
-      call: {
-        exportPath: options.export,
-        argsBlob: await serializeHostValue(options.args ?? [], this.brandKey, streams),
-      },
-    }))
-    return result as CallResult
-  }
-
-  /**
-   * Shared body of {@link run} and {@link call}: disposal/abort guards,
-   * bridge-global extraction, import-rebind merging, and the PrefixRun round
-   * trip. `buildPayload` yields the postfix source or the call — exactly one,
-   * as the wire demands; it also selects how the result blob decodes. It runs
-   * after the checks, so a refused run never registers a stream source.
-   * @param options
-   * @param options.globals
-   * @param options.imports
-   * @param options.limits
-   * @param options.signal
-   * @param options.hardAbortSignal
-   * @param options.filename
-   * @param buildPayload
-   */
-  private async dispatch(
-    options: {
-      globals?: RebindGlobals<G>
-      imports?: RebindImports<M>
-      limits?: ResourceLimits
-      signal?: AbortSignal
-      hardAbortSignal?: AbortSignal
-      filename?: string
-    },
-    buildPayload: (streams: StreamSourceRegistry) => Promise<
-      { code: string, call?: undefined } | { code?: undefined, call: CallPayload }
-    >,
-  ): Promise<RunResult | CallResult> {
     if (this._status === 'disposed')
       throw setupError('ERR_PREFIX_DISPOSED', `prefix '${this.id}' has been disposed or never existed`)
     if (this._status === 'broken')
@@ -1239,12 +1181,17 @@ implements Prefix<G, M> {
     }
     const streams = new StreamSourceRegistry()
     try {
-      const payload = await buildPayload(streams)
+      // Same host-type-aware args leg as SandboxImpl.run — a real `Request`
+      // (async body drain) works at any depth, as one blob holding the array.
+      // The stream registry covers both the args and this run's bridge
+      // responses.
+      const call: CallPayload = {
+        exportPath: options.export,
+        argsBlob: await serializeHostValue(options.args ?? [], this.brandKey, streams),
+      }
       return await this.pool.withClient(async (client, queueWaitMs) => {
         const raw = await client.prefixRun({
           prefixId: this.id,
-          code: payload.code,
-          filename: options.filename,
           limits: { ...this.defaultLimits, ...wireLimits(options.limits), ...heapCapsForWire(this.memoryMb) },
           globals: defs,
           dispatch,
@@ -1252,17 +1199,14 @@ implements Prefix<G, M> {
           importDispatch: merged.handlers,
           signal: options.signal,
           hardAbortSignal: options.hardAbortSignal,
-          call: payload.call,
+          call,
           streams,
         })
-        // `call` present ⇒ the value blob is the function's return value;
-        // absent ⇒ the exports object. Never both. Streamed result bodies
-        // hydrate through the run's outbound registry (#128).
+        // The value blob is the function's return value. Streamed result
+        // bodies hydrate through the run's outbound registry.
         const completion = withBodyStreamBinder(
           (id) => raw.outStreams.attach(id),
-          () => payload.call === undefined
-            ? decodeRunCompletionPayload(raw.result, undefined, raw.droppedCallIds)
-            : decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds),
+          () => decodeRunCompletionPayload(raw.result, 'call', raw.droppedCallIds),
         )
         const decoded = completion.result
         if (decoded.status === 'failed' && (decoded.error.code as string) === 'ERR_PREFIX_BROKEN') {

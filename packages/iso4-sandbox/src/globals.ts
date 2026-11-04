@@ -181,7 +181,7 @@ export function declareGlobals(globals: HostGlobals): Map<string, DeclaredGlobal
 }
 
 /**
- * Resolve bridge globals for a `prefix.run()` call.
+ * Resolve bridge globals for a `prefix.call()`.
  *
  * Value globals and shim wrappers are replayed from the declared prefix
  * state, so every returned def is `kind: 'bridge'`; a shim override is routed

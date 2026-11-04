@@ -56,7 +56,7 @@ export const MAX_HOST_MODULE_DEPTH = 64
  * Handler lookup for host-module function leaves, keyed by
  * `importHandlerKey(specifier, path)`. Built at `processImports` time
  * (precompile / direct run) and re-derived with per-run overrides by
- * `mergeRebindImports` on `prefix.run()`.
+ * `mergeRebindImports` on `prefix.call()`.
  */
 export type ImportHandlerMap = Map<string, HostExportFunction>
 
@@ -207,7 +207,7 @@ function lowerNode(
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// mergeRebindImports — `prefix.run()` overrides
+// mergeRebindImports — `prefix.call()` overrides
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
@@ -258,7 +258,7 @@ export function mergeRebindImports(
     if ('source' in binding) {
       throw new ImportRebindError(
         'ERR_FROZEN_BINDING',
-        `import '${specifier}' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`,
+        `import '${specifier}' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.call() time`,
       )
     }
     if (!isPlainObject(value)) {

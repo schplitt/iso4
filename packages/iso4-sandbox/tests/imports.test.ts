@@ -334,7 +334,7 @@ describe('processImports — rejected configurations', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────
-// mergeRebindImports — rebinding on prefix.run()
+// mergeRebindImports — rebinding on prefix.call()
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('import specifiers that are not well-formed strings', () => {
@@ -443,8 +443,8 @@ describe('mergeRebindImports — ImportRebindError', () => {
     ['an undeclared specifier as null', { 'host:nope': null }, 'ERR_UNDECLARED_BINDING', `import 'host:nope' was not declared at precompile time`],
     ['an undeclared path with a non-function', { 'host:tools': { nope: 42 } }, 'ERR_UNDECLARED_BINDING', `import 'host:tools'.nope was not declared at precompile time`],
     ['a function at an object node', { 'host:tools': { nested: () => 1 } }, 'ERR_INVALID_REBIND', `import 'host:tools'.nested can only be rebound with a plain object; got function`],
-    ['a source module as a string', { 'lib:math': 'export const x = 2' }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`],
-    ['a source module as an object', { 'lib:math': { x: () => 2 } }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.run() time`],
+    ['a source module as a string', { 'lib:math': 'export const x = 2' }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.call() time`],
+    ['a source module as an object', { 'lib:math': { x: () => 2 } }, 'ERR_FROZEN_BINDING', `import 'lib:math' is a source module — source imports are frozen with the prefix and cannot be rebound at prefix.call() time`],
     ['a data leaf with data', { 'host:tools': { version: '2.0.0' } }, 'ERR_FROZEN_BINDING', `import 'host:tools'.version is a data leaf, not a function — data leaves cannot be rebound`],
     ['a data leaf with a function', { 'host:tools': { version: () => '2' } }, 'ERR_FROZEN_BINDING', `import 'host:tools'.version is a data leaf, not a function — data leaves cannot be rebound`],
     ['a host module as a string', { 'host:tools': 'x' }, 'ERR_INVALID_REBIND', `import 'host:tools' can only be rebound with a plain object; got string`],

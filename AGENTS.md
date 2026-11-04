@@ -3,9 +3,10 @@
 ## Project Overview
 
 **iso4** is a fast, sandboxed V8 isolate runtime with permission-controlled
-`fetch` and pluggable modules. Built primarily for the AI-agent prefix/postfix
-pattern: host code prepares setup (globals, data, tool bindings) once, then
-runs many agent-generated postfixes against it. The prefix is stored as
+`fetch` and pluggable modules. Built primarily for the prepare-once,
+call-many pattern: host code prepares a prefix (globals, data, tool bindings,
+and the code that uses them) once, then calls its exports many times with
+`prefix.call()`; throwaway code runs once with `sandbox.run()`. The prefix is stored as
 source (`prepare()` evaluates nothing, DESIGN.md §16.4) and evaluated per
 isolate — there is no runtime V8 snapshot
 (DESIGN.md §11.6); every isolate boots from one build-time snapshot of the
@@ -332,8 +333,8 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   native `setTimeout`/`clearTimeout` globals are runtime-internal — their
   callbacks never cross the boundary; DESIGN.md §7 item 8.)
 - **One execution model in this product.** `@iso4/sandbox` ships one API
-  shape: independent runs against a prepared prefix (`prefix.execute()` /
-  `prefix.call()`, plus one-off `sandbox.run()`). Warm instances make those
+  shape: independent runs against a prepared prefix (`prefix.call()`,
+  plus one-off `sandbox.run()`). Warm instances make those
   runs cheap but are a transparent cache, not a second model — no session
   handle, no host-visible lifecycle. The persistent-session
   / per-row-analytics use case is its own product (`@iso4/analytics` or

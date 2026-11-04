@@ -39,8 +39,6 @@ describe('prepare({ limits }) as per-run defaults', () => {
       limits: { cpuTimeMs: 250, maxBridgeCalls: 3 },
     })
     const spy = vi.spyOn(RuntimeIpcClient.prototype, 'prefixRun')
-    await prefix.execute({ code: 'export default 1' })
-    expect(lastWireLimits(spy)).toMatchObject({ cpuTimeMs: 250, maxBridgeCalls: 3 })
     await prefix.call({ export: 'default' })
     expect(lastWireLimits(spy)).toMatchObject({ cpuTimeMs: 250, maxBridgeCalls: 3 })
     await prefix.dispose()
@@ -52,10 +50,10 @@ describe('prepare({ limits }) as per-run defaults', () => {
       limits: { cpuTimeMs: 250, maxBridgeCalls: 3 },
     })
     const spy = vi.spyOn(RuntimeIpcClient.prototype, 'prefixRun')
-    await prefix.execute({ code: 'export default 1', limits: { cpuTimeMs: 500, wallTimeMs: 1_000 } })
+    await prefix.call({ export: 'default', limits: { cpuTimeMs: 500, wallTimeMs: 1_000 } })
     const sent = lastWireLimits(spy)
     expect(sent).toMatchObject({ cpuTimeMs: 500, maxBridgeCalls: 3, wallTimeMs: 1_000 })
-    await prefix.execute({ code: 'export default 1', limits: { cpuTimeMs: undefined } as never })
+    await prefix.call({ export: 'default', limits: { cpuTimeMs: undefined } as never })
     expect(lastWireLimits(spy)).toMatchObject({ cpuTimeMs: 250, maxBridgeCalls: 3 })
     await prefix.dispose()
   })
@@ -63,7 +61,7 @@ describe('prepare({ limits }) as per-run defaults', () => {
   test('a field set nowhere is absent on the wire so the runtime default applies', async () => {
     const prefix = await sandbox.prepare({ code: 'export default () => 1', limits: { cpuTimeMs: 250 } })
     const spy = vi.spyOn(RuntimeIpcClient.prototype, 'prefixRun')
-    await prefix.execute({ code: 'export default 1' })
+    await prefix.call({ export: 'default' })
     expect(lastWireLimits(spy)).not.toHaveProperty('wallTimeMs')
     await prefix.dispose()
   })
@@ -100,7 +98,7 @@ test('the defaults are a snapshot: editing the caller object after prepare() cha
   const prefix = await sandbox.prepare({ code: 'export default () => 1', limits })
   limits.cpuTimeMs = -1
   const spy = vi.spyOn(RuntimeIpcClient.prototype, 'prefixRun')
-  await prefix.execute({ code: 'export default 1' })
+  await prefix.call({ export: 'default' })
   expect(lastWireLimits(spy)).toMatchObject({ cpuTimeMs: 250 })
   await prefix.dispose()
 })

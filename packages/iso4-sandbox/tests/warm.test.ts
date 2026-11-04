@@ -94,10 +94,6 @@ describe('warm instances', () => {
     expect(call.ok).toBe(true)
     expect(call.heapUsedBytes).toBeGreaterThan(0)
 
-    const execute = await prefix.execute({ code: 'export default 1' })
-    expect(execute.ok).toBe(true)
-    expect(execute.heapUsedBytes).toBeGreaterThan(0)
-
     const oneOff = await single.run({ code: 'export default 1' })
     expect(oneOff.ok).toBe(true)
     expect(oneOff.heapUsedBytes).toBeUndefined()
@@ -107,12 +103,12 @@ describe('warm instances', () => {
     // prepare() evaluates nothing. The fixed warm-up budget (1s, Cloudflare's
     // script-startup model) fails the cold start with its own code.
     await using prefix = await single.prepare({ code: 'for (;;) {}' })
-    const check = await prefix.execute({ code: 'export default 0' })
+    const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_WARMUP_LIMIT' } })
     // Load-dependent: the budget never breaks the prefix, the next run cold-starts again.
     expect(check.ok || check.error.stage).toBeUndefined()
     expect(prefix.status).toBe('ready')
-    const again = await prefix.execute({ code: 'export default 0' })
+    const again = await prefix.call({ export: 'default' })
     expect(again).toMatchObject({ ok: false, error: { code: 'ERR_WARMUP_LIMIT' } })
   }, 15_000)
 

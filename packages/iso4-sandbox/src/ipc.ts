@@ -784,15 +784,21 @@ class PayloadWriter {
     return this
   }
 
+  writeCall(call: CallPayload): this {
+    // CallSpec: `String exportPath` + a value slot holding the
+    // pre-serialized argument-array blob.
+    this.writeString(call.exportPath)
+    this.writeLengthPrefixedBytes(call.argsBlob)
+    return this
+  }
+
   writeOptionalCall(call: CallPayload | undefined): this {
-    // Optional<CallSpec>: presence byte, then `String exportPath` + a value
-    // slot holding the pre-serialized argument-array blob.
+    // Optional<CallSpec>: presence byte, then the CallSpec.
     if (call === undefined) {
       this.writeU8(0)
     } else {
       this.writeU8(1)
-      this.writeString(call.exportPath)
-      this.writeLengthPrefixedBytes(call.argsBlob)
+      this.writeCall(call)
     }
     return this
   }
@@ -1126,13 +1132,6 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buff
 
 export interface PrefixRunPayloadOptions {
   prefixId: string
-  /**
-   * Postfix module source. A `PrefixRun` frame carries a postfix *or* a call
-   * — exactly one; the encoder enforces this before any bytes are
-   * written, mirroring the Rust parser.
-   */
-  code?: string
-  filename?: string
   limits?: WireResourceLimits
   globals?: readonly GlobalDefPayload[]
   /**
@@ -1141,10 +1140,10 @@ export interface PrefixRunPayloadOptions {
    */
   importRebinds?: readonly ImportRebindPayload[]
   /**
-   * When present, the run calls into the prefix module's exports instead of
-   * evaluating a postfix; the result is the function's return value.
+   * The call into the prefix module's exports; the result is the function's
+   * return value.
    */
-  call?: CallPayload
+  call: CallPayload
 }
 
 /**
@@ -1156,20 +1155,13 @@ export interface PrefixRunPayloadOptions {
 export function encodePrefixRunPayload(
   options: PrefixRunPayloadOptions & { runId: number },
 ): Buffer {
-  if ((options.code === undefined) === (options.call === undefined)) {
-    throw new Error(
-      '[iso4] PrefixRun must carry exactly one of code or call',
-    )
-  }
   return new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.prefixId)
-    .writeOptionalString(options.code)
-    .writeOptionalString(options.filename)
     .writeResourceLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImportRebinds(options.importRebinds ?? [])
-    .writeOptionalCall(options.call)
+    .writeCall(options.call)
     .toBuffer()
 }
 

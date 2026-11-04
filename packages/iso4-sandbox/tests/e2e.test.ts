@@ -12,7 +12,7 @@
  *
  * Test organisation:
  * 1. Direct run (no precompile)
- * 2. Precompile + prefix.run()
+ * 2. Prepare + prefix.call()
  * 3. Globals — fetch handler and custom tool functions
  * 4. Source imports — host-provided JS libraries (e.g. zod-like)
  * 5. Host imports — host-provided function bridges
@@ -248,10 +248,10 @@ describe('runtime.run() — direct execution', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Precompile + prefix.run()
+// 2. Prepare + prefix.call()
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('precompile + prefix.run()', () => {
+describe('prepare + prefix.call()', () => {
   let runtime: Runtime
 
   beforeAll(async () => {
@@ -262,45 +262,45 @@ describe('precompile + prefix.run()', () => {
     await runtime?.dispose()
   })
 
-  test('prefix compiles and postfix runs', async () => {
+  test('prefix evaluates and a call reads its state', async () => {
     // ESM top-level const is module-scoped; use globalThis to share across modules.
-    const prefix = await runtime.precompile({
-      code: 'globalThis.base = 100',
+    const prefix = await runtime.prepare({
+      code: 'globalThis.base = 100\nexport default () => globalThis.base + 1',
     })
-    const result = await prefix.run({ code: 'export default globalThis.base + 1' })
+    const result = await prefix.call({ export: 'default' })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.exports.default).toBe(101)
+    expect(result.value).toBe(101)
     await prefix.dispose()
   })
 
-  test('prepare()/execute() are aliases of precompile()/run()', async () => {
-    // The canonical names must behave identically to the deprecated aliases,
-    // and interoperate (a prefix from prepare() still answers run()).
-    const prefix = await runtime.prepare({ code: 'globalThis.base = 200' })
-    const viaExecute = await prefix.execute({ code: 'export default globalThis.base + 1' })
-    expect(viaExecute.ok).toBe(true)
-    if (!viaExecute.ok)
+  test('prepare() and the deprecated precompile() alias behave identically', async () => {
+    const code = 'globalThis.base = 200\nexport default (n) => globalThis.base + n'
+    const prepared = await runtime.prepare({ code })
+    const viaPrepare = await prepared.call({ export: 'default', args: [1] })
+    expect(viaPrepare.ok).toBe(true)
+    if (!viaPrepare.ok)
       return
-    expect(viaExecute.exports.default).toBe(201)
-    // Deprecated run() still works on a prefix produced by prepare().
-    const viaRun = await prefix.run({ code: 'export default globalThis.base + 2' })
-    expect(viaRun.ok).toBe(true)
-    if (!viaRun.ok)
+    expect(viaPrepare.value).toBe(201)
+    await prepared.dispose()
+    const precompiled = await runtime.precompile({ code })
+    const viaPrecompile = await precompiled.call({ export: 'default', args: [2] })
+    expect(viaPrecompile.ok).toBe(true)
+    if (!viaPrecompile.ok)
       return
-    expect(viaRun.exports.default).toBe(202)
-    await prefix.dispose()
+    expect(viaPrecompile.value).toBe(202)
+    await precompiled.dispose()
   })
 
-  test('many postfix runs against the same prefix', async () => {
-    const prefix = await runtime.precompile({
-      code: 'globalThis.multiplier = 10',
+  test('many calls against the same prefix', async () => {
+    const prefix = await runtime.prepare({
+      code: 'globalThis.multiplier = 10\nexport default (n) => n * globalThis.multiplier',
     })
 
     const results = await Promise.all(
       [1, 2, 3, 4, 5].map((n) =>
-        prefix.run({ code: `export default ${n} * globalThis.multiplier` }),
+        prefix.call({ export: 'default', args: [n] }),
       ),
     )
 
@@ -308,91 +308,94 @@ describe('precompile + prefix.run()', () => {
       expect(result.ok).toBe(true)
       if (!result.ok)
         continue
-      expect(result.exports.default).toBe((i + 1) * 10)
+      expect(result.value).toBe((i + 1) * 10)
     }
 
     await prefix.dispose()
   })
 
-  test('warm reuse: a later run may see an earlier run\'s globals', async () => {
-    const prefix = await runtime.precompile({ code: '' })
+  test('warm reuse: a later call may see an earlier call\'s globals', async () => {
+    const prefix = await runtime.prepare({
+      code: `
+        export function set() { globalThis.__secret = 42; return 1 }
+        export function read() { return globalThis.__secret ?? "clean" }
+      `,
+    })
 
     // Prefix runs reuse warm instances of the same prefix, so a
     // mutation made by one run MAY be visible to the next — permitted,
     // unguaranteed, evictable at any time (warmth is a cache). Back-to-back
     // runs on one prefix reuse deterministically, so assert the carryover.
-    await prefix.run({ code: 'globalThis.__secret = 42; export default 1' })
-    const second = await prefix.run({
-      code: 'export default globalThis.__secret ?? "clean"',
-    })
+    await prefix.call({ export: 'set' })
+    const second = await prefix.call({ export: 'read' })
 
     expect(second.ok).toBe(true)
     if (!second.ok)
       return
-    expect(second.exports.default).toBe(42)
+    expect(second.value).toBe(42)
 
     await prefix.dispose()
   })
 
-  test('prefix with source library available in postfix', async () => {
-    const prefix = await runtime.precompile({
-      code: `import { add } from 'lib:math'; globalThis.add = add`,
+  test('prefix with source library available to its exports', async () => {
+    const prefix = await runtime.prepare({
+      code: `import { add } from 'lib:math'; export default () => add(3, 4)`,
       imports: {
 
         'lib:math': MATH_UTILS_SOURCE,
       },
     })
 
-    const result = await prefix.run({ code: 'export default add(3, 4)' })
+    const result = await prefix.call({ export: 'default' })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.exports.default).toBe(7)
+    expect(result.value).toBe(7)
 
     await prefix.dispose()
   })
 
-  test('prefix with top-level await settles and snapshots', async () => {
-    const prefix = await runtime.precompile({
+  test('prefix with top-level await settles', async () => {
+    const prefix = await runtime.prepare({
       code: `globalThis.a = await Promise.resolve(41)
-globalThis.b = await new Response('body').text()`,
+globalThis.b = await new Response('body').text()
+export default () => [globalThis.a + 1, globalThis.b].join("|")`,
     })
-    const result = await prefix.run({
-      code: 'export default [globalThis.a + 1, globalThis.b].join("|")',
-    })
+    const result = await prefix.call({ export: 'default' })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.exports.default).toBe('42|body')
+    expect(result.value).toBe('42|body')
     await prefix.dispose()
   })
 
   test('prefix with top-level await in plain exports settles (bundled-handler shape)', async () => {
-    // A prefix's module namespace is discarded by design, so these bindings
-    // are unobservable from a postfix — the point is that prepare() itself
-    // succeeds for the shapes bundled handlers commonly produce.
-    const prefix = await runtime.precompile({
+    // The point is that the cold start itself succeeds for the shapes
+    // bundled handlers commonly produce.
+    const prefix = await runtime.prepare({
       code: `export const test = await 1
-export default await Promise.resolve(2)`,
+export default await Promise.resolve(2)
+export const ran = () => 'ran'`,
     })
-    const result = await prefix.run({ code: 'export default "ran"' })
+    const result = await prefix.call({ export: 'ran' })
     expect(result.ok).toBe(true)
     await prefix.dispose()
   })
 
   test('prefix importing a module with top-level await settles', async () => {
-    const prefix = await runtime.precompile({
+    const prefix = await runtime.prepare({
       code: `import { config } from 'lib:config'
-globalThis.retries = config.retries`,
+globalThis.retries = config.retries
+export default () => globalThis.retries`,
       imports: {
         'lib:config': 'export const config = await Promise.resolve({ retries: 3 })',
       },
     })
-    const result = await prefix.run({ code: 'export default globalThis.retries' })
+    const result = await prefix.call({ export: 'default' })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.exports.default).toBe(3)
+    expect(result.value).toBe(3)
     await prefix.dispose()
   })
 
@@ -401,10 +404,10 @@ globalThis.retries = config.retries`,
 
   test('prefix that never settles fails the first run with ERR_PREFIX_DID_NOT_SETTLE', async () => {
     await using prefix = await runtime.prepare({ code: 'await new Promise(() => {})' })
-    const check = await prefix.execute({ code: 'export default 0' })
+    const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_DID_NOT_SETTLE', stage: 'prefix' } })
     expect(prefix.status).toBe('broken')
-    await expect(prefix.execute({ code: 'export default 0' })).rejects.toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_PREFIX_DID_NOT_SETTLE' } })
+    await expect(prefix.call({ export: 'default' })).rejects.toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_PREFIX_DID_NOT_SETTLE' } })
   })
 
   test('prefix calling a declared bridge global fails the first run with ERR_PREFIX_BRIDGE_CALL', async () => {
@@ -415,7 +418,7 @@ globalThis.retries = config.retries`,
       code: 'await fetch("https://example.com")',
       globals: { fetch: async () => ({ status: 200 }) },
     })
-    const check = await prefix.execute({ code: 'export default 0' })
+    const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_BRIDGE_CALL' } })
   })
 
@@ -427,13 +430,13 @@ await search('dogs')`,
         'tools:web': { search: async () => [] },
       },
     })
-    const check = await prefix.execute({ code: 'export default 0' })
+    const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_BRIDGE_CALL' } })
   })
 
   test('a prefix syntax error fails the first run with ERR_USER_CODE, named by file and line', async () => {
     await using prefix = await runtime.prepare({ code: '\nexport default (((', filename: 'setup.js' })
-    const check = await prefix.execute({ code: 'export default 0' })
+    const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({
       ok: false,
       error: { code: 'ERR_USER_CODE', name: 'SyntaxError', message: 'Unexpected end of input' },
@@ -443,13 +446,10 @@ await search('dogs')`,
     expect(check.error.stack).toMatch(/^SyntaxError: Unexpected end of input\n {4}at setup\.js:2:\d+$/)
   })
 
-  test('a broken prefix fails the first run and is refused after that, execute() and call() alike', async () => {
+  test('a broken prefix fails the first call and is refused after that', async () => {
     await using prefix = await runtime.prepare({ code: 'throw new Error("broken prefix")' })
-    expect(await prefix.execute({ code: 'export default 0' }))
+    expect(await prefix.call({ export: 'default' }))
       .toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', message: 'broken prefix', stage: 'prefix' } })
-    await expect(prefix.execute({ code: 'export default 0' }))
-      .rejects
-      .toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
     await expect(prefix.call({ export: 'default', args: [] }))
       .rejects
       .toMatchObject({ code: 'ERR_PREFIX_BROKEN', cause: { code: 'ERR_USER_CODE', message: 'broken prefix' } })
@@ -463,7 +463,7 @@ await search('dogs')`,
     await using many = await createRuntime({ maxConcurrentRuns: 64 })
     await using prefix = await many.prepare({ code: 'throw new Error("broken prefix")' })
     const results = await Promise.allSettled(
-      Array.from({ length: 48 }, () => prefix.execute({ code: 'export default 0' })),
+      Array.from({ length: 48 }, () => prefix.call({ export: 'default' })),
     )
     for (const settled of results) {
       if (settled.status === 'fulfilled')
@@ -483,10 +483,10 @@ await search('dogs')`,
     expect(prefix.alive).toBe(false)
   })
 
-  test('run on disposed prefix rejects', async () => {
-    const prefix = await runtime.precompile({ code: '' })
+  test('call on disposed prefix rejects', async () => {
+    const prefix = await runtime.prepare({ code: '' })
     await prefix.dispose()
-    await expect(prefix.run({ code: 'export default 1' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+    await expect(prefix.call({ export: 'default' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
   })
 })
 
@@ -564,19 +564,20 @@ describe('globals', () => {
   test('per-run fetch handler is scoped to that run', async () => {
     const calls: string[] = []
 
-    const prefix = await runtime.precompile({
+    const prefix = await runtime.prepare({
       code: `
-        globalThis.run = async (url) => {
+        export default async (url) => {
           const r = await fetch(url)
           return r.status
         }
       `,
-      // Declare fetch at precompile time so the prefix body can reference it.
+      // Declare fetch at prepare time so the prefix body can reference it.
       globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
     })
 
-    await prefix.run({
-      code: 'export default await globalThis.run("https://run-a.example.com")',
+    await prefix.call({
+      export: 'default',
+      args: ['https://run-a.example.com'],
       globals: {
         fetch: async (url: unknown) => {
           calls.push(`a:${url as string}`)
@@ -585,8 +586,9 @@ describe('globals', () => {
       },
     })
 
-    await prefix.run({
-      code: 'export default await globalThis.run("https://run-b.example.com")',
+    await prefix.call({
+      export: 'default',
+      args: ['https://run-b.example.com'],
       globals: {
         fetch: async (url: unknown) => {
           calls.push(`b:${url as string}`)
@@ -703,26 +705,22 @@ describe('source imports', () => {
     expect(result.exports.default).toMatchObject({ success: false })
   })
 
-  test('source module declared on prefix is reachable from postfix import', async () => {
-    // ESM bindings don't cross module boundaries: postfix code that wants a
-    // source-module function must import it itself. The precompiled prefix's
-    // role is to declare the binding so the postfix's import resolves
-    // against the same source. (DESIGN.md §4.3.)
-    const prefix = await runtime.precompile({
-      code: `import { add, multiply } from 'lib:math'`,
+  test('source module declared on prefix is usable from its exports', async () => {
+    // The prefix imports the declared source module; its exports close over
+    // the bindings. (DESIGN.md §4.3.)
+    const prefix = await runtime.prepare({
+      code: `import { add, multiply } from 'lib:math'
+             export default () => multiply(add(1, 2), 4)`,
       imports: {
         'lib:math': MATH_UTILS_SOURCE,
       },
     })
 
-    const result = await prefix.run({
-      code: `import { add, multiply } from 'lib:math'
-             export default multiply(add(1, 2), 4)`,
-    })
+    const result = await prefix.call({ export: 'default' })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.exports.default).toBe(12)
+    expect(result.value).toBe(12)
 
     await prefix.dispose()
   })
@@ -2300,18 +2298,19 @@ describe('AbortSignal cancellation', () => {
       .toEqual(['unanswered', 'dropped', 'dropped', 'dropped'])
   })
 
-  test('prefix.run honors an in-flight abort and keeps the prefix usable', async () => {
-    const prefix = await runtime.precompile({
-      code: '',
+  test('prefix.call honors an in-flight abort and keeps the prefix usable', async () => {
+    const prefix = await runtime.prepare({
+      code: `
+        export default async () => await slow()
+        export const seven = () => 7
+      `,
       globals: { slow: () => Promise.resolve('unused') },
     })
 
     const controller = new AbortController()
     setTimeout(() => controller.abort(), 50)
-    const aborted = await prefix.run({
-      code: `
-        export default await slow()
-      `,
+    const aborted = await prefix.call({
+      export: 'default',
       signal: controller.signal,
       globals: {
         // Rebind the declared global to one that never resolves in time.
@@ -2327,10 +2326,10 @@ describe('AbortSignal cancellation', () => {
 
     // The prefix (and the pool) survive: a subsequent run on the same prefix
     // still works.
-    const ok = await prefix.run({ code: 'export default 7' })
+    const ok = await prefix.call({ export: 'seven' })
     expect(ok.ok).toBe(true)
     if (ok.ok)
-      expect(ok.exports.default).toBe(7)
+      expect(ok.value).toBe(7)
 
     await prefix.dispose()
   }, 15_000)
@@ -3079,7 +3078,7 @@ describe('custom error classes end-to-end', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 14. ERR_UNDECLARED_BINDING — prefix.run() with undeclared globals
+// 14. ERR_UNDECLARED_BINDING — prefix.call() with undeclared globals
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('ERR_UNDECLARED_BINDING', () => {
@@ -3097,18 +3096,18 @@ describe('ERR_UNDECLARED_BINDING', () => {
     // The prefix does NOT declare fetch at precompile time.
     // Passing fetch at run time must be rejected — adding it would widen the
     // declared prefix surface.
-    const prefix = await runtime.precompile({ code: '' })
-    await expect(prefix.run({
-      code: 'export default 1',
+    const prefix = await runtime.prepare({ code: 'export default () => 1' })
+    await expect(prefix.call({
+      export: 'default',
       globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
     })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
     await prefix.dispose()
   })
 
   test('an undeclared non-identifier name is ERR_UNDECLARED_BINDING', async () => {
-    const prefix = await runtime.prepare({ code: '' })
-    await expect(prefix.run({
-      code: 'export default 1',
+    const prefix = await runtime.prepare({ code: 'export default () => 1' })
+    await expect(prefix.call({
+      export: 'default',
       globals: { 'my-tool': async () => 1 } as never,
     })).rejects.toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
     await expect(prefix.call({
@@ -3131,43 +3130,46 @@ describe('ERR_UNDECLARED_BINDING', () => {
     const solo = await createRuntime({ maxConcurrentRuns: 1 })
     try {
       const prefix = await solo.prepare({
-        code: 'globalThis.base = 41',
+        code: `
+          import { add } from 'host:tools'
+          globalThis.base = 41
+          export default () => globalThis.base + 1
+          export const addBase = async () => await add(globalThis.base)
+        `,
         imports: { 'host:tools': { add: (n: number) => n + 1 } },
       })
-      expect((await prefix.run({ code: 'export default globalThis.base + 1' })).ok).toBe(true)
+      expect((await prefix.call({ export: 'default' })).ok).toBe(true)
       for (let i = 0; i < 3; i++) {
-        await expect(prefix.run({ code: 'export default 1', globals: { zzz: async () => 1 } as never }))
+        await expect(prefix.call({ export: 'default', globals: { zzz: async () => 1 } as never }))
           .rejects
           .toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
-        await expect(prefix.run({ code: 'export default 1', imports: { 'host:tools': { nope: () => 1 } } as never }))
+        await expect(prefix.call({ export: 'default', imports: { 'host:tools': { nope: () => 1 } } as never }))
           .rejects
           .toMatchObject({ code: 'ERR_UNDECLARED_BINDING' })
-        await expect(prefix.run({ code: 'export default 1', imports: { 'host:tools': { add: 1 } } as never }))
+        await expect(prefix.call({ export: 'default', imports: { 'host:tools': { add: 1 } } as never }))
           .rejects
           .toMatchObject({ code: 'ERR_INVALID_REBIND' })
       }
       expect((await solo.stats()).activeRuns).toBe(0)
-      const after = await prefix.run({
-        code: `import { add } from 'host:tools'\nexport default await add(globalThis.base)`,
-      })
-      expect(after).toMatchObject({ ok: true, exports: { default: 42 } })
+      const after = await prefix.call({ export: 'addBase' })
+      expect(after).toMatchObject({ ok: true, value: 42 })
       expect((await solo.stats()).warmInstances).toBe(1)
       await prefix.dispose()
-      await expect(prefix.run({ code: 'export default 1' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
+      await expect(prefix.call({ export: 'default' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
     } finally {
       await solo.dispose()
     }
   })
 
-  test('declared global at precompile time can be rebound at run time', async () => {
-    // fetch IS declared at precompile time (even if the stub is never called).
-    // Rebinding at run time is allowed.
-    const prefix = await runtime.precompile({
-      code: '',
+  test('declared global at prepare time can be rebound at call time', async () => {
+    // fetch IS declared at prepare time (even if the stub is never called).
+    // Rebinding at call time is allowed.
+    const prefix = await runtime.prepare({
+      code: 'export default () => 1',
       globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
     })
-    const result = await prefix.run({
-      code: 'export default 1',
+    const result = await prefix.call({
+      export: 'default',
       globals: { fetch: async () => ({ status: 418, headers: {}, body: null }) },
     })
     expect(result.ok).toBe(true)
@@ -3375,7 +3377,6 @@ describe('native timers', () => {
     await expect(runtime.prepare({ code: '', imports })).rejects.toThrow(error)
     await expect(runtime.prepare({ code: '', imports: { 'x\uD800': 'export default 1' } })).rejects.toThrow(error)
     const prefix = await runtime.prepare({ code: 'export default () => 1' })
-    await expect(prefix.run({ code: 'export default 1', imports } as never)).rejects.toThrow(error)
     await expect(prefix.call({ export: 'default', imports } as never)).rejects.toThrow(error)
     await prefix.dispose()
   })
@@ -3386,10 +3387,10 @@ describe('native timers', () => {
     const code = `import m from 'host:ü😀'\nexport default [await m['é'][''](), await m['a.b']()]`
     expect(await runtime.run({ code, imports })).toMatchObject({ ok: true, exports: { default: [7, 8] } })
 
-    const prefix = await runtime.prepare({ code: '', imports })
-    const rebound = await prefix.run({ code, imports: { 'host:ü😀': { default: { é: { '': async () => 70 } } } } } as never)
-    expect(rebound).toMatchObject({ ok: true, exports: { default: [70, 8] } })
-    expect(await prefix.run({ code })).toMatchObject({ ok: true, exports: { default: [7, 8] } })
+    const prefix = await runtime.prepare({ code: `import m from 'host:ü😀'\nexport default async () => [await m['é'][''](), await m['a.b']()]`, imports })
+    const rebound = await prefix.call({ export: 'default', imports: { 'host:ü😀': { default: { é: { '': async () => 70 } } } } } as never)
+    expect(rebound).toMatchObject({ ok: true, value: [70, 8] })
+    expect(await prefix.call({ export: 'default' })).toMatchObject({ ok: true, value: [7, 8] })
     await prefix.dispose()
   })
 
@@ -3399,7 +3400,6 @@ describe('native timers', () => {
     await expect(runtime.run({ code: 'export default 1', imports })).rejects.toThrow(error)
     await expect(runtime.prepare({ code: '', imports })).rejects.toThrow(error)
     const prefix = await runtime.prepare({ code: 'export default () => 1', imports: { 'host:t': { f: { g: () => 1 } } } })
-    await expect(prefix.run({ code: 'export default 1', imports } as never)).rejects.toThrow(error)
     await expect(prefix.call({ export: 'default', imports } as never)).rejects.toThrow(error)
     await prefix.dispose()
   })
@@ -3414,7 +3414,6 @@ describe('native timers', () => {
     await expect(runtime.run({ code: 'export default 1', globals })).rejects.toThrow(error)
     await expect(runtime.prepare({ code: '', globals })).rejects.toThrow(error)
     const prefix = await runtime.prepare({ code: 'export default () => 1' })
-    await expect(prefix.run({ code: 'export default 1', globals } as never)).rejects.toThrow(error)
     await expect(prefix.call({ export: 'default', globals } as never)).rejects.toThrow(error)
     await prefix.dispose()
   })
@@ -3453,7 +3452,7 @@ describe('native timers', () => {
     // No loop exists while a prefix evaluates — the call throws instead of
     // hanging (workerd's explicit route). Uncaught, it fails the cold start.
     await using prefix = await runtime.prepare({ code: 'setTimeout(() => {}, 5)' })
-    const check = await prefix.execute({ code: 'export default 0' })
+    const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({
       ok: false,
       error: { code: 'ERR_USER_CODE', message: expect.stringMatching(/only available to run code/) },
@@ -3462,32 +3461,31 @@ describe('native timers', () => {
 
   test('timers work on warm prefix runs, and grace work may sleep', async () => {
     const prefix = await runtime.prepare({
-      code: 'globalThis.sleep = ms => new Promise(r => setTimeout(r, ms))',
+      code: `
+        globalThis.sleep = ms => new Promise(r => setTimeout(r, ms))
+        export function a() {
+          waitUntil((async () => { await sleep(120); console.log('grace woke') })())
+          return 'early'
+        }
+        export async function b() { await sleep(30); return 'b done' }
+      `,
     })
     try {
       // Run A: registers grace work that sleeps — the run's value ships at
       // Result while the timer is still pending on the instance loop.
-      const a = await prefix.run({
-        code: `
-          waitUntil((async () => { await sleep(120); console.log('grace woke') })())
-          export default 'early'
-        `,
-        limits: { graceMs: 5_000 },
-      })
+      const a = await prefix.call({ export: 'a', limits: { graceMs: 5_000 } })
       expect(a.ok).toBe(true)
       if (!a.ok)
         return
-      expect(a.exports.default).toBe('early')
+      expect(a.value).toBe('early')
 
       // Run B lands while A's grace timer is pending — the instance loop
       // serves both (slot freed at Result since #127).
-      const b = await prefix.run({
-        code: 'await sleep(30); export default \'b done\'',
-      })
+      const b = await prefix.call({ export: 'b' })
       expect(b.ok).toBe(true)
       if (!b.ok)
         return
-      expect(b.exports.default).toBe('b done')
+      expect(b.value).toBe('b done')
 
       const report = await a.waitUntil!
       expect(report.status).toBe('settled')
@@ -3620,29 +3618,29 @@ describe('native timers', () => {
 
   test('a settled run\'s pending timer never fires into the next run', async () => {
     const prefix = await runtime.prepare({
-      code: 'globalThis.hit = \'untouched\'',
+      code: `
+        globalThis.hit = 'untouched'
+        export function arm() {
+          setTimeout(() => { globalThis.hit = 'FIRED' }, 20)
+          return 'armed'
+        }
+        export async function read() {
+          await new Promise(r => setTimeout(r, 30))
+          return globalThis.hit
+        }
+      `,
     })
     try {
-      const armed = await prefix.run({
-        code: `
-          setTimeout(() => { globalThis.hit = 'FIRED' }, 20)
-          export default 'armed'
-        `,
-      })
+      const armed = await prefix.call({ export: 'arm' })
       expect(armed.ok).toBe(true)
       await new Promise<void>((r) => {
         setTimeout(r, 60)
       })
-      const later = await prefix.run({
-        code: `
-          await new Promise(r => setTimeout(r, 30))
-          export default globalThis.hit
-        `,
-      })
+      const later = await prefix.call({ export: 'read' })
       expect(later.ok).toBe(true)
       if (!later.ok)
         return
-      expect(later.exports.default).toBe('untouched')
+      expect(later.value).toBe('untouched')
     } finally {
       await prefix.dispose()
     }
@@ -3829,21 +3827,23 @@ describe('maxBridgeCalls limit', () => {
     expect(calls).toBe(3)
   })
 
-  test('limit applies on prefix.run() too', async () => {
-    const prefix = await runtime.precompile({
-      code: '',
+  test('limit applies on prefix.call() too', async () => {
+    const prefix = await runtime.prepare({
+      code: `
+        export default async () => {
+          await myTool()
+          await myTool()
+          await myTool()
+          await myTool()
+          return 'done'
+        }
+      `,
       globals: { myTool: () => null },
     })
 
     let calls = 0
-    const result = await prefix.run({
-      code: `
-        await myTool()
-        await myTool()
-        await myTool()
-        await myTool()
-        export default 'done'
-      `,
+    const result = await prefix.call({
+      export: 'default',
       limits: { maxBridgeCalls: 2, cpuTimeMs: 5_000, wallTimeMs: 10_000 },
       globals: { myTool: () => {
         calls++
@@ -3987,34 +3987,9 @@ describe('async context — node:async_hooks', () => {
     expect(result.exports.default).toEqual(['A:A', 'B:B', 'C:C'])
   })
 
-  test('works in postfix code against a precompiled prefix', async () => {
-    const prefix = await runtime.precompile({
-      code: 'globalThis.workflowRoot = "wf"',
-    })
-    const result = await prefix.run({
-      code: /* js */ `
-        import { AsyncLocalStorage } from 'node:async_hooks'
-        const als = new AsyncLocalStorage()
-        export default await als.run(globalThis.workflowRoot, async () => {
-          await Promise.resolve()
-          return als.getStore()
-        })
-      `,
-    })
-    expect(result.ok).toBe(true)
-    if (!result.ok) {
-      await prefix.dispose()
-      return
-    }
-    expect(result.exports.default).toBe('wf')
-    await prefix.dispose()
-  })
-
-  // ── WORKS: the durable-workflow shape ──────────────────────────────────────
-  // The `step.do(name, fn)` shim lives in a declared IMPORT that the postfix
-  // pulls in. Because the prefix code never imports it, the shim (and its
-  // module-global `AsyncLocalStorage`) is resolved at RUN time — where
-  // `node:async_hooks` is available — not baked into the snapshot.
+  // ── WORKS: the durable-workflow shape in a one-off run ─────────────────────
+  // The `step.do(name, fn)` shim lives in a declared IMPORT that one-off run
+  // code pulls in, where `node:async_hooks` is available.
 
   const STEP_SHIM_SOURCE = /* js */ `
     import { AsyncLocalStorage } from 'node:async_hooks'
@@ -4026,7 +4001,7 @@ describe('async context — node:async_hooks', () => {
     export function currentKey() { return keyScope.getStore() ?? '' }
   `
 
-  test('WORKS: step.do shim provided as a run-time import, used by the postfix', async () => {
+  test('WORKS: step.do shim provided as a run-time import, used by one-off run code', async () => {
     const result = await runtime.run({
       imports: { 'workflow:steps': STEP_SHIM_SOURCE },
       code: /* js */ `
@@ -4058,60 +4033,44 @@ describe('async context — node:async_hooks', () => {
     ])
   })
 
-  test('WORKS: prefix pre-warms heavy setup; postfix uses BOTH it and the step shim', async () => {
-    // The expensive setup (tools/data) is compiled once into the snapshot and
-    // restored cheaply per run. The async-context shim is a run-time import.
-    // Both are available to the postfix at the same time.
-    const prefix = await runtime.precompile({
-      code: 'globalThis.tools = { rate: (n) => n * 2 }',
-      imports: { 'workflow:steps': STEP_SHIM_SOURCE },
-    })
-    const result = await prefix.run({
-      code: /* js */ `
-        import { step, currentKey } from 'workflow:steps'
-        export default await step('order', async () => {
-          const doubled = globalThis.tools.rate(21)   // prefix-provided (pre-warmed)
-          return await step('price', async () => {
-            await Promise.resolve()
-            return { key: currentKey(), doubled }      // shim-provided (run-time)
-          })
-        })
-      `,
-    })
-    expect(result.ok).toBe(true)
-    if (!result.ok) {
-      await prefix.dispose()
-      return
-    }
-    expect(result.exports.default).toEqual({ key: 'order/price', doubled: 42 })
-    await prefix.dispose()
-  })
+  // ── WORKS: async context in prefix code (the workerd shape) ─────────────────
+  // The instance is created at module scope and used inside the exported
+  // handler; the ambient value follows awaits within one call.
 
-  // ── DOES NOT WORK: async context in prefix code ─────────────────────────────
-  // `node:async_hooks` does not resolve while a prefix evaluates. The first
-  // run fails cleanly with ERR_MODULE_NOT_FOUND — not a crash.
-
-  test('DOES NOT WORK: importing node:async_hooks in prefix code', async () => {
+  test('WORKS: an AsyncLocalStorage created in prefix code is used by its exports', async () => {
     await using prefix = await runtime.prepare({
       code: /* js */ `
         import { AsyncLocalStorage } from 'node:async_hooks'
-        globalThis.als = new AsyncLocalStorage()
+        const als = new AsyncLocalStorage()
+        export default async (key) => als.run(key, async () => {
+          await Promise.resolve()
+          return als.getStore()
+        })
       `,
     })
-    const check = await prefix.execute({ code: 'export default 0' })
-    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_MODULE_NOT_FOUND' } })
+    const first = await prefix.call({ export: 'default', args: ['wf-1'] })
+    expect(first).toMatchObject({ ok: true, value: 'wf-1' })
+    const second = await prefix.call({ export: 'default', args: ['wf-2'] })
+    expect(second).toMatchObject({ ok: true, value: 'wf-2' })
   })
 
-  test('DOES NOT WORK: baking the step shim into the prefix (prefix imports it)', async () => {
-    // Same reason: if the PREFIX imports the shim, the shim's own
-    // `import ... from 'node:async_hooks'` must resolve at the prefix stage,
-    // which it can't. Keep the shim as a postfix import instead.
+  test('WORKS: the step shim baked into the prefix, used by an export', async () => {
     await using prefix = await runtime.prepare({
-      code: `import { step } from 'workflow:steps'; globalThis.step = step`,
+      code: /* js */ `
+        import { step, currentKey } from 'workflow:steps'
+        globalThis.tools = { rate: (n) => n * 2 }
+        export default async () => step('order', async () => {
+          const doubled = globalThis.tools.rate(21)
+          return await step('price', async () => {
+            await Promise.resolve()
+            return { key: currentKey(), doubled }
+          })
+        })
+      `,
       imports: { 'workflow:steps': STEP_SHIM_SOURCE },
     })
-    const check = await prefix.execute({ code: 'export default 0' })
-    expect(check).toMatchObject({ ok: false, error: { code: 'ERR_MODULE_NOT_FOUND' } })
+    const result = await prefix.call({ export: 'default' })
+    expect(result).toMatchObject({ ok: true, value: { key: 'order/price', doubled: 42 } })
   })
 
   // ── BOUNDARY: only run + getStore are implemented ───────────────────────────
@@ -4342,14 +4301,14 @@ describe('bridge report', () => {
     expect(result.cpuTimeMs).toBeGreaterThanOrEqual(0)
   })
 
-  test('prefix.run() carries the bridge report too', async () => {
-    const prefix = await runtime.precompile({
-      code: 'globalThis.ready = true',
+  test('prefix.call() carries the bridge report too', async () => {
+    const prefix = await runtime.prepare({
+      code: 'export default async () => await tool()',
       globals: { tool: () => 'v' },
     })
-    const result = await prefix.run({ code: 'export default await tool()' })
+    const result = await prefix.call({ export: 'default' })
     expect(result.ok).toBe(true)
-    expect(result.exports.default).toBe('v')
+    expect(result.value).toBe('v')
     expect(result.bridgeCalls).toHaveLength(1)
     expect(result.bridgeCalls[0].name).toBe('tool')
     expect(result.cpuTimeMs).toBeGreaterThan(0)
@@ -4762,21 +4721,22 @@ describe('eval and new Function are prepare()-time only', () => {
     // The zod-shaped pattern: compile a matcher from strings once at
     // prepare(), call it cheaply per run.
     const prefix = await runtime.prepare({
-      code: `globalThis.matcher = new Function('s', 'return /^item-[0-9]+$/.test(s)')`,
-    })
-    const result = await prefix.execute({
       code: `
-        const denied = (() => {
-          try { eval('1'); return 'allowed' }
-          catch (e) { return e instanceof EvalError && e.name }
-        })()
-        export default { ok: matcher('item-42'), no: matcher('nope'), denied }
+        globalThis.matcher = new Function('s', 'return /^item-[0-9]+$/.test(s)')
+        export default () => {
+          const denied = (() => {
+            try { eval('1'); return 'allowed' }
+            catch (e) { return e instanceof EvalError && e.name }
+          })()
+          return { ok: matcher('item-42'), no: matcher('nope'), denied }
+        }
       `,
     })
+    const result = await prefix.call({ export: 'default' })
     expect(result.ok).toBe(true)
     if (!result.ok)
       return
-    expect(result.exports.default).toEqual({ ok: true, no: false, denied: 'EvalError' })
+    expect(result.value).toEqual({ ok: true, no: false, denied: 'EvalError' })
     await prefix.dispose()
   })
 
@@ -5478,7 +5438,6 @@ describe('limits validation', () => {
     ['sandbox.run()', (limits) => runtime.run({ code: 'export default 1', limits })],
     ['sandbox.readExports()', (limits) => runtime.readExports({ code: 'export default 1', limits })],
     ['sandbox.prepare()', (limits) => runtime.prepare({ code: '', limits })],
-    ['prefix.run()', (limits) => prefix.run({ code: 'export default 1', limits })],
     ['prefix.call()', (limits) => prefix.call({ export: 'default', limits })],
   ]
   const cases = entryPoints.flatMap(([entry, invoke]) =>
@@ -5569,9 +5528,9 @@ describe('refused runs release call arguments', () => {
     const code = 'const a = new Uint8Array(32 * 1024 * 1024); a[0] = 1; export default a.length'
     const oneOff = await runtime.run({ code, limits: { hardMemoryMb: 4 } as never })
     expect(oneOff).toMatchObject({ ok: true, exports: { default: 32 * 1024 * 1024 } })
-    const prefix = await runtime.prepare({ code: '' })
-    const warm = await prefix.run({ code, limits: { hardMemoryMb: 4 } as never })
-    expect(warm).toMatchObject({ ok: true, exports: { default: 32 * 1024 * 1024 } })
+    const prefix = await runtime.prepare({ code: 'export default () => { const a = new Uint8Array(32 * 1024 * 1024); a[0] = 1; return a.length }' })
+    const warm = await prefix.call({ export: 'default', limits: { hardMemoryMb: 4 } as never })
+    expect(warm).toMatchObject({ ok: true, value: 32 * 1024 * 1024 })
     await prefix.dispose()
   })
 })
@@ -5725,14 +5684,14 @@ describe('import failures', () => {
 
   test('a prefix that calls import() or imports an unknown module fails its first run', async () => {
     await using dynamic = await runtime.prepare({ code: `try { await import('lodash') } catch {}` })
-    expect(await dynamic.execute({ code: 'export default 0' }))
+    expect(await dynamic.call({ export: 'default' }))
       .toMatchObject({ ok: false, error: { code: 'ERR_IMPORT', message: DYN } })
     await using unknown = await runtime.prepare({ code: `import x from 'lodash'` })
-    expect(await unknown.execute({ code: 'export default 0' }))
+    expect(await unknown.call({ export: 'default' }))
       .toMatchObject({ ok: false, error: { code: 'ERR_MODULE_NOT_FOUND', message: `Cannot find module 'lodash'` } })
   })
 
-  test('dynamic import() in prefix.call and prefix.run fails that run; the next run is clean', async () => {
+  test('dynamic import() in prefix.call fails that call; the next call is clean', async () => {
     await using prefix = await runtime.prepare({
       code: `
         export function load() { try { import('lodash') } catch {} return 'swallowed' }
@@ -5749,13 +5708,6 @@ describe('import failures', () => {
     expect(after.ok).toBe(true)
     if (after.ok)
       expect(after.value).toBe(7)
-
-    const ran = await prefix.run({ code: `import('lodash').catch(() => {}); export default 1` })
-    expect(ran.ok).toBe(false)
-    if (!ran.ok)
-      expect(ran.error.code).toBe('ERR_IMPORT')
-    const again = await prefix.run({ code: 'export default 2' })
-    expect(again.ok).toBe(true)
   })
 
   test('a sync prefix.call that queues import() fails itself; the next call is clean', async () => {

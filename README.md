@@ -1,7 +1,7 @@
 # iso4
 
 > Fast, sandboxed V8 isolate runtime with permission-controlled `fetch` and pluggable modules.
-> Built for the AI-agent prefix/postfix pattern.
+> Built for the prepare-once, call-many pattern.
 
 A minimal, composable V8 sandbox. Pure JavaScript execution in a separate Rust process.
 Memory and CPU limits enforced at the V8 level. Async time spent waiting on host work
@@ -13,8 +13,9 @@ modules the sandbox can `import` — nothing leaks unless it's handed over by na
 ## Why
 
 The canonical pattern this is built for: host application sets up tools, data, and library
-bindings as a **prefix**; an AI agent generates a **postfix** that uses them; the host
-executes the postfix and gets a result. The host wants:
+bindings together with the (often agent-generated) code that uses them as a **prefix**;
+the host then **calls** its exports once per request and gets a result. Throwaway code
+runs once with `sandbox.run()`. The host wants:
 
 - Hard limits on memory and active execution time per run.
 - Fine control over which URLs and which modules the sandbox can reach.
@@ -32,10 +33,14 @@ import { createSafeFetch } from '@iso4/fetch'
 // one off runs have a hard limit of 128 MB and no soft limit
 const sandbox = await createSandbox({ memoryMb: 128 })
 
-const prefix = await sandbox.precompile({
+const prefix = await sandbox.prepare({
   code: `
     const config = { apiBase: 'https://api.example.com' }
-    globalThis.config = config
+    export default async () => {
+      const res = await fetch(config.apiBase + '/users')
+      const users = res.json()
+      return { count: users.length }
+    }
   `,
   globals: {
     fetch: createSafeFetch({
@@ -47,17 +52,13 @@ const prefix = await sandbox.precompile({
   },
 })
 
-const result = await prefix.run({
-  code: `
-    const res = await fetch(config.apiBase + '/users')
-    const users = res.json()
-    export default { count: users.length }
-  `,
+const result = await prefix.call({
+  export: 'default',
   limits: { cpuTimeMs: 200 }, // overrides prepare({ limits }) field by field; memoryMb is per prefix, not per run
 })
 
 if (result.ok) {
-  console.log(result.exports.default) // { count: 42 }
+  console.log(result.value) // { count: 42 }
 }
 
 await sandbox.dispose()
@@ -148,7 +149,7 @@ pnpm changeset          # record a per-package version bump
 ## Current status
 
 - `sandbox.run({ code, limits })` — direct sandboxed execution ✅
-- `sandbox.precompile()` + `prefix.run()` — prefix/postfix pattern ✅
+- `sandbox.prepare()` + `prefix.call()` — prepare once, call many ✅
 - CPU and wall-clock limits enforced, async wait excluded from CPU budget ✅
 - Host-declared globals bridged into V8 (`fetch`, `myTool`, any name) ✅
 - Setup errors on prefix runs (undeclared, frozen or invalid rebinds, a disposed prefix) throw before anything runs ✅
@@ -205,15 +206,16 @@ tool such as `oxc`, or do one trial run (its instance stays warm):
 
 ```ts
 const prefix = await sandbox.prepare({ code })
-const check = await prefix.execute({ code: 'export default 0' })
-if (!check.ok)
+// Call a side-effect-free export; a failure of the prefix itself carries `stage: 'prefix'`.
+const check = await prefix.call({ export: 'ready' })
+if (!check.ok && check.error.stage === 'prefix')
   throw new Error(`broken prefix: ${check.error.message}`)
 ```
 
 A failure of the prefix itself carries `error.stage === 'prefix'`, so a
 host can tell it from a failure of the run code. The runtime remembers it:
 `prefix.status` becomes `'broken'`, `prefix.error` holds the failure, and
-every later `execute()`/`call()` rejects with `ERR_PREFIX_BROKEN` (its
+every later `call()` rejects with `ERR_PREFIX_BROKEN` (its
 `cause` is that failure) without booting an isolate. `dispose()` still
 works; the only retry is a new `prepare()`. Failures that depend on load
 (`ERR_WARMUP_LIMIT`, `ERR_MEMORY_LIMIT`) never break a prefix.
@@ -281,8 +283,8 @@ const result = await sandbox.run({
 Only `run(store, callback, ...args)` and `getStore()` are provided — the
 concurrency-safe core. It's built on V8's continuation-preserved embedder data
 (the same primitive modern Node uses), registers no promise hooks, and is
-always available to run code at no cost unless used. It is **not** available in
-`precompile()` (prefix) code — it's for the postfix. See DESIGN.md §16.
+always available at no cost unless used, in prefix code and one-off runs
+alike. See DESIGN.md §16.
 
 ## License
 
