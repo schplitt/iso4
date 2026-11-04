@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use crate::errors::failure;
 use crate::types;
-use crate::types::ImportBinding;
+use crate::types::{HostGlobalDef, ImportBinding};
 use crate::v8::bridge::StubSlots;
 use crate::v8::guard::{GuardTarget, InstanceGuard};
 use crate::v8::modules::{evaluate_prefix_module, host_import_meta_callback};
 use crate::v8::oom_label::oom_error_cb;
 use crate::v8::runtable::RunTable;
-use crate::v8::{FailureOutput, PrefixSpec, RunError, WARMUP_CPU_MS, WARMUP_WALL_MS};
+use crate::v8::{FailureOutput, RunError};
 
 static INIT: Once = Once::new();
 
@@ -423,6 +423,13 @@ impl CpuBudget {
     }
 }
 
+/// Wall-clock elapsed time since `start` in milliseconds, rounded to
+/// microsecond resolution (three decimal places). The wire carries
+/// durations as f64, so sub-millisecond runs stay visible.
+pub(crate) fn elapsed_ms(start: std::time::Instant) -> f64 {
+    (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1_000.0
+}
+
 /// Everything that lives as long as an isolate: the isolate itself, its
 /// context, the once-per-instance installs (console, web runtime, async
 /// context), and the evaluated prefix module. One-off runs build the same
@@ -548,6 +555,29 @@ fn warmup_error(reason: &ReasonCell, fallback: RunError) -> RunError {
         Some(_) => RunError::WarmupLimit,
         None => fallback,
     }
+}
+
+/// Fixed budget for warm-up, deliberately not user-configurable —
+/// Cloudflare's script-startup limit (1 s since 2025-10) is the model. The
+/// wall guard spans the per-instance runtime installs plus prefix
+/// evaluation; the CPU meter counts prefix evaluation only. Isolate boot
+/// itself (~0.2 ms, cannot loop) precedes the guards and is excluded — it is
+/// not sandbox-controllable, so there is nothing to police. Warm-up is never
+/// billed to the request that triggered it; blowing this budget reports
+/// `ERR_WARMUP_LIMIT`.
+pub const WARMUP_WALL_MS: u32 = 1_000;
+/// CPU half of the warm-up budget; see [`WARMUP_WALL_MS`].
+pub const WARMUP_CPU_MS: u32 = 1_000;
+
+/// The prefix an instance evaluates at cold start: validated source plus the
+/// globals declared at `prepare()` time, replayed into the fresh context.
+#[derive(Clone, Copy)]
+pub struct PrefixSpec<'a> {
+    pub code: &'a str,
+    pub filename: &'a str,
+    /// The full `prepare()`-time global defs — value globals installed before
+    /// the prefix evaluates, bridge callables as throwing placeholders.
+    pub globals: &'a [HostGlobalDef],
 }
 
 /// Build a fresh isolate + context, run the boot fixups, and

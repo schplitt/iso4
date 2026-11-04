@@ -28,7 +28,7 @@ use crate::v8::globals::install_value_globals;
 use crate::v8::guard::{GuardTarget, InstanceGuard};
 use crate::v8::isolate::{
     BUDGET_ALLOC_VTABLE, BudgetAllocState, LogBuffers, NearHeapData, ReasonCell, TerminationReason,
-    deny_wasm_codegen, heap_used, install_dynamic_import, near_heap_limit_cb,
+    deny_wasm_codegen, elapsed_ms, heap_used, install_dynamic_import, near_heap_limit_cb,
 };
 use crate::v8::modules::{
     ResolverContext, extract_module_exports, host_import_meta_callback, install_resolver,
@@ -45,8 +45,9 @@ use crate::v8::streams::{
 };
 use crate::v8::timers::{TimerTable, timer_turn};
 use crate::v8::{
-    CpuBudget, FailureOutput, GuardCtl, InstanceCore, Limits, OutStreamTable, PendingWork, RunError,
-    RunTable, RuntimeErrorData, StreamTable, alloc_run_token, create_instance_core, init_platform,
+    CpuBudget, FailureOutput, GuardCtl, InstanceCore, Limits, OutStreamTable, PendingWork,
+    PrefixSpec, RunError, RunTable, RuntimeErrorData, StreamTable, alloc_run_token,
+    create_instance_core, init_platform,
 };
 
 // ── Output types ─────────────────────────────────────────────────────────────
@@ -235,17 +236,6 @@ pub fn execute_with_io(
         ctl_slot,
         observer,
     )
-}
-
-/// The prefix an instance evaluates at cold start: validated source plus the
-/// globals declared at `prepare()` time, replayed into the fresh context.
-#[derive(Clone, Copy)]
-pub struct PrefixSpec<'a> {
-    pub code: &'a str,
-    pub filename: &'a str,
-    /// The full `prepare()`-time global defs — value globals installed before
-    /// the prefix evaluates, bridge callables as throwing placeholders.
-    pub globals: &'a [HostGlobalDef],
 }
 
 /// Call an export of a prepared prefix on a fresh, throwaway instance.
@@ -2387,18 +2377,6 @@ pub(super) fn capped_grace_error(name: String, message: String) -> (String, Stri
 
 // ── Warm instances ────────────────────────────────────────────────────
 
-/// Fixed budget for warm-up, deliberately not user-configurable —
-/// Cloudflare's script-startup limit (1 s since 2025-10) is the model. The
-/// wall guard spans the per-instance runtime installs plus prefix
-/// evaluation; the CPU meter counts prefix evaluation only. Isolate boot
-/// itself (~0.2 ms, cannot loop) precedes the guards and is excluded — it is
-/// not sandbox-controllable, so there is nothing to police. Warm-up is never
-/// billed to the request that triggered it; blowing this budget reports
-/// `ERR_WARMUP_LIMIT`.
-pub const WARMUP_WALL_MS: u32 = 1_000;
-/// CPU half of the warm-up budget; see [`WARMUP_WALL_MS`].
-pub const WARMUP_CPU_MS: u32 = 1_000;
-
 /// One call forwarded to an instance owner thread (or run by a one-off
 /// worker). Owns everything a run needs: the code/call, the limits, the
 /// per-call bridge defs, and the run's I/O.
@@ -2632,13 +2610,6 @@ pub fn run_call_on_core(
         heap_used_bytes: heap_used(&mut core.isolate),
         prefix_failed: false,
     }
-}
-
-/// Wall-clock elapsed time since `start` in milliseconds, rounded to
-/// microsecond resolution (three decimal places). The wire carries
-/// durations as f64, so sub-millisecond runs stay visible.
-pub(crate) fn elapsed_ms(start: std::time::Instant) -> f64 {
-    (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1_000.0
 }
 
 #[cfg(test)]

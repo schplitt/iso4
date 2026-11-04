@@ -13,12 +13,14 @@ use crate::link::{Addr, HostLink, Inbound, LinkError, Outbound};
 use crate::types;
 use crate::v8::bridge::{BridgeCallLog, install_prefix_bridge_placeholders};
 use crate::v8::guard::GuardTarget;
-use crate::v8::isolate::{LogBuffers, TerminationReason, heap_used, idle_settle_after, settle_heap};
+use crate::v8::isolate::{
+    LogBuffers, TerminationReason, elapsed_ms, heap_used, idle_settle_after, settle_heap,
+};
 use crate::v8::runloop::{
     CallPhaseCtx, LoopEvent, RunEntry, RunFacts, RunPhase, RunState, ScanOutcome, begin_call,
     boundary_close, boundary_deadline, conclude_grace_wall, counted_wall_ms, earliest_timer,
-    elapsed_ms, enter_turn, grace_wall_due, handle_loop_event, instance_tainted, leave_turn,
-    next_deadline, stream_idle_turn,
+    enter_turn, grace_wall_due, handle_loop_event, instance_tainted, leave_turn, next_deadline,
+    stream_idle_turn,
 };
 use crate::v8::runtable::{LOAD_WINDOW_MS, RUN_TABLE_PTR, RunCallState, TIMERS_TOUCHED};
 use crate::v8::streams::{close_out_streams, close_run_streams, out_idle_deadline};
