@@ -14,10 +14,10 @@ differently or not at all.
 
 Inside, the engine owns:
 
-- **Isolates and limits** (`v8/mod.rs`, `v8/guard.rs`): one OS thread per
-  isolate, heap limits, CPU budgets that stop counting while the run waits
-  on the host, wall deadlines on a shared watchdog thread, the turn loop that
-  drives a run.
+- **Isolates and limits** (`v8/mod.rs`, `v8/isolate.rs`, `v8/guard.rs`): one OS
+  thread per isolate, heap limits, CPU budgets that stop counting while the
+  run waits on the host, wall deadlines on a shared watchdog thread, the
+  turn loop that drives a run.
 - **The prefix store and warm instances** (`prefix.rs`, `warm.rs`,
   `engine.rs`): a prepared prefix is kept as source, evaluated per isolate,
   and served by resident warm instances that skip that evaluation on reuse.
@@ -45,9 +45,12 @@ network policy; `fetch` is a host-configured bridge global like any other.
 - `src/lib.rs` lists the modules and embeds the snapshot `build.rs` makes.
 - `src/types.rs` re-exports `iso4-types`, so the modules keep saying
   `crate::types`.
-- `src/v8/` is the engine: `mod.rs` holds isolates and the turn loop;
-  `console.rs`, `timers.rs` and `guard.rs` hold the console capture, the
-  guest timers and the limit guard; `globals.rs` installs host globals and
+- `src/errors.rs` holds `RunError`, the failure output and the error codes.
+- `src/v8/` is the engine: `mod.rs` holds the run entry points and the turn
+  loop; `isolate.rs` creates isolates and warm instance cores;
+  `oom_label.rs` writes the fatal OOM line; `console.rs`, `timers.rs` and
+  `guard.rs` hold the console capture, the guest timers and the limit
+  guard; `globals.rs` installs host globals and
   `waitUntil`; `modules.rs` evaluates prefixes, resolves imports and
   extracts exports; `bridge.rs` carries calls in both directions;
   `streams.rs` moves streamed bodies; `testsupport.rs` (test only) holds

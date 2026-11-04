@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::blob;
+use crate::errors::{codec_error_to_run_error, reason_error, termination_or};
 use crate::types::{HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
 use crate::v8::bridge::{
     host_module_base_id, install_prefix_bridge_placeholders, owned_bridge_error,
@@ -16,9 +17,8 @@ use crate::v8::globals::{
 };
 use crate::v8::{
     ASYNC_HOOKS_MODULE_SRC, ASYNC_HOOKS_SPECIFIER, RunError, RunFacts, RunState, RuntimeErrorData,
-    ScanOutcome, build_output_and_maybe_grace, codec_error_to_run_error, exception_fields,
-    exception_message, exception_name, exception_stack, finished, reason_error,
-    runtime_error_from_value, syntax_error, termination_or,
+    ScanOutcome, build_output_and_maybe_grace, exception_fields, exception_message, exception_name,
+    exception_stack, finished, runtime_error_from_value, syntax_error,
 };
 
 /// Extract and serialize a settled module's exports, then finish (or start

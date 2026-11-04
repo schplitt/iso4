@@ -8,20 +8,21 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::blob;
+use crate::errors::{codec_error_to_run_error, reason_error, termination_or};
 use crate::link::{Addr, HostLink, Outbound};
 use crate::types;
 use crate::types::{
     BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule,
 };
 use crate::v8::globals::{check_not_reserved, define_global, eval_script, throw_v8_error};
+use crate::v8::isolate::{ReasonCell, TerminationReason};
 use crate::v8::streams::ResultStreamMode;
 use crate::v8::{
-    FailureOutput, RESERVED_ERROR_KEYS, ReasonCell, RunError, RunFacts, RunPhase, RunState,
-    RunTable, RuntimeErrorData, ScanOutcome, TerminationReason, attributed_state,
-    build_output_and_maybe_grace, codec_error_to_run_error, copy_own_properties_except, elapsed_ms,
-    error_fields_from_value, error_message_from_value, error_name_from_value, exception_fields,
-    exception_message, exception_name, exception_stack, reason_error, runtime_error_from_value,
-    termination_or,
+    FailureOutput, RESERVED_ERROR_KEYS, RunError, RunFacts, RunPhase, RunState, RunTable,
+    RuntimeErrorData, ScanOutcome, attributed_state, build_output_and_maybe_grace,
+    copy_own_properties_except, elapsed_ms, error_fields_from_value, error_message_from_value,
+    error_name_from_value, exception_fields, exception_message, exception_name, exception_stack,
+    runtime_error_from_value,
 };
 
 // ── Bridge call log ──────────────────────────────────────────────────────────

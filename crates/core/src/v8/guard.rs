@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::v8::{CpuBudget, ReasonCell, TerminationReason};
+use crate::v8::CpuBudget;
+use crate::v8::isolate::{ReasonCell, TerminationReason};
 
 /// What the watchdog enforces while a turn is executing.
 pub(super) struct GuardTarget {

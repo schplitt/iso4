@@ -2,7 +2,8 @@
 //! each, buffered per run under its byte caps and echoed to the observer.
 
 use crate::link::ConsoleStream;
-use crate::v8::{LogBuffers, RunError, attributed_state, capped_text_lossy, slot_table};
+use crate::v8::isolate::LogBuffers;
+use crate::v8::{RunError, attributed_state, capped_text_lossy, slot_table};
 
 /// Wrap five methods on V8's own `console` — replacing the object would delete
 /// 18 others. Unwrapped ones no-op: no `ConsoleDelegate` is registered.
