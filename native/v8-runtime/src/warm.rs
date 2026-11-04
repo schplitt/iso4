@@ -10,11 +10,10 @@
 //! frames (demux-routed) and the registry's Retire all arrive on the
 //! handle's ONE ordered channel — a run's job always precedes its frames
 //! (#170) — and any number of session runs can be
-//! suspended on one instance at once. Session
-//! dispatch never blocks — a job's completion hook writes the run's frames
-//! through the connection's serialized writer and releases the instance;
-//! only the direct API (`InstanceHandle::call`, tests) waits on a respond
-//! channel.
+//! suspended on one instance at once. Session dispatch never blocks — a
+//! job's release hook gives the instance back and its completion goes out
+//! on the run's link; only the direct API (`InstanceHandle::call`, tests)
+//! waits for the outcome.
 //!
 //! Capacity model (v4, #77 — full rationale: DESIGN.md §13.2.1): metered
 //! against GLOBAL container memory (`container.rs`; child RSS where no
@@ -91,12 +90,16 @@ impl AttachedInstance {
 }
 
 impl InstanceHandle {
-    /// Run one call on this instance and wait for the outcome. A dead owner
-    /// thread (panic during the call) reports an internal failure with
-    /// `tainted: true`, so the caller evicts it like any other taint.
-    pub fn call(&self, job: CallJob) -> sandbox::CallOutcome {
+    /// Run one call on this instance and wait for the outcome; the job's
+    /// own release hook is replaced. A dead owner thread (panic during the
+    /// call) reports an internal failure with `tainted: true`, so the
+    /// caller evicts it like any other taint.
+    pub fn call(&self, mut job: CallJob) -> sandbox::CallOutcome {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job((Box::new(job), Some(tx))));
+        job.release = Some(Box::new(move |outcome| {
+            tx.send(outcome).ok();
+        }));
+        let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job(Box::new(job)));
         if self.msgs.send(msg).is_err() {
             return dead_instance_outcome();
         }
@@ -104,7 +107,7 @@ impl InstanceHandle {
     }
 
     /// A clone of the instance's one sender, for the session dispatch path
-    /// where the handle itself moves into the job's completion hook before
+    /// where the handle itself moves into the job's release hook before
     /// the job is sent, and for the demux route of a run dispatched to this
     /// instance.
     pub fn sender(&self) -> sandbox::RunEventSender {
@@ -201,7 +204,7 @@ fn instance_main(
     // surfaces as that call's result. The first message is always a job:
     // the dispatcher enqueues a run's job before any of its events can
     // route, and Retire only means eviction before ever serving.
-    let (mut first_job, first_respond) = loop {
+    let mut first_job = loop {
         match events.recv() {
             Ok(routed) => match routed.event {
                 sandbox::RunEvent::Job(msg) => break msg,
@@ -248,18 +251,12 @@ fn instance_main(
                 heap_used_bytes: 0,
                 prefix_failed,
             };
-            if let Some(complete) = first_job.complete.take() {
-                complete(outcome(&f));
-            } else if let Some(respond) = first_respond {
-                respond.send(outcome(&f)).ok();
-            }
+            let link = first_job.io.link();
+            sandbox::finish_job(&mut first_job, link, outcome(&f));
             while let Ok(routed) = events.recv() {
-                if let sandbox::RunEvent::Job((mut job, respond)) = routed.event {
-                    if let Some(complete) = job.complete.take() {
-                        complete(outcome(&f));
-                    } else if let Some(respond) = respond {
-                        respond.send(outcome(&f)).ok();
-                    }
+                if let sandbox::RunEvent::Job(mut job) = routed.event {
+                    let link = job.io.link();
+                    sandbox::finish_job(&mut job, link, outcome(&f));
                 }
             }
             return;
@@ -272,7 +269,7 @@ fn instance_main(
         &mut core,
         &prefix.globals,
         &prefix.declared_imports,
-        (first_job, first_respond),
+        first_job,
         &events,
         &load,
     );
@@ -1133,6 +1130,7 @@ fn evict_scored(inner: &mut RegistryInner, now: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::{Addr, HostLink, Inbound, NoopObserver, Outbound};
     use crate::testval::{self, TestValue};
     use std::sync::atomic::AtomicU32;
 
@@ -1151,26 +1149,20 @@ mod tests {
         crate::webcodec::brand_key_for_token(&[0xab; crate::webcodec::DESCRIPTOR_TOKEN_LEN])
     }
 
-    /// A soft Terminate payload: `u32 runId, u8 mode = 0`.
-    fn terminate_payload(run_id: u32) -> Vec<u8> {
-        let mut p = run_id.to_be_bytes().to_vec();
-        p.push(0);
-        p
-    }
-
     fn bump_job() -> CallJob {
         CallJob {
             token: 0,
             limits: sandbox::Limits::default(),
             globals: Vec::new(),
             io: sandbox::RunIo::None,
+            observer: Arc::new(NoopObserver),
             call_id_counter: Arc::new(AtomicU32::new(0)),
             call: crate::types::CallSpec {
                 export_path: "bump".to_string(),
                 args_blob: testval::to_blob(&TestValue::Array(Vec::new())),
             },
             epilogue: None,
-            complete: None,
+            release: None,
             ctl_slot: None,
         }
     }
@@ -1227,13 +1219,13 @@ mod tests {
         }
     }
 
-    fn call_via(a: &AttachedInstance, job: CallJob) -> sandbox::CallOutcome {
+    fn call_via(a: &AttachedInstance, mut job: CallJob) -> sandbox::CallOutcome {
         let (tx, rx) = crossbeam_channel::bounded(1);
+        job.release = Some(Box::new(move |outcome| {
+            tx.send(outcome).ok();
+        }));
         a.sender()
-            .send(sandbox::RoutedEvent::new(
-                0,
-                sandbox::RunEvent::Job((Box::new(job), Some(tx))),
-            ))
+            .send(sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job(Box::new(job))))
             .expect("instance accepts the job");
         rx.recv().expect("instance answers")
     }
@@ -1865,11 +1857,10 @@ mod tests {
 
     // ── The per-instance turn loop: interleaved session runs ──────────────
     //
-    // These drive `serve_instance` the way the session demux does: jobs with
-    // channel I/O, bridge frames answered by the test, outcomes read off the
-    // respond channels. One instance, several runs in flight.
+    // These drive `serve_instance` the way the session demux does: jobs
+    // with an in-memory link, bridge calls answered by the test, outcomes
+    // read off each job's release hook. One instance, several runs in flight.
 
-    use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -1937,9 +1928,13 @@ mod tests {
         })
     }
 
-    /// Read one frame off the writer socket.
-    fn read_frame(server: &mut UnixStream) -> crate::ipc::RustToTsFrame {
-        crate::ipc::read_rust_to_ts_frame(server).expect("a frame")
+    /// The host's end of the instance's link.
+    type Host = crossbeam_channel::Receiver<(Addr, Outbound)>;
+
+    /// The next message the instance sent.
+    fn read_frame(host: &Host) -> (Addr, Outbound) {
+        host.recv_timeout(Duration::from_secs(10))
+            .expect("the instance sends a message")
     }
 
     struct SessionRun {
@@ -1959,18 +1954,18 @@ mod tests {
     }
 
     /// Submit one channel-mode job calling `export_path(args)` with a live
-    /// `tool` bridge stub writing to `sink_fd`'s socket.
+    /// `tool` bridge stub sending on `link`.
     #[allow(clippy::too_many_arguments)]
     fn submit_session_job(
         handle: &InstanceHandle,
         run_id: u32,
         export_path: &str,
         args: Vec<TestValue>,
-        sink: crate::ipc::FrameSink,
+        link: Arc<dyn HostLink>,
         counter: &Arc<AtomicU32>,
         limits: sandbox::Limits,
     ) -> SessionRun {
-        submit_session_job_with_ctl(handle, run_id, export_path, args, sink, counter, limits, None)
+        submit_session_job_with_ctl(handle, run_id, export_path, args, link, counter, limits, None)
     }
 
     /// [`submit_session_job`] plus the demux's guard-ctl slot, for tests
@@ -1981,7 +1976,7 @@ mod tests {
         run_id: u32,
         export_path: &str,
         args: Vec<TestValue>,
-        sink: crate::ipc::FrameSink,
+        link: Arc<dyn HostLink>,
         counter: &Arc<AtomicU32>,
         limits: sandbox::Limits,
         ctl_slot: Option<Arc<std::sync::OnceLock<sandbox::GuardCtl>>>,
@@ -1992,7 +1987,8 @@ mod tests {
             token,
             limits,
             globals: vec![crate::types::HostGlobalDef::bridge("tool")],
-            io: sandbox::RunIo::Instance { sink },
+            io: sandbox::RunIo::Instance { link },
+            observer: Arc::new(NoopObserver),
             call_id_counter: Arc::clone(counter),
             call: crate::types::CallSpec {
                 export_path: export_path.to_string(),
@@ -2002,15 +1998,14 @@ mod tests {
                 run_id,
                 report_heap: false,
             }),
-            complete: None,
+            release: Some(Box::new(move |outcome| {
+                otx.send(outcome).ok();
+            })),
             ctl_slot,
         });
         handle
             .sender()
-            .send(sandbox::RoutedEvent::new(
-                token,
-                sandbox::RunEvent::Job((job, Some(otx))),
-            ))
+            .send(sandbox::RoutedEvent::new(token, sandbox::RunEvent::Job(job)))
             .expect("instance accepts the job");
         SessionRun {
             token,
@@ -2019,53 +2014,43 @@ mod tests {
         }
     }
 
-    /// Read one BridgeCall frame off the writer socket: (runId, callId).
-    fn read_bridge_call(server: &mut UnixStream) -> (u32, u32) {
-        let frame = crate::ipc::read_rust_to_ts_frame(server).expect("a BridgeCall frame");
-        assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::BridgeCall);
-        let run_id = u32::from_be_bytes(frame.payload[0..4].try_into().unwrap());
-        let call_id = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
-        (run_id, call_id)
+    /// The next message, which must be a BridgeCall: (runId, callId).
+    fn read_bridge_call(host: &Host) -> (u32, u32) {
+        match read_frame(host) {
+            (Addr::Run(run_id), Outbound::BridgeCall { call_id, .. }) => (run_id, call_id),
+            (addr, other) => panic!("expected a BridgeCall, got {other:?} for {addr:?}"),
+        }
     }
 
-    /// A successful BridgeResponse frame event (runId, callId, number value).
-    fn bridge_response_event(run_id: u32, call_id: u32, value: f64) -> sandbox::RunEvent {
-        let mut p = Vec::new();
-        p.extend_from_slice(&run_id.to_be_bytes());
-        p.extend_from_slice(&call_id.to_be_bytes());
-        p.push(1); // ok
-        p.push(1); // value present
-        let blob = testval::to_blob(&TestValue::Number(value));
-        p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-        p.extend_from_slice(&blob);
-        sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-            message_type: crate::ipc::TsToRustMessageType::BridgeResponse,
-            payload: p,
+    /// A successful BridgeResponse event (callId, number value).
+    fn bridge_response_event(call_id: u32, value: f64) -> sandbox::RunEvent {
+        sandbox::RunEvent::Host(Inbound::BridgeResponse {
+            call_id,
+            result: Ok(Some(testval::to_blob(&TestValue::Number(value)))),
         })
     }
 
     #[test]
     fn one_instance_interleaves_two_runs_with_correct_attribution() {
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // Two runs, both suspended awaiting their bridge response.
         let run1 = submit_session_job(
             &handle, 101, "viaTool", vec![TestValue::Number(1.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
         let run2 = submit_session_job(
             &handle, 102, "viaTool", vec![TestValue::Number(2.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
 
         // Both BridgeCall frames arrive on the one serialized writer, each
         // leading with its run id.
-        let first = read_bridge_call(&mut server);
-        let second = read_bridge_call(&mut server);
+        let first = read_bridge_call(&server);
+        let second = read_bridge_call(&server);
         let mut calls = std::collections::HashMap::from([first, second]);
         assert_eq!(calls.len(), 2, "two distinct runs sent bridge calls");
         let c1 = calls.remove(&101).expect("run 101 sent a call");
@@ -2073,9 +2058,9 @@ mod tests {
 
         // Answer run 2 FIRST: routing must deliver each response to its own
         // run even though run 1 suspended earlier.
-        run2.send(bridge_response_event(102, c2, 20.0));
+        run2.send(bridge_response_event(c2, 20.0));
         let out2 = run2.outcome.recv().expect("run 2 completes");
-        run1.send(bridge_response_event(101, c1, 10.0));
+        run1.send(bridge_response_event(c1, 10.0));
         let out1 = run1.outcome.recv().expect("run 1 completes");
 
         let v1 = out1.result.expect("run 1 ok");
@@ -2098,22 +2083,21 @@ mod tests {
     #[test]
     fn a_mid_turn_kill_resets_innocent_co_resident_runs() {
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // The innocent victim: suspended awaiting a bridge response.
         let victim = submit_session_job(
             &handle, 8, "viaTool", vec![TestValue::Number(1.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let _ = read_bridge_call(&mut server); // proof it is suspended
+        let _ = read_bridge_call(&server); // proof it is suspended
 
         // The culprit: a synchronous spin killed mid-turn by the CPU guard.
         let culprit = submit_session_job(
             &handle, 7, "spin", vec![],
-            sink.clone(), &counter,
+            Arc::clone(&link), &counter,
             sandbox::Limits {
                 cpu_time_ms: 100,
                 wall_time_ms: 10_000,
@@ -2145,20 +2129,19 @@ mod tests {
     #[test]
     fn a_dynamic_import_resets_innocent_co_resident_runs() {
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let victim = submit_session_job(
             &handle, 8, "viaTool", vec![TestValue::Number(1.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let _ = read_bridge_call(&mut server);
+        let _ = read_bridge_call(&server);
 
         let culprit = submit_session_job(
             &handle, 7, "dynImport", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
         let culprit_out = culprit.outcome.recv().expect("culprit concludes");
         assert!(culprit_out.tainted);
@@ -2190,34 +2173,42 @@ mod tests {
         // implicit initial credit window — no host frame needed — then a
         // clean StreamEnd, and the run concludes.
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
             &handle, 40, "streamSmall", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
 
-        let result = read_frame(&mut server);
-        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
-        assert_eq!(u32::from_be_bytes(result.payload[0..4].try_into().unwrap()), 40);
-        assert_eq!(result.payload[8], 1, "the run succeeds");
+        assert!(
+            matches!(
+                read_frame(&server),
+                (
+                    Addr::Run(40),
+                    Outbound::Result {
+                        completion: crate::types::RunCompletion::Success(_)
+                    }
+                )
+            ),
+            "the run succeeds"
+        );
 
-        let c1 = read_frame(&mut server);
-        assert_eq!(c1.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
-        let c1 = crate::ipc::parse_stream_chunk_payload(&c1.payload).unwrap();
-        assert_eq!((c1.run_id, c1.stream_id, c1.data), (40, 1, &[1u8, 2, 3][..]));
-
-        let c2 = read_frame(&mut server);
-        let c2 = crate::ipc::parse_stream_chunk_payload(&c2.payload).unwrap();
-        assert_eq!(c2.data, b"abc");
-
-        let end = read_frame(&mut server);
-        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
-        let end = crate::ipc::parse_stream_end_payload(&end.payload).unwrap();
-        assert!(end.ok, "clean EOF");
+        match read_frame(&server) {
+            (Addr::Run(40), Outbound::StreamChunk { stream_id: 1, data }) => {
+                assert_eq!(data, [1u8, 2, 3]);
+            }
+            other => panic!("expected the first chunk, got {other:?}"),
+        }
+        match read_frame(&server) {
+            (_, Outbound::StreamChunk { data, .. }) => assert_eq!(data, b"abc"),
+            other => panic!("expected the second chunk, got {other:?}"),
+        }
+        match read_frame(&server) {
+            (_, Outbound::StreamEnd { error: None, .. }) => {}
+            other => panic!("expected a clean EOF, got {other:?}"),
+        }
 
         let out = run.outcome.recv().expect("run concludes after the stream drains");
         assert!(!out.tainted);
@@ -2230,53 +2221,49 @@ mod tests {
     #[test]
     fn an_outbound_stream_waits_for_credit_past_the_initial_window() {
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         const TOTAL: usize = 300_000;
         let run = submit_session_job(
             &handle, 41, "streamBig", vec![TestValue::Number(TOTAL as f64)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
 
-        let result = read_frame(&mut server);
-        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+        assert!(matches!(read_frame(&server), (_, Outbound::Result { .. })));
 
         // Exactly the initial window arrives eagerly, in max-size chunks.
         let mut received = 0usize;
         while received < crate::types::STREAM_CREDIT_WINDOW_BYTES as usize {
-            let frame = read_frame(&mut server);
-            assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
-            let chunk = crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap();
-            assert!(chunk.data.len() <= crate::types::STREAM_CHUNK_MAX_BYTES as usize);
-            received += chunk.data.len();
+            let (_, Outbound::StreamChunk { data, .. }) = read_frame(&server) else {
+                panic!("expected a chunk");
+            };
+            assert!(data.len() <= crate::types::STREAM_CHUNK_MAX_BYTES as usize);
+            received += data.len();
         }
         assert_eq!(received, crate::types::STREAM_CREDIT_WINDOW_BYTES as usize);
 
         // Nothing more until credit is granted.
-        server
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
         assert!(
-            crate::ipc::read_rust_to_ts_frame(&mut server).is_err(),
+            server.recv_timeout(Duration::from_millis(200)).is_err(),
             "production must stall at the window"
         );
-        server.set_read_timeout(None).unwrap();
 
-        run.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-            message_type: crate::ipc::TsToRustMessageType::StreamPull,
-            payload: crate::ipc::encode_stream_pull_payload(41, 1, 100_000),
+        run.send(sandbox::RunEvent::Host(Inbound::StreamPull {
+            stream_id: 1,
+            credit: 100_000,
         }));
 
-        let frame = read_frame(&mut server);
-        let chunk = crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap();
-        assert_eq!(chunk.data.len(), TOTAL - crate::types::STREAM_CREDIT_WINDOW_BYTES as usize);
+        let (_, Outbound::StreamChunk { data, .. }) = read_frame(&server) else {
+            panic!("expected the remainder");
+        };
+        assert_eq!(data.len(), TOTAL - crate::types::STREAM_CREDIT_WINDOW_BYTES as usize);
 
-        let end = read_frame(&mut server);
-        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
-        assert!(crate::ipc::parse_stream_end_payload(&end.payload).unwrap().ok);
+        assert!(matches!(
+            read_frame(&server),
+            (_, Outbound::StreamEnd { error: None, .. })
+        ));
 
         let out = run.outcome.recv().expect("run concludes");
         assert!(out.result.is_ok());
@@ -2285,24 +2272,31 @@ mod tests {
     #[test]
     fn an_invalid_chunk_fails_the_stream_not_the_run() {
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
             &handle, 44, "streamBad", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let result = read_frame(&mut server);
-        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
-        assert_eq!(result.payload[8], 1, "the run itself succeeded");
+        assert!(
+            matches!(
+                read_frame(&server),
+                (
+                    _,
+                    Outbound::Result {
+                        completion: crate::types::RunCompletion::Success(_)
+                    }
+                )
+            ),
+            "the run itself succeeded"
+        );
 
-        let end = read_frame(&mut server);
-        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
-        let end = crate::ipc::parse_stream_end_payload(&end.payload).unwrap();
-        assert!(!end.ok);
-        assert!(end.error.unwrap().contains("Uint8Array or string"));
+        let (_, Outbound::StreamEnd { error: Some(error), .. }) = read_frame(&server) else {
+            panic!("expected a failed StreamEnd");
+        };
+        assert!(error.contains("Uint8Array or string"));
 
         let out = run.outcome.recv().expect("run concludes");
         assert!(!out.tainted);
@@ -2312,31 +2306,30 @@ mod tests {
     #[test]
     fn a_host_cancel_runs_the_generators_finally_and_frees_the_run() {
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
             &handle, 42, "streamHang", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let result = read_frame(&mut server);
-        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+        assert!(matches!(read_frame(&server), (_, Outbound::Result { .. })));
         // Drain the eager window; the generator is now parked AT ITS YIELD
         // (44 KB backlog, no credit) — the state where `.return()` can run
         // its `finally` (a generator blocked mid-await queues the return
         // instead, exactly like Node).
         let mut received = 0usize;
         while received < crate::types::STREAM_CREDIT_WINDOW_BYTES as usize {
-            let frame = read_frame(&mut server);
-            assert_eq!(frame.message_type, crate::ipc::RustToTsMessageType::StreamChunk);
-            received += crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap().data.len();
+            let (_, Outbound::StreamChunk { data, .. }) = read_frame(&server) else {
+                panic!("expected a chunk");
+            };
+            received += data.len();
         }
 
-        run.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-            message_type: crate::ipc::TsToRustMessageType::StreamCancel,
-            payload: crate::ipc::encode_stream_cancel_payload(42, 1, "consumer cancelled"),
+        run.send(sandbox::RunEvent::Host(Inbound::StreamCancel {
+            stream_id: 1,
+            reason: "consumer cancelled".to_string(),
         }));
 
         let out = run.outcome.recv().expect("run concludes after cancel");
@@ -2355,30 +2348,29 @@ mod tests {
         sandbox::init_platform();
         sandbox::OUT_IDLE_OVERRIDE_MS.store(300, Ordering::Relaxed);
         let _reset = scopeguard(|| sandbox::OUT_IDLE_OVERRIDE_MS.store(0, Ordering::Relaxed));
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
             &handle, 43, "streamHang", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let result = read_frame(&mut server);
-        assert_eq!(result.message_type, crate::ipc::RustToTsMessageType::Result);
+        assert!(matches!(read_frame(&server), (_, Outbound::Result { .. })));
         let mut received = 0usize;
         while received < crate::types::STREAM_CREDIT_WINDOW_BYTES as usize {
-            let frame = read_frame(&mut server);
-            received += crate::ipc::parse_stream_chunk_payload(&frame.payload).unwrap().data.len();
+            let (_, Outbound::StreamChunk { data, .. }) = read_frame(&server) else {
+                panic!("expected a chunk");
+            };
+            received += data.len();
         }
 
         // Neither read nor cancelled: the idle deadline ends the stream with
         // an error naming the timeout, guest cleanup runs, run concludes.
-        let end = read_frame(&mut server);
-        assert_eq!(end.message_type, crate::ipc::RustToTsMessageType::StreamEnd);
-        let end = crate::ipc::parse_stream_end_payload(&end.payload).unwrap();
-        assert!(!end.ok);
-        assert!(end.error.unwrap().contains("stream idle timeout"));
+        let (_, Outbound::StreamEnd { error: Some(error), .. }) = read_frame(&server) else {
+            panic!("expected a failed StreamEnd");
+        };
+        assert!(error.contains("stream idle timeout"));
 
         let out = run
             .outcome
@@ -2412,27 +2404,26 @@ mod tests {
         // deterministic: culprit ERR_ABORTED + taint, innocents reset with
         // cause `abort` and the culprit's wire id.
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // The innocent victim: suspended awaiting a bridge response.
         let victim = submit_session_job(
             &handle, 12, "viaTool", vec![TestValue::Number(1.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let _ = read_bridge_call(&mut server);
+        let _ = read_bridge_call(&server);
 
         // The culprit: its continuation after the bridge response spins.
         let ctl_slot = Arc::new(std::sync::OnceLock::new());
         let culprit = submit_session_job_with_ctl(
             &handle, 11, "spinAfterTool", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
             Some(Arc::clone(&ctl_slot)),
         );
-        let (run_id, call_id) = read_bridge_call(&mut server);
-        culprit.send(bridge_response_event(run_id, call_id, 1.0));
+        let (_, call_id) = read_bridge_call(&server);
+        culprit.send(bridge_response_event(call_id, 1.0));
 
         // Kill the culprit once its turn is really executing (the spin).
         let ctl = ctl_slot.get().expect("dispatch filled the ctl slot").clone();
@@ -2469,20 +2460,18 @@ mod tests {
     #[test]
     fn an_abort_abandons_the_run_and_the_instance_survives() {
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // Suspend a run mid-bridge after it bumped the counter, then abort.
         let run = submit_session_job(
             &handle, 5, "hangBump", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let _ = read_bridge_call(&mut server);
-        run.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-            message_type: crate::ipc::TsToRustMessageType::Terminate,
-            payload: terminate_payload(5),
+        let _ = read_bridge_call(&server);
+        run.send(sandbox::RunEvent::Host(Inbound::Terminate {
+            mode: crate::types::TerminateMode::Soft,
         }));
         let aborted = run.outcome.recv().expect("aborted run concludes");
         assert!(
@@ -2508,20 +2497,19 @@ mod tests {
         // instance stays trustworthy and keeps its state (E1 ruling 3
         // deliberately narrows the old taint-on-WallTimeout).
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
             &handle, 9, "hangBump", vec![],
-            sink.clone(), &counter,
+            Arc::clone(&link), &counter,
             sandbox::Limits {
                 wall_time_ms: 200,
                 ..Default::default()
             },
         );
-        let _ = read_bridge_call(&mut server);
+        let _ = read_bridge_call(&server);
         let out = run.outcome.recv().expect("run concludes at its wall");
         assert!(!out.tainted, "boundary wall expiry must not taint");
         assert!(matches!(
@@ -2535,17 +2523,12 @@ mod tests {
         assert_eq!(bump_value(&outcome), 2.0);
     }
 
-    /// A benign frame for run 22: a StreamChunk for a stream it never opened
+    /// A benign event for run 22: a StreamChunk for a stream it never opened
     /// is ignored, but delivering it still costs a turn.
     fn ignored_chunk_for_22() -> sandbox::RunEvent {
-        let mut chunk = Vec::new();
-        chunk.extend_from_slice(&22u32.to_be_bytes()); // run id
-        chunk.extend_from_slice(&999u32.to_be_bytes()); // unknown stream id
-        chunk.extend_from_slice(&1u32.to_be_bytes()); // 1 data byte
-        chunk.push(0);
-        sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-            message_type: crate::ipc::TsToRustMessageType::StreamChunk,
-            payload: chunk,
+        sandbox::RunEvent::Host(Inbound::StreamChunk {
+            stream_id: 999,
+            data: vec![0],
         })
     }
 
@@ -2564,27 +2547,26 @@ mod tests {
         // non-empty — the old code could only conclude it on a drained-empty
         // queue.
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let b = submit_session_job(
             &handle, 22, "viaTool", vec![TestValue::Number(2.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let (b_run, b_call) = read_bridge_call(&mut server);
+        let (b_run, b_call) = read_bridge_call(&server);
         assert_eq!(b_run, 22);
 
         let a = submit_session_job(
             &handle, 21, "hangBump", vec![],
-            sink.clone(), &counter,
+            Arc::clone(&link), &counter,
             sandbox::Limits {
                 wall_time_ms: 50,
                 ..Default::default()
             },
         );
-        let (a_run, _a_call) = read_bridge_call(&mut server);
+        let (a_run, _a_call) = read_bridge_call(&server);
         assert_eq!(a_run, 21);
 
         // Pump until A concluded (or a cap: enqueueing is ~10× faster than a
@@ -2629,7 +2611,7 @@ mod tests {
 
         // The instance stayed healthy throughout: settle B normally (its
         // response queues behind the leftover traffic and drains through).
-        b.send(bridge_response_event(22, b_call, 20.0));
+        b.send(bridge_response_event(b_call, 20.0));
         let out_b = b.outcome.recv().expect("run B completes");
         assert!(!out_b.tainted);
     }
@@ -2647,21 +2629,20 @@ mod tests {
         // while C spins — stamped well before A's wall. The loop resumes
         // after A's wall has passed; A must still settle with its value.
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let started = Instant::now();
         let a = submit_session_job(
             &handle, 21, "hangBump", vec![],
-            sink.clone(), &counter,
+            Arc::clone(&link), &counter,
             sandbox::Limits {
                 wall_time_ms: 150,
                 ..Default::default()
             },
         );
-        let (a_run, a_call) = read_bridge_call(&mut server);
+        let (a_run, a_call) = read_bridge_call(&server);
         assert_eq!(a_run, 21);
 
         // One long-running start turn. The busy count is calibrated far
@@ -2669,12 +2650,12 @@ mod tests {
         // loudly (rather than passing vacuously) if it ever gets too fast.
         let c = submit_session_job(
             &handle, 23, "busy", vec![TestValue::Number(1_500_000_000.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
         // Give the loop a moment to dispatch C — its job is the only ready
         // operation until the response below is enqueued.
         std::thread::sleep(Duration::from_millis(10));
-        a.send(bridge_response_event(21, a_call, 10.0));
+        a.send(bridge_response_event(a_call, 10.0));
 
         let out_c = c.outcome.recv_timeout(Duration::from_secs(30)).expect("C completes");
         assert!(!out_c.tainted);
@@ -2718,31 +2699,30 @@ mod tests {
         // bridge round-trip afterwards, instead of hitting a real-time
         // deadline that expired while the engine was busy elsewhere.
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let started = Instant::now();
         let a = submit_session_job(
             &handle, 51, "twoTools", vec![],
-            sink.clone(), &counter,
+            Arc::clone(&link), &counter,
             sandbox::Limits {
                 wall_time_ms: 150,
                 ..Default::default()
             },
         );
-        let (a_run, c1) = read_bridge_call(&mut server);
+        let (a_run, c1) = read_bridge_call(&server);
         assert_eq!(a_run, 51);
 
         // Occupy the loop far past A's 150 ms (loud guard below).
         let c = submit_session_job(
             &handle, 53, "busy", vec![TestValue::Number(1_500_000_000.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
         std::thread::sleep(Duration::from_millis(10));
         // Arrives at ~10 ms of A's counted time; delivered only after C.
-        a.send(bridge_response_event(51, c1, 1.0));
+        a.send(bridge_response_event(c1, 1.0));
 
         let out_c = c.outcome.recv_timeout(Duration::from_secs(30)).expect("C completes");
         assert!(!out_c.tainted);
@@ -2752,11 +2732,17 @@ mod tests {
             "busy() finished before A's wall — raise its iteration count"
         );
 
+        // C's completion went out on the link before A's turn.
+        assert!(matches!(
+            read_frame(&server),
+            (Addr::Run(53), Outbound::Result { .. })
+        ));
+
         // A resumed with ~140 ms of budget left: the second round-trip
         // happens entirely after the real-time instant `start + 150 ms`.
-        let (a_run2, c2) = read_bridge_call(&mut server);
+        let (a_run2, c2) = read_bridge_call(&server);
         assert_eq!(a_run2, 51);
-        a.send(bridge_response_event(51, c2, 2.0));
+        a.send(bridge_response_event(c2, 2.0));
 
         let out_a = a.outcome.recv_timeout(Duration::from_secs(5)).expect("A concludes");
         let v = out_a.result.expect(
@@ -2774,32 +2760,31 @@ mod tests {
         // A timer that came due while the loop was busy fires before jobs
         // stamped after it — overdue work beats admitting new runs.
         sandbox::init_platform();
-        let (_server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, _server) = crate::link::channel_link();
         let handle = spawn_instance(timer_order_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let started = Instant::now();
         let a = submit_session_job(
             &handle, 41, "sleepMark", vec![TestValue::Number(20.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
         // Calibrated far above the timer on any machine; the elapsed assert
         // below fails loudly if it ever gets too fast.
         let b = submit_session_job(
             &handle, 42, "busy", vec![TestValue::Number(1_500_000_000.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
         // Enqueue the burst only once A's timer is safely due, so both job
         // stamps land after it.
         std::thread::sleep(Duration::from_millis(60));
         let j1 = submit_session_job(
             &handle, 43, "mark", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
         let j2 = submit_session_job(
             &handle, 44, "mark", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
 
         let out_b = b.outcome.recv_timeout(Duration::from_secs(30)).expect("B completes");
@@ -2836,27 +2821,25 @@ mod tests {
         // both while the loop is inside another run's turn so they are
         // dequeued back to back.
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // Park the loop on a first run so the instance is live.
         let first = submit_session_job(
             &handle, 31, "viaTool", vec![TestValue::Number(1.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let (_, c1) = read_bridge_call(&mut server);
+        let (_, c1) = read_bridge_call(&server);
 
         // hangBump bumps the counter, then suspends on tool() — so the run
         // observably STARTS before the queued Terminate reaches it.
         let b = submit_session_job(
             &handle, 32, "hangBump", vec![],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        b.send(sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-            message_type: crate::ipc::TsToRustMessageType::Terminate,
-            payload: terminate_payload(32),
+        b.send(sandbox::RunEvent::Host(Inbound::Terminate {
+            mode: crate::types::TerminateMode::Soft,
         }));
 
         let out = b.outcome.recv_timeout(Duration::from_secs(5)).expect("job answered");
@@ -2868,7 +2851,7 @@ mod tests {
 
         // The instance stayed healthy and the co-resident is untouched; the
         // aborted run's start turn really ran (its bump is visible).
-        first.send(bridge_response_event(31, c1, 10.0));
+        first.send(bridge_response_event(c1, 10.0));
         let out_first = first.outcome.recv().expect("first run completes");
         assert!(!out_first.tainted);
         let outcome = handle.call(bump_job());
@@ -2894,9 +2877,8 @@ mod tests {
             .sender()
             .send(sandbox::RoutedEvent::new(
                 sandbox::alloc_run_token(),
-                sandbox::RunEvent::Frame(crate::ipc::TypedFrame {
-                    message_type: crate::ipc::TsToRustMessageType::Terminate,
-                    payload: terminate_payload(99),
+                sandbox::RunEvent::Host(Inbound::Terminate {
+                    mode: crate::types::TerminateMode::Soft,
                 }),
             ))
             .unwrap();
@@ -2925,8 +2907,7 @@ mod tests {
         // (unknown token) about half the time. Several rounds because the
         // old failure depended on select order.
         sandbox::init_platform();
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let sink = crate::ipc::FrameSink::Shared(crate::ipc::Outbox::spawn(&client).unwrap());
+        let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
@@ -2934,17 +2915,17 @@ mod tests {
         // exactly one id per run, so round i's call id is base + 1 + i.
         let probe = submit_session_job(
             &handle, 99, "viaTool", vec![TestValue::Number(0.0)],
-            sink.clone(), &counter, sandbox::Limits::default(),
+            Arc::clone(&link), &counter, sandbox::Limits::default(),
         );
-        let (_, base) = read_bridge_call(&mut server);
-        probe.send(bridge_response_event(99, base, 1.0));
+        let (_, base) = read_bridge_call(&server);
+        probe.send(bridge_response_event(base, 1.0));
         probe.outcome.recv_timeout(Duration::from_secs(5)).expect("probe settles");
 
         for round in 0..8u32 {
             // Occupy the loop with a CPU-bound start turn (~100 ms class).
             let a = submit_session_job(
                 &handle, 200 + round, "busy", vec![TestValue::Number(800_000_000.0)],
-                sink.clone(), &counter, sandbox::Limits::default(),
+                Arc::clone(&link), &counter, sandbox::Limits::default(),
             );
             std::thread::sleep(Duration::from_millis(10));
 
@@ -2952,9 +2933,9 @@ mod tests {
             // to the bridge call its start turn will make.
             let b = submit_session_job(
                 &handle, 100 + round, "viaTool", vec![TestValue::Number(f64::from(round))],
-                sink.clone(), &counter, sandbox::Limits::default(),
+                Arc::clone(&link), &counter, sandbox::Limits::default(),
             );
-            b.send(bridge_response_event(100 + round, base + 1 + round, 7.0));
+            b.send(bridge_response_event(base + 1 + round, 7.0));
 
             let out_b = b
                 .outcome
@@ -3026,7 +3007,11 @@ mod tests {
         // leaked sender gets the dead-instance outcome instead of hanging.
         std::thread::sleep(Duration::from_millis(50));
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job((Box::new(bump_job()), Some(tx))));
+        let mut job = bump_job();
+        job.release = Some(Box::new(move |outcome| {
+            tx.send(outcome).ok();
+        }));
+        let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job(Box::new(job)));
         let late = match sender.send(msg) {
             Err(_) => dead_instance_outcome(),
             Ok(()) => rx.recv().unwrap_or_else(|_| dead_instance_outcome()),

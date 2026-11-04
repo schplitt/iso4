@@ -8,9 +8,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::ffi::c_void;
 use std::io;
-use std::mem::ManuallyDrop;
-use std::os::unix::io::{FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
 use std::sync::OnceLock;
@@ -19,10 +16,11 @@ use std::time::Duration;
 
 use crate::blob;
 use crate::errors;
-use crate::ipc;
+use crate::link::{Addr, ConsoleStream, HostLink, Inbound, LinkError, Observer, Outbound};
 use crate::types;
-use crate::types::{HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
-use crate::wire::{self, BridgeErrorPayload};
+use crate::types::{
+    BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule,
+};
 
 static INIT: Once = Once::new();
 
@@ -60,8 +58,8 @@ pub fn init_platform() {
 pub struct Limits {
     pub wall_time_ms: u32,
     pub cpu_time_ms: u32,
-    /// The retirement line, and the run's inbound frame allowance (see
-    /// `frame_limit`). Nothing terminates at it. Zero means none.
+    /// The retirement line, and the run's inbound frame allowance (enforced
+    /// by the frontend). Nothing terminates at it. Zero means none.
     pub soft_memory_mb: u32,
     /// The terminating line: `CreateParams::heap_limits` +
     /// `add_near_heap_limit_callback` + the ArrayBuffer budget. Zero = none.
@@ -786,9 +784,9 @@ pub struct GraceReport {
     /// `name`/`message` of the first rejection when `status == Failed`, or of
     /// the fatal error that ended a truncated phase, when one exists.
     pub error: Option<(String, String)>,
-    /// Whether the early Result frame was written by the run flow. Always
-    /// true on the session paths; false only in direct-API use without a
-    /// socket or epilogue spec (tests), where grace ran before returning.
+    /// Whether the early Result was sent by the run flow. Always true on
+    /// the session paths; false only in direct-API use without a link or
+    /// epilogue spec (tests), where grace ran before returning.
     pub early_result_sent: bool,
 }
 
@@ -877,9 +875,9 @@ pub struct StreamTable {
 
 struct StreamTableState {
     streams: HashMap<u32, StreamState>,
-    /// Wire identity for outbound `StreamPull`/`StreamCancel` frames.
+    /// The run's address on outbound `StreamPull`/`StreamCancel` messages.
     run_id: u32,
-    sink: Option<ipc::FrameSink>,
+    link: Option<Arc<dyn HostLink>>,
 }
 
 impl StreamTable {
@@ -941,9 +939,9 @@ pub struct OutStreamTable {
 struct OutTableState {
     streams: HashMap<u32, OutStream>,
     next_id: u32,
-    /// Wire identity for outbound `StreamChunk`/`StreamEnd` frames.
+    /// The run's address on outbound `StreamChunk`/`StreamEnd` messages.
     run_id: u32,
-    sink: Option<ipc::FrameSink>,
+    link: Option<Arc<dyn HostLink>>,
     /// Last host read/cancel — the idle-deadline anchor.
     last_activity: std::time::Instant,
 }
@@ -1267,13 +1265,21 @@ struct RunCallState {
     /// [`StubSlot`] its External points at.
     /// Rc'd so the bridge callback can take a per-invocation handle with one
     /// refcount bump instead of cloning the whole binding (two Strings and a
-    /// fistful of Arcs — and since the outbox rework a sink clone also costs
-    /// a producer-count lock).
+    /// fistful of Arcs).
     stubs: RefCell<HashMap<String, std::rc::Rc<GlobalCallbackData>>>,
+    /// The side channel console lines are copied to as they happen.
+    observer: Arc<dyn Observer>,
+    /// This run's address on observer messages.
+    addr: Addr,
 }
 
 impl RunCallState {
-    fn new(max_stdout_bytes: u32, max_stderr_bytes: u32) -> Box<Self> {
+    fn new(
+        max_stdout_bytes: u32,
+        max_stderr_bytes: u32,
+        observer: Arc<dyn Observer>,
+        addr: Addr,
+    ) -> Box<Self> {
         Box::new(Self {
             logs: Box::new(RefCell::new(LogBuffers {
                 max_stdout_bytes,
@@ -1285,6 +1291,8 @@ impl RunCallState {
             out_streams: OutStreamTable::boxed(),
             timers: TimerTable::boxed(),
             stubs: RefCell::new(HashMap::new()),
+            observer,
+            addr,
         })
     }
 }
@@ -1394,22 +1402,29 @@ pub fn register_hydrated_stream(stream_id: u32) -> bool {
     })
 }
 
-/// Write a `StreamPull` credit grant for consumed bytes. Best-effort: a dead
-/// socket surfaces through the run's own I/O soon enough.
+/// Send a `StreamPull` credit grant for consumed bytes. Best-effort: a dead
+/// link surfaces through the run's own events soon enough.
 fn send_stream_credit(state: &StreamTableState, stream_id: u32, credit: u32) {
-    let Some(sink) = &state.sink else { return };
+    let Some(link) = &state.link else { return };
     if credit == 0 {
         return;
     }
-    let payload = ipc::encode_stream_pull_payload(state.run_id, stream_id, credit);
-    let _ = sink.write(ipc::RustToTsMessageType::StreamPull, payload);
+    let _ = link.send(
+        Addr::Run(state.run_id),
+        Outbound::StreamPull { stream_id, credit },
+    );
 }
 
-/// Write a `StreamCancel` so the host stops pumping and releases the source.
+/// Send a `StreamCancel` so the host stops pumping and releases the source.
 fn send_stream_cancel(state: &StreamTableState, stream_id: u32, reason: &str) {
-    let Some(sink) = &state.sink else { return };
-    let payload = ipc::encode_stream_cancel_payload(state.run_id, stream_id, reason);
-    let _ = sink.write(ipc::RustToTsMessageType::StreamCancel, payload);
+    let Some(link) = &state.link else { return };
+    let _ = link.send(
+        Addr::Run(state.run_id),
+        Outbound::StreamCancel {
+            stream_id,
+            reason: reason.to_string(),
+        },
+    );
 }
 
 /// The result of a failed JavaScript execution.
@@ -1556,17 +1571,17 @@ pub enum RunError {
 /// Execute a sandboxed run and return the full output.
 ///
 /// `globals` is the list of declared host globals, each tagged by how it is
-/// installed natively (`HostGlobalDef`): bridge stubs issue `BridgeCall` frames
-/// on `stream_fd` and block until the matching `BridgeResponse`; string/data
-/// globals are evaluated/materialised in-isolate and need no socket. Pass
-/// `None` for `stream_fd` when no global installs a bridge stub.
+/// installed natively (`HostGlobalDef`): bridge stubs send `BridgeCall`s on
+/// the run's link and suspend until the matching `BridgeResponse` arrives on
+/// its events; string/data globals are evaluated/materialised in-isolate and
+/// need no host. Pass `RunIo::None` when no global installs a bridge stub.
 pub fn execute(
     code: &str,
     filename: Option<&str>,
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-    stream_fd: Option<RawFd>,
+    io: RunIo,
     call_id_counter: Arc<AtomicU32>,
     call: Option<&types::CallSpec>,
 ) -> Result<Output, FailureOutput> {
@@ -1576,11 +1591,12 @@ pub fn execute(
         limits,
         globals,
         imports,
-        stream_fd.map_or(RunIo::None, RunIo::Fd),
+        io,
         0,
         call_id_counter,
         call,
         None,
+        Arc::new(crate::link::NoopObserver),
     )
 }
 
@@ -1603,6 +1619,7 @@ pub fn execute_with_io(
     call_id_counter: Arc<AtomicU32>,
     call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+    observer: Arc<dyn Observer>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
@@ -1616,6 +1633,7 @@ pub fn execute_with_io(
         call_id_counter,
         call,
         ctl_slot,
+        observer,
     )
 }
 
@@ -1634,7 +1652,7 @@ pub struct PrefixSpec<'a> {
 ///
 /// The prefix source is evaluated into the fresh context first (under the
 /// warm-up budget), then `globals` — all `HostGlobalDef::Bridge` stubs bound
-/// to `stream_fd` for this run — overwrite the prefix-time placeholders, then
+/// to the run's link — overwrite the prefix-time placeholders, then
 /// the call runs. String/data globals and shim wrappers are replayed from
 /// `prefix.globals` and are not re-sent per run.
 pub fn execute_with_prefix(
@@ -1642,7 +1660,7 @@ pub fn execute_with_prefix(
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-    stream_fd: Option<RawFd>,
+    io: RunIo,
     call_id_counter: Arc<AtomicU32>,
     call: &types::CallSpec,
 ) -> Result<Output, FailureOutput> {
@@ -1660,7 +1678,7 @@ pub fn execute_with_prefix(
         limits,
         globals,
         imports,
-        stream_fd,
+        io,
         call_id_counter,
         call,
     )
@@ -1670,8 +1688,7 @@ pub fn execute_with_prefix(
 /// One-off ESM path: compile source as a module, instantiate it, evaluate
 /// it, then inspect the module namespace object for `default` and named
 /// exports. When `globals` is non-empty, live bridge stubs are installed for
-/// each name. `stream_fd` is the raw file-descriptor of the session socket;
-/// it is used only during bridge calls and is never closed by this function.
+/// each name, writing through the run's link.
 ///
 /// When `call` is `Some`, the run's value is the called function's return
 /// value instead of the exports, resolved against the freshly evaluated
@@ -1688,6 +1705,7 @@ fn run_module(
     call_id_counter: Arc<AtomicU32>,
     call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+    observer: Arc<dyn Observer>,
 ) -> Result<Output, FailureOutput> {
     // The run clock, CPU budget, and bridge-call log live here (not inside
     // the inner function) so the final values can be stamped onto BOTH
@@ -1707,6 +1725,7 @@ fn run_module(
         call_id_counter,
         call,
         ctl_slot,
+        observer,
         start,
         Arc::clone(&cpu_budget),
         Arc::clone(&bridge_log),
@@ -1746,6 +1765,7 @@ fn run_module_inner(
     call_id_counter: Arc<AtomicU32>,
     call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
+    observer: Arc<dyn Observer>,
     start: std::time::Instant,
     cpu_budget: Arc<CpuBudget>,
     bridge_log: Arc<Mutex<BridgeCallLog>>,
@@ -1755,7 +1775,13 @@ fn run_module_inner(
     // uniform across both paths.
     let run_table = RunTable::boxed();
     let token = if token != 0 { token } else { alloc_run_token() };
-    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes);
+    let epilogue = take_epilogue_spec();
+    let entry = RunCallState::new(
+        limits.max_stdout_bytes,
+        limits.max_stderr_bytes,
+        observer,
+        Addr::Run(epilogue.map_or(0, |e| e.run_id)),
+    );
     let logs_ptr: *const RefCell<LogBuffers> = std::ptr::addr_of!(*entry.logs);
     let pending_ptr: *const PendingWork = std::ptr::addr_of!(*entry.pending);
     let streams_ptr: *const StreamTable = std::ptr::addr_of!(*entry.streams);
@@ -1940,7 +1966,7 @@ fn run_module_inner(
             streams: streams_ptr,
             out_streams: out_streams_ptr,
             timers: timers_ptr,
-            epilogue: take_epilogue_spec(),
+            epilogue,
             cancel_handle: &cancel_handle,
         },
     );
@@ -1963,13 +1989,10 @@ fn run_module_inner(
 pub enum RunEvent {
     /// A new run for the instance's turn loop. One-off runs never see this
     /// variant (their private channel carries only their own events).
-    Job(JobMsg),
-    /// An inbound frame addressed to this run (BridgeResponse, stream
-    /// frames, Terminate).
-    Frame(ipc::TsToRustFrame),
-    /// The run's connection is gone — framing died or the peer closed. The
-    /// optional detail lands in the run's failure message.
-    ConnLost(Option<String>),
+    Job(Box<CallJob>),
+    /// A host message addressed to this run (bridge response, stream
+    /// traffic, terminate, connection loss).
+    Host(Inbound),
     /// The registry dropped the instance's handle: accept no new work, exit
     /// once the in-flight runs drain. Sent by `InstanceHandle::drop`, so a
     /// leaked sender clone can never strand a retired instance.
@@ -2011,29 +2034,32 @@ impl RoutedEvent {
 /// its runs' events, Retire — so per-run ordering is channel FIFO (#170).
 pub type RunEventSender = crossbeam_channel::Sender<RoutedEvent>;
 
-/// Where a run's frames come from and where its frames go.
+/// Where a run's host messages come from and where its own go.
 pub enum RunIo {
-    /// Direct fd (tests / direct API): reads and writes on the raw session
-    /// socket, whose only user is this run — the pre-demux discipline.
-    Fd(RawFd),
-    /// Session mode with a private event channel (one-off runs): the demux
-    /// feeds this run's events; writes go through the connection's
-    /// serialized writer.
+    /// A private event channel (one-off runs): the frontend feeds this
+    /// run's events; outbound messages go through its link.
     Session {
         events: crossbeam_channel::Receiver<RoutedEvent>,
-        sink: ipc::FrameSink,
+        link: Arc<dyn HostLink>,
     },
-    /// Session mode on a warm instance: events arrive on the instance's
-    /// shared event channel (owned by its turn loop), so the run itself
-    /// carries only the sink.
-    Instance { sink: ipc::FrameSink },
-    /// No I/O: a pure compute run (no bridge, no epilogue socket).
+    /// A run on a warm instance: events arrive on the instance's shared
+    /// channel (owned by its turn loop), so the run carries only the link.
+    Instance { link: Arc<dyn HostLink> },
+    /// No I/O: a pure compute run (no bridge, no host to answer).
     None,
+}
+
+impl RunIo {
+    pub fn link(&self) -> Option<Arc<dyn HostLink>> {
+        match self {
+            RunIo::Session { link, .. } | RunIo::Instance { link } => Some(Arc::clone(link)),
+            RunIo::None => None,
+        }
+    }
 }
 
 /// The read half of [`RunIo`], as the drive loops hold it.
 enum RunSource {
-    Fd(RawFd),
     Channel(crossbeam_channel::Receiver<RoutedEvent>),
     /// Events arrive on the owning instance's shared channel — the run can
     /// be woken (it is NOT sourceless), it just owns no receiver itself.
@@ -2070,7 +2096,7 @@ struct CallPhaseCtx<'a> {
     cpu_budget: &'a Arc<CpuBudget>,
     bridge_log: &'a Arc<Mutex<BridgeCallLog>>,
     reason: &'a Arc<ReasonCell>,
-    /// The run's console sink (in its table entry) for failure snapshots.
+    /// The run's console buffers (in its table entry) for failure snapshots.
     /// A raw pointer; only transient borrows are taken, never across JS
     /// execution.
     logs: *const RefCell<LogBuffers>,
@@ -2119,9 +2145,9 @@ struct RunState {
     epilogue: Option<EpilogueSpec>,
     /// Where this run's events come from; `None` = nothing can wake it.
     source: Option<RunSource>,
-    /// Outbound frames (the early Result at grace start). Bridge stubs and
-    /// stream credit carry their own clone via the table entry.
-    sink: Option<ipc::FrameSink>,
+    /// Outbound messages (the early Result at grace start). Bridge stubs
+    /// and stream credit carry their own clone via the table entry.
+    link: Option<Arc<dyn HostLink>>,
     cpu_budget: Arc<CpuBudget>,
     bridge_log: Arc<Mutex<BridgeCallLog>>,
     bridge_error: Arc<OnceLock<RunError>>,
@@ -2170,7 +2196,7 @@ struct GraceState {
 }
 
 impl RunState {
-    /// Snapshot the run's console sink for a failure result.
+    /// Snapshot the run's console buffers for a failure result.
     fn fail(&self, error: RunError) -> FailureOutput {
         // SAFETY: `logs` points into the run's live table entry.
         failure(error, &unsafe { &*self.logs }.borrow(), self.start)
@@ -2181,17 +2207,6 @@ impl RunState {
         match &self.phase {
             RunPhase::Grace(g) => Arc::clone(&g.grace_cpu),
             _ => Arc::clone(&self.cpu_budget),
-        }
-    }
-
-    /// The read cap for inbound frames while this run waits: its own memory
-    /// budget — the advertised (soft) line, else the terminating one — or the
-    /// global framing cap when it opted out of both.
-    fn frame_limit(&self) -> u32 {
-        match (self.limits.soft_memory_mb, self.limits.hard_memory_mb) {
-            (0, 0) => ipc::DEFAULT_MAX_FRAME_LENGTH,
-            (0, hard) => hard.saturating_mul(1024 * 1024),
-            (soft, _) => soft.saturating_mul(1024 * 1024),
         }
     }
 
@@ -2282,27 +2297,19 @@ fn finished(r: Result<Output, FailureOutput>) -> ScanOutcome {
 
 /// One event delivered to the loop while runs are suspended.
 enum LoopEvent {
-    Frame(ipc::TsToRustFrame),
+    Host(Inbound),
     /// The wait timed out — the nearest boundary deadline is due.
     DeadlineHit,
-    /// The frame source is gone (socket died / channel closed).
+    /// The event source is gone (connection lost / channel closed).
     SourceClosed(io::Error),
 }
 
-/// Wait for the next event from either source kind, plus the instant the
-/// wait's counted time cuts off (a frame's arrival stamp; delivery time for the
-/// rest). Only the single-run drive loop (`run_call_phase`) calls this;
-/// instance-channel runs are woken by their owner loop's select instead.
-fn wait_event(
-    source: &RunSource,
-    timeout: Option<Duration>,
-    limit: u32,
-) -> (LoopEvent, std::time::Instant) {
+/// Wait for the next event on a private channel, plus the instant the
+/// wait's counted time cuts off (a message's arrival stamp; delivery time
+/// for the rest). Only the single-run drive loop (`run_call_phase`) calls
+/// this; instance-channel runs are woken by their owner loop's select.
+fn wait_event(source: &RunSource, timeout: Option<Duration>) -> (LoopEvent, std::time::Instant) {
     match source {
-        RunSource::Fd(fd) => {
-            // A blocking read: the frame's arrival IS the read's return.
-            (wait_frame_on_fd(*fd, timeout, limit), std::time::Instant::now())
-        }
         RunSource::Instance => {
             unreachable!("instance-channel runs are driven by serve_instance, not wait_event")
         }
@@ -2322,13 +2329,13 @@ fn wait_event(
                 .map(|routed| routed.at)
                 .unwrap_or_else(|_| std::time::Instant::now());
             let event = match received.map(|routed| routed.event) {
-                Ok(RunEvent::Frame(frame)) => LoopEvent::Frame(frame),
-                Ok(RunEvent::ConnLost(detail)) => {
+                Ok(RunEvent::Host(Inbound::ConnectionLost { detail })) => {
                     LoopEvent::SourceClosed(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         detail.unwrap_or_else(|| "connection closed".to_string()),
                     ))
                 }
+                Ok(RunEvent::Host(msg)) => LoopEvent::Host(msg),
                 // Instance-loop message kinds; a one-off's private channel
                 // never carries them.
                 Ok(RunEvent::Job(_) | RunEvent::Retire) => {
@@ -2345,28 +2352,6 @@ fn wait_event(
             };
             (event, woke_at)
         }
-    }
-}
-
-/// Wait for the next inbound frame on the session socket (the direct-API /
-/// dark-mode frame source; the session demux feeds a channel instead).
-fn wait_frame_on_fd(fd: RawFd, timeout: Option<Duration>, limit: u32) -> LoopEvent {
-    // SAFETY: the fd is the live session socket owned by the caller of the
-    // run; ManuallyDrop prevents closing it here.
-    let mut sock = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(fd) });
-    if timeout.is_some() {
-        sock.set_read_timeout(timeout).ok();
-    }
-    let result = ipc::read_ts_to_rust_frame_with_limit(&mut *sock, limit);
-    if timeout.is_some() {
-        sock.set_read_timeout(None).ok();
-    }
-    match result {
-        Ok(frame) => LoopEvent::Frame(frame),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-            LoopEvent::DeadlineHit
-        }
-        Err(e) => LoopEvent::SourceClosed(e),
     }
 }
 
@@ -2455,9 +2440,9 @@ fn run_call_phase(
         let timeout = rs.next_timeout();
         let (event, woke_at) = {
             let source = rs.source.as_ref().expect("checked above");
-            wait_event(source, timeout, rs.frame_limit())
+            wait_event(source, timeout)
         };
-        let entered = matches!(event, LoopEvent::Frame(_));
+        let entered = matches!(event, LoopEvent::Host(_));
         if entered {
             enter_turn(&mut rs, woke_at);
         }
@@ -2505,10 +2490,9 @@ fn begin_call(
         guard,
         cancel_handle: ctx.cancel_handle,
     };
-    let (source, sink) = match std::mem::replace(&mut ctx.io, RunIo::None) {
-        RunIo::Fd(fd) => (Some(RunSource::Fd(fd)), Some(ipc::FrameSink::Fd(fd))),
-        RunIo::Session { events, sink } => (Some(RunSource::Channel(events)), Some(sink)),
-        RunIo::Instance { sink } => (Some(RunSource::Instance), Some(sink)),
+    let (source, link) = match std::mem::replace(&mut ctx.io, RunIo::None) {
+        RunIo::Session { events, link } => (Some(RunSource::Channel(events)), Some(link)),
+        RunIo::Instance { link } => (Some(RunSource::Instance), Some(link)),
         RunIo::None => (None, None),
     };
     let mut rs = RunState {
@@ -2518,7 +2502,7 @@ fn begin_call(
         start: ctx.start,
         epilogue: ctx.epilogue,
         source,
-        sink,
+        link,
         cpu_budget: Arc::clone(ctx.cpu_budget),
         bridge_log: Arc::clone(ctx.bridge_log),
         bridge_error: Arc::new(OnceLock::new()),
@@ -2557,7 +2541,7 @@ fn handle_loop_event(
     event: LoopEvent,
 ) -> Option<Result<Output, FailureOutput>> {
     match event {
-        LoopEvent::Frame(frame) => match frame_turn(isolate, context, facts, rs, frame) {
+        LoopEvent::Host(msg) => match frame_turn(isolate, context, facts, rs, msg) {
             ScanOutcome::Finished(result) => Some(*result),
             ScanOutcome::Continue => None,
         },
@@ -2850,8 +2834,8 @@ fn start_turn(
     }
 
     if !bridge_stubs.is_empty() {
-        let sink = rs
-            .sink
+        let link = rs
+            .link
             .clone()
             .expect("install_bridge_globals called with bridge-backed globals but no run I/O");
         if let Err(e) = install_bridge_globals(
@@ -2860,7 +2844,7 @@ fn start_turn(
             rs.token,
             ctx.table,
             rs.epilogue.map(|e| e.run_id).unwrap_or(0),
-            sink,
+            link,
             Arc::clone(&ctx.call_id_counter),
             Arc::clone(&rs.bridge_error),
             rs.limits.max_bridge_call_bytes,
@@ -2907,21 +2891,21 @@ fn start_turn(
         *(*rs.streams).slot.borrow_mut() = Some(StreamTableState {
             streams: HashMap::new(),
             run_id: rs.epilogue.map(|e| e.run_id).unwrap_or(0),
-            sink: rs.sink.clone(),
+            link: rs.link.clone(),
         });
     }
     // Arm the OUTBOUND registry only for runs that can stream a result out:
-    // an epilogue (the early Result carries the handle) and a sink to write
+    // an epilogue (the early Result carries the handle) and a link to send
     // chunks through. Hold-mode runs stay unarmed — registration fails and
     // the codec reports the existing cannot-cross error.
-    if rs.epilogue.is_some() && rs.sink.is_some() {
+    if rs.epilogue.is_some() && rs.link.is_some() {
         // SAFETY: `out_streams` points at the run entry's OutStreamTable Box.
         unsafe {
             *(*rs.out_streams).slot.borrow_mut() = Some(OutTableState {
                 streams: HashMap::new(),
                 next_id: 1,
                 run_id: rs.epilogue.map(|e| e.run_id).unwrap_or(0),
-                sink: rs.sink.clone(),
+                link: rs.link.clone(),
                 last_activity: std::time::Instant::now(),
             });
         }
@@ -3203,7 +3187,7 @@ fn serialize_call_result(
     // The RESULT of a session run is the one leg that may carry stream
     // bodies (#128): the codec registers them in the run's outbound table.
     // Exports and every host→sandbox leg stay stream-free.
-    let _mode = ResultStreamMode::enter(rs.epilogue.is_some() && rs.sink.is_some());
+    let _mode = ResultStreamMode::enter(rs.epilogue.is_some() && rs.link.is_some());
     blob::serialize_value(scope, value).map_err(|message| {
         let error = match blob::take_codec_error() {
             Some(e) => codec_error_to_run_error(e),
@@ -3219,13 +3203,13 @@ fn serialize_call_result(
     })
 }
 
-/// One event-driven turn: deliver `frame` to the run, checkpoint, scan.
+/// One event-driven turn: deliver `msg` to the run, checkpoint, scan.
 fn frame_turn(
     isolate: &mut v8::OwnedIsolate,
     context: &v8::Global<v8::Context>,
     facts: &RunFacts<'_>,
     rs: &mut RunState,
-    frame: ipc::TsToRustFrame,
+    msg: Inbound,
 ) -> ScanOutcome {
     let in_grace = matches!(rs.phase, RunPhase::Grace(_));
 
@@ -3238,9 +3222,9 @@ fn frame_turn(
     let context_local = v8::Local::new(scope, context);
     let scope = &mut v8::ContextScope::new(scope, context_local);
 
-    // A frame arrived — the runtime holds control, so this is an observable
-    // I/O boundary: the frozen clock advances before anything of the frame
-    // is delivered into JS (E1 ruling 7: once per turn entry).
+    // A message arrived — the runtime holds control, so this is an
+    // observable I/O boundary: the frozen clock advances before anything of
+    // it is delivered into JS (E1 ruling 7: once per turn entry).
     crate::webtypes::advance_frozen_clock(scope);
     CURRENT_RUN_TOKEN.with(|c| c.set(rs.token));
     RUN_TABLE_PTR.with(|c| c.set(rs.table));
@@ -3248,102 +3232,83 @@ fn frame_turn(
 
     v8::tc_scope!(let scope, scope);
 
-    match frame.message_type {
-        ipc::TsToRustMessageType::BridgeResponse => {
-            match wire::parse_bridge_response_payload(&frame.payload) {
-                Err(e) => {
-                    return finished(Err(rs.fail(RunError::Internal(format!(
-                        "poll loop: response decode: {e}"
-                    )))));
-                }
-                // The leading runId is demux routing state; inside a run's
-                // own loop, callId routing is authoritative.
-                Ok((_run_id, call_id, result)) => {
-                    // Settle the call's bridge record: round-trip time on
-                    // the run clock plus the response value's serialized
-                    // size (frame payload minus the runId + callId + ok
-                    // header). Unknown callIds are ignored inside settle().
-                    let response_value_bytes = if result.is_ok() {
-                        frame.payload.len().saturating_sub(9) as u32
-                    } else {
-                        0
-                    };
-                    rs.bridge_log
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .settle(
-                            call_id,
-                            elapsed_ms(rs.start),
-                            result.is_ok(),
-                            response_value_bytes,
-                        );
-                    // Route to the matching resolver. An unknown callId
-                    // means a stale frame from a previous run — discard.
-                    let entry = rs
-                        .resolvers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .remove(&call_id);
-                    if let Some(PendingResolver(global_resolver)) = entry {
-                        let resolver = v8::Local::new(scope, global_resolver);
-                        match result {
-                            Ok(value_blob) => {
-                                let decoded = match &value_blob {
-                                    // Absent value slot → the handler
-                                    // returned nothing.
-                                    None => Some(v8::undefined(scope).into()),
-                                    // Web-aware: a bridge handler may
-                                    // return a Request/Response.
-                                    Some(bytes) => {
-                                        blob::deserialize_value_with_web_types(scope, bytes)
-                                    }
-                                };
-                                let Some(v8_val) = decoded else {
-                                    // Same outcome as a data global or call
-                                    // argument that cannot cross: the run fails.
-                                    let error = match blob::take_codec_error() {
-                                        Some(e) => codec_error_to_run_error(e),
-                                        None => RunError::Internal(
-                                            "failed to deserialize response value".to_string(),
-                                        ),
-                                    };
-                                    return finished(Err(rs.fail(termination_or(facts.reason, error))));
-                                };
-                                resolver.resolve(scope, v8_val);
+    match msg {
+        Inbound::BridgeResponse { call_id, result } => {
+            // Settle the call's bridge record: round-trip time on
+            // the run clock plus the response value's serialized
+            // size. Unknown callIds are ignored inside settle().
+            let response_value_bytes = match &result {
+                Ok(Some(blob)) => blob.len() as u32,
+                Ok(None) | Err(_) => 0,
+            };
+            rs.bridge_log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .settle(
+                    call_id,
+                    elapsed_ms(rs.start),
+                    result.is_ok(),
+                    response_value_bytes,
+                );
+            // Route to the matching resolver. An unknown callId
+            // means a stale frame from a previous run — discard.
+            let entry = rs
+                .resolvers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&call_id);
+            if let Some(PendingResolver(global_resolver)) = entry {
+                let resolver = v8::Local::new(scope, global_resolver);
+                match result {
+                    Ok(value_blob) => {
+                        let decoded = match &value_blob {
+                            // Absent value slot → the handler
+                            // returned nothing.
+                            None => Some(v8::undefined(scope).into()),
+                            // Web-aware: a bridge handler may
+                            // return a Request/Response.
+                            Some(bytes) => {
+                                blob::deserialize_value_with_web_types(scope, bytes)
                             }
-                            Err(bridge_err) => {
-                                // Reject with a real Error carrying the
-                                // handler's name/message/fields, tagged with
-                                // a private symbol so the rejected-root arm
-                                // can classify an *uncaught* one as
-                                // HostBridge. Sandbox code may catch it and
-                                // continue — host handler errors are not
-                                // run-fatal.
-                                let error_obj = host_bridge_error_to_v8(scope, &bridge_err);
-                                resolver.reject(scope, error_obj);
-                            }
-                        }
+                        };
+                        let Some(v8_val) = decoded else {
+                            // Same outcome as a data global or call
+                            // argument that cannot cross: the run fails.
+                            let error = match blob::take_codec_error() {
+                                Some(e) => codec_error_to_run_error(e),
+                                None => RunError::Internal(
+                                    "failed to deserialize response value".to_string(),
+                                ),
+                            };
+                            return finished(Err(rs.fail(termination_or(facts.reason, error))));
+                        };
+                        resolver.resolve(scope, v8_val);
+                    }
+                    Err(bridge_err) => {
+                        // Reject with a real Error carrying the
+                        // handler's name/message/fields, tagged with
+                        // a private symbol so the rejected-root arm
+                        // can classify an *uncaught* one as
+                        // HostBridge. Sandbox code may catch it and
+                        // continue — host handler errors are not
+                        // run-fatal.
+                        let error_obj = host_bridge_error_to_v8(scope, &bridge_err);
+                        resolver.reject(scope, error_obj);
                     }
                 }
             }
         }
-        ipc::TsToRustMessageType::Terminate => {
-            // Mode is irrelevant here: a Terminate frame that reached the
-            // loop is by definition landing at a turn boundary, where soft
-            // and hard mean the same clean abandon (hard's extra power —
-            // the mid-turn kill — was already applied by the demux, or
-            // there was nothing to kill).
+        Inbound::Terminate { .. } => {
+            // Mode is irrelevant here: a Terminate that reached the loop is
+            // by definition landing at a turn boundary, where soft and hard
+            // mean the same clean abandon (hard's extra power — the
+            // mid-turn kill — was already applied by the frontend, or there
+            // was nothing to kill).
+            let run_id = rs.epilogue.map(|e| e.run_id).unwrap_or(0);
             if in_grace {
                 // A host Terminate mid-grace (abort during the epilogue):
                 // truncate the phase cleanly — the value already shipped.
-                match ipc::parse_terminate_payload(&frame.payload) {
-                    Ok((run_id, _)) => eprintln!(
-                        "[iso4-v8] Terminate received for run {run_id} — truncating grace"
-                    ),
-                    Err(e) => eprintln!(
-                        "[iso4-v8] Terminate received with malformed payload ({e}) — truncating grace"
-                    ),
-                }
+                eprintln!("[iso4-v8] Terminate received for run {run_id} — truncating grace");
                 return finished(Ok(finish_post_phase(rs)));
             }
             // Graceful abort = direct abandon (E2 amendment to E1 ruling 5):
@@ -3352,51 +3317,26 @@ fn frame_turn(
             // interrupted mid-JS — so the instance is NOT tainted and
             // co-resident runs are unaffected. The failure carries the real
             // telemetry collected so far.
-            match ipc::parse_terminate_payload(&frame.payload) {
-                Ok((run_id, _)) => {
-                    eprintln!("[iso4-v8] Terminate received for run {run_id} — abandoning")
-                }
-                Err(e) => eprintln!(
-                    "[iso4-v8] Terminate received with malformed payload ({e}) — abandoning"
-                ),
-            }
+            eprintln!("[iso4-v8] Terminate received for run {run_id} — abandoning");
             return finished(Err(rs.fail(RunError::Aborted)));
         }
-        ipc::TsToRustMessageType::StreamChunk | ipc::TsToRustMessageType::StreamEnd => {
-            if let Err(e) = deliver_stream_frame(scope, rs.streams, &frame) {
+        msg @ (Inbound::StreamChunk { .. } | Inbound::StreamEnd { .. }) => {
+            if let Err(e) = deliver_stream_frame(scope, rs.streams, msg) {
                 return finished(Err(rs.fail(e)));
             }
         }
-        ipc::TsToRustMessageType::StreamPull => {
+        Inbound::StreamPull { stream_id, credit } => {
             // Outbound credit grant: production resumes in this turn's scan.
-            match ipc::parse_stream_pull_payload(&frame.payload) {
-                Ok(pull) => note_out_credit(rs, &pull),
-                Err(e) => {
-                    return finished(Err(rs.fail(RunError::Internal(format!(
-                        "stream pull decode: {e}"
-                    )))));
-                }
-            }
+            note_out_credit(rs, stream_id, credit);
         }
-        ipc::TsToRustMessageType::StreamCancel => {
+        Inbound::StreamCancel { stream_id, reason } => {
             // The host dropped an outbound stream: guest cleanup runs as
             // part of this turn (web-streams cancel semantics), never taint.
-            match ipc::parse_stream_cancel_payload(&frame.payload) {
-                Ok(cancel) => {
-                    note_out_activity(rs, cancel.run_id);
-                    cancel_out_stream(scope, rs, cancel.stream_id, &cancel.reason, false);
-                }
-                Err(e) => {
-                    return finished(Err(rs.fail(RunError::Internal(format!(
-                        "stream cancel decode: {e}"
-                    )))));
-                }
-            }
+            note_out_activity(rs);
+            cancel_out_stream(scope, rs, stream_id, &reason, false);
         }
-        other => {
-            return finished(Err(rs.fail(RunError::Internal(format!(
-                "poll loop: expected BridgeResponse or Terminate, got {other:?}"
-            )))));
+        Inbound::ConnectionLost { .. } => {
+            unreachable!("connection loss is a SourceClosed event, never a turn")
         }
     }
 
@@ -3922,14 +3862,13 @@ fn build_output_and_maybe_grace(
         l.stderr.clear();
     }
 
-    let early_result_sent = match (rs.epilogue, &rs.sink) {
-        (Some(spec), Some(sink)) => {
+    let early_result_sent = match (rs.epilogue, &rs.link) {
+        (Some(spec), Some(link)) => {
             let heap_used_bytes = spec.report_heap.then(|| {
                 let stats = scope.get_heap_statistics();
                 stats.used_heap_size() as u64
             });
-            let payload = wire::encode_run_completion_payload(
-                spec.run_id,
+            let completion =
                 types::RunCompletion::Success(types::RunSuccessPayload {
                     exports: output.exports.clone(),
                     skipped_exports: output.skipped_exports.clone(),
@@ -3942,14 +3881,13 @@ fn build_output_and_maybe_grace(
                     heap_used_bytes,
                     background_flags: (u8::from(has_grace))
                         | (u8::from(has_streams) << 1),
-                }),
-            );
-            match sink.write(ipc::RustToTsMessageType::Result, payload) {
+                });
+            match link.send(Addr::Run(spec.run_id), Outbound::Result { completion }) {
                 Ok(()) => true,
                 Err(e) => {
-                    // Fall back to hold mode: the session writes the Result
-                    // (without the pending flag) after grace completes.
-                    eprintln!("[iso4-v8] early Result write failed ({e}); holding");
+                    // Fall back to hold mode: the Result (without the
+                    // pending flag) goes out after grace completes.
+                    eprintln!("[iso4-v8] early Result send failed ({e}); holding");
                     false
                 }
             }
@@ -4021,39 +3959,33 @@ fn out_idle_deadline(rs: &RunState) -> Option<std::time::Instant> {
     }
 }
 
-/// Apply a host credit grant to an outbound stream (run id validated like
-/// the inbound direction's frames; unknown or done streams ignore it).
-fn note_out_credit(rs: &RunState, pull: &ipc::StreamPullPayload) {
+/// Apply a host credit grant to an outbound stream (unknown or done streams
+/// ignore it).
+fn note_out_credit(rs: &RunState, stream_id: u32, credit: u32) {
     // SAFETY: `out_streams` points into the run's live table entry.
     let table = unsafe { &*rs.out_streams };
     let mut slot = table.slot.borrow_mut();
     let Some(st) = slot.as_mut() else { return };
-    if st.run_id != 0 && pull.run_id != st.run_id {
-        return;
-    }
     st.last_activity = std::time::Instant::now();
-    if let Some(stream) = st.streams.get_mut(&pull.stream_id) {
+    if let Some(stream) = st.streams.get_mut(&stream_id) {
         if !stream.done {
-            stream.credit = stream.credit.saturating_add(pull.credit);
+            stream.credit = stream.credit.saturating_add(credit);
         }
     }
 }
 
 /// Note host activity on the run's outbound table (a cancel counts — the
 /// idle deadline measures abandonment, not consumption).
-fn note_out_activity(rs: &RunState, run_id: u32) {
+fn note_out_activity(rs: &RunState) {
     // SAFETY: `out_streams` points into the run's live table entry.
     let table = unsafe { &*rs.out_streams };
     let mut slot = table.slot.borrow_mut();
     let Some(st) = slot.as_mut() else { return };
-    if st.run_id != 0 && run_id != st.run_id {
-        return;
-    }
     st.last_activity = std::time::Instant::now();
 }
 
 /// Best-effort, turn-less termination of every open outbound stream: one
-/// `StreamEnd` error frame each (dead sinks ignored), no guest cleanup —
+/// `StreamEnd` error each (dead links ignored), no guest cleanup —
 /// the truncate/kill/give-up paths, where no cleanup slice runs.
 fn close_out_streams(out_streams: *const OutStreamTable, message: &str) {
     // SAFETY: `out_streams` points into the run's live table entry.
@@ -4061,7 +3993,7 @@ fn close_out_streams(out_streams: *const OutStreamTable, message: &str) {
     let mut slot = table.slot.borrow_mut();
     let Some(st) = slot.as_mut() else { return };
     let run_id = st.run_id;
-    let sink = st.sink.clone();
+    let link = st.link.clone();
     for (id, stream) in st.streams.iter_mut() {
         if stream.done {
             continue;
@@ -4069,9 +4001,14 @@ fn close_out_streams(out_streams: *const OutStreamTable, message: &str) {
         stream.done = true;
         stream.pending = None;
         stream.backlog = Vec::new();
-        if let Some(sink) = &sink {
-            let payload = ipc::encode_stream_end_payload(run_id, *id, Some(message));
-            let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+        if let Some(link) = &link {
+            let _ = link.send(
+                Addr::Run(run_id),
+                Outbound::StreamEnd {
+                    stream_id: *id,
+                    error: Some(message.to_string()),
+                },
+            );
         }
     }
 }
@@ -4096,7 +4033,7 @@ fn cancel_out_stream(
         let mut slot = table.slot.borrow_mut();
         let Some(st) = slot.as_mut() else { return };
         let run_id = st.run_id;
-        let sink = st.sink.clone();
+        let link = st.link.clone();
         let Some(stream) = st.streams.get_mut(&id) else { return };
         if stream.done {
             return;
@@ -4105,9 +4042,14 @@ fn cancel_out_stream(
         stream.pending = None;
         stream.backlog = Vec::new();
         if notify_host {
-            if let Some(sink) = &sink {
-                let payload = ipc::encode_stream_end_payload(run_id, id, Some(reason));
-                let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+            if let Some(link) = &link {
+                let _ = link.send(
+                    Addr::Run(run_id),
+                    Outbound::StreamEnd {
+                        stream_id: id,
+                        error: Some(reason.to_string()),
+                    },
+                );
             }
         }
         stream.body.clone()
@@ -4284,7 +4226,7 @@ fn drive_out_stream(
         let mut slot = table.slot.borrow_mut();
         let Some(st) = slot.as_mut() else { return Step::Idle };
         let run_id = st.run_id;
-        let sink = st.sink.clone();
+        let link = st.link.clone();
         let Some(stream) = st.streams.get_mut(&id) else { return Step::Idle };
         if stream.done {
             return Step::Idle;
@@ -4294,17 +4236,16 @@ fn drive_out_stream(
             let n = remaining
                 .min(stream.credit as usize)
                 .min(types::STREAM_CHUNK_MAX_BYTES as usize);
-            let Some(sink) = &sink else {
+            let Some(link) = &link else {
                 stream.done = true;
                 return Step::Idle;
             };
-            let slice = &stream.backlog[stream.backlog_sent..stream.backlog_sent + n];
-            let payload = ipc::encode_stream_chunk_payload(run_id, id, slice);
-            if sink
-                .write(ipc::RustToTsMessageType::StreamChunk, payload)
+            let data = stream.backlog[stream.backlog_sent..stream.backlog_sent + n].to_vec();
+            if link
+                .send(Addr::Run(run_id), Outbound::StreamChunk { stream_id: id, data })
                 .is_err()
             {
-                // Dead socket: the connection-loss event ends the phase.
+                // Dead link: the connection-loss event ends the phase.
                 stream.done = true;
                 return Step::Idle;
             }
@@ -4331,7 +4272,7 @@ fn drive_out_stream(
         let mut slot = table.slot.borrow_mut();
         let Some(st) = slot.as_mut() else { return };
         let run_id = st.run_id;
-        let sink = st.sink.clone();
+        let link = st.link.clone();
         let Some(stream) = st.streams.get_mut(&id) else { return };
         stream.pending = None;
         match outcome {
@@ -4341,16 +4282,26 @@ fn drive_out_stream(
             }
             Ok(None) => {
                 stream.done = true;
-                if let Some(sink) = &sink {
-                    let payload = ipc::encode_stream_end_payload(run_id, id, None);
-                    let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+                if let Some(link) = &link {
+                    let _ = link.send(
+                        Addr::Run(run_id),
+                        Outbound::StreamEnd {
+                            stream_id: id,
+                            error: None,
+                        },
+                    );
                 }
             }
             Err(message) => {
                 stream.done = true;
-                if let Some(sink) = &sink {
-                    let payload = ipc::encode_stream_end_payload(run_id, id, Some(&message));
-                    let _ = sink.write(ipc::RustToTsMessageType::StreamEnd, payload);
+                if let Some(link) = &link {
+                    let _ = link.send(
+                        Addr::Run(run_id),
+                        Outbound::StreamEnd {
+                            stream_id: id,
+                            error: Some(message),
+                        },
+                    );
                 }
             }
         }
@@ -4895,35 +4846,28 @@ pub struct CallJob {
     pub limits: Limits,
     /// Bridge-stub defs for this call (re-installed per call).
     pub globals: Vec<types::HostGlobalDef>,
-    /// The run's frame source and outbound sink.
+    /// The run's event source and its link to the host.
     pub io: RunIo,
+    /// The side channel for this run's console lines.
+    pub observer: Arc<dyn Observer>,
     /// The connection's monotonically increasing bridge call-ID counter.
     pub call_id_counter: Arc<AtomicU32>,
     pub call: types::CallSpec,
-    /// Per-run identity for the early Result frame.
+    /// Per-run identity for the early Result.
     pub epilogue: Option<EpilogueSpec>,
-    /// Session completion hook, run on the instance thread when the run
-    /// finishes: writes the Result/RunComplete frames through the shared
-    /// writer and releases registry state. `None` for direct callers, which
-    /// take the outcome off the respond channel instead.
-    pub complete: Option<CompletionHook>,
+    /// Registry bookkeeping run on the instance thread when the run
+    /// finishes, before its completion goes out on the link. Owns the
+    /// outcome; direct callers use it to receive the outcome.
+    pub release: Option<ReleaseHook>,
     /// Filled with the instance guard's cross-thread face once the isolate
     /// exists, so the session demux can terminate this run mid-turn
     /// (Terminate for a CPU-bound run — E1 ruling 5's fallback).
     pub ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
 }
 
-/// One message to an instance owner thread: the job, plus an optional
-/// blocking-caller channel for the outcome.
-pub type JobMsg = (
-    Box<CallJob>,
-    Option<crossbeam_channel::Sender<CallOutcome>>,
-);
-
-/// The session completion hook a [`CallJob`] can carry: runs on the instance
-/// thread when the run finishes and OWNS the outcome — no payload cloning on
-/// the completion path. Mutually exclusive with the respond channel.
-pub type CompletionHook = Box<dyn FnOnce(CallOutcome) + Send>;
+/// The release hook a [`CallJob`] can carry: runs on the instance thread
+/// when the run finishes and owns the outcome.
+pub type ReleaseHook = Box<dyn FnOnce(CallOutcome) + Send>;
 
 /// What the warm layer needs to know after each call on an instance.
 pub struct CallOutcome {
@@ -4953,7 +4897,7 @@ pub fn run_call_on_core(
     limits: Limits,
     globals: &[HostGlobalDef],
     imports: &[ImportBinding],
-    stream_fd: Option<RawFd>,
+    io: RunIo,
     call_id_counter: Arc<AtomicU32>,
     call: &types::CallSpec,
 ) -> CallOutcome {
@@ -4969,7 +4913,13 @@ pub fn run_call_on_core(
     // exactly as when the buffers were shared.)
     core.reason.reset();
     let token = alloc_run_token();
-    let entry = RunCallState::new(limits.max_stdout_bytes, limits.max_stderr_bytes);
+    let epilogue = take_epilogue_spec();
+    let entry = RunCallState::new(
+        limits.max_stdout_bytes,
+        limits.max_stderr_bytes,
+        Arc::new(crate::link::NoopObserver),
+        Addr::Run(epilogue.map_or(0, |e| e.run_id)),
+    );
     if core.warmup_logs_pending {
         core.warmup_logs_pending = false;
         let mut setup = core.run_table.setup_logs.borrow_mut();
@@ -5037,7 +4987,7 @@ pub fn run_call_on_core(
                 limits: &limits,
                 globals,
                 imports,
-                io: stream_fd.map_or(RunIo::None, RunIo::Fd),
+                io,
                 call_id_counter,
                 call: Some(call),
                 start,
@@ -5049,7 +4999,7 @@ pub fn run_call_on_core(
                 streams: streams_ptr,
                 out_streams: out_streams_ptr,
                 timers: timers_ptr,
-                epilogue: take_epilogue_spec(),
+                epilogue,
                 cancel_handle: &cancel_handle,
             },
         ),
@@ -5064,7 +5014,7 @@ pub fn run_call_on_core(
     // The stream table was disarmed (and live streams cancelled) by
     // run_call_phase's normal exit; this covers the failure paths that never
     // reached it. Idempotent. Must happen before the entry is removed — the
-    // cancel frames read the entry's sink.
+    // cancel messages read the entry's link.
     close_run_streams(streams_ptr);
     close_out_streams(out_streams_ptr, "run ended");
     // Remove the run's entry: stub Functions sandbox code stashed now fail
@@ -5120,7 +5070,6 @@ pub fn run_call_on_core(
 struct LiveRun {
     rs: RunState,
     job: Box<CallJob>,
-    respond: Option<crossbeam_channel::Sender<CallOutcome>>,
 }
 
 /// Whether a turn was interrupted mid-JS — the instance-wide taint test
@@ -5132,8 +5081,7 @@ fn instance_tainted(core: &mut InstanceCore) -> bool {
 }
 
 /// Finish one run: stamp its telemetry, close its streams, drop its table
-/// entry, and hand the outcome to whoever waits for it (the session
-/// completion hook and/or the blocking caller's channel).
+/// entry, then release it and answer the host (`finish_job`).
 fn conclude_run(
     isolate: &mut v8::OwnedIsolate,
     run_table: &RunTable,
@@ -5172,13 +5120,140 @@ fn conclude_run(
         heap_used_bytes: heap_used(isolate),
         prefix_failed: false,
     };
-    // The hook and the respond channel are mutually exclusive consumers
-    // (session jobs carry a hook; direct callers a channel) — whichever
-    // exists owns the outcome.
-    if let Some(complete) = live.job.complete.take() {
-        complete(outcome);
-    } else if let Some(respond) = live.respond {
-        respond.send(outcome).ok();
+    finish_job(&mut live.job, live.rs.link.take(), outcome);
+}
+
+/// Conclude a job: the release hook first (the instance is back in the
+/// registry before the host can see the answer), then the completion
+/// through the run's link.
+pub fn finish_job(job: &mut CallJob, link: Option<Arc<dyn HostLink>>, outcome: CallOutcome) {
+    let run_id = job.epilogue.map(|e| e.run_id).unwrap_or(0);
+    let msg = link.as_ref().map(|_| {
+        completion_message(
+            &outcome.result,
+            Some(outcome.heap_used_bytes),
+            outcome.prefix_failed,
+        )
+    });
+    if let Some(release) = job.release.take() {
+        release(outcome);
+    }
+    if let (Some(link), Some(msg)) = (link, msg) {
+        send_completion(&*link, run_id, msg);
+    }
+}
+
+/// A run's completion as the host receives it: the final `Result`, or the
+/// `RunComplete` when the early Result already went out during grace.
+pub fn completion_message(
+    result: &Result<Output, FailureOutput>,
+    heap_used_bytes: Option<u64>,
+    prefix_stage: bool,
+) -> Outbound {
+    match result {
+        Ok(output) => match &output.background {
+            Some(bg) if bg.early_result_sent => Outbound::RunComplete { report: bg.clone() },
+            _ => Outbound::Result {
+                completion: types::RunCompletion::Success(types::RunSuccessPayload {
+                    exports: output.exports.clone(),
+                    skipped_exports: output.skipped_exports.clone(),
+                    stdout: output.stdout.clone(),
+                    stderr: output.stderr.clone(),
+                    duration_ms: output.duration_ms,
+                    wall_time_ms: output.wall_time_ms,
+                    cpu_time_ms: output.cpu_time_ms,
+                    bridge_calls: output.bridge_calls.clone(),
+                    heap_used_bytes,
+                    background_flags: 0,
+                }),
+            },
+        },
+        Err(failure) => Outbound::Result {
+            completion: types::RunCompletion::Failure(types::RunFailurePayload {
+                error: types::RunErrorPayload {
+                    prefix_stage,
+                    ..failure.error.to_payload()
+                },
+                stdout: failure.stdout.clone(),
+                stderr: failure.stderr.clone(),
+                duration_ms: failure.duration_ms,
+                wall_time_ms: failure.wall_time_ms,
+                cpu_time_ms: failure.cpu_time_ms,
+                bridge_calls: failure.bridge_calls.clone(),
+                heap_used_bytes,
+            }),
+        },
+    }
+}
+
+/// Send a completion, substituting a minimal one when the host cannot carry
+/// it: a guest-authored oversized rejection message (or an unbounded record
+/// list under `maxBridgeCalls: 0`) costs its telemetry, never the answer.
+/// Other failures are logged: the run's own events report the dead host.
+pub fn send_completion(link: &dyn HostLink, run_id: u32, msg: Outbound) {
+    let report_status = match &msg {
+        Outbound::RunComplete { report } => Some(report.status),
+        _ => None,
+    };
+    let outcome = match link.send(Addr::Run(run_id), msg) {
+        Err(LinkError::TooLarge(detail)) if report_status.is_none() => {
+            eprintln!(
+                "[iso4-v8] Result for run {run_id} too large to send ({detail}) — \
+                 replacing it with ERR_INTERNAL"
+            );
+            let completion = types::RunCompletion::Failure(types::RunFailurePayload {
+                error: types::RunErrorPayload {
+                    code: "ERR_INTERNAL".to_string(),
+                    name: "Error".to_string(),
+                    message: format!(
+                        "the run's result was too large to send to the host ({detail}). \
+                         A thrown error's message, stack and properties are reported \
+                         verbatim, so a very large one cannot be delivered."
+                    ),
+                    stack: None,
+                    fields: None,
+                    reset: None,
+                    prefix_stage: false,
+                    cause: None,
+                },
+                // Dropped deliberately: stdout/stderr are unbounded too, and
+                // this payload has to be small by construction.
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                duration_ms: 0.0,
+                wall_time_ms: 0.0,
+                cpu_time_ms: 0.0,
+                bridge_calls: Vec::new(),
+                heap_used_bytes: None,
+            });
+            link.send(Addr::Run(run_id), Outbound::Result { completion })
+        }
+        Err(LinkError::TooLarge(detail)) => {
+            eprintln!(
+                "[iso4-v8] RunComplete for run {run_id} too large to send ({detail}) — \
+                 substituting a minimal report"
+            );
+            let report = GraceReport {
+                status: report_status.unwrap_or(GraceStatus::Settled),
+                duration_ms: 0.0,
+                wall_time_ms: 0.0,
+                cpu_time_ms: 0.0,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                bridge_calls: Vec::new(),
+                error: Some((
+                    "Error".to_string(),
+                    "the grace report was too large to send; its telemetry was dropped"
+                        .to_string(),
+                )),
+                early_result_sent: true,
+            };
+            link.send(Addr::Run(run_id), Outbound::RunComplete { report })
+        }
+        other => other,
+    };
+    if let Err(e) = outcome {
+        eprintln!("[iso4-v8] failed to send completion for run {run_id}: {e}");
     }
 }
 
@@ -5415,9 +5490,7 @@ pub(crate) fn idle_settle_after() -> Option<Duration> {
 /// run's job before it can route any of that run's frames, so channel FIFO
 /// guarantees a run is live before its events are delivered: an event whose
 /// token is not live is LATE (its run concluded), never early. Any number
-/// of session runs can be suspended at once; a direct-fd job (tests, dark
-/// mode) blocks the loop for its duration — the pre-demux discipline where
-/// this thread is the fd's only reader.
+/// of runs can be suspended at once.
 ///
 /// Deadlines fire in ARRIVAL order, not processing order (see
 /// [`sweep_expired_deadlines`]): each delivered event first concludes the
@@ -5435,7 +5508,7 @@ pub fn serve_instance(
     core: &mut InstanceCore,
     prefix_globals: &[types::HostGlobalDef],
     imports: &[types::ImportBinding],
-    first: JobMsg,
+    first: Box<CallJob>,
     events: &crossbeam_channel::Receiver<RoutedEvent>,
     load: &InstanceLoad,
 ) {
@@ -5515,7 +5588,7 @@ pub fn serve_instance(
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                 // Every sender is gone. The handle's Retire precedes its own
                 // sender dropping, so runs still live here mean a panicked
-                // feeder dropped its routes without the usual ConnLost
+                // feeder dropped its routes without the usual connection-lost
                 // delivery. Nothing can ever wake them: fail them cleanly
                 // instead of stranding them.
                 while let Some(mut l) = live.pop() {
@@ -5563,12 +5636,8 @@ pub fn serve_instance(
                     // event sat in the queue. Discard like the demux's own
                     // late-frame rule — but loudly (silence hid #170).
                     match &event {
-                        RunEvent::Frame(f) => eprintln!(
-                            "[iso4-v8] discarding late {:?} frame (run already concluded)",
-                            f.message_type
-                        ),
-                        RunEvent::ConnLost(_) => eprintln!(
-                            "[iso4-v8] discarding late ConnLost (run already concluded)"
+                        RunEvent::Host(msg) => eprintln!(
+                            "[iso4-v8] discarding late {msg} (run already concluded)"
                         ),
                         RunEvent::Job(_) | RunEvent::Retire => {}
                     }
@@ -5579,11 +5648,13 @@ pub fn serve_instance(
                 };
                 let mut l = live.swap_remove(idx);
                 let event = match event {
-                    RunEvent::Frame(frame) => LoopEvent::Frame(frame),
-                    RunEvent::ConnLost(detail) => LoopEvent::SourceClosed(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        detail.unwrap_or_else(|| "connection closed".to_string()),
-                    )),
+                    RunEvent::Host(Inbound::ConnectionLost { detail }) => {
+                        LoopEvent::SourceClosed(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            detail.unwrap_or_else(|| "connection closed".to_string()),
+                        ))
+                    }
+                    RunEvent::Host(msg) => LoopEvent::Host(msg),
                     RunEvent::Job(_) | RunEvent::Retire => unreachable!("consumed above"),
                 };
                 note_turn_owner(&l.job);
@@ -5659,48 +5730,16 @@ fn dispatch_job(
     imports: &[types::ImportBinding],
     live: &mut Vec<LiveRun>,
     deadlines: &mut DeadlineHeap,
-    (mut job, respond): JobMsg,
+    mut job: Box<CallJob>,
 ) -> bool {
     if let Some(slot) = &job.ctl_slot {
         slot.set(core.guard.ctl()).ok();
     }
     note_turn_owner(&job);
 
-    // Direct-fd jobs run inline to completion — this thread is the fd's
-    // only reader for the duration, the pre-demux discipline. They must
-    // never coexist with suspended session runs: an inline run would stall
-    // the suspended runs' frames AND their deadlines (their guard is
-    // unarmed while parked), and its unconditional reason-reset inside
-    // run_call_on_core assumes sole occupancy. Today this holds by
-    // construction (fd jobs come only from the direct API and tests, where
-    // the instance serves one caller); the assert keeps it that way.
-    if let RunIo::Fd(fd) = job.io {
-        debug_assert!(
-            live.is_empty(),
-            "a direct-fd job must not run while session runs are suspended on the instance"
-        );
-        set_run_epilogue_spec(job.epilogue);
-        let outcome = run_call_on_core(
-            core,
-            prefix_globals,
-            job.limits,
-            &job.globals,
-            imports,
-            Some(fd),
-            Arc::clone(&job.call_id_counter),
-            &job.call,
-        );
-        if let Some(complete) = job.complete.take() {
-            complete(outcome);
-        } else if let Some(respond) = respond {
-            respond.send(outcome).ok();
-        }
-        return false; // run_call_on_core's caller judges taint via release
-    }
-
-    // Session (channel) jobs interleave. The reason cell may only be reset
-    // while nothing else is in flight; when runs are live it is guaranteed
-    // clear (a set reason ends the loop).
+    // Jobs interleave. The reason cell may only be reset while nothing else
+    // is in flight; when runs are live it is guaranteed clear (a set reason
+    // ends the loop).
     if live.is_empty() {
         core.reason.reset();
     }
@@ -5714,7 +5753,12 @@ fn dispatch_job(
     let bridge_log: Arc<Mutex<BridgeCallLog>> = Arc::new(Mutex::new(BridgeCallLog::default()));
 
     // The run's table entry (see run_call_on_core — the same prelude).
-    let entry = RunCallState::new(job.limits.max_stdout_bytes, job.limits.max_stderr_bytes);
+    let entry = RunCallState::new(
+        job.limits.max_stdout_bytes,
+        job.limits.max_stderr_bytes,
+        Arc::clone(&job.observer),
+        Addr::Run(job.epilogue.map_or(0, |e| e.run_id)),
+    );
     if core.warmup_logs_pending {
         core.warmup_logs_pending = false;
         let mut setup = core.run_table.setup_logs.borrow_mut();
@@ -5813,7 +5857,7 @@ fn dispatch_job(
                     start,
                     epilogue: job.epilogue,
                     source: None,
-                    sink: None,
+                    link: job.io.link(),
                     cpu_budget,
                     bridge_log,
                     bridge_error: Arc::new(OnceLock::new()),
@@ -5829,12 +5873,11 @@ fn dispatch_job(
                     turn_entered: Some(start),
                 },
                 job,
-                respond,
             };
             conclude_run(&mut core.isolate, &core.run_table, l, Err(f), tainted_now);
         }
         Ok((rs, outcome)) => {
-            let l = LiveRun { rs, job, respond };
+            let l = LiveRun { rs, job };
             match outcome {
                 ScanOutcome::Finished(result) => {
                     conclude_run(&mut core.isolate, &core.run_table, l, *result, tainted_now);
@@ -5894,7 +5937,7 @@ fn taint_sweep(
     // their callers hang on a dropped channel. Queued events belong to runs
     // failed above (or concluded earlier) — dropped with the instance.
     while let Ok(routed) = events.try_recv() {
-        let RunEvent::Job((mut job, respond)) = routed.event else {
+        let RunEvent::Job(mut job) = routed.event else {
             continue;
         };
         let outcome = CallOutcome {
@@ -5910,11 +5953,8 @@ fn taint_sweep(
             heap_used_bytes: 0,
             prefix_failed: false,
         };
-        if let Some(complete) = job.complete.take() {
-            complete(outcome);
-        } else if let Some(respond) = respond {
-            respond.send(outcome).ok();
-        }
+        let link = job.io.link();
+        finish_job(&mut job, link, outcome);
     }
 }
 
@@ -5966,23 +6006,17 @@ fn owned_bridge_error(err: &RunError) -> RunError {
 fn deliver_stream_frame(
     scope: &mut v8::PinScope,
     streams: *const StreamTable,
-    frame: &ipc::TsToRustFrame,
+    msg: Inbound,
 ) -> Result<(), RunError> {
-    // SAFETY: the table outlives the run frame; transient borrow.
+    // SAFETY: the table outlives the run's events; transient borrow.
     let table = unsafe { &*streams };
     let mut slot = table.slot.borrow_mut();
     let Some(state) = slot.as_mut() else {
-        return Ok(()); // no run armed (stray frame) — drop it
+        return Ok(()); // no run armed (stray message) — drop it
     };
 
-    match frame.message_type {
-        ipc::TsToRustMessageType::StreamChunk => {
-            let chunk = ipc::parse_stream_chunk_payload(&frame.payload)
-                .map_err(|e| RunError::Internal(format!("stream chunk decode: {e}")))?;
-            if state.run_id != 0 && chunk.run_id != state.run_id {
-                return Ok(());
-            }
-            let stream_id = chunk.stream_id;
+    match msg {
+        Inbound::StreamChunk { stream_id, data } => {
             let Some(stream) = state.streams.get_mut(&stream_id) else {
                 return Ok(());
             };
@@ -5990,8 +6024,7 @@ fn deliver_stream_frame(
                 return Ok(());
             }
             if let Some(pending) = stream.pending.take() {
-                let credit = chunk.data.len() as u32;
-                let data = chunk.data.to_vec();
+                let credit = data.len() as u32;
                 send_stream_credit(state, stream_id, credit);
                 drop(slot);
                 let value = bytes_to_uint8array(scope, data);
@@ -6013,30 +6046,22 @@ fn deliver_stream_frame(
             // races the pump.
             let cap = types::STREAM_CREDIT_WINDOW_BYTES as usize
                 + types::STREAM_CHUNK_MAX_BYTES as usize;
-            if stream.buffered_bytes + chunk.data.len() > cap {
+            if stream.buffered_bytes + data.len() > cap {
                 return Err(RunError::Internal(
                     "stream credit window violated by the host".to_string(),
                 ));
             }
-            stream.buffered_bytes += chunk.data.len();
-            stream.buffered.push_back(chunk.data.to_vec());
+            stream.buffered_bytes += data.len();
+            stream.buffered.push_back(data);
             Ok(())
         }
-        ipc::TsToRustMessageType::StreamEnd => {
-            let end = ipc::parse_stream_end_payload(&frame.payload)
-                .map_err(|e| RunError::Internal(format!("stream end decode: {e}")))?;
-            if state.run_id != 0 && end.run_id != state.run_id {
-                return Ok(());
-            }
-            let Some(stream) = state.streams.get_mut(&end.stream_id) else {
+        Inbound::StreamEnd { stream_id, error } => {
+            let Some(stream) = state.streams.get_mut(&stream_id) else {
                 return Ok(());
             };
-            let outcome: Result<(), String> = if end.ok {
-                Ok(())
-            } else {
-                Err(end
-                    .error
-                    .unwrap_or_else(|| "the host body source failed".to_string()))
+            let outcome: Result<(), String> = match error {
+                None => Ok(()),
+                Some(message) => Err(message),
             };
             stream.ended = Some(outcome.clone());
             // A read waiting on an empty buffer observes the end immediately.
@@ -7156,7 +7181,7 @@ fn next_check_for(
 //   1. Resolves the CALLING run's binding by its attributed token (one stub
 //      Function serves every run that binds the name).
 //   2. Serialises the JS arguments into one value blob (rejects function args).
-//   3. Writes a BridgeCall frame through the run's sink and returns a pending
+//   3. Sends a BridgeCall through the run's link and returns a pending
 //      Promise immediately — it never reads the socket; the instance loop
 //      delivers the BridgeResponse as a later turn and resolves the Promise.
 //   4. On handler error the loop rejects with a real Error carrying the
@@ -7196,7 +7221,7 @@ type PendingResolvers = Arc<Mutex<HashMap<u32, PendingResolver>>>;
 /// its slot, and sandbox code can stash that function across calls on a warm
 /// instance (`globalThis.saved = fetch`) — so the pointee must outlive every
 /// call, not just the one that installed it. The slot carries only identity:
-/// the stub name and the instance's run table. The per-run half (socket sink,
+/// the stub name and the instance's run table. The per-run half (link,
 /// counters, limits) lives in the calling run's [`RunCallState::stubs`] map,
 /// resolved per invocation by the attributed token — so one Function object
 /// serves every run that binds the name, each with its own state, and a run
@@ -7214,16 +7239,16 @@ struct StubSlot {
 type StubSlots = HashMap<String, Box<StubSlot>>;
 
 // Deliberately NOT Clone: bindings live behind an Rc in the run's stub map,
-// and a per-invocation deep clone (two Strings, several Arcs, a sink whose
-// clone takes the outbox producer lock) is the cost this shape removed.
+// and a per-invocation deep clone (two Strings, several Arcs) is the cost
+// this shape removed.
 struct GlobalCallbackData {
-    /// The owning run's wire id, leading every BridgeCall frame this stub
-    /// writes (0 = a direct-API run with no wire identity).
+    /// The owning run's address on every BridgeCall this stub sends
+    /// (0 = a direct-API run with no wire identity).
     run_id: u32,
-    /// Outbound frame sink for the session socket.  The callback writes a
-    /// BridgeCall frame here (non-blocking in practice) and returns immediately;
-    /// it never reads from the socket.
-    sink: ipc::FrameSink,
+    /// The run's link to the host. The callback sends a BridgeCall here
+    /// (non-blocking in practice) and returns immediately; the answer
+    /// arrives as a run event.
+    link: Arc<dyn HostLink>,
     /// Monotonic bridge call-ID counter, shared across all stubs in one run.
     call_id: Arc<AtomicU32>,
     /// First bridge error wins. Written once, read after evaluate() returns.
@@ -7305,10 +7330,10 @@ fn fatal_bridge_error(
 
 /// A single generic V8 FunctionCallback used for every host-declared global.
 ///
-/// Non-blocking: serialises arguments, writes a BridgeCall frame, stores a
+/// Non-blocking: serialises arguments, sends a BridgeCall, stores a
 /// PromiseResolver keyed by callId, and returns the pending Promise immediately.
-/// The run_module poll loop drives resolution by reading BridgeResponse frames
-/// and calling perform_microtask_checkpoint().
+/// The turn loop drives resolution when the BridgeResponse arrives and runs
+/// perform_microtask_checkpoint().
 fn bridge_global_callback(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -7402,7 +7427,7 @@ fn bridge_global_callback(
     // leaf path (targetKind = 1) and the ID never leaves the process.
     let (target, first_arg, record_name) = match &data.import_handles {
         None => (
-            types::BridgeTarget::Global(data.stub_name.as_str()),
+            types::BridgeTarget::Global(data.stub_name.clone()),
             0,
             data.record_name.clone(),
         ),
@@ -7425,8 +7450,8 @@ fn bridge_global_callback(
             let entry = &table[handle as usize];
             (
                 types::BridgeTarget::Import {
-                    specifier: entry.specifier.as_str(),
-                    path: &entry.path,
+                    specifier: entry.specifier.clone(),
+                    path: entry.path.clone(),
                 },
                 1, // the handle ID never leaves the process
                 entry.record_name.clone(),
@@ -7472,18 +7497,13 @@ fn bridge_global_callback(
         }
     };
 
-    // ── Assign call ID and build the BridgeCall header ────────────────────
+    // ── Assign call ID and size the BridgeCall ────────────────────────────
     //
-    // Header only: the arguments stay in the buffer the serializer produced,
-    // and are written straight after it. Copying them into a combined payload
-    // first would double the peak memory of every bridge call — that memory
-    // is outside the V8 heap, so `memoryMb` does not account for it, and it
-    // lands in the process RSS the warm-instance ceiling watches, where one
-    // run's arguments can push a shared child into shedding. It would also
-    // put the copy *before* the size check, leaving `maxBridgeCallBytes` able
-    // to refuse the send but not the allocation.
+    // `maxBridgeCallBytes` counts the serialized arguments, the only part of
+    // a call whose size the sandbox controls; the frontend's own framing is
+    // not the sandbox's doing. The buffer moves to the frontend uncopied.
     let call_id = data.call_id.fetch_add(1, Ordering::Relaxed);
-    let Ok(args_blob_len) = u32::try_from(args_blob.len()) else {
+    if u32::try_from(args_blob.len()).is_err() {
         record_blocked(u32::MAX);
         fatal_bridge_error(
             scope,
@@ -7491,14 +7511,8 @@ fn bridge_global_callback(
             RunError::BridgeCallPayloadTooLarge,
         );
         return;
-    };
-    let bridge_call_header = wire::encode_bridge_call_header(
-        data.run_id,
-        call_id,
-        target,
-        args_blob_len,
-    );
-    let payload_len = bridge_call_header.len() + args_blob.len();
+    }
+    let payload_len = args_blob.len();
 
     if data.max_bridge_call_bytes > 0 && payload_len > data.max_bridge_call_bytes as usize {
         record_blocked(u32::try_from(payload_len).unwrap_or(u32::MAX));
@@ -7520,12 +7534,15 @@ fn bridge_global_callback(
         return;
     }
 
-    // ── Write BridgeCall frame (queued; blocks only if the host stopped
-    // draining the connection, bounded by the outbox stall timeout) ────────
-    if let Err(e) = data.sink.write_parts(
-        ipc::RustToTsMessageType::BridgeCall,
-        bridge_call_header,
-        args_blob,
+    // ── Send the BridgeCall (queued; blocks only if the host stopped
+    // draining, bounded by the frontend's stall timeout) ──────────────────
+    if let Err(e) = data.link.send(
+        Addr::Run(data.run_id),
+        Outbound::BridgeCall {
+            call_id,
+            target,
+            args: args_blob,
+        },
     ) {
         record_blocked(u32::try_from(payload_len).unwrap_or(u32::MAX));
         fatal_bridge_error(
@@ -7536,7 +7553,7 @@ fn bridge_global_callback(
         return;
     }
 
-    // The frame reached the host — record the call for the run's bridge
+    // The call reached the host — record it for the run's bridge
     // report under its resolved public name. Settled by the poll loop when
     // the matching BridgeResponse arrives.
     data.log
@@ -7602,7 +7619,7 @@ fn install_bridge_globals(
     token: u64,
     table: *const RunTable,
     run_id: u32,
-    sink: ipc::FrameSink,
+    link: Arc<dyn HostLink>,
     call_id: Arc<AtomicU32>,
     bridge_error: Arc<OnceLock<RunError>>,
     max_bridge_call_bytes: u32,
@@ -7627,7 +7644,7 @@ fn install_bridge_globals(
         });
         // This run's binding for the name — the callback resolves it per
         // invocation by the attributed token, so co-resident runs never see
-        // each other's sockets or counters.
+        // each other's links or counters.
         {
             // SAFETY: `table` is the instance-lifetime RunTable Box.
             let table = unsafe { &*table };
@@ -7639,7 +7656,7 @@ fn install_bridge_globals(
                 spec.stub_name.clone(),
                 std::rc::Rc::new(GlobalCallbackData {
                     run_id,
-                    sink: sink.clone(),
+                    link: Arc::clone(&link),
                     call_id: Arc::clone(&call_id),
                     bridge_error: Arc::clone(&bridge_error),
                     stub_name: spec.stub_name.clone(),
@@ -7850,7 +7867,7 @@ fn install_public_global(
 /// `typeof fetch` inside a prefix matches what run() code sees.
 ///
 /// The placeholders are captured in the snapshot; every run overwrites the
-/// same names with live socket-backed stubs (`install_bridge_globals`).
+/// same names with live link-backed stubs (`install_bridge_globals`).
 fn install_prefix_bridge_placeholders(
     scope: &mut v8::PinScope,
     globals: &[HostGlobalDef],
@@ -8841,7 +8858,17 @@ fn append_console_line(
         return;
     }
     // SAFETY: entry pointers are valid for the remainder of the turn.
-    append_capped_line(&mut unsafe { &*state }.logs.borrow_mut(), stdout, line);
+    let entry = unsafe { &*state };
+    entry.observer.console(
+        entry.addr,
+        if stdout {
+            ConsoleStream::Stdout
+        } else {
+            ConsoleStream::Stderr
+        },
+        &line,
+    );
+    append_capped_line(&mut entry.logs.borrow_mut(), stdout, line);
 }
 
 /// Push one console line into `buffers`, honouring its byte caps. Lines that
@@ -9365,6 +9392,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             None,
             None,
+            Arc::new(crate::link::NoopObserver),
         )
     }
 
@@ -9423,6 +9451,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             None,
             None,
+            Arc::new(crate::link::NoopObserver),
         )
         .map_err(|failure| failure.error)
     }
@@ -9730,6 +9759,50 @@ mod tests {
     fn console_log_does_not_bleed_into_stderr() {
         let out = run_ok(r#"console.log("stdout only"); export default 1"#);
         assert!(out.stderr.is_empty());
+    }
+
+    #[test]
+    fn console_lines_reach_the_observer_before_the_caps_apply() {
+        struct Recorder(Mutex<Vec<(Addr, ConsoleStream, String)>>);
+        impl Observer for Recorder {
+            fn console(&self, to: Addr, stream: ConsoleStream, line: &str) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((to, stream, line.to_string()));
+            }
+        }
+        init_platform();
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let out = execute_with_io(
+            "console.log('a'); console.error('b'); console.log('c'.repeat(100)); export default 1",
+            None,
+            Limits {
+                max_stdout_bytes: 1,
+                ..Default::default()
+            },
+            &[],
+            &[],
+            RunIo::None,
+            0,
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            Arc::clone(&recorder) as Arc<dyn Observer>,
+        )
+        .unwrap();
+        // The result keeps the capped buffers; the observer saw every line.
+        assert_eq!(out.stdout, vec!["a".to_string()]);
+        assert_eq!(out.stderr, vec!["b".to_string()]);
+        let lines = recorder.0.lock().unwrap();
+        assert_eq!(
+            *lines,
+            vec![
+                (Addr::Run(0), ConsoleStream::Stdout, "a".to_string()),
+                (Addr::Run(0), ConsoleStream::Stderr, "b".to_string()),
+                (Addr::Run(0), ConsoleStream::Stdout, "c".repeat(100)),
+            ]
+        );
     }
 
     #[test]
@@ -10425,12 +10498,7 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &large),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(0, &large));
             },
         );
         h.join().unwrap();
@@ -10498,7 +10566,7 @@ mod tests {
     // Real module resolver wired up: source modules compile through V8 directly,
     // host modules become synthetic v8::Modules whose exports are bridge stubs.
     // Host-import bridge call tests live further down with the other
-    // bridge-call integration tests because they need a session socket.
+    // bridge-call integration tests because they need a host.
 
     #[test]
     fn unknown_import_is_module_not_found() {
@@ -10603,7 +10671,7 @@ mod tests {
             },
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("spin", &[]),
         )
@@ -11073,7 +11141,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11097,7 +11165,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -11129,7 +11197,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11161,7 +11229,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -11183,7 +11251,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -11203,7 +11271,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -11222,7 +11290,7 @@ mod tests {
             Limits::default(), // grace_ms: 0
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -11244,7 +11312,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11268,7 +11336,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -11287,18 +11355,9 @@ mod tests {
         // settled: the fire-and-forget frame was written during the run, the
         // response is consumed by the grace poll loop.
         let (out, h) = {
-            use std::mem::ManuallyDrop;
-            use std::os::unix::io::AsRawFd;
-            let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-            let client = ManuallyDrop::new(client);
-            let fd = client.as_raw_fd();
-            let handle = spawn_responder(server, |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Number(42.0)),
-                )
-                .unwrap();
+            let (io, host) = test_io();
+            let handle = spawn_responder(host, |s| {
+                s.send(bridge_resp_ok(0, &WireValue::Number(42.0)));
             });
             let result = execute(
                 "waitUntil((async () => { console.log('bg:' + (await myTool())) })())\n\
@@ -11307,7 +11366,7 @@ mod tests {
                 grace_limits(),
                 &[HostGlobalDef::bridge("myTool")],
                 &[],
-                Some(fd),
+                io,
                 Arc::new(AtomicU32::new(0)),
                 None,
             );
@@ -11344,7 +11403,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("park", &[]),
         );
@@ -11361,7 +11420,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("probe", &[]),
         );
@@ -11393,7 +11452,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11444,7 +11503,7 @@ mod tests {
             Limits::default(),
             &[],
             &imports,
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11468,7 +11527,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11518,9 +11577,8 @@ mod tests {
         // generic sandbox code enumerating the global and invoking every key.
         // The names stay reachable by string (hygiene, not secrecy), and
         // host-declared names stay enumerable like `fetch` in a browser.
-        use std::os::unix::io::AsRawFd;
         init_platform();
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (io, host) = test_io();
         let globals = [HostGlobalDef::Shim {
             name: "fetch".to_string(),
             shim: "(raw) => raw".to_string(),
@@ -11546,12 +11604,12 @@ mod tests {
             Limits::default(),
             &globals,
             &imports,
-            Some(client.as_raw_fd()),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
         .unwrap();
-        drop(server);
+        drop(host);
         assert_eq!(
             get_default(&out).as_deref(),
             Some("0|0|function|function|true")
@@ -11562,9 +11620,8 @@ mod tests {
     fn a_non_enumerable_global_is_hidden_but_callable() {
         // The host's per-global opt-out. Hidden names stay reachable
         // (hygiene, not secrecy); undeclared-flag names stay enumerable.
-        use std::os::unix::io::AsRawFd;
         init_platform();
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (io, host) = test_io();
         let globals = [
             HostGlobalDef::Bridge {
                 name: "hiddenTool".to_string(),
@@ -11590,12 +11647,12 @@ mod tests {
             Limits::default(),
             &globals,
             &[],
-            Some(client.as_raw_fd()),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
         .unwrap();
-        drop(server);
+        drop(host);
         assert_eq!(
             get_default(&out).as_deref(),
             Some("false|false|true|function|42")
@@ -11606,9 +11663,8 @@ mod tests {
     fn a_non_enumerable_global_has_the_same_surface_at_prepare_and_run_time() {
         // The between-runs placeholder installs with the declared flag, so
         // enumeration inside the prefix and inside a run agree.
-        use std::os::unix::io::AsRawFd;
         init_platform();
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (io, host) = test_io();
         let globals = [HostGlobalDef::Bridge {
             name: "tool".to_string(),
             enumerable: false,
@@ -11626,12 +11682,12 @@ mod tests {
             Limits::default(),
             &globals,
             &[],
-            Some(client.as_raw_fd()),
+            io,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
         .unwrap();
-        drop(server);
+        drop(host);
         assert_eq!(
             value_of(&out),
             WireValue::String("false|function|false|function".to_string())
@@ -11684,7 +11740,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11709,7 +11765,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11741,7 +11797,7 @@ mod tests {
                 Limits::default(),
                 &[],
                 &[],
-                None,
+                RunIo::None,
                 Arc::new(AtomicU32::new(0)),
                 &call_spec("default", &[]),
             )
@@ -11764,7 +11820,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11789,7 +11845,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("bump", &[]),
         )
@@ -11799,7 +11855,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("read", &[]),
         )
@@ -11820,7 +11876,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11840,7 +11896,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -11860,7 +11916,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -12027,29 +12083,12 @@ mod tests {
         // A run with a tight cpuTimeMs limit (50 ms) but a slow bridge
         // response (100 ms sleep) must NOT hit ERR_CPU_TIMEOUT because
         // cpu_budget.leave() is called before the blocking bridge read.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        use std::os::unix::net::UnixStream;
-
-        let (mut server, client) = UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let responder = std::thread::spawn(move || {
-            let _ = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            let _ = host.recv();
             std::thread::sleep(Duration::from_millis(100));
-            let mut payload = Vec::new();
-            payload.extend_from_slice(&0u32.to_be_bytes()); // runId
-            payload.extend_from_slice(&0u32.to_be_bytes()); // callId
-            payload.push(1); // ok = true
-            payload.push(1); // value present
-            push_value_blob(&mut payload, &WireValue::Number(1.0));
-            ipc::write_ts_to_rust_frame(
-                &mut server,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &payload,
-            )
-            .unwrap();
+            host.send(bridge_resp_ok(0, &WireValue::Number(1.0)));
         });
 
         let out = execute(
@@ -12062,7 +12101,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         );
@@ -12203,93 +12242,134 @@ mod tests {
     // ── Bridge tests ───────────────────────────────────────────────────────────────────
     //
     // These tests exercise the full bridge round-trip: V8 calls a host global,
-    // a responder thread reads the BridgeCall frame and writes a BridgeResponse,
+    // a responder thread receives the BridgeCall and sends a BridgeResponse,
     // and we assert on the returned JS value or error code.
 
-    /// Append a value slot: `u32 byteLength` + V8 serialization blob.
-    fn push_value_blob(out: &mut Vec<u8>, value: &WireValue) {
-        let blob = testval::to_blob(value);
-        out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-        out.extend_from_slice(&blob);
+    /// The host's end of a run's link: the run's outbound messages, and the
+    /// channel its events arrive on.
+    struct TestHost {
+        out: crossbeam_channel::Receiver<(Addr, Outbound)>,
+        events: RunEventSender,
     }
 
-    /// Encode a successful BridgeResponse payload (runId 0, callId, ok=1,
-    /// value). Direct-API runs have no wire identity, so fixtures echo 0.
-    fn bridge_resp_ok(call_id: u32, value: &WireValue) -> Vec<u8> {
-        let mut p = Vec::new();
-        p.extend_from_slice(&0u32.to_be_bytes()); // runId
-        p.extend_from_slice(&call_id.to_be_bytes());
-        p.push(1); // ok
-        p.push(1); // value present
-        push_value_blob(&mut p, value);
-        p
+    impl TestHost {
+        fn send(&self, msg: Inbound) {
+            self.events
+                .send(RoutedEvent::new(0, RunEvent::Host(msg)))
+                .ok();
+        }
+
+        /// The next outbound message, or `None` after `timeout` of silence.
+        /// A direct-API run addresses everything to run 0.
+        fn recv_timeout(&self, timeout: Duration) -> Option<Outbound> {
+            self.out.recv_timeout(timeout).ok().map(|(addr, msg)| {
+                assert_eq!(addr, Addr::Run(0), "direct-API runs carry run id 0");
+                msg
+            })
+        }
+
+        /// The next outbound message; silence for 10 s fails the test.
+        fn recv(&self) -> Outbound {
+            self.recv_timeout(Duration::from_secs(10))
+                .expect("the run sends a message")
+        }
     }
 
-    /// Encode an error BridgeResponse payload (callId, ok=0, name/message/fields).
+    /// A one-off run's I/O over an in-memory link, plus the host's end of it.
+    fn test_io() -> (RunIo, TestHost) {
+        let (link, out) = crate::link::channel_link();
+        let (events_tx, events) = crossbeam_channel::unbounded();
+        (
+            RunIo::Session { events, link },
+            TestHost {
+                out,
+                events: events_tx,
+            },
+        )
+    }
+
+    /// The parts of a `BridgeCall`: callId, targetKind, specifier, name path,
+    /// decoded args.
+    fn bridge_call_parts(msg: Outbound) -> (u32, u8, Option<String>, Vec<String>, Vec<WireValue>) {
+        let Outbound::BridgeCall {
+            call_id,
+            target,
+            args,
+        } = msg
+        else {
+            panic!("expected a BridgeCall, got {msg:?}");
+        };
+        let (kind, specifier, path) = match target {
+            types::BridgeTarget::Global(name) => (0, None, vec![name]),
+            types::BridgeTarget::Import { specifier, path } => (1, Some(specifier), path),
+        };
+        // The whole argument list is one value slot holding an array.
+        let args = match testval::from_blob(&args) {
+            WireValue::Array(items) => items,
+            other => panic!("BridgeCall args must decode to an array, got {other:?}"),
+        };
+        (call_id, kind, specifier, path, args)
+    }
+
+    /// A successful BridgeResponse carrying `value`.
+    fn bridge_resp_ok(call_id: u32, value: &WireValue) -> Inbound {
+        Inbound::BridgeResponse {
+            call_id,
+            result: Ok(Some(testval::to_blob(value))),
+        }
+    }
+
+    /// An error BridgeResponse (name/message/fields).
     fn bridge_resp_err_full(
         call_id: u32,
         name: &str,
         message: &str,
         fields: Option<&WireValue>,
-    ) -> Vec<u8> {
-        let mut p = Vec::new();
-        p.extend_from_slice(&0u32.to_be_bytes()); // runId
-        p.extend_from_slice(&call_id.to_be_bytes());
-        p.push(0); // ok = false
-        for s in &["ERR_HOST_BRIDGE", name, message] {
-            let b = s.as_bytes();
-            p.extend_from_slice(&(b.len() as u32).to_be_bytes());
-            p.extend_from_slice(b);
+    ) -> Inbound {
+        Inbound::BridgeResponse {
+            call_id,
+            result: Err(BridgeErrorPayload {
+                name: name.to_string(),
+                message: message.to_string(),
+                fields: fields.map(testval::to_blob),
+            }),
         }
-        p.push(0); // no stack
-        match fields {
-            Some(f) => {
-                p.push(1);
-                push_value_blob(&mut p, f);
-            }
-            None => p.push(0),
-        }
-        p
     }
 
-    /// Encode an error BridgeResponse payload (callId, ok=0, message).
-    fn bridge_resp_err(call_id: u32, message: &str) -> Vec<u8> {
+    /// An error BridgeResponse with name `Error` and `message`.
+    fn bridge_resp_err(call_id: u32, message: &str) -> Inbound {
         bridge_resp_err_full(call_id, "Error", message, None)
     }
 
-    /// Spawn a single-response bridge responder thread.
-    /// Reads one BridgeCall frame, calls `respond`, drops the server.
+    /// Spawn a single-response bridge responder thread: waits for one
+    /// BridgeCall, calls `respond`, drops the host (closing the run's events).
     fn spawn_responder(
-        mut server: std::os::unix::net::UnixStream,
-        respond: impl FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static,
+        host: TestHost,
+        respond: impl FnOnce(&TestHost) + Send + 'static,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let _ = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            respond(&mut server);
+            let _ = host.recv();
+            respond(&host);
         })
     }
 
-    /// Run code with one declared global, backed by a socket pair.
+    /// Run code with one declared global over an in-memory link.
     /// Returns the execute result and the responder JoinHandle.
     fn run_with_bridge(
         code: &str,
         global: &str,
         limits: Limits,
-        respond: impl FnOnce(&mut std::os::unix::net::UnixStream) + Send + 'static,
+        respond: impl FnOnce(&TestHost) + Send + 'static,
     ) -> (Result<Output, FailureOutput>, std::thread::JoinHandle<()>) {
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
-        let handle = spawn_responder(server, respond);
+        let (io, host) = test_io();
+        let handle = spawn_responder(host, respond);
         let result = execute(
             code,
             None,
             limits,
             &[HostGlobalDef::bridge(global)],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         );
@@ -12307,12 +12387,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Number(42.0)),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(0, &WireValue::Number(42.0)));
             },
         );
         h.join().unwrap();
@@ -12334,10 +12409,9 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                let mut payload = 7u32.to_be_bytes().to_vec();
-                payload.push(0); // soft
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::Terminate, &payload)
-                    .unwrap();
+                s.send(Inbound::Terminate {
+                    mode: types::TerminateMode::Soft,
+                });
             },
         );
         h.join().unwrap();
@@ -12368,12 +12442,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::String("hello bridge".into())),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(0, &WireValue::String("hello bridge".into())));
             },
         );
         h.join().unwrap();
@@ -12383,27 +12452,17 @@ mod tests {
     #[test]
     fn bridge_call_passes_args_to_host() {
         // Verify the BridgeCall frame actually contains the argument we passed.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let responder = std::thread::spawn(move || {
-            let mut server = server;
-            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            assert_eq!(frame.message_type, ipc::RustToTsMessageType::BridgeCall);
+            let host = host;
+            let frame = host.recv();
             // callId (4) + targetKind (1) + specifier absent (1) + name len (4)
             // + "add" (3) = 13, then the args value slot: u32 length + blob.
-            let (_, _, _, export_name, args) = parse_bridge_call(&frame.payload);
+            let (_, _, _, export_name, args) = bridge_call_parts(frame);
             assert_eq!(export_name, ["add"]);
             assert_eq!(args, vec![WireValue::Number(7.0)]);
-            ipc::write_ts_to_rust_frame(
-                &mut server,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(0, &WireValue::Number(99.0)),
-            )
-            .unwrap();
+            host.send(bridge_resp_ok(0, &WireValue::Number(99.0)));
         });
 
         let out = execute(
@@ -12416,7 +12475,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("add")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -12436,12 +12495,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err(0, "handler blew up"),
-                )
-                .unwrap();
+                s.send(bridge_resp_err(0, "handler blew up"));
             },
         );
         h.join().unwrap();
@@ -12464,15 +12518,10 @@ mod tests {
             },
             |s| {
                 let blob = crate::blob::deep_array_blob(1_000_000);
-                let mut p = Vec::new();
-                p.extend_from_slice(&0u32.to_be_bytes()); // runId
-                p.extend_from_slice(&0u32.to_be_bytes()); // callId
-                p.push(1); // ok
-                p.push(1); // value present
-                p.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-                p.extend_from_slice(&blob);
-                ipc::write_ts_to_rust_frame(s, ipc::TsToRustMessageType::BridgeResponse, &p)
-                    .unwrap();
+                s.send(Inbound::BridgeResponse {
+                    call_id: 0,
+                    result: Ok(Some(blob)),
+                });
             },
         );
         h.join().unwrap();
@@ -12498,12 +12547,7 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err_full(0, "WorkflowTimeout", "took too long", Some(&fields)),
-                )
-                .unwrap();
+                s.send(bridge_resp_err_full(0, "WorkflowTimeout", "took too long", Some(&fields)));
             },
         );
         h.join().unwrap();
@@ -12554,12 +12598,7 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err_full(0, "TypeError", "bad input", Some(&fields)),
-                )
-                .unwrap();
+                s.send(bridge_resp_err_full(0, "TypeError", "bad input", Some(&fields)));
             },
         );
         h.join().unwrap();
@@ -12594,12 +12633,7 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err_full(0, "Error", "real message", Some(&fields)),
-                )
-                .unwrap();
+                s.send(bridge_resp_err_full(0, "Error", "real message", Some(&fields)));
             },
         );
         h.join().unwrap();
@@ -12652,12 +12686,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_err_full(0, "NonRetryableError", "nope", None),
-                )
-                .unwrap();
+                s.send(bridge_resp_err_full(0, "NonRetryableError", "nope", None));
             },
         );
         h.join().unwrap();
@@ -12674,19 +12703,11 @@ mod tests {
     #[test]
     fn bridge_call_function_argument_rejected() {
         // Function args are rejected before any socket write.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
-        // The bridge errors before writing to the socket, so no frame arrives.
-        // Give the server a short read timeout to avoid hanging.
-        server
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .ok();
+        // The bridge errors before sending, so no message arrives.
         let responder = std::thread::spawn(move || {
-            let _ = ipc::read_rust_to_ts_frame(&mut server); // may timeout — ignore
+            let _ = host.recv_timeout(Duration::from_millis(500)); // may time out — ignore
         });
 
         let err = execute(
@@ -12699,7 +12720,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -12717,18 +12738,11 @@ mod tests {
     fn bridge_call_outbound_payload_too_large_is_rejected() {
         // A call payload larger than max_bridge_payload_bytes must be caught
         // before writing to the socket and surface as BridgePayloadTooLarge.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
-        // The bridge aborts before writing to the socket, so no frame arrives.
-        server
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .ok();
+        // The bridge aborts before sending, so no message arrives.
         let responder = std::thread::spawn(move || {
-            let _ = ipc::read_rust_to_ts_frame(&mut server); // may timeout — ignore
+            let _ = host.recv_timeout(Duration::from_millis(500)); // may time out — ignore
         });
 
         // Pass a 10-byte string argument but set the limit to 4 bytes.
@@ -12743,7 +12757,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -12759,40 +12773,23 @@ mod tests {
 
     #[test]
     fn bridge_call_inbound_response_too_large_is_rejected() {
-        // BridgeResponse frame reads are capped by memory_mb (the sandbox
-        // cannot hold more data than its own memory budget).
-        // memory_mb = 1 → frame cap = 1 MiB. The response below is ~41 bytes
-        // which fits easily, so we use a very small memory_mb value (1 byte
-        // expressed in MB rounds to 1 MiB minimum via saturating_mul). We
-        // instead test with a response larger than memory_mb * 1 MiB by using
-        // memory_mb = 0 (no memory limit set → 64 MiB cap) and crafting a
-        // large string. To keep the test fast we just verify the frame-cap
-        // logic: set memory_mb = 1 (1 MiB cap) and send a response that fits,
-        // confirming the run succeeds, then rely on the wall-timeout path for
-        // the too-large case (testing the full OOM path is too slow here).
-        //
-        // The meaningful invariant is tested in the wall_timeout test: if the
-        // host never sends a valid frame the sandbox times out cleanly.
-        // Frame-cap rejection manifests as an Internal socket error which
-        // ultimately surfaces as WallTimeout (wall guard fires first).
+        // The per-run inbound allowance (soft_memory_mb) is enforced by the
+        // frontend before a message reaches the engine; session.rs tests
+        // cover the refusal. Here: a small response under a small budget
+        // still arrives and the run succeeds.
         let (out, h) = run_with_bridge(
             "export default await myTool()",
             "myTool",
             Limits {
                 cpu_time_ms: 5_000,
                 wall_time_ms: 10_000,
-                soft_memory_mb: 64, // sets the BridgeResponse frame cap to 64 MiB
+                soft_memory_mb: 64,
                 hard_memory_mb: 64,
                 ..Default::default()
             },
             |s| {
                 // Response is tiny — should succeed.
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::String("ok".into())),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(0, &WireValue::String("ok".into())));
             },
         );
         h.join().unwrap();
@@ -12813,12 +12810,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Number(7.0)),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(0, &WireValue::Number(7.0)));
             },
         );
         h.join().unwrap();
@@ -12838,12 +12830,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::String("big payload".into())),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(0, &WireValue::String("big payload".into())));
             },
         );
         h.join().unwrap();
@@ -12853,12 +12840,8 @@ mod tests {
     #[test]
     fn bridge_call_wall_timeout_mid_wait() {
         // If the host never responds, the wall guard terminates V8.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
-        let _server_guard = server; // keep fd open, never respond
+        let (io, host) = test_io();
+        let _host_guard = host; // keep the events open, never respond
 
         let err = execute(
             "export default await myTool()",
@@ -12870,7 +12853,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -12894,18 +12877,13 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(
+                s.send(bridge_resp_ok(
                         0,
                         &WireValue::Object(vec![
                             ("x".to_string(), WireValue::Number(3.0)),
                             ("y".to_string(), WireValue::Number(4.0)),
                         ]),
-                    ),
-                )
-                .unwrap();
+                    ));
             },
         );
         h.join().unwrap();
@@ -12914,14 +12892,10 @@ mod tests {
 
     #[test]
     fn bridge_wait_respects_wall_timeout() {
-        // If the TS host never responds and a wall limit is set, the callback's
-        // own socket read-timeout fires and terminates V8 with WallTimeout.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
-        let _guard = server; // keep open, never respond
+        // If the host never responds and a wall limit is set, the run's wall
+        // deadline fires and it ends with WallTimeout.
+        let (io, host) = test_io();
+        let _guard = host; // keep open, never respond
 
         let err = execute(
             "export default await myTool()",
@@ -12933,7 +12907,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -12961,19 +12935,14 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(
+                s.send(bridge_resp_ok(
                         0,
                         &WireValue::Object(vec![
                             ("x".to_string(), WireValue::Number(1.0)),
                             ("__proto__".to_string(), WireValue::Number(99.0)),
                             ("y".to_string(), WireValue::Number(2.0)),
                         ]),
-                    ),
-                )
-                .unwrap();
+                    ));
             },
         );
         h.join().unwrap();
@@ -12998,10 +12967,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(
+                s.send(bridge_resp_ok(
                         0,
                         &WireValue::Object(vec![
                             ("x".to_string(), WireValue::Number(1.0)),
@@ -13013,9 +12979,7 @@ mod tests {
                                 )]),
                             ),
                         ]),
-                    ),
-                )
-                .unwrap();
+                    ));
             },
         );
         h.join().unwrap();
@@ -13024,33 +12988,15 @@ mod tests {
 
     // ── max_bridge_calls limit ─────────────────────────────────────────────
 
-    /// Drain N BridgeCall frames from `server`, responding to each with the
-    /// given WireValue. Returns the number of calls actually received before
-    /// the socket is closed/times-out.
-    fn drain_bridge_calls(
-        mut server: std::os::unix::net::UnixStream,
-        max: usize,
-        value: WireValue,
-    ) -> usize {
+    /// Drain N BridgeCalls from `host`, responding to each with the given
+    /// WireValue. Returns the number of calls actually received before the
+    /// run goes quiet.
+    fn drain_bridge_calls(host: TestHost, max: usize, value: WireValue) -> usize {
         let mut count = 0;
-        server
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .ok();
         while count < max {
-            match ipc::read_rust_to_ts_frame(&mut server) {
-                Ok(frame) if frame.message_type == ipc::RustToTsMessageType::BridgeCall => {
-                    // Parse call_id from the first 4 bytes of the payload.
-                    let call_id = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
-                    let resp = bridge_resp_ok(call_id, &value);
-                    if ipc::write_ts_to_rust_frame(
-                        &mut server,
-                        ipc::TsToRustMessageType::BridgeResponse,
-                        &resp,
-                    )
-                    .is_err()
-                    {
-                        break;
-                    }
+            match host.recv_timeout(Duration::from_millis(500)) {
+                Some(Outbound::BridgeCall { call_id, .. }) => {
+                    host.send(bridge_resp_ok(call_id, &value));
                     count += 1;
                 }
                 _ => break,
@@ -13063,14 +13009,10 @@ mod tests {
     fn bridge_call_limit_exceeded_after_limit_calls() {
         // The sandbox calls myTool 5 times; limit is 3. The first 3 succeed,
         // the 4th triggers ERR_BRIDGE_CALL_LIMIT_EXCEEDED before any I/O.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 10, WireValue::Number(1.0)));
 
         let err = execute(
             // 5 sequential awaited calls
@@ -13090,7 +13032,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13113,14 +13055,10 @@ mod tests {
     fn bridge_call_limit_zero_means_no_limit() {
         // max_bridge_calls = 0 disables the count limit entirely.
         // All 5 calls should succeed.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 5, WireValue::Number(10.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 5, WireValue::Number(10.0)));
 
         let out = execute(
             "let n = 0; \
@@ -13139,7 +13077,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13152,14 +13090,10 @@ mod tests {
     #[test]
     fn bridge_call_exactly_at_limit_succeeds() {
         // max_bridge_calls = 3; sandbox makes exactly 3 calls → should succeed.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 10, WireValue::Number(1.0)));
 
         let out = execute(
             "let n = 0; \
@@ -13176,7 +13110,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13190,15 +13124,11 @@ mod tests {
     fn bridge_call_limit_is_shared_across_globals() {
         // max_bridge_calls applies across all stubs in a run.
         // Two globals (toolA + toolB) share the same counter.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         // Respond to up to 4 bridge calls, regardless of which global.
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 4, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 4, WireValue::Number(1.0)));
 
         let err = execute(
             // 2 calls to toolA + 2 calls to toolB = 4 total; limit = 3
@@ -13216,7 +13146,7 @@ mod tests {
                 HostGlobalDef::bridge("toolB"),
             ],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13238,14 +13168,10 @@ mod tests {
     fn bridge_calls_recorded_on_success_without_limit() {
         // max_bridge_calls = 0 (unlimited): calls are still recorded and
         // reported on the success output, with metadata.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 3, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 3, WireValue::Number(1.0)));
 
         let out = execute(
             "await myTool(); await myTool(); await myTool(); export default 'done'",
@@ -13258,7 +13184,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13269,7 +13195,7 @@ mod tests {
         for record in &out.bridge_calls {
             assert_eq!(record.name, "myTool");
             assert_eq!(record.outcome, types::BridgeCallOutcome::Ok, "served call must settle ok");
-            assert!(record.arg_bytes > 0, "call payload has at least the header");
+            assert!(record.arg_bytes > 0, "the args blob has bytes");
             assert!(record.response_bytes > 0, "number response has bytes");
             assert!(record.duration_ms >= 0.0);
         }
@@ -13285,14 +13211,10 @@ mod tests {
     fn bridge_calls_recorded_on_limit_failure() {
         // The violating attempt is recorded too, flagged as blocked:
         // limit 3 → 4 records, the last one blocked.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 10, WireValue::Number(1.0)));
 
         let failure = execute(
             "await myTool(); await myTool(); await myTool(); await myTool(); \
@@ -13306,7 +13228,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13328,14 +13250,10 @@ mod tests {
         // if the error propagated uncaught). The violation must terminate
         // execution: the run fails even though every throw is caught, and no
         // attempt past the limit reaches the host.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 10, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 10, WireValue::Number(1.0)));
 
         let err = execute(
             "let n = 0; \
@@ -13352,7 +13270,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13374,14 +13292,10 @@ mod tests {
     fn bridge_payload_too_large_is_uncatchable() {
         // An oversized argument payload terminates the run even when the
         // sandbox catches the error; the call never reaches the host.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 1, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 1, WireValue::Number(1.0)));
 
         let err = execute(
             "try { await myTool('x'.repeat(100000)); } catch (e) { /* swallowed */ } \
@@ -13395,7 +13309,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13414,14 +13328,10 @@ mod tests {
     fn bridge_function_argument_is_uncatchable() {
         // Function arguments cannot cross the bridge; the violation terminates
         // the run even when the sandbox catches the error.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle =
-            std::thread::spawn(move || drain_bridge_calls(server, 1, WireValue::Number(1.0)));
+            std::thread::spawn(move || drain_bridge_calls(host, 1, WireValue::Number(1.0)));
 
         let err = execute(
             "try { await myTool(() => 1); } catch (e) { /* swallowed */ } \
@@ -13434,7 +13344,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13458,25 +13368,15 @@ mod tests {
     fn bridge_response_with_wrong_call_id_is_rejected() {
         // A BridgeResponse whose callId does not match the one Rust sent must
         // be rejected as ERR_INTERNAL (cross-run contamination guard).
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle = std::thread::spawn(move || {
             // Read the BridgeCall and reply with a deliberately wrong callId.
-            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            assert_eq!(frame.message_type, ipc::RustToTsMessageType::BridgeCall);
-            let sent_call_id = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
+            let frame = host.recv();
+            let sent_call_id = bridge_call_parts(frame).0;
             // Respond with a callId that differs from the one Rust sent.
             let wrong_call_id = sent_call_id.wrapping_add(99);
-            ipc::write_ts_to_rust_frame(
-                &mut server,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(wrong_call_id, &WireValue::Number(1.0)),
-            )
-            .unwrap();
+            host.send(bridge_resp_ok(wrong_call_id, &WireValue::Number(1.0)));
         });
 
         let err = execute(
@@ -13489,7 +13389,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13509,25 +13409,16 @@ mod tests {
         // call_id_counter.  Run 1 uses callId=0; the counter advances so
         // Run 2 starts at callId=1 — a stale BridgeResponse with callId=0
         // that arrives during Run 2 is rejected as a callId mismatch.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
 
         let counter = Arc::new(AtomicU32::new(0));
 
         // ── Run 1: succeeds normally ─────────────────────────────────────
-        let (mut server1, client1) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client1 = ManuallyDrop::new(client1);
-        let fd1 = client1.as_raw_fd();
+        let (io1, host1) = test_io();
 
         let h1 = std::thread::spawn(move || {
-            let frame = ipc::read_rust_to_ts_frame(&mut server1).unwrap();
-            let cid = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
-            ipc::write_ts_to_rust_frame(
-                &mut server1,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(cid, &WireValue::Number(1.0)),
-            )
-            .unwrap();
+            let frame = host1.recv();
+            let cid = bridge_call_parts(frame).0;
+            host1.send(bridge_resp_ok(cid, &WireValue::Number(1.0)));
             cid // return the callId run 1 used
         });
 
@@ -13541,7 +13432,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd1),
+            io1,
             Arc::clone(&counter),
             None,
         )
@@ -13551,21 +13442,14 @@ mod tests {
         assert_eq!(run1_call_id, 0, "run 1 should use callId=0");
 
         // ── Run 2: counter has advanced; a stale run-1 response is rejected ─
-        let (mut server2, client2) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client2 = ManuallyDrop::new(client2);
-        let fd2 = client2.as_raw_fd();
+        let (io2, host2) = test_io();
 
         let h2 = std::thread::spawn(move || {
-            let frame = ipc::read_rust_to_ts_frame(&mut server2).unwrap();
-            let cid = u32::from_be_bytes(frame.payload[4..8].try_into().unwrap());
+            let frame = host2.recv();
+            let cid = bridge_call_parts(frame).0;
             // Simulate a stale BridgeResponse from run 1 arriving here
             // (callId=0 instead of the expected callId for run 2).
-            ipc::write_ts_to_rust_frame(
-                &mut server2,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(run1_call_id, &WireValue::Number(99.0)), // stale callId=0
-            )
-            .unwrap();
+            host2.send(bridge_resp_ok(run1_call_id, &WireValue::Number(99.0)));
             cid // return callId run 2 expected
         });
 
@@ -13579,7 +13463,7 @@ mod tests {
             },
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd2),
+            io2,
             Arc::clone(&counter),
             None,
         )
@@ -13603,36 +13487,22 @@ mod tests {
     fn promise_all_concurrent_bridge_calls_route_by_call_id() {
         // Promise.all([toolA(), toolB()]) fires both bridge_global_callbacks
         // synchronously before V8 yields, putting two BridgeCall frames on the
-        // wire at the same time.  The server responds in REVERSE order to prove
+        // wire at the same time.  The host responds in REVERSE order to prove
         // the poll loop routes each response to the correct resolver by callId.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle = std::thread::spawn(move || {
             // Read both BridgeCall frames (they arrive before V8 yields).
-            let f1 = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            let cid1 = u32::from_be_bytes(f1.payload[4..8].try_into().unwrap());
-            let f2 = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            let cid2 = u32::from_be_bytes(f2.payload[4..8].try_into().unwrap());
+            let f1 = host.recv();
+            let cid1 = bridge_call_parts(f1).0;
+            let f2 = host.recv();
+            let cid2 = bridge_call_parts(f2).0;
 
             // Respond in reverse order: second call gets 20, first gets 10.
             // The poll loop must route cid2 → toolB resolver (20)
             // and cid1 → toolA resolver (10) regardless of order.
-            ipc::write_ts_to_rust_frame(
-                &mut server,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(cid2, &WireValue::Number(20.0)),
-            )
-            .unwrap();
-            ipc::write_ts_to_rust_frame(
-                &mut server,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(cid1, &WireValue::Number(10.0)),
-            )
-            .unwrap();
+            host.send(bridge_resp_ok(cid2, &WireValue::Number(20.0)));
+            host.send(bridge_resp_ok(cid1, &WireValue::Number(10.0)));
         });
 
         let out = execute(
@@ -13650,7 +13520,7 @@ mod tests {
                 HostGlobalDef::bridge("toolB"),
             ],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -13664,27 +13534,18 @@ mod tests {
     fn promise_all_three_concurrent_calls_all_resolve() {
         // Three concurrent calls; responses arrive in reverse order.
         // Validates callId routing across more than two in-flight resolvers.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
 
         let handle = std::thread::spawn(move || {
             let mut call_ids = Vec::new();
             for _ in 0..3 {
-                let f = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-                let cid = u32::from_be_bytes(f.payload[4..8].try_into().unwrap());
+                let f = host.recv();
+                let cid = bridge_call_parts(f).0;
                 call_ids.push(cid);
             }
             // Respond in reverse.
             for (i, &cid) in call_ids.iter().rev().enumerate() {
-                ipc::write_ts_to_rust_frame(
-                    &mut server,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(cid, &WireValue::Number((i as f64 + 1.0) * 10.0)),
-                )
-                .unwrap();
+                host.send(bridge_resp_ok(cid, &WireValue::Number((i as f64 + 1.0) * 10.0)));
             }
         });
 
@@ -13695,7 +13556,7 @@ mod tests {
             None,
             Limits { cpu_time_ms: 5_000, wall_time_ms: 10_000, ..Default::default() },
             &[HostGlobalDef::bridge("tool")],
-            &[], Some(fd),
+            &[], io,
             Arc::new(AtomicU32::new(0)),
             None,
         ).unwrap();
@@ -13862,7 +13723,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[WireValue::String("wf".to_string())]),
         )
@@ -13897,70 +13758,17 @@ mod tests {
     // auto-installed `__iso4_call` stub, so those tests use a responder thread
     // like the bridge tests above.
 
-    /// Parse a BridgeCall payload: (callId, targetKind, specifier, name, args),
-    /// where `name` is the global as one segment or the import leaf's segments.
-    /// The leading runId (0 for direct-API runs) is validated and skipped.
-    fn parse_bridge_call(
-        payload: &[u8],
-    ) -> (u32, u8, Option<String>, Vec<String>, Vec<WireValue>) {
-        let mut off = 0usize;
-        let run_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
-        assert_eq!(run_id, 0, "direct-API BridgeCall frames carry runId 0");
-        off += 4;
-        let call_id = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
-        off += 4;
-        let target_kind = payload[off];
-        off += 1;
-        let specifier = if payload[off] == 1 {
-            off += 1;
-            let len = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
-            off += 4;
-            let s = String::from_utf8(payload[off..off + len].to_vec()).unwrap();
-            off += len;
-            Some(s)
-        } else {
-            off += 1;
-            None
-        };
-        let read_string = |off: &mut usize| {
-            let len = u32::from_be_bytes(payload[*off..*off + 4].try_into().unwrap()) as usize;
-            *off += 4;
-            let s = String::from_utf8(payload[*off..*off + len].to_vec()).unwrap();
-            *off += len;
-            s
-        };
-        let export_name = if target_kind == 1 {
-            let count = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
-            off += 4;
-            (0..count).map(|_| read_string(&mut off)).collect()
-        } else {
-            vec![read_string(&mut off)]
-        };
-        // The whole argument list is one value slot holding an array.
-        let blob_len = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
-        off += 4;
-        let args = match testval::from_blob(&payload[off..off + blob_len]) {
-            WireValue::Array(items) => items,
-            other => panic!("BridgeCall args must decode to an array, got {other:?}"),
-        };
-        (call_id, target_kind, specifier, export_name, args)
-    }
-
-    /// Run code with host imports over a socket pair; the responder receives
-    /// each BridgeCall frame parsed and answers via the returned closure.
+    /// Run code with host imports over an in-memory link; the responder
+    /// receives the first BridgeCall and answers through the host.
     fn run_with_host_imports(
         code: &str,
         imports: Vec<ImportBinding>,
-        respond: impl FnOnce(&mut std::os::unix::net::UnixStream, &[u8]) + Send + 'static,
+        respond: impl FnOnce(&TestHost, Outbound) + Send + 'static,
     ) -> (Result<Output, FailureOutput>, std::thread::JoinHandle<()>) {
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
         let handle = std::thread::spawn(move || {
-            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            respond(&mut server, &frame.payload);
+            let msg = host.recv();
+            respond(&host, msg);
         });
         let result = execute(
             code,
@@ -13968,7 +13776,7 @@ mod tests {
             Limits::default(),
             &[],
             &imports,
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         );
@@ -14053,9 +13861,8 @@ mod tests {
             export default await query("cats", 2)
             "#,
             imports,
-            |s, payload| {
-                let (call_id, target_kind, specifier, export_name, args) =
-                    parse_bridge_call(payload);
+            |s, msg| {
+                let (call_id, target_kind, specifier, export_name, args) = bridge_call_parts(msg);
                 // The frame carries the resolved import target — the handle ID
                 // never leaves the runtime.
                 assert_eq!(target_kind, 1);
@@ -14068,12 +13875,7 @@ mod tests {
                         WireValue::Number(2.0)
                     ]
                 );
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(call_id, &WireValue::Number(42.0)),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(call_id, &WireValue::Number(42.0)));
             },
         );
         h.join().unwrap();
@@ -14112,17 +13914,12 @@ mod tests {
             export default await second()
             "#,
             imports,
-            |s, payload| {
-                let (call_id, target_kind, specifier, export_name, _) = parse_bridge_call(payload);
+            |s, msg| {
+                let (call_id, target_kind, specifier, export_name, _) = bridge_call_parts(msg);
                 assert_eq!(target_kind, 1);
                 assert_eq!(specifier.as_deref(), Some("tools:b"));
                 assert_eq!(export_name, ["second"]);
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(call_id, &WireValue::String("ok".to_string())),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(call_id, &WireValue::String("ok".to_string())));
             },
         );
         h.join().unwrap();
@@ -14133,8 +13930,6 @@ mod tests {
 
     #[test]
     fn host_module_dotted_key_and_nested_twin_dispatch_by_segments() {
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
         let imports = vec![host_import(
             "api",
             vec![(
@@ -14148,19 +13943,12 @@ mod tests {
                 ]),
             )],
         )];
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
         let handle = std::thread::spawn(move || {
             for _ in 0..2 {
-                let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-                let (call_id, _, _, path, _) = parse_bridge_call(&frame.payload);
-                ipc::write_ts_to_rust_frame(
-                    &mut server,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(call_id, &WireValue::String(path.join("/"))),
-                )
-                .unwrap();
+                let frame = host.recv();
+                let (call_id, _, _, path, _) = bridge_call_parts(frame);
+                host.send(bridge_resp_ok(call_id, &WireValue::String(path.join("/"))));
             }
         });
         let out = execute(
@@ -14172,7 +13960,7 @@ mod tests {
             Limits::default(),
             &[],
             &imports,
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -14282,8 +14070,6 @@ mod tests {
         // function leaf on globalThis. The trampoline and data leaves are
         // plain JS created at the instance's prefix stage; the call
         // dispatches through the fresh per-run `__iso4_call` stub.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
 
         let imports = vec![host_import(
             "tools:search",
@@ -14303,23 +14089,16 @@ mod tests {
             "#;
         evaluate_prefix(prefix_src, &[], &imports).unwrap();
 
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
         let handle = std::thread::spawn(move || {
-            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
+            let frame = host.recv();
             let (call_id, target_kind, specifier, export_name, args) =
-                parse_bridge_call(&frame.payload);
+                bridge_call_parts(frame);
             assert_eq!(target_kind, 1);
             assert_eq!(specifier.as_deref(), Some("tools:search"));
             assert_eq!(export_name, ["query"]);
             assert_eq!(args, vec![WireValue::String("dogs".to_string())]);
-            ipc::write_ts_to_rust_frame(
-                &mut server,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(call_id, &WireValue::Number(3.0)),
-            )
-            .unwrap();
+            host.send(bridge_resp_ok(call_id, &WireValue::Number(3.0)));
         });
 
         let out = execute_with_prefix(
@@ -14331,7 +14110,7 @@ mod tests {
             Limits::default(),
             &[],
             &imports,
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -14345,8 +14124,6 @@ mod tests {
     fn a_prefix_export_can_call_a_host_module_function_directly() {
         // The import binding itself (not a globalThis stash) is the call
         // path; the module is built in the instance from the declared shape.
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
 
         let imports = vec![host_import(
             "tools:t",
@@ -14355,20 +14132,13 @@ mod tests {
         let prefix_src = r#"import { f } from "tools:t"; export default async () => await f()"#;
         evaluate_prefix(prefix_src, &[], &imports).unwrap();
 
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, host) = test_io();
         let handle = std::thread::spawn(move || {
-            let frame = ipc::read_rust_to_ts_frame(&mut server).unwrap();
-            let (call_id, _, specifier, export_name, _) = parse_bridge_call(&frame.payload);
+            let frame = host.recv();
+            let (call_id, _, specifier, export_name, _) = bridge_call_parts(frame);
             assert_eq!(specifier.as_deref(), Some("tools:t"));
             assert_eq!(export_name, ["f"]);
-            ipc::write_ts_to_rust_frame(
-                &mut server,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(call_id, &WireValue::Bool(true)),
-            )
-            .unwrap();
+            host.send(bridge_resp_ok(call_id, &WireValue::Bool(true)));
         });
 
         let out = execute_with_prefix(
@@ -14380,7 +14150,7 @@ mod tests {
             Limits::default(),
             &[],
             &imports,
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -14453,6 +14223,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Some(&call),
             None,
+            Arc::new(crate::link::NoopObserver),
         )
         .map_err(|failure| failure.error)
     }
@@ -14544,18 +14315,9 @@ mod tests {
 
     #[test]
     fn call_async_handler_with_bridge_call_settles() {
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
-        let handle = spawn_responder(server, |s| {
-            ipc::write_ts_to_rust_frame(
-                s,
-                ipc::TsToRustMessageType::BridgeResponse,
-                &bridge_resp_ok(0, &WireValue::Number(41.0)),
-            )
-            .unwrap();
+        let (io, host) = test_io();
+        let handle = spawn_responder(host, |s| {
+            s.send(bridge_resp_ok(0, &WireValue::Number(41.0)));
         });
         let call = call_spec("f", &[WireValue::Number(1.0)]);
         let out = execute(
@@ -14564,7 +14326,7 @@ mod tests {
             Limits::default(),
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             Some(&call),
         )
@@ -14591,7 +14353,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call,
         )
@@ -14611,7 +14373,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call,
         )
@@ -14748,6 +14510,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Some(&call),
             None,
+            Arc::new(crate::link::NoopObserver),
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::ExportTooLarge));
@@ -14825,6 +14588,7 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Some(&call),
             None,
+            Arc::new(crate::link::NoopObserver),
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::CpuTimeout));
@@ -14856,6 +14620,7 @@ mod tests {
                 Arc::new(AtomicU32::new(0)),
                 call.as_ref(),
                 None,
+                Arc::new(crate::link::NoopObserver),
             );
             let _ = tx.send(result);
         });
@@ -14965,7 +14730,7 @@ mod tests {
             limits,
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call,
         )
@@ -15009,7 +14774,7 @@ mod tests {
                 Limits::default(),
                 &[],
                 &[],
-                None,
+                RunIo::None,
                 Arc::new(AtomicU32::new(0)),
                 &call_spec("default", &[]),
             );
@@ -15054,7 +14819,7 @@ mod tests {
             },
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call,
         );
@@ -15090,7 +14855,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call,
         );
@@ -15135,8 +14900,6 @@ mod tests {
     /// a freed `GlobalCallbackData` (and wrote to a stale socket fd).
     #[test]
     fn stashed_bridge_stub_is_disarmed_on_the_next_call() {
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
         init_platform();
         let mut core = create_instance_core(
             PrefixSpec {
@@ -15155,16 +14918,14 @@ mod tests {
         // Call 1 binds `g` live and sandbox code stashes the reference. It
         // never calls `g`, so no bridge frame is written — the socket just
         // has to be a valid fd for the stub to install.
-        let (_server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
-        let fd = client.as_raw_fd();
+        let (io, _host) = test_io();
         let out1 = run_call_on_core(
             &mut core,
             &[HostGlobalDef::bridge("g")],
             Limits::default(),
             &[HostGlobalDef::bridge("g")],
             &[],
-            Some(fd),
+            io,
             Arc::new(AtomicU32::new(0)),
             &call_spec("stash", &[]),
         );
@@ -15179,7 +14940,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("poke", &[]),
         );
@@ -15218,7 +14979,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("plant", &[]),
         );
@@ -15238,7 +14999,7 @@ mod tests {
             },
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("seven", &[]),
         );
@@ -15293,7 +15054,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -15311,7 +15072,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -15360,7 +15121,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("arm", &[]),
         );
@@ -15376,7 +15137,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("fire", &[]),
         );
@@ -15390,7 +15151,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("read", &[]),
         )
@@ -15612,7 +15373,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -15632,7 +15393,7 @@ mod tests {
             },
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -15667,7 +15428,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("arm", &[]),
         );
@@ -15683,7 +15444,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("read", &[]),
         );
@@ -15718,7 +15479,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -15753,7 +15514,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         )
@@ -15798,17 +15559,14 @@ mod tests {
 
     /// Execute `code` with bridge global `myTool` on a socket nobody answers.
     fn run_with_silent_bridge(code: &str, limits: Limits) -> Result<Output, FailureOutput> {
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
-        let (_server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = ManuallyDrop::new(client);
+        let (io, _host) = test_io();
         execute(
             code,
             None,
             limits,
             &[HostGlobalDef::bridge("myTool")],
             &[],
-            Some(client.as_raw_fd()),
+            io,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -15884,8 +15642,6 @@ mod tests {
 
     #[test]
     fn a_bridge_call_queued_by_a_sync_call_belongs_to_that_call() {
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
         init_platform();
         let defs = [HostGlobalDef::bridge("g")];
         let mut core = create_instance_core(
@@ -15900,13 +15656,9 @@ mod tests {
             0,
         )
         .expect("prefix warms up");
-        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let client = ManuallyDrop::new(client);
-        // Joined after the call: the frame must be written during it.
-        let responder = spawn_responder(server, |_| {});
+        let (io, host) = test_io();
+        // Joined after the call: the message must be sent during it.
+        let responder = spawn_responder(host, |_| {});
         let leak = call_spec("leak", &[]);
         let first = run_call_on_core(
             &mut core,
@@ -15914,7 +15666,7 @@ mod tests {
             Limits::default(),
             &defs,
             &[],
-            Some(client.as_raw_fd()),
+            io,
             Arc::new(AtomicU32::new(0)),
             &leak,
         );
@@ -15930,7 +15682,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &bump,
         );
@@ -15949,7 +15701,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             None,
         )
@@ -15961,9 +15713,6 @@ mod tests {
 
     #[test]
     fn a_bridge_violation_inside_a_getter_names_itself_and_leaks_no_terminate() {
-        use std::io::Read;
-        use std::mem::ManuallyDrop;
-        use std::os::unix::io::AsRawFd;
         init_platform();
         let defs = [HostGlobalDef::bridge("tool")];
         let prefix = "let n = 0\n\
@@ -15982,10 +15731,8 @@ mod tests {
             0,
         )
         .expect("prefix warms up");
-        let (mut server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        server.set_nonblocking(true).unwrap();
-        let client = ManuallyDrop::new(client);
         for export in ["oneGetter", "twoGetters", "errFields", "argGetter"] {
+            let (io, host) = test_io();
             let call = call_spec(export, &[]);
             let outcome = run_call_on_core(
                 &mut core,
@@ -15993,7 +15740,7 @@ mod tests {
                 Limits::default(),
                 &defs,
                 &[],
-                Some(client.as_raw_fd()),
+                io,
                 Arc::new(AtomicU32::new(0)),
                 &call,
             );
@@ -16003,8 +15750,10 @@ mod tests {
                 matches!(error, RunError::FunctionArgumentNotSupported),
                 "{export}: got {error:?}"
             );
-            let mut buf = [0u8; 1];
-            assert!(server.read(&mut buf).is_err(), "{export}: no bridge frame was sent");
+            assert!(
+                host.recv_timeout(Duration::ZERO).is_none(),
+                "{export}: no bridge message was sent"
+            );
 
             // Even reused, the instance carries no terminate into the next call.
             let bump = call_spec("bump", &[]);
@@ -16014,7 +15763,7 @@ mod tests {
                 Limits::default(),
                 &[],
                 &[],
-                None,
+                RunIo::None,
                 Arc::new(AtomicU32::new(0)),
                 &bump,
             );
@@ -16156,12 +15905,7 @@ mod tests {
                 ..Default::default()
             },
             |s| {
-                ipc::write_ts_to_rust_frame(
-                    s,
-                    ipc::TsToRustMessageType::BridgeResponse,
-                    &bridge_resp_ok(0, &WireValue::Number(1.0)),
-                )
-                .unwrap();
+                s.send(bridge_resp_ok(0, &WireValue::Number(1.0)));
             },
         );
         h.join().unwrap();
@@ -16214,7 +15958,7 @@ mod tests {
             Limits::default(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call,
         );
@@ -16243,7 +15987,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         );
@@ -16283,7 +16027,7 @@ mod tests {
             grace_limits(),
             &[],
             &[],
-            None,
+            RunIo::None,
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         );
@@ -16380,7 +16124,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        let payload = wire::encode_run_completion_payload(
+        let payload = crate::wire::encode_run_completion_payload(
             1,
             types::RunCompletion::Failure(types::RunFailurePayload {
                 error: failure.error.to_payload(),

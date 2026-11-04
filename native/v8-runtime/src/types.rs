@@ -256,7 +256,7 @@ pub enum TerminateMode {
 }
 
 /// Structured error fields for `RunCompletionPayload`.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RunErrorPayload {
     pub code: String,
     pub name: String,
@@ -296,7 +296,7 @@ pub enum ResetCause {
 }
 
 /// The `ERR_INSTANCE_RESET` extras — see `RunErrorPayload::reset`.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct ResetInfo {
     pub cause: ResetCause,
     pub culprit_run_id: u32,
@@ -348,6 +348,7 @@ pub enum BridgeCallOutcome {
 }
 
 /// Payload for a successful run.
+#[derive(Debug)]
 pub struct RunSuccessPayload {
     /// All exports as **one** V8 serialization blob holding a plain
     /// `{ name: value }` object. The `default` export (if present) is the
@@ -382,6 +383,7 @@ pub struct RunSuccessPayload {
 }
 
 /// Payload for a failed run.
+#[derive(Debug)]
 pub struct RunFailurePayload {
     pub error: RunErrorPayload,
     pub stdout: Vec<String>,
@@ -398,6 +400,7 @@ pub struct RunFailurePayload {
 }
 
 /// The two variants of a completed run.
+#[derive(Debug)]
 pub enum RunCompletion {
     Success(RunSuccessPayload),
     Failure(RunFailurePayload),
@@ -405,10 +408,23 @@ pub enum RunCompletion {
 
 /// What a `BridgeCall` targets: a global by name, or a host-module function
 /// leaf by specifier and key segments.
-pub enum BridgeTarget<'a> {
-    Global(&'a str),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeTarget {
+    Global(String),
     Import {
-        specifier: &'a str,
-        path: &'a [String],
+        specifier: String,
+        path: Vec<String>,
     },
+}
+
+/// Error reported by a host bridge handler on a `BridgeResponse`. Mirrors
+/// `RunErrorPayload` minus `code` (always `ERR_HOST_BRIDGE`) and `stack`
+/// (the host stack is never exposed to sandbox code).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeErrorPayload {
+    pub name: String,
+    pub message: String,
+    /// Own-enumerable properties of the host error, as a V8 serialization blob
+    /// holding a plain object. `None` when the handler carried none.
+    pub fields: Option<Vec<u8>>,
 }

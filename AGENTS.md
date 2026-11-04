@@ -64,6 +64,7 @@ iso4/                              ← workspace root
         session.rs                 ← per-connection message loop, prefix store
         v8.rs                      ← isolates, contexts, prefix evaluation, limits
         warm.rs                    ← warm-instance registry
+        link.rs                    ← HostLink/Observer traits, Outbound/Inbound messages (the engine's only way out)
         snapshot.rs                ← build-time startup snapshot: create, boot, external refs
         clock_platform.cc          ← V8 platform whose wall clock is the isolate's frozen clock
         policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader
@@ -287,7 +288,7 @@ learned during development.
   for dev-dep versions. Reference deps as `"catalog:"` in package.json,
   not hard-coded versions.
 - Node 24+ is required; `mise.toml` pins to 26 for development. CI uses 26.
-- `spawn_responder` in `v8.rs` tests reads and discards one frame before calling the `respond` closure. Tests using `run_with_bridge` where the respond closure needs to handle multiple calls must NOT try to read frames inside respond — use `drain_bridge_calls` with a direct socket pair instead (see `bridge_call_exactly_at_limit_succeeds` as the pattern to follow).
+- Engine tests never touch a socket: `test_io()` in `v8.rs` tests gives a run an in-memory `HostLink` (`ChannelLink`) plus a `TestHost` that reads its `Outbound` messages and sends `Inbound` ones. `spawn_responder` receives and discards one message before calling the `respond` closure; a responder that must answer several calls uses `drain_bridge_calls` instead (see `bridge_call_exactly_at_limit_succeeds`). Every `CallJob` with a link also answers on it (`Outbound::Result`, or `Outbound::RunComplete` after an early Result), so a test that reads messages after another run finished must consume that run's completion first.
 - The TS test suite should be green with zero failing tests. Run
   `pnpm test:run` for the live pass/skip counts — do not trust a hard-coded
   number here, it goes stale as PRs land. Any failure after a change is a

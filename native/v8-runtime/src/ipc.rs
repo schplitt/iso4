@@ -24,8 +24,6 @@
 //!   bytes until the runtime is ready to decode them.
 
 use std::io::{self, Read, Write};
-use std::mem::ManuallyDrop;
-use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use std::sync::{Arc, Mutex};
@@ -327,72 +325,6 @@ pub fn write_frame_with_limit(
     Ok(())
 }
 
-/// Write a Rust->TS frame whose payload is already in two pieces.
-///
-/// Same bytes on the wire as `write_rust_to_ts_frame(writer, ty, [head,
-/// tail].concat())`, without building that concatenation. The writer already
-/// emits the length and the type as their own calls, so this adds one more
-/// rather than changing how a frame is written. It exists for `BridgeCall`,
-/// whose payload is a small header in front of an argument blob that can be
-/// large and that nothing has copied yet.
-pub fn write_rust_to_ts_frame_parts(
-    writer: &mut impl Write,
-    message_type: RustToTsMessageType,
-    head: &[u8],
-    tail: &[u8],
-) -> io::Result<()> {
-    let payload_length = head
-        .len()
-        .checked_add(tail.len())
-        .and_then(|total| u32::try_from(total).ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
-    let length = payload_length
-        .checked_add(1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
-    if length > DEFAULT_MAX_FRAME_LENGTH {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("frame length {length} exceeds max frame length {DEFAULT_MAX_FRAME_LENGTH}"),
-        ));
-    }
-
-    // One gather-write per frame: with concurrent runs sharing a connection,
-    // every frame is written under the connection's writer lock, so the lock
-    // must hold ONE syscall, not four. The 5-byte envelope goes on the
-    // stack; the payload pieces are never copied.
-    let mut envelope = [0u8; 5];
-    envelope[..4].copy_from_slice(&length.to_be_bytes());
-    envelope[4] = message_type as u8;
-    let mut bufs = [
-        io::IoSlice::new(&envelope),
-        io::IoSlice::new(head),
-        io::IoSlice::new(tail),
-    ];
-    write_all_vectored(writer, &mut bufs)
-}
-
-/// `write_all` over a set of buffers via gather I/O, advancing across
-/// partial writes (std's `write_all_vectored` is still unstable).
-fn write_all_vectored(writer: &mut impl Write, mut bufs: &mut [io::IoSlice<'_>]) -> io::Result<()> {
-    // Skip leading empty slices so `write_vectored` never sees a fully
-    // consumed set (advance_slices panics past the total length).
-    io::IoSlice::advance_slices(&mut bufs, 0);
-    while bufs.iter().any(|b| !b.is_empty()) {
-        match writer.write_vectored(bufs) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write whole frame",
-                ));
-            }
-            Ok(n) => io::IoSlice::advance_slices(&mut bufs, n),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
 /// Write a single TS->Rust frame using a validated message type.
 pub fn write_ts_to_rust_frame(
     writer: &mut impl Write,
@@ -472,7 +404,7 @@ struct OutboxState {
     dead: Option<String>,
     /// Live [`Outbox`] handles. The writer drains and exits when this hits
     /// zero: the outbox lives exactly as long as something can still write
-    /// — the demux, a run state, a completion hook — so a run concluding
+    /// — the demux, a run state, a release hook — so a run concluding
     /// AFTER the demux tore down still gets its final frame out, the same
     /// lifetime the direct-write socket clone used to have.
     producers: usize,
@@ -594,10 +526,15 @@ impl Outbox {
     /// smaller one), with `BrokenPipe` when the connection is dead, and
     /// with `TimedOut` when the queue stays full past the stall bound —
     /// which also declares the connection dead.
-    fn send(&self, message_type: RustToTsMessageType, head: Vec<u8>, tail: Vec<u8>) -> io::Result<()> {
+    pub(crate) fn send_frame(
+        &self,
+        message_type: RustToTsMessageType,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+    ) -> io::Result<()> {
         // The same ceiling check the direct writer does, kept synchronous so
-        // callers can react (write_result_frame substitutes a minimal
-        // Result for an oversized one).
+        // callers can react (the link reports it as `TooLarge` and the
+        // sender substitutes a minimal Result).
         let payload_len = head
             .len()
             .checked_add(tail.len())
@@ -872,51 +809,6 @@ fn writer_loop(mut stream: UnixStream, inner: &OutboxShared) {
                 return;
             }
         }
-    }
-}
-
-/// Where a run's outbound frames (BridgeCall, early Result, stream credit,
-/// RunComplete, …) go.
-///
-/// Two modes share the session protocol but not the socket discipline:
-///
-/// - `Fd`: the raw session-socket fd, written directly. The direct-API mode —
-///   one run per socket by construction, so the writing thread is the fd's
-///   only user (the `ManuallyDrop` discipline the bridge callbacks have always
-///   used: the fd stays owned by whoever opened the socket).
-/// - `Shared`: the connection's [`Outbox`] — a bounded queue in front of one
-///   writer thread, so session runs sharing the connection never block on
-///   the socket itself.
-#[derive(Clone)]
-pub enum FrameSink {
-    Fd(RawFd),
-    Shared(Outbox),
-}
-
-impl FrameSink {
-    /// Write one frame whose payload is already in two pieces (the
-    /// `BridgeCall` shape: small header + large blob nothing has copied —
-    /// ownership moves into the queue, so nothing is copied here either).
-    /// `write(ty, payload)` is the one-piece special case.
-    pub fn write_parts(
-        &self,
-        message_type: RustToTsMessageType,
-        head: Vec<u8>,
-        tail: Vec<u8>,
-    ) -> io::Result<()> {
-        match self {
-            FrameSink::Fd(fd) => {
-                // SAFETY: the fd is the live session socket owned by the
-                // caller of the run; ManuallyDrop prevents closing it here.
-                let mut stream = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(*fd) });
-                write_rust_to_ts_frame_parts(&mut *stream, message_type, &head, &tail)
-            }
-            FrameSink::Shared(outbox) => outbox.send(message_type, head, tail),
-        }
-    }
-
-    pub fn write(&self, message_type: RustToTsMessageType, payload: Vec<u8>) -> io::Result<()> {
-        self.write_parts(message_type, payload, Vec::new())
     }
 }
 
@@ -1606,17 +1498,6 @@ pub fn encode_stream_cancel_payload(run_id: u32, stream_id: u32, reason: &str) -
     out
 }
 
-/// Encode a `StreamChunk` payload for an outbound stream:
-/// `u32 runId, u32 streamId, Bytes data` — the inbound twin's exact layout.
-pub fn encode_stream_chunk_payload(run_id: u32, stream_id: u32, data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(12 + data.len());
-    out.extend_from_slice(&run_id.to_be_bytes());
-    out.extend_from_slice(&stream_id.to_be_bytes());
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(data);
-    out
-}
-
 /// Encode a `StreamEnd` payload for an outbound stream:
 /// `u32 runId, u32 streamId, bool ok, Optional<String> error`.
 pub fn encode_stream_end_payload(
@@ -1731,65 +1612,6 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A writer that accepts at most one byte per call — the adversarial
-    /// case for the gather-write loop (every partial-write boundary is hit,
-    /// including ones inside the 5-byte envelope and across slice edges).
-    struct DribbleWriter(Vec<u8>);
-
-    impl Write for DribbleWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            self.0.push(buf[0]);
-            Ok(1)
-        }
-        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-            for b in bufs {
-                if !b.is_empty() {
-                    self.0.push(b[0]);
-                    return Ok(1);
-                }
-            }
-            Ok(0)
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn gather_write_reassembles_the_exact_frame_across_partial_writes() {
-        let mut whole = Vec::new();
-        write_rust_to_ts_frame_parts(
-            &mut whole,
-            RustToTsMessageType::BridgeCall,
-            b"header",
-            b"a larger tail payload",
-        )
-        .unwrap();
-
-        let mut dribbled = DribbleWriter(Vec::new());
-        write_rust_to_ts_frame_parts(
-            &mut dribbled,
-            RustToTsMessageType::BridgeCall,
-            b"header",
-            b"a larger tail payload",
-        )
-        .unwrap();
-
-        assert_eq!(dribbled.0, whole, "partial writes must not reorder or drop bytes");
-
-        // Empty pieces are legal (a payload-less frame, a header-only frame).
-        let mut empty_tail = DribbleWriter(Vec::new());
-        write_rust_to_ts_frame_parts(&mut empty_tail, RustToTsMessageType::Result, b"only", b"")
-            .unwrap();
-        let mut expected = Vec::new();
-        write_rust_to_ts_frame_parts(&mut expected, RustToTsMessageType::Result, b"only", b"")
-            .unwrap();
-        assert_eq!(empty_tail.0, expected);
-    }
 
     #[test]
     fn frame_roundtrip_preserves_type_and_payload() {
@@ -2828,10 +2650,10 @@ mod tests {
     #[test]
     fn outbox_writes_frames_in_queue_order_and_drains_on_last_drop() {
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let sink = Outbox::spawn(&runtime).unwrap();
         drop(runtime);
         for i in 0..100u8 {
-            sink.write_parts(RustToTsMessageType::Log, vec![i], vec![i, i])
+            sink.send_frame(RustToTsMessageType::Log, vec![i], vec![i, i])
                 .unwrap();
         }
         drop(sink);
@@ -2850,10 +2672,10 @@ mod tests {
         // A frame bigger than the whole queue budget must never deadlock
         // waiting for space that cannot exist: an empty queue admits it.
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let sink = Outbox::spawn(&runtime).unwrap();
         drop(runtime);
         let reader = std::thread::spawn(move || read_rust_to_ts_frame(&mut host).unwrap());
-        sink.write(RustToTsMessageType::Log, vec![7u8; OUTBOX_CAP_BYTES + 1024])
+        sink.send_frame(RustToTsMessageType::Log, vec![7u8; OUTBOX_CAP_BYTES + 1024], Vec::new())
             .unwrap();
         drop(sink);
         let frame = reader.join().unwrap();
@@ -2866,15 +2688,16 @@ mod tests {
         // recovery in session.rs keys on it) and must not poison the
         // connection.
         let (_host, runtime) = UnixStream::pair().unwrap();
-        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let sink = Outbox::spawn(&runtime).unwrap();
         let e = sink
-            .write(
+            .send_frame(
                 RustToTsMessageType::Result,
                 vec![0u8; DEFAULT_MAX_FRAME_LENGTH as usize],
+                Vec::new(),
             )
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-        sink.write(RustToTsMessageType::Log, vec![1]).unwrap();
+        sink.send_frame(RustToTsMessageType::Log, vec![1], Vec::new()).unwrap();
     }
 
     #[test]
@@ -2883,12 +2706,12 @@ mod tests {
         // the queue fills, and the next producer times out — which latches
         // the outbox dead and shuts the socket down.
         let (host, runtime) = UnixStream::pair().unwrap();
-        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let sink = Outbox::spawn(&runtime).unwrap();
         drop(runtime);
         let chunk = vec![0u8; 1024 * 1024];
         let mut stall_error = None;
         for _ in 0..(OUTBOX_CAP_BYTES / chunk.len()) * 4 {
-            if let Err(e) = sink.write(RustToTsMessageType::Log, chunk.clone()) {
+            if let Err(e) = sink.send_frame(RustToTsMessageType::Log, chunk.clone(), Vec::new()) {
                 stall_error = Some(e);
                 break;
             }
@@ -2901,7 +2724,7 @@ mod tests {
         // Latched: the next write fails immediately, without waiting.
         let start = std::time::Instant::now();
         let e2 = sink
-            .write(RustToTsMessageType::Log, vec![0])
+            .send_frame(RustToTsMessageType::Log, vec![0], Vec::new())
             .unwrap_err();
         assert_eq!(e2.kind(), io::ErrorKind::BrokenPipe);
         assert!(start.elapsed() < OUTBOX_STALL_TIMEOUT);
@@ -2915,7 +2738,7 @@ mod tests {
         // When the peer resumes draining, every frame must arrive intact
         // and in order — framing integrity across the handoff.
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let sink = Outbox::spawn(&runtime).unwrap();
         drop(runtime);
 
         // Nobody reads yet: pump patterned frames until the kernel buffer
@@ -2926,7 +2749,7 @@ mod tests {
             let mut head = vec![0u8; 4];
             head[..4].copy_from_slice(&(i as u32).to_be_bytes());
             let tail = vec![i as u8; 65536];
-            sink.write_parts(RustToTsMessageType::Log, head, tail).unwrap();
+            sink.send_frame(RustToTsMessageType::Log, head, tail).unwrap();
         }
         drop(sink);
 
@@ -2958,7 +2781,7 @@ mod tests {
         const PRODUCERS: usize = 4;
         const FRAMES: u32 = 500;
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let sink = Outbox::spawn(&runtime).unwrap();
         drop(runtime);
 
         let reader = std::thread::spawn(move || {
@@ -2993,7 +2816,7 @@ mod tests {
                         // Varying sizes cross the kernel-buffer boundary at
                         // varying offsets — mid-frame handoffs included.
                         let tail = vec![p as u8; 1 + ((seq as usize * 7919) % 8192)];
-                        sink.write_parts(RustToTsMessageType::Log, head, tail)
+                        sink.send_frame(RustToTsMessageType::Log, head, tail)
                             .expect("send under contention");
                     }
                 })
@@ -3009,7 +2832,7 @@ mod tests {
     #[test]
     fn outbox_fails_producers_after_the_peer_closes() {
         let (host, runtime) = UnixStream::pair().unwrap();
-        let sink = FrameSink::Shared(Outbox::spawn(&runtime).unwrap());
+        let sink = Outbox::spawn(&runtime).unwrap();
         drop(runtime);
         drop(host);
         // The writer hits EPIPE on its next write; the failure reaches
@@ -3017,7 +2840,7 @@ mod tests {
         let mut failed = false;
         for _ in 0..50 {
             if sink
-                .write(RustToTsMessageType::Log, vec![0u8; 65536])
+                .send_frame(RustToTsMessageType::Log, vec![0u8; 65536], Vec::new())
                 .is_err()
             {
                 failed = true;

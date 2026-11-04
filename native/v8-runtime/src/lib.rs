@@ -10,6 +10,7 @@ pub mod container;
 pub mod cpuclock;
 pub mod errors;
 pub mod ipc;
+pub mod link;
 pub mod oom;
 pub mod policy;
 pub mod rss;

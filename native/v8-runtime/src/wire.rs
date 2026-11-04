@@ -15,7 +15,9 @@
 use std::io;
 
 use crate::errors::clamp_error_text;
-use crate::types::{BridgeCallRecord, BridgeTarget, RunCompletion, RunErrorPayload};
+use crate::types::{
+    BridgeCallRecord, BridgeErrorPayload, BridgeTarget, RunCompletion, RunErrorPayload,
+};
 
 // ── Primitive encoders ─────────────────────────────────────────────────────────
 
@@ -251,28 +253,6 @@ pub fn encode_run_complete_payload(run_id: u32, report: &crate::v8::GraceReport)
     out
 }
 
-/// Minimal `RunCompletePayload` substituted when the real grace report is too
-/// large to frame (review, finding 1): same runId and status byte, empty
-/// telemetry, and an error naming the substitution. Small by construction.
-pub fn encode_minimal_run_complete(run_id: u32, status_byte: u8) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_u32(run_id, &mut out);
-    out.push(status_byte);
-    encode_f64(0.0, &mut out);
-    encode_f64(0.0, &mut out);
-    encode_f64(0.0, &mut out);
-    encode_string_list(&[], &mut out);
-    encode_string_list(&[], &mut out);
-    encode_bridge_call_records(&[], &mut out);
-    out.push(1);
-    encode_string("Error", &mut out);
-    encode_string(
-        "the grace report was too large to send; its telemetry was dropped",
-        &mut out,
-    );
-    out
-}
-
 fn encode_optional_u64(value: Option<u64>, out: &mut Vec<u8>) {
     match value {
         Some(v) => {
@@ -465,17 +445,13 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 /// with the blob's `u32` length prefix.
 ///
 /// The arguments are already a serialized buffer by the time this runs, and
-/// they are the only part of the payload with no bound: copying them into a
-/// second buffer just to prepend this header doubles the peak memory of every
-/// bridge call, and does it *before* `maxBridgeCallBytes` gets a chance to
-/// refuse the call — so the cap could stop the send but never the allocation
-/// it exists to prevent. The header's length plus the blob's is the exact
-/// payload length, so the caller can check the cap first and then write the
-/// two pieces in sequence.
+/// they are the only part of the payload with no bound: the frontend writes
+/// this header and then that buffer in one vectored write instead of
+/// concatenating them.
 pub fn encode_bridge_call_header(
     run_id: u32,
     call_id: u32,
-    target: BridgeTarget<'_>,
+    target: &BridgeTarget,
     args_blob_len: u32,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
@@ -501,18 +477,6 @@ pub fn encode_bridge_call_header(
 }
 
 // ── BridgeResponse payload decoder ───────────────────────────────────────────────
-
-/// Error reported by a host bridge handler, as carried on a `BridgeResponse`
-/// frame. Mirrors `RunErrorPayload` minus `code` (always `ERR_HOST_BRIDGE`)
-/// and `stack` (the host stack is never exposed to sandbox code).
-#[derive(Debug, Clone, PartialEq)]
-pub struct BridgeErrorPayload {
-    pub name: String,
-    pub message: String,
-    /// Own-enumerable properties of the host error, as a V8 serialization blob
-    /// holding a plain object. `None` when the handler carried none.
-    pub fields: Option<Vec<u8>>,
-}
 
 /// Decode a `BridgeResponsePayload` from TS per `docs/protocol.md` §5.4.
 ///

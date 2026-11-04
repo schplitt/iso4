@@ -14,6 +14,8 @@ mod cpuclock;
 mod errors;
 #[path = "src/ipc.rs"]
 mod ipc;
+#[path = "src/link.rs"]
+mod link;
 #[path = "src/oom.rs"]
 mod oom;
 #[path = "src/policy.rs"]

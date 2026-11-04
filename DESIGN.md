@@ -176,7 +176,8 @@ host hands it over by name.
   │   main.rs  ─ UDS accept loop, handshake, signal handling │   
   │      │                                                  │    
   │      ├─ one demux thread per connection (only reader;   │    
-  │      │     routes frames per run; serialized writer)    │    
+  │      │     decodes and routes messages per run; the     │    
+  │      │     HostLink impl is the serialized writer)      │    
   │      ├─ one OS thread per isolate — the turn loop       │    
   │      │     v8::Isolate (heap_limits + custom allocator) │    
   │      │     v8::Context with curated globals             │    
@@ -1750,7 +1751,7 @@ sees is exactly what the prefix produces deterministically:
 - **Bound per run:**
   - Bridge function stubs. While the prefix evaluates they are throwing
     placeholders; before each call the runtime overwrites the same
-    names with live stubs bound to the run's socket and handlers.
+    names with live stubs bound to the run's link and handlers.
 - **Constraints (identical to the snapshot era, by design):**
   - The prefix's evaluation promise must settle without host I/O. Top-level
     `await` is fine as long as nothing external is awaited: the runtime
@@ -2279,10 +2280,16 @@ ordered channel — a run's job always precedes its frames, so an event for
 a run the loop does not know is late, never early (#170) — and any number
 of runs can be suspended on the instance while it executes one turn at a
 time. The
-connection's demux thread is its only socket reader; every outbound frame
-goes through one serialized writer, so concurrent runs never interleave
-mid-frame. Session dispatch never parks — a job's completion hook writes
-the run's frames and releases the instance. The owner thread is the *only*
+connection's demux thread is its only socket reader and decodes each
+run-tagged frame into an engine message before routing it. The engine
+never sees a frame or a socket: everything it sends (bridge calls, stream
+traffic, the run's result) goes through the `HostLink` trait, whose
+server-side impl is one serialized writer per connection, so concurrent
+runs never interleave mid-frame; console lines are also copied to an
+`Observer` as they happen (a no-op in the server today). Session dispatch
+never parks — when a run finishes, its release hook gives the instance
+back to the registry and then its completion goes out on the link. The
+owner thread is the *only*
 thread an instance holds: per-turn CPU/wall deadlines are enforced by one
 process-global watchdog thread (lazy-started, a deadline min-heap; turn
 entry registers, turn exit deregisters, and `terminate_execution` is
@@ -2746,10 +2753,10 @@ default implementation is reused.
 When the run’s wall-clock budget expires while the sandbox is blocked inside a
 bridge call:
 
-1. **Rust side**: the socket read in the bridge callback has a read timeout set
-   to the remaining wall budget. When it fires, the callback explicitly calls
-   `terminate_execution()` on the isolate handle, sets `TerminationReason::Wall`,
-   and returns without a result. V8 terminates at the next safe point.
+1. **Rust side**: the bridge callback never blocks; the run parks until its
+   BridgeResponse arrives or its wall deadline passes. The deadline is a turn
+   boundary, so the run ends with `ERR_WALL_TIMEOUT` and nothing is interrupted
+   mid-JS.
 2. **TypeScript side**: the `drainUntilResult` loop races each dispatcher
    invocation against a timer equal to the remaining wall budget + 200 ms.
    When the timer wins, the loop skips writing a `BridgeResponse` (which would
@@ -2918,7 +2925,7 @@ callableHandles = { 42: originalJsonFn, 43: originalTextFn }
 The Rust side detects `{ __iso4_fn__: <id> }` objects after deserializing and
 installs a real V8 `Function` in their place. The function's External data
 is the same `GlobalCallbackData` as all other bridge stubs (same
-`stream_fd`, `cpu_budget`, `call_id`, `bridge_error`), plus the callable ID.
+`link`, `cpu_budget`, `call_id`, `bridge_error`), plus the callable ID.
 
 When the sandbox calls the function (e.g. `await res.json()`), a new
 `BridgeCall` is sent with `targetKind = 2` (callable) instead of
