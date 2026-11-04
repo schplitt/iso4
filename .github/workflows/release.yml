@@ -76,7 +76,9 @@ jobs:
           echo "$(brew --prefix llvm@21)/bin" >> "$GITHUB_PATH"
       - if: matrix.platform == 'linux-arm64-gnu'
         run: |
-          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          curl -fsSL --retry 5 https://apt.llvm.org/llvm.sh -o "$RUNNER_TEMP/llvm.sh"
+          sudo bash "$RUNNER_TEMP/llvm.sh" 21
+          /usr/lib/llvm-21/bin/clang++ --version
           echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
       - run: |
           cargo build --release \
