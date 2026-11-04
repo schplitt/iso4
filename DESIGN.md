@@ -1534,7 +1534,7 @@ iso4/
     core/                           ← iso4-core (lib): the engine
       build.rs                      ← snapshot + clock_platform.cc, core modules only
       src/
-        v8/                         ← the engine core: isolates, turn loop, bridge, console, timers, guard
+        v8/                         ← the engine core: isolates, run table, turn loop, exceptions, bridge, console, timers, guard
     server/                         ← iso4-server (bin iso4-v8): socket frontend for Node
       src/
   scripts/

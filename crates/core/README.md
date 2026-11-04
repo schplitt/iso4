@@ -48,6 +48,9 @@ network policy; `fetch` is a host-configured bridge global like any other.
 - `src/errors.rs` holds `RunError`, the failure output and the error codes.
 - `src/v8/` is the engine: `mod.rs` holds the run entry points and the turn
   loop; `isolate.rs` creates isolates and warm instance cores;
+  `runtable.rs` keys everything a native callback reaches by the owning run
+  and carries that run's token through its continuations; `exceptions.rs`
+  turns thrown V8 values into `RunError`s;
   `oom_label.rs` writes the fatal OOM line; `console.rs`, `timers.rs` and
   `guard.rs` hold the console capture, the guest timers and the limit
   guard; `globals.rs` installs host globals and

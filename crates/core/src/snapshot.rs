@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use v8::MapFnTo;
 
-use crate::v8::{RunTable, RunTableSlot};
+use crate::v8::runtable::{RunTable, RunTableSlot};
 
 /// Function addresses only, written once.
 struct References(Vec<v8::ExternalReference>);

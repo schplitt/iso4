@@ -2,22 +2,22 @@
 //!
 //! Owns the engine core: the run entry points, compilation, evaluation, the
 //! turn loop and output assembly. Isolate creation, the fatal OOM line,
-//! console capture, guest timers, the limit guard, host globals, ESM modules,
-//! the bridge and streamed bodies live in the child modules `isolate`,
-//! `oom_label`, `console`, `timers`, `guard`, `globals`, `modules`, `bridge`
-//! and `streams`; the `node:*` mirrors live under `node`; `RunError` and the
-//! failure output live in `crate::errors`.
+//! the per-run state table, thrown-value handling, console capture, guest
+//! timers, the limit guard, host globals, ESM modules, the bridge and
+//! streamed bodies live in the child modules `isolate`, `oom_label`,
+//! `runtable`, `exceptions`, `console`, `timers`, `guard`, `globals`,
+//! `modules`, `bridge` and `streams`; the `node:*` mirrors live under `node`;
+//! `RunError` and the failure output live in `crate::errors`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::blob;
-use crate::errors;
 use crate::errors::{codec_error_to_run_error, failure, reason_error, termination_or};
 use guard::{GuardTarget, InstanceGuard};
 use crate::link::{Addr, HostLink, Inbound, LinkError, Observer, Outbound};
@@ -26,10 +26,14 @@ use crate::types;
 use crate::types::{HostGlobalDef, ImportBinding};
 
 use bridge::{
-    BRIDGE_DISPATCH_GLOBAL, BridgeCallLog, BridgeStubSpec, GlobalCallbackData, PendingResolver,
-    PendingResolvers, StubSlots, collect_import_handles, host_bridge_error_from_rejection,
-    host_bridge_error_to_v8, install_bridge_globals, install_prefix_bridge_placeholders,
-    invoke_requested_call, owned_bridge_error, public_record_name, serialize_call_result,
+    BRIDGE_DISPATCH_GLOBAL, BridgeCallLog, BridgeStubSpec, PendingResolver, PendingResolvers,
+    StubSlots, collect_import_handles, host_bridge_error_from_rejection, host_bridge_error_to_v8,
+    install_bridge_globals, install_prefix_bridge_placeholders, invoke_requested_call,
+    owned_bridge_error, public_record_name, serialize_call_result,
+};
+use exceptions::{
+    error_message_from_value, error_name_from_value, exception_fields, exception_message,
+    exception_name, exception_stack, runtime_error_from_value, syntax_error,
 };
 use globals::install_value_globals;
 use isolate::{
@@ -42,6 +46,10 @@ use modules::{
     module_resolver_callback, take_resolver,
 };
 use oom_label::oom_error_cb;
+use runtable::{
+    CURRENT_RUN_TOKEN, LOAD_WINDOW_MS, RUN_TABLE_PTR, RunCallState, TIMERS_TOUCHED,
+    install_cped_rider,
+};
 use streams::{
     OutTableState, StreamTableState, cancel_all_out_streams, cancel_out_stream, close_out_streams,
     close_run_streams, deliver_stream_frame, drive_out_streams, note_out_activity, note_out_credit,
@@ -54,6 +62,7 @@ pub use isolate::{
     CpuBudget, InstanceCore, Limits, create_instance_core, init_platform, set_idle_settle_secs,
 };
 pub use oom_label::{OomRun, OomRunLabel, set_oom_prefix_id, set_oom_run};
+pub use runtable::{InstanceLoad, RunTable, alloc_run_token, load_now_ms};
 pub use streams::{
     OutStreamTable, StreamTable, body_stream_id_of, is_stream_body, make_body_stream,
     register_hydrated_stream, register_out_stream,
@@ -61,12 +70,14 @@ pub use streams::{
 
 mod bridge;
 pub(crate) mod console;
+mod exceptions;
 pub(crate) mod globals;
 mod guard;
 pub(crate) mod isolate;
 mod modules;
 pub(crate) mod node;
 mod oom_label;
+pub(crate) mod runtable;
 pub(crate) mod streams;
 #[cfg(test)]
 pub(crate) mod testsupport;
@@ -211,287 +222,6 @@ impl PendingWork {
             slot: RefCell::new(None),
         })
     }
-}
-
-// ── Per-run state table ──────────────────────────────────────────────────────
-//
-// One instance serves several in-flight runs (the interleaving model),
-// so everything a native callback used to reach through a fixed
-// instance-lifetime pointer — console buffers, the waitUntil set, the
-// streamed-body registry, bridge-stub bindings — is now keyed by the owning
-// run. Attribution: a *turn* executes on behalf of exactly one run
-// ([`CURRENT_RUN_TOKEN`], set at turn entry), and continuations created by a
-// run carry its token in the CPED rider (`node::async_hooks`), so
-// work resumed during another run's turn still attributes to its creator.
-
-/// The instance's run table, held in an isolate slot so the natives baked
-/// into the startup snapshot carry no per-instance pointer.
-#[derive(Clone, Copy)]
-pub(crate) struct RunTableSlot(pub(crate) *const RunTable);
-
-fn slot_table<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<&'s RunTable> {
-    // SAFETY: the slot points at the instance-lifetime RunTable Box, which
-    // outlives every callback of its isolate.
-    scope
-        .get_slot::<RunTableSlot>()
-        .filter(|slot| !slot.0.is_null())
-        .map(|slot| unsafe { &*slot.0 })
-}
-
-thread_local! {
-    /// The run whose turn is executing on this thread. 0 = none (between
-    /// turns, prefix warm-up). Fallback attribution when no CPED rider is
-    /// present; the gate that refuses between-turn callback activity.
-    static CURRENT_RUN_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-
-    /// The run table of the instance executing on this thread, for callback
-    /// paths that have no `scope`/External to reach it through (the codec's
-    /// rehydration walk). Null outside turns.
-    static RUN_TABLE_PTR: std::cell::Cell<*const RunTable> =
-        const { std::cell::Cell::new(std::ptr::null()) };
-
-    /// Runs whose timer set changed during the current turn: a CPED-rider
-    /// continuation can arm a CO-RESIDENT's timer, invisible to the
-    /// owner-only post-turn re-queue — the loop drains this after each turn.
-    static TIMERS_TOUCHED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Process-wide run-token allocator. Tokens are instance-local identities on
-/// the wire-facing side but allocated globally so no two live runs anywhere
-/// share one (wire run ids can collide across connections; tokens cannot).
-/// Starts at 1 — 0 means "no run".
-/// Per-instance signals written by the owner loop and read by the warm
-/// registry: thread load for join routing, settled heap for eviction.
-pub struct InstanceLoad {
-    /// Thread utilization over the last closed window, per-mille.
-    util_permille: std::sync::atomic::AtomicU32,
-    /// When that window closed (ms since [`load_now_ms`]'s epoch). A stale
-    /// window means the loop is parked — utilization is genuinely ~0.
-    closed_at_ms: std::sync::atomic::AtomicU64,
-    /// When the turn running right now started, `u64::MAX` between turns.
-    /// Windows close only between turns, so a long turn would otherwise
-    /// read as idle and attract more joins.
-    turn_open_since_ms: std::sync::atomic::AtomicU64,
-    /// Heap measured after the idle settle GC; 0 = none since the last
-    /// release. Fresher than the release-time reading, which still counts
-    /// the last run's garbage.
-    settled_heap_bytes: std::sync::atomic::AtomicU64,
-}
-
-/// Utilization windows: closed every 100 ms of wall time; a reading older
-/// than 500 ms reports 0 (parked loop).
-const LOAD_WINDOW_MS: u64 = 100;
-const LOAD_STALE_MS: u64 = 500;
-
-/// Milliseconds on the process-wide load epoch (cross-thread comparable).
-pub fn load_now_ms() -> u64 {
-    static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
-    ANCHOR.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-}
-
-impl InstanceLoad {
-    pub fn new() -> Self {
-        Self {
-            util_permille: std::sync::atomic::AtomicU32::new(0),
-            closed_at_ms: std::sync::atomic::AtomicU64::new(0),
-            turn_open_since_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
-            settled_heap_bytes: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn publish_settled_heap(&self, bytes: u64) {
-        self.settled_heap_bytes
-            .store(bytes, std::sync::atomic::Ordering::Release);
-    }
-
-    /// The settled reading, or 0 when none is current.
-    pub fn settled_heap_bytes(&self) -> u64 {
-        self.settled_heap_bytes
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// A run finished on the instance: whatever was settled is spent.
-    pub fn clear_settled_heap(&self) {
-        self.publish_settled_heap(0);
-    }
-
-    fn close_window(&self, permille: u32) {
-        self.util_permille
-            .store(permille, std::sync::atomic::Ordering::Release);
-        self.closed_at_ms
-            .store(load_now_ms(), std::sync::atomic::Ordering::Release);
-    }
-
-    fn open_turn(&self, at_ms: u64) {
-        self.turn_open_since_ms
-            .store(at_ms, std::sync::atomic::Ordering::Release);
-    }
-
-    fn close_turn(&self) {
-        self.turn_open_since_ms
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Recent utilization for routing; 0 when the last window is stale.
-    pub fn current_util_permille(&self) -> u32 {
-        self.util_permille_at(load_now_ms())
-    }
-
-    fn util_permille_at(&self, now_ms: u64) -> u32 {
-        let open = self
-            .turn_open_since_ms
-            .load(std::sync::atomic::Ordering::Acquire);
-        if now_ms.saturating_sub(open) >= LOAD_WINDOW_MS {
-            // A turn holding the thread for a whole window IS saturation,
-            // whatever the last closed window measured.
-            return UTILIZATION_SATURATED_PERMILLE;
-        }
-        let at = self.closed_at_ms.load(std::sync::atomic::Ordering::Acquire);
-        if now_ms.saturating_sub(at) > LOAD_STALE_MS {
-            return 0;
-        }
-        self.util_permille.load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-
-/// Full utilization: reported for a turn that outlasts a window.
-const UTILIZATION_SATURATED_PERMILLE: u32 = 1000;
-
-impl Default for InstanceLoad {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn alloc_run_token() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Everything one in-flight run owns on its instance. Boxed in the table so
-/// the address is stable across map rehashes; pointers into an entry are
-/// derived and used only within one turn/callback invocation, and entries
-/// are inserted/removed only between turns (no JS on the stack), so such a
-/// pointer never outlives its entry.
-struct RunCallState {
-    /// Console output, capped per this run's limits.
-    logs: Box<RefCell<LogBuffers>>,
-    /// `waitUntil` registrations (armed at the setup-to-run boundary).
-    pending: Box<PendingWork>,
-    /// Streamed-body registry (armed per run).
-    streams: Box<StreamTable>,
-    /// Outbound streamed-body registry (armed per run) — result bodies the
-    /// host reads chunk by chunk (#128).
-    out_streams: Box<OutStreamTable>,
-    /// Pending `setTimeout` registrations; dropped with the entry, so a
-    /// settled run's timer can never fire into a later run.
-    timers: Box<RefCell<TimerTable>>,
-    /// Per-stub bridge bindings for THIS run — the per-call half of what a
-    /// stub `Function` needs; the instance-lifetime half is the
-    /// [`bridge::StubSlot`] its External points at.
-    /// Rc'd so the bridge callback can take a per-invocation handle with one
-    /// refcount bump instead of cloning the whole binding (two Strings and a
-    /// fistful of Arcs).
-    stubs: RefCell<HashMap<String, std::rc::Rc<GlobalCallbackData>>>,
-    /// The side channel console lines are copied to as they happen.
-    observer: Arc<dyn Observer>,
-    /// This run's address on observer messages.
-    addr: Addr,
-}
-
-impl RunCallState {
-    fn new(
-        max_stdout_bytes: u32,
-        max_stderr_bytes: u32,
-        observer: Arc<dyn Observer>,
-        addr: Addr,
-    ) -> Box<Self> {
-        Box::new(Self {
-            logs: Box::new(RefCell::new(LogBuffers {
-                max_stdout_bytes,
-                max_stderr_bytes,
-                ..LogBuffers::default()
-            })),
-            pending: PendingWork::boxed(),
-            streams: StreamTable::boxed(),
-            out_streams: OutStreamTable::boxed(),
-            timers: TimerTable::boxed(),
-            stubs: RefCell::new(HashMap::new()),
-            observer,
-            addr,
-        })
-    }
-}
-
-/// Instance-lifetime registry of in-flight runs, reachable from native
-/// callbacks through an `External` (stable Box address, the `LogBuffers`
-/// pattern generalized).
-pub struct RunTable {
-    runs: RefCell<HashMap<u64, Box<RunCallState>>>,
-    /// Console output produced outside any run — prefix warm-up — delivered
-    /// on the cold-start call (the old `warmup_logs_pending` flow).
-    setup_logs: RefCell<LogBuffers>,
-}
-
-impl RunTable {
-    fn boxed() -> Box<Self> {
-        Box::new(Self {
-            runs: RefCell::new(HashMap::new()),
-            setup_logs: RefCell::new(LogBuffers::default()),
-        })
-    }
-
-    /// Pointer to a live run's state, or null. The pointer is valid for the
-    /// remainder of the current turn (entries are only removed between
-    /// turns); callers must not hold it longer.
-    fn state_ptr(&self, token: u64) -> *const RunCallState {
-        self.runs
-            .borrow()
-            .get(&token)
-            .map_or(std::ptr::null(), |b| std::ptr::addr_of!(**b))
-    }
-}
-
-/// The run native callbacks attribute to: the CPED rider's creator token
-/// when the running continuation carries one AND that run is still live,
-/// else the current turn owner. (A stale continuation of a finished run —
-/// driven during a later run's checkpoint on a warm instance — attributes
-/// to the turn owner, exactly the pre-table behavior of the shared buffers.)
-///
-/// Returns the run's state pointer (null when the attributed run has no
-/// live entry — setup code, or a stale continuation whose turn owner
-/// already concluded), resolved in ONE table borrow: the old
-/// token-then-`state_ptr` pair cost a second hash lookup per bridge call
-/// and console line.
-///
-/// The pointer is valid for the remainder of the current turn (entries are
-/// only removed between turns); callers must not hold it longer.
-fn attributed_state(scope: &mut v8::PinScope, table: &RunTable) -> *const RunCallState {
-    attributed_token_and_state(scope, table).1
-}
-
-/// [`attributed_state`] plus the run's token, in the same table borrow.
-fn attributed_token_and_state(
-    scope: &mut v8::PinScope,
-    table: &RunTable,
-) -> (u64, *const RunCallState) {
-    let current = CURRENT_RUN_TOKEN.with(|c| c.get());
-    let cped = scope.get_continuation_preserved_embedder_data();
-    let rider = rider_parts(scope, cped).map(|(token, _)| token);
-    let runs = table.runs.borrow();
-    if let Some(token) = rider {
-        if token != current {
-            // A live rider run wins; a stale rider falls back to the owner.
-            if let Some(entry) = runs.get(&token) {
-                return (token, std::ptr::addr_of!(**entry));
-            }
-        }
-    }
-    (
-        current,
-        runs.get(&current)
-            .map_or(std::ptr::null(), |b| std::ptr::addr_of!(**b)),
-    )
 }
 
 pub use crate::types::ResetCause;
@@ -3830,313 +3560,6 @@ pub(crate) fn elapsed_ms(start: std::time::Instant) -> f64 {
     (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1_000.0
 }
 
-// ── The CPED rider ───────────────────────────────────────────────────────────
-//
-// The CPED slot no longer holds the AsyncLocalStorage frame directly: it
-// holds a rider `[token, frame]` — the owning run's token beside the guest
-// frame (celld's pattern). V8 saves and restores CPED per continuation, so a
-// continuation created by run A carries A's token even when it executes
-// during run B's turn, and console output, bridge-stub dispatch, waitUntil
-// registration and stream reads attribute to A. Guests never see the rider:
-// the native get/set below unwrap/wrap it, and raw CPED is not otherwise
-// reachable from JS.
-
-/// Build a rider `[token, inner]`.
-fn make_rider<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    token: u64,
-    inner: v8::Local<v8::Value>,
-) -> v8::Local<'s, v8::Array> {
-    let rider = v8::Array::new(scope, 2);
-    let token_val = v8::Number::new(scope, token as f64);
-    rider.set_index(scope, 0, token_val.into());
-    rider.set_index(scope, 1, inner);
-    rider
-}
-
-/// Split a CPED value into `(token, inner)` when it is a rider.
-fn rider_parts<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<v8::Value>,
-) -> Option<(u64, v8::Local<'s, v8::Value>)> {
-    let arr = v8::Local::<v8::Array>::try_from(value).ok()?;
-    if arr.length() != 2 {
-        return None;
-    }
-    let token = arr.get_index(scope, 0)?.number_value(scope)?;
-    let inner = arr.get_index(scope, 1)?;
-    Some((token as u64, inner))
-}
-
-/// Install this run's rider at turn entry: continuations created from here
-/// carry the token. The previous rider needs no restoring — turn exit clears
-/// [`CURRENT_RUN_TOKEN`] and the next turn overwrites the slot.
-fn install_cped_rider(scope: &mut v8::PinScope, token: u64) {
-    let undefined = v8::undefined(scope).into();
-    let rider = make_rider(scope, token, undefined);
-    scope.set_continuation_preserved_embedder_data(rider.into());
-}
-
-/// Error text budget: leaves room for our marker under the wire clamp, so
-/// only one marker, with the true length, reaches the host.
-const ERROR_TEXT_BYTES: usize = errors::MAX_ERROR_TEXT_BYTES - 128;
-
-/// Copy at most 64 Ki UTF-16 units, then at most `max_bytes` of UTF-8, of
-/// guest text out of V8. `write_v2` reads a cons string in place;
-/// `to_rust_string_lossy` would flatten it first.
-fn capped_text_lossy(scope: &v8::Isolate, text: v8::Local<v8::String>, max_bytes: usize) -> String {
-    const MAX_UNITS: usize = 64 * 1024;
-    let len = text.length();
-    let mut out = if len <= MAX_UNITS {
-        text.to_rust_string_lossy(scope)
-    } else {
-        let mut units = vec![0u16; MAX_UNITS];
-        text.write_v2(scope, 0, &mut units, v8::WriteFlags::empty());
-        // A cut inside a surrogate pair would decode to U+FFFD.
-        if units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
-            units.pop();
-        }
-        String::from_utf16_lossy(&units)
-    };
-    if len <= MAX_UNITS && out.len() <= max_bytes {
-        return out;
-    }
-    out.truncate(out.floor_char_boundary(max_bytes));
-    out.push_str(&format!("… [truncated by iso4: {len} UTF-16 units total]"));
-    out
-}
-
-/// A compile failure is user code too: the pending `SyntaxError` as a run
-/// error. Parse errors carry no frame, so the stack is built from V8's
-/// message location — that is what names the file (`<prefix>`, a source
-/// import, the run's own code).
-fn syntax_error(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> RunError {
-    let Some(exception) = scope.exception() else {
-        return RunError::Internal("compile failed without an exception".to_string());
-    };
-    let RunError::RuntimeError(mut data) = runtime_error_from_value(scope, exception) else {
-        unreachable!("runtime_error_from_value always builds a RuntimeError");
-    };
-    // V8 gives a SyntaxError a header-only stack; add the frame it lacks.
-    if !data.stack.as_deref().is_some_and(|s| s.contains("\n    at ")) {
-        let location = scope.message().and_then(|m| {
-            let file = m
-                .get_script_resource_name(scope)
-                .and_then(|n| n.to_string(scope))
-                .map(|s| s.to_rust_string_lossy(scope))
-                .unwrap_or_else(|| "<anonymous>".to_string());
-            let line = m.get_line_number(scope)?;
-            Some(format!("{file}:{line}:{}", m.get_start_column() + 1))
-        });
-        if let Some(location) = location {
-            data.stack = Some(format!("{}: {}\n    at {location}", data.name, data.message));
-        }
-    }
-    RunError::RuntimeError(data)
-}
-
-fn runtime_error_from_value(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-    value: v8::Local<v8::Value>,
-) -> RunError {
-    let name = error_name_from_value(scope, value).unwrap_or_else(|| "Error".to_string());
-    let message = error_message_from_value(scope, value)
-        .or_else(|| {
-            value
-                .to_string(scope)
-                .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
-        })
-        .unwrap_or_else(|| "JavaScript error".to_string());
-    RunError::RuntimeError(Box::new(RuntimeErrorData {
-        name,
-        message,
-        stack: stack_from_value(scope, value),
-        fields: error_fields_from_value(scope, value),
-    }))
-}
-
-fn error_message_from_value(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-    value: v8::Local<v8::Value>,
-) -> Option<String> {
-    let object = value.to_object(scope)?;
-    let key = v8::String::new(scope, "message")?;
-    let msg = object.get(scope, key.into())?;
-    // Skip undefined/null - thrown primitives (strings, numbers) produce a
-    // String wrapper object whose .message property is undefined, which would
-    // stringify to the literal "undefined" instead of the thrown value.
-    if msg.is_undefined() || msg.is_null() {
-        return None;
-    }
-    msg.to_string(scope).map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
-}
-
-fn stack_from_value(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-    value: v8::Local<v8::Value>,
-) -> Option<String> {
-    let object = value.to_object(scope)?;
-    let key = v8::String::new(scope, "stack")?;
-    let stack = object.get(scope, key.into())?;
-    // Skip undefined/null — thrown primitives produce a wrapper object whose
-    // .stack is undefined, which would stringify to the literal "undefined".
-    if stack.is_undefined() || stack.is_null() {
-        return None;
-    }
-    stack
-        .to_string(scope)
-        .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
-}
-
-fn exception_message(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> String {
-    scope
-        .exception()
-        .and_then(|e| e.to_string(scope))
-        .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
-        .unwrap_or_else(|| "(no exception message)".to_string())
-}
-
-fn exception_stack(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> Option<String> {
-    let exception = scope.exception()?;
-    stack_from_value(scope, exception)
-}
-
-fn error_name_from_value(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-    value: v8::Local<v8::Value>,
-) -> Option<String> {
-    let obj = value.to_object(scope)?;
-    let key = v8::String::new(scope, "name")?;
-    let name_val = obj.get(scope, key.into())?;
-    if !name_val.is_string() {
-        return None;
-    }
-    name_val
-        .to_string(scope)
-        .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
-}
-
-fn exception_name(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> String {
-    scope
-        .exception()
-        .and_then(|e| error_name_from_value(scope, e))
-        .unwrap_or_else(|| "Error".to_string())
-}
-
-/// Keys that never travel in an error's `fields`: the first three are carried
-/// in dedicated slots (and letting them through would let a payload spoof
-/// Error identity or inject a fake stack), and `__proto__` is skipped so a
-/// re-attached field can never land on the prototype accessor.
-const RESERVED_ERROR_KEYS: [&str; 4] = ["name", "message", "stack", "__proto__"];
-
-/// Copy `source`'s own enumerable string-keyed properties onto `target`,
-/// skipping `skip`. Uses `create_data_property` ([[DefineOwnProperty]]), so a
-/// copied key is always a plain own data property.
-fn copy_own_properties_except(
-    scope: &mut v8::PinScope,
-    source: v8::Local<v8::Object>,
-    target: v8::Local<v8::Object>,
-    skip: &[&str],
-) {
-    let Some(names) = source.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
-    else {
-        return;
-    };
-    for i in 0..names.length() {
-        let Some(key) = names.get_index(scope, i) else {
-            continue;
-        };
-        let Some(name) = key.to_string(scope).map(|s| s.to_rust_string_lossy(scope)) else {
-            continue;
-        };
-        if skip.contains(&name.as_str()) {
-            continue;
-        }
-        // May invoke a throwing getter; a failed read simply drops the key.
-        let Ok(property_key) = v8::Local::<v8::Name>::try_from(key) else {
-            continue;
-        };
-        let Some(value) = source.get(scope, key) else {
-            continue;
-        };
-        target.create_data_property(scope, property_key, value);
-    }
-}
-
-/// Extract own enumerable properties from the thrown value as a value blob,
-/// skipping [`RESERVED_ERROR_KEYS`]. Properties V8 refuses to clone
-/// (functions, symbols, unresolved promises) are silently dropped. Returns
-/// `None` for non-object throws or when no serializable own property remains.
-fn error_fields_from_value(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-    value: v8::Local<v8::Value>,
-) -> Option<Vec<u8>> {
-    // Thrown primitives have no own properties of their own; to_object()
-    // would create a wrapper (a String wrapper enumerates its character
-    // indices) — never collect fields from those.
-    if !value.is_object() {
-        return None;
-    }
-    let obj = value.to_object(scope)?;
-    let fields = v8::Object::new(scope);
-    copy_own_properties_except(scope, obj, fields, &RESERVED_ERROR_KEYS);
-
-    let names = fields.get_own_property_names(scope, v8::GetPropertyNamesArgs::default())?;
-    if names.length() == 0 {
-        return None;
-    }
-    if let Ok(bytes) = blob::serialize_value(scope, fields.into()) {
-        return Some(bytes);
-    }
-
-    // One property is unserializable. Rebuild, testing each in isolation, so a
-    // single function-valued field does not cost the caller every other one.
-    let kept = v8::Object::new(scope);
-    let mut any = false;
-    for i in 0..names.length() {
-        // A getter that ended the run gets no per-property retry.
-        if scope
-            .get_slot::<Arc<ReasonCell>>()
-            .is_some_and(|reason| reason.get().is_some())
-        {
-            return None;
-        }
-        let Some(key) = names.get_index(scope, i) else {
-            continue;
-        };
-        let Ok(property_key) = v8::Local::<v8::Name>::try_from(key) else {
-            continue;
-        };
-        let Some(prop) = fields.get(scope, key) else {
-            continue;
-        };
-        if blob::serialize_value(scope, prop).is_err() {
-            continue;
-        }
-        kept.create_data_property(scope, property_key, prop);
-        any = true;
-    }
-    if !any {
-        return None;
-    }
-    blob::serialize_value(scope, kept.into()).ok()
-}
-
-fn exception_fields(
-    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
-) -> Option<Vec<u8>> {
-    let exception = scope.exception()?;
-    error_fields_from_value(scope, exception)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 //
 // TDD suite for the full Phase 1-8 surface. Tests are grouped by concern.
@@ -4157,22 +3580,6 @@ mod tests {
     // alias so the assertions below still read as value shapes.
     use crate::testval::{self, TestValue as WireValue};
     use crate::types::HostModuleNode;
-
-    #[test]
-    fn a_turn_outlasting_a_window_reads_as_saturated() {
-        let load = InstanceLoad::new();
-        load.close_window(300);
-        assert_eq!(load.util_permille_at(10), 300, "between turns: the window");
-        load.open_turn(10);
-        assert_eq!(load.util_permille_at(10 + LOAD_WINDOW_MS - 1), 300);
-        assert_eq!(
-            load.util_permille_at(10 + LOAD_WINDOW_MS),
-            UTILIZATION_SATURATED_PERMILLE,
-            "one turn has held the thread for a whole window",
-        );
-        load.close_turn();
-        assert_eq!(load.util_permille_at(10 + LOAD_WINDOW_MS), 300);
-    }
 
     // ── Basic ESM execution ───────────────────────────────────────────────
 
@@ -6403,52 +5810,6 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(expect_import(&err), DYN_IMPORT_MSG);
-    }
-
-    // ── Guest text copies ────────────────────────────────────────────────
-
-    #[test]
-    fn a_huge_thrown_message_is_capped_without_flattening() {
-        // A 32 MB heap cannot hold the 64 MB string flattened: any flatten
-        // would end the run with MemoryLimit instead.
-        let failure = run_code(
-            "throw new Error('a'.repeat(64 * 1024 * 1024))",
-            "<iso4>",
-            Limits {
-                hard_memory_mb: 32,
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        let payload = failure.error.to_payload();
-        let stack = payload.stack.as_deref().unwrap_or_default();
-        // Message and stack each carry exactly one marker, with the true length.
-        assert_eq!(payload.message.matches("[truncated by iso4: ").count(), 1);
-        assert_eq!(stack.matches("[truncated by iso4: ").count(), 1);
-        assert!(payload
-            .message
-            .ends_with("… [truncated by iso4: 67108864 UTF-16 units total]"));
-        assert!(!stack.contains("67108864 UTF-16 units total"));
-        // Both fit the wire cap, so the frontend's clamp adds no marker.
-        for text in [payload.message.as_str(), stack] {
-            assert!(
-                matches!(errors::clamp_error_text(text), std::borrow::Cow::Borrowed(_)),
-                "{}",
-                text.len()
-            );
-        }
-        assert_eq!(get_default(&run_ok("export default 1")).as_deref(), Some("1"));
-    }
-
-    #[test]
-    fn a_text_cut_inside_a_surrogate_pair_leaves_no_replacement_char() {
-        let err = run_err("throw new Error('a' + '😀'.repeat(40 * 1024))");
-        let RunError::RuntimeError(data) = &err else {
-            panic!("expected RuntimeError, got {err:?}");
-        };
-        assert!(!data.message.contains('\u{FFFD}'));
-        assert!(data.message.ends_with("… [truncated by iso4: 81921 UTF-16 units total]"));
-        assert!(data.message.len() <= errors::MAX_ERROR_TEXT_BYTES);
     }
 
 }
