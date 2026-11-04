@@ -1,7 +1,7 @@
 //! Test-only value tree for asserting on value blobs.
 //!
 //! Blobs are opaque bytes to Rust — reading one back needs a V8 isolate. The
-//! unit tests in `v8.rs` assert on the *shape* of what crossed the boundary,
+//! engine's unit tests assert on the *shape* of what crossed the boundary,
 //! so this module gives them a plain Rust tree plus blob ⇄ tree conversions
 //! that spin a throwaway isolate.
 //!

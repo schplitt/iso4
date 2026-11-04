@@ -18,7 +18,7 @@ mod snapshot;
 mod types;
 #[path = "src/url.rs"]
 mod url;
-#[path = "src/v8.rs"]
+#[path = "src/v8/mod.rs"]
 mod v8;
 #[path = "src/webcodec.rs"]
 mod webcodec;
