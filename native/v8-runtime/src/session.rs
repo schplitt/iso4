@@ -1,271 +1,24 @@
-//! Per-connection session handling.
+//! Per-connection frame glue. `handle_client` runs the handshake, then
+//! becomes the connection's demux: the only socket reader, it hands run
+//! requests to the [`Engine`] and routes run-tagged frames to each run's
+//! [`RunHandle`] by the leading run id. Runs answer through [`ConnLink`],
+//! one serialized writer, so frames from concurrent runs never interleave.
 //!
-//! `handle_client` is the entry point for one authenticated connection. It
-//! is the connection's DEMUX: the only socket reader, routing run-tagged
-//! frames (BridgeResponse, stream frames, Terminate) by the leading run id
-//! to the owning run's event channel — a one-off run's private channel, or
-//! the owning warm instance's shared channel with the run's token as the
-//! tag. Runs execute on worker threads (one-off `Run`s) or warm instance
-//! threads (`PrefixRun`s) and write every outbound frame through ONE
-//! serialized writer, so frames from concurrent runs never interleave
-//! mid-frame.
-//!
-//! Blast radius: a corrupt or unparseable frame means framing can no longer
-//! be trusted — the demux stops, every run in flight on THIS connection
-//! fails cleanly (no instance taint: nothing was interrupted mid-JS), and
-//! other connections are untouched.
-//!
-//! Protocol note: logs (stdout/stderr) are captured during execution and
-//! returned inside the `Result` frame's `RunCompletionPayload`; there are no
-//! `StdioChunk` frames.
+//! A corrupt frame ends the demux: every run in flight on this connection
+//! fails cleanly, other connections are untouched.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::errors;
+use crate::engine::{trace, Caller, Engine, Refusal, RunHandle};
 use crate::ipc;
 use crate::link::{Addr, HostLink, Inbound, LinkError, NoopObserver, Outbound};
 use crate::types;
-use crate::v8 as sandbox;
 use crate::wire;
-
-/// Per-run trace lines (`Run`/`PrefixRun` received / succeeded / failed) are
-/// **off by default**. They are two unbuffered `eprintln!`s on the hot path,
-/// and the runtime's stderr is inherited by the host process, so they cost
-/// ~13 µs per run when stderr is discarded and ~23 µs when it is a real file or
-/// pipe — 2-4 % of a hot `prefix.call()` (measured 2026-08-10, release
-/// build, 10-core Apple Silicon).
-///
-/// Set `ISO4_V8_TRACE=1` to get them back. Everything else the runtime logs —
-/// handshake failures, protocol violations, prefix lifecycle, frame-write
-/// errors — is unconditional: those are rare, and they are the only signal for
-/// failures the host cannot observe from a `Result` frame.
-fn trace_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ISO4_V8_TRACE").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
-}
-
-/// `eprintln!` gated on [`trace_enabled`]. Arguments are only evaluated when
-/// tracing is on, so a disabled trace line costs one relaxed atomic load.
-macro_rules! trace {
-    ($($arg:tt)*) => {
-        if crate::session::trace_enabled() {
-            eprintln!($($arg)*);
-        }
-    };
-}
-
-/// True when the run needs the session socket for bridge calls: some global
-/// installs a bridge stub (a plain function or a shim handler), or some host
-/// import declares a function leaf (the runtime then installs the reserved
-/// `__iso4_call` dispatcher stub itself). String/data-only runs do not.
-fn needs_bridge_stub(defs: &[types::HostGlobalDef], imports: &[types::ImportBinding]) -> bool {
-    defs.iter().any(|g| g.bridge_stub_name().is_some())
-        || imports.iter().any(|b| match &b.module {
-            types::ImportModule::Source(_) => false,
-            types::ImportModule::Host(exports) => has_function_leaf(exports),
-        })
-}
-
-fn has_function_leaf(entries: &[(String, types::HostModuleNode)]) -> bool {
-    entries.iter().any(|(_, node)| match node {
-        types::HostModuleNode::Function => true,
-        types::HostModuleNode::Object(children) => has_function_leaf(children),
-        types::HostModuleNode::Data(_) => false,
-    })
-}
-
-/// Validate the globals a `PrefixRun` carries. Only declared bridge stubs may
-/// be re-installed; value globals are frozen with the prefix. A name declared
-/// as a data or string global is `FrozenBinding`, anything else
-/// `UndeclaredBinding`. Mirrors `extractBridgeGlobals` in the TS client.
-fn validate_global_rebinds(
-    globals: &[types::HostGlobalDef],
-    declared_stubs: &[String],
-    declared: &[types::HostGlobalDef],
-) -> Result<(), sandbox::RunError> {
-    for def in globals {
-        let (name, is_stub) = match def {
-            types::HostGlobalDef::Bridge { name, .. } => (name.as_str(), true),
-            types::HostGlobalDef::StringExpr { name, .. }
-            | types::HostGlobalDef::Data { name, .. }
-            | types::HostGlobalDef::Shim { name, .. } => (name.as_str(), false),
-        };
-        if is_stub && declared_stubs.iter().any(|d| d == name) {
-            continue;
-        }
-        let frozen = declared.iter().any(|d| {
-            matches!(d, types::HostGlobalDef::StringExpr { name: n, .. }
-                | types::HostGlobalDef::Data { name: n, .. } if n == name)
-        });
-        return Err(if frozen {
-            sandbox::RunError::FrozenBinding(format!(
-                "global '{name}' is a value global, frozen with the prefix — only function globals can be rebound"
-            ))
-        } else {
-            sandbox::RunError::UndeclaredBinding(format!(
-                "global '{name}' was not declared at precompile time"
-            ))
-        });
-    }
-    Ok(())
-}
-
-/// Validate the host-import rebinds a `PrefixRun` requested against the shape
-/// declared at `Precompile`. Only declared host-module *function leaves* may
-/// be re-pointed at a new host handler. An unknown specifier or path is
-/// `UndeclaredBinding`; a source module or data leaf is declared but frozen
-/// with the prefix — `FrozenBinding`.
-fn validate_import_rebinds(
-    rebinds: &[types::ImportRebind],
-    declared: &[types::ImportBinding],
-) -> Result<(), sandbox::RunError> {
-    for rb in rebinds {
-        let Some(binding) = declared.iter().find(|b| b.specifier == rb.specifier) else {
-            return Err(sandbox::RunError::UndeclaredBinding(format!(
-                "import '{}' was not declared at precompile time",
-                rb.specifier
-            )));
-        };
-        let exports = match &binding.module {
-            types::ImportModule::Source(_) => {
-                return Err(sandbox::RunError::FrozenBinding(format!(
-                    "import '{}' is a source module — source imports are frozen \
-                     with the prefix and cannot be rebound at prefix.call() time",
-                    rb.specifier
-                )))
-            }
-            types::ImportModule::Host(exports) => exports,
-        };
-        match find_host_node(exports, &rb.path) {
-            Ok(types::HostModuleNode::Function) => {}
-            Ok(types::HostModuleNode::Data(_)) => {
-                return Err(sandbox::RunError::FrozenBinding(format!(
-                    "import '{}'.{} is a data leaf, not a function — data leaves \
-                     cannot be rebound",
-                    rb.specifier,
-                    rb.path.join(".")
-                )))
-            }
-            Ok(types::HostModuleNode::Object(_)) => {
-                return Err(sandbox::RunError::UndeclaredBinding(format!(
-                    "import '{}'.{} was not declared at precompile time",
-                    rb.specifier,
-                    rb.path.join(".")
-                )))
-            }
-            Err(depth) => {
-                return Err(sandbox::RunError::UndeclaredBinding(format!(
-                    "import '{}'.{} was not declared at precompile time",
-                    rb.specifier,
-                    rb.path[..depth].join(".")
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Follow a path of key segments through a host-module tree. `Err` carries
-/// the length of the path up to and including the first segment not found.
-fn find_host_node<'a>(
-    entries: &'a [(String, types::HostModuleNode)],
-    path: &[String],
-) -> Result<&'a types::HostModuleNode, usize> {
-    let mut entries = entries;
-    let mut node = None;
-    for (i, segment) in path.iter().enumerate() {
-        let found = entries
-            .iter()
-            .find(|(k, _)| k == segment)
-            .map(|(_, n)| n)
-            .ok_or(i + 1)?;
-        if let types::HostModuleNode::Object(children) = found {
-            entries = children;
-        } else if i + 1 < path.len() {
-            return Err(path.len());
-        }
-        node = Some(found);
-    }
-    node.ok_or(path.len())
-}
-
-/// Validated source + declared global / import shape for one prepared prefix.
-///
-/// Stored behind an `Arc` in the store so a `PrefixRun` takes a handle under
-/// the lock instead of deep-cloning the source and global defs on every run.
-/// Each run re-evaluates the source into its fresh context; there is no
-/// runtime snapshot (V8 14.x cannot create snapshots safely in a live
-/// multi-isolate process).
-pub struct PrefixData {
-    /// The numeric half of the wire `prefix_id`, named by the fatal OOM line.
-    pub id: u64,
-    /// The prefix module source, exactly as validated at precompile time.
-    pub code: String,
-    /// Filename the prefix was declared with (module origin in stacks).
-    pub filename: Option<String>,
-    /// The full precompile-time global defs, replayed into every run's
-    /// context before the prefix evaluates (value globals as values, bridge
-    /// callables as throwing placeholders).
-    pub globals: Vec<types::HostGlobalDef>,
-    /// Bridge stub names declared at precompile time, the only globals a
-    /// PrefixRun may carry; anything else is ERR_UNDECLARED_BINDING, or
-    /// ERR_FROZEN_BINDING for a declared data or string global.
-    pub declared_globals: Vec<String>,
-    /// Imports declared at precompile time. Re-used as-is on PrefixRun:
-    /// source modules and host data exports are frozen at declaration, and
-    /// host import function shape (specifier + name) must match what the
-    /// prefix was validated against. Run-time `imports` in the PrefixRun
-    /// payload only carry re-binding of host function handlers (TS
-    /// dispatch); the wire-level binding shape comes from here.
-    pub declared_imports: Vec<types::ImportBinding>,
-}
-
-/// One stored prefix: runnable, or broken by a deterministic cold-start
-/// failure. A broken entry keeps only the clamped failure; the source is
-/// dropped and refusals share it by refcount.
-pub enum PrefixEntry {
-    Ready(Arc<PrefixData>),
-    Broken(Arc<types::RunErrorPayload>),
-}
-
-/// State shared across all connection threads in the same Rust process.
-///
-/// Using a single shared store means a prefix compiled on connection 0 is
-/// visible to connections 1, 2, … N — which is required for the TypeScript
-/// pool to route any run to any free slot.
-pub struct SharedState {
-    /// Prefix data keyed by their string PrefixId.
-    pub prefix_store: Mutex<HashMap<String, PrefixEntry>>,
-    /// Monotonically increasing counter for generating unique PrefixIds.
-    pub next_prefix_id: AtomicU64,
-    /// Warm instance registry: every PrefixRun is served by a resident
-    /// isolate from here; one-off runs share the same slot accounting.
-    pub warm: crate::warm::WarmRegistry,
-}
-
-impl SharedState {
-    /// `warm_budget_bytes` is the mark the registry sheds against (global
-    /// container usage; 0 disables it); `hard_line_bytes` is the isolate
-    /// admission line (0 = no container limit readable). Concurrency is
-    /// bounded by the host pool; there is no instance-count cap.
-    pub fn new(warm_budget_bytes: u64, hard_line_bytes: u64) -> Self {
-        Self {
-            prefix_store: Mutex::new(HashMap::new()),
-            next_prefix_id: AtomicU64::new(0),
-            warm: crate::warm::WarmRegistry::new(warm_budget_bytes, hard_line_bytes),
-        }
-    }
-}
 
 /// How long a freshly accepted connection has to deliver its whole
 /// `Authenticate` frame, measured from the first byte of the length prefix.
@@ -326,7 +79,12 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
 /// The connection's writer as the engine sees it: one frame per message,
 /// the run's wire id from the address. A frame over the protocol ceiling is
 /// refused synchronously as `TooLarge`, so the sender can substitute.
-impl HostLink for ipc::Outbox {
+struct ConnLink {
+    outbox: ipc::Outbox,
+    runs: ConnRuns,
+}
+
+impl HostLink for ConnLink {
     fn send(&self, to: Addr, msg: Outbound) -> Result<(), LinkError> {
         let Addr::Run(run_id) = to;
         let (message_type, head, tail) = match msg {
@@ -378,13 +136,23 @@ impl HostLink for ipc::Outbox {
                 Vec::new(),
             ),
         };
-        self.send_frame(message_type, head, tail).map_err(|e| {
+        self.outbox.send_frame(message_type, head, tail).map_err(|e| {
             if e.kind() == std::io::ErrorKind::InvalidInput {
                 LinkError::TooLarge(e.to_string())
             } else {
                 LinkError::Closed(e.to_string())
             }
         })
+    }
+
+    /// The run's route goes before its final answer, so the host can reuse
+    /// the id as soon as it has the answer.
+    fn finished(&self, to: Addr) {
+        let Addr::Run(run_id) = to;
+        self.runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&run_id);
     }
 }
 
@@ -440,49 +208,19 @@ fn inbound_of(frame: ipc::TsToRustFrame) -> Result<Inbound, String> {
     }
 }
 
-/// The failure a run refused by the memory admission reports: nothing ran,
-/// so every telemetry field is genuinely zero.
-fn capacity_failure(refusal: String) -> sandbox::FailureOutput {
-    sandbox::FailureOutput {
-        error: sandbox::RunError::Capacity(refusal),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        duration_ms: 0.0,
-        wall_time_ms: 0.0,
-        cpu_time_ms: 0.0,
-        bridge_calls: Vec::new(),
-    }
-}
-
-/// Where the demux routes one in-flight run's inbound frames: a one-off
-/// run's private channel, or the owning warm instance's shared event
-/// channel. Every event is tagged with the run's `token` so the consumer
-/// delivers it to the right run.
+/// One in-flight run as the demux routes it.
 struct RunRoute {
-    frames: sandbox::RunEventSender,
-    /// Per-run inbound frame cap (the run's memory budget) — demux policy.
+    handle: RunHandle,
+    /// Per-run inbound frame cap (the run's memory budget).
     frame_cap: u32,
-    /// The run's instance-local token: the event tag, and the mid-turn
-    /// abort target.
-    token: u64,
-    /// The owning instance guard's cross-thread face, filled once the
-    /// isolate exists.
-    ctl: std::sync::Arc<std::sync::OnceLock<sandbox::GuardCtl>>,
 }
 
-/// This connection's in-flight runs, shared between the demux reader and the
-/// release hooks (which remove their run when it finishes).
+/// This connection's in-flight runs by wire run id, shared between the demux
+/// and the link, which drops a run when it finishes.
 type ConnRuns = Arc<Mutex<HashMap<u32, RunRoute>>>;
 
-/// The per-run inbound frame allowance, enforced during routing (a frame
-/// over it fails that run alone). The DEMUX read itself uses the flat
-/// protocol ceiling instead: the host's encoder refuses to emit any frame
-/// over `DEFAULT_MAX_FRAME_LENGTH`, so an allowance above it is
-/// unreachable, and recomputing a max over live runs per inbound frame
-/// (with a lock) bought nothing. The constant ceiling also never shrinks
-/// under an in-flight frame, so a late big frame for a just-completed run
-/// reads fine and is discarded as late — only a frame the host could never
-/// have sent kills the connection.
+/// The per-run inbound frame allowance: a frame over it fails that run
+/// alone. The demux read itself is bounded by the flat protocol ceiling.
 fn frame_cap_for(limits: &types::ResourceLimits) -> u32 {
     match (limits.soft_memory_mb, limits.hard_memory_mb) {
         (0, 0) => ipc::DEFAULT_MAX_FRAME_LENGTH,
@@ -491,7 +229,7 @@ fn frame_cap_for(limits: &types::ResourceLimits) -> u32 {
     }
 }
 
-pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
+pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
     // The first frame comes from a peer that has shown nothing yet, so it is
@@ -595,20 +333,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
         return;
     }
 
-    // Brand key for host-emitted host-type descriptors (docs/protocol.md
-    // §4.4.6): derived from the handshake token, installed for this session
-    // thread (one-off runs) and handed to every warm instance this
-    // connection spawns. Only descriptors stamped with it rehydrate.
-    let brand_key = crate::webcodec::brand_key_for_token(&auth.descriptor_token);
-    crate::webcodec::set_session_brand_key(brand_key.clone());
-
     eprintln!("[iso4-v8] handshake complete");
-
-    // Per-connection bridge call-ID counter.  Monotonically increasing across
-    // all runs on this connection so callIds never reset to 0 between runs;
-    // with several runs in flight the counter also keeps their callIds
-    // disjoint.
-    let call_id_counter = Arc::new(AtomicU32::new(0));
 
     // ── Step 3: the demux loop ────────────────────────────────────────────
     //
@@ -625,21 +350,22 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
             return;
         }
     };
-    let link: Arc<dyn HostLink> = Arc::new(outbox.clone());
     let conn_runs: ConnRuns = Arc::new(Mutex::new(HashMap::new()));
+    let caller = Caller {
+        link: Arc::new(ConnLink {
+            outbox: outbox.clone(),
+            runs: Arc::clone(&conn_runs),
+        }),
+        observer: Arc::new(NoopObserver),
+        // Bridge call ids never repeat on this connection, across runs.
+        call_ids: Arc::new(AtomicU32::new(0)),
+        // Only host-type descriptors stamped with this key rehydrate
+        // (docs/protocol.md §4.4.6).
+        brand_key: crate::webcodec::brand_key_for_token(&auth.descriptor_token),
+    };
 
-    // ── Teardown guard ────────────────────────────────────────────────────
-    // When the demux ends — EOF, I/O error, protocol violation, or a panic
-    // unwinding this thread — framing can no longer be trusted: every run in
-    // flight on THIS connection fails cleanly and releases its slot;
-    // instances are NOT tainted (nothing was interrupted mid-JS) and other
-    // connections are unaffected — the epic's blast-radius bound. A Drop
-    // guard rather than code after the loop because a warm instance's event
-    // channel is shared and outlives any one connection, so a panicked demux
-    // dropping its routes would otherwise strand runs waiting on it forever.
-    // The outbox needs no explicit close: it drains and exits when the last
-    // clone drops — a run concluding after this teardown still gets its
-    // failure Result out, exactly like the old direct-write socket clone.
+    // However the demux ends, a panic included, every run in flight on this
+    // connection fails cleanly; a warm instance's channel outlives it.
     struct FailRunsOnDrop(ConnRuns);
     impl Drop for FailRunsOnDrop {
         fn drop(&mut self) {
@@ -649,12 +375,8 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
             };
             for route in routes {
                 route
-                    .frames
-                    .send(sandbox::RoutedEvent::new(
-                        route.token,
-                        sandbox::RunEvent::Host(Inbound::ConnectionLost { detail: None }),
-                    ))
-                    .ok();
+                    .handle
+                    .deliver(Inbound::ConnectionLost { detail: None });
             }
         }
     }
@@ -686,21 +408,17 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 break;
             }
             ipc::TsToRustMessageType::Run => {
-                let payload = match ipc::parse_run_payload(&frame.payload) {
+                let req = match ipc::parse_run_payload(&frame.payload) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("[iso4-v8] malformed Run payload: {e} — closing");
                         break;
                     }
                 };
-                dispatch_oneoff_run(
-                    payload,
-                    &shared,
-                    &link,
-                    &conn_runs,
-                    &call_id_counter,
-                    &brand_key,
-                );
+                let (run_id, frame_cap) = (req.run_id, frame_cap_for(&req.limits));
+                start_run(&conn_runs, &caller, run_id, frame_cap, |register| {
+                    engine.run(req, &caller, register)
+                });
             }
             ipc::TsToRustMessageType::Precompile => {
                 let payload = match ipc::parse_precompile_payload(&frame.payload) {
@@ -710,48 +428,42 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                         break;
                     }
                 };
-                dispatch_precompile(payload, &shared, &outbox);
+                let prefix_id = engine.prepare(
+                    payload.code,
+                    payload.filename,
+                    payload.globals,
+                    payload.imports,
+                );
+                let result = wire::encode_precompile_result_payload(
+                    payload.request_id,
+                    Some(&prefix_id),
+                    None,
+                );
+                if let Err(e) = outbox.send_frame(
+                    ipc::RustToTsMessageType::PrecompileResult,
+                    result,
+                    Vec::new(),
+                ) {
+                    eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
+                }
             }
             ipc::TsToRustMessageType::PrefixRun => {
-                let payload = match ipc::parse_prefix_run_payload(&frame.payload) {
+                let req = match ipc::parse_prefix_run_payload(&frame.payload) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("[iso4-v8] malformed PrefixRun payload: {e} — closing");
                         break;
                     }
                 };
-                dispatch_prefix_run(
-                    payload,
-                    &shared,
-                    &link,
-                    &conn_runs,
-                    &call_id_counter,
-                    &brand_key,
-                );
+                let (run_id, frame_cap) = (req.run_id, frame_cap_for(&req.limits));
+                start_run(&conn_runs, &caller, run_id, frame_cap, |register| {
+                    engine.prefix_run(req, &caller, register)
+                });
             }
             ipc::TsToRustMessageType::DisposePrefix => {
                 match ipc::parse_dispose_prefix_payload(&frame.payload) {
-                    Ok(prefix_id) => {
-                        // Hold the prefix_store lock across dispose_prefix so
-                        // the remove and the idle-pool drop are atomic w.r.t.
-                        // a concurrent release (see the release hook). Busy
-                        // instances are not in the idle pool yet; their
-                        // release then observes the prefix gone and drops
-                        // them instead of pooling them.
-                        let existed = {
-                            let mut store = shared
-                                .prefix_store
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner());
-                            let existed = store.remove(&prefix_id).is_some();
-                            shared.warm.dispose_prefix(&prefix_id);
-                            existed
-                        };
-                        eprintln!(
-                            "[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})"
-                        );
-                        // No response frame — DisposePrefix is fire-and-forget.
-                    }
+                    // No response frame: DisposePrefix is fire-and-forget.
+                    Ok(prefix_id) => engine.dispose_prefix(&prefix_id),
                     Err(e) => {
                         eprintln!("[iso4-v8] malformed DisposePrefix payload: {e} — closing");
                         break;
@@ -762,7 +474,7 @@ pub fn handle_client(mut stream: UnixStream, shared: Arc<SharedState>) {
                 // Capacity/usage snapshot. Sent by the host's dedicated
                 // control connection, so it never queues behind runs; the
                 // payload is empty and the reply is one StatsResult frame.
-                let stats = shared.warm.stats();
+                let stats = engine.stats();
                 if let Err(e) = outbox.send_frame(
                     ipc::RustToTsMessageType::StatsResult,
                     wire::encode_stats_payload(&stats),
@@ -820,12 +532,10 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
         }
         return Ok(());
     };
-    // Per-run inbound cap — demux policy (the read itself is bounded by the
-    // connection-wide ceiling; this enforces the RUN's own allowance).
     let frame_len = frame.payload.len().saturating_add(1);
     let cap = route.frame_cap;
-    let (frames, token) = (route.frames.clone(), route.token);
-    // Decoding copies the payload; release hooks take this lock to finish.
+    let handle = route.handle.clone();
+    // Decoding copies the payload; finishing runs take this lock.
     drop(runs);
     let msg = if frame_len > cap as usize {
         Inbound::ConnectionLost {
@@ -841,22 +551,11 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
             },
         }
     };
-    frames
-        .send(sandbox::RoutedEvent::new(
-            token,
-            sandbox::RunEvent::Host(msg),
-        ))
-        .ok();
+    handle.deliver(msg);
     Ok(())
 }
 
-/// Route a Terminate. SOFT (the default abort): always deliver as a routed
-/// frame — if the target's turn is executing, the frame waits in its queue
-/// and the abandon lands at the turn boundary; nothing is ever interrupted
-/// mid-JS, the instance survives, co-residents are untouched. HARD (opt-in
-/// sledgehammer): if the target's own turn is executing right now,
-/// terminate it mid-turn — the kill records its reason and taints the
-/// instance; otherwise hard degrades to the same clean routed abandon.
+/// Route a Terminate to its run; [`RunHandle::deliver`] decides soft or hard.
 fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<(), String> {
     let (run_id, mode) = match ipc::parse_terminate_payload(&frame.payload) {
         Ok(parsed) => parsed,
@@ -864,30 +563,17 @@ fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
         // connection rather than leaving the (unidentifiable) target running.
         Err(e) => return Err(format!("malformed Terminate payload: {e}")),
     };
-    let runs = conn_runs.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(route) = runs.get(&run_id) else {
-        // The run completed just before the abort landed — a benign race.
-        // Discard and keep the connection healthy for its other runs.
+    let handle = conn_runs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&run_id)
+        .map(|route| route.handle.clone());
+    let Some(handle) = handle else {
+        // The run completed just before the abort landed: a benign race.
         eprintln!("[iso4-v8] ignoring stray Terminate (run {run_id} already completed)");
         return Ok(());
     };
-    if mode == types::TerminateMode::Hard {
-        if let Some(ctl) = route.ctl.get() {
-            if ctl.abort_executing(route.token) {
-                eprintln!("[iso4-v8] hard Terminate for run {run_id} landed mid-turn — terminating");
-                // The loop classifies the kill and resets the instance; no
-                // frame delivery needed (the run's channel dies with it).
-                return Ok(());
-            }
-        }
-    }
-    route
-        .frames
-        .send(sandbox::RoutedEvent::new(
-            route.token,
-            sandbox::RunEvent::Host(Inbound::Terminate { mode }),
-        ))
-        .ok();
+    handle.deliver(Inbound::Terminate { mode });
     Ok(())
 }
 
@@ -898,603 +584,52 @@ fn peek_run_id(payload: &[u8]) -> Option<u32> {
         .map(|b| u32::from_be_bytes(b.try_into().expect("4-byte slice")))
 }
 
-/// Whether a run id is already in flight on this connection. Replacing a
-/// live route would strand the first run (its frames discarded as late) and
-/// misdeliver its completion cleanup, so a duplicate is refused loudly
-/// BEFORE anything is acquired for the new run. The demux thread is this
-/// connection's only route inserter, so a clear check here stays true
-/// through the dispatch that follows.
-fn run_id_in_flight(conn_runs: &ConnRuns, run_id: u32) -> bool {
-    conn_runs
+/// Start a run through the engine, routed under `run_id` once the engine
+/// registers it. A duplicate id is refused before anything is acquired:
+/// replacing a live route would strand the first run. The demux is this
+/// connection's only route inserter, so the check holds through the start.
+fn start_run(
+    conn_runs: &ConnRuns,
+    caller: &Caller,
+    run_id: u32,
+    frame_cap: u32,
+    start: impl FnOnce(&mut dyn FnMut(RunHandle)) -> Result<(), Refusal>,
+) {
+    let in_flight = conn_runs
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .contains_key(&run_id)
-}
-
-/// Register a run with the demux: events route to `frames`, tagged with
-/// `token`. The caller checked [`run_id_in_flight`] first.
-fn insert_run_route(
-    conn_runs: &ConnRuns,
-    run_id: u32,
-    token: u64,
-    limits: &types::ResourceLimits,
-    ctl: Arc<std::sync::OnceLock<sandbox::GuardCtl>>,
-    frames: sandbox::RunEventSender,
-) {
-    let mut runs = conn_runs.lock().unwrap_or_else(|p| p.into_inner());
-    let replaced = runs.insert(
-        run_id,
-        RunRoute {
-            frames,
-            frame_cap: frame_cap_for(limits),
-            token,
-            ctl,
-        },
-    );
-    debug_assert!(replaced.is_none(), "run id checked before dispatch");
-}
-
-/// Answer a run the demux refused before dispatch (duplicate run id).
-fn refuse_duplicate_run(link: &dyn HostLink, run_id: u32) {
-    eprintln!(
-        "[iso4-v8] run {run_id} is already in flight on this connection — refusing the duplicate"
-    );
-    let completion = types::RunCompletion::Failure(types::RunFailurePayload {
-        error: types::RunErrorPayload {
-            code: "ERR_INTERNAL".to_string(),
-            name: "Error".to_string(),
-            message: format!(
-                "run id {run_id} is already in flight on this connection; every \
-                 concurrent run needs a distinct id"
-            ),
-            stack: None,
-            fields: None,
-            reset: None,
-            prefix_stage: false,
-            cause: None,
-        },
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        duration_ms: 0.0,
-        wall_time_ms: 0.0,
-        cpu_time_ms: 0.0,
-        bridge_calls: Vec::new(),
-        heap_used_bytes: None,
-    });
-    sandbox::send_completion(link, run_id, Outbound::Result { completion });
-}
-
-/// A one-off `Run`: executed on its own worker thread (a fresh isolate every
-/// time), off the session thread so the demux keeps routing while it runs.
-fn dispatch_oneoff_run(
-    payload: ipc::RunPayload,
-    shared: &Arc<SharedState>,
-    link: &Arc<dyn HostLink>,
-    conn_runs: &ConnRuns,
-    call_id_counter: &Arc<AtomicU32>,
-    brand_key: &str,
-) {
-    trace!(
-        "[iso4-v8] Run {} received ({} code bytes, {} globals, call={})",
-        payload.run_id,
-        payload.code.len(),
-        payload.globals.len(),
-        payload
-            .call
-            .as_ref()
-            .map(|c| c.export_path.as_str())
-            .unwrap_or("-"),
-    );
-
-    let run_id = payload.run_id;
-    if run_id_in_flight(conn_runs, run_id) {
-        refuse_duplicate_run(&**link, run_id);
-        return;
-    }
-    // Fresh isolate per one-off, shared ledger; admission-checked before
-    // the route exists so a refusal leaves nothing to unwind.
-    let run_cap_bytes = u64::from(payload.limits.hard_memory_mb) * 1024 * 1024;
-    if let Err(refusal) = shared.warm.reserve_oneoff(run_cap_bytes) {
-        sandbox::send_completion(
-            &**link,
-            run_id,
-            sandbox::completion_message(&Err(capacity_failure(refusal)), None, false),
+        .contains_key(&run_id);
+    if in_flight {
+        eprintln!(
+            "[iso4-v8] run {run_id} is already in flight on this connection — refusing the duplicate"
         );
+        let error = crate::v8::RunError::Internal(format!(
+            "run id {run_id} is already in flight on this connection; every \
+             concurrent run needs a distinct id"
+        ));
+        refuse(&*caller.link, run_id, error.to_payload());
         return;
     }
-
-    let token = sandbox::alloc_run_token();
-    let ctl = Arc::new(std::sync::OnceLock::new());
-    // A one-off run gets a private event channel (it owns no instance loop).
-    let (events_tx, events) = crossbeam_channel::unbounded();
-    insert_run_route(
-        conn_runs,
-        run_id,
-        token,
-        &payload.limits,
-        Arc::clone(&ctl),
-        events_tx,
-    );
-
-    let worker_shared = Arc::clone(shared);
-    let worker_link = Arc::clone(link);
-    let worker_conn_runs = Arc::clone(conn_runs);
-    let call_id_counter = Arc::clone(call_id_counter);
-    let brand_key = brand_key.to_string();
-    let spawned = std::thread::Builder::new()
-        .name("iso4-oneoff-run".to_string())
-        .spawn(move || {
-            let (shared, link, conn_runs) = (worker_shared, worker_link, worker_conn_runs);
-            crate::webcodec::set_session_brand_key(brand_key);
-            sandbox::set_oom_run(sandbox::OomRun::Run(run_id));
-            sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
-                run_id,
-                report_heap: false,
-            }));
-            let result = sandbox::execute_with_io(
-                &payload.code,
-                payload.filename.as_deref(),
-                sandbox::Limits {
-                    wall_time_ms: payload.limits.wall_time_ms,
-                    cpu_time_ms: payload.limits.cpu_time_ms,
-                    soft_memory_mb: payload.limits.soft_memory_mb,
-                    hard_memory_mb: payload.limits.hard_memory_mb,
-                    max_export_bytes: payload.limits.max_export_bytes,
-                    max_stdout_bytes: payload.limits.max_stdout_bytes,
-                    max_stderr_bytes: payload.limits.max_stderr_bytes,
-                    max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
-                    max_bridge_calls: payload.limits.max_bridge_calls,
-                    grace_ms: payload.limits.grace_ms,
-                },
-                &payload.globals,
-                &payload.imports,
-                sandbox::RunIo::Session {
-                    events,
-                    link: Arc::clone(&link),
-                },
-                token,
-                call_id_counter,
-                payload.call.as_ref(),
-                Some(ctl),
-                Arc::new(NoopObserver),
-            );
-            match &result {
-                Ok(output) => {
-                    trace!("[iso4-v8] run succeeded in {:.3}ms", output.duration_ms)
-                }
-                Err(failure) => trace!(
-                    "[iso4-v8] run failed in {:.3}ms: {:?}",
-                    failure.duration_ms,
-                    failure.error
-                ),
-            }
-            conn_runs
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&run_id);
-            let (wall_time_ms, cpu_time_ms) = match &result {
-                Ok(output) => (output.wall_time_ms, output.cpu_time_ms),
-                Err(failure) => (failure.wall_time_ms, failure.cpu_time_ms),
-            };
-            shared
-                .warm
-                .release_oneoff(result.is_err(), wall_time_ms, cpu_time_ms);
-            sandbox::send_completion(
-                &*link,
-                run_id,
-                sandbox::completion_message(&result, None, false),
-            );
-        });
-    if let Err(e) = spawned {
-        eprintln!("[iso4-v8] failed to spawn one-off worker: {e}");
+    let mut register = |handle: RunHandle| {
+        let replaced = conn_runs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(run_id, RunRoute { handle, frame_cap });
+        debug_assert!(replaced.is_none(), "run id checked before the start");
+    };
+    if let Err(refusal) = start(&mut register) {
         conn_runs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&run_id);
-        // Never ran: no shape to learn from.
-        shared.warm.release_oneoff(true, 0.0, 0.0);
-        let failure = sandbox::FailureOutput {
-            error: sandbox::RunError::Internal(format!("failed to spawn run worker: {e}")),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms: 0.0,
-            wall_time_ms: 0.0,
-            cpu_time_ms: 0.0,
-            bridge_calls: Vec::new(),
-        };
-        sandbox::send_completion(
-            &**link,
-            run_id,
-            sandbox::completion_message(&Err(failure), None, false),
-        );
+        refuse(&*caller.link, run_id, refusal.to_payload());
     }
 }
 
-/// A `Precompile`: the prefix is stored, not evaluated — a broken prefix
-/// fails its first run instead. Answered inline on the demux thread.
-fn dispatch_precompile(
-    payload: ipc::PrecompilePayload,
-    shared: &Arc<SharedState>,
-    outbox: &ipc::Outbox,
-) {
-    let id = shared.next_prefix_id.fetch_add(1, Ordering::Relaxed);
-    let prefix_id = id.to_string();
-    // Only bridge-backed globals are re-installable per run (string/data
-    // globals and shim wrappers are replayed from the stored prefix defs).
-    // The declared set is the bridge stub names a PrefixRun may re-bind.
-    let declared_globals: Vec<String> = payload
-        .globals
-        .iter()
-        .filter_map(|g| g.bridge_stub_name().map(str::to_string))
-        .collect();
-    eprintln!(
-        "[iso4-v8] prefix stored — prefix_id={prefix_id} \
-         ({} source bytes, {} declared globals, {} declared imports)",
-        payload.code.len(),
-        declared_globals.len(),
-        payload.imports.len(),
-    );
-    shared
-        .prefix_store
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            prefix_id.clone(),
-            PrefixEntry::Ready(Arc::new(PrefixData {
-                id,
-                code: payload.code,
-                filename: payload.filename,
-                globals: payload.globals,
-                declared_globals,
-                declared_imports: payload.imports,
-            })),
-        );
-    let result = wire::encode_precompile_result_payload(payload.request_id, Some(&prefix_id), None);
-    if let Err(e) = outbox.send_frame(ipc::RustToTsMessageType::PrecompileResult, result, Vec::new()) {
-        eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
-    }
-}
-
-/// Answer a `PrefixRun` refused before dispatch: nothing ran, telemetry is zero.
-fn write_setup_refusal(link: &dyn HostLink, run_id: u32, error: types::RunErrorPayload) {
-    let completion = types::RunCompletion::Failure(types::RunFailurePayload {
-        error,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        duration_ms: 0.0,
-        wall_time_ms: 0.0,
-        cpu_time_ms: 0.0,
-        bridge_calls: Vec::new(),
-        heap_used_bytes: None,
-    });
-    sandbox::send_completion(link, run_id, Outbound::Result { completion });
-}
-
-/// A `PrefixRun`: validated here (cheap map lookups), then dispatched to a
-/// warm instance; its release hook gives the registry state back and the
-/// engine answers through the link — the demux never parks.
-fn dispatch_prefix_run(
-    payload: ipc::PrefixRunPayload,
-    shared: &Arc<SharedState>,
-    link: &Arc<dyn HostLink>,
-    conn_runs: &ConnRuns,
-    call_id_counter: &Arc<AtomicU32>,
-    brand_key: &str,
-) {
-    let run_id = payload.run_id;
-
-    // An `Arc` handle, so the store lock is held for one refcount bump — not
-    // for a deep clone of the source and global defs on every run. A broken
-    // prefix is refused with its stored cold-start failure as the cause.
-    let entry = shared
-        .prefix_store
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&payload.prefix_id)
-        .map(|entry| match entry {
-            PrefixEntry::Ready(data) => Ok(Arc::clone(data)),
-            PrefixEntry::Broken(cause) => Err(Arc::clone(cause)),
-        });
-
-    let prefix_data = match entry {
-        Some(Ok(data)) => data,
-        Some(Err(cause)) => {
-            eprintln!(
-                "[iso4-v8] PrefixRun {run_id} — ERR_PREFIX_BROKEN: prefix_id={} cold start \
-                 failed with {}: {}",
-                payload.prefix_id, cause.code, cause.message
-            );
-            let error = types::RunErrorPayload {
-                code: "ERR_PREFIX_BROKEN".to_string(),
-                name: "Error".to_string(),
-                message: format!(
-                    "prefix '{}' is broken: its cold start failed with {}: {}",
-                    payload.prefix_id, cause.code, cause.message
-                ),
-                stack: None,
-                fields: None,
-                reset: None,
-                prefix_stage: false,
-                cause: Some(cause),
-            };
-            write_setup_refusal(&**link, run_id, error);
-            return;
-        }
-        None => {
-            eprintln!(
-                "[iso4-v8] PrefixRun {} — prefix_id={} not found",
-                run_id, payload.prefix_id
-            );
-            let error = types::RunErrorPayload {
-                code: "ERR_PREFIX_DISPOSED".to_string(),
-                name: "Error".to_string(),
-                message: format!(
-                    "prefix '{}' has been disposed or never existed",
-                    payload.prefix_id
-                ),
-                stack: None,
-                fields: None,
-                reset: None,
-                prefix_stage: false,
-                cause: None,
-            };
-            write_setup_refusal(&**link, run_id, error);
-            return;
-        }
-    };
-
-    // ── Binding checks ───────────────────────────────────────────────────
-    // Globals first, then import rebinds; the TS client runs the same checks
-    // before sending.
-    let violation: Option<sandbox::RunError> = validate_global_rebinds(
-        &payload.globals,
-        &prefix_data.declared_globals,
-        &prefix_data.globals,
-    )
-    .err()
-    .or_else(|| {
-        validate_import_rebinds(&payload.import_rebinds, &prefix_data.declared_imports).err()
-    });
-    if let Some(error) = violation {
-        let error = error.to_payload();
-        eprintln!(
-            "[iso4-v8] PrefixRun {run_id} — {}: {}",
-            error.code, error.message
-        );
-        write_setup_refusal(&**link, run_id, error);
-        return;
-    }
-
-    trace!(
-        "[iso4-v8] PrefixRun {} (prefix_id={}, {} globals, {} imports, call={})",
-        run_id,
-        payload.prefix_id,
-        payload.globals.len(),
-        prefix_data.declared_imports.len(),
-        payload.call.export_path,
-    );
-
-    // Refuse a duplicate before anything is acquired — nothing to release.
-    // (The route itself is inserted after acquisition, because it points at
-    // the acquired instance's event channel; the demux thread is the only
-    // inserter, so the check holds through the dispatch below.)
-    if run_id_in_flight(conn_runs, run_id) {
-        refuse_duplicate_run(&**link, run_id);
-        return;
-    }
-    let token = sandbox::alloc_run_token();
-    let ctl = Arc::new(std::sync::OnceLock::new());
-
-    // ── Warm instance flow ───────────────────────────────────────────────
-    // The registry decides (#77): reuse idle, join a busy instance, or
-    // spawn — Cold = shedding with nothing to join; Refused = the
-    // admission line.
-    let spawn = || {
-        crate::warm::spawn_instance(
-            Arc::clone(&prefix_data),
-            payload.limits.hard_memory_mb,
-            brand_key.to_string(),
-        )
-    };
-    let caps = crate::warm::HeapCaps {
-        soft_bytes: u64::from(payload.limits.soft_memory_mb) * 1024 * 1024,
-        hard_bytes: u64::from(payload.limits.hard_memory_mb) * 1024 * 1024,
-    };
-    enum Taken {
-        Pooled(crate::warm::AttachedInstance),
-        Cold(crate::warm::InstanceHandle),
-    }
-    let taken = match shared.warm.acquire(&payload.prefix_id, caps, &spawn) {
-        crate::warm::Acquired::Attached(att) => Taken::Pooled(att),
-        crate::warm::Acquired::Cold(handle) => Taken::Cold(handle),
-        crate::warm::Acquired::Refused(refusal) => {
-            // No registry state taken, no route inserted — just answer.
-            sandbox::send_completion(
-                &**link,
-                run_id,
-                sandbox::completion_message(&Err(capacity_failure(refusal)), None, false),
-            );
-            return;
-        }
-        crate::warm::Acquired::SpawnFailed(e) => {
-            eprintln!("[iso4-v8] PrefixRun {run_id} — failed to spawn instance thread: {e}");
-            let failure = sandbox::FailureOutput {
-                error: sandbox::RunError::Internal(format!(
-                    "failed to spawn instance thread: {e}"
-                )),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                duration_ms: 0.0,
-                wall_time_ms: 0.0,
-                cpu_time_ms: 0.0,
-                bridge_calls: Vec::new(),
-            };
-            sandbox::send_completion(
-                &**link,
-                run_id,
-                sandbox::completion_message(&Err(failure), None, false),
-            );
-            return;
-        }
-    };
-    let msgs_tx = match &taken {
-        Taken::Pooled(att) => att.sender(),
-        Taken::Cold(handle) => handle.sender(),
-    };
-
-    // Route the run to the acquired instance's channel; from here the demux
-    // can deliver frames, aborts and connection loss by token. The job is
-    // sent below on the SAME channel, before this demux thread can route
-    // any frame — FIFO makes the job precede every event of its run (#170).
-    insert_run_route(
-        conn_runs,
-        run_id,
-        token,
-        &payload.limits,
-        Arc::clone(&ctl),
-        msgs_tx.clone(),
-    );
-
-    // The release hook, run on the instance thread when the run finishes
-    // and before the completion goes out: the instance is back in the pool
-    // first, so the host's next run on this prefix reuses it
-    // deterministically. An instance of a since-disposed prefix must not
-    // return to the pool: the aliveness check and the release are atomic
-    // w.r.t. DisposePrefix under the prefix_store lock (lock order
-    // prefix_store → warm).
-    let release: sandbox::ReleaseHook = {
-        let shared = Arc::clone(shared);
-        let conn_runs = Arc::clone(conn_runs);
-        let prefix_id = payload.prefix_id.clone();
-        Box::new(move |outcome: sandbox::CallOutcome| {
-            conn_runs
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&run_id);
-            // A deterministic cold-start failure marks the prefix broken:
-            // the entry keeps only the failure, later runs are refused with
-            // it. A prefix disposed meanwhile stays gone.
-            if outcome.prefix_failed {
-                if let Err(failure) = &outcome.result {
-                    let mut store = shared
-                        .prefix_store
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    if let Some(entry @ PrefixEntry::Ready(_)) = store.get_mut(&prefix_id) {
-                        // Stored for the prefix's lifetime: clamp like the
-                        // wire does and drop the fields blob it never carries.
-                        let raw = failure.error.to_payload();
-                        let cause = types::RunErrorPayload {
-                            message: errors::clamp_error_text(&raw.message).into_owned(),
-                            stack: raw
-                                .stack
-                                .as_deref()
-                                .map(|s| errors::clamp_error_text(s).into_owned()),
-                            fields: None,
-                            ..raw
-                        };
-                        eprintln!(
-                            "[iso4-v8] prefix_id={prefix_id} marked broken: cold start \
-                             failed with {}: {}",
-                            cause.code, cause.message
-                        );
-                        *entry = PrefixEntry::Broken(Arc::new(cause));
-                        // Healthy instances of a broken prefix never serve
-                        // again; drop them like DisposePrefix does.
-                        shared.warm.dispose_prefix(&prefix_id);
-                    }
-                }
-            }
-            match taken {
-                Taken::Pooled(att) => {
-                    let store = shared
-                        .prefix_store
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
-                    let prefix_alive =
-                        matches!(store.get(&prefix_id), Some(PrefixEntry::Ready(_)));
-                    let (wall_time_ms, cpu_time_ms) = match &outcome.result {
-                        Ok(output) => (output.wall_time_ms, output.cpu_time_ms),
-                        Err(failure) => (failure.wall_time_ms, failure.cpu_time_ms),
-                    };
-                    shared.warm.release(
-                        &prefix_id,
-                        att.id,
-                        outcome.tainted,
-                        outcome.heap_used_bytes,
-                        wall_time_ms,
-                        cpu_time_ms,
-                        prefix_alive,
-                    );
-                }
-                Taken::Cold(handle) => {
-                    // Never pooled: drop the handle (the owner thread exits
-                    // and disposes the isolate), give back the one-off slot.
-                    drop(handle);
-                    let (wall_time_ms, cpu_time_ms) = match &outcome.result {
-                        Ok(output) => (output.wall_time_ms, output.cpu_time_ms),
-                        Err(failure) => (failure.wall_time_ms, failure.cpu_time_ms),
-                    };
-                    shared
-                        .warm
-                        .release_oneoff(outcome.tainted, wall_time_ms, cpu_time_ms);
-                }
-            }
-            match &outcome.result {
-                Ok(output) => trace!(
-                    "[iso4-v8] PrefixRun {} succeeded in {:.3}ms",
-                    run_id,
-                    output.duration_ms
-                ),
-                Err(failure) => trace!(
-                    "[iso4-v8] PrefixRun {} failed in {:.3}ms: {:?}",
-                    run_id,
-                    failure.duration_ms,
-                    failure.error
-                ),
-            }
-        })
-    };
-
-    let job = Box::new(sandbox::CallJob {
-        token,
-        limits: sandbox::Limits {
-            wall_time_ms: payload.limits.wall_time_ms,
-            cpu_time_ms: payload.limits.cpu_time_ms,
-            soft_memory_mb: payload.limits.soft_memory_mb,
-            hard_memory_mb: payload.limits.hard_memory_mb,
-            max_export_bytes: payload.limits.max_export_bytes,
-            max_stdout_bytes: payload.limits.max_stdout_bytes,
-            max_stderr_bytes: payload.limits.max_stderr_bytes,
-            max_bridge_call_bytes: payload.limits.max_bridge_call_bytes,
-            max_bridge_calls: payload.limits.max_bridge_calls,
-            grace_ms: payload.limits.grace_ms,
-        },
-        globals: payload.globals,
-        io: sandbox::RunIo::Instance {
-            link: Arc::clone(link),
-        },
-        observer: Arc::new(NoopObserver),
-        call_id_counter: Arc::clone(call_id_counter),
-        call: payload.call,
-        epilogue: Some(sandbox::EpilogueSpec {
-            run_id,
-            report_heap: true,
-        }),
-        release: Some(release),
-        ctl_slot: Some(ctl),
-    });
-
-    let msg = sandbox::RoutedEvent::new(token, sandbox::RunEvent::Job(job));
-    if let Err(e) = msgs_tx.send(msg) {
-        // The instance thread died before accepting the job: finish it here,
-        // which runs the release hook and answers the run on its link.
-        eprintln!("[iso4-v8] PrefixRun {run_id} — instance thread dead before dispatch");
-        if let sandbox::RunEvent::Job(mut job) = e.0.event {
-            let link = job.io.link();
-            sandbox::finish_job(&mut job, link, crate::warm::dead_instance_outcome());
-        }
-    }
+/// Answer a run refused before it started: nothing ran, telemetry is zero.
+fn refuse(link: &dyn HostLink, run_id: u32, error: types::RunErrorPayload) {
+    let completion = types::RunCompletion::Failure(types::RunFailurePayload::bare(error));
+    crate::v8::send_completion(link, run_id, Outbound::Result { completion });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1544,88 +679,12 @@ mod tests {
         assert!(err.contains("stream chunk decode"), "{err}");
     }
 
-    #[test]
-    fn import_rebind_paths_match_whole_key_segments() {
-        let declared = vec![types::ImportBinding {
-            specifier: "api".into(),
-            module: types::ImportModule::Host(vec![(
-                "x".into(),
-                types::HostModuleNode::Object(vec![
-                    ("a.b".into(), types::HostModuleNode::Function),
-                    ("c".into(), types::HostModuleNode::Object(vec![("d".into(), types::HostModuleNode::Function)])),
-                ]),
-            )]),
-        }];
-        let check = |path: &[&str]| {
-            let rebind = types::ImportRebind {
-                specifier: "api".into(),
-                path: path.iter().map(|s| s.to_string()).collect(),
-            };
-            validate_import_rebinds(&[rebind], &declared)
-        };
-
-        assert!(check(&["x", "a.b"]).is_ok());
-        assert!(check(&["x", "c", "d"]).is_ok());
-        assert!(matches!(
-            check(&["x", "a", "b"]),
-            Err(sandbox::RunError::UndeclaredBinding(m)) if m == "import 'api'.x.a was not declared at precompile time"
-        ));
-        assert!(matches!(check(&["x", "c.d"]), Err(sandbox::RunError::UndeclaredBinding(_))));
-    }
-
-    #[test]
-    fn prefix_run_globals_may_only_rebind_declared_bridge_stubs() {
-        let declared = vec![
-            types::HostGlobalDef::bridge("tool"),
-            types::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true },
-            types::HostGlobalDef::StringExpr { name: "expr".into(), expr: "1".into(), enumerable: true },
-            types::HostGlobalDef::Shim {
-                name: "shimmed".into(),
-                shim: "(h) => h".into(),
-                handler_name: "__iso4_shimmed_h".into(),
-                enumerable: true,
-            },
-        ];
-        let stubs: Vec<String> = declared
-            .iter()
-            .filter_map(|g| g.bridge_stub_name().map(str::to_string))
-            .collect();
-        let check = |globals: Vec<types::HostGlobalDef>| validate_global_rebinds(&globals, &stubs, &declared);
-
-        assert!(check(vec![types::HostGlobalDef::bridge("tool"), types::HostGlobalDef::bridge("__iso4_shimmed_h")]).is_ok());
-        assert!(matches!(check(vec![types::HostGlobalDef::bridge("other")]), Err(sandbox::RunError::UndeclaredBinding(_))));
-        assert!(matches!(check(vec![types::HostGlobalDef::bridge("console")]), Err(sandbox::RunError::UndeclaredBinding(_))));
-        assert!(matches!(check(vec![types::HostGlobalDef::bridge("config")]), Err(sandbox::RunError::FrozenBinding(_))));
-        assert!(matches!(check(vec![types::HostGlobalDef::bridge("expr")]), Err(sandbox::RunError::FrozenBinding(_))));
-        assert!(matches!(
-            check(vec![types::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true }]),
-            Err(sandbox::RunError::FrozenBinding(m)) if m.contains("frozen with the prefix")
-        ));
-        assert!(matches!(
-            check(vec![types::HostGlobalDef::Data { name: "fresh".into(), blob: Vec::new(), enumerable: true }]),
-            Err(sandbox::RunError::UndeclaredBinding(m)) if m == "global 'fresh' was not declared at precompile time"
-        ));
-        assert!(matches!(
-            check(vec![types::HostGlobalDef::StringExpr { name: "fresh".into(), expr: "1".into(), enumerable: true }]),
-            Err(sandbox::RunError::UndeclaredBinding(_))
-        ));
-        assert!(matches!(
-            check(vec![types::HostGlobalDef::Shim {
-                name: "shimmed".into(),
-                shim: "(h) => h".into(),
-                handler_name: "__iso4_shimmed_h".into(),
-                enumerable: true,
-            }]),
-            Err(sandbox::RunError::UndeclaredBinding(_))
-        ));
-    }
-
     /// Drive `handle_client` over a socket pair with the given Authenticate
     /// payload and return the first frame it writes back (if any).
     fn handshake(payload: Vec<u8>) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(0, 0));
-        let server = std::thread::spawn(move || handle_client(runtime, shared));
+        let engine = Arc::new(Engine::new(0, 0));
+        let server = std::thread::spawn(move || handle_client(runtime, engine));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)
             .unwrap();
@@ -1642,10 +701,10 @@ mod tests {
     /// hanging the suite.
     fn spawn_session() -> (UnixStream, crossbeam_channel::Receiver<()>) {
         let (host, runtime) = UnixStream::pair().unwrap();
-        let shared = Arc::new(SharedState::new(0, 0));
+        let engine = Arc::new(Engine::new(0, 0));
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
-            handle_client(runtime, shared);
+            handle_client(runtime, engine);
             let _ = done_tx.send(());
         });
         (host, done_rx)
@@ -1912,11 +971,11 @@ mod tests {
 
     #[test]
     fn two_runs_interleave_on_one_connection_with_correct_routing() {
-        sandbox::init_platform();
+        crate::v8::init_platform();
         let (mut host, _done) = open_session();
 
-        // Two runs, in flight simultaneously on ONE connection — the #124
-        // acceptance shape. Each suspends on a bridge call.
+        // Two runs in flight at once on one connection, each suspended on a
+        // bridge call.
         let code = "export default await tool()";
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1985,7 +1044,7 @@ mod tests {
         // frame within the ceiling but over ONE run's own inbound allowance
         // (its memoryMb budget) fails that run cleanly — the connection and
         // its other runs keep going.
-        sandbox::init_platform();
+        crate::v8::init_platform();
         let (mut host, _done) = open_session();
 
         let code = "export default await tool()";
@@ -2047,7 +1106,7 @@ mod tests {
         // (routed) Terminate would sit unread forever, and the wall here is
         // 10 s. The prompt ERR_ABORTED (not ERR_WALL_TIMEOUT, not a hang)
         // proves the route's token reaches the one-off's guard.
-        sandbox::init_platform();
+        crate::v8::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -2078,12 +1137,10 @@ mod tests {
 
     #[test]
     fn hard_terminate_mid_continuation_concludes_promptly() {
-        // The kill lands inside a microtask-checkpoint continuation — the
-        // landing spot where V8's terminate flag used to be consumed
-        // silently, leaving the run parked with no Result until its wall
-        // (#75 re-check). The reason cell written by the kill makes the
-        // classification deterministic: prompt ERR_ABORTED, never a hang.
-        sandbox::init_platform();
+        // The kill lands inside a microtask-checkpoint continuation, where
+        // V8's terminate flag used to be consumed silently: prompt
+        // ERR_ABORTED, never a hang to the wall.
+        crate::v8::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -2131,7 +1188,7 @@ mod tests {
         // The continuation here burns briefly and then suspends forever on
         // a fresh promise — the abort must land right after that turn, as
         // a clean abandon, not hang and not interrupt.
-        sandbox::init_platform();
+        crate::v8::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -2174,7 +1231,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_run_id_is_refused_and_the_first_run_survives() {
-        sandbox::init_platform();
+        crate::v8::init_platform();
         let (mut host, _done) = open_session();
 
         // Run 1 suspends on its bridge call…
@@ -2227,8 +1284,24 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_runs_id_can_be_used_again() {
+        crate::v8::init_platform();
+        let (mut host, _done) = open_session();
+        for _ in 0..2 {
+            ipc::write_ts_to_rust_frame(
+                &mut host,
+                ipc::TsToRustMessageType::Run,
+                &run_payload(1, "export default 7", 10_000),
+            )
+            .unwrap();
+            let (run_id, _exports) = read_success_result(&mut host);
+            assert_eq!(run_id, 1);
+        }
+    }
+
+    #[test]
     fn a_corrupt_frame_fails_the_connections_runs_loudly() {
-        sandbox::init_platform();
+        crate::v8::init_platform();
         let (mut host, done) = open_session();
 
         // One run in flight, suspended on its bridge call…

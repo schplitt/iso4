@@ -10,6 +10,8 @@ mod blob;
 mod container;
 #[path = "src/cpuclock.rs"]
 mod cpuclock;
+#[path = "src/engine.rs"]
+mod engine;
 #[path = "src/errors.rs"]
 mod errors;
 #[path = "src/ipc.rs"]
@@ -20,6 +22,8 @@ mod link;
 mod oom;
 #[path = "src/policy.rs"]
 mod policy;
+#[path = "src/prefix.rs"]
+mod prefix;
 #[path = "src/rss.rs"]
 mod rss;
 #[path = "src/session.rs"]

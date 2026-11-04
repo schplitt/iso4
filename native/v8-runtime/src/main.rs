@@ -3,7 +3,9 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
-use iso4_v8_runtime::{blob, container, oom, policy, rss, session, types, v8 as sandbox, warm};
+use iso4_v8_runtime::{
+    blob, container, engine, oom, policy, rss, session, types, v8 as sandbox, warm,
+};
 
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
@@ -84,11 +86,9 @@ fn main() {
         ),
     }
 
-    // Shared state across all connection threads: prefix snapshots and the
-    // counter used to generate unique PrefixIds. Access control is the
-    // owner-only directory the host created the socket path in — the kernel
-    // checks it on every connect, so no application-level secret is needed.
-    let shared = Arc::new(session::SharedState::new(
+    // One engine for all connections. Access control is the owner-only
+    // directory the host created the socket path in.
+    let engine = Arc::new(engine::Engine::new(
         warm_budget_bytes,
         hard_line_bytes,
     ));
@@ -99,8 +99,8 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                let shared = Arc::clone(&shared);
-                std::thread::spawn(move || session::handle_client(stream, shared));
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || session::handle_client(stream, engine));
             }
             Err(e) => {
                 eprintln!("[iso4-v8] accept error: {e}");

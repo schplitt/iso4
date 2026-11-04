@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::policy;
 use crate::rss;
-use crate::session::PrefixData;
+use crate::prefix::PrefixData;
 use crate::v8 as sandbox;
 
 /// One call forwarded to an instance owner thread — see [`sandbox::CallJob`]
@@ -106,9 +106,9 @@ impl InstanceHandle {
         rx.recv().unwrap_or_else(|_| dead_instance_outcome())
     }
 
-    /// A clone of the instance's one sender, for the session dispatch path
+    /// A clone of the instance's one sender, for the engine's dispatch path
     /// where the handle itself moves into the job's release hook before
-    /// the job is sent, and for the demux route of a run dispatched to this
+    /// the job is sent, and for the handle of a run dispatched to this
     /// instance.
     pub fn sender(&self) -> sandbox::RunEventSender {
         self.msgs.clone()

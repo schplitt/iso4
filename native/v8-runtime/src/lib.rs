@@ -8,11 +8,13 @@
 pub mod blob;
 pub mod container;
 pub mod cpuclock;
+pub mod engine;
 pub mod errors;
 pub mod ipc;
 pub mod link;
 pub mod oom;
 pub mod policy;
+pub mod prefix;
 pub mod rss;
 pub mod session;
 pub mod snapshot;

@@ -247,6 +247,34 @@ pub struct CallSpec {
     pub args_blob: Vec<u8>,
 }
 
+/// A one-off run: fresh isolate, `code` evaluated, then exports or `call`.
+#[derive(Debug)]
+pub struct RunRequest {
+    /// The frontend's id for the run; its messages go to `Addr::Run(run_id)`.
+    pub run_id: u32,
+    pub code: String,
+    pub filename: Option<String>,
+    pub limits: ResourceLimits,
+    pub globals: Vec<HostGlobalDef>,
+    pub imports: Vec<ImportBinding>,
+    /// When present, the result is the called function's return value instead
+    /// of the exports.
+    pub call: Option<CallSpec>,
+}
+
+/// A call into a prepared prefix. Globals and import rebinds may only
+/// re-point the bridge functions the prefix declared.
+#[derive(Debug)]
+pub struct PrefixRunRequest {
+    /// The frontend's id for the run; its messages go to `Addr::Run(run_id)`.
+    pub run_id: u32,
+    pub prefix_id: String,
+    pub limits: ResourceLimits,
+    pub globals: Vec<HostGlobalDef>,
+    pub import_rebinds: Vec<ImportRebind>,
+    pub call: CallSpec,
+}
+
 /// How a `Terminate` stops its run: soft abandons it at the next turn
 /// boundary, hard interrupts executing JS now (`docs/protocol.md` §5.2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -397,6 +425,22 @@ pub struct RunFailurePayload {
     pub bridge_calls: Vec<BridgeCallRecord>,
     /// See `RunSuccessPayload::heap_used_bytes`.
     pub heap_used_bytes: Option<u64>,
+}
+
+impl RunFailurePayload {
+    /// A failure where nothing ran: no output, zero telemetry.
+    pub fn bare(error: RunErrorPayload) -> Self {
+        Self {
+            error,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            duration_ms: 0.0,
+            wall_time_ms: 0.0,
+            cpu_time_ms: 0.0,
+            bridge_calls: Vec::new(),
+            heap_used_bytes: None,
+        }
+    }
 }
 
 /// The two variants of a completed run.
