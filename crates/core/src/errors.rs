@@ -6,7 +6,8 @@ use std::borrow::Cow;
 use crate::types;
 use crate::types::{BridgeErrorPayload, ResetCause, ResetInfo, RunErrorPayload};
 use crate::v8::isolate::{LogBuffers, ReasonCell, TerminationReason};
-use crate::v8::{WARMUP_CPU_MS, WARMUP_WALL_MS, elapsed_ms};
+use crate::v8::runloop::elapsed_ms;
+use crate::v8::{WARMUP_CPU_MS, WARMUP_WALL_MS};
 
 /// Ceiling on each piece of error text (message, stack): `max_export_bytes`
 /// bounds only the success path, and an unbounded message once built a

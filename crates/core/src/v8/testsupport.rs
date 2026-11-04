@@ -9,9 +9,10 @@ use crate::link::{Addr, Inbound, Outbound};
 use crate::testval::{self, TestValue as WireValue};
 use crate::types;
 use crate::types::{BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
+use crate::v8::runloop::run_module;
 use crate::v8::{
     FailureOutput, Limits, Output, PrefixSpec, RoutedEvent, RunError, RunEvent, RunEventSender,
-    RunIo, create_instance_core, execute, init_platform, run_module,
+    RunIo, create_instance_core, execute, init_platform,
 };
 
 /// Run code with explicit limits. Used for limit-enforcement tests.

@@ -341,12 +341,13 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     use super::*;
+    use crate::v8::runloop::run_module;
     use crate::v8::testsupport::{call_spec, get_default, get_field, prepared, run_code, run_ok};
     use crate::testval::TestValue as WireValue;
     use crate::types;
     use crate::v8::{
         FailureOutput, Limits, Output, PrefixSpec, RunError, RunIo, create_instance_core,
-        execute_with_prefix, init_platform, run_call_on_core, run_module,
+        execute_with_prefix, init_platform, run_call_on_core,
     };
 
     // ── CPU and wall limits ───────────────────────────────────────────────

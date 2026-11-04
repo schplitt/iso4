@@ -166,7 +166,7 @@ impl ReasonCell {
 /// Heap data passed to [`near_heap_limit_cb`] as a raw pointer.
 ///
 /// Lives on the heap for the duration of the run (see safety note on the
-/// callback). Declaring it after `isolate` in [`crate::v8::run_module`] means it drops
+/// callback). Declaring it after `isolate` in [`crate::v8::runloop::run_module`] means it drops
 /// before the isolate, which is safe because V8 never invokes near-heap
 /// callbacks during `Isolate::Dispose()`.
 pub(super) struct NearHeapData {
