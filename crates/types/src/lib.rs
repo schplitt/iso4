@@ -191,7 +191,7 @@ pub const MAX_HOST_MODULE_DEPTH: usize = 64;
 
 /// One node in a host-module shape tree. The tree is plain data — the client
 /// never generates sandbox source from it; the runtime builds the module
-/// natively (see `v8.rs`). Mirrors `HostModuleNodePayload` on the TS side.
+/// natively (see `v8/modules.rs`). Mirrors `HostModuleNodePayload` on the TS side.
 #[derive(Debug, Clone)]
 pub enum HostModuleNode {
     /// A host function leaf. The runtime assigns it a handle ID (tree-walk
@@ -331,7 +331,7 @@ pub struct ResetInfo {
 }
 
 /// Per-call metadata for one bridge call attempt — names, timing, and sizes
-/// only, never payloads. Recorded by the runtime (`v8.rs`) and shipped on the
+/// only, never payloads. Recorded by the runtime (`v8/bridge.rs`) and shipped on the
 /// Result frame with the name already resolved — the runtime owns both the
 /// import handle table and the shim naming convention, so no client-side
 /// resolution remains.

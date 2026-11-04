@@ -7,15 +7,18 @@ use std::collections::HashMap;
 
 use crate::blob;
 use crate::types::{HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
+use crate::v8::bridge::{
+    host_module_base_id, install_prefix_bridge_placeholders, owned_bridge_error,
+    prefix_bridge_call_from_value,
+};
 use crate::v8::globals::{
     ISO4_RUNTIME_MODULE_SRC, ISO4_RUNTIME_SPECIFIER, eval_script, install_value_globals,
 };
 use crate::v8::{
     ASYNC_HOOKS_MODULE_SRC, ASYNC_HOOKS_SPECIFIER, RunError, RunFacts, RunState, RuntimeErrorData,
     ScanOutcome, build_output_and_maybe_grace, codec_error_to_run_error, exception_fields,
-    exception_message, exception_name, exception_stack, finished, host_module_base_id,
-    install_prefix_bridge_placeholders, owned_bridge_error, prefix_bridge_call_from_value,
-    reason_error, runtime_error_from_value, syntax_error, termination_or,
+    exception_message, exception_name, exception_stack, finished, reason_error,
+    runtime_error_from_value, syntax_error, termination_or,
 };
 
 /// Extract and serialize a settled module's exports, then finish (or start
@@ -980,7 +983,7 @@ mod tests {
     // ── Imports ───────────────────────────────────────────────────────────
     // Real module resolver wired up: source modules compile through V8 directly,
     // host modules become synthetic v8::Modules whose exports are bridge stubs.
-    // Host-import bridge call tests live in `mod.rs` with the other
+    // Host-import bridge call tests live in `bridge.rs` with the other
     // bridge-call integration tests because they need a host.
 
     #[test]
@@ -1159,7 +1162,7 @@ mod tests {
     // Host modules cross the wire as data trees; the runtime builds the module
     // itself. Data leaves need no socket. Function leaves dispatch through the
     // auto-installed `__iso4_call` stub, so those tests use a responder thread
-    // like the bridge tests in `mod.rs`.
+    // like the bridge tests in `bridge.rs`.
 
     /// Run code with host imports over an in-memory link; the responder
     /// receives the first BridgeCall and answers through the host.

@@ -4,10 +4,10 @@
 
 use crate::blob;
 use crate::types::HostGlobalDef;
+use crate::v8::streams::{stream_cancel_callback, stream_read_callback};
 use crate::v8::{
     RunError, RuntimeErrorData, attributed_state, codec_error_to_run_error, exception_fields,
-    exception_message, exception_name, exception_stack, slot_table, stream_cancel_callback,
-    stream_read_callback, syntax_error,
+    exception_message, exception_name, exception_stack, slot_table, syntax_error,
 };
 
 // ── Value globals (native install) ────────────────────────────────────────────
@@ -58,7 +58,7 @@ pub(super) fn check_not_reserved(name: &str) -> Result<(), RunError> {
 
 /// Install the value globals — string expressions, data constants, and shim
 /// wrappers — natively on the sandbox global object. Plain bridge stubs are
-/// installed separately by [`super::install_bridge_globals`]; their defs are skipped
+/// installed separately by [`super::bridge::install_bridge_globals`]; their defs are skipped
 /// here.
 ///
 /// Every public name reaches the global object through `object.set(key, value)`

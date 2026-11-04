@@ -2346,8 +2346,10 @@ mod tests {
     #[test]
     fn an_abandoned_stream_hits_the_idle_deadline_and_cleans_up() {
         sandbox::init_platform();
-        sandbox::OUT_IDLE_OVERRIDE_MS.store(300, Ordering::Relaxed);
-        let _reset = scopeguard(|| sandbox::OUT_IDLE_OVERRIDE_MS.store(0, Ordering::Relaxed));
+        sandbox::streams::OUT_IDLE_OVERRIDE_MS.store(300, Ordering::Relaxed);
+        let _reset = scopeguard(|| {
+            sandbox::streams::OUT_IDLE_OVERRIDE_MS.store(0, Ordering::Relaxed);
+        });
         let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));

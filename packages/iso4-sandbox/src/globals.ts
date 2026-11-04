@@ -78,7 +78,7 @@ export function isStringGlobal(v: HostGlobalValue): v is StringGlobal {
  * Private bridge-dispatch name for a `BridgeWithShim` handler. This is a wire
  * dispatch key and an object-property key — never interpolated into generated
  * code — so any global name is safe. The runtime recognises the
- * `__iso4_<name>_h` convention (`public_record_name` in `v8.rs`) and reports
+ * `__iso4_<name>_h` convention (`public_record_name` in `v8/bridge.rs`) and reports
  * bridge records under the public `<name>`.
  * @param name public global name
  */

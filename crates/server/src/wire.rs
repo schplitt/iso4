@@ -484,7 +484,8 @@ pub fn encode_bridge_call_header(
 /// returned nothing (the value slot is absent → `undefined`),
 /// `Ok(Err(BridgeErrorPayload))` when the host handler reported an error, and
 /// `Err(io::Error)` on a protocol fault. Value blobs are carried as raw bytes
-/// — materialising one needs the run's isolate (see the poll loop in `v8.rs`).
+/// — materialising one needs the run's isolate (see `frame_turn` in
+/// `v8/mod.rs`).
 ///
 /// Wire layout:
 /// ```text
