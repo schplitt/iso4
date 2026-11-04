@@ -618,7 +618,7 @@ export type GlobalDefPayload
 
 /**
  * Wire tag for each `GlobalDefPayload` kind. Mirrors `HostGlobalDef` on the
- * Rust side (`ipc.rs`).
+ * Rust side (`types.rs`).
  */
 const GLOBAL_DEF_KIND = {
   bridge: 0,
@@ -1587,7 +1587,7 @@ export function decodeRunCompletePayload(
 }
 
 /**
- * Streaming bodies — wire constants mirroring `ipc.rs`.
+ * Streaming bodies — wire constants mirroring the runtime's `types.rs`.
  */
 export const STREAM_CHUNK_MAX_BYTES: number = 64 * 1024
 export const STREAM_CREDIT_WINDOW_BYTES: number = 256 * 1024

@@ -672,7 +672,7 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 Every field is `Optional<u32>`. The client sends only the limits the caller
 explicitly set; the runtime fills any absent field from its own defaults (it
 owns the default safety posture — the numbers below live in
-`native/v8-runtime/src/ipc.rs` as the source of truth). An **absent** field
+`native/v8-runtime/src/types.rs` as the source of truth). An **absent** field
 means "apply the runtime default"; an **explicit `0`** means "no limit" and is
 distinct from absent.
 

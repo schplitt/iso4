@@ -8,6 +8,7 @@
 pub mod blob;
 pub mod container;
 pub mod cpuclock;
+pub mod errors;
 pub mod ipc;
 pub mod oom;
 pub mod policy;
@@ -16,6 +17,7 @@ pub mod session;
 pub mod snapshot;
 #[cfg(test)]
 pub mod testval;
+pub mod types;
 pub mod url;
 pub mod v8;
 pub mod warm;

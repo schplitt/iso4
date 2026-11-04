@@ -78,7 +78,7 @@ export interface OneOffResourceLimits extends ResourceLimits {
  * override. The client sends just those over the wire and the **runtime owns
  * the defaults** — it fills in any field you leave unset. The `@default` values
  * documented below mirror the runtime's defaults (defined in
- * `native/v8-runtime/src/ipc.rs`, the source of truth); if they ever drift, the
+ * `native/v8-runtime/src/types.rs`, the source of truth); if they ever drift, the
  * runtime wins.
  *
  * A field set to `0` is not the same as leaving it unset: `0` explicitly

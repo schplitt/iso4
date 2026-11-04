@@ -359,7 +359,7 @@ function containerLimitMb(): number {
  * The memory one run may reach, in megabytes — what capacity planning has to
  * reserve for a slot. The worst case is a prefix instance's TERMINATING line,
  * band included; a one-off's is the bare cap. An unset `memoryMb` reaches the
- * child as 128 (the runtime's `ipc.rs` `DEFAULT_MEMORY_MB`). `0` = uncapped,
+ * child as 128 (the runtime's `types.rs` `DEFAULT_MEMORY_MB`). `0` = uncapped,
  * which has no arithmetic.
  * @param memoryMb
  */

@@ -1,7 +1,8 @@
 //! Frame payload encoders/decoders for the iso4 Rust ↔ TypeScript protocol.
 //!
 //! This module owns the **envelope**: run completion payloads, precompile
-//! results, bridge call/response payloads, and the error mapping. It is
+//! results, and bridge call/response payloads. The types it encodes live in
+//! `types.rs`; the error code table is `errors.rs`. It is
 //! deliberately value-codec-free — every value slot is `u32 byteLength` + a V8
 //! serialization blob (see `blob.rs` and `docs/protocol.md` §4), carried here
 //! as opaque bytes because materialising one needs a V8 isolate.
@@ -13,7 +14,8 @@
 
 use std::io;
 
-use crate::v8::RunError;
+use crate::errors::clamp_error_text;
+use crate::types::{BridgeCallRecord, BridgeTarget, RunCompletion, RunErrorPayload};
 
 // ── Primitive encoders ─────────────────────────────────────────────────────────
 
@@ -123,35 +125,7 @@ fn read_value_blob(data: &[u8], offset: &mut usize) -> io::Result<Vec<u8>> {
     read_raw_bytes(data, offset, len)
 }
 
-// ── Completion payload types ───────────────────────────────────────────────────
-
-/// Structured error fields for `RunCompletionPayload`.
-#[derive(Clone)]
-pub struct RunErrorPayload {
-    pub code: String,
-    pub name: String,
-    pub message: String,
-    pub stack: Option<String>,
-    /// Own-enumerable properties beyond `name`/`message`/`stack`, as a V8
-    /// serialization blob holding a plain object. `None` when there are none.
-    pub fields: Option<Vec<u8>>,
-    /// Present only for `ERR_INSTANCE_RESET`: the cause class and the wire
-    /// run id of the run whose mid-JS interruption reset the instance.
-    pub reset: Option<ResetInfo>,
-    /// True when the failure happened while the prefix evaluated (a cold
-    /// start that broke the prefix), false for run code.
-    pub prefix_stage: bool,
-    /// Present only for `ERR_PREFIX_BROKEN`: the stored cold-start failure.
-    /// Only `code`, `name`, `message` and `stack` cross.
-    pub cause: Option<std::sync::Arc<RunErrorPayload>>,
-}
-
-/// The `ERR_INSTANCE_RESET` extras — see `RunErrorPayload::reset`.
-#[derive(Clone, Copy)]
-pub struct ResetInfo {
-    pub cause: crate::v8::ResetCause,
-    pub culprit_run_id: u32,
-}
+// ── Reset cause byte ─────────────────────────────────────────────────────────
 
 fn reset_cause_byte(cause: crate::v8::ResetCause) -> u8 {
     match cause {
@@ -162,107 +136,6 @@ fn reset_cause_byte(cause: crate::v8::ResetCause) -> u8 {
         crate::v8::ResetCause::Wall => 4,
         crate::v8::ResetCause::Unsupported => 5,
     }
-}
-
-/// Per-call metadata for one bridge call attempt — names, timing, and sizes
-/// only, never payloads. Recorded by the runtime (`v8.rs`) and shipped on the
-/// Result frame with the name already resolved — the runtime owns both the
-/// import handle table and the shim naming convention, so no client-side
-/// resolution remains.
-#[derive(Debug, Clone)]
-pub struct BridgeCallRecord {
-    /// The public name sandbox code called: plain globals as-is (`fetch`),
-    /// shimmed globals under their public name (not the private stub), and
-    /// host-module import leaves as `<specifier>.<path>`.
-    pub name: String,
-    /// Offset from run start to the attempt, in ms (same clock as
-    /// `duration_ms` on the run result).
-    pub start_ms: f64,
-    /// Round-trip time the sandbox waited (handler + IPC), in ms. For calls
-    /// still unanswered when the run ended: time until run end. `0` for
-    /// blocked attempts.
-    pub duration_ms: f64,
-    /// Serialized call payload size in bytes (the size `maxBridgeCallBytes`
-    /// is enforced against). `0` for attempts blocked before serialisation.
-    pub arg_bytes: u32,
-    /// Serialized response value size in bytes. `0` on handler error or when
-    /// the call never settled.
-    pub response_bytes: u32,
-    /// The callId the BridgeCall frame carried; `u32::MAX` for blocked
-    /// attempts, which never got one.
-    pub call_id: u32,
-    pub outcome: BridgeCallOutcome,
-}
-
-/// How a bridge call attempt ended, as the runtime saw it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum BridgeCallOutcome {
-    /// The host resolved and the response reached the sandbox.
-    Ok = 0,
-    /// Refused runtime-side (limit, oversized payload, function argument,
-    /// invalid import handle, transport failure); never sent.
-    Blocked = 1,
-    /// The host answered with an error; the sandbox promise rejected.
-    Error = 2,
-    /// Sent, but no answer before the run ended.
-    Unanswered = 3,
-}
-
-/// Payload for a successful run.
-pub struct RunSuccessPayload {
-    /// All exports as **one** V8 serialization blob holding a plain
-    /// `{ name: value }` object. The `default` export (if present) is the
-    /// `"default"` key alongside named exports; an empty module produces a
-    /// blob holding `{}`. For a run that carried a `call` this is the
-    /// called function's return value instead — the host knows which it asked
-    /// for, so the slot needs no tag.
-    pub exports: Vec<u8>,
-    /// Export names absent from `exports` because their value cannot cross
-    /// the boundary. Always empty for a call run.
-    pub skipped_exports: Vec<String>,
-    pub stdout: Vec<String>,
-    pub stderr: Vec<String>,
-    pub duration_ms: f64,
-    /// The run's own logic time: execution + async waits counted until the
-    /// answer arrived; engine time excluded. `cpu ≤ wall ≤ duration`.
-    pub wall_time_ms: f64,
-    /// Active V8 execution time (bridge waits excluded), in ms.
-    pub cpu_time_ms: f64,
-    /// One record per bridge call attempt, in attempt order.
-    pub bridge_calls: Vec<BridgeCallRecord>,
-    /// `used_heap_size` of the isolate that served the run, measured after
-    /// the run settled. Present for prefix runs (warm instances —
-    /// feeds eviction scoring); absent for one-off runs, whose isolate
-    /// is already gone.
-    pub heap_used_bytes: Option<u64>,
-    /// Post-Result flags: bit 0 = `waitUntil` background work is still
-    /// running, bit 1 = outbound stream bodies are open. Nonzero means a
-    /// final `RunComplete` frame follows this Result on the same
-    /// connection (wire-compatible with the former bool).
-    pub background_flags: u8,
-}
-
-/// Payload for a failed run.
-pub struct RunFailurePayload {
-    pub error: RunErrorPayload,
-    pub stdout: Vec<String>,
-    pub stderr: Vec<String>,
-    pub duration_ms: f64,
-    /// See `RunSuccessPayload::wall_time_ms`.
-    pub wall_time_ms: f64,
-    /// Active V8 execution time (bridge waits excluded), in ms.
-    pub cpu_time_ms: f64,
-    /// One record per bridge call attempt, in attempt order.
-    pub bridge_calls: Vec<BridgeCallRecord>,
-    /// See `RunSuccessPayload::heap_used_bytes`.
-    pub heap_used_bytes: Option<u64>,
-}
-
-/// The two variants of a completed run.
-pub enum RunCompletion {
-    Success(RunSuccessPayload),
-    Failure(RunFailurePayload),
 }
 
 // ── RunCompletionPayload encoder ───────────────────────────────────────────────
@@ -433,36 +306,10 @@ fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
     }
 }
 
-/// Ceiling on each piece of error *text* (message, stack) the runtime reports.
-///
-/// A thrown error's message and stack are copied verbatim out of the isolate,
-/// and `max_export_bytes` bounds only the success path — so
-/// `throw new Error('A'.repeat(70e6))` used to build a Result frame past the
-/// 64 MiB frame ceiling, which could not be written and cost the connection.
-/// 64 KiB is far past any real message while keeping the payload small.
-pub(crate) const MAX_ERROR_TEXT_BYTES: usize = 64 * 1024;
-
 /// Ceiling on the serialized own-properties blob attached to an error. Same
-/// reasoning as [`MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
+/// reasoning as [`crate::errors::MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
 /// cannot be truncated meaningfully, so an oversized one is dropped whole.
 const MAX_ERROR_FIELDS_BYTES: usize = 1024 * 1024;
-
-/// Clamp error text to [`MAX_ERROR_TEXT_BYTES`], on a UTF-8 boundary, and say
-/// so in the result rather than silently shortening it.
-pub(crate) fn clamp_error_text(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.len() <= MAX_ERROR_TEXT_BYTES {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut end = MAX_ERROR_TEXT_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    std::borrow::Cow::Owned(format!(
-        "{}… [truncated by iso4: {} bytes total]",
-        &text[..end],
-        text.len()
-    ))
-}
 
 fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
     encode_string(&error.code, out);
@@ -554,144 +401,6 @@ pub fn encode_precompile_result_payload(
     out
 }
 
-// ── RunError → RunErrorPayload ─────────────────────────────────────────────────
-
-/// Convert a V8 `RunError` into the wire-level `RunErrorPayload` per the error
-/// code table in `docs/protocol.md` §7.
-pub fn run_error_to_payload(error: &RunError) -> RunErrorPayload {
-    fn plain(code: &str, name: &str, message: String) -> RunErrorPayload {
-        RunErrorPayload {
-            code: code.to_string(),
-            name: name.to_string(),
-            message,
-            stack: None,
-            fields: None,
-            reset: None,
-            prefix_stage: false,
-            cause: None,
-        }
-    }
-    match error {
-        RunError::InvalidPayload(msg) => plain("ERR_INTERNAL", "Error", msg.clone()),
-        RunError::RuntimeError(inner) => RunErrorPayload {
-            code: "ERR_USER_CODE".to_string(),
-            name: inner.name.clone(),
-            message: inner.message.clone(),
-            stack: inner.stack.clone(),
-            fields: inner.fields.clone(),
-            reset: None,
-            prefix_stage: false,
-            cause: None,
-        },
-        RunError::ModuleNotFound(msg) => plain("ERR_MODULE_NOT_FOUND", "Error", msg.clone()),
-        RunError::Import(msg) => plain("ERR_IMPORT", "Error", msg.clone()),
-        RunError::ExportNotSerializable(msg) => {
-            plain("ERR_EXPORT_NOT_SERIALIZABLE", "Error", msg.clone())
-        }
-        RunError::TypeNotSerializable(msg) => {
-            plain("ERR_TYPE_NOT_SERIALIZABLE", "TypeError", msg.clone())
-        }
-        RunError::CpuTimeout => plain(
-            "ERR_CPU_TIMEOUT",
-            "Error",
-            "CPU time limit exceeded".to_string(),
-        ),
-        RunError::WallTimeout => plain(
-            "ERR_WALL_TIMEOUT",
-            "Error",
-            "Wall time limit exceeded".to_string(),
-        ),
-        RunError::MemoryLimit => plain(
-            "ERR_MEMORY_LIMIT",
-            "Error",
-            "Memory limit exceeded".to_string(),
-        ),
-        RunError::HostBridge(err) => RunErrorPayload {
-            code: "ERR_HOST_BRIDGE".to_string(),
-            name: err.name.clone(),
-            message: err.message.clone(),
-            // Host stacks never cross the boundary — they may expose host
-            // file paths and infrastructure details.
-            stack: None,
-            fields: err.fields.clone(),
-            reset: None,
-            prefix_stage: false,
-            cause: None,
-        },
-        RunError::UndeclaredBinding(msg) => plain("ERR_UNDECLARED_BINDING", "Error", msg.clone()),
-        RunError::ReservedName(msg) => plain("ERR_RESERVED_NAME", "Error", msg.clone()),
-        RunError::FrozenBinding(msg) => plain("ERR_FROZEN_BINDING", "Error", msg.clone()),
-        RunError::PrefixDidNotSettle(msg) => {
-            plain("ERR_PREFIX_DID_NOT_SETTLE", "Error", msg.clone())
-        }
-        RunError::PrefixBridgeCall(msg) => plain("ERR_PREFIX_BRIDGE_CALL", "Error", msg.clone()),
-        RunError::CallTargetNotFound(msg) => {
-            plain("ERR_CALL_TARGET_NOT_FOUND", "Error", msg.clone())
-        }
-        RunError::FunctionArgumentNotSupported => plain(
-            "ERR_FUNCTION_ARGUMENT_NOT_SUPPORTED",
-            "Error",
-            "function arguments are not supported across the bridge boundary".to_string(),
-        ),
-        RunError::BridgeCallPayloadTooLarge => plain(
-            "ERR_BRIDGE_PAYLOAD_TOO_LARGE",
-            "Error",
-            "bridge call payload exceeds configured maxBridgeCallBytes limit".to_string(),
-        ),
-        RunError::ExportTooLarge => plain(
-            "ERR_EXPORT_TOO_LARGE",
-            "Error",
-            "serialised export payload exceeds configured maxExportBytes limit".to_string(),
-        ),
-        RunError::BridgeCallLimitExceeded => plain(
-            "ERR_BRIDGE_CALL_LIMIT_EXCEEDED",
-            "Error",
-            "run exceeded the configured maxBridgeCalls limit".to_string(),
-        ),
-        RunError::Aborted => plain("ERR_ABORTED", "AbortError", "run was aborted".to_string()),
-        RunError::InstanceReset {
-            cause,
-            culprit_run_id,
-        } => RunErrorPayload {
-            code: "ERR_INSTANCE_RESET".to_string(),
-            name: "Error".to_string(),
-            message: format!(
-                "the shared instance was reset by a co-resident run ({}): this run \
-                 was in flight on it and could not continue",
-                match cause {
-                    crate::v8::ResetCause::Cpu => "CPU limit",
-                    crate::v8::ResetCause::Memory => "memory limit",
-                    crate::v8::ResetCause::Wall => "wall deadline",
-                    crate::v8::ResetCause::Abort => "mid-execution abort",
-                    crate::v8::ResetCause::Internal => "internal failure",
-                    crate::v8::ResetCause::Unsupported => "unsupported operation",
-                },
-            ),
-            stack: None,
-            fields: None,
-            reset: Some(ResetInfo {
-                cause: *cause,
-                culprit_run_id: *culprit_run_id,
-            }),
-            prefix_stage: false,
-            cause: None,
-        },
-        RunError::WarmupLimit => plain(
-            "ERR_WARMUP_LIMIT",
-            "Error",
-            format!(
-                "prefix evaluation exceeded its fixed warm-up budget ({}ms wall / \
-                 {}ms CPU); move expensive setup into the handler (lazy init on \
-                 first call)",
-                crate::v8::WARMUP_WALL_MS,
-                crate::v8::WARMUP_CPU_MS,
-            ),
-        ),
-        RunError::Capacity(msg) => plain("ERR_CAPACITY_MEMORY", "Error", msg.clone()),
-        RunError::Internal(msg) => plain("ERR_INTERNAL", "Error", msg.clone()),
-    }
-}
-
 // ── StatsPayload encoder ─────────────────────────────────────────────────────
 
 /// Encode a `StatsPayload` per `docs/protocol.md` §5.7 — the reply to a
@@ -739,16 +448,6 @@ pub fn encode_stats_payload(stats: &crate::warm::RegistryStats) -> Vec<u8> {
 }
 
 // ── BridgeCall payload encoder ────────────────────────────────────────────────────
-
-/// What a `BridgeCall` targets: a global by name, or a host-module function
-/// leaf by specifier and key segments.
-pub enum BridgeTarget<'a> {
-    Global(&'a str),
-    Import {
-        specifier: &'a str,
-        path: &'a [String],
-    },
-}
 
 /// Encode a `BridgeCallPayload` per `docs/protocol.md` §5.4.
 ///
@@ -901,6 +600,8 @@ pub fn parse_bridge_response_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::MAX_ERROR_TEXT_BYTES;
+    use crate::types::RunFailurePayload;
 
     fn failure_payload(message: String, stack: Option<String>, fields: Option<Vec<u8>>) -> Vec<u8> {
         encode_run_completion_payload(

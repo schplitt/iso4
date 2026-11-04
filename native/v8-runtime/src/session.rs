@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::errors;
 use crate::ipc;
+use crate::types;
 use crate::v8 as sandbox;
 use crate::wire;
 
@@ -65,19 +67,19 @@ macro_rules! trace {
 /// installs a bridge stub (a plain function or a shim handler), or some host
 /// import declares a function leaf (the runtime then installs the reserved
 /// `__iso4_call` dispatcher stub itself). String/data-only runs do not.
-fn needs_bridge_stub(defs: &[ipc::HostGlobalDef], imports: &[ipc::ImportBinding]) -> bool {
+fn needs_bridge_stub(defs: &[types::HostGlobalDef], imports: &[types::ImportBinding]) -> bool {
     defs.iter().any(|g| g.bridge_stub_name().is_some())
         || imports.iter().any(|b| match &b.module {
-            ipc::ImportModule::Source(_) => false,
-            ipc::ImportModule::Host(exports) => has_function_leaf(exports),
+            types::ImportModule::Source(_) => false,
+            types::ImportModule::Host(exports) => has_function_leaf(exports),
         })
 }
 
-fn has_function_leaf(entries: &[(String, ipc::HostModuleNode)]) -> bool {
+fn has_function_leaf(entries: &[(String, types::HostModuleNode)]) -> bool {
     entries.iter().any(|(_, node)| match node {
-        ipc::HostModuleNode::Function => true,
-        ipc::HostModuleNode::Object(children) => has_function_leaf(children),
-        ipc::HostModuleNode::Data(_) => false,
+        types::HostModuleNode::Function => true,
+        types::HostModuleNode::Object(children) => has_function_leaf(children),
+        types::HostModuleNode::Data(_) => false,
     })
 }
 
@@ -86,23 +88,23 @@ fn has_function_leaf(entries: &[(String, ipc::HostModuleNode)]) -> bool {
 /// as a data or string global is `FrozenBinding`, anything else
 /// `UndeclaredBinding`. Mirrors `extractBridgeGlobals` in the TS client.
 fn validate_global_rebinds(
-    globals: &[ipc::HostGlobalDef],
+    globals: &[types::HostGlobalDef],
     declared_stubs: &[String],
-    declared: &[ipc::HostGlobalDef],
+    declared: &[types::HostGlobalDef],
 ) -> Result<(), sandbox::RunError> {
     for def in globals {
         let (name, is_stub) = match def {
-            ipc::HostGlobalDef::Bridge { name, .. } => (name.as_str(), true),
-            ipc::HostGlobalDef::StringExpr { name, .. }
-            | ipc::HostGlobalDef::Data { name, .. }
-            | ipc::HostGlobalDef::Shim { name, .. } => (name.as_str(), false),
+            types::HostGlobalDef::Bridge { name, .. } => (name.as_str(), true),
+            types::HostGlobalDef::StringExpr { name, .. }
+            | types::HostGlobalDef::Data { name, .. }
+            | types::HostGlobalDef::Shim { name, .. } => (name.as_str(), false),
         };
         if is_stub && declared_stubs.iter().any(|d| d == name) {
             continue;
         }
         let frozen = declared.iter().any(|d| {
-            matches!(d, ipc::HostGlobalDef::StringExpr { name: n, .. }
-                | ipc::HostGlobalDef::Data { name: n, .. } if n == name)
+            matches!(d, types::HostGlobalDef::StringExpr { name: n, .. }
+                | types::HostGlobalDef::Data { name: n, .. } if n == name)
         });
         return Err(if frozen {
             sandbox::RunError::FrozenBinding(format!(
@@ -123,8 +125,8 @@ fn validate_global_rebinds(
 /// `UndeclaredBinding`; a source module or data leaf is declared but frozen
 /// with the prefix — `FrozenBinding`.
 fn validate_import_rebinds(
-    rebinds: &[ipc::ImportRebind],
-    declared: &[ipc::ImportBinding],
+    rebinds: &[types::ImportRebind],
+    declared: &[types::ImportBinding],
 ) -> Result<(), sandbox::RunError> {
     for rb in rebinds {
         let Some(binding) = declared.iter().find(|b| b.specifier == rb.specifier) else {
@@ -134,18 +136,18 @@ fn validate_import_rebinds(
             )));
         };
         let exports = match &binding.module {
-            ipc::ImportModule::Source(_) => {
+            types::ImportModule::Source(_) => {
                 return Err(sandbox::RunError::FrozenBinding(format!(
                     "import '{}' is a source module — source imports are frozen \
                      with the prefix and cannot be rebound at prefix.call() time",
                     rb.specifier
                 )))
             }
-            ipc::ImportModule::Host(exports) => exports,
+            types::ImportModule::Host(exports) => exports,
         };
         match find_host_node(exports, &rb.path) {
-            Ok(ipc::HostModuleNode::Function) => {}
-            Ok(ipc::HostModuleNode::Data(_)) => {
+            Ok(types::HostModuleNode::Function) => {}
+            Ok(types::HostModuleNode::Data(_)) => {
                 return Err(sandbox::RunError::FrozenBinding(format!(
                     "import '{}'.{} is a data leaf, not a function — data leaves \
                      cannot be rebound",
@@ -153,7 +155,7 @@ fn validate_import_rebinds(
                     rb.path.join(".")
                 )))
             }
-            Ok(ipc::HostModuleNode::Object(_)) => {
+            Ok(types::HostModuleNode::Object(_)) => {
                 return Err(sandbox::RunError::UndeclaredBinding(format!(
                     "import '{}'.{} was not declared at precompile time",
                     rb.specifier,
@@ -175,9 +177,9 @@ fn validate_import_rebinds(
 /// Follow a path of key segments through a host-module tree. `Err` carries
 /// the length of the path up to and including the first segment not found.
 fn find_host_node<'a>(
-    entries: &'a [(String, ipc::HostModuleNode)],
+    entries: &'a [(String, types::HostModuleNode)],
     path: &[String],
-) -> Result<&'a ipc::HostModuleNode, usize> {
+) -> Result<&'a types::HostModuleNode, usize> {
     let mut entries = entries;
     let mut node = None;
     for (i, segment) in path.iter().enumerate() {
@@ -186,7 +188,7 @@ fn find_host_node<'a>(
             .find(|(k, _)| k == segment)
             .map(|(_, n)| n)
             .ok_or(i + 1)?;
-        if let ipc::HostModuleNode::Object(children) = found {
+        if let types::HostModuleNode::Object(children) = found {
             entries = children;
         } else if i + 1 < path.len() {
             return Err(path.len());
@@ -213,7 +215,7 @@ pub struct PrefixData {
     /// The full precompile-time global defs, replayed into every run's
     /// context before the prefix evaluates (value globals as values, bridge
     /// callables as throwing placeholders).
-    pub globals: Vec<ipc::HostGlobalDef>,
+    pub globals: Vec<types::HostGlobalDef>,
     /// Bridge stub names declared at precompile time, the only globals a
     /// PrefixRun may carry; anything else is ERR_UNDECLARED_BINDING, or
     /// ERR_FROZEN_BINDING for a declared data or string global.
@@ -224,7 +226,7 @@ pub struct PrefixData {
     /// prefix was validated against. Run-time `imports` in the PrefixRun
     /// payload only carry re-binding of host function handlers (TS
     /// dispatch); the wire-level binding shape comes from here.
-    pub declared_imports: Vec<ipc::ImportBinding>,
+    pub declared_imports: Vec<types::ImportBinding>,
 }
 
 /// One stored prefix: runnable, or broken by a deterministic cold-start
@@ -232,7 +234,7 @@ pub struct PrefixData {
 /// dropped and refusals share it by refcount.
 pub enum PrefixEntry {
     Ready(Arc<PrefixData>),
-    Broken(Arc<wire::RunErrorPayload>),
+    Broken(Arc<types::RunErrorPayload>),
 }
 
 /// State shared across all connection threads in the same Rust process.
@@ -345,8 +347,8 @@ fn write_result_frame(sink: &ipc::FrameSink, run_id: u32, payload: Vec<u8>) -> s
             );
             let replacement = wire::encode_run_completion_payload(
                 run_id,
-                wire::RunCompletion::Failure(wire::RunFailurePayload {
-                    error: wire::RunErrorPayload {
+                types::RunCompletion::Failure(types::RunFailurePayload {
+                    error: types::RunErrorPayload {
                         code: "ERR_INTERNAL".to_string(),
                         name: "Error".to_string(),
                         message: format!(
@@ -439,7 +441,7 @@ fn write_completion(
                 false,
                 wire::encode_run_completion_payload(
                     run_id,
-                    wire::RunCompletion::Success(wire::RunSuccessPayload {
+                    types::RunCompletion::Success(types::RunSuccessPayload {
                         exports: output.exports.clone(),
                         skipped_exports: output.skipped_exports.clone(),
                         stdout: output.stdout.clone(),
@@ -458,10 +460,10 @@ fn write_completion(
             false,
             wire::encode_run_completion_payload(
                 run_id,
-                wire::RunCompletion::Failure(wire::RunFailurePayload {
-                    error: wire::RunErrorPayload {
+                types::RunCompletion::Failure(types::RunFailurePayload {
+                    error: types::RunErrorPayload {
                         prefix_stage,
-                        ..wire::run_error_to_payload(&failure.error)
+                        ..failure.error.to_payload()
                     },
                     stdout: failure.stdout.clone(),
                     stderr: failure.stderr.clone(),
@@ -513,7 +515,7 @@ type ConnRuns = Arc<Mutex<HashMap<u32, RunRoute>>>;
 /// under an in-flight frame, so a late big frame for a just-completed run
 /// reads fine and is discarded as late — only a frame the host could never
 /// have sent kills the connection.
-fn frame_cap_for(limits: &ipc::ResourceLimits) -> u32 {
+fn frame_cap_for(limits: &types::ResourceLimits) -> u32 {
     match (limits.soft_memory_mb, limits.hard_memory_mb) {
         (0, 0) => ipc::DEFAULT_MAX_FRAME_LENGTH,
         (0, hard) => hard.saturating_mul(1024 * 1024),
@@ -895,7 +897,7 @@ fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
         eprintln!("[iso4-v8] ignoring stray Terminate (run {run_id} already completed)");
         return Ok(());
     };
-    if mode == ipc::TerminateMode::Hard {
+    if mode == types::TerminateMode::Hard {
         if let Some(ctl) = route.ctl.get() {
             if ctl.abort_executing(route.token) {
                 eprintln!("[iso4-v8] hard Terminate for run {run_id} landed mid-turn — terminating");
@@ -941,7 +943,7 @@ fn insert_run_route(
     conn_runs: &ConnRuns,
     run_id: u32,
     token: u64,
-    limits: &ipc::ResourceLimits,
+    limits: &types::ResourceLimits,
     ctl: Arc<std::sync::OnceLock<sandbox::GuardCtl>>,
     frames: sandbox::RunEventSender,
 ) {
@@ -965,8 +967,8 @@ fn refuse_duplicate_run(sink: &ipc::FrameSink, run_id: u32) {
     );
     let payload = wire::encode_run_completion_payload(
         run_id,
-        wire::RunCompletion::Failure(wire::RunFailurePayload {
-            error: wire::RunErrorPayload {
+        types::RunCompletion::Failure(types::RunFailurePayload {
+            error: types::RunErrorPayload {
                 code: "ERR_INTERNAL".to_string(),
                 name: "Error".to_string(),
                 message: format!(
@@ -1172,10 +1174,10 @@ fn dispatch_precompile(
 }
 
 /// Answer a `PrefixRun` refused before dispatch: nothing ran, telemetry is zero.
-fn write_setup_refusal(sink: &ipc::FrameSink, run_id: u32, error: wire::RunErrorPayload) {
+fn write_setup_refusal(sink: &ipc::FrameSink, run_id: u32, error: types::RunErrorPayload) {
     let payload = wire::encode_run_completion_payload(
         run_id,
-        wire::RunCompletion::Failure(wire::RunFailurePayload {
+        types::RunCompletion::Failure(types::RunFailurePayload {
             error,
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -1225,7 +1227,7 @@ fn dispatch_prefix_run(
                  failed with {}: {}",
                 payload.prefix_id, cause.code, cause.message
             );
-            let error = wire::RunErrorPayload {
+            let error = types::RunErrorPayload {
                 code: "ERR_PREFIX_BROKEN".to_string(),
                 name: "Error".to_string(),
                 message: format!(
@@ -1246,7 +1248,7 @@ fn dispatch_prefix_run(
                 "[iso4-v8] PrefixRun {} — prefix_id={} not found",
                 run_id, payload.prefix_id
             );
-            let error = wire::RunErrorPayload {
+            let error = types::RunErrorPayload {
                 code: "ERR_PREFIX_DISPOSED".to_string(),
                 name: "Error".to_string(),
                 message: format!(
@@ -1277,7 +1279,7 @@ fn dispatch_prefix_run(
         validate_import_rebinds(&payload.import_rebinds, &prefix_data.declared_imports).err()
     });
     if let Some(error) = violation {
-        let error = wire::run_error_to_payload(&error);
+        let error = error.to_payload();
         eprintln!(
             "[iso4-v8] PrefixRun {run_id} — {}: {}",
             error.code, error.message
@@ -1396,13 +1398,13 @@ fn dispatch_prefix_run(
                     if let Some(entry @ PrefixEntry::Ready(_)) = store.get_mut(&prefix_id) {
                         // Stored for the prefix's lifetime: clamp like the
                         // wire does and drop the fields blob it never carries.
-                        let raw = wire::run_error_to_payload(&failure.error);
-                        let cause = wire::RunErrorPayload {
-                            message: wire::clamp_error_text(&raw.message).into_owned(),
+                        let raw = failure.error.to_payload();
+                        let cause = types::RunErrorPayload {
+                            message: errors::clamp_error_text(&raw.message).into_owned(),
                             stack: raw
                                 .stack
                                 .as_deref()
-                                .map(|s| wire::clamp_error_text(s).into_owned()),
+                                .map(|s| errors::clamp_error_text(s).into_owned()),
                             fields: None,
                             ..raw
                         };
@@ -1525,18 +1527,18 @@ mod tests {
 
     #[test]
     fn import_rebind_paths_match_whole_key_segments() {
-        let declared = vec![ipc::ImportBinding {
+        let declared = vec![types::ImportBinding {
             specifier: "api".into(),
-            module: ipc::ImportModule::Host(vec![(
+            module: types::ImportModule::Host(vec![(
                 "x".into(),
-                ipc::HostModuleNode::Object(vec![
-                    ("a.b".into(), ipc::HostModuleNode::Function),
-                    ("c".into(), ipc::HostModuleNode::Object(vec![("d".into(), ipc::HostModuleNode::Function)])),
+                types::HostModuleNode::Object(vec![
+                    ("a.b".into(), types::HostModuleNode::Function),
+                    ("c".into(), types::HostModuleNode::Object(vec![("d".into(), types::HostModuleNode::Function)])),
                 ]),
             )]),
         }];
         let check = |path: &[&str]| {
-            let rebind = ipc::ImportRebind {
+            let rebind = types::ImportRebind {
                 specifier: "api".into(),
                 path: path.iter().map(|s| s.to_string()).collect(),
             };
@@ -1555,10 +1557,10 @@ mod tests {
     #[test]
     fn prefix_run_globals_may_only_rebind_declared_bridge_stubs() {
         let declared = vec![
-            ipc::HostGlobalDef::bridge("tool"),
-            ipc::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true },
-            ipc::HostGlobalDef::StringExpr { name: "expr".into(), expr: "1".into(), enumerable: true },
-            ipc::HostGlobalDef::Shim {
+            types::HostGlobalDef::bridge("tool"),
+            types::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true },
+            types::HostGlobalDef::StringExpr { name: "expr".into(), expr: "1".into(), enumerable: true },
+            types::HostGlobalDef::Shim {
                 name: "shimmed".into(),
                 shim: "(h) => h".into(),
                 handler_name: "__iso4_shimmed_h".into(),
@@ -1569,27 +1571,27 @@ mod tests {
             .iter()
             .filter_map(|g| g.bridge_stub_name().map(str::to_string))
             .collect();
-        let check = |globals: Vec<ipc::HostGlobalDef>| validate_global_rebinds(&globals, &stubs, &declared);
+        let check = |globals: Vec<types::HostGlobalDef>| validate_global_rebinds(&globals, &stubs, &declared);
 
-        assert!(check(vec![ipc::HostGlobalDef::bridge("tool"), ipc::HostGlobalDef::bridge("__iso4_shimmed_h")]).is_ok());
-        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("other")]), Err(sandbox::RunError::UndeclaredBinding(_))));
-        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("console")]), Err(sandbox::RunError::UndeclaredBinding(_))));
-        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("config")]), Err(sandbox::RunError::FrozenBinding(_))));
-        assert!(matches!(check(vec![ipc::HostGlobalDef::bridge("expr")]), Err(sandbox::RunError::FrozenBinding(_))));
+        assert!(check(vec![types::HostGlobalDef::bridge("tool"), types::HostGlobalDef::bridge("__iso4_shimmed_h")]).is_ok());
+        assert!(matches!(check(vec![types::HostGlobalDef::bridge("other")]), Err(sandbox::RunError::UndeclaredBinding(_))));
+        assert!(matches!(check(vec![types::HostGlobalDef::bridge("console")]), Err(sandbox::RunError::UndeclaredBinding(_))));
+        assert!(matches!(check(vec![types::HostGlobalDef::bridge("config")]), Err(sandbox::RunError::FrozenBinding(_))));
+        assert!(matches!(check(vec![types::HostGlobalDef::bridge("expr")]), Err(sandbox::RunError::FrozenBinding(_))));
         assert!(matches!(
-            check(vec![ipc::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true }]),
+            check(vec![types::HostGlobalDef::Data { name: "config".into(), blob: Vec::new(), enumerable: true }]),
             Err(sandbox::RunError::FrozenBinding(m)) if m.contains("frozen with the prefix")
         ));
         assert!(matches!(
-            check(vec![ipc::HostGlobalDef::Data { name: "fresh".into(), blob: Vec::new(), enumerable: true }]),
+            check(vec![types::HostGlobalDef::Data { name: "fresh".into(), blob: Vec::new(), enumerable: true }]),
             Err(sandbox::RunError::UndeclaredBinding(m)) if m == "global 'fresh' was not declared at precompile time"
         ));
         assert!(matches!(
-            check(vec![ipc::HostGlobalDef::StringExpr { name: "fresh".into(), expr: "1".into(), enumerable: true }]),
+            check(vec![types::HostGlobalDef::StringExpr { name: "fresh".into(), expr: "1".into(), enumerable: true }]),
             Err(sandbox::RunError::UndeclaredBinding(_))
         ));
         assert!(matches!(
-            check(vec![ipc::HostGlobalDef::Shim {
+            check(vec![types::HostGlobalDef::Shim {
                 name: "shimmed".into(),
                 shim: "(h) => h".into(),
                 handler_name: "__iso4_shimmed_h".into(),

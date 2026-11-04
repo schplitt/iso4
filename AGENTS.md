@@ -67,6 +67,7 @@ iso4/                              ← workspace root
         snapshot.rs                ← build-time startup snapshot: create, boot, external refs
         clock_platform.cc          ← V8 platform whose wall clock is the isolate's frozen clock
         policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader
+        types.rs, errors.rs        ← plain shared types (limits, prefix shape, calls, records), error codes
         ipc.rs, wire.rs, blob.rs   ← frames, payload codecs, V8 serialization
 ```
 
@@ -227,7 +228,7 @@ When working on this project:
 11. **Keep protocol docs in sync with code** — Whenever a new `RunError`
     variant or `ERR_*` code is added, all four of the following must be
     updated in the same commit:
-    - `RunError` enum in `v8.rs` (+ `run_error_to_payload` in `wire.rs`)
+    - `RunError` enum in `v8.rs` (+ `RunError::code`/`name`/`message` in `errors.rs`)
     - `RunErrorCode` union in `packages/iso4-sandbox/src/types.ts`
     - Error-code table in `docs/protocol.md` §7
     - Any relevant limits/semantics prose in `DESIGN.md` §4.1 (for limit
