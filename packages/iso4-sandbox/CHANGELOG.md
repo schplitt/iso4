@@ -1,5 +1,27 @@
 # @iso4/sandbox
 
+## 0.10.0
+
+### Minor Changes
+
+- b1a8ed1: feat(sandbox): allow `node:async_hooks` (`AsyncLocalStorage`) in prefix code
+
+  Create the instance at module scope and use it inside an exported handler, as in workerd; importing it from a prefix no longer fails with `ERR_MODULE_NOT_FOUND`.
+
+- b1a8ed1: feat(sandbox)!: remove `prefix.execute()` and the deprecated `prefix.run()`
+
+  A prefix is full code: runs call one of its exports with `prefix.call({ export, args })`. Move per-run code into an exported function on the prefix, or run it once with `sandbox.run({ code })`.
+
+### Patch Changes
+
+- 90afc0f: fix(sandbox): bridge call records count the serialized values only
+
+  `argBytes` and `responseBytes`, and the `maxBridgeCallBytes` check, now measure the args and response blobs alone, no longer the frame header around them (a few dozen bytes per call).
+
+- aab1bca: fix(native): name the run in the fatal OOM line when V8 runs out of memory on a GC worker thread
+
+  Such OOMs used to print `with no run executing on this thread`. Between runs it now reads `with no run executing in this isolate`, and an OOM with no current isolate now prints the line with `outside any isolate`.
+
 ## 0.9.0
 
 ### Minor Changes
