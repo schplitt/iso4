@@ -19,7 +19,8 @@ pub use isolate::{
     CpuBudget, InstanceCore, Limits, PrefixSpec, WARMUP_CPU_MS, WARMUP_WALL_MS,
     create_instance_core, init_platform, set_idle_settle_secs,
 };
-pub use oom_label::{OomRun, OomRunLabel, set_oom_prefix_id, set_oom_run};
+pub use oom_label::{OomRecord, OomRun, OomRunLabel};
+pub(crate) use oom_label::{fatal_memory_error_cb, oom_error_cb};
 pub use runloop::{
     CallJob, CallOutcome, EpilogueSpec, GraceReport, GraceStatus, Output, ReleaseHook, RoutedEvent,
     RunEvent, RunEventSender, RunIo, execute, execute_with_io, execute_with_prefix,

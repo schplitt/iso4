@@ -344,19 +344,22 @@ The near-heap conversion only holds for gradual growth. An allocation that
 crosses the cap in one step (a flattened 300 MB string, a huge
 `Array.prototype.fill`) still ends in V8's fatal out-of-memory abort, which
 takes the whole runtime child and every run in flight on it. The child
-registers V8's OOM error handler on every user-code isolate, so before that
-abort it writes one line on its stderr:
+registers V8's OOM error handler on every user-code isolate, with that
+isolate's record of its prefix and executing run as the handler's data, so
+before that abort it writes one line on its stderr:
 `[iso4-v8] fatal: V8 out of memory (heap|non-heap) in run <id> of prefix
 <prefix_id>: <V8 message>[ (<detail>)] — aborting the process`, with
 `in one-off run <id>` for `sandbox.run()`, `during cold start of prefix
 <prefix_id> (triggered by run <id>)` while the prefix evaluates, and
-`with no run executing on this thread` between runs. The line names the run
-whose turn was executing; a co-resident run's continuation resumed inside
-that turn is reported as the turn owner. Heap OOMs raised on V8 worker
-threads (parallel scavenge or evacuation, background `LocalHeap` allocation)
-print the line with `no run executing on this thread`; OOMs raised with no
-current isolate (Zone exhaustion on background compile threads) print no
-iso4 line at all, only V8's own `Fatal process out of memory`. The iso4 line
+`with no run executing in this isolate` between runs. The record belongs to
+the isolate, so heap OOMs raised on V8 worker threads (parallel scavenge or
+evacuation, background `LocalHeap` allocation) name the same run. The line
+names the run whose turn was executing; a co-resident run's continuation
+resumed inside that turn is reported as the turn owner. OOMs raised with no
+current isolate (Zone exhaustion on background compile threads) reach the
+process-wide callback the child registers before V8 initializes, and print
+the line with `outside any isolate`, followed by V8's own `# Fatal process
+out of memory: <location>`. On the isolate path the iso4 line
 replaces V8's `# Fatal JavaScript out of memory: Reached heap limit` block,
 which V8 skips once a handler is installed; the process then aborts with
 `API fatal error handler returned after process out of memory`. The host
@@ -1532,7 +1535,7 @@ iso4/
     patches/                        ← patches applied to the vendored v8 crate
     types/                          ← iso4-types (lib): plain shared types, no V8, no sockets
     core/                           ← iso4-core (lib): the engine
-      build.rs                      ← snapshot + clock_platform.cc, core modules only
+      build.rs                      ← snapshot + clock_platform.cc + oom_handler.cc, core modules only
       src/
         v8/                         ← the engine core: run loop, instance loop, isolates, run table, exceptions, bridge, console, timers, guard
     server/                         ← iso4-server (bin iso4-v8): socket frontend for Node

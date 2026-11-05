@@ -650,6 +650,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("spin prefix warms up");
         let call = call_spec("spin", &[]);

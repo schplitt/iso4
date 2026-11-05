@@ -546,6 +546,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
         let run1 = run_call_on_core(
@@ -597,6 +598,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up despite the refused setTimeout");
         let out = run_call_on_core(
@@ -632,6 +634,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
         let out = run_call_on_core(
