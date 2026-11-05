@@ -63,11 +63,11 @@ iso4/                              ← workspace root
     types/                         ← iso4-types (lib): plain shared types, no V8, no sockets
       src/lib.rs                   ← limits, prefix shape, calls, bridge records, error payloads
     core/                          ← iso4-core (lib): the engine
-      build.rs                     ← builds the startup snapshot (compiles the core modules in) + clock_platform.cc
+      build.rs                     ← builds the startup snapshot (compiles the core modules in) + the two .cc files
       benches/micro.rs             ← criterion micro suite
       tests/wpt/                   ← vendored WPT URL corpus
       src/
-        lib.rs                     ← module list, SNAPSHOT_BLOB, new_platform
+        lib.rs                     ← module list, SNAPSHOT_BLOB, new_platform, the OOM handler registration
         engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
         prefix.rs                  ← stored prefix shape, rebind validation
         v8/                        ← the engine core
@@ -77,7 +77,7 @@ iso4/                              ← workspace root
           isolate.rs               ← isolate creation: platform, limits, budgets, warm InstanceCore
           runtable.rs              ← per-run state table, run tokens, attribution, the load meter, the CPED rider
           exceptions.rs            ← thrown V8 values to RunError: capped text, syntax errors, error fields
-          oom_label.rs             ← the fatal OOM line: what this thread was running when V8 aborts
+          oom_label.rs             ← the fatal OOM line: the per-isolate OomRecord and the OOM handlers
           console.rs               ← console.* capture: wrapped methods, rendering, per-run buffers
           timers.rs                ← setTimeout/clearTimeout natives and the timer turn
           guard.rs                 ← limit guard: per-turn CPU/wall deadlines on one watchdog thread
@@ -92,6 +92,7 @@ iso4/                              ← workspace root
         link.rs                    ← HostLink/Observer traits, Outbound/Inbound messages (the engine's only way out)
         snapshot.rs                ← build-time startup snapshot: create, boot, external refs
         clock_platform.cc          ← V8 platform whose wall clock is the isolate's frozen clock
+        oom_handler.cc             ← binds V8's data-carrying OOM handler + the process-wide OOM callback
         policy.rs, rss.rs          ← eviction/pressure decisions + RSS reader
         types.rs, errors.rs        ← re-export of iso4-types; RunError, FailureOutput, codes/names/messages
         blob.rs, webcodec.rs       ← V8 serialization, host-type descriptors
@@ -197,8 +198,11 @@ Toolchain:
 - **cargo** (Rust stable) for the workspace under `crates/`. Every `pnpm
   *:native` script passes `--manifest-path crates/Cargo.toml`; the binary is
   built with `--package iso4-server`. `crates/core/build.rs` also compiles
-  `src/clock_platform.cc` against the vendored V8 headers and Chromium's
-  libc++; on Linux that needs `clang++` (g++ cannot compile those headers).
+  `src/clock_platform.cc` and `src/oom_handler.cc` against the vendored V8
+  headers and Chromium's libc++; on Linux that needs `clang++` (g++ cannot
+  compile those headers). V8 calls missing from rusty_v8 go in core's C++
+  when the prebuilt `librusty_v8.a` already exports them: rusty_v8's own
+  `binding.cc` ships inside that archive, so a patch to it would not link.
 
 ## Code Style
 

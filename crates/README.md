@@ -47,8 +47,8 @@ cargo build --manifest-path crates/Cargo.toml --package iso4-server
 ```
 
 The first build downloads a prebuilt `librusty_v8.a` (about 100 MB). On
-Linux, `core/build.rs` needs `clang++` to compile `clock_platform.cc`
-against the vendored V8 headers.
+Linux, `core/build.rs` needs `clang++` to compile `clock_platform.cc` and
+`oom_handler.cc` against the vendored V8 headers.
 
 ## Diagnostics
 

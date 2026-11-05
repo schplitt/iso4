@@ -268,7 +268,6 @@ impl Engine {
             .name("iso4-oneoff-run".to_string())
             .spawn(move || {
                 crate::webcodec::set_thread_brand_key(brand_key);
-                sandbox::set_oom_run(sandbox::OomRun::Run(run_id));
                 sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
                     run_id,
                     report_heap: false,

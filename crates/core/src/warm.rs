@@ -221,14 +221,14 @@ fn instance_main(
         filename: prefix.filename.as_deref().unwrap_or("<prefix>"),
         globals: &prefix.globals,
     };
-    sandbox::set_oom_prefix_id(Some(prefix.id));
-    sandbox::set_oom_run(sandbox::OomRun::ColdStart(
-        first_job.epilogue.map(|e| e.run_id).unwrap_or(0),
-    ));
     let mut core = match sandbox::create_instance_core(
         spec,
         &prefix.declared_imports,
         hard_memory_mb,
+        sandbox::OomRunLabel {
+            prefix_id: Some(prefix.id),
+            run: sandbox::OomRun::ColdStart(first_job.epilogue.map(|e| e.run_id).unwrap_or(0)),
+        },
     ) {
         Ok(c) => c,
         Err(f) => {
@@ -276,7 +276,7 @@ fn instance_main(
     // The loop ended — the registry evicted this instance (taint, eviction,
     // dispose) or the process is shutting down. The isolate drops here, on
     // the thread that created it, as rusty_v8 requires.
-    sandbox::set_oom_run(sandbox::OomRun::None);
+    core.oom.set_run(sandbox::OomRun::None);
     drop(core);
     // Disposal is where the memory actually comes back; glibc holds the
     // freed arenas until asked.

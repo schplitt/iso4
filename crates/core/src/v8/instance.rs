@@ -27,8 +27,8 @@ use crate::v8::streams::{close_out_streams, close_run_streams, out_idle_deadline
 use crate::v8::timers::{TimerTable, timer_turn};
 use crate::v8::{
     CallJob, CallOutcome, CpuBudget, FailureOutput, GraceReport, GraceStatus, InstanceCore,
-    InstanceLoad, OomRun, OutStreamTable, Output, PendingWork, ResetCause, RoutedEvent, RunError,
-    RunEvent, RunIo, RunTable, StreamTable, alloc_run_token, load_now_ms, set_oom_run,
+    InstanceLoad, OomRecord, OomRun, OutStreamTable, Output, PendingWork, ResetCause, RoutedEvent,
+    RunError, RunEvent, RunIo, RunTable, StreamTable, alloc_run_token, load_now_ms,
 };
 
 // ── The instance loop ────────────────────────────────────────────────────────
@@ -290,7 +290,7 @@ fn sweep_expired_deadlines(
         // phase boundary.
         if earliest_timer(&live[idx].rs) == Some(at) {
             let mut l = live.swap_remove(idx);
-            note_turn_owner(&l.job);
+            note_turn_owner(&core.oom, &l.job);
             // The wait ended at the timer's due instant, not its late fire.
             enter_turn(&mut l.rs, at);
             let outcome = {
@@ -333,7 +333,7 @@ fn sweep_expired_deadlines(
             let now = std::time::Instant::now();
             if let Some(d) = out_idle_deadline(&l.rs).filter(|d| *d <= now) {
                 // Stream idle allowance: a real turn (guest cancel cleanup).
-                note_turn_owner(&l.job);
+                note_turn_owner(&core.oom, &l.job);
                 enter_turn(&mut l.rs, d);
                 let outcome = {
                     let facts = RunFacts {
@@ -372,7 +372,7 @@ fn sweep_expired_deadlines(
             // streams.
             if grace_wall_due(&l.rs, now) {
                 // Counted grace time reaches its cap exactly here.
-                note_turn_owner(&l.job);
+                note_turn_owner(&core.oom, &l.job);
                 enter_turn(&mut l.rs, at);
                 match conclude_grace_wall(&mut l.rs) {
                     Some(output) => {
@@ -396,7 +396,7 @@ fn sweep_expired_deadlines(
             continue;
         }
         // Counted wall reaches its cap exactly at the boundary instant.
-        note_turn_owner(&l.job);
+        note_turn_owner(&core.oom, &l.job);
         enter_turn(&mut l.rs, at);
         let result = boundary_deadline(&mut l.rs);
         conclude_run(&mut core.isolate, &core.run_table, l, result, false);
@@ -461,7 +461,7 @@ pub fn serve_instance(
         if live.is_empty() && retired {
             return;
         }
-        set_oom_run(OomRun::None);
+        core.oom.set_run(OomRun::None);
 
         let received = {
             let timeout = peek_valid_deadline(&live, &mut deadlines)
@@ -578,7 +578,7 @@ pub fn serve_instance(
                     RunEvent::Host(msg) => LoopEvent::Host(msg),
                     RunEvent::Job(_) | RunEvent::Retire => unreachable!("consumed above"),
                 };
-                note_turn_owner(&l.job);
+                note_turn_owner(&core.oom, &l.job);
                 // The deadline as the heap knows it; a change during this
                 // turn (settle → grace, a timer armed/fired/cleared)
                 // re-queues below. Captured before the wait is folded.
@@ -656,7 +656,7 @@ fn dispatch_job(
     if let Some(slot) = &job.ctl_slot {
         slot.set(core.guard.ctl()).ok();
     }
-    note_turn_owner(&job);
+    note_turn_owner(&core.oom, &job);
 
     // Jobs interleave. The reason cell may only be reset while nothing else
     // is in flight; when runs are live it is guaranteed clear (a set reason
@@ -886,10 +886,10 @@ thread_local! {
 }
 
 /// A turn starts for `job`: record it as the sweep culprit and as the run
-/// executing on this thread.
-pub fn note_turn_owner(job: &CallJob) {
+/// executing in the isolate.
+pub fn note_turn_owner(oom: &OomRecord, job: &CallJob) {
     let run_id = job.epilogue.map(|e| e.run_id).unwrap_or(0);
     LAST_CULPRIT_RUN_ID.with(|c| c.set(run_id));
-    set_oom_run(OomRun::Run(run_id));
+    oom.set_run(OomRun::Run(run_id));
 }
 

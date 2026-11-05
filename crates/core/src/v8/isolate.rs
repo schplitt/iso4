@@ -13,7 +13,7 @@ use crate::types::{HostGlobalDef, ImportBinding};
 use crate::v8::bridge::StubSlots;
 use crate::v8::guard::{GuardTarget, InstanceGuard};
 use crate::v8::modules::{evaluate_prefix_module, host_import_meta_callback};
-use crate::v8::oom_label::oom_error_cb;
+use crate::v8::oom_label::{OomRecord, OomRunLabel};
 use crate::v8::runtable::RunTable;
 use crate::v8::{FailureOutput, RunError};
 
@@ -37,6 +37,8 @@ pub(crate) struct LogBuffers {
 /// `Once` ensures it runs exactly once per process.
 pub fn init_platform() {
     INIT.call_once(|| {
+        // Before initialize: V8 can run out of memory before any isolate exists.
+        crate::set_fatal_memory_error_callback();
         // ICU data comes with the prebuilt V8, statically linked. Nothing to
         // load here: a missing one aborts the process on the first
         // locale-aware call, which the Intl tests cover.
@@ -468,6 +470,8 @@ pub struct InstanceCore {
     /// `console.log`s) is sitting in the table's `setup_logs` and is
     /// delivered on the cold-start call's result instead of being dropped.
     pub(super) warmup_logs_pending: bool,
+    /// The OOM handler's data; declared after `isolate` so it drops after it.
+    pub(crate) oom: Box<OomRecord>,
 }
 
 /// Build an isolate with the heap cap, budget ArrayBuffer allocator, and
@@ -482,6 +486,7 @@ pub struct InstanceCore {
 fn new_capped_isolate(
     hard_memory_mb: u32,
     reason: &Arc<ReasonCell>,
+    oom: &OomRecord,
 ) -> (
     v8::OwnedIsolate,
     Option<Arc<BudgetAllocState>>,
@@ -522,7 +527,9 @@ fn new_capped_isolate(
     // V8's default assumes it owns the machine and collects lazily; wrong for
     // a container full of isolates (workerd flips the same switch).
     isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
-    isolate.set_oom_error_handler(oom_error_cb);
+    // SAFETY: `oom` outlives the isolate: declared before it as a local, after it
+    // as an InstanceCore field.
+    unsafe { crate::set_oom_error_handler(&mut isolate, oom) };
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
     install_dynamic_import(&mut isolate, reason);
@@ -590,13 +597,15 @@ pub fn create_instance_core(
     prefix: PrefixSpec<'_>,
     imports: &[ImportBinding],
     hard_memory_mb: u32,
+    oom: OomRunLabel,
 ) -> Result<InstanceCore, FailureOutput> {
     init_platform();
     let start = std::time::Instant::now();
 
     let run_table = RunTable::boxed();
     let reason = Arc::new(ReasonCell::new());
-    let (mut isolate, alloc_state, near_heap) = new_capped_isolate(hard_memory_mb, &reason);
+    let oom = OomRecord::new(oom);
+    let (mut isolate, alloc_state, near_heap) = new_capped_isolate(hard_memory_mb, &reason, &oom);
 
     let handle = isolate.thread_safe_handle();
     let warmup_budget = Arc::new(CpuBudget::new());
@@ -656,6 +665,7 @@ pub fn create_instance_core(
                 stub_slots: StubSlots::new(),
                 guard,
                 warmup_logs_pending: true,
+                oom,
             })
         }
         Err(error) => Err(failure(
@@ -920,6 +930,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("counter prefix warms up")
     }
@@ -968,6 +979,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("setup using new Function warms up");
         for _ in 0..2 {
@@ -1011,6 +1023,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
         assert!(bump(&mut core, Limits::default()).result.is_ok());
@@ -1051,6 +1064,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         );
         let Err(failure) = result else {
             panic!("a looping prefix cannot warm up");

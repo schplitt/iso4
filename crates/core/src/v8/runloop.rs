@@ -34,7 +34,7 @@ use crate::v8::modules::{
     ResolverContext, extract_module_exports, host_import_meta_callback, install_resolver,
     module_resolver_callback, take_resolver,
 };
-use crate::v8::oom_label::oom_error_cb;
+use crate::v8::oom_label::{OomRecord, OomRun, OomRunLabel};
 use crate::v8::runtable::{
     CURRENT_RUN_TOKEN, RUN_TABLE_PTR, RunCallState, TIMERS_TOUCHED, install_cped_rider,
 };
@@ -261,7 +261,8 @@ pub fn execute_with_prefix(
     // timeout. The call itself then gets fresh guards from dispatch to
     // settle. The warm registry keeps the core alive between calls; this
     // one-shot wrapper drops it.
-    let mut core = create_instance_core(prefix, imports, limits.hard_memory_mb)?;
+    let mut core =
+        create_instance_core(prefix, imports, limits.hard_memory_mb, OomRunLabel::NONE)?;
     run_call_on_core(
         &mut core,
         prefix.globals,
@@ -395,6 +396,11 @@ fn run_module_inner(
     // ArrayBuffer allocator (which is registered in CreateParams, before the
     // isolate exists).
     let reason = Arc::new(ReasonCell::new());
+    // Declared before the isolate so it drops after it.
+    let oom = OomRecord::new(OomRunLabel {
+        prefix_id: None,
+        run: epilogue.map_or(OomRun::None, |e| OomRun::Run(e.run_id)),
+    });
 
     // ── ArrayBuffer budget allocator ──────────────────────────────────────────
     // Built before the isolate so we can pass it into CreateParams.
@@ -443,7 +449,8 @@ fn run_module_inner(
     // V8's default assumes it owns the machine and collects lazily; wrong for
     // a container full of isolates (workerd flips the same switch).
     isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
-    isolate.set_oom_error_handler(oom_error_cb);
+    // SAFETY: `oom` is declared before the isolate, so it drops after it.
+    unsafe { crate::set_oom_error_handler(&mut isolate, &oom) };
 
     // Explicit policy: microtasks only drain when we call
     // perform_microtask_checkpoint() in the poll loop.  This gives us
@@ -3435,6 +3442,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("core");
         let outcome = run_call_on_core(
@@ -4062,6 +4070,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
 
@@ -4119,6 +4128,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
 
@@ -4171,6 +4181,7 @@ mod tests {
             },
             &[],
             8,
+            crate::v8::OomRunLabel::NONE,
         );
         let Err(failure) = result else {
             panic!("prefix exceeds the cap but warmed up");
@@ -4195,6 +4206,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
 
@@ -4259,6 +4271,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
 
@@ -4397,6 +4410,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
         let (io, host) = test_io();
@@ -4472,6 +4486,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
         for export in ["oneGetter", "twoGetters", "errFields", "argGetter"] {
@@ -4675,6 +4690,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         ) else {
             panic!("a prefix calling import() cannot warm up");
         };
@@ -4692,6 +4708,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("prefix warms up");
         let call = call_spec("f", &[]);
@@ -4722,6 +4739,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("core");
         let outcome = run_call_on_core(
@@ -4762,6 +4780,7 @@ mod tests {
             },
             &[],
             0,
+            crate::v8::OomRunLabel::NONE,
         )
         .expect("core");
         let outcome = run_call_on_core(

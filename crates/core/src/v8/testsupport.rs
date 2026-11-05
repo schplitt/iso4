@@ -226,6 +226,7 @@ pub(crate) fn evaluate_prefix(
         },
         imports,
         0,
+        crate::v8::OomRunLabel::NONE,
     )
     .map(|_| ())
 }
