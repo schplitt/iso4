@@ -307,7 +307,7 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
     let fields = error.fields.as_ref().filter(|f| {
         let keep = f.len() <= MAX_ERROR_FIELDS_BYTES;
         if !keep {
-            eprintln!(
+            iso4_core::log!(
                 "[iso4-v8] dropping {} bytes of error properties (limit {MAX_ERROR_FIELDS_BYTES})",
                 f.len()
             );

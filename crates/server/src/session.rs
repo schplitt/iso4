@@ -74,7 +74,7 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
         ipc::RustToTsMessageType::Hello,
         &ipc::encode_hello_payload(status, iso4_core::blob::probe(), message),
     ) {
-        eprintln!("[iso4-v8] failed to write rejection Hello frame: {e}");
+        iso4_core::log!("[iso4-v8] failed to write rejection Hello frame: {e}");
     }
 }
 
@@ -245,7 +245,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
         match ipc::read_ts_to_rust_frame_with_limit(&mut reader, ipc::AUTH_MAX_FRAME_LENGTH) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[iso4-v8] failed to read first frame: {e}");
+                iso4_core::log!("[iso4-v8] failed to read first frame: {e}");
                 return;
             }
         }
@@ -256,12 +256,12 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     // takes. Failing to clear the deadline would put the handshake limit on an
     // idle connection, so it is fatal rather than best-effort.
     if let Err(e) = stream.set_read_timeout(None) {
-        eprintln!("[iso4-v8] failed to clear the handshake deadline: {e} — closing");
+        iso4_core::log!("[iso4-v8] failed to clear the handshake deadline: {e} — closing");
         return;
     }
 
     if auth_frame.message_type != ipc::TsToRustMessageType::Authenticate {
-        eprintln!(
+        iso4_core::log!(
             "[iso4-v8] expected Authenticate, got {:?} — closing",
             auth_frame.message_type
         );
@@ -273,7 +273,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
         Err(e) => {
             // The payload shape itself is wrong — the peer is not speaking this
             // protocol at all, so there is nothing meaningful to reply with.
-            eprintln!("[iso4-v8] bad Authenticate payload: {e}");
+            iso4_core::log!("[iso4-v8] bad Authenticate payload: {e}");
             return;
         }
     };
@@ -285,7 +285,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
             auth.protocol_version,
             ipc::PROTOCOL_VERSION
         );
-        eprintln!("[iso4-v8] {message} — closing");
+        iso4_core::log!("[iso4-v8] {message} — closing");
         send_hello(
             &mut stream,
             ipc::HelloStatus::ProtocolVersionMismatch,
@@ -320,7 +320,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "an unrecognised format".to_string()),
             );
-            eprintln!("[iso4-v8] {message} — closing");
+            iso4_core::log!("[iso4-v8] {message} — closing");
             send_hello(&mut stream, ipc::HelloStatus::V8FormatMismatch, &message);
             return;
         }
@@ -331,11 +331,11 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
         ipc::RustToTsMessageType::Hello,
         &ipc::encode_hello_payload(ipc::HelloStatus::Ok, iso4_core::blob::probe(), ""),
     ) {
-        eprintln!("[iso4-v8] failed to write Hello frame: {e}");
+        iso4_core::log!("[iso4-v8] failed to write Hello frame: {e}");
         return;
     }
 
-    eprintln!("[iso4-v8] handshake complete");
+    iso4_core::log!("[iso4-v8] handshake complete");
 
     // ── Step 3: the demux loop ────────────────────────────────────────────
     //
@@ -348,7 +348,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     let outbox = match ipc::Outbox::spawn(&stream) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[iso4-v8] failed to start the connection writer: {e} — closing");
+            iso4_core::log!("[iso4-v8] failed to start the connection writer: {e} — closing");
             return;
         }
     };
@@ -391,11 +391,11 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
         ) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                eprintln!("[iso4-v8] connection closed without close frame");
+                iso4_core::log!("[iso4-v8] connection closed without close frame");
                 break;
             }
             Err(e) => {
-                eprintln!("[iso4-v8] connection error: {e}");
+                iso4_core::log!("[iso4-v8] connection error: {e}");
                 break;
             }
         };
@@ -406,14 +406,14 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                 break;
             }
             ipc::TsToRustMessageType::Authenticate => {
-                eprintln!("[iso4-v8] unexpected second Authenticate — closing");
+                iso4_core::log!("[iso4-v8] unexpected second Authenticate — closing");
                 break;
             }
             ipc::TsToRustMessageType::Run => {
                 let req = match ipc::parse_run_payload(&frame.payload) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[iso4-v8] malformed Run payload: {e} — closing");
+                        iso4_core::log!("[iso4-v8] malformed Run payload: {e} — closing");
                         break;
                     }
                 };
@@ -426,7 +426,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                 let payload = match ipc::parse_precompile_payload(&frame.payload) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[iso4-v8] malformed Precompile payload: {e} — closing");
+                        iso4_core::log!("[iso4-v8] malformed Precompile payload: {e} — closing");
                         break;
                     }
                 };
@@ -446,14 +446,14 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     result,
                     Vec::new(),
                 ) {
-                    eprintln!("[iso4-v8] failed to write PrecompileResult frame: {e}");
+                    iso4_core::log!("[iso4-v8] failed to write PrecompileResult frame: {e}");
                 }
             }
             ipc::TsToRustMessageType::PrefixRun => {
                 let req = match ipc::parse_prefix_run_payload(&frame.payload) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[iso4-v8] malformed PrefixRun payload: {e} — closing");
+                        iso4_core::log!("[iso4-v8] malformed PrefixRun payload: {e} — closing");
                         break;
                     }
                 };
@@ -467,7 +467,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     // No response frame: DisposePrefix is fire-and-forget.
                     Ok(prefix_id) => engine.dispose_prefix(&prefix_id),
                     Err(e) => {
-                        eprintln!("[iso4-v8] malformed DisposePrefix payload: {e} — closing");
+                        iso4_core::log!("[iso4-v8] malformed DisposePrefix payload: {e} — closing");
                         break;
                     }
                 }
@@ -482,7 +482,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     wire::encode_stats_payload(&stats),
                     Vec::new(),
                 ) {
-                    eprintln!("[iso4-v8] failed to write StatsResult frame: {e}");
+                    iso4_core::log!("[iso4-v8] failed to write StatsResult frame: {e}");
                     break;
                 }
             }
@@ -492,13 +492,13 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
             | ipc::TsToRustMessageType::StreamPull
             | ipc::TsToRustMessageType::StreamCancel => {
                 if let Err(e) = route_run_frame(&conn_runs, frame) {
-                    eprintln!("[iso4-v8] {e} — closing");
+                    iso4_core::log!("[iso4-v8] {e} — closing");
                     break;
                 }
             }
             ipc::TsToRustMessageType::Terminate => {
                 if let Err(e) = route_terminate(&conn_runs, frame) {
-                    eprintln!("[iso4-v8] {e} — closing");
+                    iso4_core::log!("[iso4-v8] {e} — closing");
                     break;
                 }
             }
@@ -528,9 +528,9 @@ fn route_run_frame(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
     let Some(route) = runs.get(&run_id) else {
         match frame.message_type {
             ipc::TsToRustMessageType::BridgeResponse => {
-                eprintln!("[iso4-v8] ignoring late BridgeResponse (run already completed)")
+                iso4_core::log!("[iso4-v8] ignoring late BridgeResponse (run already completed)")
             }
-            _ => eprintln!("[iso4-v8] ignoring late stream frame (run already completed)"),
+            _ => iso4_core::log!("[iso4-v8] ignoring late stream frame (run already completed)"),
         }
         return Ok(());
     };
@@ -572,7 +572,7 @@ fn route_terminate(conn_runs: &ConnRuns, frame: ipc::TsToRustFrame) -> Result<()
         .map(|route| route.handle.clone());
     let Some(handle) = handle else {
         // The run completed just before the abort landed: a benign race.
-        eprintln!("[iso4-v8] ignoring stray Terminate (run {run_id} already completed)");
+        iso4_core::log!("[iso4-v8] ignoring stray Terminate (run {run_id} already completed)");
         return Ok(());
     };
     handle.deliver(Inbound::Terminate { mode });
@@ -602,7 +602,7 @@ fn start_run(
         .unwrap_or_else(|p| p.into_inner())
         .contains_key(&run_id);
     if in_flight {
-        eprintln!(
+        iso4_core::log!(
             "[iso4-v8] run {run_id} is already in flight on this connection — refusing the duplicate"
         );
         let error = iso4_core::v8::RunError::Internal(format!(

@@ -58,6 +58,12 @@ logged. Per-run trace lines are off by default because they cost 2 to 4 %
 on a hot `prefix.call()`; turn them on with `ISO4_V8_TRACE=1` in the
 environment the host spawns the binary from.
 
+A log line that stderr cannot take is dropped or cut short. Every log line goes through
+`iso4_core::log!` (the fatal OOM line has its own allocation-free write),
+never `eprintln!`: that one panics on a failed write, and
+a release build aborts on panic, so a closed stderr pipe would end the
+process and every run in it.
+
 ## License
 
 MIT

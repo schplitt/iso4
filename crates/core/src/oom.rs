@@ -18,7 +18,7 @@ pub const OOM_SCORE_ADJ: &str = "500";
 pub fn prefer_this_process_as_victim() {
     #[cfg(target_os = "linux")]
     if let Err(e) = std::fs::write("/proc/self/oom_score_adj", OOM_SCORE_ADJ) {
-        eprintln!("[iso4-v8] could not set oom_score_adj: {e}");
+        crate::log!("[iso4-v8] could not set oom_score_adj: {e}");
     }
 }
 

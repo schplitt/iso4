@@ -13,6 +13,8 @@ mod cpuclock;
 mod errors;
 #[path = "src/link.rs"]
 mod link;
+#[path = "src/log.rs"]
+mod log;
 #[path = "src/snapshot.rs"]
 mod snapshot;
 #[path = "src/types.rs"]
