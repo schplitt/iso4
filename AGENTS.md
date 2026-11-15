@@ -90,6 +90,7 @@ iso4/                              ← workspace root
           testsupport.rs           ← test-only run shorthands + the in-memory host end of a link
         warm.rs                    ← warm-instance registry
         link.rs                    ← HostLink/Observer traits, Outbound/Inbound messages (the engine's only way out)
+        log.rs                     ← `log!`: one stderr line per write, never panics
         snapshot.rs                ← build-time startup snapshot: create, boot, external refs
         clock_platform.cc          ← V8 platform whose wall clock is the isolate's frozen clock
         oom_handler.cc             ← binds V8's data-carrying OOM handler + the process-wide OOM callback
@@ -428,6 +429,9 @@ conversation. Codified in `DESIGN.md` but worth keeping front-of-mind:
   that history belongs in the commit message and the PR. Remove old
   references when you touch a comment that has one. The gitignored
   `internal/` notes are the exception and may cite issues freely.
+- Do not use `eprintln!` in `crates/`: it panics when the write fails, and a
+  release build aborts on panic. Log with `iso4_core::log!` (`crate::log!`
+  inside core), which drops the line instead.
 - Do not use `pnpm test` in automation.
 - Do not create tiny helper/utility functions or `parse*`/`normalize*`
   wrappers for trivial one-off logic.

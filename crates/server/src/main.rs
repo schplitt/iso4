@@ -30,7 +30,7 @@ fn main() {
         && container::usage_bytes().is_none()
         && rss::process_rss_bytes().is_none()
     {
-        eprintln!(
+        iso4_core::log!(
             "[iso4-v8] cannot read container memory or this process's \
              resident memory, so the {warm_budget_bytes}-byte memory budget \
              could never be enforced. This usually means neither the cgroup \
@@ -56,12 +56,12 @@ fn main() {
     let listener = match UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[iso4-v8] failed to bind socket at {socket_path}: {e}");
+            iso4_core::log!("[iso4-v8] failed to bind socket at {socket_path}: {e}");
             std::process::exit(1);
         }
     };
 
-    eprintln!("[iso4-v8] listening on {socket_path}");
+    iso4_core::log!("[iso4-v8] listening on {socket_path}");
 
     // One line answering what a capacity refusal makes an operator ask:
     // where the lines sit and what derived them.
@@ -74,7 +74,7 @@ fn main() {
     let default_heap_mb = types::DEFAULT_MEMORY_MB;
     let warm_ceiling_mb = default_heap_mb + policy::heap_band_mb(default_heap_mb);
     match container::limit_info() {
-        Some((limit, source)) => eprintln!(
+        Some((limit, source)) => iso4_core::log!(
             "[iso4-v8] capacity: container limit {} MB ({source}), host reserve {} MB, \
              admission line {} MB, warm budget {budget}, default run heap \
              {default_heap_mb} MB (warm-run ceiling {warm_ceiling_mb} MB)",
@@ -82,7 +82,7 @@ fn main() {
             container::host_reserve_bytes() / MB,
             hard_line_bytes / MB,
         ),
-        None => eprintln!(
+        None => iso4_core::log!(
             "[iso4-v8] capacity: container limit unreadable — admission line disabled; \
              warm budget {budget}, default run heap {default_heap_mb} MB \
              (warm-run ceiling {warm_ceiling_mb} MB)"
@@ -106,7 +106,7 @@ fn main() {
                 std::thread::spawn(move || session::handle_client(stream, engine));
             }
             Err(e) => {
-                eprintln!("[iso4-v8] accept error: {e}");
+                iso4_core::log!("[iso4-v8] accept error: {e}");
                 break;
             }
         }
@@ -135,7 +135,7 @@ fn parse_args() -> (String, u64, u64, u64) {
                 match args[i + 1].parse::<u64>() {
                     Ok(n) => warm_budget_bytes = n,
                     Err(_) => {
-                        eprintln!(
+                        iso4_core::log!(
                             "[iso4-v8] --warm-budget-bytes must be a non-negative integer, got {:?}",
                             args[i + 1]
                         );
@@ -151,7 +151,7 @@ fn parse_args() -> (String, u64, u64, u64) {
                 match args[i + 1].parse::<u64>() {
                     Ok(n) => host_reserve_bytes = n,
                     Err(_) => {
-                        eprintln!(
+                        iso4_core::log!(
                             "[iso4-v8] --host-reserve-bytes must be a non-negative integer, got {:?}",
                             args[i + 1]
                         );
@@ -166,7 +166,7 @@ fn parse_args() -> (String, u64, u64, u64) {
                 match args[i + 1].parse::<u64>() {
                     Ok(n) => idle_settle_secs = n,
                     Err(_) => {
-                        eprintln!(
+                        iso4_core::log!(
                             "[iso4-v8] --idle-settle-secs must be a non-negative integer, got {:?}",
                             args[i + 1]
                         );
@@ -180,14 +180,14 @@ fn parse_args() -> (String, u64, u64, u64) {
                 // leave a mistyped `--warm-budget-bytes` at its initial 0,
                 // which means watermarks off — the memory ceiling silently
                 // absent, with one stderr line to say so.
-                eprintln!("[iso4-v8] unknown argument: {arg}");
+                iso4_core::log!("[iso4-v8] unknown argument: {arg}");
                 std::process::exit(1);
             }
         }
     }
 
     let socket = socket.unwrap_or_else(|| {
-        eprintln!("[iso4-v8] --socket <path> is required");
+        iso4_core::log!("[iso4-v8] --socket <path> is required");
         std::process::exit(1);
     });
 

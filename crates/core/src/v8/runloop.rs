@@ -1744,7 +1744,7 @@ fn frame_turn(
             if in_grace {
                 // A host Terminate mid-grace (abort during the epilogue):
                 // truncate the phase cleanly — the value already shipped.
-                eprintln!("[iso4-v8] Terminate received for run {run_id} — truncating grace");
+                crate::log!("[iso4-v8] Terminate received for run {run_id} — truncating grace");
                 return finished(Ok(finish_post_phase(rs)));
             }
             // Graceful abort = direct abandon (E2 amendment to E1 ruling 5):
@@ -1753,7 +1753,7 @@ fn frame_turn(
             // interrupted mid-JS — so the instance is NOT tainted and
             // co-resident runs are unaffected. The failure carries the real
             // telemetry collected so far.
-            eprintln!("[iso4-v8] Terminate received for run {run_id} — abandoning");
+            crate::log!("[iso4-v8] Terminate received for run {run_id} — abandoning");
             return finished(Err(rs.fail(RunError::Aborted)));
         }
         msg @ (Inbound::StreamChunk { .. } | Inbound::StreamEnd { .. }) => {
@@ -2089,7 +2089,7 @@ pub(super) fn build_output_and_maybe_grace(
                 Err(e) => {
                     // Fall back to hold mode: the Result (without the
                     // pending flag) goes out after grace completes.
-                    eprintln!("[iso4-v8] early Result send failed ({e}); holding");
+                    crate::log!("[iso4-v8] early Result send failed ({e}); holding");
                     false
                 }
             }

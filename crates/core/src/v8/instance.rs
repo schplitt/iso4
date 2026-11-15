@@ -173,7 +173,7 @@ pub fn send_completion(link: &dyn HostLink, run_id: u32, msg: Outbound) {
     };
     let outcome = match link.send(Addr::Run(run_id), msg) {
         Err(LinkError::TooLarge(detail)) if report_status.is_none() => {
-            eprintln!(
+            crate::log!(
                 "[iso4-v8] Result for run {run_id} too large to send ({detail}) — \
                  replacing it with ERR_INTERNAL"
             );
@@ -190,7 +190,7 @@ pub fn send_completion(link: &dyn HostLink, run_id: u32, msg: Outbound) {
             link.send(Addr::Run(run_id), Outbound::Result { completion })
         }
         Err(LinkError::TooLarge(detail)) => {
-            eprintln!(
+            crate::log!(
                 "[iso4-v8] RunComplete for run {run_id} too large to send ({detail}) — \
                  substituting a minimal report"
             );
@@ -214,7 +214,7 @@ pub fn send_completion(link: &dyn HostLink, run_id: u32, msg: Outbound) {
         other => other,
     };
     if let Err(e) = outcome {
-        eprintln!("[iso4-v8] failed to send completion for run {run_id}: {e}");
+        crate::log!("[iso4-v8] failed to send completion for run {run_id}: {e}");
     }
 }
 
@@ -555,9 +555,9 @@ pub fn serve_instance(
                     // FIFO + the demux's job-before-frames order make this
                     // LATE by construction: the run concluded while the
                     // event sat in the queue. Discard like the demux's own
-                    // late-frame rule — but loudly (silence hid #170).
+                    // late-frame rule, but loudly.
                     match &event {
-                        RunEvent::Host(msg) => eprintln!(
+                        RunEvent::Host(msg) => crate::log!(
                             "[iso4-v8] discarding late {msg} (run already concluded)"
                         ),
                         RunEvent::Job(_) | RunEvent::Retire => {}

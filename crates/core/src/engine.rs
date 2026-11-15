@@ -14,7 +14,7 @@ use crate::v8 as sandbox;
 use crate::warm;
 
 /// Per-run trace lines (`Run`/`PrefixRun` received / succeeded / failed) are
-/// off by default: two unbuffered `eprintln!`s cost 2-4 % of a hot
+/// off by default: two stderr lines per run cost 2-4 % of a hot
 /// `prefix.call()`. `ISO4_V8_TRACE=1` turns them on.
 #[doc(hidden)]
 pub fn trace_enabled() -> bool {
@@ -27,13 +27,13 @@ pub fn trace_enabled() -> bool {
     })
 }
 
-/// `eprintln!` gated on [`trace_enabled`]; arguments are only evaluated when
+/// [`log!`](crate::log!) gated on [`trace_enabled`]; arguments are only evaluated when
 /// tracing is on.
 #[macro_export]
 macro_rules! trace {
     ($($arg:tt)*) => {
         if $crate::engine::trace_enabled() {
-            eprintln!($($arg)*);
+            $crate::log!($($arg)*);
         }
     };
 }
@@ -125,7 +125,7 @@ impl RunHandle {
         {
             if let Some(ctl) = self.ctl.get() {
                 if ctl.abort_executing(self.token) {
-                    eprintln!(
+                    crate::log!(
                         "[iso4-v8] hard Terminate for run {} landed mid-turn — terminating",
                         self.run_id
                     );
@@ -182,7 +182,7 @@ impl Engine {
             .iter()
             .filter_map(|g| g.bridge_stub_name().map(str::to_string))
             .collect();
-        eprintln!(
+        crate::log!(
             "[iso4-v8] prefix stored — prefix_id={prefix_id} \
              ({} source bytes, {} declared globals, {} declared imports)",
             code.len(),
@@ -217,7 +217,7 @@ impl Engine {
             self.warm.dispose_prefix(prefix_id);
             existed
         };
-        eprintln!("[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})");
+        crate::log!("[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})");
     }
 
     pub fn stats(&self) -> warm::RegistryStats {
@@ -314,7 +314,7 @@ impl Engine {
                 );
             });
         if let Err(e) = spawned {
-            eprintln!("[iso4-v8] failed to spawn one-off worker: {e}");
+            crate::log!("[iso4-v8] failed to spawn one-off worker: {e}");
             // Never ran: no shape to learn from.
             self.warm.release_oneoff(true, 0.0, 0.0);
             return Err(Refusal::Internal(format!(
@@ -348,7 +348,7 @@ impl Engine {
         let prefix_data = match entry {
             Some(Ok(data)) => data,
             Some(Err(cause)) => {
-                eprintln!(
+                crate::log!(
                     "[iso4-v8] PrefixRun {run_id} — ERR_PREFIX_BROKEN: prefix_id={} cold start \
                      failed with {}: {}",
                     req.prefix_id, cause.code, cause.message
@@ -359,7 +359,7 @@ impl Engine {
                 });
             }
             None => {
-                eprintln!(
+                crate::log!(
                     "[iso4-v8] PrefixRun {} — prefix_id={} not found",
                     run_id, req.prefix_id
                 );
@@ -380,7 +380,7 @@ impl Engine {
         });
         if let Some(error) = violation {
             let payload = error.to_payload();
-            eprintln!(
+            crate::log!(
                 "[iso4-v8] PrefixRun {run_id} — {}: {}",
                 payload.code, payload.message
             );
@@ -420,7 +420,7 @@ impl Engine {
             warm::Acquired::Cold(handle) => Taken::Cold(handle),
             warm::Acquired::Refused(refusal) => return Err(Refusal::Capacity(refusal)),
             warm::Acquired::SpawnFailed(e) => {
-                eprintln!("[iso4-v8] PrefixRun {run_id} — failed to spawn instance thread: {e}");
+                crate::log!("[iso4-v8] PrefixRun {run_id} — failed to spawn instance thread: {e}");
                 return Err(Refusal::Internal(format!(
                     "failed to spawn instance thread: {e}"
                 )));
@@ -466,7 +466,7 @@ impl Engine {
                                 fields: None,
                                 ..raw
                             };
-                            eprintln!(
+                            crate::log!(
                                 "[iso4-v8] prefix_id={prefix_id} marked broken: cold start \
                                  failed with {}: {}",
                                 cause.code, cause.message
@@ -544,7 +544,7 @@ impl Engine {
         if let Err(e) = msgs_tx.send(msg) {
             // The instance thread died before accepting the job: finish it
             // here, which releases and answers on the caller's link.
-            eprintln!("[iso4-v8] PrefixRun {run_id} — instance thread dead before dispatch");
+            crate::log!("[iso4-v8] PrefixRun {run_id} — instance thread dead before dispatch");
             if let sandbox::RunEvent::Job(mut job) = e.0.event {
                 let link = job.io.link();
                 sandbox::finish_job(&mut job, link, warm::dead_instance_outcome());

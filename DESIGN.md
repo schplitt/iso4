@@ -3429,7 +3429,7 @@ then moves into the section it belongs to.
 
 **Implementation rules.**
 
-- The child never panics on a log write. Children get a non-panicking stderr writer in the first child PR; the readiness line goes to a separate pipe.
+- The child never panics on a log write: every log line goes through `iso4_core::log!`, which drops or cuts short a line stderr cannot take (the fatal OOM line has its own allocation-free write). The readiness line goes to a separate pipe.
 - The handshake carries a role. `Authenticate{ role: node | supervisor, connectionId, incarnation? }`; the supervisor role skips the V8 serialization probe and unlocks the supervisor-only frames.
 - Committed total, full, and the park, defined. Committed = the sum of heap caps of live isolates, an uncapped run at the default cap. Full = a new isolate is needed and `instances >= maxInstances`; join semantics (sharing a busy instance) stay. Park = one `--tick-ms`. Before the first `Grant` a child uses `--grant-bytes` and `--grant-instances` from argv; `--admission-line-bytes` goes.
 - The heap cap is set at prepare and not per call. `Precompile` carries it; `PrefixRun` carries the other limits (cpu, wall, bridge) only; one-off `Run` keeps its cap.
