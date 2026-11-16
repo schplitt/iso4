@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicUsize};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,12 +27,12 @@ use crate::v8::exceptions::{
 use crate::v8::globals::install_value_globals;
 use crate::v8::guard::{GuardTarget, InstanceGuard};
 use crate::v8::isolate::{
-    BUDGET_ALLOC_VTABLE, BudgetAllocState, LogBuffers, NearHeapData, ReasonCell, TerminationReason,
-    deny_wasm_codegen, elapsed_ms, heap_used, install_dynamic_import, near_heap_limit_cb,
+    LogBuffers, NearHeapData, ReasonCell, TerminationReason, elapsed_ms, heap_check, heap_used,
+    new_capped_isolate,
 };
 use crate::v8::modules::{
-    ResolverContext, extract_module_exports, host_import_meta_callback, install_resolver,
-    module_resolver_callback, take_resolver,
+    ResolverContext, extract_module_exports, install_resolver, module_resolver_callback,
+    take_resolver,
 };
 use crate::v8::oom_label::{OomRecord, OomRun, OomRunLabel};
 use crate::v8::runtable::{
@@ -396,81 +396,15 @@ fn run_module_inner(
     // ArrayBuffer allocator (which is registered in CreateParams, before the
     // isolate exists).
     let reason = Arc::new(ReasonCell::new());
-    // Declared before the isolate so it drops after it.
+    // Declared before the isolate so they drop after it.
     let oom = OomRecord::new(OomRunLabel {
         prefix_id: None,
         run: epilogue.map_or(OomRun::None, |e| OomRun::Run(e.run_id)),
     });
+    let near_heap = NearHeapData::new(&reason, limits.hard_memory_mb);
 
-    // ── ArrayBuffer budget allocator ──────────────────────────────────────────
-    // Built before the isolate so we can pass it into CreateParams.
-    // The IsolateHandle is set on the state right after Isolate::new returns.
-    let alloc_state: Option<Arc<BudgetAllocState>> = if limits.hard_memory_mb > 0 {
-        Some(Arc::new(BudgetAllocState {
-            used: AtomicUsize::new(0),
-            budget: limits.hard_memory_mb as usize * 1024 * 1024,
-            handle: OnceLock::new(),
-            reason: Arc::clone(&reason),
-        }))
-    } else {
-        None
-    };
-
-    let mut isolate = {
-        let params = crate::snapshot::create_params();
-        // Cap the V8 heap (strings, plain objects). The near-heap callback
-        // converts a heap-OOM into a clean terminate_execution().
-        let params = if limits.hard_memory_mb > 0 {
-            params.heap_limits(0, limits.hard_memory_mb as usize * 1024 * 1024)
-        } else {
-            params
-        };
-        // Plug in the custom allocator to track ArrayBuffer/TypedArray memory.
-        let params = match &alloc_state {
-            Some(state) => {
-                // Arc::into_raw gives the allocator its own reference count.
-                // budget_alloc_drop reconstructs and drops it when V8 disposes.
-                let raw = Arc::into_raw(Arc::clone(state));
-                unsafe {
-                    params.array_buffer_allocator(v8::new_rust_allocator(raw, &BUDGET_ALLOC_VTABLE))
-                }
-            }
-            None => params,
-        };
-        v8::Isolate::new(params)
-    };
-
-    // Wire the IsolateHandle into the allocator state now that the isolate
-    // exists.  Allocations made before this point (during isolate init) would
-    // have no handle to terminate, but none of those are user-code allocations.
-    if let Some(state) = &alloc_state {
-        state.handle.set(isolate.thread_safe_handle()).ok();
-    }
-    // V8's default assumes it owns the machine and collects lazily; wrong for
-    // a container full of isolates (workerd flips the same switch).
-    isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
-    // SAFETY: `oom` is declared before the isolate, so it drops after it.
-    unsafe { crate::set_oom_error_handler(&mut isolate, &oom) };
-
-    // Explicit policy: microtasks only drain when we call
-    // perform_microtask_checkpoint() in the poll loop.  This gives us
-    // deterministic control and prevents microtasks from firing during
-    // export extraction (D9 hardening).
-    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-
-    // `Atomics.wait` throws: a blocking timed sleep on the isolate thread is
-    // a DoS primitive and a timing building block, and with no shared memory
-    // (SharedArrayBuffer is removed by the web runtime) it has no legitimate
-    // caller. Matches workerd (SetAllowAtomicsWait(false)) and browser main
-    // threads.
-    isolate.set_allow_atomics_wait(false);
-    isolate.set_allow_wasm_code_generation_callback(deny_wasm_codegen);
-
-    // Host modules receive their natively-built values through import.meta
-    // (see `build_host_module`); the callback consults the resolver context to
-    // find the values array staged for the module being initialised.
-    isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
-    install_dynamic_import(&mut isolate, &reason);
+    let (mut isolate, _alloc_state) =
+        new_capped_isolate(limits.hard_memory_mb, &reason, &oom, &near_heap);
 
     // ── The limit guard ──────────────────────────────────────────────────
     // The instance's watchdog registration (#145) — a one-off run IS an
@@ -481,7 +415,7 @@ fn run_module_inner(
     // per-call guard threads covered it.
     let handle = isolate.thread_safe_handle();
     let cancel_handle = handle.clone(); // for cancel_terminate_execution on success
-    let guard = InstanceGuard::new(handle.clone(), Arc::clone(&reason));
+    let guard = InstanceGuard::new(handle, Arc::clone(&reason));
     if let Some(slot) = &ctl_slot {
         slot.set(guard.ctl()).ok();
     }
@@ -497,22 +431,6 @@ fn run_module_inner(
         token,
     );
 
-    // ── Near-heap callback (V8 heap objects: strings, plain objects) ──────────
-    // Complements the ArrayBuffer allocator above.  Together they cover all
-    // memory sources.  The Box must outlive active JS execution; safe because
-    // V8 never invokes near-heap callbacks during Isolate::Dispose().
-    let _near_heap: Option<Box<NearHeapData>> = if limits.hard_memory_mb > 0 {
-        let data = Box::new(NearHeapData {
-            handle,
-            reason: Arc::clone(&reason),
-        });
-        let raw = &*data as *const NearHeapData as *mut std::ffi::c_void;
-        isolate.add_near_heap_limit_callback(near_heap_limit_cb, raw);
-        Some(data)
-    } else {
-        drop(handle);
-        None
-    };
     // cpu_budget.enter() is called immediately before module.evaluate() so
     // compilation and scope setup time is not charged against the CPU budget.
 
@@ -539,7 +457,7 @@ fn run_module_inner(
     // One-off runs keep the slot table as a run-local: the context (and any
     // stub Function sandbox code stashed) dies with the isolate right after.
     let mut stub_slots = StubSlots::new();
-    let result = run_call_phase(
+    let (result, _) = run_call_phase(
         &mut isolate,
         &context_global,
         RunEntry::Module { code, filename },
@@ -762,6 +680,8 @@ pub(super) struct RunState {
     pub(super) parked_at: std::time::Instant,
     /// Set while a turn for this run executes on the thread.
     pub(super) turn_entered: Option<std::time::Instant>,
+    /// The end-of-turn heap reading of the turn that finished the run.
+    pub(super) finish_heap: Option<u64>,
 }
 
 /// Post-Result bookkeeping: the `waitUntil` grace part (the dissolved
@@ -976,7 +896,7 @@ fn run_call_phase(
     stub_slots: &mut StubSlots,
     guard: &InstanceGuard,
     mut ctx: CallPhaseCtx<'_>,
-) -> Result<Output, FailureOutput> {
+) -> (Result<Output, FailureOutput>, Option<u64>) {
     let (mut rs, start_outcome) = begin_call(
         isolate,
         context,
@@ -1052,17 +972,18 @@ fn run_call_phase(
 }
 
 /// Stamp the counted logic time onto a concluding single-run result (the
-/// instance loop's counterpart is in `conclude_run`).
+/// instance loop's counterpart is in `conclude_run`), paired with the
+/// finishing turn's heap reading.
 fn stamp_wall(
     rs: &RunState,
     mut result: Result<Output, FailureOutput>,
-) -> Result<Output, FailureOutput> {
+) -> (Result<Output, FailureOutput>, Option<u64>) {
     let wall = counted_wall_ms(rs);
     match &mut result {
         Ok(output) => output.wall_time_ms = wall,
         Err(f) => f.wall_time_ms = wall,
     }
-    result
+    (result, rs.finish_heap)
 }
 
 /// Build the run's state and execute its start turn: install this call's
@@ -1111,6 +1032,7 @@ pub(super) fn begin_call(
         counted: Duration::ZERO,
         parked_at: ctx.start,
         turn_entered: Some(ctx.start),
+        finish_heap: None,
     };
     let start_outcome = start_turn(
         isolate,
@@ -1123,6 +1045,8 @@ pub(super) fn begin_call(
     );
     rs.cpu_budget.leave();
     guard.clear();
+    // After the guard is down: a late fire cannot race the memory verdict.
+    let start_outcome = end_turn(isolate, &facts, &mut rs, start_outcome);
     leave_turn(&mut rs);
     (rs, start_outcome)
 }
@@ -1136,17 +1060,53 @@ pub(super) fn handle_loop_event(
     event: LoopEvent,
 ) -> Option<Result<Output, FailureOutput>> {
     match event {
-        LoopEvent::Host(msg) => match frame_turn(isolate, context, facts, rs, msg) {
-            ScanOutcome::Finished(result) => Some(*result),
-            ScanOutcome::Continue => None,
-        },
+        LoopEvent::Host(msg) => {
+            let outcome = frame_turn(isolate, context, facts, rs, msg);
+            match end_turn(isolate, facts, rs, outcome) {
+                ScanOutcome::Finished(result) => Some(*result),
+                ScanOutcome::Continue => None,
+            }
+        }
         LoopEvent::DeadlineHit => deadline_hit(isolate, context, facts, rs),
         LoopEvent::SourceClosed(e) => {
             if matches!(rs.phase, RunPhase::Grace(_)) && out_streams_open(rs) {
                 conn_lost_stream_turn(isolate, context, facts, rs);
+                if let ScanOutcome::Finished(result) =
+                    end_turn(isolate, facts, rs, ScanOutcome::Continue)
+                {
+                    return Some(*result);
+                }
             }
             Some(boundary_close(rs, e))
         }
+    }
+}
+
+/// End of a turn: a capped heap left over its line fails the turn's run and
+/// taints the instance (V8 never size-checks a young large object).
+pub(super) fn end_turn(
+    isolate: &mut v8::Isolate,
+    facts: &RunFacts<'_>,
+    rs: &mut RunState,
+    outcome: ScanOutcome,
+) -> ScanOutcome {
+    if facts.reason.get().is_some() {
+        return outcome;
+    }
+    let Some((used, over)) = heap_check(isolate, facts.reason) else {
+        return outcome;
+    };
+    if !over {
+        rs.finish_heap = matches!(outcome, ScanOutcome::Finished(_)).then_some(used);
+        return outcome;
+    }
+    facts.reason.set(TerminationReason::Memory);
+    rs.finish_heap = Some(used);
+    match (&rs.phase, outcome) {
+        // The Result already went out: end the tail the way a guard kill does.
+        (RunPhase::Grace(_), ScanOutcome::Continue) => finished(Ok(finish_killed_grace(facts, rs))),
+        (RunPhase::Grace(_), done) => done,
+        _ => finished(Err(rs.fail(RunError::MemoryLimit))),
     }
 }
 
@@ -1165,6 +1125,7 @@ fn deadline_hit(
             // The wait ended at the timer's due instant, not its late fire.
             enter_turn(rs, due);
             let outcome = timer_turn(isolate, context, facts, rs);
+            let outcome = end_turn(isolate, facts, rs, outcome);
             leave_turn(rs);
             match outcome {
                 ScanOutcome::Finished(result) => return Some(*result),
@@ -1179,6 +1140,7 @@ fn deadline_hit(
             if let Some(d) = out_idle_deadline(rs).filter(|d| *d <= now) {
                 enter_turn(rs, d);
                 let outcome = stream_idle_turn(isolate, context, facts, rs);
+                let outcome = end_turn(isolate, facts, rs, outcome);
                 leave_turn(rs);
                 match outcome {
                     ScanOutcome::Finished(result) => return Some(*result),
@@ -2040,6 +2002,14 @@ pub(super) fn build_output_and_maybe_grace(
         return finished(Ok(output));
     }
 
+    // The Result goes out before this turn ends: check the heap now.
+    let heap = heap_check(scope, facts.reason);
+    if let Some((used, true)) = heap {
+        facts.reason.set(TerminationReason::Memory);
+        rs.finish_heap = Some(used);
+        return finished(Err(rs.fail(RunError::MemoryLimit)));
+    }
+
     // Freeze the run-phase telemetry for the early Result, and hand the
     // console buffers over to grace: lines from here on belong to the
     // grace report. The counted clock freezes with it — the rest of this
@@ -2066,10 +2036,9 @@ pub(super) fn build_output_and_maybe_grace(
 
     let early_result_sent = match (rs.epilogue, &rs.link) {
         (Some(spec), Some(link)) => {
-            let heap_used_bytes = spec.report_heap.then(|| {
-                let stats = scope.get_heap_statistics();
-                stats.used_heap_size() as u64
-            });
+            let heap_used_bytes = spec
+                .report_heap
+                .then(|| heap.map_or_else(|| heap_used(scope), |(used, _)| used));
             let completion =
                 types::RunCompletion::Success(types::RunSuccessPayload {
                     exports: output.exports.clone(),
@@ -2525,12 +2494,15 @@ pub fn run_call_on_core(
         let scope = &mut v8::ContextScope::new(scope, context);
         install_prefix_bridge_placeholders(scope, prefix_globals, imports)
     };
-    let mut result: Result<Output, FailureOutput> = match placeholder_result {
-        Err(error) => Err(failure(
-            termination_or(&core.reason, error),
-            &unsafe { &*logs_ptr }.borrow(),
-            start,
-        )),
+    let (mut result, finish_heap) = match placeholder_result {
+        Err(error) => (
+            Err(failure(
+                termination_or(&core.reason, error),
+                &unsafe { &*logs_ptr }.borrow(),
+                start,
+            )),
+            None,
+        ),
         Ok(()) => run_call_phase(
             &mut core.isolate,
             &core.context,
@@ -2614,7 +2586,7 @@ pub fn run_call_on_core(
     CallOutcome {
         result,
         tainted,
-        heap_used_bytes: heap_used(&mut core.isolate),
+        heap_used_bytes: finish_heap.unwrap_or_else(|| heap_used(&mut core.isolate)),
         prefix_failed: false,
     }
 }

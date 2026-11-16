@@ -165,16 +165,34 @@ impl ReasonCell {
     }
 }
 
-/// Heap data passed to [`near_heap_limit_cb`] as a raw pointer.
-///
-/// Lives on the heap for the duration of the run (see safety note on the
-/// callback). Declaring it after `isolate` in [`crate::v8::runloop::run_module`] means it drops
-/// before the isolate, which is safe because V8 never invokes near-heap
-/// callbacks during `Isolate::Dispose()`.
+/// Heap data passed to [`near_heap_limit_cb`] as a raw pointer. It must
+/// outlive the isolate: V8's teardown GC in `Isolate::Dispose()` can call it.
 pub(super) struct NearHeapData {
-    pub(super) handle: v8::IsolateHandle,
-    pub(super) reason: Arc<ReasonCell>,
+    /// Set once, right after the isolate exists.
+    handle: OnceLock<v8::IsolateHandle>,
+    reason: Arc<ReasonCell>,
+    hard_bytes: usize,
+    /// The isolate's one raise has been handed out.
+    raised: AtomicBool,
 }
+
+impl NearHeapData {
+    pub(super) fn new(reason: &Arc<ReasonCell>, hard_memory_mb: u32) -> Box<Self> {
+        Box::new(Self {
+            handle: OnceLock::new(),
+            reason: Arc::clone(reason),
+            hard_bytes: hard_memory_mb as usize * 1024 * 1024,
+            raised: AtomicBool::new(false),
+        })
+    }
+}
+
+/// A capped isolate's hard line in bytes, in an isolate slot.
+pub(super) struct HeapLine(u64);
+
+/// The old-generation limit granted during teardown. Far above any real heap,
+/// and small enough that V8's `MaxReserved()` sum cannot overflow.
+const TEARDOWN_HEAP_LIMIT: usize = 1 << 40;
 
 // ── ArrayBuffer budget allocator ─────────────────────────────────────────────
 //
@@ -268,22 +286,28 @@ pub(super) static BUDGET_ALLOC_VTABLE: v8::RustAllocatorVtable<BudgetAllocState>
 
 /// Near-heap-limit callback registered when `limits.hard_memory_mb > 0`.
 ///
+/// No raise makes V8 abort, so the first live call raises once; later ones do not.
+///
 /// # Safety
-/// `data` is a `*mut NearHeapData` kept alive in `run_module` for the
-/// duration of active JS execution. This callback only fires during V8 GC,
-/// which only occurs during `module.evaluate()` /
-/// `perform_microtask_checkpoint()` — never during `Isolate::Dispose()`.
+/// `data` is a `*mut NearHeapData` that outlives the isolate, teardown included.
 pub(super) extern "C" fn near_heap_limit_cb(
     data: *mut std::ffi::c_void,
     current_heap_limit: usize,
     _initial_heap_limit: usize,
 ) -> usize {
     let d = unsafe { &*(data as *const NearHeapData) };
+    // The reason goes first, as at every kill; at teardown nothing reads it.
     d.reason.set(TerminationReason::Memory);
-    d.handle.terminate_execution();
-    // Return a larger limit so V8 has headroom to unwind the stack cleanly
-    // after terminate_execution() without immediately crashing the process.
-    current_heap_limit + 32 * 1024 * 1024
+    // rusty_v8 nulls the handle before Dispose(): false means teardown.
+    if !d.handle.get().is_some_and(|h| h.terminate_execution()) {
+        return current_heap_limit.max(TEARDOWN_HEAP_LIMIT);
+    }
+    if d.raised.swap(true, Ordering::Relaxed) {
+        return current_heap_limit;
+    }
+    current_heap_limit
+        .saturating_add(32 * 1024 * 1024)
+        .max(2 * d.hard_bytes)
 }
 
 /// Wasm is removed from the sandbox for now (DESIGN §7.5): the global is
@@ -456,9 +480,9 @@ pub struct InstanceCore {
     /// per instance, not per call.
     #[allow(dead_code)]
     alloc_state: Option<Arc<BudgetAllocState>>,
-    /// Owns the near-heap callback's data for the isolate's lifetime.
+    /// The near-heap callback's data; declared after `isolate` so it drops after it.
     #[allow(dead_code)]
-    near_heap: Option<Box<NearHeapData>>,
+    near_heap: Box<NearHeapData>,
     /// Bridge-stub identity slots (see [`super::bridge::StubSlot`]): the pointees of every
     /// stub `Function` ever created in this context. Per-run bindings live
     /// in the run table; these Boxes only carry the name + table pointer.
@@ -478,20 +502,13 @@ pub struct InstanceCore {
 /// near-heap callback wired to `reason` — the CreateParams dance shared by
 /// `run_module_inner`-style one-off setup, warm instance creation, and
 /// `prepare()` validation. `hard_memory_mb == 0` means uncapped.
-///
-/// The isolate is told memory is under moderate pressure for its whole life
-/// (workerd's posture): V8's default assumes it owns the machine and collects
-/// lazily, which is wrong in a container packed with isolates and would leave
-/// the soft line reading garbage instead of live data.
-fn new_capped_isolate(
+/// The caller keeps `near_heap` alive past the isolate.
+pub(super) fn new_capped_isolate(
     hard_memory_mb: u32,
     reason: &Arc<ReasonCell>,
     oom: &OomRecord,
-) -> (
-    v8::OwnedIsolate,
-    Option<Arc<BudgetAllocState>>,
-    Option<Box<NearHeapData>>,
-) {
+    near_heap: &NearHeapData,
+) -> (v8::OwnedIsolate, Option<Arc<BudgetAllocState>>) {
     let alloc_state: Option<Arc<BudgetAllocState>> = if hard_memory_mb > 0 {
         Some(Arc::new(BudgetAllocState {
             used: AtomicUsize::new(0),
@@ -524,8 +541,8 @@ fn new_capped_isolate(
     if let Some(state) = &alloc_state {
         state.handle.set(isolate.thread_safe_handle()).ok();
     }
-    // V8's default assumes it owns the machine and collects lazily; wrong for
-    // a container full of isolates (workerd flips the same switch).
+    // Sent once at creation (workerd does too); in this V8 it starts one
+    // memory-reducing incremental marking, and the level does not persist.
     isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
     // SAFETY: `oom` outlives the isolate: declared before it as a local, after it
     // as an InstanceCore field.
@@ -533,23 +550,19 @@ fn new_capped_isolate(
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
     install_dynamic_import(&mut isolate, reason);
-    // Same rationale as the one-off path: no blocking Atomics.wait, ever.
+    // Atomics.wait throws: a blocking sleep here is a DoS primitive.
     isolate.set_allow_atomics_wait(false);
     isolate.set_allow_wasm_code_generation_callback(deny_wasm_codegen);
 
-    let near_heap: Option<Box<NearHeapData>> = if hard_memory_mb > 0 {
-        let data = Box::new(NearHeapData {
-            handle: isolate.thread_safe_handle(),
-            reason: Arc::clone(reason),
-        });
-        let raw = &*data as *const NearHeapData as *mut std::ffi::c_void;
+    if hard_memory_mb > 0 {
+        isolate.set_slot(HeapLine(u64::from(hard_memory_mb) << 20));
+        near_heap.handle.set(isolate.thread_safe_handle()).ok();
+        // SAFETY: `near_heap` outlives the isolate, like `oom`.
+        let raw = near_heap as *const NearHeapData as *mut c_void;
         isolate.add_near_heap_limit_callback(near_heap_limit_cb, raw);
-        Some(data)
-    } else {
-        None
-    };
+    }
 
-    (isolate, alloc_state, near_heap)
+    (isolate, alloc_state)
 }
 
 /// Classify a warm-up failure: a memory-cap blow keeps its own code (the
@@ -605,7 +618,8 @@ pub fn create_instance_core(
     let run_table = RunTable::boxed();
     let reason = Arc::new(ReasonCell::new());
     let oom = OomRecord::new(oom);
-    let (mut isolate, alloc_state, near_heap) = new_capped_isolate(hard_memory_mb, &reason, &oom);
+    let near_heap = NearHeapData::new(&reason, hard_memory_mb);
+    let (mut isolate, alloc_state) = new_capped_isolate(hard_memory_mb, &reason, &oom, &near_heap);
 
     let handle = isolate.thread_safe_handle();
     let warmup_budget = Arc::new(CpuBudget::new());
@@ -642,6 +656,10 @@ pub fn create_instance_core(
     // target lock: after this line, a fire that won the race has already
     // set the reason cell, so the verdict below observes it — no join.
     guard.clear();
+    // A prefix that ends evaluation over the line fails like a callback blow-out.
+    if reason.get().is_none() && heap_check(&mut isolate, &reason).is_some_and(|(_, over)| over) {
+        reason.set(TerminationReason::Memory);
+    }
 
     match setup {
         // A guard that fired *after* evaluation completed still taints: the
@@ -704,8 +722,26 @@ pub(crate) fn idle_settle_after() -> Option<Duration> {
     }
 }
 
-pub(super) fn heap_used(isolate: &mut v8::OwnedIsolate) -> u64 {
+pub(super) fn heap_used(isolate: &mut v8::Isolate) -> u64 {
     isolate.get_heap_statistics().used_heap_size() as u64
+}
+
+/// `used_heap_size` after JS and whether its run fails (`None`: uncapped).
+/// Over the line, V8's low-memory collection decides, so garbage passes.
+pub(super) fn heap_check(isolate: &mut v8::Isolate, reason: &ReasonCell) -> Option<(u64, bool)> {
+    let line = isolate.get_slot::<HeapLine>()?.0;
+    let used = heap_used(isolate);
+    if used <= line {
+        return Some((used, false));
+    }
+    // Collecting promotes live young objects to the old generation; past 1.5
+    // lines the callback's one raise (2 lines) might not hold them: V8 aborts.
+    if used > line + line / 2 {
+        return Some((used, true));
+    }
+    isolate.low_memory_notification();
+    let used = heap_used(isolate);
+    Some((used, reason.get().is_some() || used > line))
 }
 
 /// One full collection when an instance goes idle — V8's own memory reducer
@@ -772,6 +808,207 @@ mod tests {
             matches!(err, RunError::MemoryLimit),
             "expected MemoryLimit, got {err:?}"
         );
+    }
+
+    /// Doubles a 1 MB one-byte string to `MB` MB as a cons string, flattens
+    /// it and keeps it alive.
+    const FLATTEN: &str = "let s = 'x'.repeat(1024 * 1024);\n\
+        while (s.length < MB * 1024 * 1024) s = s + s;\n\
+        s.charCodeAt(s.length - 1);\n\
+        globalThis.keep = s;";
+
+    fn capped(mb: u32) -> Limits {
+        Limits {
+            hard_memory_mb: mb,
+            wall_time_ms: 10_000,
+            cpu_time_ms: 10_000,
+            ..Default::default()
+        }
+    }
+
+    fn call_on(core: &mut InstanceCore, name: &str) -> CallOutcome {
+        run_call_on_core(
+            core,
+            &[],
+            Limits::default(),
+            &[],
+            &[],
+            RunIo::None,
+            Arc::new(AtomicU32::new(0)),
+            &call_spec(name, &[]),
+        )
+    }
+
+    /// 64 MB at a 32 MB cap fails without collecting; the isolate drops over
+    /// its limit, and the teardown callback must find its data alive.
+    #[test]
+    fn a_flatten_at_the_cap_survives_isolate_teardown() {
+        let code = format!("{}\nexport default s.length", FLATTEN.replace("MB", "64"));
+        let err = run_code(&code, "<test>", capped(32))
+            .map(|_| ())
+            .map_err(|f| f.error);
+        assert!(matches!(err, Err(RunError::MemoryLimit)), "got {err:?}");
+
+        // The warm-up error path drops the isolate the same way; over the
+        // line, the memory verdict wins over the prefix's own throw.
+        init_platform();
+        let code = format!("{}\nthrow new Error('boom')", FLATTEN.replace("MB", "64"));
+        let prefix = PrefixSpec {
+            code: &code,
+            filename: "<prefix>",
+            globals: &[],
+        };
+        let err = create_instance_core(prefix, &[], 32, crate::v8::OomRunLabel::NONE)
+            .map(|_| ())
+            .map_err(|f| f.error);
+        assert!(matches!(err, Err(RunError::MemoryLimit)), "got {err:?}");
+    }
+
+    /// Used to abort at the next GC; now the flatten's own call fails
+    /// (64 MB at a 32 MB cap: no collection).
+    #[test]
+    fn a_flatten_past_the_cap_ends_its_own_call_not_the_process() {
+        init_platform();
+        let code = format!(
+            "export function flatten() {{ {} return s.length }}",
+            FLATTEN.replace("MB", "64")
+        );
+        let prefix = PrefixSpec {
+            code: &code,
+            filename: "<prefix>",
+            globals: &[],
+        };
+        let mut core = create_instance_core(prefix, &[], 32, crate::v8::OomRunLabel::NONE)
+            .expect("prefix warms up");
+        let flatten = call_on(&mut core, "flatten");
+        assert!(flatten.tainted);
+        let err = flatten.result.map(|_| ()).map_err(|f| f.error);
+        assert!(matches!(err, Err(RunError::MemoryLimit)), "got {err:?}");
+        drop(core);
+
+        let after = run_code("export default 1 + 1", "<test>", Limits::default());
+        assert!(after.is_ok(), "the process keeps serving");
+    }
+
+    /// The check runs at the end of every turn (64 MB at 32 MB: no collection).
+    #[test]
+    fn a_later_turn_over_the_cap_fails_the_run() {
+        init_platform();
+        let code = format!(
+            "export async function late() {{\n\
+                 await new Promise((r) => setTimeout(r, 1));\n{}\nreturn s.length\n}}",
+            FLATTEN.replace("MB", "64")
+        );
+        let prefix = PrefixSpec {
+            code: &code,
+            filename: "<prefix>",
+            globals: &[],
+        };
+        let mut core = create_instance_core(prefix, &[], 32, crate::v8::OomRunLabel::NONE)
+            .expect("prefix warms up");
+        let out = call_on(&mut core, "late");
+        assert!(out.tainted);
+        let err = out.result.map(|_| ()).map_err(|f| f.error);
+        assert!(matches!(err, Err(RunError::MemoryLimit)), "got {err:?}");
+    }
+
+    /// 40 MB live at a 32 MB cap: the collection fires the callback, the run
+    /// fails, and the process lives.
+    #[test]
+    fn live_data_over_the_cap_fails_after_the_collection() {
+        init_platform();
+        let prefix = PrefixSpec {
+            code: "export function grow() {\n\
+                       let s = 'x'.repeat(5 * 1024 * 1024)\n\
+                       while (s.length < 40 * 1024 * 1024) s = s + s\n\
+                       s.charCodeAt(s.length - 1)\n\
+                       globalThis.keep = s\n\
+                       return s.length\n\
+                   }",
+            filename: "<prefix>",
+            globals: &[],
+        };
+        let mut core = create_instance_core(prefix, &[], 32, crate::v8::OomRunLabel::NONE)
+            .expect("prefix warms up");
+        let out = call_on(&mut core, "grow");
+        assert!(out.tainted);
+        let err = out.result.map(|_| ()).map_err(|f| f.error);
+        assert!(matches!(err, Err(RunError::MemoryLimit)), "got {err:?}");
+        drop(core);
+
+        let after = run_code("export default 1 + 1", "<test>", Limits::default());
+        assert!(after.is_ok(), "the process keeps serving");
+    }
+
+    /// About 98 MB dropped plus a 48 MB string end over a 128 MB line; the
+    /// check's collection clears them, so garbage does not fail a run.
+    #[test]
+    fn garbage_over_the_cap_is_collected_not_failed() {
+        init_platform();
+        let prefix = PrefixSpec {
+            code: "export const ready = true",
+            filename: "<prefix>",
+            globals: &[],
+        };
+        let mut core = create_instance_core(prefix, &[], 128, crate::v8::OomRunLabel::NONE)
+            .expect("prefix warms up");
+        {
+            v8::scope!(let scope, &mut core.isolate);
+            let context = v8::Local::new(scope, &core.context);
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let src = "let junk = []\n\
+                for (let i = 0; i < 1250; i++) junk.push(new Array(10000).fill(i))\n\
+                junk = null\n\
+                let t = 'y'.repeat(3 * 1024 * 1024)\n\
+                while (t.length < 48 * 1024 * 1024) t = t + t\n\
+                t.charCodeAt(t.length - 1)";
+            let src = v8::String::new(scope, src).unwrap();
+            v8::Script::compile(scope, src, None)
+                .unwrap()
+                .run(scope)
+                .unwrap();
+        }
+        let line = 128 << 20;
+        let before = heap_used(&mut core.isolate);
+        assert!(before > line, "the setup must end over the line: {before}");
+        let (after, over) = heap_check(&mut core.isolate, &core.reason).unwrap();
+        assert!(!over && after <= line, "{before} -> {after}");
+        assert!(core.reason.get().is_none());
+    }
+
+    /// A run with waitUntil work is checked before its early Result leaves
+    /// (64 MB at a 32 MB cap: no collection).
+    #[test]
+    fn a_run_over_the_cap_fails_before_its_early_result() {
+        let code = format!(
+            "waitUntil(new Promise(() => {{}}))\n{}\nexport default s.length",
+            FLATTEN.replace("MB", "64")
+        );
+        let limits = Limits {
+            grace_ms: 1_000,
+            ..capped(32)
+        };
+        let err = run_code(&code, "<test>", limits)
+            .map(|_| ())
+            .map_err(|f| f.error);
+        assert!(matches!(err, Err(RunError::MemoryLimit)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_near_heap_callback_raises_once_then_lets_teardown_through() {
+        init_platform();
+        const MIB: usize = 1024 * 1024;
+        let reason = Arc::new(ReasonCell::new());
+        let oom = OomRecord::new(crate::v8::OomRunLabel::NONE);
+        let data = NearHeapData::new(&reason, 128);
+        let raw = &*data as *const NearHeapData as *mut c_void;
+        let (isolate, _alloc_state) = new_capped_isolate(128, &reason, &oom, &data);
+
+        assert_eq!(near_heap_limit_cb(raw, 116 * MIB, 116 * MIB), 256 * MIB);
+        assert!(matches!(reason.get(), Some(TerminationReason::Memory)));
+        assert_eq!(near_heap_limit_cb(raw, 256 * MIB, 116 * MIB), 256 * MIB);
+        drop(isolate);
+        assert!(near_heap_limit_cb(raw, 256 * MIB, 116 * MIB) > 256 * MIB);
     }
 
     // ── CPU budget excludes async wait time ───────────────────────────────
