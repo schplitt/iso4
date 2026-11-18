@@ -1,7 +1,8 @@
 //! What an isolate was executing when V8 aborts the process, and the fatal
 //! hook the embedder sets to report that death.
 
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// What an isolate is executing, for the fatal hook's benefit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,19 +113,16 @@ pub struct FatalInfo<'a> {
 /// death. It must not allocate or take locks.
 pub type FatalHook = fn(&FatalInfo<'_>);
 
-static FATAL_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+static FATAL_HOOK: OnceLock<FatalHook> = OnceLock::new();
 
-/// Sets the hook V8's out of memory and fatal error callbacks report to. Set
-/// it before anything starts V8 (`init_platform`): with no hook, core
-/// registers none of those callbacks and V8 prints its own messages.
-pub fn set_fatal_hook(hook: FatalHook) {
-    FATAL_HOOK.store(hook as *mut (), Ordering::Release);
+/// Set once by `Engine::start` (`EngineOptions::on_fatal`), before V8 starts:
+/// with no hook, core registers no fatal callbacks and V8 prints its own.
+pub(crate) fn set_fatal_hook(hook: FatalHook) {
+    let _ = FATAL_HOOK.set(hook);
 }
 
 pub(crate) fn fatal_hook() -> Option<FatalHook> {
-    let hook = FATAL_HOOK.load(Ordering::Acquire);
-    // SAFETY: only `set_fatal_hook` stores into it, always a `FatalHook`.
-    (!hook.is_null()).then(|| unsafe { std::mem::transmute::<*mut (), FatalHook>(hook) })
+    FATAL_HOOK.get().copied()
 }
 
 fn oom_info<'a>(

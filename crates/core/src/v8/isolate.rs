@@ -19,6 +19,17 @@ use crate::v8::{FailureOutput, RunError};
 
 static INIT: Once = Once::new();
 
+/// `EngineOptions::cores`, set once by `Engine::start`; unset = the machine's count.
+static CORES: OnceLock<std::num::NonZeroUsize> = OnceLock::new();
+
+pub(crate) fn set_cores(n: std::num::NonZeroUsize) {
+    let _ = CORES.set(n);
+}
+
+pub(crate) fn cores_option() -> Option<std::num::NonZeroUsize> {
+    CORES.get().copied()
+}
+
 #[derive(Default)]
 pub(crate) struct LogBuffers {
     pub(crate) stdout: Vec<String>,
@@ -36,7 +47,16 @@ pub(crate) struct LogBuffers {
 /// Initialize the V8 platform. Safe to call from multiple threads -
 /// `Once` ensures it runs exactly once per process.
 pub fn init_platform() {
+    init_platform_with(|| {});
+}
+
+/// Starts V8 after `settings` stores what the start reads; `false` when V8
+/// had already started, so `settings` did not run.
+pub(crate) fn init_platform_with(settings: impl FnOnce()) -> bool {
+    let mut ran = false;
     INIT.call_once(|| {
+        settings();
+        ran = true;
         // Before initialize: V8 can run out of memory before any isolate exists.
         crate::set_fatal_callbacks();
         // ICU data comes with the prebuilt V8, statically linked. Nothing to
@@ -46,6 +66,7 @@ pub fn init_platform() {
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
+    ran
 }
 
 // ── Limits ───────────────────────────────────────────────────────────────────
@@ -707,16 +728,20 @@ const IDLE_SETTLE_DEFAULT_SECS: u64 = 0;
 #[cfg(test)]
 const IDLE_SETTLE_DEFAULT_SECS: u64 = 1;
 
-static IDLE_SETTLE_SECS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(IDLE_SETTLE_DEFAULT_SECS);
+/// Set once by `Engine::start`; a lazy `init_platform` keeps the default.
+static IDLE_SETTLE_SECS: OnceLock<u64> = OnceLock::new();
 
-pub fn set_idle_settle_secs(secs: u64) {
-    IDLE_SETTLE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn set_idle_settle_secs(secs: u64) {
+    let _ = IDLE_SETTLE_SECS.set(secs);
 }
 
 /// How long an idle instance waits before settling, `None` when off.
 pub(crate) fn idle_settle_after() -> Option<Duration> {
-    match IDLE_SETTLE_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+    match IDLE_SETTLE_SECS
+        .get()
+        .copied()
+        .unwrap_or(IDLE_SETTLE_DEFAULT_SECS)
+    {
         0 => None,
         secs => Some(Duration::from_secs(secs)),
     }
