@@ -6,8 +6,9 @@ This is the only crate that knows the wire.
 ## What it does
 
 1. `main.rs` parses the flags (`--socket`, `--warm-budget-bytes`,
-   `--host-reserve-bytes`, `--idle-settle-secs`), prints one capacity line,
-   creates one `Engine`, and accepts connections.
+   `--host-reserve-bytes`, `--idle-settle-secs`, `--cores`, `--node-pid`),
+   writes the pid file, prints one capacity line, creates one `Engine`, and
+   accepts connections.
 2. `session.rs` runs each connection: the `Authenticate` handshake, then the
    demux loop. It is the only reader on the socket. It turns frames into
    engine requests and run messages, and the connection's `HostLink`
@@ -15,6 +16,7 @@ This is the only crate that knows the wire.
    runs never interleave.
 3. `ipc.rs` owns the frame envelope, the outbox, and the payload parsers;
    `wire.rs` owns the encoders for everything the engine sends back.
+4. `process.rs` writes the pid file and runs the `--node-pid` watch.
 
 The layout of every frame and payload is in `docs/protocol.md`. The
 TypeScript side is `packages/iso4-sandbox/src/ipc.ts`; the two must stay
@@ -40,6 +42,32 @@ crates/target/debug/iso4-v8 --socket /path/in/a/private/dir.sock
 
 The host hands the binary a fresh socket path inside a directory only it
 can read; access control is that directory, not a token.
+
+## Flags
+
+- `--socket <path>` (required): where to listen.
+- `--warm-budget-bytes`, `--host-reserve-bytes`, `--idle-settle-secs`: the
+  memory budget, the Node host's reserve, and the idle settle delay.
+- `--cores <n>` (n >= 1): use n in place of the machine's core count for the
+  V8 worker pool (n - 1 threads, at least 1, at most 16), the per-prefix
+  instance ceiling, and the cold-start slot allowance. Absent: the machine's
+  count.
+- `--node-pid <pid>`: check once a second whether that pid is gone (exited,
+  a zombie, or reused by another process) and exit when it is. A pid whose
+  details cannot be read counts as alive.
+
+A bad value for any flag logs one line and exits 1.
+
+## The pid file
+
+Before it binds the socket, the binary writes a file named `pid` into the
+directory that holds the socket: one line, `<pid> <start>\n`, its own pid
+and its start time as an opaque integer (Linux: field 22 of
+`/proc/<pid>/stat`; macOS: the BSD process start time in microseconds). It
+writes `pid.tmp` first and renames it. The directory must already exist, be
+writable, and be private to the host, like the socket. Any failure, including
+an unreadable own start time, is fatal: one line naming the cause and the
+path, then exit 1. Nothing removes the file on exit.
 
 ## Tests
 

@@ -18,5 +18,8 @@ iso4-types = { path = "../types" }
 # Lock-free channels between the demux thread and the connection's writer
 crossbeam-channel = "0.5"
 
+# kill(pid, 0) and proc_pidinfo for the Node pid watch
+libc = "0.2"
+
 [dev-dependencies]
 iso4-core = { path = "../core", features = ["test-support"] }

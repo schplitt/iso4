@@ -101,6 +101,7 @@ iso4/                              ← workspace root
     server/                        ← iso4-server (bin iso4-v8): the socket frontend for Node
       src/
         main.rs                    ← arg parsing, UDS accept loop
+        process.rs                 ← the pid file next to the socket, the --node-pid watch
         session.rs                 ← per-connection frame glue: handshake, demux, the connection's HostLink
         ipc.rs, wire.rs            ← frames, payload parsers and encoders
 ```

@@ -30,7 +30,7 @@
 //! instance may be evicted at any moment (taint, scored eviction, dispose).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -640,11 +640,26 @@ impl RegistryInner {
     }
 }
 
+/// The `--cores` value; 0 = not given, the machine's count applies.
+static CORES_FLAG: AtomicUsize = AtomicUsize::new(0);
+
+/// Replaces the machine's core count. Call before the V8 platform starts.
+pub fn set_cores(n: usize) {
+    CORES_FLAG.store(n, Ordering::Relaxed);
+}
+
+pub(crate) fn cores_flag() -> usize {
+    CORES_FLAG.load(Ordering::Relaxed)
+}
+
 /// The per-prefix instance ceiling: more instances than cores can never
 /// execute in parallel.
-fn cores() -> usize {
+pub fn cores() -> usize {
     static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CORES.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+    *CORES.get_or_init(|| match cores_flag() {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    })
 }
 
 impl WarmRegistry {
