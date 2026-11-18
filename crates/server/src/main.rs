@@ -4,6 +4,7 @@
 //! build plan.
 
 mod ipc;
+mod process;
 mod session;
 mod wire;
 
@@ -18,11 +19,19 @@ fn main() {
     // the Node host.
     oom::prefer_this_process_as_victim();
 
-    let (socket_path, warm_budget_bytes, host_reserve_bytes, idle_settle_secs) = parse_args();
+    let (socket_path, warm_budget_bytes, host_reserve_bytes, idle_settle_secs, cores, node_pid) =
+        parse_args();
 
     // Before any line is drawn: the admission line is derived from it.
     container::set_host_reserve_bytes(host_reserve_bytes);
     sandbox::set_idle_settle_secs(idle_settle_secs);
+    // Before the V8 platform starts (`blob::probe` below): it sizes its pool from this.
+    if let Some(n) = cores {
+        warm::set_cores(n);
+    }
+    if let Some(pid) = node_pid {
+        process::watch_node(pid);
+    }
 
     // A budget with no readable meter would silently never be enforced —
     // fail at startup instead (rationale: DESIGN.md §13.2.1).
@@ -48,6 +57,11 @@ fn main() {
     // arrives. The handshake in `session.rs` is then a byte comparison — no
     // isolate plumbing in the session layer, no per-connection cost.
     blob::probe();
+
+    if let Err(e) = process::write_pid_file(&socket_path) {
+        iso4_core::log!("[iso4-v8] {e}");
+        std::process::exit(1);
+    }
 
     // No pre-bind cleanup: the host hands this process a fresh path inside a
     // per-sandbox private directory, so a file already at it means two
@@ -97,7 +111,7 @@ fn main() {
     ));
 
     // Cold start: one run per core until a completed run reports its shape.
-    warm::seed_slot_allowance(std::thread::available_parallelism().map_or(1, |n| n.get()));
+    warm::seed_slot_allowance(warm::cores());
 
     for stream in listener.incoming() {
         match stream {
@@ -113,12 +127,14 @@ fn main() {
     }
 }
 
-fn parse_args() -> (String, u64, u64, u64) {
+fn parse_args() -> (String, u64, u64, u64, Option<usize>, Option<i32>) {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
     let mut warm_budget_bytes: u64 = 0;
     let mut host_reserve_bytes: u64 = container::DEFAULT_HOST_RESERVE_BYTES;
     let mut idle_settle_secs: u64 = 0;
+    let mut cores: Option<usize> = None;
+    let mut node_pid: Option<i32> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -175,6 +191,34 @@ fn parse_args() -> (String, u64, u64, u64) {
                 }
                 i += 2;
             }
+            "--cores" if i + 1 < args.len() => {
+                // Replaces the machine's core count; absent keeps it.
+                match args[i + 1].parse::<usize>() {
+                    Ok(n) if n >= 1 => cores = Some(n),
+                    _ => {
+                        iso4_core::log!(
+                            "[iso4-v8] --cores must be an integer of at least 1, got {:?}",
+                            args[i + 1]
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
+            "--node-pid" if i + 1 < args.len() => {
+                // Exit once this pid is gone.
+                match args[i + 1].parse::<i32>() {
+                    Ok(n) if n >= 1 => node_pid = Some(n),
+                    _ => {
+                        iso4_core::log!(
+                            "[iso4-v8] --node-pid must be a positive integer, got {:?}",
+                            args[i + 1]
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
             arg => {
                 // Fatal, like every other bad input here. Continuing would
                 // leave a mistyped `--warm-budget-bytes` at its initial 0,
@@ -191,5 +235,12 @@ fn parse_args() -> (String, u64, u64, u64) {
         std::process::exit(1);
     });
 
-    (socket, warm_budget_bytes, host_reserve_bytes, idle_settle_secs)
+    (
+        socket,
+        warm_budget_bytes,
+        host_reserve_bytes,
+        idle_settle_secs,
+        cores,
+        node_pid,
+    )
 }
