@@ -2,8 +2,8 @@
 //!
 //! `runloop` holds the run entry points and the turn loop; `instance` the
 //! owner thread serving a warm instance; `runtable` the per-run state table
-//! and the CPED rider; `isolate` isolate creation; `oom_label` the fatal OOM
-//! line; `exceptions` thrown-value handling; `console`, `timers`, `guard`,
+//! and the CPED rider; `isolate` isolate creation; `oom_label` the fatal
+//! hook; `exceptions` thrown-value handling; `console`, `timers`, `guard`,
 //! `globals`, `modules`, `bridge` and `streams` the runtime surface those
 //! names say; the `node:*` mirrors live under `node`. `RunError` and the
 //! failure output live in `crate::errors`. This file only re-exports.
@@ -19,8 +19,10 @@ pub use isolate::{
     CpuBudget, InstanceCore, Limits, PrefixSpec, WARMUP_CPU_MS, WARMUP_WALL_MS,
     create_instance_core, init_platform, set_idle_settle_secs,
 };
-pub use oom_label::{OomRecord, OomRun, OomRunLabel};
-pub(crate) use oom_label::{fatal_memory_error_cb, oom_error_cb};
+pub use oom_label::{
+    FatalCause, FatalHook, FatalInfo, FatalPhase, OomRecord, OomRun, OomRunLabel, set_fatal_hook,
+};
+pub(crate) use oom_label::{fatal_hook, fatal_memory_error_cb, oom_error_cb, v8_fatal_error_cb};
 pub use runloop::{
     CallJob, CallOutcome, EpilogueSpec, GraceReport, GraceStatus, Output, ReleaseHook, RoutedEvent,
     RunEvent, RunEventSender, RunIo, execute, execute_with_io, execute_with_prefix,

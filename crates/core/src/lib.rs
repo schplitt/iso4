@@ -54,11 +54,15 @@ pub(crate) fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
 }
 
 /// Registers the fatal OOM handler with `record` as its data
-/// (`src/oom_handler.cc`). `build.rs` defines its own no-op version.
+/// (`src/oom_handler.cc`), if a fatal hook is set. `build.rs` defines its own
+/// no-op version.
 ///
 /// # Safety
 /// `record` must outlive the isolate: V8 reads it until the process aborts.
 pub(crate) unsafe fn set_oom_error_handler(isolate: &mut ::v8::Isolate, record: &crate::v8::OomRecord) {
+    if crate::v8::fatal_hook().is_none() {
+        return;
+    }
     unsafe {
         iso4_set_oom_error_handler(
             isolate.as_raw_isolate_ptr(),
@@ -68,9 +72,13 @@ pub(crate) unsafe fn set_oom_error_handler(isolate: &mut ::v8::Isolate, record: 
     }
 }
 
-/// Registers the process-wide OOM callback V8 calls on every fatal OOM, after
-/// the isolate's handler if one ran. `build.rs` defines its own no-op version.
-pub(crate) fn set_fatal_memory_error_callback() {
+/// Registers V8's process-wide OOM and fatal error callbacks, if a fatal hook
+/// is set. `build.rs` defines its own no-op version.
+pub(crate) fn set_fatal_callbacks() {
+    if crate::v8::fatal_hook().is_none() {
+        return;
+    }
     // SAFETY: stores a function pointer in a V8 global.
     unsafe { iso4_set_fatal_memory_error_callback(crate::v8::fatal_memory_error_cb) }
+    ::v8::V8::set_fatal_error_handler(crate::v8::v8_fatal_error_cb);
 }

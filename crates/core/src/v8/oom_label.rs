@@ -1,9 +1,9 @@
-//! The fatal OOM line: what an isolate was executing when V8 aborts the
-//! process, written to stderr from the OOM handlers.
+//! What an isolate was executing when V8 aborts the process, and the fatal
+//! hook the embedder sets to report that death.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-/// What an isolate is executing, for the fatal OOM line's benefit.
+/// What an isolate is executing, for the fatal hook's benefit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OomRun {
     None,
@@ -69,82 +69,162 @@ impl OomRecord {
     }
 }
 
-/// The fatal OOM line, written into `buf` without allocating (the abort
-/// path must not depend on a working allocator). Returns the bytes used.
-fn format_oom_line(
-    buf: &mut [u8],
-    label: Option<OomRunLabel>,
-    is_heap_oom: bool,
-    detail: Option<&std::ffi::CStr>,
-    location: Option<&std::ffi::CStr>,
-) -> usize {
-    use std::io::Write as _;
-    let cap = buf.len();
-    let mut cur = buf;
-    let _ = write!(
-        cur,
-        "[iso4-v8] fatal: V8 out of memory ({})",
-        if is_heap_oom { "heap" } else { "non-heap" }
-    );
-    let _ = match label.map(|l| (l.run, l.prefix_id)) {
-        None => write!(cur, " outside any isolate"),
-        Some((OomRun::None, _)) => write!(cur, " with no run executing in this isolate"),
-        Some((OomRun::Run(run_id), Some(p))) => write!(cur, " in run {run_id} of prefix {p}"),
-        Some((OomRun::Run(run_id), None)) => write!(cur, " in one-off run {run_id}"),
-        Some((OomRun::ColdStart(run_id), Some(p))) => {
-            write!(cur, " during cold start of prefix {p} (triggered by run {run_id})")
-        }
-        Some((OomRun::ColdStart(run_id), None)) => {
-            write!(cur, " during cold start (triggered by run {run_id})")
-        }
-    };
-    // V8 passes its message ("Reached heap limit") as `location`.
-    if let Some(l) = location.and_then(|l| l.to_str().ok()) {
-        let _ = write!(cur, ": {l}");
-    }
-    if let Some(d) = detail.and_then(|d| d.to_str().ok()) {
-        let _ = write!(cur, " ({d})");
-    }
-    let _ = write!(cur, " — aborting the process\n");
-    cap - cur.len()
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FatalCause {
+    /// V8 ran out of memory in the JavaScript heap.
+    OomHeap,
+    /// V8 ran out of memory outside the heap, such as a zone allocation.
+    OomOther,
+    /// A V8 `CHECK` failure or other fatal error.
+    V8Fatal,
 }
 
-/// Set by the first OOM line: V8 calls the process-wide callback after an
-/// isolate's handler too, and that second line would be wrong.
-static OOM_LINE_WRITTEN: AtomicBool = AtomicBool::new(false);
+/// What the dying isolate was executing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FatalPhase {
+    /// A prefix run's turn.
+    Run,
+    /// A one-off run's turn.
+    OneOff,
+    /// A prefix evaluating for the run that triggered its instance.
+    ColdStart,
+    /// An isolate with no run executing.
+    Idle,
+    /// No current isolate.
+    Outside,
+}
 
-fn write_oom_line(label: Option<OomRunLabel>, location: *const std::ffi::c_char, details: &v8::OomDetails) {
-    use std::ffi::CStr;
-    use std::io::Write as _;
-    let mut buf = [0u8; 1024];
-    let n = format_oom_line(
-        &mut buf,
-        label,
-        details.is_heap_oom,
-        (!details.detail.is_null()).then(|| unsafe { CStr::from_ptr(details.detail.cast()) }),
-        (!location.is_null()).then(|| unsafe { CStr::from_ptr(location) }),
-    );
-    let _ = std::io::stderr().write_all(&buf[..n]);
+/// One fatal V8 error, as the fatal hook receives it. `phase` is `None` for
+/// [`FatalCause::V8Fatal`], which names no isolate.
+#[derive(Clone, Copy, Debug)]
+pub struct FatalInfo<'a> {
+    pub cause: FatalCause,
+    pub phase: Option<FatalPhase>,
+    pub run: Option<u32>,
+    pub prefix: Option<u64>,
+    /// V8's message; empty when it gave none.
+    pub message: &'a [u8],
+    /// V8's detail on an out of memory; empty when it gave none.
+    pub detail: &'a [u8],
+}
+
+/// Runs in a dying process, on any thread, and may run more than once for one
+/// death. It must not allocate or take locks.
+pub type FatalHook = fn(&FatalInfo<'_>);
+
+static FATAL_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// Sets the hook V8's out of memory and fatal error callbacks report to. Set
+/// it before anything starts V8 (`init_platform`): with no hook, core
+/// registers none of those callbacks and V8 prints its own messages.
+pub fn set_fatal_hook(hook: FatalHook) {
+    FATAL_HOOK.store(hook as *mut (), Ordering::Release);
+}
+
+pub(crate) fn fatal_hook() -> Option<FatalHook> {
+    let hook = FATAL_HOOK.load(Ordering::Acquire);
+    // SAFETY: only `set_fatal_hook` stores into it, always a `FatalHook`.
+    (!hook.is_null()).then(|| unsafe { std::mem::transmute::<*mut (), FatalHook>(hook) })
+}
+
+fn oom_info<'a>(
+    record: Option<&OomRecord>,
+    is_heap_oom: bool,
+    message: &'a [u8],
+    detail: &'a [u8],
+) -> FatalInfo<'a> {
+    let (phase, run, prefix) = match record.map(OomRecord::label) {
+        None => (FatalPhase::Outside, None, None),
+        Some(OomRunLabel {
+            prefix_id,
+            run: OomRun::None,
+        }) => (FatalPhase::Idle, None, prefix_id),
+        Some(OomRunLabel {
+            prefix_id: None,
+            run: OomRun::Run(id),
+        }) => (FatalPhase::OneOff, Some(id), None),
+        Some(OomRunLabel {
+            prefix_id,
+            run: OomRun::Run(id),
+        }) => (FatalPhase::Run, Some(id), prefix_id),
+        Some(OomRunLabel {
+            prefix_id,
+            run: OomRun::ColdStart(id),
+        }) => (FatalPhase::ColdStart, Some(id), prefix_id),
+    };
+    FatalInfo {
+        cause: if is_heap_oom {
+            FatalCause::OomHeap
+        } else {
+            FatalCause::OomOther
+        },
+        phase: Some(phase),
+        run,
+        prefix,
+        message,
+        detail,
+    }
+}
+
+fn c_bytes<'a>(s: *const std::ffi::c_char) -> &'a [u8] {
+    if s.is_null() {
+        return &[];
+    }
+    // SAFETY: V8 passes NUL-terminated strings that live through the call.
+    unsafe { std::ffi::CStr::from_ptr(s) }.to_bytes()
+}
+
+fn report_oom(
+    record: Option<&OomRecord>,
+    location: *const std::ffi::c_char,
+    details: &v8::OomDetails,
+) {
+    if let Some(hook) = fatal_hook() {
+        // V8 passes its message ("Reached heap limit") as `location`.
+        hook(&oom_info(
+            record,
+            details.is_heap_oom,
+            c_bytes(location),
+            c_bytes(details.detail.cast()),
+        ));
+    }
 }
 
 /// The isolate's OOM handler, with its [`OomRecord`] as `data`. V8 calls it
-/// right before it aborts the process, so this line is the host's only
-/// attribution.
+/// right before it aborts the process.
 pub(crate) unsafe extern "C" fn oom_error_cb(
     location: *const std::ffi::c_char,
     details: &v8::OomDetails,
     data: *mut std::ffi::c_void,
 ) {
-    let label = unsafe { data.cast::<OomRecord>().as_ref() }.map(OomRecord::label);
-    OOM_LINE_WRITTEN.store(true, Ordering::Relaxed);
-    write_oom_line(label, location, details);
+    report_oom(
+        unsafe { data.cast::<OomRecord>().as_ref() },
+        location,
+        details,
+    );
 }
 
-/// The process-wide fallback for an OOM with no current isolate, such as a
-/// zone allocation on a background compile thread.
-pub(crate) unsafe extern "C" fn fatal_memory_error_cb(location: *const std::ffi::c_char, details: &v8::OomDetails) {
-    if !OOM_LINE_WRITTEN.swap(true, Ordering::Relaxed) {
-        write_oom_line(None, location, details);
+/// The process-wide OOM callback: V8 calls it on every fatal OOM, after the
+/// isolate's handler if one ran.
+pub(crate) unsafe extern "C" fn fatal_memory_error_cb(
+    location: *const std::ffi::c_char,
+    details: &v8::OomDetails,
+) {
+    report_oom(None, location, details);
+}
+
+/// V8's process-wide fatal error callback. File and line are empty at this
+/// build's logging level.
+pub(crate) fn v8_fatal_error_cb(_file: &str, _line: i32, message: &str) {
+    if let Some(hook) = fatal_hook() {
+        hook(&FatalInfo {
+            cause: FatalCause::V8Fatal,
+            phase: None,
+            run: None,
+            prefix: None,
+            message: message.as_bytes(),
+            detail: &[],
+        });
     }
 }
 
@@ -153,38 +233,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fatal_oom_line_names_the_run_executing_in_the_isolate() {
-        let line = |buf: &mut [u8], record: &OomRecord| {
-            let n = format_oom_line(buf, Some(record.label()), true, Some(c"more"), Some(c"Reached heap limit"));
-            String::from_utf8_lossy(&buf[..n]).into_owned()
+    fn the_record_maps_to_the_phase_run_and_prefix() {
+        let at = |record: Option<&OomRecord>| {
+            let info = oom_info(record, true, b"m", b"");
+            (info.phase.unwrap(), info.run, info.prefix)
         };
-        let mut buf = [0u8; 256];
         let record = OomRecord::new(OomRunLabel {
             prefix_id: Some(123),
             run: OomRun::ColdStart(17),
         });
-        assert!(line(&mut buf, &record).contains(" during cold start of prefix 123 (triggered by run 17): "));
+        assert_eq!(
+            at(Some(&record)),
+            (FatalPhase::ColdStart, Some(17), Some(123))
+        );
         record.set_run(OomRun::Run(u32::MAX));
         assert_eq!(
-            line(&mut buf, &record),
-            "[iso4-v8] fatal: V8 out of memory (heap) in run 4294967295 of prefix 123: \
-             Reached heap limit (more) — aborting the process\n"
+            at(Some(&record)),
+            (FatalPhase::Run, Some(u32::MAX), Some(123))
         );
         record.set_run(OomRun::None);
-        assert!(line(&mut buf, &record).contains(" with no run executing in this isolate: "));
+        assert_eq!(at(Some(&record)), (FatalPhase::Idle, None, Some(123)));
         let one_off = OomRecord::new(OomRunLabel {
             prefix_id: None,
             run: OomRun::Run(18),
         });
-        assert!(line(&mut buf, &one_off).contains(" in one-off run 18: "));
-        // Null detail and location are left out; a full buffer cuts, never grows.
-        let n = format_oom_line(&mut buf, None, false, None, None);
-        assert_eq!(
-            &buf[..n],
-            "[iso4-v8] fatal: V8 out of memory (non-heap) outside any isolate — aborting the process\n".as_bytes()
-        );
-        let mut small = [0u8; 24];
-        assert_eq!(format_oom_line(&mut small, None, true, None, None), 24);
-        assert_eq!(&small, b"[iso4-v8] fatal: V8 out ");
+        assert_eq!(at(Some(&one_off)), (FatalPhase::OneOff, Some(18), None));
+        assert_eq!(at(None), (FatalPhase::Outside, None, None));
+        assert_eq!(oom_info(None, false, b"", b"").cause, FatalCause::OomOther);
     }
 }

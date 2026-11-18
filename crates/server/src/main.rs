@@ -3,6 +3,7 @@
 //! See DESIGN.md §8 for the planned module layout and §9 for the phased
 //! build plan.
 
+mod crash;
 mod ipc;
 mod process;
 mod session;
@@ -21,6 +22,9 @@ fn main() {
 
     let (socket_path, warm_budget_bytes, host_reserve_bytes, idle_settle_secs, cores, node_pid) =
         parse_args();
+
+    // Before V8 starts (`blob::probe` below), so a death in its start is recorded.
+    crash::install(&socket_path);
 
     // Before any line is drawn: the admission line is derived from it.
     container::set_host_reserve_bytes(host_reserve_bytes);

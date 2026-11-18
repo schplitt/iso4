@@ -7,7 +7,7 @@ This is the only crate that knows the wire.
 
 1. `main.rs` parses the flags (`--socket`, `--warm-budget-bytes`,
    `--host-reserve-bytes`, `--idle-settle-secs`, `--cores`, `--node-pid`),
-   writes the pid file, prints one capacity line, creates one `Engine`, and
+   opens the crash file, writes the pid file, prints one capacity line, creates one `Engine`, and
    accepts connections.
 2. `session.rs` runs each connection: the `Authenticate` handshake, then the
    demux loop. It is the only reader on the socket. It turns frames into
@@ -17,6 +17,8 @@ This is the only crate that knows the wire.
 3. `ipc.rs` owns the frame envelope, the outbox, and the payload parsers;
    `wire.rs` owns the encoders for everything the engine sends back.
 4. `process.rs` writes the pid file and runs the `--node-pid` watch.
+5. `crash.rs` opens the crash file, sets core's fatal hook and installs the
+   signal handlers.
 
 The layout of every frame and payload is in `docs/protocol.md`. The
 TypeScript side is `packages/iso4-sandbox/src/ipc.ts`; the two must stay
@@ -67,7 +69,25 @@ and its start time as an opaque integer (Linux: field 22 of
 writes `pid.tmp` first and renames it. The directory must already exist, be
 writable, and be private to the host, like the socket. Any failure, including
 an unreadable own start time, is fatal: one line naming the cause and the
-path, then exit 1. Nothing removes the file on exit.
+path (after the crash file's line, if that file could not be opened either),
+then exit 1. Nothing removes the file on exit.
+
+## The crash file
+
+Before V8 starts, the binary opens a file named `crash` in the same
+directory, emptied, for appending. When the process dies from a V8 out of
+memory, a V8 fatal error, or SIGSEGV, SIGTRAP, SIGABRT, SIGBUS or SIGILL, it
+writes one line to that file and the same line to stderr, then dies by the
+signal it was going to die by:
+
+```
+[iso4-v8] fatal cause=oom-heap phase=oneoff run=1 msg="Reached heap limit"
+[iso4-v8] fatal cause=SIGSEGV
+```
+
+DESIGN.md 4.1 has the fields. One death writes one line. If the file cannot
+be opened, the binary logs one line and goes on with stderr only. Nothing
+removes the file on exit; an empty file means no recorded crash.
 
 ## Tests
 
