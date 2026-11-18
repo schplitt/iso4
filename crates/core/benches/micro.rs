@@ -28,9 +28,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use iso4_core::blob;
-use iso4_core::v8::init_platform;
-use iso4_core::snapshot;
+use iso4_core::testing::{
+    boot_context, create_params, deserialize_value, init_platform, serialize_value,
+};
 
 // ── Deterministic payload fixtures ─────────────────────────────────────────
 
@@ -229,7 +229,7 @@ fn bench_v8_value(c: &mut Criterion) {
     for (name, shape) in &shapes() {
         // V8 value → v8-blob bytes (outbound leg).
         group.bench_function(BenchmarkId::new("value_serializer", name), |b| {
-            let isolate = &mut v8::Isolate::new(snapshot::create_params());
+            let isolate = &mut v8::Isolate::new(create_params());
             v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
@@ -238,21 +238,21 @@ fn bench_v8_value(c: &mut Criterion) {
                 // Per-iteration handle scope: without it, millions of locals
                 // accumulate in the outer scope over a bench run.
                 v8::scope!(let scope, scope);
-                black_box(blob::serialize_value(scope, black_box(value)).unwrap())
+                black_box(serialize_value(scope, black_box(value)).unwrap())
             });
         });
 
         // v8-blob bytes → V8 value (inbound leg).
         group.bench_function(BenchmarkId::new("value_deserializer", name), |b| {
-            let isolate = &mut v8::Isolate::new(snapshot::create_params());
+            let isolate = &mut v8::Isolate::new(create_params());
             v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
             let value = to_v8(scope, shape);
-            let bytes = blob::serialize_value(scope, value).unwrap();
+            let bytes = serialize_value(scope, value).unwrap();
             b.iter(|| {
                 v8::scope!(let scope, scope);
-                black_box(blob::deserialize_value(scope, black_box(&bytes)).unwrap());
+                black_box(deserialize_value(scope, black_box(&bytes)).unwrap());
             });
         });
     }
@@ -285,7 +285,7 @@ fn bench_exec(c: &mut Criterion) {
     // Fresh context in an existing isolate — the dominant slice of the
     // per-run tax.
     group.bench_function("context_create", |b| {
-        let isolate = &mut v8::Isolate::new(snapshot::create_params());
+        let isolate = &mut v8::Isolate::new(create_params());
         v8::scope!(let scope, isolate);
         b.iter(|| {
             v8::scope!(let scope, scope);
@@ -297,11 +297,11 @@ fn bench_exec(c: &mut Criterion) {
     // the fixed boot every one-off run and cold start pays.
     group.bench_function("isolate_boot", |b| {
         b.iter(|| {
-            let isolate = &mut v8::Isolate::new(snapshot::create_params());
+            let isolate = &mut v8::Isolate::new(create_params());
             v8::scope!(let scope, isolate);
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
-            snapshot::boot_context(scope, std::ptr::null()).unwrap();
+            boot_context(scope, std::ptr::null()).unwrap();
         });
     });
 
@@ -309,7 +309,7 @@ fn bench_exec(c: &mut Criterion) {
     // per iteration: identical source hits V8's compile cache and reports
     // ~5x too fast (measured 2.9 µs cached vs 15.6 µs unique).
     group.bench_function("compile_run_unique_source", |b| {
-        let isolate = &mut v8::Isolate::new(snapshot::create_params());
+        let isolate = &mut v8::Isolate::new(create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -329,7 +329,7 @@ fn bench_exec(c: &mut Criterion) {
     // Direct call of a pre-compiled function — the RunCall target pattern
     // (backlog item 2): no per-event compile, argument already materialised.
     group.bench_function("function_call", |b| {
-        let isolate = &mut v8::Isolate::new(snapshot::create_params());
+        let isolate = &mut v8::Isolate::new(create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
@@ -345,18 +345,18 @@ fn bench_exec(c: &mut Criterion) {
     // (item 1 + item 2): argsBlob in → ValueDeserializer → call() →
     // ValueSerializer → result blob out.
     group.bench_function("call_per_event", |b| {
-        let isolate = &mut v8::Isolate::new(snapshot::create_params());
+        let isolate = &mut v8::Isolate::new(create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         let (func, recv) = compile_fn(scope, TRANSFORM_SRC);
         let event = to_v8(scope, &small_event());
-        let args_blob = blob::serialize_value(scope, event).unwrap();
+        let args_blob = serialize_value(scope, event).unwrap();
         b.iter(|| {
             v8::scope!(let scope, scope);
-            let event = blob::deserialize_value(scope, &args_blob).unwrap();
+            let event = deserialize_value(scope, &args_blob).unwrap();
             let result = func.call(scope, recv, &[event]).unwrap();
-            black_box(blob::serialize_value(scope, result).unwrap());
+            black_box(serialize_value(scope, result).unwrap());
         });
     });
 
@@ -372,11 +372,11 @@ fn bench_url(c: &mut Criterion) {
     let mut group = c.benchmark_group("url");
 
     group.bench_function("parse", |b| {
-        let isolate = &mut v8::Isolate::new(snapshot::create_params());
+        let isolate = &mut v8::Isolate::new(create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        snapshot::boot_context(scope, std::ptr::null()).unwrap();
+        boot_context(scope, std::ptr::null()).unwrap();
         let (func, recv) = compile_fn(scope, "s => new URL(s)");
         let input: v8::Local<v8::Value> =
             v8::String::new(scope, "https://user@example.com:8443/a/b/../c?x=1&y=2#frag")
@@ -391,11 +391,11 @@ fn bench_url(c: &mut Criterion) {
     // Relative resolution against a base — the shape `Request` construction
     // and redirect handling produce.
     group.bench_function("parse_relative_with_base", |b| {
-        let isolate = &mut v8::Isolate::new(snapshot::create_params());
+        let isolate = &mut v8::Isolate::new(create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        snapshot::boot_context(scope, std::ptr::null()).unwrap();
+        boot_context(scope, std::ptr::null()).unwrap();
         let (func, recv) = compile_fn(
             scope,
             "s => new URL(s, 'https://example.com/base/dir/index.html')",
@@ -411,11 +411,11 @@ fn bench_url(c: &mut Criterion) {
     // One component setter: re-parse from href, apply the DOM setter
     // natively, swap in the fresh component array.
     group.bench_function("set_pathname", |b| {
-        let isolate = &mut v8::Isolate::new(snapshot::create_params());
+        let isolate = &mut v8::Isolate::new(create_params());
         v8::scope!(let scope, isolate);
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
-        snapshot::boot_context(scope, std::ptr::null()).unwrap();
+        boot_context(scope, std::ptr::null()).unwrap();
         let (make, recv) = compile_fn(scope, "() => new URL('https://example.com/a?b=1')");
         let url = make.call(scope, recv, &[]).unwrap();
         let (func, recv) = compile_fn(scope, "u => { u.pathname = '/new/path'; return u }");
@@ -451,7 +451,7 @@ fn compile_fn<'s>(
 // shed-pass walk shows up as a PR diff.
 
 fn bench_policy(c: &mut Criterion) {
-    use iso4_core::policy::{
+    use iso4_core::testing::{
         pick_victim, watermark_action, PassOutcome, PressureFacts, VictimFact,
     };
     use std::time::Instant;

@@ -5,7 +5,7 @@ use iso4_core::engine::{Engine, EngineOptions, StartError};
 
 #[test]
 fn start_after_a_lazy_v8_start_is_refused() {
-    iso4_core::v8::init_platform();
+    iso4_core::testing::init_platform();
     assert_eq!(
         Engine::start(EngineOptions::default()).err(),
         Some(StartError::AlreadyStarted)

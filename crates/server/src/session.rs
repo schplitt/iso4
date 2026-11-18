@@ -697,7 +697,7 @@ mod tests {
     /// payload and return the first frame it writes back (if any).
     fn handshake(payload: Vec<u8>) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
-        let engine = Arc::new(Engine::new(0, 0));
+        let engine = Arc::new(iso4_core::testing::engine(0, 0));
         let server = std::thread::spawn(move || handle_client(runtime, engine));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)
@@ -715,7 +715,7 @@ mod tests {
     /// hanging the suite.
     fn spawn_session() -> (UnixStream, crossbeam_channel::Receiver<()>) {
         let (host, runtime) = UnixStream::pair().unwrap();
-        let engine = Arc::new(Engine::new(0, 0));
+        let engine = Arc::new(iso4_core::testing::engine(0, 0));
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         std::thread::spawn(move || {
             handle_client(runtime, engine);
@@ -856,7 +856,7 @@ mod tests {
 
     // ── The demux: several runs on one connection ─────────────────────────
 
-    use iso4_core::testval::{self, TestValue};
+    use iso4_core::testing::testval::{self, TestValue};
 
     fn pstr(out: &mut Vec<u8>, s: &str) {
         out.extend_from_slice(&(s.len() as u32).to_be_bytes());
@@ -985,7 +985,7 @@ mod tests {
 
     #[test]
     fn two_runs_interleave_on_one_connection_with_correct_routing() {
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, _done) = open_session();
 
         // Two runs in flight at once on one connection, each suspended on a
@@ -1058,7 +1058,7 @@ mod tests {
         // frame within the ceiling but over ONE run's own inbound allowance
         // (its memoryMb budget) fails that run cleanly — the connection and
         // its other runs keep going.
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, _done) = open_session();
 
         let code = "export default await tool()";
@@ -1120,7 +1120,7 @@ mod tests {
         // (routed) Terminate would sit unread forever, and the wall here is
         // 10 s. The prompt ERR_ABORTED (not ERR_WALL_TIMEOUT, not a hang)
         // proves the route's token reaches the one-off's guard.
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1154,7 +1154,7 @@ mod tests {
         // The kill lands inside a microtask-checkpoint continuation, where
         // V8's terminate flag used to be consumed silently: prompt
         // ERR_ABORTED, never a hang to the wall.
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1202,7 +1202,7 @@ mod tests {
         // The continuation here burns briefly and then suspends forever on
         // a fresh promise — the abort must land right after that turn, as
         // a clean abandon, not hang and not interrupt.
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, _done) = open_session();
         ipc::write_ts_to_rust_frame(
             &mut host,
@@ -1245,7 +1245,7 @@ mod tests {
 
     #[test]
     fn a_duplicate_run_id_is_refused_and_the_first_run_survives() {
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, _done) = open_session();
 
         // Run 1 suspends on its bridge call…
@@ -1310,7 +1310,7 @@ mod tests {
 
     #[test]
     fn a_finished_runs_id_can_be_used_again() {
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, _done) = open_session();
         for _ in 0..2 {
             ipc::write_ts_to_rust_frame(
@@ -1326,7 +1326,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_frame_fails_the_connections_runs_loudly() {
-        iso4_core::v8::init_platform();
+        iso4_core::testing::init_platform();
         let (mut host, done) = open_session();
 
         // One run in flight, suspended on its bridge call…

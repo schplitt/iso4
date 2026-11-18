@@ -18,7 +18,7 @@ name = "micro"
 harness = false
 
 [features]
-# Test values for other crates' tests (`testval.rs`); never on in a build.
+# The `testing` module: picked internals for tests and benches; never on in a build.
 test-support = ["iso4-types/test-support"]
 
 [dependencies]
@@ -56,6 +56,8 @@ unicode-ident = "1"
 
 [dev-dependencies]
 iso4-types = { path = "../types", features = ["test-support"] }
+# Turns `test-support` on for core's own tests and benches, no flag needed.
+iso4-core = { path = ".", features = ["test-support"] }
 # Wall-time microbenchmarks (benches/micro.rs). Plots and rayon disabled:
 # CI only needs `--output-format bencher` text output.
 # CodSpeed drop-in layer: plain `cargo bench` behaves like criterion; under
