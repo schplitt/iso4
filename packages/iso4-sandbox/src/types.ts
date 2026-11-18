@@ -18,11 +18,12 @@
 /**
  * The two heap lines a REUSED isolate is held to, when the managed default
  * is not what you want. One-off `run()` isolates are never reused and take a
- * plain `memoryMb` number, enforced exactly.
+ * plain `memoryMb` number, with no headroom band.
  *
- * - `hard` **terminates**: V8's heap cap. Crossing it kills whatever JS is
- *   executing, taints the instance, and fails its co-resident runs with
- *   `ERR_INSTANCE_RESET`. This is the ceiling the container reserves against
+ * - `hard` **terminates**: V8's heap cap. A run that crosses it fails with
+ *   `ERR_MEMORY_LIMIT`, the instance is reset, and its co-resident runs fail
+ *   with `ERR_INSTANCE_RESET`. A single allocation can briefly pass the line
+ *   before that happens. This is the ceiling the container reserves against
  *   its admission line.
  * - `soft` **retires**: a warm instance whose heap sits above it at two
  *   consecutive finishes takes no further runs and is dropped once the runs
@@ -58,11 +59,13 @@ export interface MemoryLimit {
 export interface OneOffResourceLimits extends ResourceLimits {
   /**
    * Hard cap on this run's isolate memory, in megabytes — V8 heap plus
-   * external `ArrayBuffer`s. Enforced exactly: this run dies at this number.
+   * external `ArrayBuffer`s. A run that holds more than this when V8
+   * collects, or when one of its turns ends, fails with `ERR_MEMORY_LIMIT`;
+   * an allocation in flight may complete past it first, and a heap that ends
+   * far over it fails even if most of that is garbage.
    *
    * A one-off always gets a fresh isolate, so — unlike a prefix's reused
-   * instances — there is nothing to retire and no headroom band. The number
-   * you write is the number that terminates. A plain number only, for the
+   * instances — there is nothing to retire and no headroom band. A plain number only, for the
    * same reason: {@link MemoryLimit}'s soft line would be inert here.
    *
    * `0` = uncapped (admitted against the memory budget instead of the 90%
@@ -1674,7 +1677,8 @@ export interface RunError {
   /**
    * Present only for `ERR_INSTANCE_RESET`: the wire run id of the run whose
    * interruption reset the instance — an opaque number, but stable across
-   * the victims of one reset, so they can be correlated.
+   * the victims of one reset, so they can be correlated. `0` when no run
+   * caused it (the instance retired while idle).
    */
   culpritRunId?: number
   /**

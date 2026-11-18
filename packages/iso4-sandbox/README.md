@@ -256,10 +256,13 @@ await sandbox.prepare({ code, memoryMb: { soft: 96, hard: 256 } }) // exact line
 await sandbox.prepare({ code, memoryMb: { hard: 128 } }) // terminate at 128, never retire
 ```
 
-**On a one-off `run()`**, the number is enforced exactly — `memoryMb: 128`
-dies at 128. A fresh isolate is never reused, so there is nothing to retire
-and no band. It takes a plain number for the same reason: a soft line would
-be inert.
+**On a one-off `run()`**, a run that holds more than `memoryMb` when V8
+collects, or when one of its turns ends, fails with `ERR_MEMORY_LIMIT`; an
+allocation in flight may complete past it first. A fresh isolate is never
+reused, so there is nothing to retire and no band. It takes a plain number for
+the same reason: a soft line would be inert. A single allocation far past the
+limit (a huge array or string built in one step) can still end the runtime
+process and every run in it.
 
 The runtime watches its own process RSS. At or above `memoryBudgetMb` it
 evicts idle instances (largest heap × longest idle first) and stops adding new

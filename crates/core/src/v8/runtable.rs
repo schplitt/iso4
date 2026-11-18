@@ -67,6 +67,8 @@ pub struct InstanceLoad {
     /// release. Fresher than the release-time reading, which still counts
     /// the last run's garbage.
     settled_heap_bytes: std::sync::atomic::AtomicU64,
+    /// The owner thread retired itself while idle; the registry evicts it.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 /// Utilization windows: closed every 100 ms of wall time; a reading older
@@ -87,6 +89,7 @@ impl InstanceLoad {
             closed_at_ms: std::sync::atomic::AtomicU64::new(0),
             turn_open_since_ms: std::sync::atomic::AtomicU64::new(u64::MAX),
             settled_heap_bytes: std::sync::atomic::AtomicU64::new(0),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -99,6 +102,15 @@ impl InstanceLoad {
     pub fn settled_heap_bytes(&self) -> u64 {
         self.settled_heap_bytes
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn mark_retired(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A run finished on the instance: whatever was settled is spent.

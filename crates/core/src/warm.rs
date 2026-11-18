@@ -138,6 +138,17 @@ impl Drop for InstanceHandle {
     }
 }
 
+/// A job dropped unanswered (its instance thread exited with it queued) still
+/// answers, so its caller and the registry's in-flight count never hang.
+impl Drop for sandbox::CallJob {
+    fn drop(&mut self) {
+        if self.release.is_some() {
+            let link = self.io.link();
+            sandbox::finish_job(self, link, dead_instance_outcome());
+        }
+    }
+}
+
 pub(crate) fn dead_instance_outcome() -> sandbox::CallOutcome {
     sandbox::CallOutcome {
         result: Err(sandbox::FailureOutput {
@@ -765,6 +776,14 @@ impl WarmRegistry {
         let id = inner.next_instance_id;
         let entry = inner.prefixes.entry(prefix_id.to_string()).or_default();
         entry.demand.note_arrival(now);
+        // Instances whose owner thread retired itself while idle.
+        let pooled = entry.instances.len();
+        entry
+            .instances
+            .retain(|i| !(i.in_flight == 0 && i.handle.load.is_retired()));
+        let gone = pooled - entry.instances.len();
+        inner.total = inner.total.saturating_sub(gone);
+        inner.idle_total = inner.idle_total.saturating_sub(gone);
         if !entry.demand.heap_bytes.seeded && run_cap_bytes > 0 {
             // Seed: the theoretical cap, until measurements fade it out.
             entry.demand.heap_bytes.update(run_cap_bytes as f64);
@@ -789,10 +808,14 @@ impl WarmRegistry {
             .instances
             .iter()
             .enumerate()
-            .filter(|(_, i)| !i.dead && i.caps == caps)
+            .filter(|(_, i)| !i.dead && !i.handle.load.is_retired() && i.caps == caps)
             .map(|(pos, _)| pos)
             .collect();
-        let live = entry.instances.iter().filter(|i| !i.dead).count();
+        let live = entry
+            .instances
+            .iter()
+            .filter(|i| !i.dead && !i.handle.load.is_retired())
+            .count();
 
         if joinable.is_empty() {
             // First isolate of this prefix (or only dead/mismatched ones):
@@ -1828,6 +1851,37 @@ mod tests {
         let outcome = call_via(&a2, churn_job());
         assert_eq!(bump_value(&outcome), 2.0, "module state survives the settle");
         release_outcome(&registry, "p0", &a2, &outcome);
+    }
+
+    #[test]
+    fn a_dropped_job_still_answers() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut job = bump_job();
+        job.release = Some(Box::new(move |outcome| {
+            tx.send(outcome).ok();
+        }));
+        drop(job);
+        let outcome = rx.try_recv().expect("the drop answered");
+        assert!(outcome.tainted);
+        assert!(matches!(
+            outcome.result.unwrap_err().error,
+            sandbox::RunError::Internal(_)
+        ));
+    }
+
+    #[test]
+    fn an_instance_retired_while_idle_is_not_reused() {
+        let registry = WarmRegistry::new(0, 0);
+        let a = att(acquire(&registry, "p0", TEST_CAP));
+        registry.release("p0", a.id, false, 0, 0.0, 0.0, true);
+        registry.inner.lock().unwrap().prefixes["p0"].instances[0]
+            .handle
+            .load
+            .mark_retired();
+        let b = att(acquire(&registry, "p0", TEST_CAP));
+        assert_ne!(b.id, a.id, "a retired instance must not serve again");
+        assert_eq!(registry.stats().warm_idle, 0);
+        assert_eq!(registry.inner.lock().unwrap().total, 1);
     }
 
     #[test]
@@ -2973,6 +3027,32 @@ mod tests {
         // Joiners get the same answer, flag included.
         let second = dead.call(bump_job());
         assert!(second.prefix_failed);
+    }
+
+    #[test]
+    fn a_prefix_that_ends_evaluation_over_its_cap_fails_without_breaking() {
+        sandbox::init_platform();
+        let heavy = Arc::new(PrefixData {
+            id: 0,
+            code: "let s = 'x'.repeat(1024 * 1024)\n\
+                   while (s.length < 64 * 1024 * 1024) s = s + s\n\
+                   s.charCodeAt(s.length - 1)\n\
+                   globalThis.keep = s\n\
+                   export function bump() { return 1 }"
+                .to_string(),
+            filename: None,
+            globals: Vec::new(),
+            declared_globals: Vec::new(),
+            declared_imports: Vec::new(),
+        });
+        let handle = spawn_instance(heavy, 32, test_brand_key()).expect("spawn instance");
+        let outcome = handle.call(bump_job());
+        assert!(outcome.tainted);
+        assert!(!outcome.prefix_failed, "the heap cap depends on load");
+        assert!(matches!(
+            outcome.result.unwrap_err().error,
+            sandbox::RunError::MemoryLimit
+        ));
     }
 
     #[test]

@@ -19,8 +19,8 @@ use crate::v8::isolate::{
 use crate::v8::runloop::{
     CallPhaseCtx, LoopEvent, RunEntry, RunFacts, RunPhase, RunState, ScanOutcome, begin_call,
     boundary_close, boundary_deadline, conclude_grace_wall, counted_wall_ms, earliest_timer,
-    enter_turn, grace_wall_due, handle_loop_event, instance_tainted, leave_turn, next_deadline,
-    stream_idle_turn,
+    end_turn, enter_turn, grace_wall_due, handle_loop_event, instance_tainted, leave_turn,
+    next_deadline, stream_idle_turn,
 };
 use crate::v8::runtable::{LOAD_WINDOW_MS, RUN_TABLE_PTR, RunCallState, TIMERS_TOUCHED};
 use crate::v8::streams::{close_out_streams, close_run_streams, out_idle_deadline};
@@ -76,7 +76,7 @@ fn conclude_run(
     let outcome = CallOutcome {
         result,
         tainted,
-        heap_used_bytes: heap_used(isolate),
+        heap_used_bytes: live.rs.finish_heap.unwrap_or_else(|| heap_used(isolate)),
         prefix_failed: false,
     };
     finish_job(&mut live.job, live.rs.link.take(), outcome);
@@ -300,7 +300,8 @@ fn sweep_expired_deadlines(
                     guard: &core.guard,
                     cancel_handle: core.guard.handle(),
                 };
-                timer_turn(&mut core.isolate, &core.context, &facts, &mut l.rs)
+                let outcome = timer_turn(&mut core.isolate, &core.context, &facts, &mut l.rs);
+                end_turn(&mut core.isolate, &facts, &mut l.rs, outcome)
             };
             let tainted_now = instance_tainted(core);
             match outcome {
@@ -342,7 +343,9 @@ fn sweep_expired_deadlines(
                         guard: &core.guard,
                         cancel_handle: core.guard.handle(),
                     };
-                    stream_idle_turn(&mut core.isolate, &core.context, &facts, &mut l.rs)
+                    let outcome =
+                        stream_idle_turn(&mut core.isolate, &core.context, &facts, &mut l.rs);
+                    end_turn(&mut core.isolate, &facts, &mut l.rs, outcome)
                 };
                 let tainted_now = instance_tainted(core);
                 match outcome {
@@ -490,6 +493,15 @@ pub fn serve_instance(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) if live.is_empty() => {
                 settled = true;
                 settle_heap(&mut core.isolate);
+                // The settle GC fired the near-heap callback: the raise is spent
+                // and a terminate is pending, so this instance must not serve again.
+                if core.reason.get().is_some() {
+                    load.mark_retired();
+                    // No run caused it: jobs that raced in name no culprit.
+                    LAST_CULPRIT_RUN_ID.with(|c| c.set(0));
+                    taint_sweep(core, &mut live, events);
+                    return;
+                }
                 load.publish_settled_heap(heap_used(&mut core.isolate));
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -792,6 +804,7 @@ fn dispatch_job(
                     counted: Duration::ZERO,
                     parked_at: start,
                     turn_entered: Some(start),
+                    finish_heap: None,
                 },
                 job,
             };

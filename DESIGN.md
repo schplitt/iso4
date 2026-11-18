@@ -312,19 +312,21 @@ below.
 On a prefix, `memoryMb` is the **soft** line and the terminating cap sits a
 headroom band above it — `round(sqrt(8 × memoryMb))` MB, so 128 terminates at
 160. Write `memoryMb: { soft, hard }` for exact numbers, or `{ hard }` alone
-for a single terminating cap. On a one-off `run()`, `memoryMb` terminates
-exactly: a fresh isolate is never reused, so there is nothing to retire and
-no reason to loosen the number the caller asked for. The band buys reuse the
-room to be retired instead of killed; it is an optimization for warmth, not
-a general loosening of the limit.
+for a single terminating cap. On a one-off `run()`, `memoryMb` has no band: a
+fresh isolate is never reused, so there is nothing to retire. The run fails
+with `ERR_MEMORY_LIMIT` at that number; an allocation in flight may finish
+past it first. The band buys reuse the room to be retired instead of killed;
+it is an optimization for warmth, not a general loosening of the limit.
 
 The **hard** line is enforced by:
 
 - `v8::CreateParams::heap_limits(0, hard * MB)` for the V8 heap.
 - A custom `v8::Allocator` tracking external `ArrayBuffer` bytes against the
   same budget. Without this, `new ArrayBuffer(2**30)` bypasses heap_limits.
-- `add_near_heap_limit_callback` converts OOM into a clean
-  `terminate_execution` instead of a Rust-process abort.
+- `add_near_heap_limit_callback`, which in most cases ends the executing run
+  with `ERR_MEMORY_LIMIT` at the old generation's own limit, a little under
+  the hard line. Some allocations still abort the child (below).
+- An end-of-turn heap check for what the callback cannot see (below).
 
 Crossing it terminates, taints and fails co-residents with
 `ERR_INSTANCE_RESET`, so only a runaway allocation gets there. The **soft**
@@ -335,18 +337,88 @@ in-flight runs finish), and a completion below the line clears the count.
 That is the difference between a prefix that accumulates memory across reuse
 being *replaced* and it eventually killing a run. workerd's two-line model
 (`IsolateLimitEnforcer::exitJs` condemns, `hasExcessivelyExceededHeapLimit`
-kills); iso4's soft line needs no forced collection because every isolate
-runs at `MemoryPressureLevel::Moderate` — V8's default assumes it owns the
-machine and collects lazily, which is wrong in a container full of isolates
-(workerd throws the same switch at startup).
+kills). Every isolate gets one `MemoryPressureLevel::Moderate` notification at
+creation, as workerd sends. In this V8 that starts one memory-reducing
+incremental marking, and the level does not persist. So the soft line reads
+the heap as V8 last left it, which can include garbage; whether to collect
+before that reading is an open question.
 
-The near-heap conversion only holds for gradual growth. An allocation that
-crosses the cap in one step (a flattened 300 MB string, a huge
-`Array.prototype.fill`) still ends in V8's fatal out-of-memory abort, which
-takes the whole runtime child and every run in flight on it. The child
-registers V8's OOM error handler on every user-code isolate, with that
-isolate's record of its prefix and executing run as the handler's data, so
-before that abort it writes one line on its stderr:
+V8 keeps two parts of its heap: a young generation for new objects and an old
+generation for objects that survived a collection. The hard line is split
+between them, so the old generation's own limit is a little under the hard
+line (about 0.8 to 0.9 of it, depending on the cap).
+
+V8 calls the near-heap callback when the old generation reaches that limit: at
+the end of a collection, from its last-resort allocation retry, and from its
+check for collections that free too little. The callback:
+
+- On the first call on a live isolate: records the memory reason, calls
+  `terminate_execution`, and raises the old-generation limit once, to at least
+  twice the hard line (max(current + 32 MB, 2 × hard)). The terminate only
+  lands at the next interrupt check, and the allocation in flight must finish,
+  or V8 aborts.
+- On a later call on the same live isolate: raises nothing. If V8 still needs
+  room, it aborts the child with the fatal line below.
+- During teardown: always grants 1 TiB. Disposing the isolate finishes any
+  incremental marking with a full collection (`Isolate::Deinit` →
+  `Heap::StartTearDown` → `CppHeap::StartDetachingIsolate`), which can call
+  the callback. No guest code runs any more, and a refusal would abort the
+  process. The callback's data outlives the isolate for the same reason.
+
+V8 does not size-check a large object allocated in the young generation when
+the allocation succeeds without a collection. So a flattened string can land
+past the cap with no callback at all. The runtime therefore reads
+`used_heap_size` at the end of every turn, before an early Result goes out,
+and after prefix evaluation (the shape of workerd's
+`IsolateLimitEnforcer::exitJs`). The check reads the V8 heap only;
+`ArrayBuffer` bytes are the allocator's budget.
+
+- Under the hard line, nothing happens.
+- Over it, `used_heap_size` still counts dead objects, so the runtime runs V8's
+  low-memory collection (`LowMemoryNotification`, two to seven full rounds).
+  The run fails if the callback fired during it or if the heap is still over
+  the line. Otherwise it goes on. Measured in the failing case, live data at
+  1.25 hard lines, release build, one machine: about 10 ms at 128 MB, 40 ms at
+  300 MB, 0.2 s at 1024 MB.
+- Over 1.5 hard lines, the run fails without collecting, even if the heap is
+  garbage. A collection moves live young objects into the old generation, and
+  that much could exceed the callback's one raise and abort the child.
+
+The check and its collection run after the turn's guard is cleared. They count
+as wall time, not CPU time, so a finishing turn can report `wallTimeMs` above
+its limit by up to the collection time. The run whose turn ends over the line
+gets `ERR_MEMORY_LIMIT`, and its co-resident runs get `ERR_INSTANCE_RESET`. A
+cold start fails the same way, which does not break the prefix. A run whose
+Result already went out early (a `waitUntil` tail or an open stream) keeps its
+success Result while the instance resets, as with a guard kill in its tail: a
+tail still running is reported truncated, and a tail that finished in that
+turn keeps its own status.
+
+One gap stays open. Live data between the old generation's limit and the hard
+line passes the turn check without a collection. V8's next collection, possibly
+in a later run on that instance, can still fire the callback there.
+
+Some allocations still end in V8's fatal out-of-memory abort, which takes the
+whole runtime child and every run in flight on it. Measured on a one-off with a
+128 MB cap:
+
+- flattening a 256 MB string whose parts were already in the old generation
+  (`CALL_AND_RETRY_LAST`);
+- `new Array(50 * 1024 * 1024).fill(0)` (`Reached heap limit`);
+- `JSON.parse` of an array of 6 million or 20 million `{}` (`Reached heap
+  limit`).
+
+The last two keep allocating inside one builtin after the first callback has
+spent the raise. Also measured: a live 256 MB young string under a 128 MB cap
+aborts the child (`Reached heap limit`) when a full collection runs before its
+turn ends (a test build whose check still collected above 1.5 lines; that is
+why the check does not). Derived from V8's source, not measured: a live young
+large object of about twice the hard line or more meets the same end whenever
+V8 collects before its turn ends.
+
+The child registers V8's OOM error handler on every user-code isolate, with
+that isolate's record of its prefix and executing run as the handler's data,
+so before that abort it writes one line on its stderr:
 `[iso4-v8] fatal: V8 out of memory (heap|non-heap) in run <id> of prefix
 <prefix_id>: <V8 message>[ (<detail>)] — aborting the process`, with
 `in one-off run <id>` for `sandbox.run()`, `during cold start of prefix
@@ -368,6 +440,13 @@ inherits the child's stderr and sees the line unparsed.
 Capacity reserves the **hard** line: `admit_isolate` must not admit an
 isolate whose real ceiling could tip the container past the 90% admission
 line — the banded ceiling for a prefix instance, the bare cap for a one-off.
+Two things pass that ceiling. The callback's one raise lets the heap grow to
+twice the hard line or more; past the raise the child aborts. A large object
+allocated in the young generation can pass the cap with no callback, at any
+cap, up to V8's largest single object (about 1 GB, not measured), and is held
+until its turn ends and the check fails the run; that was true before the
+check as well. Today's admission counts neither. The pool's planned margin
+(§17.3, not built) would cover the raise, not the young large object.
 `maxConcurrentRuns`'s default divides the budget by the banded number, the
 wider of the two. Nothing else changes — the watermarks read measured container
 memory, never a configured cap.
@@ -2525,15 +2604,20 @@ an idle isolate would otherwise hold its garbage until eviction. Off is the
 default because a dropped instance's pages go back to the OS on their own
 within seconds — the settle only earns its cost where warmth must stay
 resident in a container tight enough to feel the garbage. That settled
-reading feeds `stats()`
-(`idleHeapBytes`, "what is still reclaimable") and **deliberately not the
+reading feeds `stats()` (`idleHeapBytes`, "what is still reclaimable") and **deliberately not the
 victim score** — scoring must compare candidates on one basis, and only
 instances past the threshold have a collected one, so mixing them would
 shield the long-parked and evict the recently used. The threshold is long
 because the settle shrinks the heap: the first allocating call afterwards
 has to grow it back, so only a genuinely parked instance should pay it. A
 settle frees nothing the prefix still reaches — module state, caches and
-compiled code survive it, and the instance stays warm.
+compiled code survive it, and the instance stays warm. The exception: a settle
+collection that fires the near-heap callback retires the instance (its one
+raise is spent). The registry drops it at the next acquire of its prefix;
+until then it still counts as idle in `stats()` and can be picked as an
+eviction victim, which frees nothing. A call that races the retire gets
+`ERR_INSTANCE_RESET` (cause memory, no culprit run) or `ERR_INTERNAL`, never
+a hang.
 Per-prefix fairness caps and the wait-vs-cold-start acquire policy
 are deliberately not here: they are the prefix-aware cost model, built on
 the per-prefix busy/idle state the registry now tracks.
@@ -3257,13 +3341,17 @@ behavior.
   and is re-asked once). Only the culprit's record moves; victims are
   untouched. First attributed crash quarantines the prefix in the key's
   quarantine child; release after k clean runs, k doubling; refused after
-  m. Most heap blow-ups never get here: the near-heap-limit callback ends
-  the one run with a memory error instead of the process, and allows the
-  one allocation in flight room up to twice the hard line (a large string
-  flatten needs a block the size of the heap; with less room V8 aborts the
-  child and every run in it). The overshoot is one allocation for
-  milliseconds; the admission margin already reserves the largest cap in
-  flight for it.
+  m. Most heap blow-ups never get here. Built today, in core (§4.1): the
+  near-heap-limit callback ends the one run with a memory error and raises
+  the limit once, to at least twice the hard line, so the allocation in
+  flight completes (a large string flatten needs a block the size of the
+  heap; with less room V8 aborts the child and every run in it), and an
+  end-of-turn heap check fails a run that leaves the heap over its line.
+  The overshoot is not small: up to the raise (one more hard line or so;
+  past it the child aborts), or a young large object of up to about 1 GB
+  (not measured) at any cap, held until its turn ends. Not built yet, part
+  of this pool: the admission margin reserves the largest cap in flight,
+  which covers the raise but not the young large object.
 - **In a pod, a kernel OOM kill takes everything.** Kubernetes on cgroup
   v2 kills the whole container when its limit is hit, and only a node-wide
   kubelet setting changes that. The children's "kill me first" marking
