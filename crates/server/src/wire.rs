@@ -171,13 +171,17 @@ fn reset_cause_byte(cause: iso4_core::v8::ResetCause) -> u8 {
 ///   List<BridgeCallRecord>  bridgeCalls
 ///   Optional<u64>  heapUsedBytes   (present for prefix runs)
 /// ```
-pub fn encode_run_completion_payload(run_id: u32, completion: RunCompletion) -> Vec<u8> {
+pub fn encode_run_completion_payload(
+    run_id: u32,
+    completion: RunCompletion,
+    slot_allowance: u32,
+) -> Vec<u8> {
     let mut out = Vec::new();
     encode_u32(run_id, &mut out);
     // The runtime's current concurrency allowance, on every completion:
     // four bytes on a frame the host already reads, instead of a poll or a
     // second channel. Zero = no opinion yet (before the cold-start seed).
-    encode_u32(iso4_core::warm::slot_allowance(), &mut out);
+    encode_u32(slot_allowance, &mut out);
 
     match completion {
         RunCompletion::Success(s) => {
@@ -590,6 +594,7 @@ mod tests {
                 bridge_calls: Vec::new(),
                 heap_used_bytes: None,
             }),
+            0,
         )
     }
 

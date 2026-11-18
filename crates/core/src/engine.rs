@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::container;
 use crate::errors;
-use crate::link::{HostLink, Inbound, Observer};
+use crate::link::{HostLink, Inbound, Observer, Outbound};
 use crate::prefix::{validate_global_rebinds, validate_import_rebinds, PrefixData, PrefixEntry};
 use crate::types;
 use crate::v8 as sandbox;
@@ -64,7 +64,7 @@ pub enum Refusal {
     },
     /// A rebind the prefix did not declare, or of a frozen binding.
     Binding(sandbox::RunError),
-    /// The runtime could not start the run.
+    /// The runtime could not start the run, or the caller erred (a duplicate run id).
     Internal(String),
 }
 
@@ -295,6 +295,20 @@ impl Engine {
             host_reserve_bytes: container::host_reserve_bytes(),
             admission_line_bytes: self.admission_line_bytes,
         }
+    }
+
+    /// Runs the host may keep in flight now; 0 = no opinion yet. Process-wide:
+    /// one engine per process.
+    pub fn slot_allowance(&self) -> u32 {
+        warm::slot_allowance()
+    }
+
+    /// Answer a run refused before it started: one bare failure on the caller's
+    /// link. Touches no route, so a refused duplicate id leaves the live run alone.
+    pub fn refuse(&self, caller: &Caller, run_id: u32, refusal: Refusal) {
+        let completion =
+            types::RunCompletion::Failure(types::RunFailurePayload::bare(refusal.to_payload()));
+        sandbox::send_completion(&*caller.link, run_id, Outbound::Result { completion });
     }
 
     /// Store a prefix and return its id. Nothing is evaluated: a broken
@@ -683,5 +697,36 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::{channel_link, Addr, NoopObserver};
+
+    #[test]
+    fn refuse_sends_one_bare_failure_with_the_refusals_code() {
+        let engine = Engine::new(0, 0);
+        let (link, host) = channel_link();
+        let caller = Caller {
+            link,
+            observer: Arc::new(NoopObserver),
+            call_ids: Arc::new(AtomicU32::new(0)),
+            brand_key: String::new(),
+        };
+        engine.refuse(&caller, 7, Refusal::PrefixDisposed("p1".to_string()));
+        let (to, msg) = host.try_recv().expect("one answer");
+        assert_eq!(to, Addr::Run(7));
+        match msg {
+            Outbound::Result {
+                completion: types::RunCompletion::Failure(failure),
+            } => {
+                assert_eq!(failure.error.code, "ERR_PREFIX_DISPOSED");
+                assert!(failure.stdout.is_empty() && failure.bridge_calls.is_empty());
+            }
+            other => panic!("expected a failure Result, got {other:?}"),
+        }
+        assert!(host.try_recv().is_err(), "exactly one answer");
     }
 }
