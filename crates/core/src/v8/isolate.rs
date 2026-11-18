@@ -38,7 +38,7 @@ pub(crate) struct LogBuffers {
 pub fn init_platform() {
     INIT.call_once(|| {
         // Before initialize: V8 can run out of memory before any isolate exists.
-        crate::set_fatal_memory_error_callback();
+        crate::set_fatal_callbacks();
         // ICU data comes with the prebuilt V8, statically linked. Nothing to
         // load here: a missing one aborts the process on the first
         // locale-aware call, which the Intl tests cover.

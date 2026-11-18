@@ -1,8 +1,9 @@
-//! The pid file next to the socket, `--node-pid` and `--cores`, observed on
-//! the real binary.
+//! The pid and crash files next to the socket, `--node-pid` and `--cores`,
+//! observed on the real binary.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -39,7 +40,10 @@ fn fresh_dir() -> PathBuf {
 
 /// Starts the binary with `extra` flags and waits until its socket accepts.
 fn spawn(extra: &[&str]) -> (Spawned, UnixStream) {
-    let dir = fresh_dir();
+    spawn_in(fresh_dir(), extra)
+}
+
+fn spawn_in(dir: PathBuf, extra: &[&str]) -> (Spawned, UnixStream) {
     let socket = dir.join("sock");
     let child = Command::new(env!("CARGO_BIN_EXE_iso4-v8"))
         .arg("--socket")
@@ -109,13 +113,21 @@ fn authenticate(stream: &mut UnixStream) {
     assert_eq!(read_frame(stream)[..2], [0x05, 0], "Hello, status ok");
 }
 
-/// A `Run` frame with no filename, default limits, no globals, imports or call.
-fn send_run(stream: &mut UnixStream, code: &str) {
+/// A `Run` frame (run id 1) with no filename, default limits but `memory_mb`,
+/// no globals, imports or call.
+fn send_run(stream: &mut UnixStream, code: &str, memory_mb: Option<u32>) {
     let mut p = 1u32.to_be_bytes().to_vec();
     p.extend_from_slice(&(code.len() as u32).to_be_bytes());
     p.extend_from_slice(code.as_bytes());
     p.push(0);
-    p.extend_from_slice(&[0u8; 10]);
+    match memory_mb {
+        Some(mb) => {
+            p.push(1);
+            p.extend_from_slice(&mb.to_be_bytes());
+        }
+        None => p.push(0),
+    }
+    p.extend_from_slice(&[0u8; 9]);
     p.extend_from_slice(&0u32.to_be_bytes());
     p.extend_from_slice(&0u32.to_be_bytes());
     p.push(0);
@@ -206,7 +218,7 @@ fn bad_flag_values_are_fatal() {
 fn cores_seeds_the_slot_allowance() {
     let (_spawned, mut stream) = spawn(&["--cores", "37"]);
     authenticate(&mut stream);
-    send_run(&mut stream, "export default 1");
+    send_run(&mut stream, "export default 1", None);
     let body = loop {
         let body = read_frame(&mut stream);
         if body[0] == 0x02 {
@@ -258,9 +270,83 @@ fn the_child_exits_with_a_run_spinning() {
     let mut node = fake_node();
     let (mut spawned, mut stream) = spawn(&["--node-pid", &node.0.id().to_string()]);
     authenticate(&mut stream);
-    send_run(&mut stream, "while (true) {}");
+    send_run(&mut stream, "while (true) {}", None);
     std::thread::sleep(Duration::from_millis(300));
     node.0.kill().unwrap();
     let status = exit_within(&mut spawned.child, Duration::from_secs(3));
     assert_eq!(status.and_then(|s| s.code()), Some(0));
+}
+
+fn crash_file(spawned: &Spawned) -> String {
+    std::fs::read_to_string(spawned.dir.join("crash")).unwrap()
+}
+
+#[test]
+fn a_signal_death_writes_one_line_and_keeps_the_signal() {
+    for (sig, name) in [
+        (libc::SIGSEGV, "SIGSEGV"),
+        (libc::SIGTRAP, "SIGTRAP"),
+        (libc::SIGABRT, "SIGABRT"),
+        (libc::SIGBUS, "SIGBUS"),
+        (libc::SIGILL, "SIGILL"),
+    ] {
+        let (mut spawned, _stream) = spawn(&[]);
+        assert_eq!(crash_file(&spawned), "", "{name}: empty while alive");
+        assert_eq!(unsafe { libc::kill(spawned.child.id() as i32, sig) }, 0);
+        let status = exit_within(&mut spawned.child, TIMEOUT).expect("child exited");
+        assert_eq!(status.signal(), Some(sig), "{name}: {status:?}");
+        let line = format!("[iso4-v8] fatal cause={name}\n");
+        assert_eq!(crash_file(&spawned), line);
+        let stderr = read_stderr(&mut spawned.child);
+        assert_eq!(stderr.matches("fatal cause=").count(), 1, "{stderr}");
+        assert!(stderr.contains(&line), "{stderr}");
+    }
+}
+
+#[test]
+fn an_out_of_memory_names_the_one_off_run() {
+    let (mut spawned, mut stream) = spawn(&[]);
+    authenticate(&mut stream);
+    // DESIGN.md 4.1 measures this one as still aborting the child.
+    send_run(
+        &mut stream,
+        "new Array(50 * 1024 * 1024).fill(0)",
+        Some(128),
+    );
+    let status = exit_within(&mut spawned.child, Duration::from_secs(60)).expect("child exited");
+    assert_eq!(status.signal(), Some(libc::SIGTRAP), "{status:?}");
+    let file = crash_file(&spawned);
+    assert_eq!(file.matches('\n').count(), 1, "{file}");
+    assert!(
+        file.starts_with("[iso4-v8] fatal cause=oom-heap phase=oneoff run=1 msg=\""),
+        "{file}"
+    );
+    assert!(file.ends_with("\"\n"), "{file}");
+    let stderr = read_stderr(&mut spawned.child);
+    assert_eq!(stderr.matches("fatal cause=").count(), 1, "{stderr}");
+    assert!(stderr.contains(&file), "{stderr}");
+}
+
+#[test]
+fn a_crash_file_that_cannot_open_leaves_stderr() {
+    let dir = fresh_dir();
+    std::fs::create_dir(dir.join("crash")).unwrap();
+    let (mut spawned, mut stream) = spawn_in(dir, &[]);
+    authenticate(&mut stream);
+    assert_eq!(
+        unsafe { libc::kill(spawned.child.id() as i32, libc::SIGSEGV) },
+        0
+    );
+    let status = exit_within(&mut spawned.child, TIMEOUT).expect("child exited");
+    assert_eq!(status.signal(), Some(libc::SIGSEGV));
+    let stderr = read_stderr(&mut spawned.child);
+    assert_eq!(
+        stderr.matches("cannot open the crash file").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("[iso4-v8] fatal cause=SIGSEGV\n"),
+        "{stderr}"
+    );
 }

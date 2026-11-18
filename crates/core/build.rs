@@ -39,7 +39,7 @@ fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
 
 // No OOM handlers either, for the same two reasons.
 unsafe fn set_oom_error_handler(_: &mut ::v8::Isolate, _: &crate::v8::OomRecord) {}
-fn set_fatal_memory_error_callback() {}
+fn set_fatal_callbacks() {}
 
 fn main() {
     println!("cargo:rerun-if-changed=src");

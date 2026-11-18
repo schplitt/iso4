@@ -77,7 +77,7 @@ iso4/                              ← workspace root
           isolate.rs               ← isolate creation: platform, limits, budgets, warm InstanceCore
           runtable.rs              ← per-run state table, run tokens, attribution, the load meter, the CPED rider
           exceptions.rs            ← thrown V8 values to RunError: capped text, syntax errors, error fields
-          oom_label.rs             ← the fatal OOM line: the per-isolate OomRecord and the OOM handlers
+          oom_label.rs             ← the fatal hook: the per-isolate OomRecord and the OOM and V8 fatal callbacks
           console.rs               ← console.* capture: wrapped methods, rendering, per-run buffers
           timers.rs                ← setTimeout/clearTimeout natives and the timer turn
           guard.rs                 ← limit guard: per-turn CPU/wall deadlines on one watchdog thread
@@ -102,6 +102,7 @@ iso4/                              ← workspace root
       src/
         main.rs                    ← arg parsing, UDS accept loop
         process.rs                 ← the pid file next to the socket, the --node-pid watch
+        crash.rs                   ← the crash file, the fatal line, the signal handlers
         session.rs                 ← per-connection frame glue: handshake, demux, the connection's HostLink
         ipc.rs, wire.rs            ← frames, payload parsers and encoders
 ```

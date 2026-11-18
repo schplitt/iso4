@@ -53,8 +53,9 @@ network policy; `fetch` is a host-configured bridge global like any other.
   `runtable.rs` keys everything a native callback reaches by the owning run
   and carries that run's token through its continuations; `exceptions.rs`
   turns thrown V8 values into `RunError`s;
-  `oom_label.rs` writes the fatal OOM line from each isolate's
-  `OomRecord`, which `src/oom_handler.cc` hands to V8; `console.rs`, `timers.rs` and
+  `oom_label.rs` reports a fatal V8 error to the embedder's fatal hook,
+  naming the run from each isolate's `OomRecord`, which
+  `src/oom_handler.cc` hands to V8; `console.rs`, `timers.rs` and
   `guard.rs` hold the console capture, the guest timers and the limit
   guard; `globals.rs` installs host globals and
   `waitUntil`; `modules.rs` evaluates prefixes, resolves imports and

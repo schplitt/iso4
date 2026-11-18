@@ -418,24 +418,35 @@ V8 collects before its turn ends.
 
 The child registers V8's OOM error handler on every user-code isolate, with
 that isolate's record of its prefix and executing run as the handler's data,
-so before that abort it writes one line on its stderr:
-`[iso4-v8] fatal: V8 out of memory (heap|non-heap) in run <id> of prefix
-<prefix_id>: <V8 message>[ (<detail>)] — aborting the process`, with
-`in one-off run <id>` for `sandbox.run()`, `during cold start of prefix
-<prefix_id> (triggered by run <id>)` while the prefix evaluates, and
-`with no run executing in this isolate` between runs. The record belongs to
-the isolate, so heap OOMs raised on V8 worker threads (parallel scavenge or
-evacuation, background `LocalHeap` allocation) name the same run. The line
-names the run whose turn was executing; a co-resident run's continuation
-resumed inside that turn is reported as the turn owner. OOMs raised with no
-current isolate (Zone exhaustion on background compile threads) reach the
-process-wide callback the child registers before V8 initializes, and print
-the line with `outside any isolate`, followed by V8's own `# Fatal process
-out of memory: <location>`. On the isolate path the iso4 line
-replaces V8's `# Fatal JavaScript out of memory: Reached heap limit` block,
-which V8 skips once a handler is installed; the process then aborts with
-`API fatal error handler returned after process out of memory`. The host
-inherits the child's stderr and sees the line unparsed.
+so before that abort it writes one line, to the `crash` file next to its
+socket and to its stderr:
+`[iso4-v8] fatal cause=oom-heap phase=run run=42 prefix=7 msg="Reached heap
+limit"`. `cause` is `oom-heap` or `oom-other`; `phase` is `run`, `oneoff`
+for `sandbox.run()`, `cold-start` while the prefix evaluates (`run` names
+the run that triggered it), `idle` between runs, or `none` outside any
+isolate; a value that does not apply is left out. `msg` comes last, holds
+V8's message and ` (<detail>)` if V8 gave one, escapes `"`, `\` and control
+bytes as `\"`, `\\` and `\xHH`, and is cut so the line stays within 1024
+bytes. The record belongs to the isolate, so heap OOMs raised on V8 worker
+threads (parallel scavenge or evacuation, background `LocalHeap` allocation)
+name the same run. The line names the run whose turn was executing; a
+co-resident run's continuation resumed inside that turn is reported as the
+turn owner. OOMs raised with no current isolate (Zone exhaustion on
+background compile threads) reach the process-wide callback the child
+registers before V8 initializes, with `phase=none`. A V8 fatal error (a
+failed `CHECK`) writes `cause=v8-fatal` and `msg` only. The signals
+SIGSEGV, SIGTRAP, SIGABRT, SIGBUS and SIGILL write `cause=` with the signal
+name and nothing else; the handler then ends the process with that same
+signal, so the host sees the true cause (V8's own abort is a trap
+instruction in this build, so an OOM death is SIGTRAP). One death writes one
+line, whichever of these it passes through first. On the OOM path V8 still
+prints its own output around the line: its `<--- Last few GCs --->` block
+before it, and after it a `# Fatal error` block with `API fatal error
+handler returned after process out of memory` and a C stack trace. The host inherits the child's stderr
+and sees the line unparsed. Core writes no line itself: it calls the fatal
+hook an embedder sets with `set_fatal_hook`, and registers none of these V8
+callbacks when no hook is set, so V8 prints its own messages, like any plain
+V8 embedder.
 
 Capacity reserves the **hard** line: `admit_isolate` must not admit an
 isolate whose real ceiling could tip the container past the 90% admission
@@ -3517,7 +3528,7 @@ then moves into the section it belongs to.
 
 **Implementation rules.**
 
-- The child never panics on a log write: every log line goes through `iso4_core::log!`, which drops or cuts short a line stderr cannot take (the fatal OOM line has its own allocation-free write). The readiness line goes to a separate pipe.
+- The child never panics on a log write: every log line goes through `iso4_core::log!`, which drops or cuts short a line stderr cannot take (the fatal line is written without allocating by the server's `crash.rs`). The readiness line goes to a separate pipe.
 - The handshake carries a role. `Authenticate{ role: node | supervisor, connectionId, incarnation? }`; the supervisor role skips the V8 serialization probe and unlocks the supervisor-only frames.
 - Committed total, full, and the park, defined. Committed = the sum of heap caps of live isolates, an uncapped run at the default cap. Full = a new isolate is needed and `instances >= maxInstances`; join semantics (sharing a busy instance) stay. Park = one `--tick-ms`. Before the first `Grant` a child uses `--grant-bytes` and `--grant-instances` from argv; `--admission-line-bytes` goes.
 - The heap cap is set at prepare and not per call. `Precompile` carries it; `PrefixRun` carries the other limits (cpu, wall, bridge) only; one-off `Run` keeps its cap.
