@@ -103,6 +103,7 @@ iso4/                              ← workspace root
         main.rs                    ← arg parsing, UDS accept loop
         process.rs                 ← the pid file next to the socket, the --node-pid watch
         crash.rs                   ← the crash file, the fatal line, the signal handlers
+        oom.rs                     ← oom_score_adj at startup (Linux), so the kernel kills the child before Node
         session.rs                 ← per-connection frame glue: handshake, demux, the connection's HostLink
         ipc.rs, wire.rs            ← frames, payload parsers and encoders
 ```

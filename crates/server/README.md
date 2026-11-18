@@ -19,6 +19,8 @@ This is the only crate that knows the wire.
 4. `process.rs` writes the pid file and runs the `--node-pid` watch.
 5. `crash.rs` opens the crash file, sets core's fatal hook and installs the
    signal handlers.
+6. `oom.rs` raises this process's `oom_score_adj` at startup (Linux only),
+   so a container OOM kill takes the child before Node.
 
 The layout of every frame and payload is in `docs/protocol.md`. The
 TypeScript side is `packages/iso4-sandbox/src/ipc.ts`; the two must stay

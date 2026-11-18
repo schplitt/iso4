@@ -5,11 +5,12 @@
 
 mod crash;
 mod ipc;
+mod oom;
 mod process;
 mod session;
 mod wire;
 
-use iso4_core::{blob, container, engine, oom, policy, rss, v8 as sandbox, warm};
+use iso4_core::{blob, container, engine, policy, rss, v8 as sandbox, warm};
 use iso4_types as types;
 
 use std::os::unix::net::UnixListener;
