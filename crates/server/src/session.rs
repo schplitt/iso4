@@ -72,7 +72,7 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
     if let Err(e) = ipc::write_rust_to_ts_frame(
         stream,
         ipc::RustToTsMessageType::Hello,
-        &ipc::encode_hello_payload(status, iso4_core::blob::probe(), message),
+        &ipc::encode_hello_payload(status, iso4_core::wire::probe(), message),
     ) {
         iso4_core::log!("[iso4-v8] failed to write rejection Hello frame: {e}");
     }
@@ -313,8 +313,8 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     // emits — the Hello probe included — carries the relabelled WRITE version
     // (see `blob::relabel_write_version`). One binary spans Node lines on
     // either side of V8's 15→16 format bump.
-    let host_version = iso4_core::blob::probe_format_version(&auth.probe);
-    let read_version = iso4_core::blob::read_format_version();
+    let host_version = iso4_core::wire::probe_format_version(&auth.probe);
+    let read_version = iso4_core::wire::read_format_version();
     match host_version {
         Some(v) if v <= read_version => {}
         _ => {
@@ -335,7 +335,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     if let Err(e) = ipc::write_rust_to_ts_frame(
         &mut stream,
         ipc::RustToTsMessageType::Hello,
-        &ipc::encode_hello_payload(ipc::HelloStatus::Ok, iso4_core::blob::probe(), ""),
+        &ipc::encode_hello_payload(ipc::HelloStatus::Ok, iso4_core::wire::probe(), ""),
     ) {
         iso4_core::log!("[iso4-v8] failed to write Hello frame: {e}");
         return;
@@ -370,7 +370,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
         call_ids: Arc::new(AtomicU32::new(0)),
         // Only host-type descriptors stamped with this key rehydrate
         // (docs/protocol.md §4.4.6).
-        brand_key: iso4_core::webcodec::brand_key_for_token(&auth.descriptor_token),
+        brand_key: iso4_core::wire::brand_key_for_token(&auth.descriptor_token),
     };
 
     // However the demux ends, a panic included, every run in flight on this
@@ -742,7 +742,7 @@ mod tests {
         // refused purely for its size, which is what the pre-handshake ceiling
         // is for: how much an unproven peer can make the runtime buffer. A
         // real probe is a few bytes, so nothing legitimate comes near 4 KiB.
-        let mut probe = iso4_core::blob::probe().to_vec();
+        let mut probe = iso4_core::wire::probe().to_vec();
         probe.resize(5_000, 0);
         let (mut host, done) = spawn_session();
 
@@ -766,7 +766,7 @@ mod tests {
         ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
             probe,
-            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         })
     }
 
@@ -785,11 +785,11 @@ mod tests {
     #[test]
     fn valid_handshake_is_acknowledged_with_the_runtime_probe() {
         let frame =
-            handshake(authenticate(iso4_core::blob::probe().to_vec())).expect("expected a Hello frame");
+            handshake(authenticate(iso4_core::wire::probe().to_vec())).expect("expected a Hello frame");
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Hello);
         let (status, probe, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
-        assert_eq!(probe, iso4_core::blob::probe());
+        assert_eq!(probe, iso4_core::wire::probe());
         assert_eq!(message, "");
     }
 
@@ -798,7 +798,7 @@ mod tests {
     /// even though it relabels its own writes to 15.
     #[test]
     fn a_format_16_probe_is_accepted() {
-        let mut probe = iso4_core::blob::probe().to_vec();
+        let mut probe = iso4_core::wire::probe().to_vec();
         probe[1] = 0x10;
         let frame = handshake(authenticate(probe)).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
@@ -812,10 +812,10 @@ mod tests {
     #[test]
     fn the_hello_probe_advertises_write_format_15() {
         let frame =
-            handshake(authenticate(iso4_core::blob::probe().to_vec())).expect("expected a Hello frame");
+            handshake(authenticate(iso4_core::wire::probe().to_vec())).expect("expected a Hello frame");
         let (status, probe, _) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
-        assert_eq!(probe[0], iso4_core::blob::V8_BLOB_HEADER_TAG);
+        assert_eq!(probe[0], iso4_core::wire::V8_BLOB_HEADER_TAG);
         assert_eq!(probe[1], 0x0F);
     }
 
@@ -823,7 +823,7 @@ mod tests {
     fn impossible_v8_format_version_is_refused_loudly() {
         // A probe claiming a serialization format far newer than anything this
         // V8 can read. The old protocol closed the socket silently here.
-        let probe = vec![iso4_core::blob::V8_BLOB_HEADER_TAG, 0x63, 0x30];
+        let probe = vec![iso4_core::wire::V8_BLOB_HEADER_TAG, 0x63, 0x30];
         let frame = handshake(authenticate(probe)).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::V8FormatMismatch as u8);
@@ -845,8 +845,8 @@ mod tests {
     fn protocol_version_mismatch_is_refused_loudly() {
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION + 1,
-            probe: iso4_core::blob::probe().to_vec(),
-            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
+            probe: iso4_core::wire::probe().to_vec(),
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         });
         let frame = handshake(payload).expect("expected a Hello frame");
         let (status, _, message) = parse_hello(&frame.payload);
@@ -961,7 +961,7 @@ mod tests {
         ipc::write_ts_to_rust_frame(
             &mut host,
             ipc::TsToRustMessageType::Authenticate,
-            &authenticate(iso4_core::blob::probe().to_vec()),
+            &authenticate(iso4_core::wire::probe().to_vec()),
         )
         .unwrap();
         let hello = ipc::read_rust_to_ts_frame(&mut host).expect("a Hello frame");
@@ -1370,7 +1370,7 @@ mod tests {
         // as any other malformed Authenticate.
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
-            probe: iso4_core::blob::probe().to_vec(),
+            probe: iso4_core::wire::probe().to_vec(),
             descriptor_token: vec![0xab; 8],
         });
         assert!(
