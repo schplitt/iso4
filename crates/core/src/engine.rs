@@ -275,9 +275,8 @@ impl Engine {
         Ok(Self::new(budget, line))
     }
 
-    /// For tests that start V8 lazily; goes behind `testing` in a later PR.
-    #[doc(hidden)]
-    pub fn new(warm_budget_bytes: u64, hard_line_bytes: u64) -> Self {
+    /// For tests that start V8 lazily (`testing::engine`).
+    pub(crate) fn new(warm_budget_bytes: u64, hard_line_bytes: u64) -> Self {
         Self {
             prefixes: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),

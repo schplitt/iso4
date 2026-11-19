@@ -17,6 +17,8 @@ pub mod prefix;
 pub mod rss;
 pub mod snapshot;
 #[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+#[cfg(any(test, feature = "test-support"))]
 pub mod testval;
 pub mod types;
 pub mod url;

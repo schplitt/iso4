@@ -74,8 +74,8 @@ network policy; `fetch` is a host-configured bridge global like any other.
 `cargo test --manifest-path crates/Cargo.toml -p iso4-core`. The tests drive
 runs through an in-memory `HostLink` (`ChannelLink` in `link.rs`, wired up
 by `test_io` in `v8/testsupport.rs`) and never touch a socket. The
-`test-support` feature exposes `testval`, a test-only value tree for
-asserting on serialized blobs from other crates' tests.
+`test-support` feature exposes `testing` (`engine`, `testval`, the lazy V8
+start, bench internals) for other crates' tests and `benches/`.
 
 ## Read next
 
