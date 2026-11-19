@@ -142,11 +142,11 @@ pub struct NoopObserver;
 
 impl Observer for NoopObserver {}
 
-/// A link that queues every message for the test to read.
-#[cfg(test)]
+/// A link that queues every message for tests and benches to read.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct ChannelLink(pub(crate) crossbeam_channel::Sender<(Addr, Outbound)>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl HostLink for ChannelLink {
     fn send(&self, to: Addr, msg: Outbound) -> Result<(), LinkError> {
         self.0
@@ -155,9 +155,9 @@ impl HostLink for ChannelLink {
     }
 }
 
-/// A [`ChannelLink`] and the receiving end.
-#[cfg(test)]
-pub(crate) fn channel_link() -> (
+/// A `ChannelLink` and the receiving end.
+#[cfg(any(test, feature = "test-support"))]
+pub fn channel_link() -> (
     std::sync::Arc<dyn HostLink>,
     crossbeam_channel::Receiver<(Addr, Outbound)>,
 ) {
