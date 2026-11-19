@@ -14,9 +14,10 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use iso4_core::engine::{Caller, Engine, Refusal, RunHandle};
-use iso4_core::link::{Addr, HostLink, Inbound, LinkError, NoopObserver, Outbound};
 use iso4_core::trace;
+use iso4_core::{
+    Addr, Caller, Engine, HostLink, Inbound, LinkError, NoopObserver, Outbound, Refusal, RunHandle,
+};
 use iso4_types as types;
 
 use crate::ipc;

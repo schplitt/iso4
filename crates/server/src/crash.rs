@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
-use iso4_core::v8::{FatalCause, FatalInfo, FatalPhase};
+use iso4_core::{FatalCause, FatalInfo, FatalPhase};
 
 /// The line's bound, newline included.
 const LINE_MAX: usize = 1024;

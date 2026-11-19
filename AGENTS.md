@@ -67,7 +67,7 @@ iso4/                              ← workspace root
       benches/micro.rs             ← criterion micro suite
       tests/wpt/                   ← vendored WPT URL corpus
       src/
-        lib.rs                     ← module list, SNAPSHOT_BLOB, new_platform, the OOM handler registration
+        lib.rs                     ← the export list, SNAPSHOT_BLOB, new_platform, the OOM handler registration
         engine.rs                  ← Engine: prefix store + warm registry; prepare/run/prefix_run, RunHandle
         prefix.rs                  ← stored prefix shape, rebind validation
         v8/                        ← the engine core
