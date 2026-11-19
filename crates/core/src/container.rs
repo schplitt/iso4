@@ -25,19 +25,21 @@ use std::time::Instant;
 /// the admission line from the container limit. Sized for a typical Node
 /// host (~80 MB measured) with margin; a host that caches heavily wants
 /// more. Mirrored by `index.ts` `DEFAULT_HOST_RESERVE_MB` — change both
-/// together.
-pub const DEFAULT_HOST_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
+/// together. Public through `EngineOptions::default()`.
+pub(crate) const DEFAULT_HOST_RESERVE_BYTES: u64 = 128 * 1024 * 1024;
 
-/// The reserve actually in force: the host's `hostReserveMb`, set once from
-/// `--host-reserve-bytes` before the first line is drawn.
-static HOST_RESERVE_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_HOST_RESERVE_BYTES);
+/// `EngineOptions::host_reserve_bytes`, set once by `Engine::start`.
+static HOST_RESERVE_BYTES: OnceLock<u64> = OnceLock::new();
 
 pub fn host_reserve_bytes() -> u64 {
-    HOST_RESERVE_BYTES.load(Ordering::Relaxed)
+    HOST_RESERVE_BYTES
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_HOST_RESERVE_BYTES)
 }
 
-pub fn set_host_reserve_bytes(bytes: u64) {
-    HOST_RESERVE_BYTES.store(bytes, Ordering::Relaxed);
+pub(crate) fn set_host_reserve_bytes(bytes: u64) {
+    let _ = HOST_RESERVE_BYTES.set(bytes);
 }
 
 /// The hard admission line: 90% of (container limit − host reserve). An

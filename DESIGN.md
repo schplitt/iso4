@@ -444,7 +444,7 @@ prints its own output around the line: its `<--- Last few GCs --->` block
 before it, and after it a `# Fatal error` block with `API fatal error
 handler returned after process out of memory` and a C stack trace. The host inherits the child's stderr
 and sees the line unparsed. Core writes no line itself: it calls the fatal
-hook an embedder sets with `set_fatal_hook`, and registers none of these V8
+hook an embedder passes as `EngineOptions::on_fatal` to `Engine::start`, and registers none of these V8
 callbacks when no hook is set, so V8 prints its own messages, like any plain
 V8 embedder.
 

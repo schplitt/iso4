@@ -34,8 +34,8 @@ const SIGNALS: [(c_int, &str); 5] = [
 /// Rust std's handler, which reports a stack overflow and otherwise returns.
 static PREVIOUS: [OnceLock<libc::sigaction>; 2] = [const { OnceLock::new() }; 2];
 
-/// Opens the crash file, sets core's fatal hook and installs the signal
-/// handlers. Call before V8 starts.
+/// Opens the crash file and installs the signal handlers. Call before V8
+/// starts; [`on_fatal`] goes to `EngineOptions::on_fatal`.
 pub fn install(socket_path: &str) {
     let dir = Path::new(socket_path).parent().unwrap_or(Path::new(""));
     let path = dir.join("crash");
@@ -52,7 +52,6 @@ pub fn install(socket_path: &str) {
             path.display()
         ),
     }
-    iso4_core::v8::set_fatal_hook(on_fatal);
     for (i, &(sig, _)) in SIGNALS.iter().enumerate() {
         // SAFETY: all zeros is a valid sigaction; the fields are set below.
         let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -75,7 +74,7 @@ pub fn install(socket_path: &str) {
     }
 }
 
-fn on_fatal(info: &FatalInfo<'_>) {
+pub(crate) fn on_fatal(info: &FatalInfo<'_>) {
     let cause = match info.cause {
         FatalCause::OomHeap => "oom-heap",
         FatalCause::OomOther => "oom-other",

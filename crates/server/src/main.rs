@@ -10,9 +10,11 @@ mod process;
 mod session;
 mod wire;
 
-use iso4_core::{blob, container, engine, policy, rss, v8 as sandbox, warm};
+use iso4_core::engine::{Engine, EngineOptions, StartError};
+use iso4_core::policy;
 use iso4_types as types;
 
+use std::num::NonZeroUsize;
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 
@@ -24,44 +26,39 @@ fn main() {
     let (socket_path, warm_budget_bytes, host_reserve_bytes, idle_settle_secs, cores, node_pid) =
         parse_args();
 
-    // Before V8 starts (`blob::probe` below), so a death in its start is recorded.
+    // Before V8 starts (`Engine::start` below), so a death in its start is recorded.
     crash::install(&socket_path);
 
-    // Before any line is drawn: the admission line is derived from it.
-    container::set_host_reserve_bytes(host_reserve_bytes);
-    sandbox::set_idle_settle_secs(idle_settle_secs);
-    // Before the V8 platform starts (`blob::probe` below): it sizes its pool from this.
-    if let Some(n) = cores {
-        warm::set_cores(n);
-    }
     if let Some(pid) = node_pid {
         process::watch_node(pid);
     }
 
-    // A budget with no readable meter would silently never be enforced —
-    // fail at startup instead (rationale: DESIGN.md §13.2.1).
-    if warm_budget_bytes > 0
-        && container::usage_bytes().is_none()
-        && rss::process_rss_bytes().is_none()
-    {
-        iso4_core::log!(
-            "[iso4-v8] cannot read container memory or this process's \
-             resident memory, so the {warm_budget_bytes}-byte memory budget \
-             could never be enforced. This usually means neither the cgroup \
-             filesystem nor /proc is readable in this environment. Mount \
-             one, or pass memoryBudgetMb: 0 to run without a budget."
-        );
-        std::process::exit(1);
-    }
-
-    // 0 when no container limit is readable (line disabled).
-    let hard_line_bytes = container::admission_line_bytes();
-
-    // Compute the V8 serialization probe (and with it this binary's write
-    // format version) once, in a throwaway isolate, before any connection
-    // arrives. The handshake in `session.rs` is then a byte comparison — no
-    // isolate plumbing in the session layer, no per-connection cost.
-    blob::probe();
+    // One engine for all connections. Access control is the owner-only
+    // directory the host created the socket path in.
+    let engine = match Engine::start(EngineOptions {
+        cores,
+        on_fatal: Some(crash::on_fatal),
+        warm_budget_bytes,
+        host_reserve_bytes,
+        idle_settle_secs,
+        ..EngineOptions::default()
+    }) {
+        Ok(engine) => Arc::new(engine),
+        Err(StartError::NoMemoryMeter) => {
+            iso4_core::log!(
+                "[iso4-v8] cannot read container memory or this process's \
+                 resident memory, so the {warm_budget_bytes}-byte memory budget \
+                 could never be enforced. This usually means neither the cgroup \
+                 filesystem nor /proc is readable in this environment. Mount \
+                 one, or pass memoryBudgetMb: 0 to run without a budget."
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            iso4_core::log!("[iso4-v8] {e}");
+            std::process::exit(1);
+        }
+    };
 
     if let Err(e) = process::write_pid_file(&socket_path) {
         iso4_core::log!("[iso4-v8] {e}");
@@ -92,31 +89,22 @@ fn main() {
     };
     let default_heap_mb = types::DEFAULT_MEMORY_MB;
     let warm_ceiling_mb = default_heap_mb + policy::heap_band_mb(default_heap_mb);
-    match container::limit_info() {
-        Some((limit, source)) => iso4_core::log!(
+    let capacity = engine.capacity();
+    match (capacity.container_limit_bytes, capacity.limit_source) {
+        (Some(limit), Some(source)) => iso4_core::log!(
             "[iso4-v8] capacity: container limit {} MB ({source}), host reserve {} MB, \
              admission line {} MB, warm budget {budget}, default run heap \
              {default_heap_mb} MB (warm-run ceiling {warm_ceiling_mb} MB)",
             limit / MB,
-            container::host_reserve_bytes() / MB,
-            hard_line_bytes / MB,
+            capacity.host_reserve_bytes / MB,
+            capacity.admission_line_bytes / MB,
         ),
-        None => iso4_core::log!(
+        _ => iso4_core::log!(
             "[iso4-v8] capacity: container limit unreadable — admission line disabled; \
              warm budget {budget}, default run heap {default_heap_mb} MB \
              (warm-run ceiling {warm_ceiling_mb} MB)"
         ),
     }
-
-    // One engine for all connections. Access control is the owner-only
-    // directory the host created the socket path in.
-    let engine = Arc::new(engine::Engine::new(
-        warm_budget_bytes,
-        hard_line_bytes,
-    ));
-
-    // Cold start: one run per core until a completed run reports its shape.
-    warm::seed_slot_allowance(warm::cores());
 
     for stream in listener.incoming() {
         match stream {
@@ -132,13 +120,13 @@ fn main() {
     }
 }
 
-fn parse_args() -> (String, u64, u64, u64, Option<usize>, Option<i32>) {
+fn parse_args() -> (String, u64, u64, u64, Option<NonZeroUsize>, Option<i32>) {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
     let mut warm_budget_bytes: u64 = 0;
-    let mut host_reserve_bytes: u64 = container::DEFAULT_HOST_RESERVE_BYTES;
+    let mut host_reserve_bytes: u64 = EngineOptions::default().host_reserve_bytes;
     let mut idle_settle_secs: u64 = 0;
-    let mut cores: Option<usize> = None;
+    let mut cores: Option<NonZeroUsize> = None;
     let mut node_pid: Option<i32> = None;
 
     let mut i = 1;
@@ -198,8 +186,8 @@ fn parse_args() -> (String, u64, u64, u64, Option<usize>, Option<i32>) {
             }
             "--cores" if i + 1 < args.len() => {
                 // Replaces the machine's core count; absent keeps it.
-                match args[i + 1].parse::<usize>() {
-                    Ok(n) if n >= 1 => cores = Some(n),
+                match args[i + 1].parse::<NonZeroUsize>() {
+                    Ok(n) => cores = Some(n),
                     _ => {
                         iso4_core::log!(
                             "[iso4-v8] --cores must be an integer of at least 1, got {:?}",

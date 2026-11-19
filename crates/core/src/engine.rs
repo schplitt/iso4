@@ -3,9 +3,11 @@
 //! [`HostLink`] and never sees a frame.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::container;
 use crate::errors;
 use crate::link::{HostLink, Inbound, Observer};
 use crate::prefix::{validate_global_rebinds, validate_import_rebinds, PrefixData, PrefixEntry};
@@ -142,6 +144,83 @@ impl RunHandle {
     }
 }
 
+/// Process-wide settings for [`Engine::start`]. `Default` holds every default.
+#[derive(Clone, Debug)]
+pub struct EngineOptions {
+    /// `None` = the machine's count. Sizes V8's thread pool and the per-prefix ceiling.
+    pub cores: Option<NonZeroUsize>,
+    /// Called from a dying process on a fatal V8 error; `None` = V8 prints its own.
+    pub on_fatal: Option<sandbox::FatalHook>,
+    /// The mark the warm registry sheds against (global container usage); 0 = off.
+    pub warm_budget_bytes: u64,
+    /// The isolate admission line.
+    pub admission_line: AdmissionLine,
+    /// What the container limit owes the host before [`AdmissionLine::Auto`] is drawn.
+    pub host_reserve_bytes: u64,
+    /// Idle seconds before an instance settles its heap once; 0 = off.
+    pub idle_settle_secs: u64,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            cores: None,
+            on_fatal: None,
+            warm_budget_bytes: 0,
+            admission_line: AdmissionLine::Auto,
+            host_reserve_bytes: container::DEFAULT_HOST_RESERVE_BYTES,
+            idle_settle_secs: 0,
+        }
+    }
+}
+
+/// Where isolate admission stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionLine {
+    /// 90% of (container limit - host reserve); off when no limit is readable.
+    Auto,
+    /// No line.
+    Off,
+    /// This many bytes.
+    Bytes(u64),
+}
+
+/// Why [`Engine::start`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StartError {
+    /// `start` already ran in this process, or V8 was started before it.
+    AlreadyStarted,
+    /// A warm budget is set, but neither container memory nor this process's
+    /// resident memory is readable.
+    NoMemoryMeter,
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AlreadyStarted => "the engine was already started in this process",
+            Self::NoMemoryMeter => {
+                "no memory meter is readable, so the memory budget could never be enforced"
+            }
+        })
+    }
+}
+
+impl std::error::Error for StartError {}
+
+/// The memory lines an engine runs under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capacity {
+    /// The container's memory limit; `None` when unreadable.
+    pub container_limit_bytes: Option<u64>,
+    /// Where the limit was read from ("cgroup v2", "cgroup v1", "host total").
+    pub limit_source: Option<&'static str>,
+    pub host_reserve_bytes: u64,
+    /// 0 = no line.
+    pub admission_line_bytes: u64,
+}
+
 /// One per process. A prefix prepared through any caller is visible to all
 /// of them, so the host pool can route any run to any connection. A caller
 /// starts its runs from one thread.
@@ -151,17 +230,70 @@ pub struct Engine {
     /// Every prefix run is served by a resident instance from here; one-off
     /// runs share its slot accounting.
     warm: warm::WarmRegistry,
+    admission_line_bytes: u64,
 }
 
 impl Engine {
-    /// `warm_budget_bytes` is the mark the registry sheds against (global
-    /// container usage; 0 disables it); `hard_line_bytes` is the isolate
-    /// admission line (0 = no container limit readable).
+    /// Once per process: checks the memory meter, stores the settings, starts
+    /// V8, runs the blob probe and seeds the slot allowance.
+    pub fn start(options: EngineOptions) -> Result<Engine, StartError> {
+        // A budget with no readable meter would silently never be enforced
+        // (DESIGN.md §13.2.1). Checked first: it stores nothing, so a retry works.
+        let budget = options.warm_budget_bytes;
+        if budget > 0
+            && container::usage_bytes().is_none()
+            && crate::rss::process_rss_bytes().is_none()
+        {
+            return Err(StartError::NoMemoryMeter);
+        }
+
+        // Decided inside V8's one start, so a lazy start on another thread
+        // cannot slip in between.
+        let started = sandbox::isolate::init_platform_with(|| {
+            if let Some(hook) = options.on_fatal {
+                sandbox::set_fatal_hook(hook);
+            }
+            if let Some(n) = options.cores {
+                sandbox::isolate::set_cores(n);
+            }
+            container::set_host_reserve_bytes(options.host_reserve_bytes);
+            sandbox::isolate::set_idle_settle_secs(options.idle_settle_secs);
+        });
+        if !started {
+            return Err(StartError::AlreadyStarted);
+        }
+        // The handshake then compares bytes: no isolate per connection.
+        crate::blob::probe();
+        // Cold start: one run per core until a completed run reports its shape.
+        warm::seed_slot_allowance(warm::cores());
+
+        let line = match options.admission_line {
+            AdmissionLine::Auto => container::admission_line_bytes(),
+            AdmissionLine::Off => 0,
+            AdmissionLine::Bytes(n) => n,
+        };
+        Ok(Self::new(budget, line))
+    }
+
+    /// For tests that start V8 lazily; goes behind `testing` in a later PR.
+    #[doc(hidden)]
     pub fn new(warm_budget_bytes: u64, hard_line_bytes: u64) -> Self {
         Self {
             prefixes: Mutex::new(HashMap::new()),
             next_prefix_id: AtomicU64::new(0),
             warm: warm::WarmRegistry::new(warm_budget_bytes, hard_line_bytes),
+            admission_line_bytes: hard_line_bytes,
+        }
+    }
+
+    /// The container limit, host reserve and admission line in force.
+    pub fn capacity(&self) -> Capacity {
+        let limit = container::limit_info();
+        Capacity {
+            container_limit_bytes: limit.map(|(bytes, _)| bytes),
+            limit_source: limit.map(|(_, source)| source),
+            host_reserve_bytes: container::host_reserve_bytes(),
+            admission_line_bytes: self.admission_line_bytes,
         }
     }
 

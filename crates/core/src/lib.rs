@@ -42,11 +42,11 @@ extern "C" {
 /// frozen clock (`src/clock_platform.cc`). `build.rs` defines its own stock
 /// version of this function.
 pub(crate) fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
-    // `--cores n` sizes the pool n - 1, at least 1, at most 16; unset
+    // `cores: Some(n)` sizes the pool n - 1, at least 1, at most 16; unset
     // passes 0, V8's own count.
-    let pool = match warm::cores_flag() {
-        0 => 0,
-        n => (n - 1).clamp(1, 16) as std::ffi::c_int,
+    let pool = match crate::v8::isolate::cores_option() {
+        None => 0,
+        Some(n) => (n.get() - 1).clamp(1, 16) as std::ffi::c_int,
     };
     // SAFETY: a fresh heap-allocated platform the caller now owns.
     unsafe { ::v8::UniquePtr::from_raw(iso4_new_frozen_clock_platform(pool)) }.unwrap()

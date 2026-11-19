@@ -17,12 +17,12 @@ pub use instance::{
 };
 pub use isolate::{
     CpuBudget, InstanceCore, Limits, PrefixSpec, WARMUP_CPU_MS, WARMUP_WALL_MS,
-    create_instance_core, init_platform, set_idle_settle_secs,
+    create_instance_core, init_platform,
 };
-pub use oom_label::{
-    FatalCause, FatalHook, FatalInfo, FatalPhase, OomRecord, OomRun, OomRunLabel, set_fatal_hook,
+pub(crate) use oom_label::{
+    fatal_hook, fatal_memory_error_cb, oom_error_cb, set_fatal_hook, v8_fatal_error_cb,
 };
-pub(crate) use oom_label::{fatal_hook, fatal_memory_error_cb, oom_error_cb, v8_fatal_error_cb};
+pub use oom_label::{FatalCause, FatalHook, FatalInfo, FatalPhase, OomRecord, OomRun, OomRunLabel};
 pub use runloop::{
     CallJob, CallOutcome, EpilogueSpec, GraceReport, GraceStatus, Output, ReleaseHook, RoutedEvent,
     RunEvent, RunEventSender, RunIo, execute, execute_with_io, execute_with_prefix,
