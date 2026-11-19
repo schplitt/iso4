@@ -12,6 +12,8 @@
 //! - `policy` — warm-registry eviction/pressure decisions (policy.rs).
 //! - `url` — the sandbox `URL` class end to end: JS call → native callback →
 //!   ada parse → component array (url.rs).
+//! - `engine` — whole runs through `Engine` and an in-memory link: cold
+//!   one-off run, warm `prefix_run`, one bridge round trip.
 //!
 //! The payload matrix mirrors `packages/iso4-sandbox/bench/payloads.ts`:
 //! codec cost tracks value count, not bytes, so shapes are chosen by value
@@ -492,6 +494,136 @@ fn bench_policy(c: &mut Criterion) {
     group.finish();
 }
 
+// ── engine: whole runs through the public Engine API ───────────────────────
+
+fn bench_engine(c: &mut Criterion) {
+    use iso4_core::testing::{channel_link, engine, testval};
+    use iso4_core::{Addr, Caller, Engine, Inbound, NoopObserver, Outbound, RunHandle};
+    use iso4_types::{CallSpec, HostGlobalDef, PrefixRunRequest, ResourceLimits, RunRequest};
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+
+    init_platform();
+    let engine: Arc<Engine> = Arc::new(engine(0, 0));
+    let (link, host) = channel_link();
+    let caller = Caller {
+        link,
+        observer: Arc::new(NoopObserver),
+        call_ids: Arc::new(AtomicU32::new(0)),
+        brand_key: String::new(),
+    };
+    let next = |host: &crossbeam_channel::Receiver<(Addr, Outbound)>| {
+        host.recv_timeout(Duration::from_secs(10))
+            .expect("engine bench: no message within 10 s")
+            .1
+    };
+    let expect_success = |msg: Outbound| match msg {
+        Outbound::Result {
+            completion: iso4_types::RunCompletion::Success(_),
+        } => {}
+        other => panic!("engine bench: expected a successful Result, got {other:?}"),
+    };
+    let no_args = testval::to_blob(&testval::TestValue::Array(Vec::new()));
+    let mut run_id: u32 = 0;
+    let prefix_run = |prefix_id: &str, run_id: u32, globals: Vec<HostGlobalDef>| {
+        let req = PrefixRunRequest {
+            run_id,
+            prefix_id: prefix_id.to_string(),
+            limits: ResourceLimits::default(),
+            globals,
+            import_rebinds: Vec::new(),
+            call: CallSpec {
+                export_path: "f".to_string(),
+                args_blob: no_args.clone(),
+            },
+        };
+        let mut handle = None;
+        engine
+            .prefix_run(req, &caller, &mut |h: RunHandle| handle = Some(h))
+            .expect("prefix_run refused");
+        handle.expect("registered handle")
+    };
+
+    let mut group = c.benchmark_group("engine");
+
+    // Fresh isolate per run.
+    let oneoff_code = "export const x = 1".to_string();
+    group.bench_function("oneoff_cold", |b| {
+        b.iter(|| {
+            run_id += 1;
+            let req = RunRequest {
+                run_id,
+                code: oneoff_code.clone(),
+                filename: None,
+                limits: ResourceLimits::default(),
+                globals: Vec::new(),
+                imports: Vec::new(),
+                call: None,
+            };
+            let mut handle = None;
+            engine
+                .run(req, &caller, &mut |h: RunHandle| handle = Some(h))
+                .expect("run refused");
+            expect_success(next(&host));
+            drop(handle);
+        });
+    });
+
+    // One call into an idle warm instance.
+    let warm_prefix = engine.prepare(
+        "export function f(){ return 1 }".to_string(),
+        None,
+        Vec::new(),
+        Vec::new(),
+    );
+    run_id += 1;
+    let handle = prefix_run(&warm_prefix, run_id, Vec::new());
+    expect_success(next(&host));
+    drop(handle);
+    group.bench_function("prefix_run_warm", |b| {
+        b.iter(|| {
+            run_id += 1;
+            let handle = prefix_run(&warm_prefix, run_id, Vec::new());
+            expect_success(next(&host));
+            drop(handle);
+        });
+    });
+
+    // One iteration = one warm prefix_run plus one host bridge call.
+    let bridge_prefix = engine.prepare(
+        "export async function f(){ return await tool() }".to_string(),
+        None,
+        vec![HostGlobalDef::bridge("tool")],
+        Vec::new(),
+    );
+    let answer = testval::to_blob(&testval::TestValue::Number(1.0));
+    let round_trip = |run_id: u32| {
+        // The run binds `tool` to this caller's host session.
+        let handle = prefix_run(&bridge_prefix, run_id, vec![HostGlobalDef::bridge("tool")]);
+        let call_id = match next(&host) {
+            Outbound::BridgeCall { call_id, .. } => call_id,
+            other => panic!("engine bench: expected a BridgeCall, got {other:?}"),
+        };
+        handle.deliver(Inbound::BridgeResponse {
+            call_id,
+            result: Ok(Some(answer.clone())),
+        });
+        expect_success(next(&host));
+    };
+    run_id += 1;
+    round_trip(run_id);
+    group.bench_function("bridge_roundtrip", |b| {
+        b.iter(|| {
+            run_id += 1;
+            round_trip(run_id);
+        });
+    });
+
+    group.finish();
+    engine.dispose_prefix(&warm_prefix);
+    engine.dispose_prefix(&bridge_prefix);
+}
+
 // ── Criterion config ───────────────────────────────────────────────────────
 
 fn configured() -> Criterion {
@@ -515,6 +647,6 @@ fn configured() -> Criterion {
 criterion_group! {
     name = benches;
     config = configured();
-    targets = bench_v8_value, bench_exec, bench_policy, bench_url
+    targets = bench_v8_value, bench_exec, bench_policy, bench_url, bench_engine
 }
 criterion_main!(benches);

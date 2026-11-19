@@ -2,6 +2,7 @@
 //! other crates' tests and `benches/`. Never on in a build.
 
 pub use crate::blob::{deserialize_value, serialize_value};
+pub use crate::link::channel_link;
 pub use crate::policy::{pick_victim, watermark_action, PassOutcome, PressureFacts, VictimFact};
 pub use crate::snapshot::{boot_context, create_params};
 #[path = "testval.rs"]
