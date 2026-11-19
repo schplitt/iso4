@@ -84,6 +84,8 @@ fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) 
 struct ConnLink {
     outbox: ipc::Outbox,
     runs: ConnRuns,
+    /// Read per completion for the slot allowance it carries.
+    engine: Arc<Engine>,
 }
 
 impl HostLink for ConnLink {
@@ -129,7 +131,11 @@ impl HostLink for ConnLink {
             ),
             Outbound::Result { completion } => (
                 ipc::RustToTsMessageType::Result,
-                wire::encode_run_completion_payload(run_id, completion),
+                wire::encode_run_completion_payload(
+                    run_id,
+                    completion,
+                    self.engine.slot_allowance(),
+                ),
                 Vec::new(),
             ),
             Outbound::RunComplete { report } => (
@@ -357,6 +363,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
         link: Arc::new(ConnLink {
             outbox: outbox.clone(),
             runs: Arc::clone(&conn_runs),
+            engine: Arc::clone(&engine),
         }),
         observer: Arc::new(NoopObserver),
         // Bridge call ids never repeat on this connection, across runs.
@@ -418,9 +425,14 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     }
                 };
                 let (run_id, frame_cap) = (req.run_id, frame_cap_for(&req.limits));
-                start_run(&conn_runs, &caller, run_id, frame_cap, |register| {
-                    engine.run(req, &caller, register)
-                });
+                start_run(
+                    &engine,
+                    &conn_runs,
+                    &caller,
+                    run_id,
+                    frame_cap,
+                    |register| engine.run(req, &caller, register),
+                );
             }
             ipc::TsToRustMessageType::Precompile => {
                 let payload = match ipc::parse_precompile_payload(&frame.payload) {
@@ -458,9 +470,14 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     }
                 };
                 let (run_id, frame_cap) = (req.run_id, frame_cap_for(&req.limits));
-                start_run(&conn_runs, &caller, run_id, frame_cap, |register| {
-                    engine.prefix_run(req, &caller, register)
-                });
+                start_run(
+                    &engine,
+                    &conn_runs,
+                    &caller,
+                    run_id,
+                    frame_cap,
+                    |register| engine.prefix_run(req, &caller, register),
+                );
             }
             ipc::TsToRustMessageType::DisposePrefix => {
                 match ipc::parse_dispose_prefix_payload(&frame.payload) {
@@ -591,6 +608,7 @@ fn peek_run_id(payload: &[u8]) -> Option<u32> {
 /// replacing a live route would strand the first run. The demux is this
 /// connection's only route inserter, so the check holds through the start.
 fn start_run(
+    engine: &Engine,
     conn_runs: &ConnRuns,
     caller: &Caller,
     run_id: u32,
@@ -605,11 +623,11 @@ fn start_run(
         iso4_core::log!(
             "[iso4-v8] run {run_id} is already in flight on this connection — refusing the duplicate"
         );
-        let error = iso4_core::v8::RunError::Internal(format!(
+        let refusal = Refusal::Internal(format!(
             "run id {run_id} is already in flight on this connection; every \
              concurrent run needs a distinct id"
         ));
-        refuse(&*caller.link, run_id, error.to_payload());
+        engine.refuse(caller, run_id, refusal);
         return;
     }
     let mut register = |handle: RunHandle| {
@@ -624,14 +642,8 @@ fn start_run(
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&run_id);
-        refuse(&*caller.link, run_id, refusal.to_payload());
+        engine.refuse(caller, run_id, refusal);
     }
-}
-
-/// Answer a run refused before it started: nothing ran, telemetry is zero.
-fn refuse(link: &dyn HostLink, run_id: u32, error: types::RunErrorPayload) {
-    let completion = types::RunCompletion::Failure(types::RunFailurePayload::bare(error));
-    iso4_core::v8::send_completion(link, run_id, Outbound::Result { completion });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1262,6 +1274,17 @@ mod tests {
         assert!(
             text.contains("already in flight"),
             "unexpected refusal shape: {text}"
+        );
+        assert!(
+            text.contains("ERR_INTERNAL"),
+            "unexpected refusal code: {text}"
+        );
+        assert!(
+            text.contains(
+                "run id 1 is already in flight on this connection; every \
+                 concurrent run needs a distinct id"
+            ),
+            "the refusal text changed: {text}"
         );
 
         // Run 1 is unharmed: its response still routes and it completes.

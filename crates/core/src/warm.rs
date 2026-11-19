@@ -506,12 +506,12 @@ const RECOMPUTE_EVERY: u32 = 32;
 static SLOT_ALLOWANCE: AtomicU32 = AtomicU32::new(0);
 
 /// The allowance to stamp on the next `Result`; 0 = no opinion yet.
-pub fn slot_allowance() -> u32 {
+pub(crate) fn slot_allowance() -> u32 {
     SLOT_ALLOWANCE.load(Ordering::Relaxed)
 }
 
 /// Seed the cold-start allowance (the core count) before any run reports.
-pub fn seed_slot_allowance(cores: usize) {
+pub(crate) fn seed_slot_allowance(cores: usize) {
     SLOT_ALLOWANCE.store(u32::try_from(cores).unwrap_or(u32::MAX), Ordering::Relaxed);
 }
 
