@@ -797,11 +797,6 @@ pub(super) fn close_run_streams(streams: *const StreamTable) {
     }
 }
 
-/// Private-symbol key stamping a hydrated body-stream object with its stream
-/// id — Rust-readable, guest-invisible, and how the outbound codec refuses to
-/// serialize a stream back to the host.
-const BODY_STREAM_ID_KEY: &str = "iso4::bodyStreamId";
-
 /// Private marker stamped on EVERY `Iso4BodyStream` at construction (the JS
 /// constructor calls the `stampStreamBody` native), so the codec can
 /// recognize a stream body without consulting guest-mutable state.
@@ -813,18 +808,6 @@ fn body_stream_private<'s>(
 ) -> Option<v8::Local<'s, v8::Private>> {
     let key = v8::String::new(scope, name)?;
     Some(v8::Private::for_api(scope, Some(key)))
-}
-
-/// The stream id a hydrated body-stream object was stamped with, if this is
-/// one. Used by the outbound body check.
-pub fn body_stream_id_of(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Option<u32> {
-    let obj = v8::Local::<v8::Object>::try_from(value).ok()?;
-    let key = body_stream_private(scope, BODY_STREAM_ID_KEY)?;
-    let stamped = obj.get_private(scope, key)?;
-    if !stamped.is_uint32() {
-        return None;
-    }
-    stamped.uint32_value(scope)
 }
 
 /// Whether `value` is a guest body stream (`Iso4BodyStream`), by its
@@ -858,9 +841,8 @@ pub(crate) fn stamp_stream_body_callback(
 }
 
 /// Build the sandbox-side body-stream object for a hydrated stream handle:
-/// calls the factory the web runtime returned at install and stamps the
-/// stream id under a private key. Runs during the rehydration walk (JS is
-/// legal there).
+/// calls the factory the web runtime returned at install. Runs during the
+/// rehydration walk (JS is legal there).
 pub fn make_body_stream<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     stream_id: u32,
@@ -872,11 +854,7 @@ pub fn make_body_stream<'s>(
     let recv = v8::undefined(scope).into();
     let id_arg = v8::Integer::new_from_unsigned(scope, stream_id);
     let stream = factory.call(scope, recv, &[id_arg.into()])?;
-    let stream = v8::Local::<v8::Object>::try_from(stream).ok()?;
-    let id_key = body_stream_private(scope, BODY_STREAM_ID_KEY)?;
-    let id_value = v8::Integer::new_from_unsigned(scope, stream_id);
-    stream.set_private(scope, id_key, id_value.into())?;
-    Some(stream)
+    v8::Local::<v8::Object>::try_from(stream).ok()
 }
 
 /// `streamRead(streamId)` — native pull for the sandbox body stream: resolves

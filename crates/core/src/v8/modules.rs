@@ -313,15 +313,6 @@ pub(super) fn evaluate_prefix_module(
     Ok(v8::Global::new(scope, module))
 }
 
-fn no_import_resolver<'a>(
-    _context: v8::Local<'a, v8::Context>,
-    _specifier: v8::Local<'a, v8::String>,
-    _import_assertions: v8::Local<'a, v8::FixedArray>,
-    _referrer: v8::Local<'a, v8::Module>,
-) -> Option<v8::Local<'a, v8::Module>> {
-    None
-}
-
 // ── Module resolver (Phases 6 + 7) ──────────────────────────────────────────
 //
 // Two flavours per DESIGN.md §4.3:
