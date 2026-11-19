@@ -10,6 +10,7 @@
 /// Comfortably above the host's default of 0 without claiming the scale's
 /// extreme (−1000..=1000): the gap orders the kill, and an embedder running
 /// other adjusted processes keeps room on either side.
+#[cfg(target_os = "linux")]
 pub const OOM_SCORE_ADJ: &str = "500";
 
 /// Best-effort and Linux-only (macOS has no OOM score): a failure leaves
@@ -18,7 +19,7 @@ pub const OOM_SCORE_ADJ: &str = "500";
 pub fn prefer_this_process_as_victim() {
     #[cfg(target_os = "linux")]
     if let Err(e) = std::fs::write("/proc/self/oom_score_adj", OOM_SCORE_ADJ) {
-        crate::log!("[iso4-v8] could not set oom_score_adj: {e}");
+        iso4_core::log!("[iso4-v8] could not set oom_score_adj: {e}");
     }
 }
 

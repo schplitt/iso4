@@ -12,7 +12,6 @@ pub mod engine;
 pub mod errors;
 pub mod link;
 pub mod log;
-pub mod oom;
 pub mod policy;
 pub mod prefix;
 pub mod rss;
