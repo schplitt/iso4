@@ -10,8 +10,7 @@ mod process;
 mod session;
 mod wire;
 
-use iso4_core::engine::{Engine, EngineOptions, StartError};
-use iso4_core::policy;
+use iso4_core::{Engine, EngineOptions, StartError};
 use iso4_types as types;
 
 use std::num::NonZeroUsize;
@@ -88,7 +87,7 @@ fn main() {
         format!("{} MB", warm_budget_bytes / MB)
     };
     let default_heap_mb = types::DEFAULT_MEMORY_MB;
-    let warm_ceiling_mb = default_heap_mb + policy::heap_band_mb(default_heap_mb);
+    let warm_ceiling_mb = default_heap_mb + types::heap_band_mb(default_heap_mb);
     let capacity = engine.capacity();
     match (capacity.container_limit_bytes, capacity.limit_source) {
         (Some(limit), Some(source)) => iso4_core::log!(

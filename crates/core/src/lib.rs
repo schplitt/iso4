@@ -2,34 +2,51 @@
 //!
 //! Isolates, limits, the turn loop, the warm registry, the prefix store, the
 //! web globals and the value codec. It encodes no frame and owns no socket:
-//! a frontend (`crates/server`) drives [`engine::Engine`] and answers through
-//! [`link::HostLink`]. `publish = false`, no API stability guarantees.
+//! a frontend (`crates/server`) drives [`Engine`] and answers through
+//! [`HostLink`]. `publish = false`, no API stability guarantees.
 
-pub mod blob;
-pub mod container;
-pub mod cpuclock;
-pub mod engine;
-pub mod errors;
-pub mod link;
+mod blob;
+mod container;
+mod cpuclock;
+mod engine;
+mod errors;
+mod link;
+#[doc(hidden)]
 pub mod log;
-pub mod policy;
-pub mod prefix;
-pub mod rss;
-pub mod snapshot;
+mod policy;
+mod prefix;
+mod rss;
+mod snapshot;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
-#[cfg(any(test, feature = "test-support"))]
-pub mod testval;
-pub mod types;
-pub mod url;
-pub mod v8;
-pub mod warm;
-pub mod webcodec;
-pub mod webtypes;
+mod types;
+mod url;
+mod v8;
+mod warm;
+mod webcodec;
+mod webtypes;
 pub mod wire;
 
+pub use engine::{
+    AdmissionLine, Caller, Capacity, Engine, EngineOptions, Refusal, RunHandle, StartError,
+};
+pub use errors::{RunError, RuntimeErrorData};
+pub use link::{
+    Addr, ConsoleStream, HostLink, Inbound, LinkError, NoopObserver, Observer, Outbound,
+};
+pub use v8::{FatalCause, FatalHook, FatalInfo, FatalPhase, GraceReport, GraceStatus, ResetCause};
+pub use warm::RegistryStats;
+
+/// Reached by [`trace!`]; not API.
+#[doc(hidden)]
+pub use engine::trace_enabled;
+
+// `testval` lives in `testing`; core's tests keep saying `crate::testval`.
+#[cfg(test)]
+use testing::testval;
+
 /// The startup snapshot `build.rs` creates (see `snapshot.rs`).
-pub static SNAPSHOT_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin"));
+pub(crate) static SNAPSHOT_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin"));
 
 extern "C" {
     fn iso4_new_frozen_clock_platform(thread_pool_size: std::ffi::c_int) -> *mut ::v8::Platform;

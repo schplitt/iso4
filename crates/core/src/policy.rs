@@ -39,7 +39,7 @@ pub struct VictimFact {
     pub last_used: Instant,
 }
 
-/// Pick the instance to evict: highest `heapUsed × idleSecs^`[`AGE_EXPONENT`],
+/// Pick the instance to evict: highest `heapUsed × idleSecs^AGE_EXPONENT`,
 /// ties to the longest-idle. Returns an index into `idle`, or `None` when it
 /// is empty.
 ///

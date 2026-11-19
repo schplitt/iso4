@@ -4,7 +4,8 @@
 pub use crate::blob::{deserialize_value, serialize_value};
 pub use crate::policy::{pick_victim, watermark_action, PassOutcome, PressureFacts, VictimFact};
 pub use crate::snapshot::{boot_context, create_params};
-pub use crate::testval;
+#[path = "testval.rs"]
+pub mod testval;
 /// The default lazy V8 start; `Engine::start` refuses after it.
 pub use crate::v8::init_platform;
 

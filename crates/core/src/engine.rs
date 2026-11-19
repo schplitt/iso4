@@ -34,7 +34,7 @@ pub fn trace_enabled() -> bool {
 #[macro_export]
 macro_rules! trace {
     ($($arg:tt)*) => {
-        if $crate::engine::trace_enabled() {
+        if $crate::trace_enabled() {
             $crate::log!($($arg)*);
         }
     };

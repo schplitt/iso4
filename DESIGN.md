@@ -340,8 +340,14 @@ being *replaced* and it eventually killing a run. workerd's two-line model
 kills). Every isolate gets one `MemoryPressureLevel::Moderate` notification at
 creation, as workerd sends. In this V8 that starts one memory-reducing
 incremental marking, and the level does not persist. So the soft line reads
-the heap as V8 last left it, which can include garbage; whether to collect
-before that reading is an open question.
+the heap as V8 last left it (raw `used_heap_size`), which can include garbage.
+The soft line itself never collects, by ruling: V8 schedules its own
+collections (`v8-isolate.h` says of its explicit GC request that it is "not
+to enforce a garbage collection schedule" and "has strong negative impact on
+the garbage collection performance"), and Cloudflare's model is to evict
+isolates that go over the limit, not to collect them back under it. One
+case reads a collected heap: a finish over the hard line, where the hard
+check below has already collected once.
 
 V8 keeps two parts of its heap: a young generation for new objects and an old
 generation for objects that survived a collection. The hard line is split

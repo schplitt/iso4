@@ -5,8 +5,8 @@ that talks to a socket does.
 
 ## What it does
 
-A frontend hands `engine::Engine` a prefix to store, or a run to execute,
-together with a `link::HostLink`: the one channel through which the engine
+A frontend hands `Engine` a prefix to store, or a run to execute,
+together with a `HostLink`: the one channel through which the engine
 asks the host something (a bridge call, a stream chunk) and answers
 (result, completion). The engine never sees a frame. The server crate
 encodes those messages for Node; another frontend could encode them
@@ -42,7 +42,16 @@ network policy; `fetch` is a host-configured bridge global like any other.
 
 ## Layout
 
-- `src/lib.rs` lists the modules and embeds the snapshot `build.rs` makes.
+- `src/lib.rs` embeds the snapshot `build.rs` makes and holds the public
+  API: a fixed export list, every other module private (`log` and
+  `trace_enabled` stay reachable, hidden, for the two macros). The list is `Engine`,
+  `EngineOptions`, `StartError`, `AdmissionLine`, `Capacity`, `Caller`,
+  `RunHandle`, `Refusal`; `HostLink`, `Addr`, `Inbound`, `Outbound`,
+  `LinkError`, `Observer`, `NoopObserver`, `ConsoleStream`; `RunError`,
+  `RuntimeErrorData`; `FatalInfo`, `FatalCause`, `FatalPhase`, `FatalHook`,
+  `ResetCause`, `GraceReport`, `GraceStatus`; `RegistryStats`; the `log!`
+  and `trace!` macros. Two side doors: `wire` (bytes the frame layer must
+  agree on) and `testing` (feature `test-support`).
 - `src/types.rs` re-exports `iso4-types`, so the modules keep saying
   `crate::types`.
 - `src/errors.rs` holds `RunError`, the failure output and the error codes.

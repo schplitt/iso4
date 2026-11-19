@@ -129,14 +129,14 @@ fn read_value_blob(data: &[u8], offset: &mut usize) -> io::Result<Vec<u8>> {
 
 // ── Reset cause byte ─────────────────────────────────────────────────────────
 
-fn reset_cause_byte(cause: iso4_core::v8::ResetCause) -> u8 {
+fn reset_cause_byte(cause: iso4_core::ResetCause) -> u8 {
     match cause {
-        iso4_core::v8::ResetCause::Cpu => 0,
-        iso4_core::v8::ResetCause::Memory => 1,
-        iso4_core::v8::ResetCause::Abort => 2,
-        iso4_core::v8::ResetCause::Internal => 3,
-        iso4_core::v8::ResetCause::Wall => 4,
-        iso4_core::v8::ResetCause::Unsupported => 5,
+        iso4_core::ResetCause::Cpu => 0,
+        iso4_core::ResetCause::Memory => 1,
+        iso4_core::ResetCause::Abort => 2,
+        iso4_core::ResetCause::Internal => 3,
+        iso4_core::ResetCause::Wall => 4,
+        iso4_core::ResetCause::Unsupported => 5,
     }
 }
 
@@ -232,13 +232,13 @@ pub fn encode_run_completion_payload(
 /// List<BridgeCallRecord>  bridgeCalls  (attempted during grace)
 /// Optional<(String name, String message)>  error
 /// ```
-pub fn encode_run_complete_payload(run_id: u32, report: &iso4_core::v8::GraceReport) -> Vec<u8> {
+pub fn encode_run_complete_payload(run_id: u32, report: &iso4_core::GraceReport) -> Vec<u8> {
     let mut out = Vec::new();
     encode_u32(run_id, &mut out);
     out.push(match report.status {
-        iso4_core::v8::GraceStatus::Settled => 0,
-        iso4_core::v8::GraceStatus::Truncated => 1,
-        iso4_core::v8::GraceStatus::Failed => 2,
+        iso4_core::GraceStatus::Settled => 0,
+        iso4_core::GraceStatus::Truncated => 1,
+        iso4_core::GraceStatus::Failed => 2,
     });
     encode_f64(report.duration_ms, &mut out);
     encode_f64(report.wall_time_ms, &mut out);
@@ -404,7 +404,7 @@ pub fn encode_precompile_result_payload(
 ///   u32     idle
 ///   u32     busy
 /// ```
-pub fn encode_stats_payload(stats: &iso4_core::warm::RegistryStats) -> Vec<u8> {
+pub fn encode_stats_payload(stats: &iso4_core::RegistryStats) -> Vec<u8> {
     // Counts saturate at u32::MAX instead of wrapping: a live cap that is a
     // multiple of 2^32 (seen with cgroup v1's "unlimited" memory sentinel
     // before the host clamped its budget) would otherwise truncate to 0.

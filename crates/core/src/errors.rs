@@ -111,7 +111,7 @@ pub enum RunError {
     /// never declared by Precompile.
     UndeclaredBinding(String),
     /// A host global (or bridge stub) uses a name the runtime owns
-    /// ([`crate::v8::RESERVED_GLOBAL_NAMES`]). Shaped to also cover runtime-owned
+    /// (`RESERVED_GLOBAL_NAMES`). Shaped to also cover runtime-owned
     /// module specifiers if one ever becomes non-overridable.
     ReservedName(String),
     /// A PrefixRun rebind targets a declared location that is frozen with
@@ -126,7 +126,7 @@ pub enum RunError {
     /// evaluates, so the call can never be served.
     PrefixBridgeCall(String),
     /// Warm-up (isolate boot + prefix evaluation) blew its fixed budget
-    /// ([`WARMUP_WALL_MS`]/[`WARMUP_CPU_MS`]). Not a per-request timeout —
+    /// (`WARMUP_WALL_MS`/`WARMUP_CPU_MS`). Not a per-request timeout —
     /// the caller's limits are not armed during warm-up, and the budget is
     /// deliberately not configurable (Cloudflare's script-startup model).
     WarmupLimit,
