@@ -14,7 +14,7 @@
 
 use std::io;
 
-use iso4_core::errors::clamp_error_text;
+use iso4_core::wire::clamp_error_text;
 use iso4_types::{
     BridgeCallRecord, BridgeErrorPayload, BridgeTarget, RunCompletion, RunErrorPayload,
 };
@@ -291,7 +291,7 @@ fn encode_bridge_call_records(records: &[BridgeCallRecord], out: &mut Vec<u8>) {
 }
 
 /// Ceiling on the serialized own-properties blob attached to an error. Same
-/// reasoning as [`iso4_core::errors::MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
+/// reasoning as [`iso4_core::wire::MAX_ERROR_TEXT_BYTES`], but this one is a value blob and
 /// cannot be truncated meaningfully, so an oversized one is dropped whole.
 const MAX_ERROR_FIELDS_BYTES: usize = 1024 * 1024;
 
@@ -569,7 +569,7 @@ pub fn parse_bridge_response_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iso4_core::errors::MAX_ERROR_TEXT_BYTES;
+    use iso4_core::wire::MAX_ERROR_TEXT_BYTES;
     use iso4_types::RunFailurePayload;
 
     fn failure_payload(message: String, stack: Option<String>, fields: Option<Vec<u8>>) -> Vec<u8> {

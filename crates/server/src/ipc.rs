@@ -191,7 +191,7 @@ pub struct AuthenticatePayload {
     /// Random per-sandbox descriptor token (`docs/protocol.md` §5.1). Host-
     /// emitted host-type descriptors are stamped with a brand key derived from
     /// it; the runtime rehydrates only descriptors carrying that key. Exactly
-    /// [`iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN`] bytes; the host sends the
+    /// [`iso4_core::wire::DESCRIPTOR_TOKEN_LEN`] bytes; the host sends the
     /// same token on every connection of one sandbox.
     pub descriptor_token: Vec<u8>,
 }
@@ -847,12 +847,12 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
             .try_into()
             .expect("bounds checked above"),
     ) as usize;
-    if token_len != iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN {
+    if token_len != iso4_core::wire::DESCRIPTOR_TOKEN_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "descriptor token must be exactly {} bytes, got {token_len}",
-                iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN
+                iso4_core::wire::DESCRIPTOR_TOKEN_LEN
             ),
         ));
     }
@@ -1600,7 +1600,7 @@ mod tests {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
             probe: vec![0xff, 0x0f, 0x30],
-            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         };
 
         let payload = encode_authenticate_payload(&auth);
@@ -1614,7 +1614,7 @@ mod tests {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
             probe: vec![0xff, 0x0f, 0x30],
-            descriptor_token: vec![0xab; iso4_core::webcodec::DESCRIPTOR_TOKEN_LEN],
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         };
         let mut v = encode_authenticate_payload(&auth);
         v.extend_from_slice(b"extra");

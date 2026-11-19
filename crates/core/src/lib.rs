@@ -24,6 +24,7 @@ pub mod v8;
 pub mod warm;
 pub mod webcodec;
 pub mod webtypes;
+pub mod wire;
 
 /// The startup snapshot `build.rs` creates (see `snapshot.rs`).
 pub static SNAPSHOT_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/snapshot.bin"));
