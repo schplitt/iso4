@@ -76,9 +76,6 @@ pub(crate) fn init_platform_with(settings: impl FnOnce()) -> bool {
 pub struct Limits {
     pub wall_time_ms: u32,
     pub cpu_time_ms: u32,
-    /// The retirement line, and the run's inbound frame allowance (enforced
-    /// by the frontend). Nothing terminates at it. Zero means none.
-    pub soft_memory_mb: u32,
     /// The terminating line: `CreateParams::heap_limits` +
     /// `add_near_heap_limit_callback` + the ArrayBuffer budget. Zero = none.
     pub hard_memory_mb: u32,
@@ -110,7 +107,6 @@ impl From<&types::ResourceLimits> for Limits {
         Limits {
             wall_time_ms: l.wall_time_ms,
             cpu_time_ms: l.cpu_time_ms,
-            soft_memory_mb: l.soft_memory_mb,
             hard_memory_mb: l.hard_memory_mb,
             max_export_bytes: l.max_export_bytes,
             max_stdout_bytes: l.max_stdout_bytes,
