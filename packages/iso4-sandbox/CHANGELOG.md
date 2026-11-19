@@ -1,5 +1,39 @@
 # @iso4/sandbox
 
+## 0.10.0
+
+### Minor Changes
+
+- af44e16: feat(native): the runtime writes one fatal line to a `crash` file next to its socket and to stderr when it dies
+
+  The line is `key=value` (`[iso4-v8] fatal cause=oom-heap phase=oneoff run=1 msg="..."`), replaces the old out of memory sentence, and also covers V8 fatal errors and SIGSEGV, SIGTRAP, SIGABRT, SIGBUS and SIGILL, after which the runtime dies by the same signal.
+
+- b1a8ed1: feat(sandbox): allow `node:async_hooks` (`AsyncLocalStorage`) in prefix code
+
+  Create the instance at module scope and use it inside an exported handler, as in workerd; importing it from a prefix no longer fails with `ERR_MODULE_NOT_FOUND`.
+
+- b1a8ed1: feat(sandbox)!: remove `prefix.execute()` and the deprecated `prefix.run()`
+
+  A prefix is full code: runs call one of its exports with `prefix.call({ export, args })`. Move per-run code into an exported function on the prefix, or run it once with `sandbox.run({ code })`.
+
+- fc1da0e: feat(native): the runtime writes a `pid` file next to its socket
+
+  It fails to start if it cannot write that file or read its own start time, which on Linux needs a readable `/proc`.
+
+### Patch Changes
+
+- 90afc0f: fix(sandbox): bridge call records count the serialized values only
+
+  `argBytes` and `responseBytes`, and the `maxBridgeCallBytes` check, now measure the args and response blobs alone, no longer the frame header around them (a few dozen bytes per call).
+
+- 1074b67: fix(native): fail more heap-limit blow-ups with `ERR_MEMORY_LIMIT` instead of killing the runtime
+
+  A run that reaches its heap limit now fails with `ERR_MEMORY_LIMIT` in more cases instead of ending the runtime child, and a run that ends a turn with its heap over its hard memory line fails the same way. Some single allocations far past the limit still end the runtime child.
+
+- aab1bca: fix(native): name the run in the fatal OOM line when V8 runs out of memory on a GC worker thread
+
+  The line now names the run of the isolate that ran out of memory, also when V8 reports it from a worker thread, where it used to name no run.
+
 ## 0.9.0
 
 ### Minor Changes
