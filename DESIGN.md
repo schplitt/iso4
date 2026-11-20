@@ -574,15 +574,15 @@ budget. Grace wall and CPU time are metered separately and reported on the
 `durationMs`/`cpuTimeMs`. Zero disables the grace phase: registered work dies
 when the value settles. Cloudflare's `ctx.waitUntil` (30 s) is the model.
 
-Hardening from the pre-merge security review: the grace loop waits in
-~250 ms ticks, so a CPU-killed background task frees the connection slot
-within a quarter second instead of holding it for the rest of `graceMs` (a
+Hardening from the pre-merge security review: the grace loop ends
+the phase as soon as the CPU guard kills a background task, so the connection
+slot frees at once instead of being held for the rest of `graceMs` (a
 slot is only held long-term by work that is genuinely still running — freeing
 it during live grace requires the run-tagged post-Result frames the
 streaming design introduces,
-recorded there as a requirement). The aggregate is driven by the pristine
-`Promise.allSettled` captured into a private slot before any guest code runs,
-so tampering with the public one changes nothing. The rejection text carried
+recorded there as a requirement). The grace loop reads each registered
+promise's state directly from Rust, so a guest that replaces
+`Promise.allSettled` cannot affect it. The rejection text carried
 on the final frame is capped (256/2048 bytes), and an oversized grace report
 is substituted by a minimal one rather than costing the connection. A host
 `AbortSignal` firing during the epilogue cancels the background work
