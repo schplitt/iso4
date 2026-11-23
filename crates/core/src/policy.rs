@@ -170,8 +170,6 @@ pub fn watermark_action(facts: &PressureFacts) -> PressureVerdict {
     }
 }
 
-pub use crate::types::heap_band_mb;
-
 /// Consecutive over-the-soft-line finishes before an instance is retired.
 /// One crossing is a spike; two in a row is growth.
 pub const SOFT_LINE_STRIKES: u8 = 2;
@@ -377,6 +375,7 @@ pub fn admit_isolate(facts: &AdmitFacts) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::heap_band_mb;
     use std::time::Duration;
 
     const MB: u64 = 1024 * 1024;

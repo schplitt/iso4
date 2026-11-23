@@ -713,7 +713,7 @@ exists only for isolates that get reused:
 | either      | `0`        | absent         | none  | uncapped          |
 | either      | any        | `0`            | none  | uncapped          |
 
-`band(n)` is `policy::heap_band_mb` — `round(sqrt(8 × n))` MB, the geometric
+`band(n)` is `iso4_types::heap_band_mb` — `round(sqrt(8 × n))` MB, the geometric
 mean of the cap and 8 MB, so a small cap gets a large share of headroom and a
 large cap a small one (8 → +8, 32 → +16, 128 → +32, 512 → +64). It is
 monotonic, so a larger `memoryMb` never yields a smaller ceiling.

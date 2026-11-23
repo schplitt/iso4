@@ -307,17 +307,6 @@ pub(super) const ISO4_RUNTIME_SPECIFIER: &str = "iso4:runtime";
 /// import. Must match `Symbol.for(...)` in [`ISO4_RUNTIME_MODULE_SRC`].
 const ISO4_RUNTIME_WAITUNTIL_SYMBOL: &str = "iso4.runtime.waitUntil";
 
-/// Private-symbol key holding the pristine `Promise.allSettled` (bound),
-/// captured at install time — before any guest code runs — and called by the
-/// grace loop. A guest replacing `Promise.allSettled` therefore sabotages
-/// nothing: privates are unreachable from JS (the type-tag mechanism).
-const GRACE_ALL_SETTLED_KEY: &str = "iso4::graceAllSettled";
-
-fn grace_all_settled_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
-    let name = v8::String::new(scope, GRACE_ALL_SETTLED_KEY)?;
-    Some(v8::Private::for_api(scope, Some(name)))
-}
-
 /// ESM source of the built-in `iso4:runtime` module.
 pub(super) const ISO4_RUNTIME_MODULE_SRC: &str =
     "export const waitUntil = globalThis[Symbol.for('iso4.runtime.waitUntil')];\n";
@@ -380,19 +369,6 @@ pub(crate) fn install_wait_until(scope: &mut v8::PinScope) -> Result<(), RunErro
     global
         .set(scope, key.into(), function.into())
         .ok_or_else(|| RunError::Internal("failed to stash waitUntil".to_string()))?;
-
-    // Capture the pristine Promise.allSettled before any guest code exists,
-    // into a private slot the grace loop calls directly from Rust.
-    let all_settled = eval_script(
-        scope,
-        "(Promise.allSettled.bind(Promise))",
-        "<iso4:runtime-install>",
-    )?;
-    let all_settled_key = grace_all_settled_key(scope)
-        .ok_or_else(|| RunError::Internal("failed to intern allSettled key".to_string()))?;
-    global
-        .set_private(scope, all_settled_key, all_settled)
-        .ok_or_else(|| RunError::Internal("failed to stash allSettled".to_string()))?;
     Ok(())
 }
 

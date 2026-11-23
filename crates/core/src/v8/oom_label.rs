@@ -22,6 +22,7 @@ pub struct OomRunLabel {
 }
 
 impl OomRunLabel {
+    #[cfg(test)]
     pub const NONE: Self = Self {
         prefix_id: None,
         run: OomRun::None,
