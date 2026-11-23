@@ -101,6 +101,36 @@ pub fn finish_job(job: &mut CallJob, link: Option<Arc<dyn HostLink>>, outcome: C
     });
 }
 
+/// A job dropped unanswered (its instance thread exited with it queued) still
+/// answers, so its caller and the registry's in-flight count never hang.
+impl Drop for CallJob {
+    fn drop(&mut self) {
+        if self.release.is_some() {
+            let link = self.io.link();
+            finish_job(self, link, dead_instance_outcome());
+        }
+    }
+}
+
+pub(crate) fn dead_instance_outcome() -> CallOutcome {
+    CallOutcome {
+        result: Err(FailureOutput {
+            error: RunError::Internal(
+                "warm instance thread died before completing the call".to_string(),
+            ),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            duration_ms: 0.0,
+            wall_time_ms: 0.0,
+            cpu_time_ms: 0.0,
+            bridge_calls: Vec::new(),
+        }),
+        tainted: true,
+        heap_used_bytes: 0,
+        prefix_failed: false,
+    }
+}
+
 /// Conclude a run: the frontend drops its route, the registry bookkeeping
 /// runs (the instance is back before the host can see the answer), then the
 /// completion goes out.

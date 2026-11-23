@@ -98,9 +98,9 @@ impl InstanceHandle {
         }));
         let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job(Box::new(job)));
         if self.msgs.send(msg).is_err() {
-            return dead_instance_outcome();
+            return sandbox::dead_instance_outcome();
         }
-        rx.recv().unwrap_or_else(|_| dead_instance_outcome())
+        rx.recv().unwrap_or_else(|_| sandbox::dead_instance_outcome())
     }
 
     /// A clone of the instance's one sender, for the engine's dispatch path
@@ -132,36 +132,6 @@ impl Drop for InstanceHandle {
         self.msgs
             .send(sandbox::RoutedEvent::new(0, sandbox::RunEvent::Retire))
             .ok();
-    }
-}
-
-/// A job dropped unanswered (its instance thread exited with it queued) still
-/// answers, so its caller and the registry's in-flight count never hang.
-impl Drop for sandbox::CallJob {
-    fn drop(&mut self) {
-        if self.release.is_some() {
-            let link = self.io.link();
-            sandbox::finish_job(self, link, dead_instance_outcome());
-        }
-    }
-}
-
-pub(crate) fn dead_instance_outcome() -> sandbox::CallOutcome {
-    sandbox::CallOutcome {
-        result: Err(sandbox::FailureOutput {
-            error: sandbox::RunError::Internal(
-                "warm instance thread died before completing the call".to_string(),
-            ),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms: 0.0,
-            wall_time_ms: 0.0,
-            cpu_time_ms: 0.0,
-            bridge_calls: Vec::new(),
-        }),
-        tainted: true,
-        heap_used_bytes: 0,
-        prefix_failed: false,
     }
 }
 
@@ -3099,8 +3069,8 @@ mod tests {
         }));
         let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job(Box::new(job)));
         let late = match sender.send(msg) {
-            Err(_) => dead_instance_outcome(),
-            Ok(()) => rx.recv().unwrap_or_else(|_| dead_instance_outcome()),
+            Err(_) => sandbox::dead_instance_outcome(),
+            Ok(()) => rx.recv().unwrap_or_else(|_| sandbox::dead_instance_outcome()),
         };
         assert!(matches!(
             late.result.unwrap_err().error,
