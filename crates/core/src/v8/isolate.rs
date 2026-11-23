@@ -619,7 +619,7 @@ pub struct PrefixSpec<'a> {
 
 /// Build a fresh isolate + context, run the boot fixups, and
 /// evaluate the prefix — all under the fixed warm-up budget. This is the
-/// cold-start half of a warm instance; `run_call_on_core` is the per-call
+/// cold-start half of a warm instance; `serve_instance` is the per-call
 /// half. A guard fired during warm-up reports `ERR_WARMUP_LIMIT` (the
 /// caller's limits are not armed, so neither timeout code would be honest);
 /// blowing the heap cap keeps `ERR_MEMORY_LIMIT`.

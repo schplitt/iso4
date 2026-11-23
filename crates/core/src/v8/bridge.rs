@@ -1607,8 +1607,8 @@ mod tests {
     }
 
     #[test]
-    fn bridge_call_inbound_response_too_large_is_rejected() {
-        // The per-run inbound allowance (soft_memory_mb) is enforced by the
+    fn bridge_call_small_response_succeeds() {
+        // The per-run inbound allowance is enforced by the
         // frontend before a message reaches the engine; the server's
         // session.rs tests cover the refusal. Here: a small response still
         // arrives and the run succeeds.

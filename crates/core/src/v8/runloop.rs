@@ -1,5 +1,5 @@
 //! The run loop: entry points, run I/O, the turn loop that drives one run,
-//! output assembly, and `run_call_on_core` for calls on a warm instance.
+//! and output assembly.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,9 +17,11 @@ use crate::types::{HostGlobalDef, ImportBinding};
 use crate::v8::bridge::{
     BRIDGE_DISPATCH_GLOBAL, BridgeCallLog, BridgeStubSpec, PendingResolver, PendingResolvers,
     StubSlots, collect_import_handles, host_bridge_error_from_rejection, host_bridge_error_to_v8,
-    install_bridge_globals, install_prefix_bridge_placeholders, invoke_requested_call,
-    owned_bridge_error, public_record_name, serialize_call_result,
+    install_bridge_globals, invoke_requested_call, owned_bridge_error, public_record_name,
+    serialize_call_result,
 };
+#[cfg(test)]
+use crate::v8::bridge::install_prefix_bridge_placeholders;
 use crate::v8::exceptions::{
     error_message_from_value, error_name_from_value, exception_fields, exception_message,
     exception_name, exception_stack, runtime_error_from_value, syntax_error,
@@ -46,9 +48,10 @@ use crate::v8::streams::{
 use crate::v8::timers::{TimerTable, timer_turn};
 use crate::v8::{
     CpuBudget, FailureOutput, GuardCtl, InstanceCore, Limits, OutStreamTable, PendingWork,
-    PrefixSpec, RunError, RunTable, RuntimeErrorData, StreamTable, alloc_run_token,
-    create_instance_core, init_platform,
+    RunError, RunTable, RuntimeErrorData, StreamTable, alloc_run_token, init_platform,
 };
+#[cfg(test)]
+use crate::v8::{PrefixSpec, create_instance_core};
 
 // ── Output types ─────────────────────────────────────────────────────────────
 
@@ -162,7 +165,7 @@ thread_local! {
 }
 
 /// Install the epilogue spec for the next run executed on this thread.
-/// Consumed by that run; set it before every `execute`/`run_call_on_core`.
+/// Consumed by that run; set it before every run.
 pub fn set_run_epilogue_spec(spec: Option<EpilogueSpec>) {
     EPILOGUE_SPEC.with(|c| c.set(spec));
 }
@@ -180,6 +183,7 @@ fn take_epilogue_spec() -> Option<EpilogueSpec> {
 /// the run's link and suspend until the matching `BridgeResponse` arrives on
 /// its events; string/data globals are evaluated/materialised in-isolate and
 /// need no host. Pass `RunIo::None` when no global installs a bridge stub.
+#[cfg(test)]
 pub fn execute(
     code: &str,
     filename: Option<&str>,
@@ -205,7 +209,7 @@ pub fn execute(
     )
 }
 
-/// [`execute`] with an explicit run I/O mode: the engine's one-off worker
+/// `execute` with an explicit run I/O mode: the engine's one-off worker
 /// path. `token` is the run's table token (0 = allocate one internally);
 /// pass the token the run's handle carries, or mid-turn aborts never land.
 #[allow(clippy::too_many_arguments)]
@@ -245,6 +249,7 @@ pub fn execute_with_io(
 /// to the run's link — overwrite the prefix-time placeholders, then
 /// the call runs. String/data globals and shim wrappers are replayed from
 /// `prefix.globals` and are not re-sent per run.
+#[cfg(test)]
 pub fn execute_with_prefix(
     prefix: PrefixSpec<'_>,
     limits: Limits,
@@ -591,7 +596,7 @@ pub(super) enum RunSource {
 // per-call blocking poll loop and the separate grace phase.)
 
 /// Per-call parameters for [`run_call_phase`] — bundled so the one-off path
-/// (`run_module_inner`) and warm instances (`run_call_on_core`) drive
+/// (`run_module_inner`) and warm instances (`dispatch_job`) drive
 /// the identical machinery with their own state lifetimes.
 pub(super) struct CallPhaseCtx<'a> {
     /// This run's table token — the identity every native callback
@@ -2415,6 +2420,7 @@ pub(super) fn instance_tainted(core: &mut InstanceCore) -> bool {
 /// from dispatch to settle, per-call bridge stubs, per-call console caps —
 /// the same per-request semantics a one-off run has, minus the isolate boot
 /// and prefix evaluation.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // mirrors run_module; bundled state is the instance itself
 pub fn run_call_on_core(
     core: &mut InstanceCore,

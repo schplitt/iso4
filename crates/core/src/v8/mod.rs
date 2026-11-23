@@ -22,9 +22,10 @@ pub(crate) use oom_label::{
 pub use oom_label::{FatalCause, FatalHook, FatalInfo, FatalPhase, OomRecord, OomRun, OomRunLabel};
 pub use runloop::{
     CallJob, CallOutcome, EpilogueSpec, GraceReport, GraceStatus, Output, ReleaseHook, RoutedEvent,
-    RunEvent, RunEventSender, RunIo, execute, execute_with_io, execute_with_prefix,
-    run_call_on_core, set_run_epilogue_spec,
+    RunEvent, RunEventSender, RunIo, execute_with_io, set_run_epilogue_spec,
 };
+#[cfg(test)]
+pub use runloop::{execute, execute_with_prefix, run_call_on_core};
 pub use runtable::{InstanceLoad, RunTable, alloc_run_token, load_now_ms};
 pub use streams::{
     OutStreamTable, StreamTable, is_stream_body, make_body_stream, register_hydrated_stream,

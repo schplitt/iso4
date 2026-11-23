@@ -39,10 +39,6 @@ use crate::rss;
 use crate::prefix::PrefixData;
 use crate::v8 as sandbox;
 
-/// One call forwarded to an instance owner thread — see [`sandbox::CallJob`]
-/// (the job type lives beside the turn loop that executes it).
-pub use crate::v8::CallJob;
-
 /// A live warm instance as the registry sees it: the channel to its owner
 /// thread plus the metadata eviction needs. Dropping the handle sends a
 /// Retire message; the owner thread then exits (once its in-flight runs
@@ -94,7 +90,8 @@ impl InstanceHandle {
     /// own release hook is replaced. A dead owner thread (panic during the
     /// call) reports an internal failure with `tainted: true`, so the
     /// caller evicts it like any other taint.
-    pub fn call(&self, mut job: CallJob) -> sandbox::CallOutcome {
+    #[cfg(test)]
+    pub fn call(&self, mut job: sandbox::CallJob) -> sandbox::CallOutcome {
         let (tx, rx) = crossbeam_channel::bounded(1);
         job.release = Some(Box::new(move |outcome| {
             tx.send(outcome).ok();
@@ -1158,6 +1155,7 @@ fn evict_scored(inner: &mut RegistryInner, now: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v8::CallJob;
     use crate::link::{Addr, HostLink, Inbound, NoopObserver, Outbound};
     use crate::testval::{self, TestValue};
     use std::sync::atomic::AtomicU32;
