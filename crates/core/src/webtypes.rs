@@ -307,7 +307,7 @@ pub fn install_with_streams(
 
     // The construction-time stream-body stamp (context-free, so it is built
     // here for every install path — prefix validation included).
-    let stamp = v8::Function::builder(crate::v8::streams::stamp_stream_body_callback)
+    let stamp = v8::Function::builder(crate::v8::stamp_stream_body_callback)
         .build(scope)
         .ok_or_else(|| "create stampStreamBody failed".to_string())?;
     factory_args.push(v8::Local::<v8::Value>::from(stamp));

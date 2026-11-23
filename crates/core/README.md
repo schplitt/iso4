@@ -55,7 +55,8 @@ network policy; `fetch` is a host-configured bridge global like any other.
 - `src/types.rs` re-exports `iso4-types`, so the modules keep saying
   `crate::types`.
 - `src/errors.rs` holds `RunError`, the failure output and the error codes.
-- `src/v8/` is the engine: `mod.rs` only lists the modules and re-exports;
+- `src/v8/` is the engine: `mod.rs` only lists the modules and re-exports
+  (outside code imports from `crate::v8` only; the submodules are private);
   `runloop.rs` holds the run entry points and the turn loop; `instance.rs`
   the owner thread that serves a warm instance; `isolate.rs` creates
   isolates and warm instance cores;

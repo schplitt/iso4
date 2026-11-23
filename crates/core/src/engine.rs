@@ -249,15 +249,15 @@ impl Engine {
 
         // Decided inside V8's one start, so a lazy start on another thread
         // cannot slip in between.
-        let started = sandbox::isolate::init_platform_with(|| {
+        let started = sandbox::init_platform_with(|| {
             if let Some(hook) = options.on_fatal {
                 sandbox::set_fatal_hook(hook);
             }
             if let Some(n) = options.cores {
-                sandbox::isolate::set_cores(n);
+                sandbox::set_cores(n);
             }
             container::set_host_reserve_bytes(options.host_reserve_bytes);
-            sandbox::isolate::set_idle_settle_secs(options.idle_settle_secs);
+            sandbox::set_idle_settle_secs(options.idle_settle_secs);
         });
         if !started {
             return Err(StartError::AlreadyStarted);
