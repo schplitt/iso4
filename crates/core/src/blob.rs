@@ -334,6 +334,7 @@ pub fn probe() -> &'static [u8] {
 
 /// The V8 serialization format version this binary writes — the relabelled
 /// version carried by every emitted blob, not V8's native one.
+#[cfg(test)]
 pub fn write_format_version() -> u8 {
     probe()[1]
 }

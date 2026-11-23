@@ -594,7 +594,7 @@ function validateMemoryMb(value: number | MemoryLimit | undefined, where: string
 
 /**
  * Headroom above a managed cap before the terminating line — mirrors
- * `policy::heap_band_mb` in the runtime, which is the source of truth (the
+ * `iso4_types::heap_band_mb` in the runtime, which is the source of truth (the
  * wire sends the cap, not the band; this copy only sizes host-side
  * defaults). Geometric mean of the cap and 8 MB: 8 → +8, 128 → +32.
  * @param capMb

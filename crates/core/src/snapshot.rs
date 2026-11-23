@@ -82,6 +82,7 @@ pub fn boot_context(scope: &mut v8::PinScope, table: *const RunTable) -> Result<
 
 /// Build the snapshot blob. Called by `build.rs` only: creating a snapshot in
 /// a process that runs isolates is unsupported (DESIGN.md §11.6).
+#[expect(dead_code, reason = "build.rs only: the library loads the finished snapshot")]
 pub fn create() -> Vec<u8> {
     crate::v8::init_platform();
     let mut isolate =

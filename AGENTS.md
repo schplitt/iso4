@@ -72,7 +72,7 @@ iso4/                              ← workspace root
         prefix.rs                  ← stored prefix shape, rebind validation
         v8/                        ← the engine core
           mod.rs                   ← module list and re-exports only
-          runloop.rs               ← run entry points, run I/O, the turn loop, output assembly, run_call_on_core
+          runloop.rs               ← run entry points, run I/O, the turn loop, output assembly
           instance.rs              ← the owner thread serving a warm instance: queue, deadlines, completions, taint sweep
           isolate.rs               ← isolate creation: platform, limits, budgets, warm InstanceCore
           runtable.rs              ← per-run state table, run tokens, attribution, the load meter, the CPED rider

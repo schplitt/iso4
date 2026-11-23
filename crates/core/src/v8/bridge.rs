@@ -1607,18 +1607,17 @@ mod tests {
     }
 
     #[test]
-    fn bridge_call_inbound_response_too_large_is_rejected() {
-        // The per-run inbound allowance (soft_memory_mb) is enforced by the
+    fn bridge_call_small_response_succeeds() {
+        // The per-run inbound allowance is enforced by the
         // frontend before a message reaches the engine; the server's
-        // session.rs tests cover the refusal. Here: a small response under a small budget
-        // still arrives and the run succeeds.
+        // session.rs tests cover the refusal. Here: a small response still
+        // arrives and the run succeeds.
         let (out, h) = run_with_bridge(
             "export default await myTool()",
             "myTool",
             Limits {
                 cpu_time_ms: 5_000,
                 wall_time_ms: 10_000,
-                soft_memory_mb: 64,
                 hard_memory_mb: 64,
                 ..Default::default()
             },
