@@ -692,7 +692,7 @@ impl Engine {
             crate::log!("[iso4-v8] PrefixRun {run_id} — instance thread dead before dispatch");
             if let sandbox::RunEvent::Job(mut job) = e.0.event {
                 let link = job.io.link();
-                sandbox::finish_job(&mut job, link, warm::dead_instance_outcome());
+                sandbox::finish_job(&mut job, link, sandbox::dead_instance_outcome());
             }
         }
         Ok(())

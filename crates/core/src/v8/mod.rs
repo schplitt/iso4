@@ -12,6 +12,7 @@ pub use crate::errors::{FailureOutput, RunError, RuntimeErrorData};
 pub use crate::types::ResetCause;
 pub use globals::PendingWork;
 pub use guard::GuardCtl;
+pub(crate) use instance::dead_instance_outcome;
 pub use instance::{completion_message, finish_job, finish_run, send_completion, serve_instance};
 pub use isolate::{
     CpuBudget, InstanceCore, Limits, PrefixSpec, create_instance_core, init_platform,
