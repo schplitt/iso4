@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::link::{Addr, Observer};
-use crate::v8::PendingWork;
 use crate::v8::bridge::GlobalCallbackData;
 use crate::v8::isolate::LogBuffers;
 use crate::v8::streams::{OutStreamTable, StreamTable};
 use crate::v8::timers::TimerTable;
+use crate::v8::PendingWork;
 
 /// The instance's run table, held in an isolate slot so the natives baked
 /// into the startup snapshot carry no per-instance pointer.
@@ -79,7 +79,10 @@ const LOAD_STALE_MS: u64 = 500;
 /// Milliseconds on the process-wide load epoch (cross-thread comparable).
 pub fn load_now_ms() -> u64 {
     static ANCHOR: OnceLock<std::time::Instant> = OnceLock::new();
-    ANCHOR.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    ANCHOR
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 impl InstanceLoad {
@@ -153,7 +156,8 @@ impl InstanceLoad {
         if now_ms.saturating_sub(at) > LOAD_STALE_MS {
             return 0;
         }
-        self.util_permille.load(std::sync::atomic::Ordering::Acquire)
+        self.util_permille
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

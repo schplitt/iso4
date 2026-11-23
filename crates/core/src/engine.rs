@@ -494,27 +494,29 @@ impl Engine {
                 PrefixEntry::Ready(data) => Ok(Arc::clone(data)),
                 PrefixEntry::Broken(cause) => Err(Arc::clone(cause)),
             });
-        let prefix_data = match entry {
-            Some(Ok(data)) => data,
-            Some(Err(cause)) => {
-                crate::log!(
+        let prefix_data =
+            match entry {
+                Some(Ok(data)) => data,
+                Some(Err(cause)) => {
+                    crate::log!(
                     "[iso4-v8] PrefixRun {run_id} — ERR_PREFIX_BROKEN: prefix_id={} cold start \
                      failed with {}: {}",
                     req.prefix_id, cause.code, cause.message
                 );
-                return Err(Refusal::PrefixBroken {
-                    prefix_id: req.prefix_id,
-                    cause,
-                });
-            }
-            None => {
-                crate::log!(
-                    "[iso4-v8] PrefixRun {} — prefix_id={} not found",
-                    run_id, req.prefix_id
-                );
-                return Err(Refusal::PrefixDisposed(req.prefix_id));
-            }
-        };
+                    return Err(Refusal::PrefixBroken {
+                        prefix_id: req.prefix_id,
+                        cause,
+                    });
+                }
+                None => {
+                    crate::log!(
+                        "[iso4-v8] PrefixRun {} — prefix_id={} not found",
+                        run_id,
+                        req.prefix_id
+                    );
+                    return Err(Refusal::PrefixDisposed(req.prefix_id));
+                }
+            };
 
         // Globals first, then import rebinds; the TS client runs the same
         // checks before sending.
@@ -531,7 +533,8 @@ impl Engine {
             let payload = error.to_payload();
             crate::log!(
                 "[iso4-v8] PrefixRun {run_id} — {}: {}",
-                payload.code, payload.message
+                payload.code,
+                payload.message
             );
             return Err(Refusal::Binding(error));
         }
@@ -618,7 +621,8 @@ impl Engine {
                             crate::log!(
                                 "[iso4-v8] prefix_id={prefix_id} marked broken: cold start \
                                  failed with {}: {}",
-                                cause.code, cause.message
+                                cause.code,
+                                cause.message
                             );
                             *entry = PrefixEntry::Broken(Arc::new(cause));
                             // Healthy instances of a broken prefix never serve

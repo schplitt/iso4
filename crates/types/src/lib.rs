@@ -81,11 +81,7 @@ pub enum BandPolicy {
 
 /// Resolve the advertised cap plus optional hard override into the two
 /// enforced lines. Truth table: `docs/protocol.md` §5.2.
-pub fn resolve_heap_lines(
-    cap_mb: u32,
-    hard_override: Option<u32>,
-    band: BandPolicy,
-) -> (u32, u32) {
+pub fn resolve_heap_lines(cap_mb: u32, hard_override: Option<u32>, band: BandPolicy) -> (u32, u32) {
     match (hard_override, band) {
         // No soft line on a one-off: nothing is ever retired there.
         (None, BandPolicy::Strict) => (0, cap_mb),

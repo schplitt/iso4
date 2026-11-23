@@ -1,8 +1,8 @@
 //! `node:async_hooks`: a minimal `AsyncLocalStorage` over V8's
 //! continuation-preserved embedder data.
 
+use crate::v8::runtable::{make_rider, rider_parts, CURRENT_RUN_TOKEN};
 use crate::v8::RunError;
-use crate::v8::runtable::{CURRENT_RUN_TOKEN, make_rider, rider_parts};
 
 // A minimal, Node-compatible `AsyncLocalStorage` (`run` + `getStore`), surfaced
 // to run and prefix code via `import { AsyncLocalStorage } from 'node:async_hooks'`.
@@ -144,12 +144,12 @@ pub(crate) fn install_async_context(scope: &mut v8::PinScope) -> Result<(), RunE
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
 
     use crate::testval::TestValue as WireValue;
     use crate::v8::testsupport::{call_spec, get_default, prepared, run, value_of};
-    use crate::v8::{Limits, RunIo, execute_with_prefix};
+    use crate::v8::{execute_with_prefix, Limits, RunIo};
 
     // ── Async context (AsyncLocalStorage) ─────────────────────────────────
 

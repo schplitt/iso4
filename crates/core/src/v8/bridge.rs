@@ -11,16 +11,18 @@ use crate::blob;
 use crate::errors::{codec_error_to_run_error, reason_error, termination_or};
 use crate::link::{Addr, HostLink, Outbound};
 use crate::types;
-use crate::types::{BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
+use crate::types::{
+    BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule,
+};
 use crate::v8::exceptions::{
-    RESERVED_ERROR_KEYS, copy_own_properties_except, error_fields_from_value,
-    error_message_from_value, error_name_from_value, exception_fields, exception_message,
-    exception_name, exception_stack, runtime_error_from_value,
+    copy_own_properties_except, error_fields_from_value, error_message_from_value,
+    error_name_from_value, exception_fields, exception_message, exception_name, exception_stack,
+    runtime_error_from_value, RESERVED_ERROR_KEYS,
 };
 use crate::v8::globals::{check_not_reserved, define_global, eval_script, throw_v8_error};
-use crate::v8::isolate::{ReasonCell, TerminationReason, elapsed_ms};
-use crate::v8::runloop::{RunFacts, RunPhase, RunState, ScanOutcome, build_output_and_maybe_grace};
-use crate::v8::runtable::{RunTable, attributed_state};
+use crate::v8::isolate::{elapsed_ms, ReasonCell, TerminationReason};
+use crate::v8::runloop::{build_output_and_maybe_grace, RunFacts, RunPhase, RunState, ScanOutcome};
+use crate::v8::runtable::{attributed_state, RunTable};
 use crate::v8::streams::ResultStreamMode;
 use crate::v8::{FailureOutput, RunError, RuntimeErrorData};
 
@@ -653,7 +655,11 @@ fn bridge_global_callback(
         // Take an Rc handle (one refcount bump) so no table borrow is held
         // across the serialization below, which can run guest getters.
         // SAFETY: entry pointers are valid for the remainder of the turn.
-        unsafe { &*state }.stubs.borrow().get(&slot.stub_name).cloned()
+        unsafe { &*state }
+            .stubs
+            .borrow()
+            .get(&slot.stub_name)
+            .cloned()
     };
     let Some(data) = data else {
         // The calling run did not bind this name: the Function was captured
@@ -1203,7 +1209,7 @@ mod tests {
         drain_bridge_calls, get_default, get_field, host_import, prepared, run_call, run_code,
         run_ok, run_with_bridge, source_import, spawn_responder, test_io, value_of,
     };
-    use crate::v8::{Limits, RunIo, execute, execute_with_prefix};
+    use crate::v8::{execute, execute_with_prefix, Limits, RunIo};
 
     // ── Bridge tests ───────────────────────────────────────────────────────────────────
     //
@@ -1260,7 +1266,10 @@ mod tests {
         // (unsettled → ok=false), not dropped.
         assert_eq!(failure.bridge_calls.len(), 1);
         assert_eq!(failure.bridge_calls[0].name, "myTool");
-        assert_eq!(failure.bridge_calls[0].outcome, types::BridgeCallOutcome::Unanswered);
+        assert_eq!(
+            failure.bridge_calls[0].outcome,
+            types::BridgeCallOutcome::Unanswered
+        );
         // Timings are stamped from the shared run state, not left as zeros.
         assert!(failure.duration_ms >= 0.0);
         assert!(failure.cpu_time_ms >= 0.0);
@@ -1382,7 +1391,12 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                s.send(bridge_resp_err_full(0, "WorkflowTimeout", "took too long", Some(&fields)));
+                s.send(bridge_resp_err_full(
+                    0,
+                    "WorkflowTimeout",
+                    "took too long",
+                    Some(&fields),
+                ));
             },
         );
         h.join().unwrap();
@@ -1433,7 +1447,12 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                s.send(bridge_resp_err_full(0, "TypeError", "bad input", Some(&fields)));
+                s.send(bridge_resp_err_full(
+                    0,
+                    "TypeError",
+                    "bad input",
+                    Some(&fields),
+                ));
             },
         );
         h.join().unwrap();
@@ -1468,7 +1487,12 @@ mod tests {
                 ..Default::default()
             },
             move |s| {
-                s.send(bridge_resp_err_full(0, "Error", "real message", Some(&fields)));
+                s.send(bridge_resp_err_full(
+                    0,
+                    "Error",
+                    "real message",
+                    Some(&fields),
+                ));
             },
         );
         h.join().unwrap();
@@ -1712,12 +1736,12 @@ mod tests {
             },
             |s| {
                 s.send(bridge_resp_ok(
-                        0,
-                        &WireValue::Object(vec![
-                            ("x".to_string(), WireValue::Number(3.0)),
-                            ("y".to_string(), WireValue::Number(4.0)),
-                        ]),
-                    ));
+                    0,
+                    &WireValue::Object(vec![
+                        ("x".to_string(), WireValue::Number(3.0)),
+                        ("y".to_string(), WireValue::Number(4.0)),
+                    ]),
+                ));
             },
         );
         h.join().unwrap();
@@ -1770,13 +1794,13 @@ mod tests {
             },
             |s| {
                 s.send(bridge_resp_ok(
-                        0,
-                        &WireValue::Object(vec![
-                            ("x".to_string(), WireValue::Number(1.0)),
-                            ("__proto__".to_string(), WireValue::Number(99.0)),
-                            ("y".to_string(), WireValue::Number(2.0)),
-                        ]),
-                    ));
+                    0,
+                    &WireValue::Object(vec![
+                        ("x".to_string(), WireValue::Number(1.0)),
+                        ("__proto__".to_string(), WireValue::Number(99.0)),
+                        ("y".to_string(), WireValue::Number(2.0)),
+                    ]),
+                ));
             },
         );
         h.join().unwrap();
@@ -1802,18 +1826,18 @@ mod tests {
             },
             |s| {
                 s.send(bridge_resp_ok(
-                        0,
-                        &WireValue::Object(vec![
-                            ("x".to_string(), WireValue::Number(1.0)),
-                            (
-                                "__proto__".to_string(),
-                                WireValue::Object(vec![(
-                                    "polluted".to_string(),
-                                    WireValue::Bool(true),
-                                )]),
-                            ),
-                        ]),
-                    ));
+                    0,
+                    &WireValue::Object(vec![
+                        ("x".to_string(), WireValue::Number(1.0)),
+                        (
+                            "__proto__".to_string(),
+                            WireValue::Object(vec![(
+                                "polluted".to_string(),
+                                WireValue::Bool(true),
+                            )]),
+                        ),
+                    ]),
+                ));
             },
         );
         h.join().unwrap();
@@ -2011,7 +2035,11 @@ mod tests {
         assert_eq!(out.bridge_calls.len(), 3);
         for record in &out.bridge_calls {
             assert_eq!(record.name, "myTool");
-            assert_eq!(record.outcome, types::BridgeCallOutcome::Ok, "served call must settle ok");
+            assert_eq!(
+                record.outcome,
+                types::BridgeCallOutcome::Ok,
+                "served call must settle ok"
+            );
             assert!(record.arg_bytes > 0, "the args blob has bytes");
             assert!(record.response_bytes > 0, "number response has bytes");
             assert!(record.duration_ms >= 0.0);
@@ -2054,7 +2082,9 @@ mod tests {
         handle.join().unwrap();
         assert!(matches!(failure.error, RunError::BridgeCallLimitExceeded));
         assert_eq!(failure.bridge_calls.len(), 4);
-        assert!(failure.bridge_calls[..3].iter().all(|r| r.outcome == types::BridgeCallOutcome::Ok));
+        assert!(failure.bridge_calls[..3]
+            .iter()
+            .all(|r| r.outcome == types::BridgeCallOutcome::Ok));
         let violating = &failure.bridge_calls[3];
         assert_eq!(violating.outcome, types::BridgeCallOutcome::Blocked);
         assert_eq!(violating.response_bytes, 0);
@@ -2362,7 +2392,10 @@ mod tests {
             }
             // Respond in reverse.
             for (i, &cid) in call_ids.iter().rev().enumerate() {
-                host.send(bridge_resp_ok(cid, &WireValue::Number((i as f64 + 1.0) * 10.0)));
+                host.send(bridge_resp_ok(
+                    cid,
+                    &WireValue::Number((i as f64 + 1.0) * 10.0),
+                ));
             }
         });
 

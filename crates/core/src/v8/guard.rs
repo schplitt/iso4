@@ -9,8 +9,8 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::v8::CpuBudget;
 use crate::v8::isolate::{ReasonCell, TerminationReason};
+use crate::v8::CpuBudget;
 
 /// What the watchdog enforces while a turn is executing.
 pub(super) struct GuardTarget {
@@ -341,13 +341,13 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     use super::*;
-    use crate::v8::runloop::run_module;
-    use crate::v8::testsupport::{call_spec, get_default, get_field, prepared, run_code, run_ok};
     use crate::testval::TestValue as WireValue;
     use crate::types;
+    use crate::v8::runloop::run_module;
+    use crate::v8::testsupport::{call_spec, get_default, get_field, prepared, run_code, run_ok};
     use crate::v8::{
-        FailureOutput, Limits, Output, PrefixSpec, RunError, RunIo, create_instance_core,
-        execute_with_prefix, init_platform, run_call_on_core,
+        create_instance_core, execute_with_prefix, init_platform, run_call_on_core, FailureOutput,
+        Limits, Output, PrefixSpec, RunError, RunIo,
     };
 
     // ── CPU and wall limits ───────────────────────────────────────────────

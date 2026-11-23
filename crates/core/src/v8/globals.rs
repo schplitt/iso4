@@ -596,9 +596,24 @@ mod tests {
 
     #[test]
     fn any_non_reserved_string_is_a_valid_global_name() {
-        for name in ["my-tool", "user.lookup", "class", "default", "1abc", "", "café", "eval"] {
-            assert!(check_not_reserved(name).is_ok(), "expected '{name}' to be allowed");
+        for name in [
+            "my-tool",
+            "user.lookup",
+            "class",
+            "default",
+            "1abc",
+            "",
+            "café",
+            "eval",
+        ] {
+            assert!(
+                check_not_reserved(name).is_ok(),
+                "expected '{name}' to be allowed"
+            );
         }
-        assert!(matches!(check_not_reserved("console"), Err(RunError::ReservedName(_))));
+        assert!(matches!(
+            check_not_reserved("console"),
+            Err(RunError::ReservedName(_))
+        ));
     }
 }

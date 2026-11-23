@@ -3,8 +3,8 @@
 //! `InstanceCore` with its idle settle.
 
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::Duration;
 
 use crate::errors::failure;
@@ -167,7 +167,10 @@ impl ReasonCell {
     }
 
     pub(crate) fn get(&self) -> Option<TerminationReason> {
-        self.reason.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.reason
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub(super) fn bare_terminate(&self) -> bool {
@@ -294,12 +297,13 @@ unsafe extern "C" fn budget_alloc_drop(state: *const BudgetAllocState) {
 /// with it. Resizes now run through `allocate` + copy + `free`, so every byte
 /// still passes `check_and_maybe_terminate` — the budget sees the new size
 /// before the old one is released, which is the conservative direction.
-pub(super) static BUDGET_ALLOC_VTABLE: v8::RustAllocatorVtable<BudgetAllocState> = v8::RustAllocatorVtable {
-    allocate: budget_alloc_alloc,
-    allocate_uninitialized: budget_alloc_alloc_uninit,
-    free: budget_alloc_free,
-    drop: budget_alloc_drop,
-};
+pub(super) static BUDGET_ALLOC_VTABLE: v8::RustAllocatorVtable<BudgetAllocState> =
+    v8::RustAllocatorVtable {
+        allocate: budget_alloc_alloc,
+        allocate_uninitialized: budget_alloc_alloc_uninit,
+        free: budget_alloc_free,
+        drop: budget_alloc_drop,
+    };
 
 /// Near-heap-limit callback registered when `limits.hard_memory_mb > 0`.
 ///
@@ -779,7 +783,7 @@ mod tests {
     use crate::testval::TestValue as WireValue;
     use crate::types::HostGlobalDef;
     use crate::v8::testsupport::{bridge_resp_ok, call_spec, run_code, test_io, value_of};
-    use crate::v8::{CallOutcome, RunIo, execute, run_call_on_core};
+    use crate::v8::{execute, run_call_on_core, CallOutcome, RunIo};
 
     // ── Memory limits ─────────────────────────────────────────────────────
 

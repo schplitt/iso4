@@ -40,7 +40,10 @@ fn read_frame_head(stream: &mut UnixStream) -> std::io::Result<[u8; 2]> {
 
 #[test]
 fn a_closed_stderr_pipe_does_not_end_the_session() {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
     let dir = std::env::temp_dir().join(format!("iso4-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let socket = dir.join("sock");
@@ -65,7 +68,11 @@ fn a_closed_stderr_pipe_does_not_end_the_session() {
             .any(|line| line.contains("capacity:"));
         let _ = ready_tx.send(started);
     });
-    assert_eq!(ready_rx.recv_timeout(TIMEOUT), Ok(true), "child did not start");
+    assert_eq!(
+        ready_rx.recv_timeout(TIMEOUT),
+        Ok(true),
+        "child did not start"
+    );
 
     let mut stream = UnixStream::connect(&socket).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
@@ -77,9 +84,17 @@ fn a_closed_stderr_pipe_does_not_end_the_session() {
     auth.extend_from_slice(&16u32.to_be_bytes());
     auth.extend_from_slice(&[0xAB; 16]);
     stream.write_all(&frame(0x01, &auth)).unwrap();
-    assert_eq!(read_frame_head(&mut stream).ok(), Some([0x05, 0]), "Hello, status ok");
+    assert_eq!(
+        read_frame_head(&mut stream).ok(),
+        Some([0x05, 0]),
+        "Hello, status ok"
+    );
 
     // The session logs the handshake to the dead pipe before it reads this.
     stream.write_all(&frame(0x08, &[])).unwrap();
-    assert_eq!(read_frame_head(&mut stream).ok().map(|h| h[0]), Some(0x06), "StatsResult");
+    assert_eq!(
+        read_frame_head(&mut stream).ok().map(|h| h[0]),
+        Some(0x06),
+        "StatsResult"
+    );
 }

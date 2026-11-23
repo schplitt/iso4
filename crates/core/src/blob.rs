@@ -689,10 +689,7 @@ mod tests {
         crate::snapshot::boot_context(scope, std::ptr::null()).expect("boot context");
 
         let key = webcodec::brand_key_for_token(&[0xab; webcodec::DESCRIPTOR_TOKEN_LEN]);
-        let value = eval(
-            scope,
-            &format!("({{ '{key}': 1, headers: ['x-a','1'] }})"),
-        );
+        let value = eval(scope, &format!("({{ '{key}': 1, headers: ['x-a','1'] }})"));
         let bytes = serialize_value(scope, value).expect("serialize");
 
         let plain = deserialize_value_with_web_types(scope, &bytes).expect("deserialize");

@@ -2,10 +2,10 @@
 //! each, buffered per run under its byte caps and echoed to the observer.
 
 use crate::link::ConsoleStream;
-use crate::v8::RunError;
 use crate::v8::exceptions::capped_text_lossy;
 use crate::v8::isolate::LogBuffers;
 use crate::v8::runtable::{attributed_state, slot_table};
+use crate::v8::RunError;
 
 /// Wrap five methods on V8's own `console` — replacing the object would delete
 /// 18 others. Unwrapped ones no-op: no `ConsoleDelegate` is registered.
@@ -109,7 +109,11 @@ fn render_console_arg(
             // JSON said nothing. `String(v)` names a Map, a Promise or a
             // RegExp; for a genuinely empty object it says less than `{}`.
             let named = display_string(scope, value);
-            return if named == "[object Object]" { text } else { named };
+            return if named == "[object Object]" {
+                text
+            } else {
+                named
+            };
         }
         scope.reset();
     }
@@ -130,7 +134,10 @@ fn is_json_renderable(value: v8::Local<v8::Value>) -> bool {
 
 /// `JSON.stringify(value)`, or `None` when it throws (a cycle) or yields
 /// `undefined` (a function, a symbol) — both fall back to `String(v)`.
-fn render_json_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>, value: v8::Local<v8::Value>) -> Option<String> {
+fn render_json_arg(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Local<v8::Value>,
+) -> Option<String> {
     if scope.has_terminated() {
         return None;
     }
@@ -140,7 +147,10 @@ fn render_json_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::Handle
 
 /// The stack is the useful part of a logged error; `Name: message` when it is
 /// absent or throws.
-fn render_error_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>, value: v8::Local<v8::Value>) -> String {
+fn render_error_arg(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Local<v8::Value>,
+) -> String {
     if let Ok(object) = v8::Local::<v8::Object>::try_from(value) {
         if let Some(key) = v8::String::new(scope, "stack") {
             if let Some(stack) = object.get(scope, key.into()) {
@@ -155,7 +165,10 @@ fn render_error_arg(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::Handl
 }
 
 /// `String(value)`, or a placeholder when even that throws.
-fn display_string(scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>, value: v8::Local<v8::Value>) -> String {
+fn display_string(
+    scope: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    value: v8::Local<v8::Value>,
+) -> String {
     if scope.has_terminated() {
         return "[unprintable]".to_string();
     }
@@ -235,7 +248,7 @@ mod tests {
     use super::*;
     use crate::link::{Addr, Observer};
     use crate::v8::testsupport::{evaluate_prefix, get_default, has_line, run_code, run_ok};
-    use crate::v8::{Limits, RunError, RunIo, execute_with_io, init_platform};
+    use crate::v8::{execute_with_io, init_platform, Limits, RunError, RunIo};
 
     // ── Console capture ───────────────────────────────────────────────────
     // Requires the console shim (Phase 3+).
@@ -296,10 +309,7 @@ mod tests {
         struct Recorder(Mutex<Vec<(Addr, ConsoleStream, String)>>);
         impl Observer for Recorder {
             fn console(&self, to: Addr, stream: ConsoleStream, line: &str) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((to, stream, line.to_string()));
+                self.0.lock().unwrap().push((to, stream, line.to_string()));
             }
         }
         init_platform();
@@ -347,15 +357,26 @@ mod tests {
     /// One `console.log(<expr>)` line, rendered.
     fn logged(expr: &str) -> String {
         let out = run_ok(&format!("console.log({expr}); export default 1"));
-        assert_eq!(out.stdout.len(), 1, "expected one line, got {:?}", out.stdout);
+        assert_eq!(
+            out.stdout.len(),
+            1,
+            "expected one line, got {:?}",
+            out.stdout
+        );
         out.stdout.into_iter().next().unwrap()
     }
 
     #[test]
     fn plain_data_logs_as_json() {
-        assert_eq!(logged("{ user: 'bob', tries: 3 }"), r#"{"user":"bob","tries":3}"#);
+        assert_eq!(
+            logged("{ user: 'bob', tries: 3 }"),
+            r#"{"user":"bob","tries":3}"#
+        );
         assert_eq!(logged("[1, 2, 3]"), "[1,2,3]");
-        assert_eq!(logged("{ nested: { deep: [1] } }"), r#"{"nested":{"deep":[1]}}"#);
+        assert_eq!(
+            logged("{ nested: { deep: [1] } }"),
+            r#"{"nested":{"deep":[1]}}"#
+        );
         assert_eq!(logged("{}"), "{}");
     }
 
@@ -388,7 +409,10 @@ mod tests {
     #[test]
     fn strings_are_not_quoted_and_primitives_read_plainly() {
         assert_eq!(logged("'plain'"), "plain");
-        assert_eq!(logged("null, undefined, 42, true"), "null undefined 42 true");
+        assert_eq!(
+            logged("null, undefined, 42, true"),
+            "null undefined 42 true"
+        );
         assert_eq!(logged("() => 1"), "() => 1");
         assert_eq!(logged("Symbol('s')"), "Symbol(s)");
     }
@@ -487,8 +511,8 @@ mod tests {
     fn the_console_surface_is_identical_in_prefix_and_run_code() {
         let at_run = get_default(&run_ok(&format!("export default {CONSOLE_SURFACE}")))
             .expect("run surface");
-        let err = evaluate_prefix(&format!("throw new Error({CONSOLE_SURFACE})"), &[], &[])
-            .unwrap_err();
+        let err =
+            evaluate_prefix(&format!("throw new Error({CONSOLE_SURFACE})"), &[], &[]).unwrap_err();
         let RunError::RuntimeError(data) = &err.error else {
             panic!("expected the probe to throw, got {:?}", err.error);
         };
@@ -582,7 +606,11 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(failure.error, RunError::CpuTimeout), "got {:?}", failure.error);
+        assert!(
+            matches!(failure.error, RunError::CpuTimeout),
+            "got {:?}",
+            failure.error
+        );
         assert!(failure.stdout.is_empty(), "got {:?}", failure.stdout);
     }
 

@@ -648,7 +648,10 @@ mod tests {
         let encoded = String::from_utf8_lossy(&payload);
 
         assert_eq!(encoded.matches("[truncated by iso4: ").count(), 2);
-        assert!(!encoded.contains("bytes total]"), "the wire clamp added a marker");
+        assert!(
+            !encoded.contains("bytes total]"),
+            "the wire clamp added a marker"
+        );
         assert!(payload.len() < 2 * MAX_ERROR_TEXT_BYTES + 256);
     }
 }

@@ -17,10 +17,10 @@ use crate::v8::exceptions::{
     syntax_error,
 };
 use crate::v8::globals::{
-    ISO4_RUNTIME_MODULE_SRC, ISO4_RUNTIME_SPECIFIER, eval_script, install_value_globals,
+    eval_script, install_value_globals, ISO4_RUNTIME_MODULE_SRC, ISO4_RUNTIME_SPECIFIER,
 };
 use crate::v8::node::async_hooks::{ASYNC_HOOKS_MODULE_SRC, ASYNC_HOOKS_SPECIFIER};
-use crate::v8::runloop::{RunFacts, RunState, ScanOutcome, build_output_and_maybe_grace, finished};
+use crate::v8::runloop::{build_output_and_maybe_grace, finished, RunFacts, RunState, ScanOutcome};
 use crate::v8::{RunError, RuntimeErrorData};
 
 /// Extract and serialize a settled module's exports, then finish (or start
@@ -466,12 +466,10 @@ pub(super) fn module_resolver_callback<'a>(
     // binding matches do we fall back to the built-in async-context module.
     let binding = match lookup_binding(&specifier_str) {
         Some(b) => b,
-        None if specifier_str == ASYNC_HOOKS_SPECIFIER => {
-            ImportBinding {
-                specifier: specifier_str.clone(),
-                module: ImportModule::Source(ASYNC_HOOKS_MODULE_SRC.to_string()),
-            }
-        }
+        None if specifier_str == ASYNC_HOOKS_SPECIFIER => ImportBinding {
+            specifier: specifier_str.clone(),
+            module: ImportModule::Source(ASYNC_HOOKS_MODULE_SRC.to_string()),
+        },
         None if specifier_str == ISO4_RUNTIME_SPECIFIER => ImportBinding {
             specifier: specifier_str.clone(),
             module: ImportModule::Source(ISO4_RUNTIME_MODULE_SRC.to_string()),
@@ -534,7 +532,10 @@ fn compile_source_module<'s>(
                 record_resolve_error(syntax_error(tc));
                 return None;
             };
-            data.message = format!("failed to compile source import '{specifier}': {}", data.message);
+            data.message = format!(
+                "failed to compile source import '{specifier}': {}",
+                data.message
+            );
             record_resolve_error(RunError::RuntimeError(data));
             None
         }
@@ -783,9 +784,21 @@ fn is_valid_export_identifier(name: &str) -> bool {
     };
     // ID minus XID; V8 uses ID.
     let id_not_xid = |c: char| {
-        matches!(c, '\u{037A}' | '\u{309B}' | '\u{309C}' | '\u{FC5E}'..='\u{FC63}'
-            | '\u{FDFA}' | '\u{FDFB}' | '\u{FE70}' | '\u{FE72}' | '\u{FE74}' | '\u{FE76}'
-            | '\u{FE78}' | '\u{FE7A}' | '\u{FE7C}' | '\u{FE7E}')
+        matches!(
+            c,
+            '\u{037A}' | '\u{309B}' | '\u{309C}' | '\u{FC5E}'
+                ..='\u{FC63}'
+                    | '\u{FDFA}'
+                    | '\u{FDFB}'
+                    | '\u{FE70}'
+                    | '\u{FE72}'
+                    | '\u{FE74}'
+                    | '\u{FE76}'
+                    | '\u{FE78}'
+                    | '\u{FE7A}'
+                    | '\u{FE7C}'
+                    | '\u{FE7E}'
+        )
     };
     if !(unicode_ident::is_xid_start(first)
         || id_not_xid(first)
@@ -831,19 +844,19 @@ fn check_export_serializable(name: &str, value: v8::Local<v8::Value>) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
 
     use super::*;
     use crate::link::Outbound;
     use crate::testval::{self, TestValue as WireValue};
     use crate::types;
-    use crate::v8::{FailureOutput, Limits, Output, PrefixSpec, execute, execute_with_prefix};
     use crate::v8::testsupport::{
-        TestHost, bridge_call_parts, bridge_resp_ok, call_spec, evaluate_prefix, get_default,
-        get_field, get_named, host_import, run_err, run_ok, run_with_source_imports, source_import,
-        test_io, value_of,
+        bridge_call_parts, bridge_resp_ok, call_spec, evaluate_prefix, get_default, get_field,
+        get_named, host_import, run_err, run_ok, run_with_source_imports, source_import, test_io,
+        value_of, TestHost,
     };
+    use crate::v8::{execute, execute_with_prefix, FailureOutput, Limits, Output, PrefixSpec};
 
     // ── Export validation ─────────────────────────────────────────────────
     //
@@ -1141,7 +1154,11 @@ mod tests {
     #[test]
     fn prefix_syntax_error_is_user_code() {
         let err = evaluate_prefix("export default (((", &[], &[]).unwrap_err();
-        assert!(matches!(&err.error, RunError::RuntimeError(d) if d.name == "SyntaxError"), "got {:?}", err.error);
+        assert!(
+            matches!(&err.error, RunError::RuntimeError(d) if d.name == "SyntaxError"),
+            "got {:?}",
+            err.error
+        );
     }
 
     #[test]
@@ -1155,7 +1172,11 @@ mod tests {
         // Regression (snapshot era): an unresolvable import used to segfault
         // (unconditional create_blob after a failed instantiate). The cold
         // start must return a clean ModuleNotFound.
-        let err = evaluate_prefix("import x from 'totally-nonexistent-xyz'; export default x;", &[], &[])
+        let err = evaluate_prefix(
+            "import x from 'totally-nonexistent-xyz'; export default x;",
+            &[],
+            &[],
+        )
         .unwrap_err();
         assert!(
             matches!(err.error, RunError::ModuleNotFound(_)),
@@ -1166,8 +1187,7 @@ mod tests {
 
     #[test]
     fn prefix_with_globalthis_state_evaluates() {
-        evaluate_prefix("globalThis.base = 100; export default 1;", &[], &[])
-        .unwrap();
+        evaluate_prefix("globalThis.base = 100; export default 1;", &[], &[]).unwrap();
     }
 
     // ── Host modules built natively from shape data ────────────────────
@@ -1338,7 +1358,10 @@ mod tests {
                 assert_eq!(target_kind, 1);
                 assert_eq!(specifier.as_deref(), Some("tools:b"));
                 assert_eq!(export_name, ["second"]);
-                s.send(bridge_resp_ok(call_id, &WireValue::String("ok".to_string())));
+                s.send(bridge_resp_ok(
+                    call_id,
+                    &WireValue::String("ok".to_string()),
+                ));
             },
         );
         h.join().unwrap();
@@ -1417,11 +1440,27 @@ mod tests {
 
     #[test]
     fn host_module_export_name_follows_unicode_identifier_rules() {
-        for name in ["café", "π", "$", "_", "a\u{200C}b", "a\u{200D}b", "\u{309B}", "\u{0E33}", "a\u{FE70}"] {
-            assert!(is_valid_export_identifier(name), "expected '{name}' to be valid");
+        for name in [
+            "café",
+            "π",
+            "$",
+            "_",
+            "a\u{200C}b",
+            "a\u{200D}b",
+            "\u{309B}",
+            "\u{0E33}",
+            "a\u{FE70}",
+        ] {
+            assert!(
+                is_valid_export_identifier(name),
+                "expected '{name}' to be valid"
+            );
         }
         for name in ["", "1abc", "my-tool", "\u{200C}a"] {
-            assert!(!is_valid_export_identifier(name), "expected '{name}' to be invalid");
+            assert!(
+                !is_valid_export_identifier(name),
+                "expected '{name}' to be invalid"
+            );
         }
     }
 
@@ -1456,7 +1495,10 @@ mod tests {
         );
         // One blocked record for the refused attempt.
         assert_eq!(out.bridge_calls.len(), 1);
-        assert_eq!(out.bridge_calls[0].outcome, types::BridgeCallOutcome::Blocked);
+        assert_eq!(
+            out.bridge_calls[0].outcome,
+            types::BridgeCallOutcome::Blocked
+        );
         // The responder thread never got a frame; drop it by closing our end.
         drop(h);
     }
@@ -1511,8 +1553,7 @@ mod tests {
         let (io, host) = test_io();
         let handle = std::thread::spawn(move || {
             let frame = host.recv();
-            let (call_id, target_kind, specifier, export_name, args) =
-                bridge_call_parts(frame);
+            let (call_id, target_kind, specifier, export_name, args) = bridge_call_parts(frame);
             assert_eq!(target_kind, 1);
             assert_eq!(specifier.as_deref(), Some("tools:search"));
             assert_eq!(export_name, ["query"]);

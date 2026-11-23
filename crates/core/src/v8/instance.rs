@@ -11,24 +11,24 @@ use std::time::Duration;
 use crate::errors::{failure, reason_error, termination_or};
 use crate::link::{Addr, HostLink, Inbound, LinkError, Outbound};
 use crate::types;
-use crate::v8::bridge::{BridgeCallLog, install_prefix_bridge_placeholders};
+use crate::v8::bridge::{install_prefix_bridge_placeholders, BridgeCallLog};
 use crate::v8::guard::GuardTarget;
 use crate::v8::isolate::{
-    LogBuffers, TerminationReason, elapsed_ms, heap_used, idle_settle_after, settle_heap,
+    elapsed_ms, heap_used, idle_settle_after, settle_heap, LogBuffers, TerminationReason,
 };
 use crate::v8::runloop::{
-    CallPhaseCtx, LoopEvent, RunEntry, RunFacts, RunPhase, RunState, ScanOutcome, begin_call,
-    boundary_close, boundary_deadline, conclude_grace_wall, counted_wall_ms, earliest_timer,
-    end_turn, enter_turn, grace_wall_due, handle_loop_event, instance_tainted, leave_turn,
-    next_deadline, stream_idle_turn,
+    begin_call, boundary_close, boundary_deadline, conclude_grace_wall, counted_wall_ms,
+    earliest_timer, end_turn, enter_turn, grace_wall_due, handle_loop_event, instance_tainted,
+    leave_turn, next_deadline, stream_idle_turn, CallPhaseCtx, LoopEvent, RunEntry, RunFacts,
+    RunPhase, RunState, ScanOutcome,
 };
-use crate::v8::runtable::{LOAD_WINDOW_MS, RUN_TABLE_PTR, RunCallState, TIMERS_TOUCHED};
+use crate::v8::runtable::{RunCallState, LOAD_WINDOW_MS, RUN_TABLE_PTR, TIMERS_TOUCHED};
 use crate::v8::streams::{close_out_streams, close_run_streams, out_idle_deadline};
-use crate::v8::timers::{TimerTable, timer_turn};
+use crate::v8::timers::{timer_turn, TimerTable};
 use crate::v8::{
-    CallJob, CallOutcome, CpuBudget, FailureOutput, GraceReport, GraceStatus, InstanceCore,
-    InstanceLoad, OomRecord, OomRun, OutStreamTable, Output, PendingWork, ResetCause, RoutedEvent,
-    RunError, RunEvent, RunIo, RunTable, StreamTable, alloc_run_token, load_now_ms,
+    alloc_run_token, load_now_ms, CallJob, CallOutcome, CpuBudget, FailureOutput, GraceReport,
+    GraceStatus, InstanceCore, InstanceLoad, OomRecord, OomRun, OutStreamTable, Output,
+    PendingWork, ResetCause, RoutedEvent, RunError, RunEvent, RunIo, RunTable, StreamTable,
 };
 
 // ── The instance loop ────────────────────────────────────────────────────────
@@ -234,8 +234,7 @@ pub fn send_completion(link: &dyn HostLink, run_id: u32, msg: Outbound) {
                 bridge_calls: Vec::new(),
                 error: Some((
                     "Error".to_string(),
-                    "the grace report was too large to send; its telemetry was dropped"
-                        .to_string(),
+                    "the grace report was too large to send; its telemetry was dropped".to_string(),
                 )),
                 early_result_sent: true,
             };
@@ -482,8 +481,14 @@ pub fn serve_instance(
 
     // The job that triggered instance creation, then the loop.
     load.open_turn(load_now_ms());
-    let first_tainted =
-        dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, first);
+    let first_tainted = dispatch_job(
+        core,
+        prefix_globals,
+        imports,
+        &mut live,
+        &mut deadlines,
+        first,
+    );
     load.close_turn();
     if first_tainted {
         taint_sweep(core, &mut live, events);
@@ -501,7 +506,11 @@ pub fn serve_instance(
                 .map(|(at, _)| at.saturating_duration_since(std::time::Instant::now()))
                 // Nothing pending and the last run's garbage still held:
                 // wake once to settle the heap, then park indefinitely.
-                .or_else(|| (live.is_empty() && !settled).then(idle_settle_after).flatten());
+                .or_else(|| {
+                    (live.is_empty() && !settled)
+                        .then(idle_settle_after)
+                        .flatten()
+                });
             let oper = match timeout {
                 Some(t) => sel.select_timeout(t).ok(),
                 None => Some(sel.select()),
@@ -580,7 +589,14 @@ pub fn serve_instance(
                     taint_sweep(core, &mut live, events);
                     return;
                 }
-                if dispatch_job(core, prefix_globals, imports, &mut live, &mut deadlines, msg) {
+                if dispatch_job(
+                    core,
+                    prefix_globals,
+                    imports,
+                    &mut live,
+                    &mut deadlines,
+                    msg,
+                ) {
                     taint_sweep(core, &mut live, events);
                     return;
                 }
@@ -599,9 +615,9 @@ pub fn serve_instance(
                     // event sat in the queue. Discard like the demux's own
                     // late-frame rule, but loudly.
                     match &event {
-                        RunEvent::Host(msg) => crate::log!(
-                            "[iso4-v8] discarding late {msg} (run already concluded)"
-                        ),
+                        RunEvent::Host(msg) => {
+                            crate::log!("[iso4-v8] discarding late {msg} (run already concluded)")
+                        }
                         RunEvent::Job(_) | RunEvent::Retire => {}
                     }
                     // Discarding is the whole turn; an unclosed one reads
@@ -673,9 +689,8 @@ pub fn serve_instance(
         busy_nanos += turn_started.elapsed().as_nanos() as u64;
         let window = window_start.elapsed();
         if window.as_millis() as u64 >= LOAD_WINDOW_MS {
-            let permille = (busy_nanos.saturating_mul(1000)
-                / (window.as_nanos() as u64).max(1))
-            .min(1000) as u32;
+            let permille = (busy_nanos.saturating_mul(1000) / (window.as_nanos() as u64).max(1))
+                .min(1000) as u32;
             load.close_window(permille);
             window_start = std::time::Instant::now();
             busy_nanos = 0;
@@ -828,7 +843,7 @@ fn dispatch_job(
                     logs: logs_ptr,
                     pending: pending_ptr,
                     streams: streams_ptr,
-                out_streams: out_streams_ptr,
+                    out_streams: out_streams_ptr,
                     timers: timers_ptr,
                     phase: RunPhase::Starting,
                     counted: Duration::ZERO,
@@ -935,4 +950,3 @@ pub fn note_turn_owner(oom: &OomRecord, job: &CallJob) {
     LAST_CULPRIT_RUN_ID.with(|c| c.set(run_id));
     oom.set_run(OomRun::Run(run_id));
 }
-

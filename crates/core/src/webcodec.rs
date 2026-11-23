@@ -566,12 +566,17 @@ pub fn rehydrate<'s>(
             let mut pairs = Vec::with_capacity(entries.length() as usize / 2);
             let mut changed = false;
             for i in (0..entries.length()).step_by(2) {
-                let (Some(k), Some(v)) = (entries.get_index(scope, i), entries.get_index(scope, i + 1))
+                let (Some(k), Some(v)) =
+                    (entries.get_index(scope, i), entries.get_index(scope, i + 1))
                 else {
                     return interrupted();
                 };
-                let k = visit(scope, k, key, seen, &mut pending)?.inspect(|_| changed = true).unwrap_or(k);
-                let v = visit(scope, v, key, seen, &mut pending)?.inspect(|_| changed = true).unwrap_or(v);
+                let k = visit(scope, k, key, seen, &mut pending)?
+                    .inspect(|_| changed = true)
+                    .unwrap_or(k);
+                let v = visit(scope, v, key, seen, &mut pending)?
+                    .inspect(|_| changed = true)
+                    .unwrap_or(v);
                 pairs.push((k, v));
             }
             if changed {
@@ -590,7 +595,11 @@ pub fn rehydrate<'s>(
                 let Some(item) = entries.get_index(scope, i) else {
                     return interrupted();
                 };
-                items.push(visit(scope, item, key, seen, &mut pending)?.inspect(|_| changed = true).unwrap_or(item));
+                items.push(
+                    visit(scope, item, key, seen, &mut pending)?
+                        .inspect(|_| changed = true)
+                        .unwrap_or(item),
+                );
             }
             if changed {
                 set.clear();
@@ -648,7 +657,11 @@ fn visit<'s>(
     };
     // A miss reads as `undefined`; a stand-in is always an object.
     if let Some(stand_in) = seen.get(scope, value).filter(|s| s.is_object()) {
-        return Ok(if stand_in == value { None } else { Some(stand_in) });
+        return Ok(if stand_in == value {
+            None
+        } else {
+            Some(stand_in)
+        });
     }
     // A stamped descriptor is replaced wholesale; its own fields are plain data.
     // The host only ever emits one as a plain object.
@@ -1158,7 +1171,10 @@ mod tests {
     fn a_graph_without_descriptors_is_returned_untouched() {
         let key = brand_key_for_token(&[0xab; DESCRIPTOR_TOKEN_LEN]);
         with_web(|scope| {
-            let value = eval(scope, "({ a: [1, { b: 2 }], m: new Map([[1, 2]]), s: new Set([3]) })");
+            let value = eval(
+                scope,
+                "({ a: [1, { b: 2 }], m: new Map([[1, 2]]), s: new Set([3]) })",
+            );
             let out = rehydrate(scope, value, &key).expect("rehydrate");
             assert!(out == value);
         });
@@ -1181,7 +1197,10 @@ mod tests {
             let global = scope.get_current_context().global(scope);
             let name = v8::String::new(scope, "__rt").unwrap();
             global.set(scope, name.into(), out);
-            let probe = eval(scope, "[__rt[0] instanceof Response, Array.isArray(__rt[1])].join('|')");
+            let probe = eval(
+                scope,
+                "[__rt[0] instanceof Response, Array.isArray(__rt[1])].join('|')",
+            );
             probe.to_string(scope).unwrap().to_rust_string_lossy(scope)
         });
         assert_eq!(out, "false|true");

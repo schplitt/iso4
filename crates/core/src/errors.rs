@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use crate::types;
 use crate::types::{BridgeErrorPayload, ResetCause, ResetInfo, RunErrorPayload};
 use crate::v8::{
-    LogBuffers, ReasonCell, TerminationReason, WARMUP_CPU_MS, WARMUP_WALL_MS, elapsed_ms,
+    elapsed_ms, LogBuffers, ReasonCell, TerminationReason, WARMUP_CPU_MS, WARMUP_WALL_MS,
 };
 
 /// Ceiling on each piece of error text (message, stack): `max_export_bytes`
@@ -328,7 +328,11 @@ pub(crate) fn termination_or(reason: &ReasonCell, fallback: RunError) -> RunErro
     }
 }
 
-pub(crate) fn failure(error: RunError, logs: &LogBuffers, start: std::time::Instant) -> FailureOutput {
+pub(crate) fn failure(
+    error: RunError,
+    logs: &LogBuffers,
+    start: std::time::Instant,
+) -> FailureOutput {
     let duration_ms = elapsed_ms(start);
     FailureOutput {
         error,

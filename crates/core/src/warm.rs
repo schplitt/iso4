@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::policy;
-use crate::rss;
 use crate::prefix::PrefixData;
+use crate::rss;
 use crate::v8 as sandbox;
 
 /// A live warm instance as the registry sees it: the channel to its owner
@@ -100,7 +100,8 @@ impl InstanceHandle {
         if self.msgs.send(msg).is_err() {
             return sandbox::dead_instance_outcome();
         }
-        rx.recv().unwrap_or_else(|_| sandbox::dead_instance_outcome())
+        rx.recv()
+            .unwrap_or_else(|_| sandbox::dead_instance_outcome())
     }
 
     /// A clone of the instance's one sender, for the engine's dispatch path
@@ -420,8 +421,7 @@ struct PrefixDemand {
 impl PrefixDemand {
     fn note_arrival(&mut self, now: Instant) {
         if let Some(last) = self.last_arrival {
-            self.interval_ms
-                .update((now - last).as_secs_f64() * 1000.0);
+            self.interval_ms.update((now - last).as_secs_f64() * 1000.0);
         }
         self.last_arrival = Some(now);
     }
@@ -661,7 +661,9 @@ impl WarmRegistry {
         }
         #[cfg(test)]
         {
-            let injected = self.usage_override.load(std::sync::atomic::Ordering::Relaxed);
+            let injected = self
+                .usage_override
+                .load(std::sync::atomic::Ordering::Relaxed);
             if injected != u64::MAX {
                 return Some(injected);
             }
@@ -840,8 +842,7 @@ impl WarmRegistry {
             .heap_bytes
             .get()
             .map_or(run_cap_bytes, |h| h as u64);
-        let can_spawn =
-            admit_warm && live < cores() && self.admit(usage, spawn_cap).is_ok();
+        let can_spawn = admit_warm && live < cores() && self.admit(usage, spawn_cap).is_ok();
         let facts: Vec<policy::JoinFact> = joinable
             .iter()
             .map(|&pos| {
@@ -1082,7 +1083,9 @@ impl WarmRegistry {
     fn stats_usage_bytes(&self) -> u64 {
         #[cfg(test)]
         {
-            let injected = self.usage_override.load(std::sync::atomic::Ordering::Relaxed);
+            let injected = self
+                .usage_override
+                .load(std::sync::atomic::Ordering::Relaxed);
             if injected != u64::MAX {
                 return injected;
             }
@@ -1111,7 +1114,11 @@ fn evict_scored(inner: &mut RegistryInner, now: Instant) -> bool {
     let mut facts: Vec<policy::VictimFact> = Vec::with_capacity(inner.idle_total);
     let mut locations: Vec<(&String, u64)> = Vec::with_capacity(inner.idle_total);
     for (prefix_id, entry) in &inner.prefixes {
-        for inst in entry.instances.iter().filter(|i| i.in_flight == 0 && !i.dead) {
+        for inst in entry
+            .instances
+            .iter()
+            .filter(|i| i.in_flight == 0 && !i.dead)
+        {
             facts.push(policy::VictimFact {
                 heap_used_bytes: inst.handle.heap_used_bytes,
                 last_used: inst.handle.last_used,
@@ -1140,9 +1147,9 @@ fn evict_scored(inner: &mut RegistryInner, now: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v8::CallJob;
     use crate::link::{Addr, HostLink, Inbound, NoopObserver, Outbound};
     use crate::testval::{self, TestValue};
+    use crate::v8::CallJob;
     use std::sync::atomic::AtomicU32;
 
     fn counter_prefix() -> Arc<PrefixData> {
@@ -1236,7 +1243,10 @@ mod tests {
             tx.send(outcome).ok();
         }));
         a.sender()
-            .send(sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job(Box::new(job))))
+            .send(sandbox::RoutedEvent::new(
+                0,
+                sandbox::RunEvent::Job(Box::new(job)),
+            ))
             .expect("instance accepts the job");
         rx.recv().expect("instance answers")
     }
@@ -1252,7 +1262,15 @@ mod tests {
             Ok(o) => o.cpu_time_ms,
             Err(f) => f.cpu_time_ms,
         };
-        reg.release(prefix, a.id, out.tainted, out.heap_used_bytes, 0.0, cpu, true);
+        reg.release(
+            prefix,
+            a.id,
+            out.tainted,
+            out.heap_used_bytes,
+            0.0,
+            cpu,
+            true,
+        );
     }
 
     #[test]
@@ -1513,10 +1531,16 @@ mod tests {
         let Acquired::Refused(msg) = acquire(&registry, "p", TEST_CAP) else {
             panic!("128 MB run at 800/900 MB must be refused");
         };
-        assert!(msg.contains("admission line"), "message names the line: {msg}");
+        assert!(
+            msg.contains("admission line"),
+            "message names the line: {msg}"
+        );
         // The reader can reconstruct the whole calculation: the explicit sum,
         // the line's derivation inputs, and the cap that would still fit.
-        assert!(msg.contains("totals 928 MB"), "message states the sum: {msg}");
+        assert!(
+            msg.contains("totals 928 MB"),
+            "message states the sum: {msg}"
+        );
         assert!(
             msg.contains("90% of (container limit 1128 MB minus host reserve 128 MB)"),
             "message derives the line: {msg}"
@@ -1557,8 +1581,14 @@ mod tests {
         let registry = WarmRegistry::new(0, 900 * TEST_MB);
         registry.set_usage_for_test(800 * TEST_MB);
         assert!(registry.reserve_oneoff(TEST_CAP).is_err());
-        assert_eq!(registry.stats().oneoff_running, 0, "refusal takes no counters");
-        registry.reserve_oneoff(64 * TEST_MB).expect("a smaller run fits");
+        assert_eq!(
+            registry.stats().oneoff_running,
+            0,
+            "refusal takes no counters"
+        );
+        registry
+            .reserve_oneoff(64 * TEST_MB)
+            .expect("a smaller run fits");
         assert_eq!(registry.stats().oneoff_running, 1);
         registry.release_oneoff(false, 0.0, 0.0);
 
@@ -1709,7 +1739,10 @@ mod tests {
 
         // Latch released (at/below 80% of the mark): normal pooling.
         registry.set_usage_for_test(50 * TEST_MB);
-        assert!(matches!(acquire(&registry, "r", TEST_CAP), Acquired::Attached(_)));
+        assert!(matches!(
+            acquire(&registry, "r", TEST_CAP),
+            Acquired::Attached(_)
+        ));
     }
 
     #[test]
@@ -1833,8 +1866,7 @@ mod tests {
             "before the settle the registry reads the release-time heap"
         );
 
-        let after =
-            sandbox::idle_settle_after().expect("the suite runs with the settle on");
+        let after = sandbox::idle_settle_after().expect("the suite runs with the settle on");
         std::thread::sleep(after + Duration::from_millis(500));
         let settled = registry.stats().idle_heap_bytes;
         assert!(
@@ -1848,7 +1880,11 @@ mod tests {
         }));
         assert_eq!(a2.id, a.id);
         let outcome = call_via(&a2, churn_job());
-        assert_eq!(bump_value(&outcome), 2.0, "module state survives the settle");
+        assert_eq!(
+            bump_value(&outcome),
+            2.0,
+            "module state survives the settle"
+        );
         release_outcome(&registry, "p0", &a2, &outcome);
     }
 
@@ -2019,7 +2055,16 @@ mod tests {
         counter: &Arc<AtomicU32>,
         limits: sandbox::Limits,
     ) -> SessionRun {
-        submit_session_job_with_ctl(handle, run_id, export_path, args, link, counter, limits, None)
+        submit_session_job_with_ctl(
+            handle,
+            run_id,
+            export_path,
+            args,
+            link,
+            counter,
+            limits,
+            None,
+        )
     }
 
     /// [`submit_session_job`] plus the demux's guard-ctl slot, for tests
@@ -2059,7 +2104,10 @@ mod tests {
         });
         handle
             .sender()
-            .send(sandbox::RoutedEvent::new(token, sandbox::RunEvent::Job(job)))
+            .send(sandbox::RoutedEvent::new(
+                token,
+                sandbox::RunEvent::Job(job),
+            ))
             .expect("instance accepts the job");
         SessionRun {
             token,
@@ -2088,17 +2136,28 @@ mod tests {
     fn one_instance_interleaves_two_runs_with_correct_attribution() {
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // Two runs, both suspended awaiting their bridge response.
         let run1 = submit_session_job(
-            &handle, 101, "viaTool", vec![TestValue::Number(1.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            101,
+            "viaTool",
+            vec![TestValue::Number(1.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let run2 = submit_session_job(
-            &handle, 102, "viaTool", vec![TestValue::Number(2.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            102,
+            "viaTool",
+            vec![TestValue::Number(2.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
 
         // Both BridgeCall frames arrive on the one serialized writer, each
@@ -2138,20 +2197,30 @@ mod tests {
     fn a_mid_turn_kill_resets_innocent_co_resident_runs() {
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // The innocent victim: suspended awaiting a bridge response.
         let victim = submit_session_job(
-            &handle, 8, "viaTool", vec![TestValue::Number(1.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            8,
+            "viaTool",
+            vec![TestValue::Number(1.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let _ = read_bridge_call(&server); // proof it is suspended
 
         // The culprit: a synchronous spin killed mid-turn by the CPU guard.
         let culprit = submit_session_job(
-            &handle, 7, "spin", vec![],
-            Arc::clone(&link), &counter,
+            &handle,
+            7,
+            "spin",
+            vec![],
+            Arc::clone(&link),
+            &counter,
             sandbox::Limits {
                 cpu_time_ms: 100,
                 wall_time_ms: 10_000,
@@ -2184,18 +2253,29 @@ mod tests {
     fn a_dynamic_import_resets_innocent_co_resident_runs() {
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let victim = submit_session_job(
-            &handle, 8, "viaTool", vec![TestValue::Number(1.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            8,
+            "viaTool",
+            vec![TestValue::Number(1.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let _ = read_bridge_call(&server);
 
         let culprit = submit_session_job(
-            &handle, 7, "dynImport", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            7,
+            "dynImport",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let culprit_out = culprit.outcome.recv().expect("culprit concludes");
         assert!(culprit_out.tainted);
@@ -2232,8 +2312,13 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
-            &handle, 40, "streamSmall", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            40,
+            "streamSmall",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
 
         assert!(
@@ -2264,7 +2349,10 @@ mod tests {
             other => panic!("expected a clean EOF, got {other:?}"),
         }
 
-        let out = run.outcome.recv().expect("run concludes after the stream drains");
+        let out = run
+            .outcome
+            .recv()
+            .expect("run concludes after the stream drains");
         assert!(!out.tainted);
         let output = out.result.unwrap();
         let report = output.background.expect("post-Result phase reports");
@@ -2281,8 +2369,13 @@ mod tests {
 
         const TOTAL: usize = 300_000;
         let run = submit_session_job(
-            &handle, 41, "streamBig", vec![TestValue::Number(TOTAL as f64)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            41,
+            "streamBig",
+            vec![TestValue::Number(TOTAL as f64)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
 
         assert!(matches!(read_frame(&server), (_, Outbound::Result { .. })));
@@ -2312,7 +2405,10 @@ mod tests {
         let (_, Outbound::StreamChunk { data, .. }) = read_frame(&server) else {
             panic!("expected the remainder");
         };
-        assert_eq!(data.len(), TOTAL - crate::types::STREAM_CREDIT_WINDOW_BYTES as usize);
+        assert_eq!(
+            data.len(),
+            TOTAL - crate::types::STREAM_CREDIT_WINDOW_BYTES as usize
+        );
 
         assert!(matches!(
             read_frame(&server),
@@ -2331,8 +2427,13 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
-            &handle, 44, "streamBad", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            44,
+            "streamBad",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         assert!(
             matches!(
@@ -2347,14 +2448,23 @@ mod tests {
             "the run itself succeeded"
         );
 
-        let (_, Outbound::StreamEnd { error: Some(error), .. }) = read_frame(&server) else {
+        let (
+            _,
+            Outbound::StreamEnd {
+                error: Some(error), ..
+            },
+        ) = read_frame(&server)
+        else {
             panic!("expected a failed StreamEnd");
         };
         assert!(error.contains("Uint8Array or string"));
 
         let out = run.outcome.recv().expect("run concludes");
         assert!(!out.tainted);
-        assert!(out.result.is_ok(), "a body error is a stream event, not a run failure");
+        assert!(
+            out.result.is_ok(),
+            "a body error is a stream event, not a run failure"
+        );
     }
 
     #[test]
@@ -2365,8 +2475,13 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
-            &handle, 42, "streamHang", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            42,
+            "streamHang",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         assert!(matches!(read_frame(&server), (_, Outbound::Result { .. })));
         // Drain the eager window; the generator is now parked AT ITS YIELD
@@ -2409,8 +2524,13 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
-            &handle, 43, "streamHang", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            43,
+            "streamHang",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         assert!(matches!(read_frame(&server), (_, Outbound::Result { .. })));
         let mut received = 0usize;
@@ -2423,7 +2543,13 @@ mod tests {
 
         // Neither read nor cancelled: the idle deadline ends the stream with
         // an error naming the timeout, guest cleanup runs, run concludes.
-        let (_, Outbound::StreamEnd { error: Some(error), .. }) = read_frame(&server) else {
+        let (
+            _,
+            Outbound::StreamEnd {
+                error: Some(error), ..
+            },
+        ) = read_frame(&server)
+        else {
             panic!("expected a failed StreamEnd");
         };
         assert!(error.contains("stream idle timeout"));
@@ -2437,7 +2563,11 @@ mod tests {
 
         let outcome = handle.call(bump_job());
         let value = testval::from_blob(&outcome.result.unwrap().exports);
-        assert_eq!(value, TestValue::Number(101.0), "finally ran via the cancel path");
+        assert_eq!(
+            value,
+            TestValue::Number(101.0),
+            "finally ran via the cancel path"
+        );
     }
 
     /// Tiny drop guard for test-global overrides.
@@ -2461,28 +2591,42 @@ mod tests {
         // cause `abort` and the culprit's wire id.
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // The innocent victim: suspended awaiting a bridge response.
         let victim = submit_session_job(
-            &handle, 12, "viaTool", vec![TestValue::Number(1.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            12,
+            "viaTool",
+            vec![TestValue::Number(1.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let _ = read_bridge_call(&server);
 
         // The culprit: its continuation after the bridge response spins.
         let ctl_slot = Arc::new(std::sync::OnceLock::new());
         let culprit = submit_session_job_with_ctl(
-            &handle, 11, "spinAfterTool", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            11,
+            "spinAfterTool",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
             Some(Arc::clone(&ctl_slot)),
         );
         let (_, call_id) = read_bridge_call(&server);
         culprit.send(bridge_response_event(call_id, 1.0));
 
         // Kill the culprit once its turn is really executing (the spin).
-        let ctl = ctl_slot.get().expect("dispatch filled the ctl slot").clone();
+        let ctl = ctl_slot
+            .get()
+            .expect("dispatch filled the ctl slot")
+            .clone();
         let mut killed = false;
         for _ in 0..200 {
             std::thread::sleep(Duration::from_millis(10));
@@ -2517,13 +2661,19 @@ mod tests {
     fn an_abort_abandons_the_run_and_the_instance_survives() {
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // Suspend a run mid-bridge after it bumped the counter, then abort.
         let run = submit_session_job(
-            &handle, 5, "hangBump", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            5,
+            "hangBump",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let _ = read_bridge_call(&server);
         run.send(sandbox::RunEvent::Host(Inbound::Terminate {
@@ -2554,12 +2704,17 @@ mod tests {
         // deliberately narrows the old taint-on-WallTimeout).
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let run = submit_session_job(
-            &handle, 9, "hangBump", vec![],
-            Arc::clone(&link), &counter,
+            &handle,
+            9,
+            "hangBump",
+            vec![],
+            Arc::clone(&link),
+            &counter,
             sandbox::Limits {
                 wall_time_ms: 200,
                 ..Default::default()
@@ -2604,19 +2759,29 @@ mod tests {
         // queue.
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let b = submit_session_job(
-            &handle, 22, "viaTool", vec![TestValue::Number(2.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            22,
+            "viaTool",
+            vec![TestValue::Number(2.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let (b_run, b_call) = read_bridge_call(&server);
         assert_eq!(b_run, 22);
 
         let a = submit_session_job(
-            &handle, 21, "hangBump", vec![],
-            Arc::clone(&link), &counter,
+            &handle,
+            21,
+            "hangBump",
+            vec![],
+            Arc::clone(&link),
+            &counter,
             sandbox::Limits {
                 wall_time_ms: 50,
                 ..Default::default()
@@ -2686,13 +2851,18 @@ mod tests {
         // after A's wall has passed; A must still settle with its value.
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let started = Instant::now();
         let a = submit_session_job(
-            &handle, 21, "hangBump", vec![],
-            Arc::clone(&link), &counter,
+            &handle,
+            21,
+            "hangBump",
+            vec![],
+            Arc::clone(&link),
+            &counter,
             sandbox::Limits {
                 wall_time_ms: 150,
                 ..Default::default()
@@ -2705,15 +2875,23 @@ mod tests {
         // above the wall on any machine; the elapsed assert below fails
         // loudly (rather than passing vacuously) if it ever gets too fast.
         let c = submit_session_job(
-            &handle, 23, "busy", vec![TestValue::Number(1_500_000_000.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            23,
+            "busy",
+            vec![TestValue::Number(1_500_000_000.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         // Give the loop a moment to dispatch C — its job is the only ready
         // operation until the response below is enqueued.
         std::thread::sleep(Duration::from_millis(10));
         a.send(bridge_response_event(a_call, 10.0));
 
-        let out_c = c.outcome.recv_timeout(Duration::from_secs(30)).expect("C completes");
+        let out_c = c
+            .outcome
+            .recv_timeout(Duration::from_secs(30))
+            .expect("C completes");
         assert!(!out_c.tainted);
         out_c.result.expect("busy() succeeds");
         assert!(
@@ -2730,10 +2908,7 @@ mod tests {
             "A's response arrived before its wall deadline and must settle it — \
              a busy loop must not turn an answered run into a WallTimeout",
         );
-        assert_eq!(
-            testval::from_blob(&v.exports),
-            TestValue::Number(1.0)
-        );
+        assert_eq!(testval::from_blob(&v.exports), TestValue::Number(1.0));
         assert!(!out_a.tainted);
         // The telemetry triple: duration is real elapsed (C's spin included),
         // wall is A's own logic time (its wait ended when the response
@@ -2756,13 +2931,18 @@ mod tests {
         // deadline that expired while the engine was busy elsewhere.
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let started = Instant::now();
         let a = submit_session_job(
-            &handle, 51, "twoTools", vec![],
-            Arc::clone(&link), &counter,
+            &handle,
+            51,
+            "twoTools",
+            vec![],
+            Arc::clone(&link),
+            &counter,
             sandbox::Limits {
                 wall_time_ms: 150,
                 ..Default::default()
@@ -2773,14 +2953,22 @@ mod tests {
 
         // Occupy the loop far past A's 150 ms (loud guard below).
         let c = submit_session_job(
-            &handle, 53, "busy", vec![TestValue::Number(1_500_000_000.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            53,
+            "busy",
+            vec![TestValue::Number(1_500_000_000.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         std::thread::sleep(Duration::from_millis(10));
         // Arrives at ~10 ms of A's counted time; delivered only after C.
         a.send(bridge_response_event(c1, 1.0));
 
-        let out_c = c.outcome.recv_timeout(Duration::from_secs(30)).expect("C completes");
+        let out_c = c
+            .outcome
+            .recv_timeout(Duration::from_secs(30))
+            .expect("C completes");
         assert!(!out_c.tainted);
         out_c.result.expect("busy() succeeds");
         assert!(
@@ -2800,14 +2988,21 @@ mod tests {
         assert_eq!(a_run2, 51);
         a.send(bridge_response_event(c2, 2.0));
 
-        let out_a = a.outcome.recv_timeout(Duration::from_secs(5)).expect("A concludes");
+        let out_a = a
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A concludes");
         let v = out_a.result.expect(
             "the wall budget counts A's own time only — engine time while C \
              spun must not expire it",
         );
         assert!(!out_a.tainted);
         assert_eq!(testval::from_blob(&v.exports), TestValue::Number(3.0));
-        assert!(v.wall_time_ms < 150.0, "counted wall stays within the cap (got {})", v.wall_time_ms);
+        assert!(
+            v.wall_time_ms < 150.0,
+            "counted wall stays within the cap (got {})",
+            v.wall_time_ms
+        );
         assert!(v.duration_ms > 160.0, "real elapsed ran past the cap");
     }
 
@@ -2817,33 +3012,57 @@ mod tests {
         // stamped after it — overdue work beats admitting new runs.
         sandbox::init_platform();
         let (link, _server) = crate::link::channel_link();
-        let handle = spawn_instance(timer_order_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(timer_order_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         let started = Instant::now();
         let a = submit_session_job(
-            &handle, 41, "sleepMark", vec![TestValue::Number(20.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            41,
+            "sleepMark",
+            vec![TestValue::Number(20.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         // Calibrated far above the timer on any machine; the elapsed assert
         // below fails loudly if it ever gets too fast.
         let b = submit_session_job(
-            &handle, 42, "busy", vec![TestValue::Number(1_500_000_000.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            42,
+            "busy",
+            vec![TestValue::Number(1_500_000_000.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         // Enqueue the burst only once A's timer is safely due, so both job
         // stamps land after it.
         std::thread::sleep(Duration::from_millis(60));
         let j1 = submit_session_job(
-            &handle, 43, "mark", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            43,
+            "mark",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let j2 = submit_session_job(
-            &handle, 44, "mark", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            44,
+            "mark",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
 
-        let out_b = b.outcome.recv_timeout(Duration::from_secs(30)).expect("B completes");
+        let out_b = b
+            .outcome
+            .recv_timeout(Duration::from_secs(30))
+            .expect("B completes");
         assert!(!out_b.tainted);
         out_b.result.expect("busy() succeeds");
         assert!(
@@ -2852,7 +3071,10 @@ mod tests {
              count, the scenario no longer queues the jobs behind a busy turn"
         );
 
-        let out_a = a.outcome.recv_timeout(Duration::from_secs(5)).expect("A concludes");
+        let out_a = a
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A concludes");
         let v = out_a.result.expect("A settles via its timer");
         assert!(!out_a.tainted);
         assert_eq!(
@@ -2861,12 +3083,26 @@ mod tests {
             "A's due timer must fire before the queued jobs' start turns"
         );
         // The burst ran after the timer: each job sees the mark ahead of its own.
-        let v1 = j1.outcome.recv_timeout(Duration::from_secs(5)).expect("mark 1 concludes")
-            .result.expect("mark 1 ok");
-        assert_eq!(testval::from_blob(&v1.exports), TestValue::String("t,j".to_string()));
-        let v2 = j2.outcome.recv_timeout(Duration::from_secs(5)).expect("mark 2 concludes")
-            .result.expect("mark 2 ok");
-        assert_eq!(testval::from_blob(&v2.exports), TestValue::String("t,j,j".to_string()));
+        let v1 = j1
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mark 1 concludes")
+            .result
+            .expect("mark 1 ok");
+        assert_eq!(
+            testval::from_blob(&v1.exports),
+            TestValue::String("t,j".to_string())
+        );
+        let v2 = j2
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mark 2 concludes")
+            .result
+            .expect("mark 2 ok");
+        assert_eq!(
+            testval::from_blob(&v2.exports),
+            TestValue::String("t,j,j".to_string())
+        );
     }
 
     #[test]
@@ -2878,27 +3114,41 @@ mod tests {
         // dequeued back to back.
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // Park the loop on a first run so the instance is live.
         let first = submit_session_job(
-            &handle, 31, "viaTool", vec![TestValue::Number(1.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            31,
+            "viaTool",
+            vec![TestValue::Number(1.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let (_, c1) = read_bridge_call(&server);
 
         // hangBump bumps the counter, then suspends on tool() — so the run
         // observably STARTS before the queued Terminate reaches it.
         let b = submit_session_job(
-            &handle, 32, "hangBump", vec![],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            32,
+            "hangBump",
+            vec![],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         b.send(sandbox::RunEvent::Host(Inbound::Terminate {
             mode: crate::types::TerminateMode::Soft,
         }));
 
-        let out = b.outcome.recv_timeout(Duration::from_secs(5)).expect("job answered");
+        let out = b
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job answered");
         assert!(!out.tainted, "a boundary abandon must not taint");
         assert!(matches!(
             out.result.unwrap_err().error,
@@ -2925,7 +3175,8 @@ mod tests {
         // invariant (its run concluded); the loop discards it loudly and
         // stays healthy — nothing is remembered, nothing leaks.
         sandbox::init_platform();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let outcome = handle.call(bump_job());
         assert_eq!(bump_value(&outcome), 1.0);
 
@@ -2950,7 +3201,11 @@ mod tests {
 
         let outcome = handle.call(bump_job());
         assert!(!outcome.tainted);
-        assert_eq!(bump_value(&outcome), 2.0, "the stray event left the loop serving");
+        assert_eq!(
+            bump_value(&outcome),
+            2.0,
+            "the stray event left the loop serving"
+        );
     }
 
     #[test]
@@ -2964,32 +3219,51 @@ mod tests {
         // old failure depended on select order.
         sandbox::init_platform();
         let (link, server) = crate::link::channel_link();
-        let handle = spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
+        let handle =
+            spawn_instance(interleave_prefix(), 0, test_brand_key()).expect("spawn instance");
         let counter = Arc::new(AtomicU32::new(0));
 
         // One settled probe fixes the call-id sequence: viaTool consumes
         // exactly one id per run, so round i's call id is base + 1 + i.
         let probe = submit_session_job(
-            &handle, 99, "viaTool", vec![TestValue::Number(0.0)],
-            Arc::clone(&link), &counter, sandbox::Limits::default(),
+            &handle,
+            99,
+            "viaTool",
+            vec![TestValue::Number(0.0)],
+            Arc::clone(&link),
+            &counter,
+            sandbox::Limits::default(),
         );
         let (_, base) = read_bridge_call(&server);
         probe.send(bridge_response_event(base, 1.0));
-        probe.outcome.recv_timeout(Duration::from_secs(5)).expect("probe settles");
+        probe
+            .outcome
+            .recv_timeout(Duration::from_secs(5))
+            .expect("probe settles");
 
         for round in 0..8u32 {
             // Occupy the loop with a CPU-bound start turn (~100 ms class).
             let a = submit_session_job(
-                &handle, 200 + round, "busy", vec![TestValue::Number(800_000_000.0)],
-                Arc::clone(&link), &counter, sandbox::Limits::default(),
+                &handle,
+                200 + round,
+                "busy",
+                vec![TestValue::Number(800_000_000.0)],
+                Arc::clone(&link),
+                &counter,
+                sandbox::Limits::default(),
             );
             std::thread::sleep(Duration::from_millis(10));
 
             // While that turn runs, enqueue the joining run AND the response
             // to the bridge call its start turn will make.
             let b = submit_session_job(
-                &handle, 100 + round, "viaTool", vec![TestValue::Number(f64::from(round))],
-                Arc::clone(&link), &counter, sandbox::Limits::default(),
+                &handle,
+                100 + round,
+                "viaTool",
+                vec![TestValue::Number(f64::from(round))],
+                Arc::clone(&link),
+                &counter,
+                sandbox::Limits::default(),
             );
             b.send(bridge_response_event(base + 1 + round, 7.0));
 
@@ -2999,7 +3273,10 @@ mod tests {
                 .expect("the joining run settles — its early frame was delivered, not dropped");
             assert!(!out_b.tainted);
             out_b.result.expect("viaTool succeeds");
-            let out_a = a.outcome.recv_timeout(Duration::from_secs(30)).expect("A completes");
+            let out_a = a
+                .outcome
+                .recv_timeout(Duration::from_secs(30))
+                .expect("A completes");
             assert!(!out_a.tainted);
         }
     }
@@ -3096,7 +3373,9 @@ mod tests {
         let msg = sandbox::RoutedEvent::new(0, sandbox::RunEvent::Job(Box::new(job)));
         let late = match sender.send(msg) {
             Err(_) => sandbox::dead_instance_outcome(),
-            Ok(()) => rx.recv().unwrap_or_else(|_| sandbox::dead_instance_outcome()),
+            Ok(()) => rx
+                .recv()
+                .unwrap_or_else(|_| sandbox::dead_instance_outcome()),
         };
         assert!(matches!(
             late.result.unwrap_err().error,

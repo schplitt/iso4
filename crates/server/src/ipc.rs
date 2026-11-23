@@ -31,10 +31,9 @@ use std::sync::{Arc, Mutex};
 use iso4_types::{
     resolve_heap_lines, BandPolicy, CallSpec, HostGlobalDef, HostModuleNode, ImportBinding,
     ImportModule, ImportRebind, PrefixRunRequest, ResourceLimits, RunRequest, TerminateMode,
-    DEFAULT_CPU_TIME_MS, DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS,
-    DEFAULT_MAX_BRIDGE_CALL_BYTES, DEFAULT_MAX_EXPORT_BYTES, DEFAULT_MAX_STDERR_BYTES,
-    DEFAULT_MAX_STDOUT_BYTES, DEFAULT_MEMORY_MB, DEFAULT_WALL_TIME_MS, MAX_HOST_MODULE_DEPTH,
-    STREAM_CHUNK_MAX_BYTES,
+    DEFAULT_CPU_TIME_MS, DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS, DEFAULT_MAX_BRIDGE_CALL_BYTES,
+    DEFAULT_MAX_EXPORT_BYTES, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
+    DEFAULT_MEMORY_MB, DEFAULT_WALL_TIME_MS, MAX_HOST_MODULE_DEPTH, STREAM_CHUNK_MAX_BYTES,
 };
 
 /// Current wire protocol version.
@@ -707,7 +706,10 @@ impl<'a> FrameProgress<'a> {
                 Ok(n) => self.written += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e)
-                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
                 {
                     return Ok(false);
                 }
@@ -880,8 +882,7 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
 /// `parse_authenticate_payload`, used by tests.
 #[cfg(test)]
 pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
-    let mut payload =
-        Vec::with_capacity(6 + auth.probe.len() + 4 + auth.descriptor_token.len());
+    let mut payload = Vec::with_capacity(6 + auth.probe.len() + 4 + auth.descriptor_token.len());
     payload.extend_from_slice(&auth.protocol_version.to_be_bytes());
     payload.extend_from_slice(&(auth.probe.len() as u32).to_be_bytes());
     payload.extend_from_slice(&auth.probe);
@@ -1469,11 +1470,7 @@ pub fn encode_stream_cancel_payload(run_id: u32, stream_id: u32, reason: &str) -
 
 /// Encode a `StreamEnd` payload for an outbound stream:
 /// `u32 runId, u32 streamId, bool ok, Optional<String> error`.
-pub fn encode_stream_end_payload(
-    run_id: u32,
-    stream_id: u32,
-    error: Option<&str>,
-) -> Vec<u8> {
+pub fn encode_stream_end_payload(run_id: u32, stream_id: u32, error: Option<&str>) -> Vec<u8> {
     let mut out = Vec::with_capacity(10 + error.map_or(0, |e| 5 + e.len()));
     out.extend_from_slice(&run_id.to_be_bytes());
     out.extend_from_slice(&stream_id.to_be_bytes());
@@ -1503,10 +1500,7 @@ pub fn parse_stream_pull_payload(payload: &[u8]) -> io::Result<StreamPullPayload
     let stream_id = r.read_u32()?;
     let credit = r.read_u32()?;
     r.assert_done()?;
-    Ok(StreamPullPayload {
-        stream_id,
-        credit,
-    })
+    Ok(StreamPullPayload { stream_id, credit })
 }
 
 /// Parsed `StreamCancel` payload (host cancelled an outbound stream):
@@ -1523,10 +1517,7 @@ pub fn parse_stream_cancel_payload(payload: &[u8]) -> io::Result<StreamCancelPay
     let stream_id = r.read_u32()?;
     let reason = r.read_string()?;
     r.assert_done()?;
-    Ok(StreamCancelPayload {
-        stream_id,
-        reason,
-    })
+    Ok(StreamCancelPayload { stream_id, reason })
 }
 
 pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType> {
@@ -1645,10 +1636,7 @@ mod tests {
         payload.extend_from_slice(&4u32.to_be_bytes());
         payload.extend_from_slice(&[1, 2, 3, 4]);
         let chunk = parse_stream_chunk_payload(&payload).unwrap();
-        assert_eq!(
-            (chunk.stream_id, chunk.data),
-            (3, &[1u8, 2, 3, 4][..])
-        );
+        assert_eq!((chunk.stream_id, chunk.data), (3, &[1u8, 2, 3, 4][..]));
 
         // Oversized chunk claim → malformed, before any allocation.
         let mut oversized = Vec::new();
@@ -1679,7 +1667,10 @@ mod tests {
         failed.push(1); // error present
         push_string(&mut failed, "disk on fire");
         let end = parse_stream_end_payload(&failed).unwrap();
-        assert_eq!((end.ok, end.error.as_deref()), (false, Some("disk on fire")));
+        assert_eq!(
+            (end.ok, end.error.as_deref()),
+            (false, Some("disk on fire"))
+        );
     }
 
     #[test]
@@ -2142,7 +2133,7 @@ mod tests {
         v.push(0);
         push_string(&mut v, "fetch");
         v.push(1); // enumerable
-        // string expr (non-enumerable — the flag parses on every kind)
+                   // string expr (non-enumerable — the flag parses on every kind)
         v.push(1);
         push_string(&mut v, "PI");
         v.push(0); // enumerable = false
@@ -2336,7 +2327,10 @@ mod tests {
         ))
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("nests deeper than 64 levels"), "{err}");
+        assert!(
+            err.to_string().contains("nests deeper than 64 levels"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2641,8 +2635,12 @@ mod tests {
         let sink = Outbox::spawn(&runtime).unwrap();
         drop(runtime);
         let reader = std::thread::spawn(move || read_rust_to_ts_frame(&mut host).unwrap());
-        sink.send_frame(RustToTsMessageType::Log, vec![7u8; OUTBOX_CAP_BYTES + 1024], Vec::new())
-            .unwrap();
+        sink.send_frame(
+            RustToTsMessageType::Log,
+            vec![7u8; OUTBOX_CAP_BYTES + 1024],
+            Vec::new(),
+        )
+        .unwrap();
         drop(sink);
         let frame = reader.join().unwrap();
         assert_eq!(frame.payload.len(), OUTBOX_CAP_BYTES + 1024);
@@ -2663,7 +2661,8 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-        sink.send_frame(RustToTsMessageType::Log, vec![1], Vec::new()).unwrap();
+        sink.send_frame(RustToTsMessageType::Log, vec![1], Vec::new())
+            .unwrap();
     }
 
     #[test]
@@ -2684,7 +2683,10 @@ mod tests {
         }
         let e = stall_error.expect("a peer that stops draining must fail producers");
         assert!(
-            matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::BrokenPipe),
+            matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::BrokenPipe
+            ),
             "unexpected error kind: {e}"
         );
         // Latched: the next write fails immediately, without waiting.
@@ -2715,7 +2717,8 @@ mod tests {
             let mut head = vec![0u8; 4];
             head[..4].copy_from_slice(&(i as u32).to_be_bytes());
             let tail = vec![i as u8; 65536];
-            sink.send_frame(RustToTsMessageType::Log, head, tail).unwrap();
+            sink.send_frame(RustToTsMessageType::Log, head, tail)
+                .unwrap();
         }
         drop(sink);
 
@@ -2733,7 +2736,10 @@ mod tests {
                 "frame {i} payload corrupted across the inline/writer handoff"
             );
         }
-        assert!(read_rust_to_ts_frame(&mut host).is_err(), "clean EOF after drain");
+        assert!(
+            read_rust_to_ts_frame(&mut host).is_err(),
+            "clean EOF after drain"
+        );
     }
 
     #[test]

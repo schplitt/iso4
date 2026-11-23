@@ -5,17 +5,17 @@ use std::cell::RefCell;
 use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
 
-use crate::v8::RunError;
 use crate::v8::exceptions::runtime_error_from_value;
 use crate::v8::globals::{define_global, throw_v8_error};
 use crate::v8::runloop::{
-    BudgetEpoch, RunFacts, RunPhase, RunState, ScanOutcome, TurnGuard, capped_grace_error,
-    finish_post_phase, finish_turn, finished,
+    capped_grace_error, finish_post_phase, finish_turn, finished, BudgetEpoch, RunFacts, RunPhase,
+    RunState, ScanOutcome, TurnGuard,
 };
 use crate::v8::runtable::{
-    CURRENT_RUN_TOKEN, RUN_TABLE_PTR, TIMERS_TOUCHED, attributed_token_and_state,
-    install_cped_rider, slot_table,
+    attributed_token_and_state, install_cped_rider, slot_table, CURRENT_RUN_TOKEN, RUN_TABLE_PTR,
+    TIMERS_TOUCHED,
 };
+use crate::v8::RunError;
 
 /// Cap on pending timers per run (workerd's number). The entries live
 /// outside the isolate heap, where `memoryMb` cannot see them.
@@ -173,8 +173,9 @@ pub(crate) fn set_timeout_callback(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue,
 ) {
-    let (token, state) = slot_table(scope)
-        .map_or((0, std::ptr::null()), |table| attributed_token_and_state(scope, table));
+    let (token, state) = slot_table(scope).map_or((0, std::ptr::null()), |table| {
+        attributed_token_and_state(scope, table)
+    });
     if state.is_null() {
         throw_v8_error(
             scope,
@@ -251,8 +252,9 @@ pub(crate) fn clear_timeout_callback(
     mut rv: v8::ReturnValue,
 ) {
     rv.set_undefined();
-    let (token, state) = slot_table(scope)
-        .map_or((0, std::ptr::null()), |table| attributed_token_and_state(scope, table));
+    let (token, state) = slot_table(scope).map_or((0, std::ptr::null()), |table| {
+        attributed_token_and_state(scope, table)
+    });
     if state.is_null() {
         return;
     }
@@ -278,17 +280,17 @@ pub(crate) fn clear_timeout_callback(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::testval::TestValue as WireValue;
     use crate::v8::testsupport::{
         call_spec, get_default, grace_limits, run_code, run_err, run_ok, value_of,
     };
-    use crate::testval::TestValue as WireValue;
     use crate::v8::{
-        GraceStatus, Limits, PrefixSpec, RunError, RunIo, create_instance_core, execute,
-        init_platform, run_call_on_core,
+        create_instance_core, execute, init_platform, run_call_on_core, GraceStatus, Limits,
+        PrefixSpec, RunError, RunIo,
     };
 
     // ── Guest timers ────────────────────────────────────────────────────────

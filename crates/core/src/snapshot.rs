@@ -52,7 +52,9 @@ fn external_references() -> &'static [v8::ExternalReference] {
                     .map(|function| v8::ExternalReference { function })
                     .chain([
                         v8::ExternalReference {
-                            pointer: std::ptr::addr_of!(crate::webtypes::RUNTIME_JS).cast_mut().cast(),
+                            pointer: std::ptr::addr_of!(crate::webtypes::RUNTIME_JS)
+                                .cast_mut()
+                                .cast(),
                         },
                         v8::ExternalReference {
                             pointer: std::ptr::null_mut(),
@@ -82,7 +84,10 @@ pub fn boot_context(scope: &mut v8::PinScope, table: *const RunTable) -> Result<
 
 /// Build the snapshot blob. Called by `build.rs` only: creating a snapshot in
 /// a process that runs isolates is unsupported (DESIGN.md §11.6).
-#[expect(dead_code, reason = "build.rs only: the library loads the finished snapshot")]
+#[expect(
+    dead_code,
+    reason = "build.rs only: the library loads the finished snapshot"
+)]
 pub fn create() -> Vec<u8> {
     crate::v8::init_platform();
     let mut isolate =
@@ -93,8 +98,7 @@ pub fn create() -> Vec<u8> {
         let scope = &mut v8::ContextScope::new(scope, context);
         crate::v8::install_console(scope).expect("install console");
         crate::v8::install_web_runtime(scope).expect("install web runtime");
-        crate::v8::install_async_context(scope)
-            .expect("install AsyncLocalStorage");
+        crate::v8::install_async_context(scope).expect("install AsyncLocalStorage");
         crate::v8::install_wait_until(scope).expect("install waitUntil");
         crate::v8::install_timers(scope).expect("install timers");
         scope.set_default_context(context);

@@ -4,18 +4,18 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::link::{Addr, HostLink, Inbound, Outbound};
 use crate::types;
-use crate::v8::RunError;
 use crate::v8::exceptions::error_message_from_value;
 use crate::v8::globals::{throw_v8_error, v8_error_value};
 use crate::v8::runloop::RunState;
-use crate::v8::runtable::{CURRENT_RUN_TOKEN, RUN_TABLE_PTR, attributed_state, slot_table};
+use crate::v8::runtable::{attributed_state, slot_table, CURRENT_RUN_TOKEN, RUN_TABLE_PTR};
+use crate::v8::RunError;
 
 // ── Streamed host-type bodies ────────────────────────────────────────────────
 
@@ -136,10 +136,7 @@ impl OutStreamTable {
 /// Returns the allocated stream id, or `None` when the executing run cannot
 /// stream (no run, table not armed — hold-mode runs, or a leg where stream
 /// bodies are not allowed; the codec turns `None` into its own error).
-pub fn register_out_stream(
-    scope: &mut v8::PinScope,
-    body: v8::Local<v8::Object>,
-) -> Option<u32> {
+pub fn register_out_stream(scope: &mut v8::PinScope, body: v8::Local<v8::Object>) -> Option<u32> {
     if !RESULT_STREAM_MODE.with(|c| c.get()) {
         return None;
     }
@@ -363,7 +360,9 @@ pub(super) fn cancel_out_stream(
         let Some(st) = slot.as_mut() else { return };
         let run_id = st.run_id;
         let link = st.link.clone();
-        let Some(stream) = st.streams.get_mut(&id) else { return };
+        let Some(stream) = st.streams.get_mut(&id) else {
+            return;
+        };
         if stream.done {
             return;
         }
@@ -384,14 +383,23 @@ pub(super) fn cancel_out_stream(
         stream.body.clone()
     };
     let body_local = v8::Local::new(scope, &body);
-    let Some(name) = v8::String::new(scope, "_cancelSource") else { return };
-    let Some(method) = body_local.get(scope, name.into()) else { return };
-    let Ok(method) = v8::Local::<v8::Function>::try_from(method) else { return };
+    let Some(name) = v8::String::new(scope, "_cancelSource") else {
+        return;
+    };
+    let Some(method) = body_local.get(scope, name.into()) else {
+        return;
+    };
+    let Ok(method) = v8::Local::<v8::Function>::try_from(method) else {
+        return;
+    };
     let reason_v8: v8::Local<v8::Value> = match v8::String::new(scope, reason) {
         Some(r) => r.into(),
         None => v8::undefined(scope).into(),
     };
-    if method.call(scope, body_local.into(), &[reason_v8]).is_none() {
+    if method
+        .call(scope, body_local.into(), &[reason_v8])
+        .is_none()
+    {
         // Guest cleanup threw (or was killed — the caller's tail sees the
         // reason cell). A plain throw in cleanup is swallowed: the stream
         // is already over either way.
@@ -553,10 +561,14 @@ fn drive_out_stream(
         // SAFETY: `out_streams` points into the run's live table entry.
         let table = unsafe { &*rs.out_streams };
         let mut slot = table.slot.borrow_mut();
-        let Some(st) = slot.as_mut() else { return Step::Idle };
+        let Some(st) = slot.as_mut() else {
+            return Step::Idle;
+        };
         let run_id = st.run_id;
         let link = st.link.clone();
-        let Some(stream) = st.streams.get_mut(&id) else { return Step::Idle };
+        let Some(stream) = st.streams.get_mut(&id) else {
+            return Step::Idle;
+        };
         if stream.done {
             return Step::Idle;
         }
@@ -571,7 +583,13 @@ fn drive_out_stream(
             };
             let data = stream.backlog[stream.backlog_sent..stream.backlog_sent + n].to_vec();
             if link
-                .send(Addr::Run(run_id), Outbound::StreamChunk { stream_id: id, data })
+                .send(
+                    Addr::Run(run_id),
+                    Outbound::StreamChunk {
+                        stream_id: id,
+                        data,
+                    },
+                )
                 .is_err()
             {
                 // Dead link: the connection-loss event ends the phase.
@@ -602,7 +620,9 @@ fn drive_out_stream(
         let Some(st) = slot.as_mut() else { return };
         let run_id = st.run_id;
         let link = st.link.clone();
-        let Some(stream) = st.streams.get_mut(&id) else { return };
+        let Some(stream) = st.streams.get_mut(&id) else {
+            return;
+        };
         stream.pending = None;
         match outcome {
             Ok(Some(bytes)) => {
@@ -736,8 +756,8 @@ pub(super) fn deliver_stream_frame(
             // Buffered: the host must stay inside the credit window; a small
             // slack of one max chunk absorbs frames in flight when a cancel
             // races the pump.
-            let cap = types::STREAM_CREDIT_WINDOW_BYTES as usize
-                + types::STREAM_CHUNK_MAX_BYTES as usize;
+            let cap =
+                types::STREAM_CREDIT_WINDOW_BYTES as usize + types::STREAM_CHUNK_MAX_BYTES as usize;
             if stream.buffered_bytes + data.len() > cap {
                 return Err(RunError::Internal(
                     "stream credit window violated by the host".to_string(),
@@ -878,7 +898,10 @@ pub(crate) fn stream_read_callback(
 
     let state = attributed_state(scope, run_table);
     if state.is_null() {
-        let msg = v8_error_value(scope, "[iso4] streamed bodies are only readable during a run");
+        let msg = v8_error_value(
+            scope,
+            "[iso4] streamed bodies are only readable during a run",
+        );
         resolver.reject(scope, msg);
         return;
     }
@@ -887,7 +910,10 @@ pub(crate) fn stream_read_callback(
     let mut slot = table.slot.borrow_mut();
     let Some(state) = slot.as_mut() else {
         drop(slot);
-        let msg = v8_error_value(scope, "[iso4] streamed bodies are only readable during a run");
+        let msg = v8_error_value(
+            scope,
+            "[iso4] streamed bodies are only readable during a run",
+        );
         resolver.reject(scope, msg);
         return;
     };

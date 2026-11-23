@@ -98,12 +98,8 @@ impl HostLink for ConnLink {
                 target,
                 args,
             } => {
-                let header = wire::encode_bridge_call_header(
-                    run_id,
-                    call_id,
-                    &target,
-                    args.len() as u32,
-                );
+                let header =
+                    wire::encode_bridge_call_header(run_id, call_id, &target, args.len() as u32);
                 (ipc::RustToTsMessageType::BridgeCall, header, args)
             }
             Outbound::StreamPull { stream_id, credit } => (
@@ -145,13 +141,15 @@ impl HostLink for ConnLink {
                 Vec::new(),
             ),
         };
-        self.outbox.send_frame(message_type, head, tail).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::InvalidInput {
-                LinkError::TooLarge(e.to_string())
-            } else {
-                LinkError::Closed(e.to_string())
-            }
-        })
+        self.outbox
+            .send_frame(message_type, head, tail)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::InvalidInput {
+                    LinkError::TooLarge(e.to_string())
+                } else {
+                    LinkError::Closed(e.to_string())
+                }
+            })
     }
 
     /// The run's route goes before its final answer, so the host can reuse
@@ -205,14 +203,12 @@ fn inbound_of(frame: ipc::TsToRustFrame) -> Result<Inbound, String> {
                 credit: pull.credit,
             })
             .map_err(|e| format!("stream pull decode: {e}")),
-        ipc::TsToRustMessageType::StreamCancel => {
-            ipc::parse_stream_cancel_payload(&frame.payload)
-                .map(|cancel| Inbound::StreamCancel {
-                    stream_id: cancel.stream_id,
-                    reason: cancel.reason,
-                })
-                .map_err(|e| format!("stream cancel decode: {e}"))
-        }
+        ipc::TsToRustMessageType::StreamCancel => ipc::parse_stream_cancel_payload(&frame.payload)
+            .map(|cancel| Inbound::StreamCancel {
+                stream_id: cancel.stream_id,
+                reason: cancel.reason,
+            })
+            .map_err(|e| format!("stream cancel decode: {e}")),
         other => Err(format!("{other:?} is not a run message")),
     }
 }
@@ -393,20 +389,19 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
     let _teardown = FailRunsOnDrop(Arc::clone(&conn_runs));
 
     loop {
-        let frame = match ipc::read_ts_to_rust_frame_with_limit(
-            &mut stream,
-            ipc::DEFAULT_MAX_FRAME_LENGTH,
-        ) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                iso4_core::log!("[iso4-v8] connection closed without close frame");
-                break;
-            }
-            Err(e) => {
-                iso4_core::log!("[iso4-v8] connection error: {e}");
-                break;
-            }
-        };
+        let frame =
+            match ipc::read_ts_to_rust_frame_with_limit(&mut stream, ipc::DEFAULT_MAX_FRAME_LENGTH)
+            {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    iso4_core::log!("[iso4-v8] connection closed without close frame");
+                    break;
+                }
+                Err(e) => {
+                    iso4_core::log!("[iso4-v8] connection error: {e}");
+                    break;
+                }
+            };
 
         match frame.message_type {
             ipc::TsToRustMessageType::Close => {
@@ -785,8 +780,8 @@ mod tests {
 
     #[test]
     fn valid_handshake_is_acknowledged_with_the_runtime_probe() {
-        let frame =
-            handshake(authenticate(iso4_core::wire::probe().to_vec())).expect("expected a Hello frame");
+        let frame = handshake(authenticate(iso4_core::wire::probe().to_vec()))
+            .expect("expected a Hello frame");
         assert_eq!(frame.message_type, ipc::RustToTsMessageType::Hello);
         let (status, probe, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
@@ -812,8 +807,8 @@ mod tests {
     /// read it.
     #[test]
     fn the_hello_probe_advertises_write_format_15() {
-        let frame =
-            handshake(authenticate(iso4_core::wire::probe().to_vec())).expect("expected a Hello frame");
+        let frame = handshake(authenticate(iso4_core::wire::probe().to_vec()))
+            .expect("expected a Hello frame");
         let (status, probe, _) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::Ok as u8);
         assert_eq!(probe[0], iso4_core::wire::V8_BLOB_HEADER_TAG);
@@ -877,8 +872,8 @@ mod tests {
         p.extend_from_slice(&run_id.to_be_bytes());
         pstr(&mut p, code);
         p.push(0); // filename absent
-        // limits: memory, cpu, wall, export, stdout, stderr, bridgeBytes,
-        // bridgeCalls, grace, hardMemory — each an Optional<u32>.
+                   // limits: memory, cpu, wall, export, stdout, stderr, bridgeBytes,
+                   // bridgeCalls, grace, hardMemory — each an Optional<u32>.
         match memory_mb {
             Some(v) => {
                 p.push(1);
@@ -903,7 +898,7 @@ mod tests {
         p.push(0); // kind = bridge
         pstr(&mut p, "tool");
         p.push(1); // enumerable
-        // imports: none
+                   // imports: none
         p.extend_from_slice(&0u32.to_be_bytes());
         p.push(0); // call absent
         p
@@ -939,7 +934,11 @@ mod tests {
         let p = &frame.payload;
         let run_id = u32::from_be_bytes(p[0..4].try_into().unwrap());
         // p[4..8] is slotAllowance.
-        assert_eq!(p[8], 1, "run {run_id} must succeed, payload says ok = {}", p[8]);
+        assert_eq!(
+            p[8], 1,
+            "run {run_id} must succeed, payload says ok = {}",
+            p[8]
+        );
         assert_eq!(p[9], 1);
         let blob_len = u32::from_be_bytes(p[10..14].try_into().unwrap()) as usize;
         let exports = testval::from_blob(&p[14..14 + blob_len]);
@@ -1143,7 +1142,10 @@ mod tests {
         assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
         assert_eq!(p[8], 0, "the aborted run must fail");
         let text = String::from_utf8_lossy(p);
-        assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
+        assert!(
+            text.contains("ERR_ABORTED"),
+            "unexpected failure shape: {text}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the abort must land mid-turn, not at the wall"
@@ -1189,7 +1191,10 @@ mod tests {
         assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
         assert_eq!(p[8], 0, "the aborted run must fail");
         let text = String::from_utf8_lossy(p);
-        assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
+        assert!(
+            text.contains("ERR_ABORTED"),
+            "unexpected failure shape: {text}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the hard abort must conclude promptly, not hang to the wall"
@@ -1237,7 +1242,10 @@ mod tests {
         assert_eq!(u32::from_be_bytes(p[0..4].try_into().unwrap()), 1);
         assert_eq!(p[8], 0, "the aborted run must fail");
         let text = String::from_utf8_lossy(p);
-        assert!(text.contains("ERR_ABORTED"), "unexpected failure shape: {text}");
+        assert!(
+            text.contains("ERR_ABORTED"),
+            "unexpected failure shape: {text}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the soft abort must land at the turn boundary, not the wall"
@@ -1269,7 +1277,10 @@ mod tests {
         .unwrap();
         let refusal = ipc::read_rust_to_ts_frame(&mut host).expect("a refusal Result");
         assert_eq!(refusal.message_type, ipc::RustToTsMessageType::Result);
-        assert_eq!(u32::from_be_bytes(refusal.payload[0..4].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_be_bytes(refusal.payload[0..4].try_into().unwrap()),
+            1
+        );
         assert_eq!(refusal.payload[4], 0, "the duplicate must fail");
         let text = String::from_utf8_lossy(&refusal.payload);
         assert!(
@@ -1379,5 +1390,4 @@ mod tests {
             "a malformed token must not be answered"
         );
     }
-
 }

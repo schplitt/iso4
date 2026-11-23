@@ -4,8 +4,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicU32;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,14 +14,14 @@ use crate::errors::{codec_error_to_run_error, failure, reason_error, termination
 use crate::link::{Addr, HostLink, Inbound, Observer, Outbound};
 use crate::types;
 use crate::types::{HostGlobalDef, ImportBinding};
-use crate::v8::bridge::{
-    BRIDGE_DISPATCH_GLOBAL, BridgeCallLog, BridgeStubSpec, PendingResolver, PendingResolvers,
-    StubSlots, collect_import_handles, host_bridge_error_from_rejection, host_bridge_error_to_v8,
-    install_bridge_globals, invoke_requested_call, owned_bridge_error, public_record_name,
-    serialize_call_result,
-};
 #[cfg(test)]
 use crate::v8::bridge::install_prefix_bridge_placeholders;
+use crate::v8::bridge::{
+    collect_import_handles, host_bridge_error_from_rejection, host_bridge_error_to_v8,
+    install_bridge_globals, invoke_requested_call, owned_bridge_error, public_record_name,
+    serialize_call_result, BridgeCallLog, BridgeStubSpec, PendingResolver, PendingResolvers,
+    StubSlots, BRIDGE_DISPATCH_GLOBAL,
+};
 use crate::v8::exceptions::{
     error_message_from_value, error_name_from_value, exception_fields, exception_message,
     exception_name, exception_stack, runtime_error_from_value, syntax_error,
@@ -29,29 +29,29 @@ use crate::v8::exceptions::{
 use crate::v8::globals::install_value_globals;
 use crate::v8::guard::{GuardTarget, InstanceGuard};
 use crate::v8::isolate::{
-    LogBuffers, NearHeapData, ReasonCell, TerminationReason, elapsed_ms, heap_check, heap_used,
-    new_capped_isolate,
+    elapsed_ms, heap_check, heap_used, new_capped_isolate, LogBuffers, NearHeapData, ReasonCell,
+    TerminationReason,
 };
 use crate::v8::modules::{
-    ResolverContext, extract_module_exports, install_resolver, module_resolver_callback,
-    take_resolver,
+    extract_module_exports, install_resolver, module_resolver_callback, take_resolver,
+    ResolverContext,
 };
 use crate::v8::oom_label::{OomRecord, OomRun, OomRunLabel};
 use crate::v8::runtable::{
-    CURRENT_RUN_TOKEN, RUN_TABLE_PTR, RunCallState, TIMERS_TOUCHED, install_cped_rider,
+    install_cped_rider, RunCallState, CURRENT_RUN_TOKEN, RUN_TABLE_PTR, TIMERS_TOUCHED,
 };
 use crate::v8::streams::{
-    OutTableState, StreamTableState, cancel_all_out_streams, cancel_out_stream, close_out_streams,
-    close_run_streams, deliver_stream_frame, drive_out_streams, note_out_activity, note_out_credit,
-    out_idle_deadline, out_streams_open,
+    cancel_all_out_streams, cancel_out_stream, close_out_streams, close_run_streams,
+    deliver_stream_frame, drive_out_streams, note_out_activity, note_out_credit, out_idle_deadline,
+    out_streams_open, OutTableState, StreamTableState,
 };
-use crate::v8::timers::{TimerTable, timer_turn};
+use crate::v8::timers::{timer_turn, TimerTable};
 use crate::v8::{
-    CpuBudget, FailureOutput, GuardCtl, InstanceCore, Limits, OutStreamTable, PendingWork,
-    RunError, RunTable, RuntimeErrorData, StreamTable, alloc_run_token, init_platform,
+    alloc_run_token, init_platform, CpuBudget, FailureOutput, GuardCtl, InstanceCore, Limits,
+    OutStreamTable, PendingWork, RunError, RunTable, RuntimeErrorData, StreamTable,
 };
 #[cfg(test)]
-use crate::v8::{PrefixSpec, create_instance_core};
+use crate::v8::{create_instance_core, PrefixSpec};
 
 // ── Output types ─────────────────────────────────────────────────────────────
 
@@ -254,8 +254,7 @@ pub fn execute_with_prefix(
     // timeout. The call itself then gets fresh guards from dispatch to
     // settle. The warm registry keeps the core alive between calls; this
     // one-shot wrapper drops it.
-    let mut core =
-        create_instance_core(prefix, imports, limits.hard_memory_mb, OomRunLabel::NONE)?;
+    let mut core = create_instance_core(prefix, imports, limits.hard_memory_mb, OomRunLabel::NONE)?;
     run_call_on_core(
         &mut core,
         prefix.globals,
@@ -725,10 +724,13 @@ impl RunState {
     /// stream idle), or its earliest timer — whichever is sooner.
     fn next_timeout(&self) -> Option<Duration> {
         let now = std::time::Instant::now();
-        let boundary = deadline_instant(self)
-            .map(|at| at.saturating_duration_since(now).max(Duration::from_millis(1)));
+        let boundary = deadline_instant(self).map(|at| {
+            at.saturating_duration_since(now)
+                .max(Duration::from_millis(1))
+        });
         let timer = earliest_timer(self).map(|at| {
-            at.saturating_duration_since(now).max(Duration::from_millis(1))
+            at.saturating_duration_since(now)
+                .max(Duration::from_millis(1))
         });
         match (boundary, timer) {
             (Some(b), Some(t)) => Some(b.min(t)),
@@ -856,9 +858,9 @@ fn wait_event(source: &RunSource, timeout: Option<Duration>) -> (LoopEvent, std:
                     ))
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => LoopEvent::DeadlineHit,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => LoopEvent::SourceClosed(
-                    io::Error::new(io::ErrorKind::BrokenPipe, "demux gone"),
-                ),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    LoopEvent::SourceClosed(io::Error::new(io::ErrorKind::BrokenPipe, "demux gone"))
+                }
             };
             (event, woke_at)
         }
@@ -892,14 +894,7 @@ fn run_call_phase(
     guard: &InstanceGuard,
     mut ctx: CallPhaseCtx<'_>,
 ) -> (Result<Output, FailureOutput>, Option<u64>) {
-    let (mut rs, start_outcome) = begin_call(
-        isolate,
-        context,
-        entry,
-        stub_slots,
-        guard,
-        &mut ctx,
-    );
+    let (mut rs, start_outcome) = begin_call(isolate, context, entry, stub_slots, guard, &mut ctx);
     if let ScanOutcome::Finished(result) = start_outcome {
         return stamp_wall(&rs, *result);
     }
@@ -1029,15 +1024,7 @@ pub(super) fn begin_call(
         turn_entered: Some(ctx.start),
         finish_heap: None,
     };
-    let start_outcome = start_turn(
-        isolate,
-        context,
-        entry,
-        stub_slots,
-        ctx,
-        &facts,
-        &mut rs,
-    );
+    let start_outcome = start_turn(isolate, context, entry, stub_slots, ctx, &facts, &mut rs);
     rs.cpu_budget.leave();
     guard.clear();
     // After the guard is down: a late fire cannot race the memory verdict.
@@ -1261,9 +1248,9 @@ pub(super) fn boundary_deadline(rs: &mut RunState) -> Result<Output, FailureOutp
 /// cleanly (E1 ruling 3 narrows the old taint).
 pub(super) fn boundary_close(rs: &mut RunState, e: io::Error) -> Result<Output, FailureOutput> {
     match rs.phase {
-        RunPhase::Starting | RunPhase::Settling { .. } => Err(rs.fail(RunError::Internal(
-            format!("poll loop socket read: {e}"),
-        ))),
+        RunPhase::Starting | RunPhase::Settling { .. } => {
+            Err(rs.fail(RunError::Internal(format!("poll loop socket read: {e}"))))
+        }
         RunPhase::Grace(_) => {
             if let RunPhase::Grace(g) = &mut rs.phase {
                 if g.error.is_none() {
@@ -1475,9 +1462,9 @@ fn start_turn(
                 ))));
             };
             let Some(filename_str) = v8::String::new(scope, filename) else {
-                return finished(Err(rs.fail(RunError::Internal(
-                    "failed to intern filename".to_string(),
-                ))));
+                return finished(Err(
+                    rs.fail(RunError::Internal("failed to intern filename".to_string()))
+                ));
             };
             let origin = v8::ScriptOrigin::new(
                 scope,
@@ -1497,10 +1484,9 @@ fn start_turn(
             let module = match v8::script_compiler::compile_module(scope, &mut source) {
                 Some(m) => m,
                 None => {
-                    return finished(Err(rs.fail(termination_or(
-                        facts.reason,
-                        syntax_error(scope),
-                    ))));
+                    return finished(Err(
+                        rs.fail(termination_or(facts.reason, syntax_error(scope)))
+                    ));
                 }
             };
 
@@ -1530,7 +1516,9 @@ fn start_turn(
                 Some(value) => value,
                 None => {
                     if let Some(err) = rs.bridge_error.get() {
-                        return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
+                        return finished(Err(
+                            rs.fail(termination_or(facts.reason, owned_bridge_error(err)))
+                        ));
                     }
                     let error = match facts.reason.get() {
                         Some(TerminationReason::Wall) => RunError::WallTimeout,
@@ -1660,9 +1648,7 @@ fn frame_turn(
                             None => Some(v8::undefined(scope).into()),
                             // Web-aware: a bridge handler may
                             // return a Request/Response.
-                            Some(bytes) => {
-                                blob::deserialize_value_with_web_types(scope, bytes)
-                            }
+                            Some(bytes) => blob::deserialize_value_with_web_types(scope, bytes),
                         };
                         let Some(v8_val) = decoded else {
                             // Same outcome as a data global or call
@@ -1776,7 +1762,9 @@ pub(super) fn finish_turn(
             }
             return finished(Ok(finish_post_phase(rs)));
         }
-        return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
+        return finished(Err(
+            rs.fail(termination_or(facts.reason, owned_bridge_error(err)))
+        ));
     }
 
     scan(scope, facts, rs)
@@ -1798,7 +1786,12 @@ fn scan(
                 module,
                 call_pending,
                 root_is_call_result,
-            } => (root.clone(), module.clone(), *call_pending, *root_is_call_result),
+            } => (
+                root.clone(),
+                module.clone(),
+                *call_pending,
+                *root_is_call_result,
+            ),
         };
         let root_local = v8::Local::new(scope, &root);
         match root_local.state() {
@@ -1807,7 +1800,9 @@ fn scan(
                 // BridgeResponse will ever arrive — fail now, not at the
                 // wall.
                 if let Some(err) = rs.bridge_error.get() {
-                    return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
+                    return finished(Err(
+                        rs.fail(termination_or(facts.reason, owned_bridge_error(err)))
+                    ));
                 }
                 if rs.source.is_none() && earliest_timer(rs).is_none() {
                     // Pending with no socket and no pending timer —
@@ -1849,7 +1844,9 @@ fn scan(
                     return finished(Err(rs.fail(termination_or(facts.reason, err))));
                 }
                 if let Some(err) = rs.bridge_error.get() {
-                    return finished(Err(rs.fail(termination_or(facts.reason, owned_bridge_error(err)))));
+                    return finished(Err(
+                        rs.fail(termination_or(facts.reason, owned_bridge_error(err)))
+                    ));
                 }
                 let err = runtime_error_from_value(scope, rejection);
                 let err = rs.bridge_error.get().map_or(err, owned_bridge_error);
@@ -1878,10 +1875,8 @@ fn scan(
                     return build_output_and_maybe_grace(scope, facts, rs, exports, Vec::new());
                 }
                 // Plain module run: walk the namespace exports.
-                let module_local = v8::Local::new(
-                    scope,
-                    module.as_ref().expect("module run without a module"),
-                );
+                let module_local =
+                    v8::Local::new(scope, module.as_ref().expect("module run without a module"));
                 return extract_module_exports(scope, facts, rs, module_local);
             }
         }
@@ -2034,20 +2029,18 @@ pub(super) fn build_output_and_maybe_grace(
             let heap_used_bytes = spec
                 .report_heap
                 .then(|| heap.map_or_else(|| heap_used(scope), |(used, _)| used));
-            let completion =
-                types::RunCompletion::Success(types::RunSuccessPayload {
-                    exports: output.exports.clone(),
-                    skipped_exports: output.skipped_exports.clone(),
-                    stdout: output.stdout.clone(),
-                    stderr: output.stderr.clone(),
-                    duration_ms: output.duration_ms,
-                    wall_time_ms: output.wall_time_ms,
-                    cpu_time_ms: run_cpu_ms,
-                    bridge_calls: run_records,
-                    heap_used_bytes,
-                    background_flags: (u8::from(has_grace))
-                        | (u8::from(has_streams) << 1),
-                });
+            let completion = types::RunCompletion::Success(types::RunSuccessPayload {
+                exports: output.exports.clone(),
+                skipped_exports: output.skipped_exports.clone(),
+                stdout: output.stdout.clone(),
+                stderr: output.stderr.clone(),
+                duration_ms: output.duration_ms,
+                wall_time_ms: output.wall_time_ms,
+                cpu_time_ms: run_cpu_ms,
+                bridge_calls: run_records,
+                heap_used_bytes,
+                background_flags: (u8::from(has_grace)) | (u8::from(has_streams) << 1),
+            });
             match link.send(Addr::Run(spec.run_id), Outbound::Result { completion }) {
                 Ok(()) => true,
                 Err(e) => {
@@ -2719,7 +2712,10 @@ mod tests {
     #[test]
     fn syntax_error_is_user_code() {
         let err = run_err("export default (((");
-        assert!(matches!(&err, RunError::RuntimeError(d) if d.name == "SyntaxError"), "got {err:?}");
+        assert!(
+            matches!(&err, RunError::RuntimeError(d) if d.name == "SyntaxError"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -3392,7 +3388,11 @@ mod tests {
         let bg = out.background.expect("grace phase ran");
         assert_eq!(bg.status, GraceStatus::Settled);
         assert_eq!(bg.stdout, vec!["bg:42".to_string()]);
-        assert_eq!(bg.bridge_calls.len(), 0, "the call was attempted pre-settle");
+        assert_eq!(
+            bg.bridge_calls.len(),
+            0,
+            "the call was attempted pre-settle"
+        );
     }
 
     #[test]
@@ -3439,14 +3439,20 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             &call_spec("probe", &[]),
         );
-        let out = second.result.expect("instance reusable after clean truncation");
+        let out = second
+            .result
+            .expect("instance reusable after clean truncation");
         assert_eq!(value_of(&out), WireValue::String("function".to_string()));
         assert!(out.background.is_none());
     }
 
     #[test]
     fn prefix_code_may_use_codegen() {
-        evaluate_prefix("globalThis.f = new Function('return 1'); eval('2')", &[], &[])
+        evaluate_prefix(
+            "globalThis.f = new Function('return 1'); eval('2')",
+            &[],
+            &[],
+        )
         .unwrap();
     }
 
@@ -3552,8 +3558,12 @@ mod tests {
 
     #[test]
     fn prefix_rejected_top_level_await_is_runtime_error() {
-        let err = evaluate_prefix(r#"await Promise.reject(new Error("prefix rejected"))"#, &[], &[])
-            .unwrap_err();
+        let err = evaluate_prefix(
+            r#"await Promise.reject(new Error("prefix rejected"))"#,
+            &[],
+            &[],
+        )
+        .unwrap_err();
         assert!(matches!(err.error, RunError::RuntimeError(_)));
     }
 
@@ -3717,8 +3727,7 @@ mod tests {
             handler_name: "__iso4_fetch_h".to_string(),
             enumerable: true,
         }];
-        let err =
-            evaluate_prefix("await fetch('https://example.com')", &globals, &[]).unwrap_err();
+        let err = evaluate_prefix("await fetch('https://example.com')", &globals, &[]).unwrap_err();
         match err.error {
             // The placeholder sits under the handler name but reports the
             // public name — the user called `fetch`, not `__iso4_fetch_h`.
@@ -3735,7 +3744,11 @@ mod tests {
             "tools:search",
             vec![("query", HostModuleNode::Function)],
         )];
-        let err = evaluate_prefix("import { query } from 'tools:search'; await query('dogs')", &[], &imports)
+        let err = evaluate_prefix(
+            "import { query } from 'tools:search'; await query('dogs')",
+            &[],
+            &imports,
+        )
         .unwrap_err();
         assert!(matches!(err.error, RunError::PrefixBridgeCall(_)));
     }
@@ -3800,7 +3813,8 @@ mod tests {
             "new Request('https://ex.com/a')",
             "new Headers([['content-type', 'text/plain']])",
         ] {
-            let prefix_src = format!("globalThis.v = {expr}\nexport default () => typeof globalThis.v");
+            let prefix_src =
+                format!("globalThis.v = {expr}\nexport default () => typeof globalThis.v");
             evaluate_prefix(&prefix_src, &[], &[])
                 .unwrap_or_else(|_| panic!("a prefix with a live {expr} must evaluate"));
             let out = execute_with_prefix(
@@ -3817,7 +3831,11 @@ mod tests {
                 &call_spec("default", &[]),
             )
             .unwrap_or_else(|_| panic!("run with a prefix holding {expr} must not fail"));
-            assert_eq!(value_of(&out), WireValue::String("object".to_string()), "{expr}");
+            assert_eq!(
+                value_of(&out),
+                WireValue::String("object".to_string()),
+                "{expr}"
+            );
         }
     }
 
@@ -4332,8 +4350,16 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(failure.error, RunError::CpuTimeout), "got {:?}", failure.error);
-        assert!(failure.bridge_calls.is_empty(), "got {:?}", failure.bridge_calls);
+        assert!(
+            matches!(failure.error, RunError::CpuTimeout),
+            "got {:?}",
+            failure.error
+        );
+        assert!(
+            failure.bridge_calls.is_empty(),
+            "got {:?}",
+            failure.bridge_calls
+        );
     }
 
     #[test]
@@ -4346,7 +4372,11 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(failure.error, RunError::CpuTimeout), "got {:?}", failure.error);
+        assert!(
+            matches!(failure.error, RunError::CpuTimeout),
+            "got {:?}",
+            failure.error
+        );
     }
 
     #[test]
@@ -4430,7 +4460,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let (name, message) = out.background.expect("grace ran").error.expect("error kept");
+        let (name, message) = out
+            .background
+            .expect("grace ran")
+            .error
+            .expect("error kept");
         assert_eq!(name, "€".repeat(85));
         assert_eq!(message, format!("{}… [truncated]", "€".repeat(682)));
     }
@@ -4469,7 +4503,10 @@ mod tests {
                 Arc::new(AtomicU32::new(0)),
                 &call,
             );
-            assert!(outcome.tainted, "{export}: an interrupted instance is tainted");
+            assert!(
+                outcome.tainted,
+                "{export}: an interrupted instance is tainted"
+            );
             let error = outcome.result.expect_err(export).error;
             assert!(
                 matches!(error, RunError::FunctionArgumentNotSupported),
@@ -4536,10 +4573,16 @@ mod tests {
     fn a_missing_named_export_is_an_import_error() {
         let imports = [host_import(
             "tools",
-            vec![("yes", HostModuleNode::Data(testval::to_blob(&WireValue::Number(1.0))))],
+            vec![(
+                "yes",
+                HostModuleNode::Data(testval::to_blob(&WireValue::Number(1.0))),
+            )],
         )];
-        let err = run_with_source_imports("import { nope } from 'tools'; export default nope", &imports)
-            .unwrap_err();
+        let err = run_with_source_imports(
+            "import { nope } from 'tools'; export default nope",
+            &imports,
+        )
+        .unwrap_err();
         let m = expect_import(&err);
         assert!(
             m.contains("does not provide an export named 'nope'"),
@@ -4584,7 +4627,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
-        assert!(failure.stdout.is_empty(), "nothing runs after the import() call");
+        assert!(
+            failure.stdout.is_empty(),
+            "nothing runs after the import() call"
+        );
     }
 
     #[test]
@@ -4641,7 +4687,11 @@ mod tests {
 
     #[test]
     fn dynamic_import_in_a_prefix_fails_evaluation() {
-        let failure = evaluate_prefix("try { await import('lodash') } catch {}\nexport default 1", &[], &[])
+        let failure = evaluate_prefix(
+            "try { await import('lodash') } catch {}\nexport default 1",
+            &[],
+            &[],
+        )
         .unwrap_err();
         assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
     }
@@ -4690,7 +4740,10 @@ mod tests {
             &call,
         );
         assert!(outcome.tainted, "an interrupted instance must be discarded");
-        assert_eq!(expect_import(&outcome.result.unwrap_err().error), DYN_IMPORT_MSG);
+        assert_eq!(
+            expect_import(&outcome.result.unwrap_err().error),
+            DYN_IMPORT_MSG
+        );
     }
 
     #[test]
@@ -4724,7 +4777,10 @@ mod tests {
         assert_eq!(value_of(&out), WireValue::String("early".to_string()));
         let bg = out.background.expect("grace ran");
         assert_eq!(bg.status, GraceStatus::Truncated);
-        assert_eq!(bg.error, Some(("Error".to_string(), DYN_IMPORT_MSG.to_string())));
+        assert_eq!(
+            bg.error,
+            Some(("Error".to_string(), DYN_IMPORT_MSG.to_string()))
+        );
     }
 
     #[test]
@@ -4760,7 +4816,11 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             &call_spec("default", &[]),
         );
-        let bg = outcome.result.expect("value settled").background.expect("grace ran");
+        let bg = outcome
+            .result
+            .expect("value settled")
+            .background
+            .expect("grace ran");
         let expected = format!("dynamic import() is not supported: '{}…'", "€".repeat(256));
         assert_eq!(bg.error, Some(("Error".to_string(), expected)));
     }
@@ -4787,7 +4847,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(expect_import(&failure.error), DYN_IMPORT_MSG);
-        assert!(failure.bridge_calls.is_empty(), "got {:?}", failure.bridge_calls);
+        assert!(
+            failure.bridge_calls.is_empty(),
+            "got {:?}",
+            failure.bridge_calls
+        );
     }
 
     #[test]

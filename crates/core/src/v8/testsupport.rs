@@ -1,22 +1,28 @@
 //! Test-only helpers shared by the engine's test modules: run shorthands,
 //! export decoding, and the in-memory host end of a run's link.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::link::{Addr, Inbound, Outbound};
 use crate::testval::{self, TestValue as WireValue};
 use crate::types;
-use crate::types::{BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule};
+use crate::types::{
+    BridgeErrorPayload, HostGlobalDef, HostModuleNode, ImportBinding, ImportModule,
+};
 use crate::v8::runloop::run_module;
 use crate::v8::{
-    FailureOutput, Limits, Output, PrefixSpec, RoutedEvent, RunError, RunEvent, RunEventSender,
-    RunIo, create_instance_core, execute, init_platform,
+    create_instance_core, execute, init_platform, FailureOutput, Limits, Output, PrefixSpec,
+    RoutedEvent, RunError, RunEvent, RunEventSender, RunIo,
 };
 
 /// Run code with explicit limits. Used for limit-enforcement tests.
-pub(crate) fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Output, FailureOutput> {
+pub(crate) fn run_code(
+    code: &str,
+    filename: &str,
+    limits: Limits,
+) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
         code,
@@ -61,7 +67,10 @@ pub(crate) fn host_import(specifier: &str, exports: Vec<(&str, HostModuleNode)>)
 }
 
 /// Run user code with a fixed set of source imports; no host bridge.
-pub(crate) fn run_with_source_imports(code: &str, imports: &[ImportBinding]) -> Result<Output, RunError> {
+pub(crate) fn run_with_source_imports(
+    code: &str,
+    imports: &[ImportBinding],
+) -> Result<Output, RunError> {
     init_platform();
     run_module(
         code,
@@ -302,7 +311,9 @@ pub(crate) fn test_io() -> (RunIo, TestHost) {
 
 /// The parts of a `BridgeCall`: callId, targetKind, specifier, name path,
 /// decoded args.
-pub(crate) fn bridge_call_parts(msg: Outbound) -> (u32, u8, Option<String>, Vec<String>, Vec<WireValue>) {
+pub(crate) fn bridge_call_parts(
+    msg: Outbound,
+) -> (u32, u8, Option<String>, Vec<String>, Vec<WireValue>) {
     let Outbound::BridgeCall {
         call_id,
         target,

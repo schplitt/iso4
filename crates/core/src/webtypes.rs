@@ -363,8 +363,7 @@ pub fn install_with_streams(
             .get_index(tc, index as u32)
             .filter(|c| c.is_function())
             .ok_or_else(|| format!("web runtime did not return the {name} class"))?;
-        let key =
-            class_key(tc, name).ok_or_else(|| format!("intern {name} class key failed"))?;
+        let key = class_key(tc, name).ok_or_else(|| format!("intern {name} class key failed"))?;
         global
             .set_private(tc, key, class)
             .ok_or_else(|| format!("store {name} class reference failed"))?;

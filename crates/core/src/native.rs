@@ -7,7 +7,11 @@ extern "C" {
     fn iso4_new_frozen_clock_platform(thread_pool_size: std::ffi::c_int) -> *mut ::v8::Platform;
     fn iso4_set_oom_error_handler(
         isolate: ::v8::UnsafeRawIsolatePtr,
-        callback: unsafe extern "C" fn(*const std::ffi::c_char, &::v8::OomDetails, *mut std::ffi::c_void),
+        callback: unsafe extern "C" fn(
+            *const std::ffi::c_char,
+            &::v8::OomDetails,
+            *mut std::ffi::c_void,
+        ),
         data: *mut std::ffi::c_void,
     );
     fn iso4_set_fatal_memory_error_callback(callback: ::v8::OomErrorCallback);
@@ -33,7 +37,10 @@ pub(crate) fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
 ///
 /// # Safety
 /// `record` must outlive the isolate: V8 reads it until the process aborts.
-pub(crate) unsafe fn set_oom_error_handler(isolate: &mut ::v8::Isolate, record: &crate::v8::OomRecord) {
+pub(crate) unsafe fn set_oom_error_handler(
+    isolate: &mut ::v8::Isolate,
+    record: &crate::v8::OomRecord,
+) {
     if crate::v8::fatal_hook().is_none() {
         return;
     }

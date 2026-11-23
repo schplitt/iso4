@@ -471,11 +471,9 @@ fn bench_policy(c: &mut Criterion) {
                 last_used: now - Duration::from_micros((rand() * 60_000_000.0) as u64),
             })
             .collect();
-        group.bench_with_input(
-            BenchmarkId::new("pick_victim", count),
-            &idle,
-            |b, idle| b.iter(|| black_box(pick_victim(black_box(idle), now))),
-        );
+        group.bench_with_input(BenchmarkId::new("pick_victim", count), &idle, |b, idle| {
+            b.iter(|| black_box(pick_victim(black_box(idle), now)))
+        });
     }
 
     let facts = PressureFacts {

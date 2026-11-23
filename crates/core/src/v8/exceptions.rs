@@ -54,7 +54,11 @@ pub(super) fn syntax_error(
         unreachable!("runtime_error_from_value always builds a RuntimeError");
     };
     // V8 gives a SyntaxError a header-only stack; add the frame it lacks.
-    if !data.stack.as_deref().is_some_and(|s| s.contains("\n    at ")) {
+    if !data
+        .stack
+        .as_deref()
+        .is_some_and(|s| s.contains("\n    at "))
+    {
         let location = scope.message().and_then(|m| {
             let file = m
                 .get_script_resource_name(scope)
@@ -65,7 +69,10 @@ pub(super) fn syntax_error(
             Some(format!("{file}:{line}:{}", m.get_start_column() + 1))
         });
         if let Some(location) = location {
-            data.stack = Some(format!("{}: {}\n    at {location}", data.name, data.message));
+            data.stack = Some(format!(
+                "{}: {}\n    at {location}",
+                data.name, data.message
+            ));
         }
     }
     RunError::RuntimeError(data)
@@ -104,7 +111,8 @@ pub(super) fn error_message_from_value(
     if msg.is_undefined() || msg.is_null() {
         return None;
     }
-    msg.to_string(scope).map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
+    msg.to_string(scope)
+        .map(|s| capped_text_lossy(scope, s, ERROR_TEXT_BYTES))
 }
 
 fn stack_from_value(
@@ -274,8 +282,8 @@ pub(super) fn exception_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v8::Limits;
     use crate::v8::testsupport::{get_default, run_code, run_err, run_ok};
+    use crate::v8::Limits;
 
     // ── Guest text copies ────────────────────────────────────────────────
 
@@ -304,12 +312,18 @@ mod tests {
         // Both fit the wire cap, so the frontend's clamp adds no marker.
         for text in [payload.message.as_str(), stack] {
             assert!(
-                matches!(errors::clamp_error_text(text), std::borrow::Cow::Borrowed(_)),
+                matches!(
+                    errors::clamp_error_text(text),
+                    std::borrow::Cow::Borrowed(_)
+                ),
                 "{}",
                 text.len()
             );
         }
-        assert_eq!(get_default(&run_ok("export default 1")).as_deref(), Some("1"));
+        assert_eq!(
+            get_default(&run_ok("export default 1")).as_deref(),
+            Some("1")
+        );
     }
 
     #[test]
@@ -319,7 +333,9 @@ mod tests {
             panic!("expected RuntimeError, got {err:?}");
         };
         assert!(!data.message.contains('\u{FFFD}'));
-        assert!(data.message.ends_with("… [truncated by iso4: 81921 UTF-16 units total]"));
+        assert!(data
+            .message
+            .ends_with("… [truncated by iso4: 81921 UTF-16 units total]"));
         assert!(data.message.len() <= errors::MAX_ERROR_TEXT_BYTES);
     }
 }

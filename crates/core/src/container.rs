@@ -15,9 +15,9 @@
 //! container's cgroup is mounted at `/sys/fs/cgroup` inside its namespace,
 //! so the files are read at the mount root — no `/proc/self/cgroup` walk.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -185,16 +185,22 @@ fn read_usage() -> Option<u64> {
     static V1: AtomicI32 = AtomicI32::new(-1); // v1 fallback fds, lazily
     static V1_STAT: AtomicI32 = AtomicI32::new(-1);
 
-    let (current, inactive) = if let Some(fd) = cached_fd(&CURRENT_FD, c"/sys/fs/cgroup/memory.current")
-    {
-        let stat = cached_fd(&STAT_FD, c"/sys/fs/cgroup/memory.stat");
-        (read_number(fd)?, stat.and_then(|s| read_stat_field(s, "inactive_file ")))
-    } else if let Some(fd) = cached_fd(&V1, c"/sys/fs/cgroup/memory/memory.usage_in_bytes") {
-        let stat = cached_fd(&V1_STAT, c"/sys/fs/cgroup/memory/memory.stat");
-        (read_number(fd)?, stat.and_then(|s| read_stat_field(s, "total_inactive_file ")))
-    } else {
-        return None;
-    };
+    let (current, inactive) =
+        if let Some(fd) = cached_fd(&CURRENT_FD, c"/sys/fs/cgroup/memory.current") {
+            let stat = cached_fd(&STAT_FD, c"/sys/fs/cgroup/memory.stat");
+            (
+                read_number(fd)?,
+                stat.and_then(|s| read_stat_field(s, "inactive_file ")),
+            )
+        } else if let Some(fd) = cached_fd(&V1, c"/sys/fs/cgroup/memory/memory.usage_in_bytes") {
+            let stat = cached_fd(&V1_STAT, c"/sys/fs/cgroup/memory/memory.stat");
+            (
+                read_number(fd)?,
+                stat.and_then(|s| read_stat_field(s, "total_inactive_file ")),
+            )
+        } else {
+            return None;
+        };
     // Working set: page cache the kernel can reclaim never OOMs the
     // container, so it must not evict warmth or refuse admissions.
     Some(current.saturating_sub(inactive.unwrap_or(0)))
@@ -235,7 +241,10 @@ mod tests {
     fn limit_is_plausible_on_supported_platforms() {
         let limit = limit_bytes().expect("Linux and macOS always resolve a total");
         assert!(limit > 256 * 1024 * 1024, "implausibly small: {limit}");
-        assert!(limit < 1 << 50, "unlimited sentinel leaked through: {limit}");
+        assert!(
+            limit < 1 << 50,
+            "unlimited sentinel leaked through: {limit}"
+        );
     }
 
     #[test]
@@ -243,7 +252,10 @@ mod tests {
         let line = admission_line_bytes();
         let limit = limit_bytes().unwrap();
         assert!(line > 0);
-        assert!(line < limit, "line {line} must leave headroom below {limit}");
+        assert!(
+            line < limit,
+            "line {line} must leave headroom below {limit}"
+        );
         assert_eq!(line, line_from(limit, host_reserve_bytes()));
     }
 

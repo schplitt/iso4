@@ -305,9 +305,7 @@ pub fn target_slots(prefixes: &[SlotFacts], cores: usize) -> usize {
     if !(wall_ms > 0.0) || !(cpu_ms > 0.0) {
         return cores.max(1);
     }
-    let slots = SLOT_COEFFICIENT
-        * cores_f
-        * wall_ms.powf(SLOT_WALL_EXPONENT)
+    let slots = SLOT_COEFFICIENT * cores_f * wall_ms.powf(SLOT_WALL_EXPONENT)
         / cpu_ms.powf(SLOT_CPU_EXPONENT);
     if !slots.is_finite() {
         return cores.max(1);
@@ -391,13 +389,24 @@ mod tests {
     fn the_slot_formula_separates_waiting_work_from_computing_work() {
         // An HTTP-shaped run: 200 ms of waiting, a twentieth of a
         // millisecond of CPU. Little's law says thousands in flight.
-        let io = SlotFacts { arrivals_per_sec: 100.0, wall_ms: 200.0, cpu_ms: 0.05 };
+        let io = SlotFacts {
+            arrivals_per_sec: 100.0,
+            wall_ms: 200.0,
+            cpu_ms: 0.05,
+        };
         // A compute-shaped run: the wall IS the CPU.
-        let cpu = SlotFacts { arrivals_per_sec: 100.0, wall_ms: 3.4, cpu_ms: 3.4 };
+        let cpu = SlotFacts {
+            arrivals_per_sec: 100.0,
+            wall_ms: 3.4,
+            cpu_ms: 3.4,
+        };
 
         let io_slots = target_slots(&[io], 2);
         let cpu_slots = target_slots(&[cpu], 2);
-        assert!(io_slots > 1000, "wait-dominated work wants thousands, got {io_slots}");
+        assert!(
+            io_slots > 1000,
+            "wait-dominated work wants thousands, got {io_slots}"
+        );
         assert!(
             (4..=12).contains(&cpu_slots),
             "compute-bound work wants a handful, got {cpu_slots}"
@@ -408,15 +417,31 @@ mod tests {
     fn a_shorter_run_of_the_same_shape_wants_more_slots() {
         // Same wall/cpu ratio, a tenth the run: the fixed per-run cost the
         // guest cannot see means shorter runs need deeper pipelining.
-        let long = SlotFacts { arrivals_per_sec: 10.0, wall_ms: 100.0, cpu_ms: 1.0 };
-        let short = SlotFacts { arrivals_per_sec: 10.0, wall_ms: 10.0, cpu_ms: 0.1 };
+        let long = SlotFacts {
+            arrivals_per_sec: 10.0,
+            wall_ms: 100.0,
+            cpu_ms: 1.0,
+        };
+        let short = SlotFacts {
+            arrivals_per_sec: 10.0,
+            wall_ms: 10.0,
+            cpu_ms: 0.1,
+        };
         assert!(target_slots(&[short], 4) > target_slots(&[long], 4));
     }
 
     #[test]
     fn prefixes_fold_by_arrival_share() {
-        let io = SlotFacts { arrivals_per_sec: 900.0, wall_ms: 200.0, cpu_ms: 0.05 };
-        let cpu = SlotFacts { arrivals_per_sec: 100.0, wall_ms: 3.4, cpu_ms: 3.4 };
+        let io = SlotFacts {
+            arrivals_per_sec: 900.0,
+            wall_ms: 200.0,
+            cpu_ms: 0.05,
+        };
+        let cpu = SlotFacts {
+            arrivals_per_sec: 100.0,
+            wall_ms: 3.4,
+            cpu_ms: 3.4,
+        };
         let mixed = target_slots(&[io, cpu], 2);
         // Between the two, and nearer the prefix taking most of the traffic.
         assert!(mixed > target_slots(&[cpu], 2));
@@ -427,7 +452,11 @@ mod tests {
     fn nothing_measured_yet_falls_back_to_one_run_per_core() {
         assert_eq!(target_slots(&[], 4), 4);
         // A sample with no usable times is not a reason to admit nothing.
-        let empty = SlotFacts { arrivals_per_sec: 5.0, wall_ms: 0.0, cpu_ms: 0.0 };
+        let empty = SlotFacts {
+            arrivals_per_sec: 5.0,
+            wall_ms: 0.0,
+            cpu_ms: 0.0,
+        };
         assert_eq!(target_slots(&[empty], 4), 4);
     }
 
@@ -435,7 +464,11 @@ mod tests {
     fn the_core_count_is_a_floor_not_a_suggestion() {
         // A run that somehow reports more CPU than wall must never take the
         // sandbox below one job per core.
-        let absurd = SlotFacts { arrivals_per_sec: 1.0, wall_ms: 0.001, cpu_ms: 500.0 };
+        let absurd = SlotFacts {
+            arrivals_per_sec: 1.0,
+            wall_ms: 0.001,
+            cpu_ms: 500.0,
+        };
         assert_eq!(target_slots(&[absurd], 8), 8);
     }
 
@@ -710,7 +743,10 @@ mod tests {
     fn an_uncapped_run_is_refused_once_usage_reaches_the_budget() {
         assert!(admit(799, 0, 900, 800), "below the budget: admissible");
         assert!(!admit(800, 0, 900, 800), "at the budget: refused");
-        assert!(!admit(850, 0, 900, 800), "above: refused even under the line");
+        assert!(
+            !admit(850, 0, 900, 800),
+            "above: refused even under the line"
+        );
     }
 
     #[test]
@@ -754,7 +790,10 @@ mod tests {
     }
 
     fn jf(in_flight: usize, util: u32) -> JoinFact {
-        JoinFact { in_flight, util_permille: util }
+        JoinFact {
+            in_flight,
+            util_permille: util,
+        }
     }
 
     #[test]
