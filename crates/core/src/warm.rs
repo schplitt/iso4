@@ -332,10 +332,12 @@ pub struct WarmRegistry {
     /// `dispose()`; the host's default budget makes that an explicit
     /// opt-out, not a default.
     warm_budget_bytes: u64,
-    /// The hard admission line in bytes (90% of container limit − Node
-    /// reserve, `container::admission_line_bytes()`). 0 = disabled (no
-    /// container limit readable).
+    /// The hard admission line in bytes (90% of container limit − host
+    /// reserve, `container::admission_line_bytes()`, or set by the
+    /// embedder). 0 = disabled.
     hard_line_bytes: u64,
+    /// The line was derived from the container limit, not set by the embedder.
+    line_derived: bool,
     /// Test seam: watermark tests inject a usage sample instead of reading
     /// the real meter (u64::MAX = unset). Never set outside tests.
     #[cfg(test)]
@@ -636,9 +638,16 @@ impl WarmRegistry {
             }),
             warm_budget_bytes,
             hard_line_bytes,
+            line_derived: false,
             #[cfg(test)]
             usage_override: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// Marks the line as derived, so refusals print its formula.
+    pub(crate) fn with_derived_line(mut self) -> Self {
+        self.line_derived = true;
+        self
     }
 
     /// One usage sample for the pressure/admission checks — taken BEFORE
@@ -697,11 +706,19 @@ impl WarmRegistry {
                 self.warm_budget_bytes / MB,
             )
         } else {
-            // The line's inputs aren't stored; reconstruct the limit it implies
-            // (exact modulo the derivation's /10 floor) so the shown arithmetic
-            // checks out even for test-injected lines.
-            let reserve_bytes = crate::container::host_reserve_bytes();
-            let limit_bytes = self.hard_line_bytes / 9 * 10 + reserve_bytes;
+            // A derived line's inputs aren't stored; reconstruct the limit it
+            // implies (exact modulo the derivation's /10 floor).
+            let how = if self.line_derived {
+                let reserve_bytes = crate::container::host_reserve_bytes();
+                let limit_bytes = self.hard_line_bytes / 9 * 10 + reserve_bytes;
+                format!(
+                    " — 90% of (container limit {} MB minus host reserve {} MB)",
+                    limit_bytes / MB,
+                    reserve_bytes / MB,
+                )
+            } else {
+                " (set by the embedder)".to_string()
+            };
             let headroom_mb = self.hard_line_bytes.saturating_sub(usage_bytes) / MB;
             let fit = if headroom_mb > 0 {
                 format!("the largest heap ceiling admissible right now is {headroom_mb} MB")
@@ -711,14 +728,12 @@ impl WarmRegistry {
             format!(
                 "no capacity for a new isolate: measured container memory ({} MB) plus \
                  this run's heap ceiling ({} MB) totals {} MB, crossing the admission \
-                 line of {} MB — 90% of (container limit {} MB minus host reserve \
-                 {} MB); {}",
+                 line of {} MB{}; {}",
                 usage_bytes / MB,
                 run_cap_bytes / MB,
                 usage_bytes.saturating_add(run_cap_bytes) / MB,
                 self.hard_line_bytes / MB,
-                limit_bytes / MB,
-                reserve_bytes / MB,
+                how,
                 fit,
             )
         })
@@ -1493,7 +1508,7 @@ mod tests {
     fn the_admission_line_refuses_new_isolates_but_never_reuse() {
         // Hard line 900 MB, usage 800: a 128 MB isolate no longer fits
         // (928 > 900) while a 64 MB one does.
-        let registry = WarmRegistry::new(0, 900 * TEST_MB);
+        let registry = WarmRegistry::new(0, 900 * TEST_MB).with_derived_line();
         registry.set_usage_for_test(800 * TEST_MB);
         let Acquired::Refused(msg) = acquire(&registry, "p", TEST_CAP) else {
             panic!("128 MB run at 800/900 MB must be refused");
@@ -1510,6 +1525,17 @@ mod tests {
             msg.contains("admissible right now is 100 MB"),
             "message states the headroom: {msg}"
         );
+        // A hand-set line has no formula to show.
+        let hand_set = WarmRegistry::new(0, 900 * TEST_MB);
+        hand_set.set_usage_for_test(800 * TEST_MB);
+        let Acquired::Refused(msg) = acquire(&hand_set, "p", TEST_CAP) else {
+            panic!("128 MB run at 800/900 MB must be refused");
+        };
+        assert!(
+            msg.contains("crossing the admission line of 900 MB (set by the embedder)"),
+            "message names the embedder: {msg}"
+        );
+        assert!(!msg.contains("container limit"), "no derivation: {msg}");
         let small = att(acquire(&registry, "p", 64 * TEST_MB));
         registry.release("p", small.id, false, 0, 0.0, 0.0, true);
 

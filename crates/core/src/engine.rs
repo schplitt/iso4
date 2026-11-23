@@ -272,7 +272,11 @@ impl Engine {
             AdmissionLine::Off => 0,
             AdmissionLine::Bytes(n) => n,
         };
-        Ok(Self::new(budget, line))
+        let mut engine = Self::new(budget, line);
+        if options.admission_line == AdmissionLine::Auto {
+            engine.warm = engine.warm.with_derived_line();
+        }
+        Ok(engine)
     }
 
     /// For tests that start V8 lazily (`testing::engine`).
