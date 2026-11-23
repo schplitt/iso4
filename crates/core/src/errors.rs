@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 use crate::types;
 use crate::types::{BridgeErrorPayload, ResetCause, ResetInfo, RunErrorPayload};
-use crate::v8::isolate::{
+use crate::v8::{
     LogBuffers, ReasonCell, TerminationReason, WARMUP_CPU_MS, WARMUP_WALL_MS, elapsed_ms,
 };
 

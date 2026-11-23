@@ -19,7 +19,7 @@ extern "C" {
 pub(crate) fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
     // `cores: Some(n)` sizes the pool n - 1, at least 1, at most 16; unset
     // passes 0, V8's own count.
-    let pool = match crate::v8::isolate::cores_option() {
+    let pool = match crate::v8::cores_option() {
         None => 0,
         Some(n) => (n.get() - 1).clamp(1, 16) as std::ffi::c_int,
     };

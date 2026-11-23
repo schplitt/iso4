@@ -611,7 +611,7 @@ impl RegistryInner {
 /// execute in parallel. `EngineOptions::cores`, else the machine's count.
 pub fn cores() -> usize {
     static MACHINE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    match sandbox::isolate::cores_option() {
+    match sandbox::cores_option() {
         Some(n) => n.get(),
         None => {
             *MACHINE.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
@@ -1808,7 +1808,7 @@ mod tests {
         );
 
         let after =
-            sandbox::isolate::idle_settle_after().expect("the suite runs with the settle on");
+            sandbox::idle_settle_after().expect("the suite runs with the settle on");
         std::thread::sleep(after + Duration::from_millis(500));
         let settled = registry.stats().idle_heap_bytes;
         assert!(
@@ -2374,9 +2374,9 @@ mod tests {
     #[test]
     fn an_abandoned_stream_hits_the_idle_deadline_and_cleans_up() {
         sandbox::init_platform();
-        sandbox::streams::OUT_IDLE_OVERRIDE_MS.store(300, Ordering::Relaxed);
+        sandbox::OUT_IDLE_OVERRIDE_MS.store(300, Ordering::Relaxed);
         let _reset = scopeguard(|| {
-            sandbox::streams::OUT_IDLE_OVERRIDE_MS.store(0, Ordering::Relaxed);
+            sandbox::OUT_IDLE_OVERRIDE_MS.store(0, Ordering::Relaxed);
         });
         let (link, server) = crate::link::channel_link();
         let handle = spawn_instance(stream_prefix(), 0, test_brand_key()).expect("spawn instance");
