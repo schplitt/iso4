@@ -58,11 +58,11 @@ pub(crate) fn init_platform_with(settings: impl FnOnce()) -> bool {
         settings();
         ran = true;
         // Before initialize: V8 can run out of memory before any isolate exists.
-        crate::set_fatal_callbacks();
+        crate::native::set_fatal_callbacks();
         // ICU data comes with the prebuilt V8, statically linked. Nothing to
         // load here: a missing one aborts the process on the first
         // locale-aware call, which the Intl tests cover.
-        let platform = crate::new_platform().make_shared();
+        let platform = crate::native::new_platform().make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
@@ -563,7 +563,7 @@ pub(super) fn new_capped_isolate(
     isolate.memory_pressure_notification(v8::MemoryPressureLevel::Moderate);
     // SAFETY: `oom` outlives the isolate: declared before it as a local, after it
     // as an InstanceCore field.
-    unsafe { crate::set_oom_error_handler(&mut isolate, oom) };
+    unsafe { crate::native::set_oom_error_handler(&mut isolate, oom) };
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     isolate.set_host_initialize_import_meta_object_callback(host_import_meta_callback);
     install_dynamic_import(&mut isolate, reason);

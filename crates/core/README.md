@@ -42,8 +42,8 @@ network policy; `fetch` is a host-configured bridge global like any other.
 
 ## Layout
 
-- `src/lib.rs` embeds the snapshot `build.rs` makes and holds the public
-  API: a fixed export list, every other module private (`log` and
+- `src/native.rs` embeds the snapshot `build.rs` makes; `src/lib.rs` holds
+  the public API: a fixed export list, every other module private (`log` and
   `trace_enabled` stay reachable, hidden, for the two macros). The list is `Engine`,
   `EngineOptions`, `StartError`, `AdmissionLine`, `Capacity`, `Caller`,
   `RunHandle`, `Refusal`; `HostLink`, `Addr`, `Inbound`, `Outbound`,

@@ -67,7 +67,7 @@ fn external_references() -> &'static [v8::ExternalReference] {
 /// Isolate parameters that boot from the embedded snapshot.
 pub fn create_params() -> v8::CreateParams {
     v8::Isolate::create_params()
-        .snapshot_blob(v8::StartupData::from(crate::SNAPSHOT_BLOB))
+        .snapshot_blob(v8::StartupData::from(crate::native::SNAPSHOT_BLOB))
         .external_references(Cow::Borrowed(external_references()))
 }
 

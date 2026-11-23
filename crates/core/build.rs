@@ -1,5 +1,5 @@
 //! Builds the V8 startup snapshot (`src/snapshot.rs`) into `OUT_DIR`, where
-//! `src/lib.rs` embeds it, and compiles the frozen-clock platform
+//! `src/native.rs` embeds it, and compiles the frozen-clock platform
 //! (`src/clock_platform.cc`) and the OOM handler bindings
 //! (`src/oom_handler.cc`). The engine modules the snapshot reaches are
 //! compiled into this script so its native callbacks are the crate's own.
@@ -28,18 +28,20 @@ mod webcodec;
 #[path = "src/webtypes.rs"]
 mod webtypes;
 
-// Read only when an isolate boots, which never happens in this script.
-static SNAPSHOT_BLOB: &[u8] = &[];
+mod native {
+    // Read only when an isolate boots, which never happens in this script.
+    pub(crate) static SNAPSHOT_BLOB: &[u8] = &[];
 
-// The stock platform: this script runs no guest code, and a build script
-// cannot link the C++ it compiles.
-fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
-    ::v8::new_default_platform(0, false)
+    // The stock platform: this script runs no guest code, and a build script
+    // cannot link the C++ it compiles.
+    pub(crate) fn new_platform() -> ::v8::UniqueRef<::v8::Platform> {
+        ::v8::new_default_platform(0, false)
+    }
+
+    // No OOM handlers either, for the same two reasons.
+    pub(crate) unsafe fn set_oom_error_handler(_: &mut ::v8::Isolate, _: &crate::v8::OomRecord) {}
+    pub(crate) fn set_fatal_callbacks() {}
 }
-
-// No OOM handlers either, for the same two reasons.
-unsafe fn set_oom_error_handler(_: &mut ::v8::Isolate, _: &crate::v8::OomRecord) {}
-fn set_fatal_callbacks() {}
 
 fn main() {
     println!("cargo:rerun-if-changed=src");
