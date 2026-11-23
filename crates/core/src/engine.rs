@@ -413,10 +413,6 @@ impl Engine {
             .name("iso4-oneoff-run".to_string())
             .spawn(move || {
                 crate::webcodec::set_thread_brand_key(brand_key);
-                sandbox::set_run_epilogue_spec(Some(sandbox::EpilogueSpec {
-                    run_id,
-                    report_heap: false,
-                }));
                 let result = sandbox::execute_with_io(
                     &req.code,
                     req.filename.as_deref(),
@@ -432,6 +428,10 @@ impl Engine {
                     req.call.as_ref(),
                     Some(ctl),
                     observer,
+                    Some(sandbox::EpilogueSpec {
+                        run_id,
+                        report_heap: false,
+                    }),
                 );
                 match &result {
                     Ok(output) => {

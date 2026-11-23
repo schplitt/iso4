@@ -35,7 +35,7 @@ pub(crate) use oom_label::{
 pub use oom_label::{FatalCause, FatalHook, FatalInfo, FatalPhase, OomRecord, OomRun, OomRunLabel};
 pub use runloop::{
     CallJob, CallOutcome, EpilogueSpec, GraceReport, GraceStatus, Output, ReleaseHook, RoutedEvent,
-    RunEvent, RunEventSender, RunIo, execute_with_io, set_run_epilogue_spec,
+    RunEvent, RunEventSender, RunIo, execute_with_io,
 };
 #[cfg(test)]
 pub use runloop::{execute, execute_with_prefix, run_call_on_core};
