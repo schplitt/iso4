@@ -319,6 +319,7 @@ mod tests {
             None,
             None,
             Arc::clone(&recorder) as Arc<dyn Observer>,
+            None,
         )
         .unwrap();
         // The result keeps the capped buffers; the observer saw every line.

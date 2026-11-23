@@ -30,6 +30,7 @@ pub(crate) fn run_code(code: &str, filename: &str, limits: Limits) -> Result<Out
         None,
         None,
         Arc::new(crate::link::NoopObserver),
+        None,
     )
 }
 
@@ -74,6 +75,7 @@ pub(crate) fn run_with_source_imports(code: &str, imports: &[ImportBinding]) -> 
         None,
         None,
         Arc::new(crate::link::NoopObserver),
+        None,
     )
     .map_err(|failure| failure.error)
 }
@@ -427,6 +429,7 @@ pub(crate) fn run_call(code: &str, path: &str, args: &[WireValue]) -> Result<Out
         Some(&call),
         None,
         Arc::new(crate::link::NoopObserver),
+        None,
     )
     .map_err(|failure| failure.error)
 }

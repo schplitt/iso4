@@ -558,6 +558,7 @@ mod tests {
                 call.as_ref(),
                 None,
                 Arc::new(crate::link::NoopObserver),
+                None,
             );
             let _ = tx.send(result);
         });

@@ -2732,6 +2732,7 @@ mod tests {
             Some(&call),
             None,
             Arc::new(crate::link::NoopObserver),
+            None,
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::ExportTooLarge));
@@ -2810,6 +2811,7 @@ mod tests {
             Some(&call),
             None,
             Arc::new(crate::link::NoopObserver),
+            None,
         )
         .unwrap_err();
         assert!(matches!(failure.error, RunError::CpuTimeout));

@@ -146,10 +146,9 @@ pub struct GraceReport {
 }
 
 /// Per-run identity the run flow needs to write the early Result frame
-/// itself. Installed per run as thread state by the session loop and
-/// the warm owner thread — the same pattern as the descriptor brand key
-/// — so the deep call chain stays unchanged. Unset (direct API, tests)
-/// means grace runs in hold mode: work is driven before the run returns.
+/// itself. Passed per run: an argument on the one-off path, on `CallJob`
+/// for warm calls. `None` (direct API, tests) means grace runs in hold
+/// mode: work is driven before the run returns.
 #[derive(Clone, Copy)]
 pub struct EpilogueSpec {
     /// The run's wire id, echoed on the early Result and the RunComplete.
@@ -157,21 +156,6 @@ pub struct EpilogueSpec {
     /// Whether the early Result reports `heapUsedBytes` (prefix runs feed
     /// eviction scoring; one-off runs do not).
     pub report_heap: bool,
-}
-
-thread_local! {
-    static EPILOGUE_SPEC: std::cell::Cell<Option<EpilogueSpec>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Install the epilogue spec for the next run executed on this thread.
-/// Consumed by that run; set it before every run.
-pub fn set_run_epilogue_spec(spec: Option<EpilogueSpec>) {
-    EPILOGUE_SPEC.with(|c| c.set(spec));
-}
-
-fn take_epilogue_spec() -> Option<EpilogueSpec> {
-    EPILOGUE_SPEC.with(|c| c.take())
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
@@ -206,12 +190,14 @@ pub fn execute(
         call,
         None,
         Arc::new(crate::link::NoopObserver),
+        None,
     )
 }
 
 /// `execute` with an explicit run I/O mode: the engine's one-off worker
 /// path. `token` is the run's table token (0 = allocate one internally);
 /// pass the token the run's handle carries, or mid-turn aborts never land.
+/// `epilogue` is `None` for hold mode.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_with_io(
     code: &str,
@@ -225,6 +211,7 @@ pub fn execute_with_io(
     call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
     observer: Arc<dyn Observer>,
+    epilogue: Option<EpilogueSpec>,
 ) -> Result<Output, FailureOutput> {
     init_platform();
     run_module(
@@ -239,6 +226,7 @@ pub fn execute_with_io(
         call,
         ctl_slot,
         observer,
+        epilogue,
     )
 }
 
@@ -302,6 +290,7 @@ pub(super) fn run_module(
     call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
     observer: Arc<dyn Observer>,
+    epilogue: Option<EpilogueSpec>,
 ) -> Result<Output, FailureOutput> {
     // The run clock, CPU budget, and bridge-call log live here (not inside
     // the inner function) so the final values can be stamped onto BOTH
@@ -322,6 +311,7 @@ pub(super) fn run_module(
         call,
         ctl_slot,
         observer,
+        epilogue,
         start,
         Arc::clone(&cpu_budget),
         Arc::clone(&bridge_log),
@@ -362,6 +352,7 @@ fn run_module_inner(
     call: Option<&types::CallSpec>,
     ctl_slot: Option<Arc<OnceLock<GuardCtl>>>,
     observer: Arc<dyn Observer>,
+    epilogue: Option<EpilogueSpec>,
     start: std::time::Instant,
     cpu_budget: Arc<CpuBudget>,
     bridge_log: Arc<Mutex<BridgeCallLog>>,
@@ -371,7 +362,6 @@ fn run_module_inner(
     // uniform across both paths.
     let run_table = RunTable::boxed();
     let token = if token != 0 { token } else { alloc_run_token() };
-    let epilogue = take_epilogue_spec();
     let entry = RunCallState::new(
         limits.max_stdout_bytes,
         limits.max_stderr_bytes,
@@ -2444,12 +2434,11 @@ pub fn run_call_on_core(
     // exactly as when the buffers were shared.)
     core.reason.reset();
     let token = alloc_run_token();
-    let epilogue = take_epilogue_spec();
     let entry = RunCallState::new(
         limits.max_stdout_bytes,
         limits.max_stderr_bytes,
         Arc::new(crate::link::NoopObserver),
-        Addr::Run(epilogue.map_or(0, |e| e.run_id)),
+        Addr::Run(0),
     );
     if core.warmup_logs_pending {
         core.warmup_logs_pending = false;
@@ -2533,7 +2522,7 @@ pub fn run_call_on_core(
                 streams: streams_ptr,
                 out_streams: out_streams_ptr,
                 timers: timers_ptr,
-                epilogue,
+                epilogue: None,
                 cancel_handle: &cancel_handle,
             },
         ),
