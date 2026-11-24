@@ -46,6 +46,7 @@
     "typecheck": "tsc --noEmit",
     "bench": "vitest bench --run",
     "bench:json": "vitest bench --run --outputJson bench-results.json",
+    "bench:counted": "bash bench/counted/run.sh",
     "test": "vitest",
     "test:run": "vitest run"
   },

@@ -10,6 +10,7 @@ crates/vendor
 
 # Benchmark outputs (vitest bench --outputJson / criterion)
 bench-results.json
+counted.json
 bench-results
 
 # Native binaries copied into platform packages — built in CI, never committed
