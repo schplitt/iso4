@@ -18,5 +18,5 @@ docker run --rm -v "$ROOT":/src -w /src \
 docker run --rm --memory 1g --memory-swap 1g --cpus 2 \
   -v "$ROOT":/src -w /src \
   -v iso4-counted-cargo-target:/cargo-target:ro \
-  -e COUNTED_SHA="$(git -C "$ROOT" rev-parse HEAD)" \
+  -e COUNTED_SHA="${COUNTED_SHA:-$(git -C "$ROOT" rev-parse HEAD)}" \
   "$IMAGE" node packages/iso4-sandbox/bench/counted/counted.ts /cargo-target/release/iso4-v8
