@@ -30,7 +30,7 @@
 import { afterAll, bench, describe } from 'vitest'
 import { createSandbox } from '../src/index.js'
 import type { CallResult, Prefix, Sandbox } from '../src/index.js'
-import { HEAVY_OPTS } from './profile.js'
+import { benchBinary, HEAVY_OPTS } from './profile.js'
 
 const SYNC_HANDLER = `
 export default {
@@ -82,7 +82,7 @@ function assertOk(result: CallResult, what: string): void {
 
 // ── Cold instance per call — hard pressure disables pooling ────────────────
 
-const pressured: Sandbox = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 8 })
+const pressured: Sandbox = await createSandbox({ ...benchBinary(), maxConcurrentRuns: 1, memoryBudgetMb: 8 })
 const coldSync: Prefix = await pressured.prepare({ code: SYNC_HANDLER })
 const coldRealistic: Prefix = await pressured.prepare({ code: REALISTIC_PREFIX })
 

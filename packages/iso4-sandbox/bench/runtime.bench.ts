@@ -1,8 +1,9 @@
 /**
  * Runtime benchmarks for \@iso4/sandbox.
  *
- * Four measurements across two describe blocks:
+ * Five measurements across two describe blocks:
  *
+ * cold / startup — spawn binary → connect pool → dispose, nothing run.
  * cold / direct  — full cycle: spawn binary → connect pool → run → dispose.
  * cold / prefix  — full cycle: spawn → connect → prepare → prefix.call → dispose.
  *
@@ -16,7 +17,7 @@
 import { afterAll, bench, describe } from 'vitest'
 import { createSandbox as createRuntime } from '../src/index.js'
 import type { CallResult, Prefix as DynamicPrefix, RunResult, Sandbox as Runtime } from '../src/index.js'
-import { HEAVY_OPTS } from './profile.js'
+import { benchBinary, HEAVY_OPTS } from './profile.js'
 
 const SAMPLE_CODE = 'export default 42'
 const SAMPLE_PREFIX = 'export default () => 42'
@@ -39,8 +40,8 @@ function assertOk(result: RunResult | CallResult, what: string): void {
 //    Two separate runtimes so the benches don't queue behind each other
 //    on a shared pool slot when vitest runs them concurrently.
 
-const hotDirectRt: Runtime = await createRuntime({ maxConcurrentRuns: 1 })
-const hotPrefixRt: Runtime = await createRuntime({ maxConcurrentRuns: 1 })
+const hotDirectRt: Runtime = await createRuntime({ ...benchBinary(), maxConcurrentRuns: 1 })
+const hotPrefixRt: Runtime = await createRuntime({ ...benchBinary(), maxConcurrentRuns: 1 })
 const hotPrefix: DynamicPrefix = await hotPrefixRt.prepare({ code: SAMPLE_PREFIX })
 
 afterAll(async () => {
@@ -56,9 +57,18 @@ afterAll(async () => {
 
 describe('cold start', () => {
   bench(
+    'startup (createRuntime → dispose)',
+    async () => {
+      const rt = await createRuntime(benchBinary())
+      await rt.dispose()
+    },
+    HEAVY_OPTS,
+  )
+
+  bench(
     'direct  (createRuntime → run → dispose)',
     async () => {
-      const rt = await createRuntime({ maxConcurrentRuns: 1 })
+      const rt = await createRuntime({ ...benchBinary(), maxConcurrentRuns: 1 })
       assertOk(await rt.run({ code: SAMPLE_CODE }), 'bench cold direct run')
       await rt.dispose()
     },
@@ -68,7 +78,7 @@ describe('cold start', () => {
   bench(
     'prefix  (createRuntime → prepare → prefix.call → dispose)',
     async () => {
-      const rt = await createRuntime({ maxConcurrentRuns: 1 })
+      const rt = await createRuntime({ ...benchBinary(), maxConcurrentRuns: 1 })
       const prefix = await rt.prepare({ code: SAMPLE_PREFIX })
       assertOk(await prefix.call({ export: 'default' }), 'bench cold prefix run')
       await rt.dispose()

@@ -29,7 +29,7 @@ import { afterAll, bench, describe } from 'vitest'
 import { createSandbox } from '../src/index.js'
 import type { CallResult, HostExportData, Prefix, Sandbox } from '../src/index.js'
 import { sparse1k } from './payloads.js'
-import { HEAVY_OPTS } from './profile.js'
+import { benchBinary, HEAVY_OPTS } from './profile.js'
 
 const SYNC_HANDLER = `
 export default {
@@ -181,8 +181,8 @@ function batched(size: number): Record<string, HostExportData>[][] {
 // reparented to init. The hook still earns its place for the normal path,
 // where the benches run and the file completes.
 
-const latencyRt: Sandbox = await createSandbox({ maxConcurrentRuns: 1 })
-const throughputRt: Sandbox = await createSandbox({ maxConcurrentRuns: SLOTS })
+const latencyRt: Sandbox = await createSandbox({ ...benchBinary(), maxConcurrentRuns: 1 })
+const throughputRt: Sandbox = await createSandbox({ ...benchBinary(), maxConcurrentRuns: SLOTS })
 
 // `allSettled` in both places: one runtime failing to dispose must not skip
 // the other.

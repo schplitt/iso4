@@ -5,11 +5,20 @@
  * (e.g. a fast same-machine A/B while iterating on an optimization). For
  * numbers meant to be compared via scripts/bench-compare.ts, run the full
  * profile on both sides so they are collected the same way.
+ *
+ * `ISO4_BENCH_BIN=<absolute path>` runs the child benches against that
+ * iso4-v8 binary. A relative path resolves against the vitest process.
  */
 
 import process from 'node:process'
 
 export const PR_PROFILE: boolean = process.env.ISO4_BENCH_PROFILE === 'pr'
+
+// `{ binaryPath }` from `ISO4_BENCH_BIN`, or `{}` when it is unset.
+export function benchBinary(): { binaryPath?: string } {
+  const bin = process.env.ISO4_BENCH_BIN
+  return bin ? { binaryPath: bin } : {}
+}
 
 export interface BenchOpts {
   warmupIterations: number

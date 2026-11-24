@@ -27,9 +27,9 @@ import { afterAll, bench, describe } from 'vitest'
 import { createSandbox } from '../src/index.js'
 import type { RunResult, Sandbox } from '../src/index.js'
 import { PAYLOAD_MATRIX, sparse1k } from './payloads.js'
-import { HEAVY_OPTS, PR_PROFILE } from './profile.js'
+import { benchBinary, HEAVY_OPTS, PR_PROFILE } from './profile.js'
 
-const rt: Sandbox = await createSandbox({ maxConcurrentRuns: 1 })
+const rt: Sandbox = await createSandbox({ ...benchBinary(), maxConcurrentRuns: 1 })
 
 afterAll(async () => {
   await rt.dispose()
