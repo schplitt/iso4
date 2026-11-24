@@ -15,6 +15,7 @@ import { randomBytes } from 'node:crypto'
 import type { ChildProcess } from 'node:child_process'
 
 import { resolveRuntimeBinary } from './binary'
+import type { RunIdCounter } from './client'
 import { ProtocolDesyncError, RunAbortedError, RuntimeIpcClient } from './client'
 
 import { QueueFullError, RunPool } from './pool'
@@ -218,10 +219,13 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
     // sockets (see `pool.ts`). Nothing connects eagerly here except the
     // control connection below.
     let pool: RunPool
+    // One counter for every connection to this child, so `run=N` names one run.
+    const runIds: RunIdCounter = { last: 0 }
     const connect = (): Promise<RuntimeIpcClient> =>
       RuntimeIpcClient.connect({
         socketPath,
         descriptorToken,
+        runIds,
         // Every Result carries the runtime's current allowance; an explicit
         // maxConcurrentRuns pins the number and ignores it.
         onSlotAllowance: pinnedConcurrency === undefined

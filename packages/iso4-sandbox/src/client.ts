@@ -62,6 +62,18 @@ export interface RuntimeIpcClientOptions {
    * opinion yet.
    */
   onSlotAllowance?: (allowance: number) => void
+  /**
+   * Run id counter shared by every connection of one sandbox, so a run id
+   * names one run in the child. Without it the connection counts on its own.
+   */
+  runIds?: RunIdCounter
+}
+
+/**
+ * The last run id handed out; `createSandbox` shares one per sandbox.
+ */
+export interface RunIdCounter {
+  last: number
 }
 
 export interface RawRunResult {
@@ -310,6 +322,10 @@ export class RuntimeIpcClient {
    * Set by {@link connect} — see `RuntimeIpcClientOptions.onSlotAllowance`.
    */
   private onSlotAllowance: ((allowance: number) => void) | undefined
+  /**
+   * Set by {@link connect} — see `RuntimeIpcClientOptions.runIds`.
+   */
+  private runIds: RunIdCounter = { last: 0 }
 
   private constructor(socket: Socket, brandKey: string) {
     this.socket = socket
@@ -373,6 +389,8 @@ export class RuntimeIpcClient {
     const socket = await connectSocket(options.socketPath)
     const client = new RuntimeIpcClient(socket, brandKeyForToken(options.descriptorToken))
     client.onSlotAllowance = options.onSlotAllowance
+    if (options.runIds)
+      client.runIds = options.runIds
 
     try {
       await client.write(
@@ -454,21 +472,21 @@ export class RuntimeIpcClient {
     }
   }
 
-  private nextRunId = 0
   private nextRunIdValue(): number {
     // Wraps at 2³²-1 back to 0. `>>> 0` and not `& 0xffffffff`: `&` coerces
     // through ToInt32, so `(0x7fffffff + 1) & 0xffffffff` is -2147483648, which
     // `writeU32` then rejects with ERR_OUT_OF_RANGE — killing every subsequent
-    // run on the connection for the next 2³¹ increments.
+    // run on the sandbox for the next 2³¹ increments.
     //
     // Run id 0 is skipped (it disables stream-frame run validation on both
     // sides), and so is any id still routing in `runs` — after a wrap, a
     // rolled-over id colliding with a live run would splice two runs' frames
     // together.
+    const ids = this.runIds
     do {
-      this.nextRunId = (this.nextRunId + 1) >>> 0
-    } while (this.nextRunId === 0 || this.runs.has(this.nextRunId))
-    return this.nextRunId
+      ids.last = (ids.last + 1) >>> 0
+    } while (ids.last === 0 || this.runs.has(ids.last))
+    return ids.last
   }
 
   // `globals` is the wire-shaped `GlobalDefPayload[]` produced by
