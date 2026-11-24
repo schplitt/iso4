@@ -3,7 +3,7 @@ name: Counted
 # Counted tier: bytes and counts (memory, threads, binary size) from
 # `pnpm bench:counted` in a container pinned to 1 GB / 2 CPUs.
 # Push to main uploads counted.json as the baseline artifact; a PR diffs its
-# run against main's newest green run in the job summary.
+# run against main's newest green run in the job summary and a PR comment.
 # Report only: number changes never fail the job.
 
 on:
@@ -26,6 +26,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+    outputs:
+      table: ${{ steps.diff.outputs.table }}
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -66,5 +68,40 @@ jobs:
           fi
 
       - name: Diff against main
+        id: diff
         if: github.event_name == 'pull_request'
-        run: node packages/iso4-sandbox/bench/counted/diff.ts "$RUNNER_TEMP/base/counted.json" packages/iso4-sandbox/counted.json >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          node packages/iso4-sandbox/bench/counted/diff.ts "$RUNNER_TEMP/base/counted.json" packages/iso4-sandbox/counted.json > "$RUNNER_TEMP/counted.md"
+          delimiter=$(openssl rand -hex 16)
+          {
+            printf 'table<<%s\n' "$delimiter"
+            tee -a "$GITHUB_STEP_SUMMARY" < "$RUNNER_TEMP/counted.md"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+  comment:
+    name: Counted PR comment
+    needs: counted
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post or update counted results
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TABLE: ${{ needs.counted.outputs.table }}
+        run: |
+          test -n "$TABLE"
+          issues="repos/$GITHUB_REPOSITORY/issues"
+          comments="$issues/$PR_NUMBER/comments"
+          ids=$(gh api --paginate "$comments" --jq '.[] | select(.user.login == "github-actions[bot]" and (.body // "" | startswith("<!-- iso4-counted -->"))) | .id')
+          id=${ids%%$'\n'*}
+          body=$(printf '%s\n\n%s\n' '<!-- iso4-counted -->' "$TABLE")
+          if [ -n "$id" ]; then
+            gh api --method PATCH "$issues/comments/$id" --raw-field "body=$body" > /dev/null
+          else
+            gh api --method POST "$comments" --raw-field "body=$body" > /dev/null
+          fi
