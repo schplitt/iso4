@@ -1,0 +1,70 @@
+name: Counted
+
+# Counted tier: bytes and counts (memory, threads, binary size) from
+# `pnpm bench:counted` in a container pinned to 1 GB / 2 CPUs.
+# Push to main uploads counted.json as the baseline artifact; a PR diffs its
+# run against main's newest green run in the job summary.
+# Report only: number changes never fail the job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: counted-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  counted:
+    name: Counted tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4.3.0
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 26
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run counted tier
+        env:
+          COUNTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: pnpm bench:counted
+
+      - name: Upload counted.json
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: counted
+          path: packages/iso4-sandbox/counted.json
+
+      # A missing baseline (no main run yet, expired artifact) leaves the base path empty.
+      - name: Download main baseline
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh run list --workflow counted.yml --branch main --event push --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [ -n "$id" ]; then
+            gh run download "$id" -n counted -D "$RUNNER_TEMP/base" || echo "no baseline artifact in run $id"
+          else
+            echo "no successful main run yet"
+          fi
+
+      - name: Diff against main
+        if: github.event_name == 'pull_request'
+        run: node packages/iso4-sandbox/bench/counted/diff.ts "$RUNNER_TEMP/base/counted.json" packages/iso4-sandbox/counted.json >> "$GITHUB_STEP_SUMMARY"

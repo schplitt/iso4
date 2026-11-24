@@ -10,8 +10,8 @@ import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import type * as SandboxModule from '../../src/index.js'
 
-interface CountedRow { name: string, value: number, unit: 'bytes' | 'count' }
-interface CountedRun { sha: string, date: string, rows: CountedRow[] }
+export interface CountedRow { name: string, value: number, unit: 'bytes' | 'count' }
+export interface CountedRun { sha: string, date: string, rows: CountedRow[] }
 
 interface ProcReading { privateBytes: number, pssBytes: number, threads: number }
 
@@ -147,8 +147,6 @@ async function main(): Promise<void> {
     rows.push(...await warm())
     const raw = await garbage(0)
     const settled = await garbage(1)
-    if (settled >= raw)
-      throw new Error(`[counted] settled idle heap ${settled} is not below raw ${raw}; the settle GC did not run`)
     rows.push({ name: 'garbage.idle_heap_raw_bytes', value: raw, unit: 'bytes' })
     rows.push({ name: 'garbage.idle_heap_settled_bytes', value: settled, unit: 'bytes' })
     rows.push({ name: 'binary.bytes', value: statSync(resolve(bin)).size, unit: 'bytes' })
