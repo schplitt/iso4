@@ -17,6 +17,10 @@ bench = false
 name = "micro"
 harness = false
 
+[[bench]]
+name = "gc"
+harness = false
+
 [features]
 # The `testing` module: picked internals for tests and benches; never on in a build.
 test-support = ["iso4-types/test-support"]
