@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { parseProc } from '../bench/counted/counted.js'
+import { parseProc, warmRows } from '../bench/counted/counted.js'
 
 const SMAPS_ROLLUP = `55d1c0a00000-ffffd8a3f000 ---p 00000000 00:00 0                          [rollup]
 Rss:               14652 kB
@@ -44,5 +44,17 @@ describe('counted /proc parser', () => {
   test('throws on text without the expected fields', () => {
     expect(() => parseProc('Rss: 1 kB\n', STATUS)).toThrow(/unexpected \/proc format/)
     expect(() => parseProc(SMAPS_ROLLUP, 'Name:\tx\n')).toThrow(/unexpected \/proc format/)
+  })
+})
+
+describe('counted warm rows', () => {
+  test('divides PSS growth by the instance count and subtracts the idle heap per instance', () => {
+    const idle = { privateBytes: 0, pssBytes: 10_000_000, threads: 11 }
+    const warm = { privateBytes: 0, pssBytes: 226_000_005, threads: 27 }
+    expect(warmRows(idle, warm, 148_000_000, 16)).toEqual([
+      { name: 'warm.per_instance.pss_bytes', value: 13_500_000, unit: 'bytes' },
+      { name: 'warm.per_instance.overhead_bytes', value: 4_250_000, unit: 'bytes' },
+      { name: 'warm.at16.threads', value: 27, unit: 'count' },
+    ])
   })
 })
