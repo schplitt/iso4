@@ -1,5 +1,11 @@
 # @iso4/fetch
 
+## 0.1.2
+
+### Patch Changes
+
+- 656e4f5: fix(fetch): require undici 6.29.1, which fixes the TLS certificate check bypass and several DoS advisories
+
 ## 0.1.1
 
 ### Patch Changes

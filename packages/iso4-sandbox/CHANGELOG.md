@@ -1,5 +1,11 @@
 # @iso4/sandbox
 
+## 0.9.1
+
+### Patch Changes
+
+- 68fe481: chore(native): update Rust dependencies
+
 ## 0.9.0
 
 ### Minor Changes
