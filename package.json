@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.33.2",
+  "packageManager": "pnpm@10.34.9",
   "description": "iso4 \u2014 fast, sandboxed V8 isolate runtime with permission-controlled fetch and pluggable modules",
   "license": "MIT",
   "author": "schplitt",
