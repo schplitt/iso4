@@ -253,3 +253,18 @@ export type SetupErrorCode = "ERR_PREFIX_DISPOSED" | "ERR_PREFIX_BROKEN" | "ERR_
 // #region Functions
 export declare function createSandbox(_?: SandboxOptions): Promise<Sandbox>;
 // #endregion
+
+// #region Referenced (internal)
+interface RunAborted {
+  status: "aborted";
+  ok: false;
+  error: RunError;
+  reason?: AbortReason;
+  stdout: string[];
+  stderr: string[];
+  durationMs: number;
+  wallTimeMs: number;
+  cpuTimeMs: number;
+  bridgeCalls: BridgeCallEntry[];
+}
+// #endregion
