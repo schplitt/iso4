@@ -130,6 +130,8 @@ pub struct PrefixData {
     pub code: String,
     /// Filename the prefix was declared with (module origin in stacks).
     pub filename: Option<String>,
+    /// The code hash sent at prepare; a run must carry the same one.
+    pub hash: [u8; 16],
     /// The heap lines set at prepare; every run on the prefix gets them.
     pub heap: types::HeapLimits,
     /// The full precompile-time global defs, replayed into every run's
@@ -146,11 +148,14 @@ pub struct PrefixData {
 }
 
 /// One stored prefix: runnable, or broken by a deterministic cold-start
-/// failure. A broken entry keeps only the clamped failure; the source is
-/// dropped and refusals share it by refcount.
+/// failure. A broken entry keeps only its hash and the clamped failure; the
+/// source is dropped and refusals share the failure by refcount.
 pub enum PrefixEntry {
     Ready(Arc<PrefixData>),
-    Broken(Arc<types::RunErrorPayload>),
+    Broken {
+        hash: [u8; 16],
+        cause: Arc<types::RunErrorPayload>,
+    },
 }
 
 #[cfg(test)]

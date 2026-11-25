@@ -690,15 +690,14 @@ function desyncResult(error: ProtocolDesyncError): RunFailure {
 
 /**
  * Codes the runtime reports for a run whose options are invalid. The client
- * checks first; this catches what it cannot know, such as a prefix the
- * runtime dropped. Runs throw these, like `prepare()`, instead of returning them.
+ * checks first; this catches what it cannot know, such as a prefix whose
+ * cold start broke it. Runs throw these, like `prepare()`, instead of returning them.
  */
 const SETUP_ERROR_CODES: ReadonlySet<SetupErrorCode> = new Set<SetupErrorCode>([
   'ERR_RESERVED_NAME',
   'ERR_UNDECLARED_BINDING',
   'ERR_FROZEN_BINDING',
   'ERR_INVALID_REBIND',
-  'ERR_PREFIX_DISPOSED',
   'ERR_PREFIX_BROKEN',
 ])
 
@@ -995,19 +994,19 @@ class SandboxImpl implements Sandbox {
       // the modules on every run and for validating rebind attempts. The
       // handler map is kept here as the per-run dispatch defaults.
       const { bindings, handlers } = processImports(options.imports)
-      const raw = await client.precompile({
+      const { reply, hash } = await client.precompile({
         code: options.code,
         filename: options.filename,
         heap: heapCapsForWire(prefixMemoryMb),
         globals: defs,
         imports: bindings,
       })
-      const result = decodePrecompileResultPayload(raw)
+      const result = decodePrecompileResultPayload(reply)
 
       if (!result.ok)
         throw thrownRunError(result.error)
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, wireLimits(options.limits))
+      return new PrefixImpl<G, M>(result.prefixId, hash, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, wireLimits(options.limits))
     })
   }
 
@@ -1039,6 +1038,10 @@ class SandboxImpl implements Sandbox {
 class PrefixImpl<G extends HostGlobals = {}, M extends Imports = {}>
 implements Prefix<G, M> {
   readonly id: string
+  /**
+   * The code hash sent at `prepare()`; every run carries it.
+   */
+  private readonly hash: Uint8Array
   private readonly pool: RunPool
   /**
    * The global shape declared at `prepare()`, with the default handlers a run
@@ -1071,6 +1074,7 @@ implements Prefix<G, M> {
 
   constructor(
     id: string,
+    hash: Uint8Array,
     pool: RunPool,
     declaredGlobals: ReadonlyMap<string, DeclaredGlobal>,
     defaultImportHandlers: ImportHandlerMap,
@@ -1079,6 +1083,7 @@ implements Prefix<G, M> {
     defaultLimits: ResourceLimits = {},
   ) {
     this.id = id
+    this.hash = hash
     this.pool = pool
     this.declaredGlobals = declaredGlobals
     this.defaultImportHandlers = defaultImportHandlers
@@ -1182,6 +1187,7 @@ implements Prefix<G, M> {
       return await this.pool.withClient(async (client, queueWaitMs) => {
         const raw = await client.prefixRun({
           prefixId: this.id,
+          hash: this.hash,
           limits: { ...this.defaultLimits, ...wireLimits(options.limits) },
           globals: defs,
           dispatch,

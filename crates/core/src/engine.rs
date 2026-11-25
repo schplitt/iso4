@@ -55,8 +55,8 @@ pub struct Caller {
 pub enum Refusal {
     /// The memory admission line.
     Capacity(String),
-    /// No such prefix: disposed, or never prepared.
-    PrefixDisposed(String),
+    /// No such prefix here: never prepared, disposed, or prepared with another hash.
+    PrefixUnknown(String),
     /// The prefix's cold start failed; `cause` is that failure.
     PrefixBroken {
         prefix_id: String,
@@ -84,9 +84,9 @@ impl Refusal {
             Refusal::Capacity(refusal) => sandbox::RunError::Capacity(refusal.clone()).to_payload(),
             Refusal::Internal(detail) => sandbox::RunError::Internal(detail.clone()).to_payload(),
             Refusal::Binding(error) => error.to_payload(),
-            Refusal::PrefixDisposed(prefix_id) => plain(
-                "ERR_PREFIX_DISPOSED",
-                format!("prefix '{prefix_id}' has been disposed or never existed"),
+            Refusal::PrefixUnknown(prefix_id) => plain(
+                "ERR_PREFIX_UNKNOWN",
+                format!("prefix '{prefix_id}' is unknown to the runtime: never prepared, disposed, or prepared with other code"),
                 None,
             ),
             Refusal::PrefixBroken { prefix_id, cause } => plain(
@@ -317,7 +317,8 @@ impl Engine {
     }
 
     /// Store a prefix and return its id. Nothing is evaluated: a broken
-    /// prefix fails its first run instead. `heap` applies to every run.
+    /// prefix fails its first run instead. `heap` applies to every run;
+    /// every run must carry `hash`.
     pub fn prepare(
         &self,
         code: String,
@@ -325,6 +326,7 @@ impl Engine {
         heap: types::HeapLimits,
         globals: Vec<types::HostGlobalDef>,
         imports: Vec<types::ImportBinding>,
+        hash: [u8; 16],
     ) -> String {
         let id = self.next_prefix_id.fetch_add(1, Ordering::Relaxed);
         let prefix_id = id.to_string();
@@ -350,6 +352,7 @@ impl Engine {
                     id,
                     code,
                     filename,
+                    hash,
                     heap,
                     globals,
                     declared_globals,
@@ -495,13 +498,16 @@ impl Engine {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&req.prefix_id)
-            .map(|entry| match entry {
-                PrefixEntry::Ready(data) => Ok(Arc::clone(data)),
-                PrefixEntry::Broken(cause) => Err(Arc::clone(cause)),
+            .and_then(|entry| match entry {
+                PrefixEntry::Ready(data) => Some(Ok(Arc::clone(data))),
+                PrefixEntry::Broken { hash, cause } if *hash == req.hash => {
+                    Some(Err(Arc::clone(cause)))
+                }
+                PrefixEntry::Broken { .. } => None,
             });
         let prefix_data =
             match entry {
-                Some(Ok(data)) => data,
+                Some(Ok(data)) if data.hash == req.hash => data,
                 Some(Err(cause)) => {
                     crate::log!(
                     "[iso4-v8] PrefixRun {run_id} — ERR_PREFIX_BROKEN: prefix_id={} cold start \
@@ -513,13 +519,13 @@ impl Engine {
                         cause,
                     });
                 }
-                None => {
+                Some(Ok(_)) | None => {
                     crate::log!(
-                        "[iso4-v8] PrefixRun {} — prefix_id={} not found",
+                        "[iso4-v8] PrefixRun {} — prefix_id={} not found with this hash",
                         run_id,
                         req.prefix_id
                     );
-                    return Err(Refusal::PrefixDisposed(req.prefix_id));
+                    return Err(Refusal::PrefixUnknown(req.prefix_id));
                 }
             };
 
@@ -611,7 +617,8 @@ impl Engine {
                 if outcome.prefix_failed {
                     if let Err(failure) = &outcome.result {
                         let mut store = engine.prefixes.lock().unwrap_or_else(|p| p.into_inner());
-                        if let Some(entry @ PrefixEntry::Ready(_)) = store.get_mut(&prefix_id) {
+                        if let Some(PrefixEntry::Ready(data)) = store.get(&prefix_id) {
+                            let hash = data.hash;
                             // Stored for the prefix's lifetime: clamp like the
                             // wire does and drop the fields blob it never carries.
                             let raw = failure.error.to_payload();
@@ -630,7 +637,13 @@ impl Engine {
                                 cause.code,
                                 cause.message
                             );
-                            *entry = PrefixEntry::Broken(Arc::new(cause));
+                            store.insert(
+                                prefix_id.clone(),
+                                PrefixEntry::Broken {
+                                    hash,
+                                    cause: Arc::new(cause),
+                                },
+                            );
                             // Healthy instances of a broken prefix never serve
                             // again; drop them like a dispose does.
                             engine.warm.dispose_prefix(&prefix_id);
@@ -728,14 +741,14 @@ mod tests {
             call_ids: Arc::new(AtomicU32::new(0)),
             brand_key: String::new(),
         };
-        engine.refuse(&caller, 7, Refusal::PrefixDisposed("p1".to_string()));
+        engine.refuse(&caller, 7, Refusal::PrefixUnknown("p1".to_string()));
         let (to, msg) = host.try_recv().expect("one answer");
         assert_eq!(to, Addr::Run(7));
         match msg {
             Outbound::Result {
                 completion: types::RunCompletion::Failure(failure),
             } => {
-                assert_eq!(failure.error.code, "ERR_PREFIX_DISPOSED");
+                assert_eq!(failure.error.code, "ERR_PREFIX_UNKNOWN");
                 assert!(failure.stdout.is_empty() && failure.bridge_calls.is_empty());
             }
             other => panic!("expected a failure Result, got {other:?}"),
@@ -766,10 +779,12 @@ mod tests {
             heap,
             Vec::new(),
             Vec::new(),
+            [0; 16],
         );
         let req = types::PrefixRunRequest {
             run_id: 1,
             prefix_id,
+            hash: [0; 16],
             limits: types::RunLimits::default(),
             globals: Vec::new(),
             import_rebinds: Vec::new(),
@@ -791,6 +806,85 @@ mod tests {
                 completion: types::RunCompletion::Failure(failure),
             } => assert_eq!(failure.error.code, "ERR_MEMORY_LIMIT"),
             other => panic!("expected ERR_MEMORY_LIMIT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_prefix_run_with_another_hash_or_id_is_unknown() {
+        let engine = Arc::new(Engine::new(0, 0));
+        let (link, _host) = channel_link();
+        let caller = Caller {
+            link,
+            observer: Arc::new(NoopObserver),
+            call_ids: Arc::new(AtomicU32::new(0)),
+            brand_key: String::new(),
+        };
+        let prefix_id = engine.prepare(
+            "export const f = () => 1".to_string(),
+            None,
+            types::HeapLimits::default(),
+            Vec::new(),
+            Vec::new(),
+            [1; 16],
+        );
+        for (prefix_id, hash) in [(prefix_id, [2; 16]), ("nope".to_string(), [1; 16])] {
+            let req = types::PrefixRunRequest {
+                run_id: 1,
+                prefix_id: prefix_id.clone(),
+                hash,
+                limits: types::RunLimits::default(),
+                globals: Vec::new(),
+                import_rebinds: Vec::new(),
+                call: types::CallSpec {
+                    export_path: "f".to_string(),
+                    args_blob: Vec::new(),
+                },
+            };
+            match engine.prefix_run(req, &caller, &mut |_| panic!("must not register")) {
+                Err(Refusal::PrefixUnknown(id)) => assert_eq!(id, prefix_id),
+                other => panic!("expected PrefixUnknown, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_broken_prefix_with_another_hash_is_unknown() {
+        let engine = Arc::new(Engine::new(0, 0));
+        let (link, _host) = channel_link();
+        let caller = Caller {
+            link,
+            observer: Arc::new(NoopObserver),
+            call_ids: Arc::new(AtomicU32::new(0)),
+            brand_key: String::new(),
+        };
+        let cause = Refusal::Internal("cold start".to_string()).to_payload();
+        engine.prefixes.lock().unwrap().insert(
+            "p".to_string(),
+            PrefixEntry::Broken {
+                hash: [1; 16],
+                cause: Arc::new(cause),
+            },
+        );
+        let req = |hash| types::PrefixRunRequest {
+            run_id: 1,
+            prefix_id: "p".to_string(),
+            hash,
+            limits: types::RunLimits::default(),
+            globals: Vec::new(),
+            import_rebinds: Vec::new(),
+            call: types::CallSpec {
+                export_path: "f".to_string(),
+                args_blob: Vec::new(),
+            },
+        };
+        let mut no_register = |_| panic!("must not register");
+        match engine.prefix_run(req([2; 16]), &caller, &mut no_register) {
+            Err(Refusal::PrefixUnknown(id)) => assert_eq!(id, "p"),
+            other => panic!("expected PrefixUnknown, got {other:?}"),
+        }
+        match engine.prefix_run(req([1; 16]), &caller, &mut no_register) {
+            Err(Refusal::PrefixBroken { prefix_id, .. }) => assert_eq!(prefix_id, "p"),
+            other => panic!("expected PrefixBroken, got {other:?}"),
         }
     }
 }

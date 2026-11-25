@@ -522,6 +522,7 @@ export class RuntimeIpcClient {
   async prefixRun(
     options: {
       prefixId: string
+      hash: Uint8Array
       limits?: ResourceLimits
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
@@ -543,6 +544,7 @@ export class RuntimeIpcClient {
         TsToRustMessageTypes.PrefixRun,
         encodePrefixRunPayload({
           prefixId: options.prefixId,
+          hash: options.hash,
           limits: options.limits,
           globals: options.globals,
           importRebinds: options.importRebinds,
@@ -731,22 +733,20 @@ export class RuntimeIpcClient {
       globals?: readonly GlobalDefPayload[]
       imports?: readonly ImportBindingPayload[]
     },
-  ): Promise<Uint8Array> {
+  ): Promise<{ reply: Uint8Array, hash: Buffer }> {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
 
     const requestId = this.nextPrecompileIdValue()
-    const frame = encodeTsToRustFrame(
-      TsToRustMessageTypes.Precompile,
-      encodePrecompilePayload({
-        requestId,
-        code: options.code,
-        filename: options.filename,
-        heap: options.heap,
-        globals: options.globals,
-        imports: options.imports,
-      }),
-    )
+    const { payload, hash } = encodePrecompilePayload({
+      requestId,
+      code: options.code,
+      filename: options.filename,
+      heap: options.heap,
+      globals: options.globals,
+      imports: options.imports,
+    })
+    const frame = encodeTsToRustFrame(TsToRustMessageTypes.Precompile, payload)
     const reply = new Promise<Uint8Array>((resolve, reject) => {
       this.precompileWaiters.set(requestId, { resolve, reject })
     })
@@ -760,7 +760,7 @@ export class RuntimeIpcClient {
       this.precompileWaiters.delete(requestId)
       throw error
     }
-    return reply
+    return { reply: await reply, hash }
   }
 
   /**

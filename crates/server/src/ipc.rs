@@ -28,6 +28,8 @@ use std::os::unix::net::UnixStream;
 
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
+
 use iso4_types::{
     resolve_heap_lines, BandPolicy, CallSpec, HeapLimits, HostGlobalDef, HostModuleNode,
     ImportBinding, ImportModule, ImportRebind, PrefixRunRequest, RunLimits, RunRequest,
@@ -1037,6 +1039,14 @@ impl<'a> PayloadReader<'a> {
         Ok(out)
     }
 
+    /// A prefix code hash: 16 raw bytes.
+    fn read_hash(&mut self) -> io::Result<[u8; 16]> {
+        let bytes = self.read_bytes(16)?;
+        Ok(bytes
+            .try_into()
+            .expect("read_bytes returns exactly 16 bytes"))
+    }
+
     fn read_optional_string(&mut self) -> io::Result<Option<String>> {
         match self.read_u8()? {
             0 => Ok(None),
@@ -1264,8 +1274,7 @@ impl<'a> PayloadReader<'a> {
 
 // ── Payload parsers ──────────────────────────────────────────────────────────────
 
-/// Parse the shared code + filename + heap fields that open `RunRequest`
-/// and `PrecompilePayload`. What follows differs per message type.
+/// Parse the code + filename + heap fields that open a `RunRequest`.
 fn parse_code_fields(
     r: &mut PayloadReader,
     band: BandPolicy,
@@ -1299,6 +1308,18 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunRequest> {
     })
 }
 
+/// The prefix code hash: SHA-256 over the code + filename bytes, then the
+/// globals + imports bytes, as encoded; the first 16 bytes. See `docs/protocol.md` §5.2.
+pub fn prefix_hash(code_fields: &[u8], shape_fields: &[u8]) -> [u8; 16] {
+    let digest = Sha256::new()
+        .chain_update(code_fields)
+        .chain_update(shape_fields)
+        .finalize();
+    let mut hash = [0; 16];
+    hash.copy_from_slice(&digest[..16]);
+    hash
+}
+
 /// Fully parsed `Precompile` frame payload per `docs/protocol.md` §5.2.
 /// Same fields as `RunRequest` but without `run_id`.
 #[derive(Debug)]
@@ -1306,6 +1327,8 @@ pub struct PrecompilePayload {
     /// Correlation id echoed on the `PrecompileResult` so the host matches
     /// replies by id, never by order (the run frames' leading-id pattern).
     pub request_id: u32,
+    /// The host's code hash, checked against the bytes received.
+    pub hash: [u8; 16],
     pub code: String,
     pub filename: Option<String>,
     /// The prefix's heap lines, applied to every run on it.
@@ -1318,13 +1341,26 @@ pub struct PrecompilePayload {
 pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload> {
     let mut r = PayloadReader::new(payload);
     let request_id = r.read_u32()?;
+    let hash = r.read_hash()?;
+    let code_start = r.offset;
+    let code = r.read_string()?;
+    let filename = r.read_optional_string()?;
+    let code_end = r.offset;
     // Managed: the prefix's instances are reused.
-    let (code, filename, heap) = parse_code_fields(&mut r, BandPolicy::Managed)?;
+    let heap = r.read_heap_limits(BandPolicy::Managed)?;
+    let shape_start = r.offset;
     let globals = r.read_global_defs()?;
     let imports = r.read_import_bindings()?;
     r.assert_done()?;
+    if prefix_hash(&payload[code_start..code_end], &payload[shape_start..]) != hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "code hash does not match the payload",
+        ));
+    }
     Ok(PrecompilePayload {
         request_id,
+        hash,
         code,
         filename,
         heap,
@@ -1338,6 +1374,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunRequest> 
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
     let prefix_id = r.read_string()?;
+    let hash = r.read_hash()?;
     let limits = r.read_run_limits()?;
     let globals = r.read_global_defs()?;
     let import_rebinds = r.read_import_rebinds()?;
@@ -1346,6 +1383,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunRequest> 
     Ok(PrefixRunRequest {
         run_id,
         prefix_id,
+        hash,
         limits,
         globals,
         import_rebinds,
@@ -2033,17 +2071,57 @@ mod tests {
         assert_eq!(p.limits.max_bridge_calls, DEFAULT_MAX_BRIDGE_CALLS);
     }
 
+    /// Shared with `ipc.test.ts`: the same Precompile bytes, the same hash.
+    const PRECOMPILE_VECTOR: &str = "000000019c0151069957142d7b202a45e999faaa000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031";
+    const PRECOMPILE_VECTOR_HASH: &str = "9c0151069957142d7b202a45e999faaa";
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn parse_precompile_payload_checks_the_shared_hash_vector() {
+        let p = parse_precompile_payload(&from_hex(PRECOMPILE_VECTOR)).unwrap();
+        assert_eq!(p.hash.to_vec(), from_hex(PRECOMPILE_VECTOR_HASH));
+        assert_eq!(p.code, "export default 1");
+        assert_eq!(p.filename.as_deref(), Some("a.js"));
+        assert_eq!(p.globals.len(), 1);
+        assert_eq!(p.imports.len(), 1);
+    }
+
+    #[test]
+    fn parse_precompile_payload_rejects_a_hash_mismatch() {
+        let bytes = from_hex(PRECOMPILE_VECTOR);
+        // Byte 4 is in the hash, 24 in the code, 53 in the heap block.
+        for (at, rejected) in [(4, true), (24, true), (53, false)] {
+            let mut v = bytes.clone();
+            v[at] ^= 1;
+            let result = parse_precompile_payload(&v);
+            assert_eq!(result.is_err(), rejected, "byte {at}");
+            if let Err(e) = result {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                assert!(e.to_string().contains("code hash"), "unexpected: {e}");
+            }
+        }
+    }
+
     #[test]
     fn a_prefix_gets_the_band_a_one_off_does_not() {
         // Same absent heap block on both frame kinds — only the frame kind
         // differs, and with it whether an absent hard override earns a band.
+        let mut code_fields = Vec::new();
+        push_string(&mut code_fields, "1"); // code
+        code_fields.push(0); // no filename
+        let shape_fields = [0u8; 8]; // globals count, imports count
         let mut v = Vec::new();
         push_u32(&mut v, 1); // request_id
-        push_string(&mut v, "1"); // code
-        v.push(0); // no filename
+        v.extend_from_slice(&prefix_hash(&code_fields, &shape_fields));
+        v.extend_from_slice(&code_fields);
         v.extend_from_slice(&[0u8; 2]); // heap: memory_mb, hard_memory_mb absent
-        push_u32(&mut v, 0); // globals count
-        push_u32(&mut v, 0); // imports count
+        v.extend_from_slice(&shape_fields);
         let prefix = parse_precompile_payload(&v).unwrap();
         assert_eq!(prefix.heap.soft_memory_mb, DEFAULT_MEMORY_MB);
         assert_eq!(
@@ -2479,6 +2557,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 3); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
+        v.extend_from_slice(&[7; 16]); // hash
         push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, u32::MAX); // claims every rebind there could be
@@ -2496,6 +2575,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 3); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
+        v.extend_from_slice(&[7; 16]); // hash
         push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 2); // 2 rebinds
@@ -2538,6 +2618,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
+        v.extend_from_slice(&[7; 16]); // hash
         push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // rebinds count
@@ -2552,6 +2633,7 @@ mod tests {
         let p = parse_prefix_run_payload(&encode_prefix_run_payload("named")).unwrap();
         assert_eq!(p.run_id, 1);
         assert_eq!(p.prefix_id, "prefix-0");
+        assert_eq!(p.hash, [7; 16]);
         assert_eq!(p.call.export_path, "named");
         assert_eq!(p.call.args_blob, vec![0xff, 0x0f, 0x41]);
     }
@@ -2561,6 +2643,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
+        v.extend_from_slice(&[7; 16]); // hash
         push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // rebinds count

@@ -305,10 +305,23 @@ describe('the client mirrors the runtime', () => {
     const local = await sandbox.prepare({ code: 'export default () => 1' })
     await (ghost as unknown as { pool: RunPool }).pool.withClient((c) => c.disposePrefix(ghost.id))
     await local.dispose()
-    const runtime = await ghost.call({ export: 'default' }).then(() => undefined, (e: unknown) => e)
+    // The runtime cannot tell a dropped prefix from one it never held: a failed result.
+    const runtime = await ghost.call({ export: 'default' })
     const client = await local.call({ export: 'default' }).then(() => undefined, (e: unknown) => e)
-    expect(runtime).toMatchObject({ name: 'Error', code: 'ERR_PREFIX_DISPOSED', message: `prefix '${ghost.id}' has been disposed or never existed` })
+    expect(runtime).toMatchObject({ ok: false, error: { name: 'Error', code: 'ERR_PREFIX_UNKNOWN', message: `prefix '${ghost.id}' is unknown to the runtime: never prepared, disposed, or prepared with other code` } })
     expect(client).toMatchObject({ name: 'Error', code: 'ERR_PREFIX_DISPOSED', message: `prefix '${local.id}' has been disposed or never existed` })
     await ghost.dispose()
+  })
+
+  test('a prefix run with another code hash', async () => {
+    const prefix = await sandbox.prepare({ code: 'export default () => 1' })
+    const internals = prefix as unknown as { hash: Uint8Array }
+    const hash = internals.hash
+    internals.hash = new Uint8Array(16)
+    const runtime = await prefix.call({ export: 'default' })
+    expect(runtime).toMatchObject({ ok: false, error: { code: 'ERR_PREFIX_UNKNOWN' } })
+    internals.hash = hash
+    expect(await prefix.call({ export: 'default' })).toMatchObject({ ok: true, value: 1 })
+    await prefix.dispose()
   })
 })

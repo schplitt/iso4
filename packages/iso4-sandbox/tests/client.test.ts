@@ -348,8 +348,8 @@ describe('RuntimeIpcClient', () => {
       client.precompile({ code: 'export const a = 1' }),
       client.precompile({ code: 'export const b = 2' }),
     ])
-    expect(decodePrecompileResultPayload(a)).toMatchObject({ ok: true, prefixId: 'prefix-of-first' })
-    expect(decodePrecompileResultPayload(b)).toMatchObject({ ok: true, prefixId: 'prefix-of-second' })
+    expect(decodePrecompileResultPayload(a.reply)).toMatchObject({ ok: true, prefixId: 'prefix-of-first' })
+    expect(decodePrecompileResultPayload(b.reply)).toMatchObject({ ok: true, prefixId: 'prefix-of-second' })
     await client.dispose()
   })
 

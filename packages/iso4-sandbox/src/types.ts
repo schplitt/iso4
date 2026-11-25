@@ -1709,8 +1709,8 @@ export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'uns
  * whose `code` is one of these; a run never returns them as a result. The
  * client checks first and throws without a runtime round trip; the runtime
  * repeats every check (except `ERR_INVALID_REBIND`) and the client throws its
- * answer the same way. `ERR_PREFIX_DISPOSED`: the prefix was disposed, or the
- * runtime no longer holds it.
+ * answer the same way. `ERR_PREFIX_DISPOSED`: the prefix was disposed; a
+ * prefix the runtime no longer holds fails with `ERR_PREFIX_UNKNOWN` instead.
  */
 export type SetupErrorCode
   = | 'ERR_PREFIX_DISPOSED'
@@ -1851,6 +1851,11 @@ export type RunErrorCode
      * first call runs under that call's budget and survives warm reuse.
      */
     | 'ERR_WARMUP_LIMIT'
+    /**
+     * The runtime does not hold this prefix: it was never prepared there,
+     * was dropped, or was prepared with other code. Nothing ran.
+     */
+    | 'ERR_PREFIX_UNKNOWN'
     /**
      * The runtime answered with a `Result` belonging to a different run, or
      * sent a frame that has no place in the run protocol. Host-detected, never

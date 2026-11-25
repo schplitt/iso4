@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer'
+import { createHash } from 'node:crypto'
 import { deserializeValue, serializeValue } from './v8-codec.js'
 import { DESCRIPTOR_TOKEN_LEN } from './web-codec.js'
 import type {
@@ -1120,25 +1121,47 @@ export interface PrecompilePayloadOptions {
 }
 
 /**
- * Encode a `PrecompilePayload` per `docs/protocol.md` §5.2.
- * Leads with `requestId`; carries the heap block but no run limits.
+ * The prefix code hash: SHA-256 over the code + filename bytes, then the
+ * globals + imports bytes, as encoded; the first 16 bytes. See `docs/protocol.md` §5.2.
+ * @param codeFields
+ * @param shapeFields
+ */
+export function prefixHash(codeFields: Uint8Array, shapeFields: Uint8Array): Buffer {
+  return createHash('sha256').update(codeFields).update(shapeFields).digest().subarray(0, 16)
+}
+
+/**
+ * Encode a `PrecompilePayload` per `docs/protocol.md` §5.2, with the code
+ * hash the prefix's runs must carry.
  * @param options
  */
-export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buffer {
-  return new PayloadWriter()
+export function encodePrecompilePayload(options: PrecompilePayloadOptions): { payload: Buffer, hash: Buffer } {
+  const writer = new PayloadWriter()
     .writeU32(options.requestId)
+    .writeBytes(new Uint8Array(16)) // the hash, filled in below
     .writeString(options.code)
     .writeOptionalString(options.filename)
-    .writeHeapLimits(options.heap ?? {})
+  const written = (): number => writer.parts.reduce((n, part) => n + part.byteLength, 0)
+  const codeEnd = written()
+  writer.writeHeapLimits(options.heap ?? {})
+  const shapeStart = written()
+  const payload = writer
     .writeGlobalDefs(options.globals ?? [])
     .writeImports(options.imports ?? [])
     .toBuffer()
+  const hash = prefixHash(payload.subarray(20, codeEnd), payload.subarray(shapeStart))
+  hash.copy(payload, 4)
+  return { payload, hash }
 }
 
 // ── PrefixRunPayload ────────────────────────────────────────────
 
 export interface PrefixRunPayloadOptions {
   prefixId: string
+  /**
+   * The code hash sent at precompile; another hash is `ERR_PREFIX_UNKNOWN`.
+   */
+  hash: Uint8Array
   limits?: ResourceLimits
   globals?: readonly GlobalDefPayload[]
   /**
@@ -1165,6 +1188,7 @@ export function encodePrefixRunPayload(
   return new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.prefixId)
+    .writeBytes(options.hash)
     .writeRunLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImportRebinds(options.importRebinds ?? [])

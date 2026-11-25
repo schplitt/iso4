@@ -21,5 +21,8 @@ crossbeam-channel = "0.5"
 # kill(pid, 0) and proc_pidinfo for the Node pid watch
 libc = "0.2"
 
+# The prefix code hash, recomputed over each Precompile
+sha2 = "0.11"
+
 [dev-dependencies]
 iso4-core = { path = "../core", features = ["test-support"] }
