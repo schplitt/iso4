@@ -1157,6 +1157,7 @@ mod tests {
             id: 0,
             code: "let n = 0\nexport function bump() { return ++n }".to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),
@@ -1842,6 +1843,7 @@ mod tests {
                    }"
             .to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),
@@ -1968,6 +1970,7 @@ mod tests {
                    export function busy(c) { let x = 0; for (let i = 0; i < c; i++) x = (x + i) & 1048575; return x }"
                 .to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: vec!["tool".to_string()],
             declared_imports: Vec::new(),
@@ -1983,6 +1986,7 @@ mod tests {
                    export function busy(c) { let x = 0; for (let i = 0; i < c; i++) x = (x + i) & 1048575; return x }"
                 .to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: vec!["tool".to_string()],
             declared_imports: Vec::new(),
@@ -2012,6 +2016,7 @@ mod tests {
                    }"
                 .to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: vec!["tool".to_string()],
             declared_imports: Vec::new(),
@@ -3288,6 +3293,7 @@ mod tests {
             id: 0,
             code: "throw new Error('setup failed')".to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),
@@ -3317,6 +3323,7 @@ mod tests {
                    export function bump() { return 1 }"
                 .to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),
@@ -3341,6 +3348,7 @@ mod tests {
             id: 0,
             code: "for (;;) {}".to_string(),
             filename: None,
+            heap: Default::default(),
             globals: Vec::new(),
             declared_globals: Vec::new(),
             declared_imports: Vec::new(),

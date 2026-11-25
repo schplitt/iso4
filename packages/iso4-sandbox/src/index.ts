@@ -22,7 +22,7 @@ import {
   decodePrecompileResultPayload,
   decodeRunCompletionPayload,
 } from './ipc'
-import type { CallPayload, DecodedRunComplete, ImportBindingPayload, WireResourceLimits } from './ipc'
+import type { CallPayload, DecodedRunComplete, ImportBindingPayload, WireHeapLimits } from './ipc'
 import type {
   CallResult,
   HostGlobals,
@@ -534,8 +534,8 @@ function validateLimits(limits: ResourceLimits | undefined): void {
  * untyped caller cannot smuggle `memoryMb`/`hardMemoryMb` onto the wire.
  * @param limits the validated `limits` option
  */
-function wireLimits(limits: ResourceLimits | undefined): WireResourceLimits {
-  const out: WireResourceLimits = {}
+function wireLimits(limits: ResourceLimits | undefined): ResourceLimits {
+  const out: ResourceLimits = {}
   for (const field of U32_LIMIT_FIELDS) {
     if (limits?.[field] !== undefined)
       out[field] = limits[field]
@@ -626,7 +626,7 @@ function hardCeilingMb(value: number | MemoryLimit | undefined): number | undefi
  */
 function heapCapsForWire(
   value: number | MemoryLimit | undefined,
-): { memoryMb?: number, hardMemoryMb?: number } {
+): WireHeapLimits {
   if (value === undefined)
     return {}
   if (typeof value === 'number')
@@ -743,10 +743,9 @@ class SandboxImpl implements Sandbox {
   private readonly statsClient: RuntimeIpcClient
   private readonly socketPath: string
   /**
-   * Uniform per-isolate heap cap, set once at `createSandbox` and
-   * injected into every frame's limits — the wire still carries `memoryMb`
-   * per run, this is simply the only writer. `undefined` defers to the
-   * runtime default (128 MB).
+   * Uniform per-isolate heap cap, set once at `createSandbox` and sent in
+   * the heap block of every one-off `Run` and `Precompile` unless overridden.
+   * `undefined` defers to the runtime default (128 MB).
    */
   private readonly memoryMb: number | MemoryLimit | undefined
   /**
@@ -853,7 +852,8 @@ class SandboxImpl implements Sandbox {
         // always starts at line 1.
         const raw = await client.runRawCode(options.code, {
           filename: options.filename,
-          limits: { ...wireLimits(options.limits), ...heapCapsForWire(runMemoryMb) },
+          heap: heapCapsForWire(runMemoryMb),
+          limits: wireLimits(options.limits),
           globals: defs,
           dispatch,
           imports: bindings,
@@ -981,9 +981,8 @@ class SandboxImpl implements Sandbox {
       throw new TypeError(`prepare({ code }) must be a string, got ${options.code === null ? 'null' : typeof options.code}`)
     validateMemoryMb(options.memoryMb, 'memoryMb')
     validateLimits(options.limits)
-    // Per-prefix heap cap (#77): baked into every instance serving this
-    // prefix; every run frame for it carries this value, so warm instances
-    // are created with it and attach cap-matching holds by construction.
+    // Per-prefix heap cap (#77): sent once on Precompile; the runtime stores
+    // it with the prefix and creates every instance serving it with it.
     const prefixMemoryMb = options.memoryMb ?? this.memoryMb
     // Throws for a malformed or reserved global name before a client is taken.
     const rawGlobals = options.globals ?? {} as G
@@ -999,7 +998,7 @@ class SandboxImpl implements Sandbox {
       const raw = await client.precompile({
         code: options.code,
         filename: options.filename,
-        limits: { ...wireLimits(options.limits), ...heapCapsForWire(prefixMemoryMb) },
+        heap: heapCapsForWire(prefixMemoryMb),
         globals: defs,
         imports: bindings,
       })
@@ -1008,7 +1007,7 @@ class SandboxImpl implements Sandbox {
       if (!result.ok)
         throw thrownRunError(result.error)
 
-      return new PrefixImpl<G, M>(result.prefixId, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, prefixMemoryMb, wireLimits(options.limits))
+      return new PrefixImpl<G, M>(result.prefixId, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, wireLimits(options.limits))
     })
   }
 
@@ -1056,16 +1055,9 @@ implements Prefix<G, M> {
    */
   private declaredImports: readonly ImportBindingPayload[]
   /**
-   * THIS prefix's heap cap (`prepare({ memoryMb })`, falling back to the
-   * sandbox default). Warm instances serving the prefix are created with
-   * it; a per-run value stays impossible — the cap is baked into the
-   * isolate at creation and instances are shared.
-   */
-  private readonly memoryMb: number | MemoryLimit | undefined
-  /**
    * `prepare({ limits })` snapshot: the per-run defaults, overridden field by field.
    */
-  private readonly defaultLimits: WireResourceLimits
+  private readonly defaultLimits: ResourceLimits
   /**
    * Session brand key for host-type descriptors — see `SandboxImpl`.
    */
@@ -1084,8 +1076,7 @@ implements Prefix<G, M> {
     defaultImportHandlers: ImportHandlerMap,
     declaredImports: readonly ImportBindingPayload[],
     brandKey: string,
-    memoryMb?: number | MemoryLimit,
-    defaultLimits: WireResourceLimits = {},
+    defaultLimits: ResourceLimits = {},
   ) {
     this.id = id
     this.pool = pool
@@ -1093,7 +1084,6 @@ implements Prefix<G, M> {
     this.defaultImportHandlers = defaultImportHandlers
     this.declaredImports = declaredImports
     this.brandKey = brandKey
-    this.memoryMb = memoryMb
     this.defaultLimits = defaultLimits
   }
 
@@ -1192,7 +1182,7 @@ implements Prefix<G, M> {
       return await this.pool.withClient(async (client, queueWaitMs) => {
         const raw = await client.prefixRun({
           prefixId: this.id,
-          limits: { ...this.defaultLimits, ...wireLimits(options.limits), ...heapCapsForWire(this.memoryMb) },
+          limits: { ...this.defaultLimits, ...wireLimits(options.limits) },
           globals: defs,
           dispatch,
           importRebinds: merged.rebinds,

@@ -30,18 +30,24 @@ pub const STREAM_CHUNK_MAX_BYTES: u32 = 64 * 1024;
 /// `StreamPull` as the sandbox consumes. Bounds runtime-side buffering.
 pub const STREAM_CREDIT_WINDOW_BYTES: u32 = 256 * 1024;
 
-/// Resource limits applied to a `Run` request, with runtime defaults already
-/// resolved: each field is the caller's explicit value or, when the caller left
-/// it unset on the wire, the corresponding `DEFAULT_*` constant. A field of
-/// zero means the limit is explicitly disabled (no cap).
-#[derive(Debug, Clone)]
-pub struct ResourceLimits {
+/// The two heap lines, resolved: set per one-off `Run`, and once per
+/// prefix at prepare (every run on the prefix gets them). Zero = none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapLimits {
     /// The retirement line: a warm instance whose heap sits above this at
     /// two consecutive finishes is retired (no run fails). Zero = none.
     pub soft_memory_mb: u32,
     /// The terminating V8 cap (`heap_limits` + the near-heap callback) and
     /// the ArrayBuffer budget. Zero = uncapped.
     pub hard_memory_mb: u32,
+}
+
+/// The per-run limits besides the heap, with runtime defaults already
+/// resolved: each field is the caller's explicit value or, when the caller
+/// left it unset on the wire, the corresponding `DEFAULT_*` constant. A
+/// field of zero means the limit is explicitly disabled (no cap).
+#[derive(Debug, Clone)]
+pub struct RunLimits {
     pub cpu_time_ms: u32,
     pub wall_time_ms: u32,
     pub max_export_bytes: u32,
@@ -93,13 +99,21 @@ pub fn resolve_heap_lines(cap_mb: u32, hard_override: Option<u32>, band: BandPol
     }
 }
 
-impl Default for ResourceLimits {
-    /// The runtime defaults — the posture applied when the client sends no
-    /// explicit limits at all.
+impl Default for HeapLimits {
+    /// The managed default: the cap is the soft line, its band terminates.
     fn default() -> Self {
         Self {
             soft_memory_mb: DEFAULT_MEMORY_MB,
             hard_memory_mb: DEFAULT_MEMORY_MB + heap_band_mb(DEFAULT_MEMORY_MB),
+        }
+    }
+}
+
+impl Default for RunLimits {
+    /// The runtime defaults — the posture applied when the client sends no
+    /// explicit limits at all.
+    fn default() -> Self {
+        Self {
             cpu_time_ms: DEFAULT_CPU_TIME_MS,
             wall_time_ms: DEFAULT_WALL_TIME_MS,
             max_export_bytes: DEFAULT_MAX_EXPORT_BYTES,
@@ -250,7 +264,8 @@ pub struct RunRequest {
     pub run_id: u32,
     pub code: String,
     pub filename: Option<String>,
-    pub limits: ResourceLimits,
+    pub heap: HeapLimits,
+    pub limits: RunLimits,
     pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
     /// When present, the result is the called function's return value instead
@@ -265,7 +280,8 @@ pub struct PrefixRunRequest {
     /// The frontend's id for the run; its messages go to `Addr::Run(run_id)`.
     pub run_id: u32,
     pub prefix_id: String,
-    pub limits: ResourceLimits,
+    /// The heap lines come from the prefix (set at prepare).
+    pub limits: RunLimits,
     pub globals: Vec<HostGlobalDef>,
     pub import_rebinds: Vec<ImportRebind>,
     pub call: CallSpec,

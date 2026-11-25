@@ -40,7 +40,7 @@ import {
   encodeStreamPullPayload,
   decodeImportKey,
 } from './ipc'
-import type { WireResourceLimits, BridgeTarget, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
+import type { WireHeapLimits, BridgeTarget, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
@@ -481,7 +481,8 @@ export class RuntimeIpcClient {
     code: string,
     options?: {
       filename?: string
-      limits?: WireResourceLimits
+      heap?: WireHeapLimits
+      limits?: ResourceLimits
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
       imports?: readonly ImportBindingPayload[]
@@ -504,6 +505,7 @@ export class RuntimeIpcClient {
           runId,
           code,
           filename: options?.filename,
+          heap: options?.heap,
           limits: options?.limits,
           globals: options?.globals,
           imports: options?.imports,
@@ -520,7 +522,7 @@ export class RuntimeIpcClient {
   async prefixRun(
     options: {
       prefixId: string
-      limits?: WireResourceLimits
+      limits?: ResourceLimits
       globals?: readonly GlobalDefPayload[]
       dispatch?: Record<string, HostExportFunction>
       importRebinds?: readonly ImportRebindPayload[]
@@ -725,7 +727,7 @@ export class RuntimeIpcClient {
     options: {
       code: string
       filename?: string
-      limits?: WireResourceLimits
+      heap?: WireHeapLimits
       globals?: readonly GlobalDefPayload[]
       imports?: readonly ImportBindingPayload[]
     },
@@ -740,7 +742,7 @@ export class RuntimeIpcClient {
         requestId,
         code: options.code,
         filename: options.filename,
-        limits: options.limits,
+        heap: options.heap,
         globals: options.globals,
         imports: options.imports,
       }),

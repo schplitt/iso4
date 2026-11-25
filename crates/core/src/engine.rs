@@ -113,6 +113,8 @@ pub struct RunHandle {
     /// The owning instance guard's cross-thread face, filled once the
     /// isolate exists; the mid-turn target of a hard Terminate.
     ctl: Arc<OnceLock<sandbox::GuardCtl>>,
+    /// The run's heap lines: the one-off's own, or its prefix's.
+    pub heap: types::HeapLimits,
 }
 
 impl RunHandle {
@@ -315,11 +317,12 @@ impl Engine {
     }
 
     /// Store a prefix and return its id. Nothing is evaluated: a broken
-    /// prefix fails its first run instead.
+    /// prefix fails its first run instead. `heap` applies to every run.
     pub fn prepare(
         &self,
         code: String,
         filename: Option<String>,
+        heap: types::HeapLimits,
         globals: Vec<types::HostGlobalDef>,
         imports: Vec<types::ImportBinding>,
     ) -> String {
@@ -347,6 +350,7 @@ impl Engine {
                     id,
                     code,
                     filename,
+                    heap,
                     globals,
                     declared_globals,
                     declared_imports: imports,
@@ -392,7 +396,7 @@ impl Engine {
                 .unwrap_or("-"),
         );
         let run_id = req.run_id;
-        let run_cap_bytes = u64::from(req.limits.hard_memory_mb) * 1024 * 1024;
+        let run_cap_bytes = u64::from(req.heap.hard_memory_mb) * 1024 * 1024;
         self.warm
             .reserve_oneoff(run_cap_bytes)
             .map_err(Refusal::Capacity)?;
@@ -406,6 +410,7 @@ impl Engine {
             run_id,
             events: events_tx,
             ctl: Arc::clone(&ctl),
+            heap: req.heap,
         });
 
         let engine = Arc::clone(self);
@@ -420,7 +425,7 @@ impl Engine {
                 let result = sandbox::execute_with_io(
                     &req.code,
                     req.filename.as_deref(),
-                    sandbox::Limits::from(&req.limits),
+                    sandbox::Limits::new(&req.limits, req.heap),
                     &req.globals,
                     &req.imports,
                     sandbox::RunIo::Channel {
@@ -555,13 +560,13 @@ impl Engine {
         let spawn = || {
             warm::spawn_instance(
                 Arc::clone(&prefix_data),
-                req.limits.hard_memory_mb,
+                prefix_data.heap.hard_memory_mb,
                 caller.brand_key.clone(),
             )
         };
         let caps = warm::HeapCaps {
-            soft_bytes: u64::from(req.limits.soft_memory_mb) * 1024 * 1024,
-            hard_bytes: u64::from(req.limits.hard_memory_mb) * 1024 * 1024,
+            soft_bytes: u64::from(prefix_data.heap.soft_memory_mb) * 1024 * 1024,
+            hard_bytes: u64::from(prefix_data.heap.hard_memory_mb) * 1024 * 1024,
         };
         enum Taken {
             Pooled(warm::AttachedInstance),
@@ -590,6 +595,7 @@ impl Engine {
             run_id,
             events: msgs_tx.clone(),
             ctl: Arc::clone(&ctl),
+            heap: prefix_data.heap,
         });
 
         // Runs on the instance thread before the completion goes out, so the
@@ -677,7 +683,7 @@ impl Engine {
 
         let job = Box::new(sandbox::CallJob {
             token,
-            limits: sandbox::Limits::from(&req.limits),
+            limits: sandbox::Limits::new(&req.limits, prefix_data.heap),
             globals: req.globals,
             io: sandbox::RunIo::Instance {
                 link: Arc::clone(&caller.link),
@@ -735,5 +741,56 @@ mod tests {
             other => panic!("expected a failure Result, got {other:?}"),
         }
         assert!(host.try_recv().is_err(), "exactly one answer");
+    }
+
+    #[test]
+    fn a_prefix_run_uses_the_cap_set_at_prepare() {
+        crate::v8::init_platform();
+        let engine = Arc::new(Engine::new(0, 0));
+        let (link, host) = channel_link();
+        let caller = Caller {
+            link,
+            observer: Arc::new(NoopObserver),
+            call_ids: Arc::new(AtomicU32::new(0)),
+            brand_key: String::new(),
+        };
+        let heap = types::HeapLimits {
+            soft_memory_mb: 0,
+            hard_memory_mb: 32,
+        };
+        // `grow` keeps ~64 MB: fits the default cap, not this one.
+        let prefix_id = engine.prepare(
+            "export function grow() { const a = []; for (let i = 0; i < 64; i++) a.push(new Array(1 << 17).fill(i)); return a.length }"
+                .to_string(),
+            None,
+            heap,
+            Vec::new(),
+            Vec::new(),
+        );
+        let req = types::PrefixRunRequest {
+            run_id: 1,
+            prefix_id,
+            limits: types::RunLimits::default(),
+            globals: Vec::new(),
+            import_rebinds: Vec::new(),
+            call: types::CallSpec {
+                export_path: "grow".to_string(),
+                args_blob: crate::testval::to_blob(&crate::testval::TestValue::Array(Vec::new())),
+            },
+        };
+        let mut handle = None;
+        engine
+            .prefix_run(req, &caller, &mut |h| handle = Some(h))
+            .expect("prefix_run refused");
+        assert_eq!(handle.expect("registered").heap, heap);
+        let (_, msg) = host
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("a result");
+        match msg {
+            Outbound::Result {
+                completion: types::RunCompletion::Failure(failure),
+            } => assert_eq!(failure.error.code, "ERR_MEMORY_LIMIT"),
+            other => panic!("expected ERR_MEMORY_LIMIT, got {other:?}"),
+        }
     }
 }

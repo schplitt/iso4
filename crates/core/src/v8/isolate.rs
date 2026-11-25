@@ -102,12 +102,12 @@ pub struct Limits {
     pub grace_ms: u32,
 }
 
-impl From<&types::ResourceLimits> for Limits {
-    fn from(l: &types::ResourceLimits) -> Self {
+impl Limits {
+    pub fn new(l: &types::RunLimits, heap: types::HeapLimits) -> Self {
         Limits {
             wall_time_ms: l.wall_time_ms,
             cpu_time_ms: l.cpu_time_ms,
-            hard_memory_mb: l.hard_memory_mb,
+            hard_memory_mb: heap.hard_memory_mb,
             max_export_bytes: l.max_export_bytes,
             max_stdout_bytes: l.max_stdout_bytes,
             max_stderr_bytes: l.max_stderr_bytes,

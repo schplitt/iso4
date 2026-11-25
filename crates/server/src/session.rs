@@ -226,8 +226,8 @@ type ConnRuns = Arc<Mutex<HashMap<u32, RunRoute>>>;
 
 /// The per-run inbound frame allowance: a frame over it fails that run
 /// alone. The demux read itself is bounded by the flat protocol ceiling.
-fn frame_cap_for(limits: &types::ResourceLimits) -> u32 {
-    match (limits.soft_memory_mb, limits.hard_memory_mb) {
+fn frame_cap_for(heap: types::HeapLimits) -> u32 {
+    match (heap.soft_memory_mb, heap.hard_memory_mb) {
         (0, 0) => ipc::DEFAULT_MAX_FRAME_LENGTH,
         (0, hard) => hard.saturating_mul(1024 * 1024),
         (soft, _) => soft.saturating_mul(1024 * 1024),
@@ -420,15 +420,10 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                         break;
                     }
                 };
-                let (run_id, frame_cap) = (req.run_id, frame_cap_for(&req.limits));
-                start_run(
-                    &engine,
-                    &conn_runs,
-                    &caller,
-                    run_id,
-                    frame_cap,
-                    |register| engine.run(req, &caller, register),
-                );
+                let run_id = req.run_id;
+                start_run(&engine, &conn_runs, &caller, run_id, |register| {
+                    engine.run(req, &caller, register)
+                });
             }
             ipc::TsToRustMessageType::Precompile => {
                 let payload = match ipc::parse_precompile_payload(&frame.payload) {
@@ -441,6 +436,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                 let prefix_id = engine.prepare(
                     payload.code,
                     payload.filename,
+                    payload.heap,
                     payload.globals,
                     payload.imports,
                 );
@@ -465,15 +461,10 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                         break;
                     }
                 };
-                let (run_id, frame_cap) = (req.run_id, frame_cap_for(&req.limits));
-                start_run(
-                    &engine,
-                    &conn_runs,
-                    &caller,
-                    run_id,
-                    frame_cap,
-                    |register| engine.prefix_run(req, &caller, register),
-                );
+                let run_id = req.run_id;
+                start_run(&engine, &conn_runs, &caller, run_id, |register| {
+                    engine.prefix_run(req, &caller, register)
+                });
             }
             ipc::TsToRustMessageType::DisposePrefix => {
                 match ipc::parse_dispose_prefix_payload(&frame.payload) {
@@ -608,7 +599,6 @@ fn start_run(
     conn_runs: &ConnRuns,
     caller: &Caller,
     run_id: u32,
-    frame_cap: u32,
     start: impl FnOnce(&mut dyn FnMut(RunHandle)) -> Result<(), Refusal>,
 ) {
     let in_flight = conn_runs
@@ -627,6 +617,7 @@ fn start_run(
         return;
     }
     let mut register = |handle: RunHandle| {
+        let frame_cap = frame_cap_for(handle.heap);
         let replaced = conn_runs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -872,8 +863,8 @@ mod tests {
         p.extend_from_slice(&run_id.to_be_bytes());
         pstr(&mut p, code);
         p.push(0); // filename absent
-                   // limits: memory, cpu, wall, export, stdout, stderr, bridgeBytes,
-                   // bridgeCalls, grace, hardMemory — each an Optional<u32>.
+                   // heap: memory, hardMemory; then cpu, wall, export, stdout,
+                   // stderr, bridgeBytes, bridgeCalls, grace — each an Optional<u32>.
         match memory_mb {
             Some(v) => {
                 p.push(1);
@@ -881,6 +872,7 @@ mod tests {
             }
             None => p.push(0),
         }
+        p.push(0); // hardMemory absent
         match cpu_ms {
             Some(v) => {
                 p.push(1);
@@ -890,7 +882,7 @@ mod tests {
         }
         p.push(1);
         p.extend_from_slice(&wall_ms.to_be_bytes());
-        for _ in 0..7 {
+        for _ in 0..6 {
             p.push(0);
         }
         // globals: one bridge def

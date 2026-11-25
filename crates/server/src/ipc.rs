@@ -29,11 +29,12 @@ use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use iso4_types::{
-    resolve_heap_lines, BandPolicy, CallSpec, HostGlobalDef, HostModuleNode, ImportBinding,
-    ImportModule, ImportRebind, PrefixRunRequest, ResourceLimits, RunRequest, TerminateMode,
-    DEFAULT_CPU_TIME_MS, DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS, DEFAULT_MAX_BRIDGE_CALL_BYTES,
-    DEFAULT_MAX_EXPORT_BYTES, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
-    DEFAULT_MEMORY_MB, DEFAULT_WALL_TIME_MS, MAX_HOST_MODULE_DEPTH, STREAM_CHUNK_MAX_BYTES,
+    resolve_heap_lines, BandPolicy, CallSpec, HeapLimits, HostGlobalDef, HostModuleNode,
+    ImportBinding, ImportModule, ImportRebind, PrefixRunRequest, RunLimits, RunRequest,
+    TerminateMode, DEFAULT_CPU_TIME_MS, DEFAULT_GRACE_MS, DEFAULT_MAX_BRIDGE_CALLS,
+    DEFAULT_MAX_BRIDGE_CALL_BYTES, DEFAULT_MAX_EXPORT_BYTES, DEFAULT_MAX_STDERR_BYTES,
+    DEFAULT_MAX_STDOUT_BYTES, DEFAULT_MEMORY_MB, DEFAULT_WALL_TIME_MS, MAX_HOST_MODULE_DEPTH,
+    STREAM_CHUNK_MAX_BYTES,
 };
 
 /// Current wire protocol version.
@@ -1058,14 +1059,26 @@ impl<'a> PayloadReader<'a> {
         }
     }
 
-    /// Read a `ResourceLimits` block: ten `Optional<u32>` fields, in wire
+    /// Read a `HeapLimits` block: `memoryMb`, `hardMemoryMb`, each
+    /// `Optional<u32>`, resolved together so nothing downstream sees a
+    /// half-decided cap. See `docs/protocol.md` §5.2.
+    ///
+    /// `band` is the caller's frame kind — see [`BandPolicy`].
+    fn read_heap_limits(&mut self, band: BandPolicy) -> io::Result<HeapLimits> {
+        let cap_mb = self.read_optional_u32()?.unwrap_or(DEFAULT_MEMORY_MB);
+        let hard_override = self.read_optional_u32()?;
+        let (soft_memory_mb, hard_memory_mb) = resolve_heap_lines(cap_mb, hard_override, band);
+        Ok(HeapLimits {
+            soft_memory_mb,
+            hard_memory_mb,
+        })
+    }
+
+    /// Read a `RunLimits` block: eight `Optional<u32>` fields, in wire
     /// order. Any field the client left absent is filled from the runtime
     /// default, so the returned struct is fully resolved. An explicit `0` is
     /// preserved (it disables that limit). See `docs/protocol.md` §5.2.
-    ///
-    /// `band` is the caller's frame kind — see [`BandPolicy`].
-    fn read_resource_limits(&mut self, band: BandPolicy) -> io::Result<ResourceLimits> {
-        let cap_mb = self.read_optional_u32()?.unwrap_or(DEFAULT_MEMORY_MB);
+    fn read_run_limits(&mut self) -> io::Result<RunLimits> {
         let cpu_time_ms = self.read_optional_u32()?.unwrap_or(DEFAULT_CPU_TIME_MS);
         let wall_time_ms = self.read_optional_u32()?.unwrap_or(DEFAULT_WALL_TIME_MS);
         let max_export_bytes = self
@@ -1084,13 +1097,7 @@ impl<'a> PayloadReader<'a> {
             .read_optional_u32()?
             .unwrap_or(DEFAULT_MAX_BRIDGE_CALLS);
         let grace_ms = self.read_optional_u32()?.unwrap_or(DEFAULT_GRACE_MS);
-        // Block's LAST field. Resolved with the cap, so nothing downstream
-        // sees a half-decided limit.
-        let hard_override = self.read_optional_u32()?;
-        let (soft_memory_mb, hard_memory_mb) = resolve_heap_lines(cap_mb, hard_override, band);
-        Ok(ResourceLimits {
-            soft_memory_mb,
-            hard_memory_mb,
+        Ok(RunLimits {
             cpu_time_ms,
             wall_time_ms,
             max_export_bytes,
@@ -1257,20 +1264,16 @@ impl<'a> PayloadReader<'a> {
 
 // ── Payload parsers ──────────────────────────────────────────────────────────────
 
-/// Parse the shared code + filename + limits + globals fields that appear in
-/// `RunRequest`, `PrecompilePayload`, and `PrefixRunRequest`. The `imports`
-/// block that follows differs per message type (`ImportBinding` declarations
-/// for Run/Precompile, `ImportRebind` entries for PrefixRun) and is read by
-/// the individual parsers.
+/// Parse the shared code + filename + heap fields that open `RunRequest`
+/// and `PrecompilePayload`. What follows differs per message type.
 fn parse_code_fields(
     r: &mut PayloadReader,
     band: BandPolicy,
-) -> io::Result<(String, Option<String>, ResourceLimits, Vec<HostGlobalDef>)> {
+) -> io::Result<(String, Option<String>, HeapLimits)> {
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
-    let limits = r.read_resource_limits(band)?;
-    let globals = r.read_global_defs()?;
-    Ok((code, filename, limits, globals))
+    let heap = r.read_heap_limits(band)?;
+    Ok((code, filename, heap))
 }
 
 /// Parse the payload bytes of a `Run` frame per `docs/protocol.md` §5.2.
@@ -1278,7 +1281,9 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunRequest> {
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
     // A one-off gets a fresh isolate: strict cap, no band.
-    let (code, filename, limits, globals) = parse_code_fields(&mut r, BandPolicy::Strict)?;
+    let (code, filename, heap) = parse_code_fields(&mut r, BandPolicy::Strict)?;
+    let limits = r.read_run_limits()?;
+    let globals = r.read_global_defs()?;
     let imports = r.read_import_bindings()?;
     let call = r.read_optional_call()?;
     r.assert_done()?;
@@ -1286,6 +1291,7 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunRequest> {
         run_id,
         code,
         filename,
+        heap,
         limits,
         globals,
         imports,
@@ -1302,6 +1308,8 @@ pub struct PrecompilePayload {
     pub request_id: u32,
     pub code: String,
     pub filename: Option<String>,
+    /// The prefix's heap lines, applied to every run on it.
+    pub heap: HeapLimits,
     pub globals: Vec<HostGlobalDef>,
     pub imports: Vec<ImportBinding>,
 }
@@ -1310,15 +1318,16 @@ pub struct PrecompilePayload {
 pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload> {
     let mut r = PayloadReader::new(payload);
     let request_id = r.read_u32()?;
-    // Band-checked like the managed instances this prefix will get; the
-    // limits are otherwise unused at Precompile.
-    let (code, filename, _limits, globals) = parse_code_fields(&mut r, BandPolicy::Managed)?;
+    // Managed: the prefix's instances are reused.
+    let (code, filename, heap) = parse_code_fields(&mut r, BandPolicy::Managed)?;
+    let globals = r.read_global_defs()?;
     let imports = r.read_import_bindings()?;
     r.assert_done()?;
     Ok(PrecompilePayload {
         request_id,
         code,
         filename,
+        heap,
         globals,
         imports,
     })
@@ -1329,7 +1338,7 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunRequest> 
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
     let prefix_id = r.read_string()?;
-    let limits = r.read_resource_limits(BandPolicy::Managed)?;
+    let limits = r.read_run_limits()?;
     let globals = r.read_global_defs()?;
     let import_rebinds = r.read_import_rebinds()?;
     let call = r.read_call()?;
@@ -1908,7 +1917,7 @@ mod tests {
                 v.push(0);
             }
         }
-        // ResourceLimits: 10 × Optional<u32>, all absent → runtime defaults.
+        // HeapLimits + RunLimits, all absent → runtime defaults.
         push_absent_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
@@ -1930,9 +1939,14 @@ mod tests {
         }
     }
 
-    /// Eight absent `Optional<u32>` limit fields (one presence byte each).
+    /// A `Run`'s absent `HeapLimits` (2) + `RunLimits` (8) fields.
     fn push_absent_limits(v: &mut Vec<u8>) {
         v.extend_from_slice(&[0u8; 10]);
+    }
+
+    /// A `PrefixRun`'s eight absent `RunLimits` fields.
+    fn push_absent_run_limits(v: &mut Vec<u8>) {
+        v.extend_from_slice(&[0u8; 8]);
     }
 
     fn push_string(v: &mut Vec<u8>, s: &str) {
@@ -1967,6 +1981,7 @@ mod tests {
         push_string(&mut v, "code"); // code
         v.push(0); // no filename
         push_optional_u32(&mut v, Some(128)); // memory_mb
+        push_optional_u32(&mut v, Some(192)); // hard_memory_mb: explicit
         push_optional_u32(&mut v, Some(5000)); // cpu_time_ms
         push_optional_u32(&mut v, Some(10000)); // wall_time_ms
         push_optional_u32(&mut v, Some(1024 * 1024)); // max_export_bytes
@@ -1975,7 +1990,6 @@ mod tests {
         push_optional_u32(&mut v, Some(64 * 1024)); // max_bridge_call_bytes
         push_optional_u32(&mut v, Some(1_000)); // max_bridge_calls
         push_optional_u32(&mut v, Some(5_000)); // grace_ms
-        push_optional_u32(&mut v, Some(192)); // hard_memory_mb: explicit
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
@@ -1983,11 +1997,11 @@ mod tests {
         let p = parse_run_payload(&v).unwrap();
         assert_eq!(p.run_id, 42);
         assert_eq!(
-            p.limits.soft_memory_mb, 0,
+            p.heap.soft_memory_mb, 0,
             "a one-off is never reused: no soft line"
         );
         assert_eq!(
-            p.limits.hard_memory_mb, 192,
+            p.heap.hard_memory_mb, 192,
             "explicit hard line is taken as given"
         );
         assert_eq!(p.limits.cpu_time_ms, 5000);
@@ -2002,9 +2016,9 @@ mod tests {
         // encoding: the client no longer ships the default numbers.
         let bytes = encode_run_payload(1, "export default 1", None);
         let p = parse_run_payload(&bytes).unwrap();
-        assert_eq!(p.limits.soft_memory_mb, 0, "one-off: no soft line");
+        assert_eq!(p.heap.soft_memory_mb, 0, "one-off: no soft line");
         assert_eq!(
-            p.limits.hard_memory_mb, DEFAULT_MEMORY_MB,
+            p.heap.hard_memory_mb, DEFAULT_MEMORY_MB,
             "a one-off gets no band — the default cap is what it dies at",
         );
         assert_eq!(p.limits.cpu_time_ms, DEFAULT_CPU_TIME_MS);
@@ -2020,21 +2034,28 @@ mod tests {
     }
 
     #[test]
-    fn a_prefix_run_gets_the_band_a_one_off_does_not() {
-        // Same bytes on both frame kinds — only the frame kind differs, and
-        // with it whether an absent hard override earns a band.
-        let prefix = parse_prefix_run_payload(&encode_prefix_run_payload("default")).unwrap();
-        assert_eq!(prefix.limits.soft_memory_mb, DEFAULT_MEMORY_MB);
+    fn a_prefix_gets_the_band_a_one_off_does_not() {
+        // Same absent heap block on both frame kinds — only the frame kind
+        // differs, and with it whether an absent hard override earns a band.
+        let mut v = Vec::new();
+        push_u32(&mut v, 1); // request_id
+        push_string(&mut v, "1"); // code
+        v.push(0); // no filename
+        v.extend_from_slice(&[0u8; 2]); // heap: memory_mb, hard_memory_mb absent
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 0); // imports count
+        let prefix = parse_precompile_payload(&v).unwrap();
+        assert_eq!(prefix.heap.soft_memory_mb, DEFAULT_MEMORY_MB);
         assert_eq!(
-            prefix.limits.hard_memory_mb,
+            prefix.heap.hard_memory_mb,
             DEFAULT_MEMORY_MB + iso4_types::heap_band_mb(DEFAULT_MEMORY_MB),
             "a reused instance is retired at the cap and terminates above it",
         );
 
         let oneoff = parse_run_payload(&encode_run_payload(1, "1", None)).unwrap();
-        assert_eq!(oneoff.limits.soft_memory_mb, 0);
+        assert_eq!(oneoff.heap.soft_memory_mb, 0);
         assert_eq!(
-            oneoff.limits.hard_memory_mb, DEFAULT_MEMORY_MB,
+            oneoff.heap.hard_memory_mb, DEFAULT_MEMORY_MB,
             "a fresh isolate dies at the cap it was given",
         );
     }
@@ -2074,6 +2095,7 @@ mod tests {
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
         push_optional_u32(&mut v, Some(0)); // memory_mb: explicitly unlimited
+        push_optional_u32(&mut v, None); // hard_memory_mb: managed
         push_optional_u32(&mut v, None); // cpu_time_ms: default
         push_optional_u32(&mut v, None); // wall_time_ms
         push_optional_u32(&mut v, None); // max_export_bytes
@@ -2082,15 +2104,14 @@ mod tests {
         push_optional_u32(&mut v, None); // max_bridge_call_bytes
         push_optional_u32(&mut v, Some(0)); // max_bridge_calls: explicitly unlimited
         push_optional_u32(&mut v, Some(0)); // grace_ms: epilogue explicitly off
-        push_optional_u32(&mut v, None); // hard_memory_mb: managed
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
 
         let p = parse_run_payload(&v).unwrap();
-        assert_eq!(p.limits.soft_memory_mb, 0);
+        assert_eq!(p.heap.soft_memory_mb, 0);
         assert_eq!(
-            p.limits.hard_memory_mb, 0,
+            p.heap.hard_memory_mb, 0,
             "uncapped stays uncapped — no band"
         );
         assert_eq!(p.limits.max_bridge_calls, 0);
@@ -2458,7 +2479,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 3); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
-        push_absent_limits(&mut v);
+        push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, u32::MAX); // claims every rebind there could be
 
@@ -2475,7 +2496,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 3); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
-        push_absent_limits(&mut v);
+        push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 2); // 2 rebinds
         push_string(&mut v, "tools:search");
@@ -2517,7 +2538,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
-        push_absent_limits(&mut v);
+        push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // rebinds count
         push_string(&mut v, export_path); // call: export path
@@ -2540,7 +2561,7 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
         push_string(&mut v, "prefix-0"); // prefix_id
-        push_absent_limits(&mut v);
+        push_absent_run_limits(&mut v);
         push_u32(&mut v, 0); // globals count
         push_u32(&mut v, 0); // rebinds count
         assert!(parse_prefix_run_payload(&v).is_err());

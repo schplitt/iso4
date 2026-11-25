@@ -130,6 +130,8 @@ pub struct PrefixData {
     pub code: String,
     /// Filename the prefix was declared with (module origin in stacks).
     pub filename: Option<String>,
+    /// The heap lines set at prepare; every run on the prefix gets them.
+    pub heap: types::HeapLimits,
     /// The full precompile-time global defs, replayed into every run's
     /// context before the prefix evaluates (value globals as values, bridge
     /// callables as throwing placeholders).
