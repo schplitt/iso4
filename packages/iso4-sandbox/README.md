@@ -123,7 +123,8 @@ host can tell it from a failure of the run code. The runtime remembers it:
 every later `call()` rejects with `ERR_PREFIX_BROKEN` (its
 `cause` is that failure) without booting an isolate. `dispose()` still
 works; the only retry is a new `prepare()`. Failures that depend on load
-(`ERR_WARMUP_LIMIT`, `ERR_MEMORY_LIMIT`) never break a prefix.
+(`ERR_WARMUP_LIMIT`, `ERR_MEMORY_LIMIT`) never break a prefix. A call on a
+prefix the runtime no longer holds returns `ERR_PREFIX_UNKNOWN`.
 
 To check generated names before `prepare()` instead of getting a failed
 setup back, import the predicates from `@iso4/sandbox/utils`. That entry

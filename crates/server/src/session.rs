@@ -439,6 +439,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     payload.heap,
                     payload.globals,
                     payload.imports,
+                    payload.hash,
                 );
                 let result = wire::encode_precompile_result_payload(
                     payload.request_id,

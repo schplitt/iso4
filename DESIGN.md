@@ -1178,15 +1178,16 @@ slot is taken or a frame is sent. The Rust runtime is the authority and
 repeats every check except `ERR_INVALID_REBIND` (it never sees the value),
 with the same codes and messages, so a non-TS client gets the same answer;
 the client throws the runtime's refusal in the same shape, which also covers
-what it cannot know in advance, such as a prefix the runtime no longer
-holds. An already-aborted signal wins over validation and resolves as
+what it cannot know in advance, such as a prefix broken by a cold start it
+did not see. A prefix the runtime does not hold under that id and code hash
+(§11.3) is not a setup error: the run fails with `ERR_PREFIX_UNKNOWN`. An already-aborted signal wins over validation and resolves as
 aborted, except disposal: using a disposed prefix always throws
 `ERR_PREFIX_DISPOSED`, and using a broken one (§16.4) always throws
 `ERR_PREFIX_BROKEN`. Everything else — user code, limits,
 bridge failures, abort, capacity and queue refusals — stays a result. That
 includes `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
-`ERR_CALL_TARGET_NOT_FOUND`, `ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL` and
-`ERR_TYPE_NOT_SERIALIZABLE`.
+`ERR_CALL_TARGET_NOT_FOUND`, `ERR_CAPACITY_MEMORY`, `ERR_QUEUE_FULL`,
+`ERR_PREFIX_UNKNOWN` and `ERR_TYPE_NOT_SERIALIZABLE`.
 
 ### 5.3 Host → sandbox calls
 
@@ -1912,6 +1913,15 @@ sees is exactly what the prefix produces deterministically:
     runtime then remembers the prefix as broken: every later run on it is
     refused with the setup error `ERR_PREFIX_BROKEN`, whose `cause` is the
     stored failure, and no isolate boots for it.
+
+**Code hash.** `prepare()` hashes the bundle: SHA-256, first 16 bytes, over
+the code and filename, then the globals (data blobs included) and imports,
+as encoded on the `Precompile` frame. Request id and limits are not in it.
+The runtime recomputes it over the bytes it received (a mismatch is a
+malformed frame, closing the connection) and stores it with the prefix.
+Every `PrefixRun` carries it; a run whose id the runtime does not hold, or
+holds with another hash, fails with `ERR_PREFIX_UNKNOWN` (docs/protocol.md
+§5.2).
 
 ### 11.4 Rebinding rules
 

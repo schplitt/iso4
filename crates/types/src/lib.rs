@@ -280,6 +280,8 @@ pub struct PrefixRunRequest {
     /// The frontend's id for the run; its messages go to `Addr::Run(run_id)`.
     pub run_id: u32,
     pub prefix_id: String,
+    /// The code hash sent at prepare; another hash is an unknown prefix.
+    pub hash: [u8; 16],
     /// The heap lines come from the prefix (set at prepare).
     pub limits: RunLimits,
     pub globals: Vec<HostGlobalDef>,

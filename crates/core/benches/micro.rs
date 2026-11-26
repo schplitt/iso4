@@ -529,6 +529,7 @@ fn bench_engine(c: &mut Criterion) {
         let req = PrefixRunRequest {
             run_id,
             prefix_id: prefix_id.to_string(),
+            hash: [0; 16],
             limits: RunLimits::default(),
             globals,
             import_rebinds: Vec::new(),
@@ -577,6 +578,7 @@ fn bench_engine(c: &mut Criterion) {
         HeapLimits::default(),
         Vec::new(),
         Vec::new(),
+        [0; 16],
     );
     run_id += 1;
     let handle = prefix_run(&warm_prefix, run_id, Vec::new());
@@ -598,6 +600,7 @@ fn bench_engine(c: &mut Criterion) {
         HeapLimits::default(),
         vec![HostGlobalDef::bridge("tool")],
         Vec::new(),
+        [0; 16],
     );
     let answer = testval::to_blob(&testval::TestValue::Number(1.0));
     let round_trip = |run_id: u32| {

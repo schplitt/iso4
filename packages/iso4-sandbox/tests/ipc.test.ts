@@ -337,26 +337,53 @@ describe('payload encoders', () => {
     expect(fn).toBe('agent')
   })
 
-  test('encodePrecompilePayload leads with its requestId', () => {
+  test('encodePrecompilePayload leads with its requestId, then the hash', () => {
     const runBuf = encodeRunPayload({ runId: 0, code: 'x' })
-    const preBuf = encodePrecompilePayload({ requestId: 12, code: 'x' })
-    // Same leading-id layout as Run, minus the run limits (8) and the
-    // trailing optional-call byte.
-    expect(preBuf.byteLength).toBe(runBuf.byteLength - 8 - 1)
+    const { payload: preBuf, hash } = encodePrecompilePayload({ requestId: 12, code: 'x' })
+    // Same leading-id layout as Run, plus the hash (16), minus the run
+    // limits (8) and the trailing optional-call byte.
+    expect(preBuf.byteLength).toBe(runBuf.byteLength + 16 - 8 - 1)
     expect(readU32BE(preBuf, 0)).toBe(12)
-    const { value: code } = readString(preBuf, 4)
+    expect(hash.byteLength).toBe(16)
+    expect(preBuf.subarray(4, 20).equals(hash)).toBe(true)
+    const { value: code } = readString(preBuf, 20)
     expect(code).toBe('x')
+  })
+
+  test('the Precompile code hash matches the shared vector (crates/server/src/ipc.rs)', () => {
+    const { payload, hash } = encodePrecompilePayload({
+      requestId: 1,
+      code: 'export default 1',
+      filename: 'a.js',
+      heap: { memoryMb: 64 },
+      globals: [{ kind: 'string', name: 'answer', expr: '42' }],
+      imports: [{ specifier: 'lib:x', source: 'export const x = 1' }],
+    })
+    expect(payload.toString('hex')).toBe('000000019c0151069957142d7b202a45e999faaa000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031')
+    expect(hash.toString('hex')).toBe('9c0151069957142d7b202a45e999faaa')
+  })
+
+  test('the code hash covers the bundle, not the request id or the heap block', () => {
+    const base = { requestId: 1, code: 'export default 1', globals: [{ kind: 'data', name: 'cfg', value: { a: 1 } }] } as const
+    const { hash } = encodePrecompilePayload(base)
+    expect(encodePrecompilePayload({ ...base, requestId: 2, heap: { memoryMb: 8 } }).hash.equals(hash)).toBe(true)
+    expect(encodePrecompilePayload({ ...base, code: 'export default 2' }).hash.equals(hash)).toBe(false)
+    expect(encodePrecompilePayload({ ...base, filename: 'a.js' }).hash.equals(hash)).toBe(false)
+    expect(encodePrecompilePayload({ ...base, globals: [{ kind: 'data', name: 'cfg', value: { a: 2 } }] }).hash.equals(hash)).toBe(false)
+    expect(encodePrecompilePayload({ ...base, imports: [{ specifier: 'lib:x', source: '' }] }).hash.equals(hash)).toBe(false)
   })
 
   test('encodePrefixRunPayload encodes runId, prefixId, and the call', () => {
     const argsBlob = serializeValue([1, 'a'])
-    const buf = encodePrefixRunPayload({ runId: 3, prefixId: '42', call: { exportPath: 'handler', argsBlob } })
+    const hash = Buffer.alloc(16, 7)
+    const buf = encodePrefixRunPayload({ runId: 3, prefixId: '42', hash, call: { exportPath: 'handler', argsBlob } })
     expect(readU32BE(buf, 0)).toBe(3) // runId
     const { value: prefixId, end } = readString(buf, 4)
     expect(prefixId).toBe('42')
-    // run limits(8) + globals count(4) + rebinds count(4), then the CallSpec
-    // with no presence byte: String exportPath + value slot.
-    const off = end + 8 + 4 + 4
+    expect(buf.subarray(end, end + 16).equals(hash)).toBe(true)
+    // hash(16) + run limits(8) + globals count(4) + rebinds count(4), then
+    // the CallSpec with no presence byte: String exportPath + value slot.
+    const off = end + 16 + 8 + 4 + 4
     const { value: path, end: pathEnd } = readString(buf, off)
     expect(path).toBe('handler')
     const argsLength = readU32BE(buf, pathEnd)
@@ -497,13 +524,14 @@ describe('payload encoders', () => {
 
   test('encodePrecompilePayload carries import declarations; encodePrefixRunPayload carries rebind locations', () => {
     const imports = [{ specifier: 'lib:zod', source: 'export const z = {}' }] as const
-    const pre = encodePrecompilePayload({ code: 'x', imports })
+    const { payload: pre } = encodePrecompilePayload({ requestId: 1, code: 'x', imports })
     expect(pre.toString('utf8')).toContain('lib:zod')
 
     const argsBlob = serializeValue([])
     const pref = encodePrefixRunPayload({
       runId: 1,
       prefixId: 'p',
+      hash: Buffer.alloc(16),
       importRebinds: [{ specifier: 'tools:search', path: ['a.b', 'inner'] }],
       call: { exportPath: 'f', argsBlob },
     })

@@ -555,6 +555,7 @@ describe('decodeRunCompletionPayload — failure', () => {
     'ERR_RESERVED_NAME',
     'ERR_FROZEN_BINDING',
     'ERR_PREFIX_DISPOSED',
+    'ERR_PREFIX_UNKNOWN',
     'ERR_ABORTED',
     'ERR_INTERNAL',
   ])('error code %s round-trips', (code) => {
