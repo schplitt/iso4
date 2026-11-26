@@ -377,6 +377,77 @@ pub fn encode_precompile_result_payload(
     out
 }
 
+// ── ListPrefixesResultPayload encoder ────────────────────────────────────────
+
+/// Encode a `ListPrefixesResultPayload` per `docs/protocol.md` §5.10.
+///
+/// Wire layout:
+/// ```text
+/// u32   requestId
+/// u8    ok
+/// u8    errorPresent     (1 when ok = false)
+///   RunErrorPayload  error
+/// when ok: u32 count, then per prefix:
+///   String  id
+///   [u8;16] hash
+///   u8      state        (0 = live, 1 = broken)
+///   u32     memoryMb
+///   u32     hardMemoryMb
+/// ```
+/// A list whose frame would exceed `max_frame_length` is answered with an
+/// `ERR_INTERNAL` refusal instead.
+pub fn encode_list_prefixes_result_payload(
+    request_id: u32,
+    answer: Result<&[iso4_core::PrefixInfo], &RunErrorPayload>,
+    max_frame_length: u32,
+) -> Vec<u8> {
+    let too_large;
+    let mut capacity = 0;
+    let answer = match answer {
+        Ok(list) => {
+            // type byte + header + count, then each row.
+            let size = list.iter().fold(1 + 6 + 4, |n: usize, p| {
+                n.saturating_add(4 + p.id.len() + 16 + 1 + 4 + 4)
+            });
+            if size > max_frame_length as usize {
+                iso4_core::log!(
+                    "[iso4-v8] ListPrefixes: {} prefixes need {size} bytes, over the frame limit — refusing",
+                    list.len()
+                );
+                too_large =
+                    iso4_core::Refusal::Internal("prefix list too large".to_string()).to_payload();
+                Err(&too_large)
+            } else {
+                capacity = size - 1;
+                Ok(list)
+            }
+        }
+        Err(e) => Err(e),
+    };
+    let mut out = Vec::with_capacity(capacity);
+    encode_u32(request_id, &mut out);
+    match answer {
+        Ok(list) => {
+            encode_bool(true, &mut out);
+            out.push(0);
+            encode_u32(list.len() as u32, &mut out);
+            for p in list {
+                encode_string(&p.id, &mut out);
+                out.extend_from_slice(&p.hash);
+                out.push(u8::from(p.broken));
+                encode_u32(p.heap.soft_memory_mb, &mut out);
+                encode_u32(p.heap.hard_memory_mb, &mut out);
+            }
+        }
+        Err(err) => {
+            encode_bool(false, &mut out);
+            out.push(1);
+            encode_run_error_payload(err, &mut out);
+        }
+    }
+    out
+}
+
 // ── StatsPayload encoder ─────────────────────────────────────────────────────
 
 /// Encode a `StatsPayload` per `docs/protocol.md` §5.7 — the reply to a
@@ -602,6 +673,67 @@ mod tests {
         let mut expected = failed[..6].to_vec();
         encode_run_error_payload(&error, &mut expected);
         assert_eq!(failed, expected);
+    }
+
+    fn prefix_info(id: &str, hash: u8, broken: bool) -> iso4_core::PrefixInfo {
+        iso4_core::PrefixInfo {
+            id: id.to_string(),
+            hash: [hash; 16],
+            heap: iso4_types::HeapLimits {
+                soft_memory_mb: 64,
+                hard_memory_mb: 87,
+            },
+            broken,
+        }
+    }
+
+    #[test]
+    fn a_list_prefixes_result_carries_the_rows() {
+        let max = crate::ipc::DEFAULT_MAX_FRAME_LENGTH;
+        assert_eq!(
+            encode_list_prefixes_result_payload(3, Ok(&[]), max),
+            [0, 0, 0, 3, 1, 0, 0, 0, 0, 0]
+        );
+        let list = [prefix_info("a", 1, false), prefix_info("bc", 2, true)];
+        let mut expected = vec![0, 0, 0, 3, 1, 0, 0, 0, 0, 2];
+        for (id, hash, state) in [("a", 1u8, 0u8), ("bc", 2, 1)] {
+            expected.extend_from_slice(&(id.len() as u32).to_be_bytes());
+            expected.extend_from_slice(id.as_bytes());
+            expected.extend_from_slice(&[hash; 16]);
+            expected.push(state);
+            expected.extend_from_slice(&64u32.to_be_bytes());
+            expected.extend_from_slice(&87u32.to_be_bytes());
+        }
+        assert_eq!(
+            encode_list_prefixes_result_payload(3, Ok(&list), max),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_list_prefixes_refusal_carries_the_error() {
+        let error = iso4_core::Refusal::Internal("no".to_string()).to_payload();
+        let refused = encode_list_prefixes_result_payload(
+            4,
+            Err(&error),
+            crate::ipc::DEFAULT_MAX_FRAME_LENGTH,
+        );
+        let mut expected = vec![0, 0, 0, 4, 0, 1];
+        encode_run_error_payload(&error, &mut expected);
+        assert_eq!(refused, expected);
+    }
+
+    #[test]
+    fn a_list_over_the_frame_limit_is_refused() {
+        let list = [prefix_info("a", 1, false)];
+        // type byte + 10-byte header + one 30-byte row.
+        let fits = encode_list_prefixes_result_payload(5, Ok(&list), 41);
+        assert_eq!(fits.len() + 1, 41);
+        let refused = encode_list_prefixes_result_payload(5, Ok(&list), 40);
+        let error = iso4_core::Refusal::Internal("prefix list too large".to_string()).to_payload();
+        let mut expected = vec![0, 0, 0, 5, 0, 1];
+        encode_run_error_payload(&error, &mut expected);
+        assert_eq!(refused, expected);
     }
 
     #[test]

@@ -97,6 +97,9 @@ pub enum TsToRustMessageType {
     StreamCancel = 0x0C,
     /// Orderly close: the host is done with this connection. Empty payload.
     Close = 0x0D,
+    /// Ask for the stored prefixes; supervisor role only. Answered with
+    /// `ListPrefixesResult`.
+    ListPrefixes = 0x0E,
 }
 
 /// Message types sent from Rust to the TypeScript host.
@@ -140,6 +143,8 @@ pub enum RustToTsMessageType {
     StreamEnd = 0x0B,
     /// Answer to a `DisposePrefix`, sent once the prefix is dropped.
     DisposePrefixResult = 0x0C,
+    /// Answer to a `ListPrefixes`: the stored prefixes, or a refusal.
+    ListPrefixesResult = 0x0D,
 }
 
 /// Handshake status reported on a `Hello` frame.
@@ -1504,6 +1509,14 @@ pub fn parse_dispose_prefix_payload(payload: &[u8]) -> io::Result<(u32, String)>
     Ok((request_id, id))
 }
 
+/// Parse the payload bytes of a `ListPrefixes` frame: `u32 requestId` only.
+pub fn parse_list_prefixes_payload(payload: &[u8]) -> io::Result<u32> {
+    let mut r = PayloadReader::new(payload);
+    let request_id = r.read_u32()?;
+    r.assert_done()?;
+    Ok(request_id)
+}
+
 /// Parse the payload bytes of a `Terminate` frame:
 /// `u32 runId, u8 mode` (`0` = soft — abandon at the run's next turn
 /// boundary; `1` = hard — interrupt executing JS immediately, tainting the
@@ -1686,6 +1699,7 @@ pub fn parse_ts_to_rust_message_type(byte: u8) -> io::Result<TsToRustMessageType
         0x0B => Ok(TsToRustMessageType::StreamPull),
         0x0C => Ok(TsToRustMessageType::StreamCancel),
         0x0D => Ok(TsToRustMessageType::Close),
+        0x0E => Ok(TsToRustMessageType::ListPrefixes),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown TS->Rust message type: {byte:#04x}"),
@@ -1711,6 +1725,7 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
         0x0A => Ok(RustToTsMessageType::StreamChunk),
         0x0B => Ok(RustToTsMessageType::StreamEnd),
         0x0C => Ok(RustToTsMessageType::DisposePrefixResult),
+        0x0D => Ok(RustToTsMessageType::ListPrefixesResult),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown Rust->TS message type: {byte:#04x}"),
@@ -2098,6 +2113,28 @@ mod tests {
         let mut bare = Vec::new();
         push_string(&mut bare, "p");
         assert!(parse_dispose_prefix_payload(&bare).is_err());
+    }
+
+    #[test]
+    fn list_prefixes_bytes_match_protocol_spec() {
+        assert_eq!(TsToRustMessageType::ListPrefixes as u8, 0x0E);
+        assert_eq!(
+            parse_ts_to_rust_message_type(0x0E).unwrap(),
+            TsToRustMessageType::ListPrefixes
+        );
+        assert_eq!(RustToTsMessageType::ListPrefixesResult as u8, 0x0D);
+        assert_eq!(
+            parse_rust_to_ts_message_type(0x0D).unwrap(),
+            RustToTsMessageType::ListPrefixesResult
+        );
+    }
+
+    #[test]
+    fn parse_list_prefixes_payload_takes_the_request_id_only() {
+        assert_eq!(parse_list_prefixes_payload(&[0, 0, 0, 7]).unwrap(), 7);
+        assert!(parse_list_prefixes_payload(&[0, 0, 0, 7, 0]).is_err());
+        assert!(parse_list_prefixes_payload(&[0, 0, 7]).is_err());
+        assert!(parse_list_prefixes_payload(&[]).is_err());
     }
 
     #[test]

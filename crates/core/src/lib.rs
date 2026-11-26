@@ -29,7 +29,8 @@ mod webtypes;
 pub mod wire;
 
 pub use engine::{
-    AdmissionLine, Caller, Capacity, Engine, EngineOptions, Refusal, RunHandle, StartError,
+    AdmissionLine, Caller, Capacity, Engine, EngineOptions, PrefixInfo, Refusal, RunHandle,
+    StartError,
 };
 pub use errors::{RunError, RuntimeErrorData};
 pub use link::{

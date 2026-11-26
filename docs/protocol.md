@@ -75,23 +75,25 @@ sides must speak exactly this version, and the handshake hard-fails otherwise
 | `0x0B` | `StreamPull`     | `StreamPullPayload`     | credit grant for an outbound streamed body (§5.5); no reply                                                                                                       |
 | `0x0C` | `StreamCancel`   | `StreamCancelPayload`   | the host cancelled an outbound streamed body (§5.5); no reply                                                                                                     |
 | `0x0D` | `Close`          | empty                   | orderly close: the host is done with the connection; no reply, Rust ends the session (§6)                                                                         |
+| `0x0E` | `ListPrefixes`   | `ListPrefixesPayload`   | exactly one `ListPrefixesResult`; supervisor role only, a `node` peer gets a refusal and the connection stays (§5.10)                                             |
 
 ### 2.2 Rust → TS
 
-|   Byte | Name                  | Payload                   | Notes                                                                                                           |
-| -----: | --------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `0x01` | `BridgeCall`          | `BridgeCallPayload`       | Sandbox called a configured host global/function or host import.                                                |
-| `0x02` | `Result`              | `RunCompletionPayload`    | Final completion for `Run` or `PrefixRun`; sent exactly once. Includes captured stdout/stderr arrays.           |
-| `0x03` | `PrecompileResult`    | `PrecompileResultPayload` | Result of `Precompile`.                                                                                         |
-| `0x04` | `Log`                 | `DiagnosticLogPayload`    | Internal runtime diagnostic; not sandbox stdout/stderr.                                                         |
-| `0x05` | `Hello`               | `HelloPayload`            | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.                         |
-| `0x06` | `StatsResult`         | `StatsPayload`            | Capacity/usage snapshot answering a `Stats` request.                                                            |
-| `0x07` | `RunComplete`         | `RunCompletePayload`      | Final frame of a run whose `Result` reported pending background work; frees the run's slot.                     |
-| `0x08` | `StreamPull`          | `StreamPullPayload`       | Credit grant: the sandbox consumed streamed-body bytes; the host may send that many more (§5.5).                |
-| `0x09` | `StreamCancel`        | `StreamCancelPayload`     | The sandbox cancelled a streamed body; the host stops pumping and releases the source (§5.5).                   |
-| `0x0A` | `StreamChunk`         | `StreamChunkPayload`      | One chunk of an OUTBOUND (sandbox → host) streamed body, inside the host-granted credit window (§5.5).          |
-| `0x0B` | `StreamEnd`           | `StreamEndPayload`        | End of an outbound streamed body: clean EOF, or a guest source failure the consumer's read rejects with (§5.5). |
-| `0x0C` | `DisposePrefixResult` | `u32 requestId`           | Answer to `DisposePrefix`, sent after the prefix is dropped (§5.3).                                             |
+|   Byte | Name                  | Payload                     | Notes                                                                                                           |
+| -----: | --------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `0x01` | `BridgeCall`          | `BridgeCallPayload`         | Sandbox called a configured host global/function or host import.                                                |
+| `0x02` | `Result`              | `RunCompletionPayload`      | Final completion for `Run` or `PrefixRun`; sent exactly once. Includes captured stdout/stderr arrays.           |
+| `0x03` | `PrecompileResult`    | `PrecompileResultPayload`   | Result of `Precompile`.                                                                                         |
+| `0x04` | `Log`                 | `DiagnosticLogPayload`      | Internal runtime diagnostic; not sandbox stdout/stderr.                                                         |
+| `0x05` | `Hello`               | `HelloPayload`              | Handshake acknowledgement; the first frame the runtime sends, answering `Authenticate`.                         |
+| `0x06` | `StatsResult`         | `StatsPayload`              | Capacity/usage snapshot answering a `Stats` request.                                                            |
+| `0x07` | `RunComplete`         | `RunCompletePayload`        | Final frame of a run whose `Result` reported pending background work; frees the run's slot.                     |
+| `0x08` | `StreamPull`          | `StreamPullPayload`         | Credit grant: the sandbox consumed streamed-body bytes; the host may send that many more (§5.5).                |
+| `0x09` | `StreamCancel`        | `StreamCancelPayload`       | The sandbox cancelled a streamed body; the host stops pumping and releases the source (§5.5).                   |
+| `0x0A` | `StreamChunk`         | `StreamChunkPayload`        | One chunk of an OUTBOUND (sandbox → host) streamed body, inside the host-granted credit window (§5.5).          |
+| `0x0B` | `StreamEnd`           | `StreamEndPayload`          | End of an outbound streamed body: clean EOF, or a guest source failure the consumer's read rejects with (§5.5). |
+| `0x0C` | `DisposePrefixResult` | `u32 requestId`             | Answer to `DisposePrefix`, sent after the prefix is dropped (§5.3).                                             |
+| `0x0D` | `ListPrefixesResult`  | `ListPrefixesResultPayload` | Answer to `ListPrefixes`: the prefixes the runtime holds, or a refusal (§5.10).                                 |
 
 ---
 
@@ -1258,6 +1260,52 @@ snapshot answers even while every run slot is busy.
 | `prefixId` | `PrefixId` |                                          |
 | `idle`     | `u32`      | Idle instances of this prefix.           |
 | `busy`     | `u32`      | Instances of this prefix serving a call. |
+
+### 5.10 ListPrefixes payloads
+
+A `supervisor` peer (§5.1) asks which prefixes the runtime holds. Node never
+sends it.
+
+`ListPrefixesPayload`:
+
+| Field       | Encoding | Notes                                               |
+| ----------- | -------- | --------------------------------------------------- |
+| `requestId` | `u32`    | Correlation id, echoed on the `ListPrefixesResult`. |
+
+Anything after `requestId` is a malformed payload and closes the connection.
+
+`ListPrefixesResultPayload`:
+
+| Field       | Encoding                    | Notes                                                                                   |
+| ----------- | --------------------------- | --------------------------------------------------------------------------------------- |
+| `requestId` | `u32`                       | Echo of the request's correlation id.                                                   |
+| `ok`        | `bool`                      | Success or failure.                                                                     |
+| `error`     | `Optional<RunErrorPayload>` | Present when `ok = false`: `ERR_INTERNAL` (below).                                      |
+| `prefixes`  | `List<PrefixInfo>`          | Present only when `ok = true`: every prefix in the runtime's store, sorted by id bytes. |
+
+`PrefixInfo`:
+
+| Field          | Encoding   | Notes                                                                       |
+| -------------- | ---------- | --------------------------------------------------------------------------- |
+| `id`           | `PrefixId` | The host-chosen id (§5.3).                                                  |
+| `hash`         | 16 bytes   | The code hash the runtime recomputed at `Precompile` (§5.2).                |
+| `state`        | `u8`       | `0 = live`, `1 = broken` (its cold start failed; the cause is not carried). |
+| `memoryMb`     | `u32`      | The prefix's resolved soft heap line, set at `Precompile` (§5.2).           |
+| `hardMemoryMb` | `u32`      | The prefix's resolved hard heap line.                                       |
+
+The list is copied under the store lock and encoded after it, so it is one
+consistent snapshot, stale the moment it is sent. A prefix is listed exactly
+while the runtime holds it: a disposed one is gone at once. No code, no key
+(every `Hello` reports the key, §5.1) and no instance data are carried.
+
+**The role rule.** The runtime checks the role the peer declared at
+`Authenticate`. A `node` peer gets `ok = false` with `ERR_INTERNAL`
+("ListPrefixes needs the supervisor role"); the runtime logs one line, and
+the connection stays usable for every other frame.
+
+**Size.** There is no paging. A list whose frame would exceed the frame
+ceiling (§2) is answered with `ok = false` and `ERR_INTERNAL` ("prefix list
+too large") instead.
 
 ---
 

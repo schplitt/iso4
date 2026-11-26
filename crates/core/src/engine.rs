@@ -223,6 +223,15 @@ pub struct Capacity {
     pub admission_line_bytes: u64,
 }
 
+/// One stored prefix, as [`Engine::list_prefixes`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixInfo {
+    pub id: String,
+    pub hash: [u8; 16],
+    pub heap: types::HeapLimits,
+    pub broken: bool,
+}
+
 /// One per process. A prefix prepared through any caller is visible to all
 /// of them, so the host pool can route any run to any connection. A caller
 /// starts its runs from one thread.
@@ -419,6 +428,30 @@ impl Engine {
 
     pub fn stats(&self) -> warm::RegistryStats {
         self.warm.stats()
+    }
+
+    /// Every stored prefix, sorted by id: a copy taken under the store lock.
+    pub fn list_prefixes(&self) -> Vec<PrefixInfo> {
+        let mut list: Vec<PrefixInfo> = {
+            let store = self.prefixes.lock().unwrap_or_else(|p| p.into_inner());
+            store
+                .iter()
+                .map(|(id, entry)| {
+                    let (hash, heap, broken) = match entry {
+                        PrefixEntry::Ready(data) => (data.hash, data.heap, false),
+                        PrefixEntry::Broken { hash, heap, .. } => (*hash, *heap, true),
+                    };
+                    PrefixInfo {
+                        id: id.clone(),
+                        hash,
+                        heap,
+                        broken,
+                    }
+                })
+                .collect()
+        };
+        list.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        list
     }
 
     /// A one-off run on its own worker thread and a fresh isolate. The
@@ -1067,5 +1100,45 @@ mod tests {
             alias,
             "a ready prefix is not rebuilt"
         );
+    }
+
+    #[test]
+    fn list_prefixes_reports_the_store_sorted_by_id() {
+        let engine = Engine::new(0, 0);
+        assert!(engine.list_prefixes().is_empty());
+
+        let heap = |soft, hard| types::HeapLimits {
+            soft_memory_mb: soft,
+            hard_memory_mb: hard,
+        };
+        store(&engine, "b", "export const b = 1", heap(64, 87), [2; 16]).unwrap();
+        store(&engine, "a", "export const a = 1", heap(0, 32), [1; 16]).unwrap();
+        let cause = Refusal::Internal("cold start".to_string()).to_payload();
+        engine.prefixes.lock().unwrap().insert(
+            "c".to_string(),
+            PrefixEntry::Broken {
+                hash: [3; 16],
+                heap: heap(128, 160),
+                cause: Arc::new(cause),
+            },
+        );
+        let info = |id: &str, hash, heap, broken| PrefixInfo {
+            id: id.to_string(),
+            hash,
+            heap,
+            broken,
+        };
+        assert_eq!(
+            engine.list_prefixes(),
+            [
+                info("a", [1; 16], heap(0, 32), false),
+                info("b", [2; 16], heap(64, 87), false),
+                info("c", [3; 16], heap(128, 160), true),
+            ]
+        );
+
+        engine.dispose_prefix("b");
+        let ids: Vec<String> = engine.list_prefixes().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["a", "c"]);
     }
 }
