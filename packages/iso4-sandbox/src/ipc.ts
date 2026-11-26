@@ -133,8 +133,20 @@ export interface TypedFrame<MessageType extends number> {
 export type TsToRustFrame = TypedFrame<TsToRustMessageType>
 export type RustToTsFrame = TypedFrame<RustToTsMessageType>
 
+/**
+ * Who `Authenticate` says is connecting. Node always sends `Node`.
+ */
+export const PeerRole = {
+  Node: 0,
+  Supervisor: 1,
+} as const
+
 export interface AuthenticatePayload {
   protocolVersion: number
+  /**
+   * 0 node, 1 supervisor (skips the runtime's probe comparison).
+   */
+  role: number
   /**
    * V8 serialization probe — a serialized `null`, whose second byte is the
    * format version this Node writes. The runtime hard-fails the connection
@@ -164,6 +176,18 @@ export type HelloStatusCode = (typeof HelloStatus)[keyof typeof HelloStatus]
 
 export interface HelloPayload {
   status: number
+  /**
+   * The child's `--id`. Decoded, not used yet.
+   */
+  childId: bigint
+  /**
+   * The child's `--kind`: 0 none, 1 prefix, 2 oneoff, 3 quarantine.
+   */
+  kind: number
+  /**
+   * The child's `--key`; absent for a keyless child.
+   */
+  key?: string
   /**
    * The runtime's own V8 serialization probe (a serialized `null`). The client
    * deserializes it to prove the runtime's format version is readable here.
@@ -477,8 +501,8 @@ export function decodeRustToTsFrame(bytes: Uint8Array): RustToTsFrame {
 
 /**
  * Encode an `Authenticate` payload per `docs/protocol.md` §5.1:
- * `u16 protocolVersion`, then `u32 probeLength + probe bytes`, then
- * `u32 tokenLength + descriptor token bytes` (exactly 16).
+ * `u16 protocolVersion`, `u8 role`, then `u32 probeLength + probe bytes`,
+ * then `u32 tokenLength + descriptor token bytes` (exactly 16).
  * @param auth
  */
 export function encodeAuthenticatePayload(
@@ -497,12 +521,13 @@ export function encodeAuthenticatePayload(
   }
 
   const token = auth.descriptorToken
-  const payload = Buffer.allocUnsafe(2 + 4 + auth.probe.byteLength + 4 + token.byteLength)
+  const payload = Buffer.allocUnsafe(2 + 1 + 4 + auth.probe.byteLength + 4 + token.byteLength)
   payload.writeUInt16BE(auth.protocolVersion, 0)
-  payload.writeUInt32BE(auth.probe.byteLength, 2)
+  payload.writeUInt8(auth.role, 2)
+  payload.writeUInt32BE(auth.probe.byteLength, 3)
   Buffer.from(auth.probe.buffer, auth.probe.byteOffset, auth.probe.byteLength)
-    .copy(payload, 6)
-  const tokenStart = 6 + auth.probe.byteLength
+    .copy(payload, 7)
+  const tokenStart = 7 + auth.probe.byteLength
   payload.writeUInt32BE(token.byteLength, tokenStart)
   Buffer.from(token.buffer, token.byteOffset, token.byteLength)
     .copy(payload, tokenStart + 4)
@@ -512,16 +537,20 @@ export function encodeAuthenticatePayload(
 export function decodeAuthenticatePayload(
   payload: Uint8Array,
 ): AuthenticatePayload {
-  if (payload.byteLength < 6) {
+  if (payload.byteLength < 7) {
     throw new Error('payload too short for Authenticate')
   }
 
   const view = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
-  const probeLength = view.readUInt32BE(2)
-  if (view.byteLength < 6 + probeLength + 4) {
+  const role = view.readUInt8(2)
+  if (role !== PeerRole.Node && role !== PeerRole.Supervisor) {
+    throw new Error(`unknown peer role ${role}`)
+  }
+  const probeLength = view.readUInt32BE(3)
+  if (view.byteLength < 7 + probeLength + 4) {
     throw new Error('Authenticate payload truncated (probe)')
   }
-  const tokenStart = 6 + probeLength
+  const tokenStart = 7 + probeLength
   const tokenLength = view.readUInt32BE(tokenStart)
   if (tokenLength !== DESCRIPTOR_TOKEN_LEN) {
     throw new Error(
@@ -536,54 +565,57 @@ export function decodeAuthenticatePayload(
   }
   return {
     protocolVersion: view.readUInt16BE(0),
-    probe: view.subarray(6, 6 + probeLength),
+    role,
+    probe: view.subarray(7, 7 + probeLength),
     descriptorToken: view.subarray(tokenStart + 4, tokenStart + 4 + tokenLength),
   }
 }
 
 /**
- * Encode a `Hello` payload — the runtime's handshake acknowledgement.
+ * Encode a `Hello` payload — the runtime's handshake acknowledgement:
+ * `u8 status`, `u64 childId`, `u8 kind`, `Optional<String> key`,
+ * `u32 probeLength + probe bytes`, `String message`.
  * Exported for tests and for the mock servers in `tests/client.test.ts`; the
  * real encoder lives in the Rust runtime.
  * @param hello
  */
 export function encodeHelloPayload(hello: HelloPayload): Buffer {
-  const message = Buffer.from(hello.message, 'utf8')
-  const payload = Buffer.allocUnsafe(
-    1 + 4 + hello.probe.byteLength + 4 + message.byteLength,
-  )
-  payload.writeUInt8(hello.status, 0)
-  payload.writeUInt32BE(hello.probe.byteLength, 1)
-  Buffer.from(hello.probe.buffer, hello.probe.byteOffset, hello.probe.byteLength)
-    .copy(payload, 5)
-  let offset = 5 + hello.probe.byteLength
-  payload.writeUInt32BE(message.byteLength, offset)
-  offset += 4
-  message.copy(payload, offset)
-  return payload
+  const head = Buffer.allocUnsafe(1 + 8 + 1)
+  head.writeUInt8(hello.status, 0)
+  head.writeBigUInt64BE(hello.childId, 1)
+  head.writeUInt8(hello.kind, 9)
+  return Buffer.concat([
+    head,
+    new PayloadWriter()
+      .writeOptionalString(hello.key)
+      .writeLengthPrefixedBytes(hello.probe)
+      .writeString(hello.message)
+      .toBuffer(),
+  ])
 }
 
+/**
+ * Decode a `Hello` payload; trailing bytes are rejected, as the runtime does
+ * for every frame it reads.
+ * @param payload
+ */
 export function decodeHelloPayload(payload: Uint8Array): HelloPayload {
-  const view = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength)
-  if (view.byteLength < 5) {
+  // status, childId, kind, key presence
+  if (payload.byteLength < 11) {
     throw new Error('payload too short for Hello')
   }
-  const status = view.readUInt8(0)
-  const probeLength = view.readUInt32BE(1)
-  if (view.byteLength < 5 + probeLength + 4) {
-    throw new Error('Hello payload truncated (probe)')
-  }
-  const probe = view.subarray(5, 5 + probeLength)
-  const messageLength = view.readUInt32BE(5 + probeLength)
-  const messageStart = 5 + probeLength + 4
-  if (view.byteLength < messageStart + messageLength) {
-    throw new Error('Hello payload truncated (message)')
-  }
-  return {
-    status,
-    probe,
-    message: view.subarray(messageStart, messageStart + messageLength).toString('utf8'),
-  }
+  const reader = new PayloadReader(payload)
+  const status = reader.readU8()
+  const childId = Buffer.from(reader.readRawBytes(8)).readBigUInt64BE(0)
+  const kind = reader.readU8()
+  const key = reader.readBool() ? reader.readString() : undefined
+  const probe = reader.readRawBytes(reader.readU32())
+  const message = reader.readString()
+  reader.assertDone()
+  const hello: HelloPayload = { status, childId, kind, probe, message }
+  if (key !== undefined)
+    hello.key = key
+  return hello
 }
 
 // ── Payload encoder helpers ───────────────────────────────────────────────

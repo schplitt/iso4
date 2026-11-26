@@ -48,6 +48,11 @@ fn spawn_in(dir: PathBuf, extra: &[&str]) -> (Spawned, UnixStream) {
     let child = Command::new(env!("CARGO_BIN_EXE_iso4-v8"))
         .arg("--socket")
         .arg(&socket)
+        .args(if extra.contains(&"--id") {
+            &[][..]
+        } else {
+            &["--id", "1"][..]
+        })
         .args(extra)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -100,17 +105,20 @@ fn read_frame(stream: &mut UnixStream) -> Vec<u8> {
     body
 }
 
-/// The handshake from `closed_stderr.rs`: protocol 1, a format-15 null probe,
-/// a 16-byte token.
-fn authenticate(stream: &mut UnixStream) {
+/// The handshake from `closed_stderr.rs`: protocol 1, role node, a format-15
+/// null probe, a 16-byte token. Returns the `Hello` frame body.
+fn authenticate(stream: &mut UnixStream) -> Vec<u8> {
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
     let mut auth = 1u16.to_be_bytes().to_vec();
+    auth.push(0);
     auth.extend_from_slice(&3u32.to_be_bytes());
     auth.extend_from_slice(&[0xFF, 0x0F, 0x30]);
     auth.extend_from_slice(&16u32.to_be_bytes());
     auth.extend_from_slice(&[0xAB; 16]);
     stream.write_all(&frame(0x01, &auth)).unwrap();
-    assert_eq!(read_frame(stream)[..2], [0x05, 0], "Hello, status ok");
+    let hello = read_frame(stream);
+    assert_eq!(hello[..2], [0x05, 0], "Hello, status ok");
+    hello
 }
 
 /// A `Run` frame (run id 1) with no key or filename, default limits but
@@ -194,7 +202,7 @@ fn the_pid_file_names_the_child_by_the_time_the_socket_accepts() {
 fn a_missing_socket_directory_fails_at_the_pid_file() {
     let dir = fresh_dir().join("missing");
     let socket = dir.join("sock");
-    let out = run_to_exit(&["--socket", socket.to_str().unwrap()]);
+    let out = run_to_exit(&["--socket", socket.to_str().unwrap(), "--id", "1"]);
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -214,11 +222,36 @@ fn bad_flag_values_are_fatal() {
         ("--node-pid", "x"),
         ("--key", ""),
         ("--key", long_key.as_str()),
+        ("--id", "x"),
+        ("--id", "-1"),
+        ("--kind", "warm"),
     ] {
-        let out = run_to_exit(&["--socket", "/unused/sock", flag, value]);
+        let out = run_to_exit(&["--socket", "/unused/sock", "--id", "1", flag, value]);
         assert_eq!(out.status.code(), Some(1), "{flag} {value}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains(&format!("{flag} must be")), "{stderr}");
+    }
+}
+
+#[test]
+fn a_missing_id_is_fatal() {
+    let out = run_to_exit(&["--socket", "/unused/sock"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--id <u64> is required"), "{stderr}");
+}
+
+#[test]
+fn hello_reports_the_id_kind_and_key_flags() {
+    for (kind, byte) in [("prefix", 1u8), ("oneoff", 2), ("quarantine", 3)] {
+        let (_spawned, mut stream) = spawn(&["--id", "7", "--kind", kind, "--key", "k"]);
+        let hello = authenticate(&mut stream);
+        // Type, status, then u64 childId, u8 kind, key present, u32 len, key.
+        assert_eq!(hello[2..10], 7u64.to_be_bytes(), "{kind}");
+        assert_eq!(hello[10], byte, "{kind}");
+        assert_eq!(hello[11], 1, "{kind}: key present");
+        assert_eq!(hello[12..16], 1u32.to_be_bytes(), "{kind}");
+        assert_eq!(hello[16], b'k', "{kind}");
     }
 }
 

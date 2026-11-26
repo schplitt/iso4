@@ -6,6 +6,7 @@ import {
   FrameReader,
   HelloStatus,
   PROTOCOL_VERSION,
+  PeerRole,
 
   RustToTsMessageTypes,
   TsToRustMessageTypes,
@@ -40,7 +41,7 @@ import {
   encodeStreamPullPayload,
   decodeImportKey,
 } from './ipc'
-import type { WireHeapLimits, BridgeTarget, CallPayload, DecodedRunComplete, GlobalDefPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
+import type { WireHeapLimits, BridgeTarget, CallPayload, DecodedRunComplete, GlobalDefPayload, HelloPayload, ImportBindingPayload, ImportRebindPayload, RustToTsFrame, RuntimeStatsPayload } from './ipc'
 import type { HostExportFunction, ResourceLimits } from './types.js'
 import type { ImportHandlerMap } from './imports.js'
 import { deserializeValue, serializationProbe, serializeHostValue } from './v8-codec.js'
@@ -381,6 +382,7 @@ export class RuntimeIpcClient {
           TsToRustMessageTypes.Authenticate,
           encodeAuthenticatePayload({
             protocolVersion: PROTOCOL_VERSION,
+            role: PeerRole.Node,
             probe: serializationProbe(),
             descriptorToken: options.descriptorToken,
           }),
@@ -432,7 +434,16 @@ export class RuntimeIpcClient {
       )
     }
 
-    const hello = decodeHelloPayload(frame.payload)
+    let hello: HelloPayload
+    try {
+      hello = decodeHelloPayload(frame.payload)
+    } catch (error) {
+      throw new HandshakeError(
+        `the V8 runtime's Hello frame does not match this host's layout `
+        + `(${error instanceof Error ? error.message : String(error)}). `
+        + `Update @iso4/sandbox and @iso4/v8-* together — they are released in lockstep.`,
+      )
+    }
     if (hello.status !== HelloStatus.Ok) {
       throw new HandshakeError(
         hello.message.length > 0

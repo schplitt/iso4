@@ -531,13 +531,21 @@ it. Additive fields go in `extras` and need no tag at all.
 | Field             | Encoding                 | Notes                                             |
 | ----------------- | ------------------------ | ------------------------------------------------- |
 | `protocolVersion` | `u16`                    | Must equal the runtime's `PROTOCOL_VERSION`.      |
+| `role`            | `u8`                     | `0 = node`, `1 = supervisor` — see below.         |
 | `probe`           | `u32 byteLength` + bytes | A serialized `null` — see below.                  |
 | `descriptorToken` | `u32 byteLength` + bytes | Exactly **16 random bytes** — see below (§4.4.6). |
 
-The payload ends with the token; a wrong-size token and trailing bytes are
-rejected as malformed. There is no auth token — access to the socket is
-controlled by the owner-only (0700) per-sandbox directory the host creates it
-in, which the kernel checks on every `connect(2)`.
+The payload ends with the token; a wrong-size token, a `role` other than 0 or
+1, and trailing bytes are rejected as malformed. There is no auth token —
+access to the socket is controlled by the owner-only (0700) per-sandbox
+directory the host creates it in, which the kernel checks on every
+`connect(2)`.
+
+**The role.** The runtime believes the role as sent; the socket directory
+stays the only access control. Node always sends `0`. A `supervisor` peer
+skips only the V8 probe comparison below: its `probe` is still parsed and may
+hold any bytes, and the protocol version check and everything else apply as
+for `node`. The runtime's `Hello` to a supervisor still carries its own probe.
 
 **The descriptor token** is not an authentication secret; it authenticates
 **data**, not peers. The host draws 16 random bytes once per sandbox and sends
@@ -550,16 +558,28 @@ and all, before a value is handed to guest JS.
 
 `HelloPayload` (Rust → TS, the first frame the runtime sends):
 
-| Field     | Encoding                 | Notes                                                                |
-| --------- | ------------------------ | -------------------------------------------------------------------- |
-| `status`  | `u8`                     | `0 = ok`, `1 = protocol version mismatch`, `2 = V8 format mismatch`. |
-| `probe`   | `u32 byteLength` + bytes | The runtime's own serialized `null`.                                 |
-| `message` | `String`                 | Actionable detail for a non-zero status; empty when `status = 0`.    |
+| Field     | Encoding                 | Notes                                                                                           |
+| --------- | ------------------------ | ----------------------------------------------------------------------------------------------- |
+| `status`  | `u8`                     | `0 = ok`, `1 = protocol version mismatch`, `2 = V8 format mismatch`.                            |
+| `childId` | `u64`                    | The runtime's `--id`.                                                                           |
+| `kind`    | `u8`                     | The runtime's `--kind`: `0 = none` (flag absent), `1 = prefix`, `2 = oneoff`, `3 = quarantine`. |
+| `key`     | `Optional<String>`       | The runtime's `--key`; absent without it.                                                       |
+| `probe`   | `u32 byteLength` + bytes | The runtime's own serialized `null`.                                                            |
+| `message` | `String`                 | Actionable detail for a non-zero status; empty when `status = 0`.                               |
+
+Every `Hello` carries the three facts, rejections included. They come from
+the runtime's flags: `--id <u64>` (required; the runtime exits 1 without it),
+`--kind prefix|oneoff|quarantine` (optional) and `--key <s>` (optional,
+§5.2). `kind` changes no behaviour yet; it is only reported. Node starts
+each runtime with `--id` from a counter that begins at 1 in each instance of
+the sandbox module, so in each `worker_threads` thread: ids are not yet unique
+across threads. Node decodes the facts without using them yet. The host
+rejects trailing bytes after `message`.
 
 **The `Authenticate` frame is read on its own terms.** It arrives from a peer
 that has shown nothing yet, so it does not get the frame ceiling the rest of
 the connection uses (§2): the runtime caps it at **4 KiB**, which is ample for
-a `u16` and a short probe, and it MUST arrive complete within **2
+a `u16`, a role byte and a short probe, and it MUST arrive complete within **2
 seconds** of the connection being accepted. The deadline covers the frame as a
 whole rather than each read within it, so a peer that sends its bytes slowly is
 bounded by the same budget as one that sends nothing. Both are enforced only
@@ -592,8 +612,9 @@ negotiation and no fallback codec:
    plumbing reaches the session layer, and no per-connection V8 work happens.
 2. On a protocol-version or format-version mismatch the runtime sends a
    `Hello` carrying the error status and an actionable message, then closes.
-   (On a **malformed payload** it closes silently — that peer is not speaking
-   this protocol at all.)
+   (On a **malformed payload**, an unknown role included, it logs one line
+   and closes without a `Hello` — that peer is not speaking this protocol at
+   all.)
 3. The host awaits the `Hello`, and empirically `v8.deserialize`s the
    runtime's probe rather than trusting the version byte alone. Any failure
    rejects `createSandbox()` with a typed error naming the remedy: update
@@ -691,7 +712,9 @@ and the connection stays open. A present key is any UTF-8 string of 1 to 200
 bytes; a frame whose key is empty or longer is a malformed payload and closes
 the connection. A `--key` value that is empty or longer than 200 bytes makes
 the runtime log one line and exit 1. The key is printed on the fatal crash
-line as `key="..."`.
+line as `key="..."`. The key is a label that routes work and catches
+misrouting, not a secret: every `Hello` carries it, so any peer that can open
+the socket can read it.
 
 A `Precompile` for an id the runtime holds stores nothing: with the same
 `hash` and the same resolved heap lines it answers `ok` (the same prefix),

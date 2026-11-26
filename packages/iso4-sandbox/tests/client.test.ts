@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { createServer } from 'node:net'
 import type { Server, Socket } from 'node:net'
 import { afterEach, describe, expect, test, vi } from 'vitest'
-import { RuntimeIpcClient } from '../src/client'
+import { HandshakeError, RuntimeIpcClient } from '../src/client'
 import {
   FrameReader,
   HelloStatus,
@@ -73,7 +73,7 @@ function writeHello(socket: Socket): void {
   socket.write(
     encodeRustToTsFrame(
       RustToTsMessageTypes.Hello,
-      encodeHelloPayload({ status: HelloStatus.Ok, probe: serializationProbe(), message: '' }),
+      encodeHelloPayload({ status: HelloStatus.Ok, childId: 1n, kind: 0, probe: serializationProbe(), message: '' }),
     ),
   )
 }
@@ -177,6 +177,7 @@ describe('RuntimeIpcClient', () => {
       expect(authFrame.messageType).toBe(TsToRustMessageTypes.Authenticate)
       const auth = decodeAuthenticatePayload(authFrame.payload)
       expect(auth.protocolVersion).toBe(PROTOCOL_VERSION)
+      expect(auth.role).toBe(0) // node
       // The probe is a serialized `null`; byte 1 is Node's format version.
       expect(Buffer.from(auth.probe)).toEqual(serializationProbe())
       expect(Buffer.from(auth.descriptorToken)).toEqual(Buffer.from(descriptorToken))
@@ -415,6 +416,8 @@ describe('RuntimeIpcClient', () => {
           RustToTsMessageTypes.Hello,
           encodeHelloPayload({
             status: HelloStatus.V8FormatMismatch,
+            childId: 1n,
+            kind: 0,
             probe: serializationProbe(),
             message: 'V8 serialization format mismatch between Node 99 and iso4-v8',
           }),
@@ -440,6 +443,8 @@ describe('RuntimeIpcClient', () => {
           RustToTsMessageTypes.Hello,
           encodeHelloPayload({
             status: HelloStatus.Ok,
+            childId: 1n,
+            kind: 0,
             probe: Buffer.from([0xFF, 0x63, 0x30]),
             message: '',
           }),
@@ -450,6 +455,28 @@ describe('RuntimeIpcClient', () => {
     await expect(
       RuntimeIpcClient.connect({ socketPath, descriptorToken }),
     ).rejects.toThrow(/V8 serialization format mismatch/)
+  })
+
+  test('a Hello in the pre-facts layout rejects as a HandshakeError naming the remedy', async () => {
+    // An older binary: status, probe, message — no child id, kind or key.
+    const probe = serializationProbe()
+    const oldHello = Buffer.concat([
+      Buffer.from([HelloStatus.Ok]),
+      Buffer.from([0, 0, 0, probe.byteLength]),
+      probe,
+      Buffer.from([0, 0, 0, 0]),
+    ])
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Hello, oldHello))
+    })
+
+    const error = await RuntimeIpcClient.connect({ socketPath, descriptorToken }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(HandshakeError)
+    expect((error as Error).message).toMatch(/does not match this host's layout \(.+\)/)
+    expect((error as Error).message).toMatch(/Update @iso4\/sandbox and @iso4\/v8-\* together/)
   })
 
   test('rejects when the first runtime frame is not a Hello', async () => {

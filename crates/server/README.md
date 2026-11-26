@@ -5,9 +5,9 @@ This is the only crate that knows the wire.
 
 ## What it does
 
-1. `main.rs` parses the flags (`--socket`, `--warm-budget-bytes`,
+1. `main.rs` parses the flags (`--socket`, `--id`, `--warm-budget-bytes`,
    `--host-reserve-bytes`, `--idle-settle-secs`, `--cores`, `--node-pid`,
-   `--key`),
+   `--key`, `--kind`),
    opens the crash file, writes the pid file, prints one capacity line, creates one `Engine`, and
    accepts connections.
 2. `session.rs` runs each connection: the `Authenticate` handshake, then the
@@ -42,7 +42,7 @@ copies it into the platform package the TypeScript tests spawn. Directly:
 
 ```sh
 cargo build --manifest-path crates/Cargo.toml --package iso4-server
-crates/target/debug/iso4-v8 --socket /path/in/a/private/dir.sock
+crates/target/debug/iso4-v8 --socket /path/in/a/private/dir.sock --id 1
 ```
 
 The host hands the binary a fresh socket path inside a directory only it
@@ -51,6 +51,7 @@ can read; access control is that directory, not a token.
 ## Flags
 
 - `--socket <path>` (required): where to listen.
+- `--id <u64>` (required): this child's id, reported on every `Hello`.
 - `--warm-budget-bytes`, `--host-reserve-bytes`, `--idle-settle-secs`: the
   memory budget, the Node host's reserve, and the idle settle delay.
 - `--cores <n>` (n >= 1): use n in place of the machine's core count for the
@@ -63,8 +64,12 @@ can read; access control is that directory, not a token.
 - `--key <s>` (1 to 200 bytes): every `Run` and `Precompile` must carry this
   key; absent, they must carry none. A mismatch fails that request with
   `ERR_INTERNAL` and the connection stays. The crash line prints it.
+  Every `Hello` reports it.
+- `--kind prefix|oneoff|quarantine`: reported on every `Hello`; absent
+  reports none. It changes no behaviour yet.
 
-A bad value for any flag logs one line and exits 1.
+A bad value for any flag, or a missing `--socket` or `--id`, logs one line
+and exits 1.
 
 ## The pid file
 

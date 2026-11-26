@@ -1299,7 +1299,7 @@ direction. Both tables start at `0x01`.
 
 | Byte   | Name             | Purpose                                                                |
 | ------ | ---------------- | ---------------------------------------------------------------------- |
-| `0x01` | `Authenticate`   | First message on connect: protocol version + V8 format probe           |
+| `0x01` | `Authenticate`   | First message on connect: protocol version, peer role + V8 format probe |
 | `0x02` | `Run`            | Start a sandboxed execution in a fresh isolate                         |
 | `0x03` | `Precompile`     | Store prefix code under a `PrefixId` (nothing is evaluated, §16.4)      |
 | `0x04` | `PrefixRun`      | Execute against a prepared prefix (served by a warm instance, §13.2.1) |
@@ -1320,7 +1320,7 @@ TS → Rust byte: `0x0E`.
 | `0x02` | `Result`           | Final result for a run (always sent exactly once)      |
 | `0x03` | `PrecompileResult` | Outcome of a `Precompile` (ok or error)                |
 | `0x04` | `Log`              | Internal runtime diagnostics                           |
-| `0x05` | `Hello`            | Handshake accepted: protocol version + V8 format probe |
+| `0x05` | `Hello`            | Handshake answer: status, the child's id, kind and key + V8 format probe |
 | `0x06` | `StatsResult`      | The registry snapshot answering a `Stats` request      |
 | `0x0C` | `DisposePrefixResult` | A `DisposePrefix` is done: the prefix is dropped    |
 

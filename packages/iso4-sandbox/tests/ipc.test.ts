@@ -23,6 +23,7 @@ import {
   encodeBridgeResponsePayload,
   encodeHelloPayload,
   HelloStatus,
+  PeerRole,
 } from '../src/ipc'
 import { deserializeValue, serializationProbe, serializeValue } from '../src/v8-codec'
 
@@ -239,12 +240,14 @@ describe('Authenticate payload', () => {
     const probe = serializationProbe()
     const payload = encodeAuthenticatePayload({
       protocolVersion: PROTOCOL_VERSION,
+      role: PeerRole.Node,
       probe,
       descriptorToken,
     })
     const auth = decodeAuthenticatePayload(payload)
 
     expect(auth.protocolVersion).toBe(PROTOCOL_VERSION)
+    expect(auth.role).toBe(PeerRole.Node)
     expect(Buffer.from(auth.probe)).toEqual(probe)
     expect(Buffer.from(auth.descriptorToken)).toEqual(Buffer.from(descriptorToken))
   })
@@ -252,6 +255,7 @@ describe('Authenticate payload', () => {
   test('auth payload rejects a wrong-size descriptor token', () => {
     expect(() => encodeAuthenticatePayload({
       protocolVersion: PROTOCOL_VERSION,
+      role: PeerRole.Node,
       probe: serializationProbe(),
       descriptorToken: new Uint8Array(8),
     })).toThrow(/descriptor token must be exactly 16 bytes/)
@@ -271,34 +275,88 @@ describe('Authenticate payload', () => {
   })
 
   test('auth payload rejects a probe length past the end', () => {
-    const payload = Buffer.from([0x00, 0x02, 0x00, 0x00, 0x00, 0x63, 0xFF])
+    const payload = Buffer.from([0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x63, 0xFF])
     expect(() => decodeAuthenticatePayload(payload)).toThrow(
       /Authenticate payload truncated/,
     )
   })
+
+  test('the role byte sits right after the version', () => {
+    const payload = encodeAuthenticatePayload({
+      protocolVersion: PROTOCOL_VERSION,
+      role: PeerRole.Supervisor,
+      probe: serializationProbe(),
+      descriptorToken,
+    })
+    expect(payload.readUInt16BE(0)).toBe(PROTOCOL_VERSION)
+    expect(payload[2]).toBe(1)
+    expect(payload.readUInt32BE(3)).toBe(serializationProbe().byteLength)
+    expect(decodeAuthenticatePayload(payload).role).toBe(PeerRole.Supervisor)
+  })
+
+  test('auth payload rejects an unknown role', () => {
+    const payload = encodeAuthenticatePayload({
+      protocolVersion: PROTOCOL_VERSION,
+      role: PeerRole.Node,
+      probe: serializationProbe(),
+      descriptorToken,
+    })
+    payload[2] = 2
+    expect(() => decodeAuthenticatePayload(payload)).toThrow(/unknown peer role 2/)
+  })
 })
 
 describe('Hello payload', () => {
-  test('roundtrip preserves status, probe and message', () => {
+  test('roundtrip preserves status, child facts, probe and message', () => {
     const probe = serializationProbe()
     const hello = decodeHelloPayload(
       encodeHelloPayload({
         status: HelloStatus.V8FormatMismatch,
+        childId: 2n ** 64n - 1n,
+        kind: 3,
+        key: 'tenant-a',
         probe,
         message: 'format mismatch',
       }),
     )
     expect(hello.status).toBe(HelloStatus.V8FormatMismatch)
+    expect(hello.childId).toBe(2n ** 64n - 1n)
+    expect(hello.kind).toBe(3)
+    expect(hello.key).toBe('tenant-a')
     expect(Buffer.from(hello.probe)).toEqual(probe)
     expect(hello.message).toBe('format mismatch')
   })
 
   test('an accepting Hello carries an empty message', () => {
     const hello = decodeHelloPayload(
-      encodeHelloPayload({ status: HelloStatus.Ok, probe: serializationProbe(), message: '' }),
+      encodeHelloPayload({ status: HelloStatus.Ok, childId: 1n, kind: 0, probe: serializationProbe(), message: '' }),
     )
     expect(hello.status).toBe(HelloStatus.Ok)
     expect(hello.message).toBe('')
+  })
+
+  test('decodes the runtime layout byte for byte, key absent', () => {
+    const probe = serializationProbe()
+    const bytes = Buffer.concat([
+      Buffer.from([0x00]), // status ok
+      Buffer.from([0, 0, 0, 0, 0, 0, 0, 7]), // childId
+      Buffer.from([0x01]), // kind prefix
+      Buffer.from([0x00]), // key absent
+      Buffer.from([0, 0, 0, probe.byteLength]),
+      probe,
+      Buffer.from([0, 0, 0, 0]), // empty message
+    ])
+    const hello = decodeHelloPayload(bytes)
+    expect(hello.childId).toBe(7n)
+    expect(hello.kind).toBe(1)
+    expect('key' in hello).toBe(false)
+    expect(Buffer.from(hello.probe)).toEqual(probe)
+    expect(encodeHelloPayload(hello)).toEqual(bytes)
+  })
+
+  test('rejects trailing bytes', () => {
+    const bytes = encodeHelloPayload({ status: HelloStatus.Ok, childId: 1n, kind: 0, probe: serializationProbe(), message: '' })
+    expect(() => decodeHelloPayload(Buffer.concat([bytes, Buffer.from([0])]))).toThrow(/trailing bytes/)
   })
 
   test('rejects a truncated payload', () => {
