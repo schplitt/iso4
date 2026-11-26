@@ -154,6 +154,33 @@ pub enum HelloStatus {
     V8FormatMismatch = 2,
 }
 
+/// Who `Authenticate` says is connecting; believed as claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PeerRole {
+    Node = 0,
+    /// Skips the V8 probe comparison.
+    Supervisor = 1,
+}
+
+/// The child's `--kind`; only reported on `Hello`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChildKind {
+    None = 0,
+    Prefix = 1,
+    Oneoff = 2,
+    Quarantine = 3,
+}
+
+/// What every `Hello` reports about this child: `--id`, `--kind`, `--key`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildFacts {
+    pub id: u64,
+    pub kind: ChildKind,
+    pub key: Option<String>,
+}
+
 /// A raw wire frame after the outer envelope has been decoded.
 ///
 /// At this layer we do not yet interpret most payloads. We just split the
@@ -183,11 +210,13 @@ pub type RustToTsFrame = TypedFrame<RustToTsMessageType>;
 ///
 /// Payload layout:
 /// - `u16` protocol version (big-endian)
+/// - `u8` role (0 node, 1 supervisor)
 /// - `u32` probe length + probe bytes
 /// - `u32` token length + token bytes (exactly 16)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatePayload {
     pub protocol_version: u16,
+    pub role: PeerRole,
     /// The host's V8 serialization probe — a serialized `null` whose second
     /// byte is the format version Node writes. Compared against this binary's
     /// own write version during the handshake.
@@ -830,15 +859,25 @@ fn writer_loop(mut stream: UnixStream, inner: &OutboxShared) {
 /// Parse the payload bytes of an `Authenticate` frame per
 /// `docs/protocol.md` §5.1.
 pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayload> {
-    if payload.len() < 6 {
+    if payload.len() < 7 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "payload too short for Authenticate",
         ));
     }
     let protocol_version = u16::from_be_bytes([payload[0], payload[1]]);
-    let probe_len = u32::from_be_bytes([payload[2], payload[3], payload[4], payload[5]]) as usize;
-    let probe_end = 6usize
+    let role = match payload[2] {
+        0 => PeerRole::Node,
+        1 => PeerRole::Supervisor,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown peer role {other}"),
+            ))
+        }
+    };
+    let probe_len = u32::from_be_bytes([payload[3], payload[4], payload[5], payload[6]]) as usize;
+    let probe_end = 7usize
         .checked_add(probe_len)
         .filter(|end| *end + 4 <= payload.len())
         .ok_or_else(|| {
@@ -847,7 +886,7 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
                 "Authenticate payload truncated (probe)",
             )
         })?;
-    let probe = payload[6..probe_end].to_vec();
+    let probe = payload[7..probe_end].to_vec();
 
     let token_len = u32::from_be_bytes(
         payload[probe_end..probe_end + 4]
@@ -878,6 +917,7 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
     }
     Ok(AuthenticatePayload {
         protocol_version,
+        role,
         probe,
         descriptor_token: payload[probe_end + 4..token_end].to_vec(),
     })
@@ -887,8 +927,9 @@ pub fn parse_authenticate_payload(payload: &[u8]) -> io::Result<AuthenticatePayl
 /// `parse_authenticate_payload`, used by tests.
 #[cfg(test)]
 pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(6 + auth.probe.len() + 4 + auth.descriptor_token.len());
+    let mut payload = Vec::with_capacity(7 + auth.probe.len() + 4 + auth.descriptor_token.len());
     payload.extend_from_slice(&auth.protocol_version.to_be_bytes());
+    payload.push(auth.role as u8);
     payload.extend_from_slice(&(auth.probe.len() as u32).to_be_bytes());
     payload.extend_from_slice(&auth.probe);
     payload.extend_from_slice(&(auth.descriptor_token.len() as u32).to_be_bytes());
@@ -898,11 +939,29 @@ pub fn encode_authenticate_payload(auth: &AuthenticatePayload) -> Vec<u8> {
 
 /// Encode a `Hello` payload — the handshake acknowledgement.
 ///
-/// Layout: `u8 status`, `u32 probeLength + probe bytes`, `String message`
-/// (empty when `status = Ok`). See `docs/protocol.md` §5.1.
-pub fn encode_hello_payload(status: HelloStatus, probe: &[u8], message: &str) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(1 + 4 + probe.len() + 4 + message.len());
+/// Layout: `u8 status`, `u64 childId`, `u8 kind`, `Optional<String> key`,
+/// `u32 probeLength + probe bytes`, `String message` (empty when
+/// `status = Ok`). See `docs/protocol.md` §5.1.
+pub fn encode_hello_payload(
+    status: HelloStatus,
+    child: &ChildFacts,
+    probe: &[u8],
+    message: &str,
+) -> Vec<u8> {
+    let key_len = child.key.as_ref().map_or(0, |k| 4 + k.len());
+    let mut payload =
+        Vec::with_capacity(1 + 8 + 1 + 1 + key_len + 4 + probe.len() + 4 + message.len());
     payload.push(status as u8);
+    payload.extend_from_slice(&child.id.to_be_bytes());
+    payload.push(child.kind as u8);
+    match &child.key {
+        Some(key) => {
+            payload.push(1);
+            payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            payload.extend_from_slice(key.as_bytes());
+        }
+        None => payload.push(0),
+    }
     payload.extend_from_slice(&(probe.len() as u32).to_be_bytes());
     payload.extend_from_slice(probe);
     payload.extend_from_slice(&(message.len() as u32).to_be_bytes());
@@ -1683,6 +1742,7 @@ mod tests {
     fn authenticate_payload_roundtrip_preserves_version_probe_and_token() {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
+            role: PeerRole::Node,
             probe: vec![0xff, 0x0f, 0x30],
             descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         };
@@ -1697,6 +1757,7 @@ mod tests {
     fn authenticate_payload_rejects_trailing_bytes() {
         let auth = AuthenticatePayload {
             protocol_version: PROTOCOL_VERSION,
+            role: PeerRole::Node,
             probe: vec![0xff, 0x0f, 0x30],
             descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         };
@@ -1710,9 +1771,10 @@ mod tests {
 
     #[test]
     fn authenticate_payload_rejects_truncated_probe() {
-        // protocolVersion + a probe length that runs past the payload end.
+        // protocolVersion, role + a probe length that runs past the payload end.
         let mut v = Vec::new();
         v.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        v.push(PeerRole::Node as u8);
         push_u32(&mut v, 99);
         v.extend_from_slice(&[0xff, 0x0f]);
 
@@ -1784,6 +1846,7 @@ mod tests {
         for wrong_len in [0usize, 8, 15, 17, 32] {
             let auth = AuthenticatePayload {
                 protocol_version: PROTOCOL_VERSION,
+                role: PeerRole::Node,
                 probe: vec![0xff, 0x0f, 0x30],
                 descriptor_token: vec![0xab; wrong_len],
             };
@@ -1798,10 +1861,11 @@ mod tests {
 
     #[test]
     fn authenticate_payload_rejects_a_missing_descriptor_token() {
-        // The pre-token layout: version + probe, nothing after. The token is
+        // The pre-token layout: version, role + probe, nothing after. The token is
         // required; both halves release in lockstep, so absence is malformed.
         let mut v = Vec::new();
         v.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        v.push(PeerRole::Node as u8);
         push_u32(&mut v, 3);
         v.extend_from_slice(&[0xff, 0x0f, 0x30]);
 
@@ -1811,14 +1875,71 @@ mod tests {
     }
 
     #[test]
-    fn hello_payload_encodes_status_probe_and_message() {
-        let payload =
-            encode_hello_payload(HelloStatus::V8FormatMismatch, &[0xff, 0x0f, 0x30], "no");
+    fn authenticate_payload_roundtrips_the_supervisor_role() {
+        let auth = AuthenticatePayload {
+            protocol_version: PROTOCOL_VERSION,
+            role: PeerRole::Supervisor,
+            probe: vec![0x01],
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
+        };
+        let payload = encode_authenticate_payload(&auth);
+        assert_eq!(payload[2], 1, "role sits right after the version");
+        assert_eq!(parse_authenticate_payload(&payload).unwrap(), auth);
+    }
+
+    #[test]
+    fn authenticate_payload_rejects_an_unknown_role() {
+        let mut v = encode_authenticate_payload(&AuthenticatePayload {
+            protocol_version: PROTOCOL_VERSION,
+            role: PeerRole::Node,
+            probe: vec![0xff, 0x0f, 0x30],
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
+        });
+        v[2] = 2;
+        let err = parse_authenticate_payload(&v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "unknown peer role 2");
+    }
+
+    #[test]
+    fn hello_payload_encodes_status_facts_probe_and_message() {
+        let child = ChildFacts {
+            id: 0x0102_0304_0506_0708,
+            kind: ChildKind::Quarantine,
+            key: Some("k1".to_string()),
+        };
+        let payload = encode_hello_payload(
+            HelloStatus::V8FormatMismatch,
+            &child,
+            &[0xff, 0x0f, 0x30],
+            "no",
+        );
         assert_eq!(payload[0], HelloStatus::V8FormatMismatch as u8);
-        assert_eq!(&payload[1..5], &3u32.to_be_bytes());
-        assert_eq!(&payload[5..8], &[0xff, 0x0f, 0x30]);
-        assert_eq!(&payload[8..12], &2u32.to_be_bytes());
-        assert_eq!(&payload[12..], b"no");
+        assert_eq!(&payload[1..9], &0x0102_0304_0506_0708u64.to_be_bytes());
+        assert_eq!(payload[9], 3);
+        assert_eq!(payload[10], 1);
+        assert_eq!(&payload[11..15], &2u32.to_be_bytes());
+        assert_eq!(&payload[15..17], b"k1");
+        assert_eq!(&payload[17..21], &3u32.to_be_bytes());
+        assert_eq!(&payload[21..24], &[0xff, 0x0f, 0x30]);
+        assert_eq!(&payload[24..28], &2u32.to_be_bytes());
+        assert_eq!(&payload[28..], b"no");
+    }
+
+    #[test]
+    fn hello_payload_without_a_key_has_one_absent_byte() {
+        let child = ChildFacts {
+            id: 7,
+            kind: ChildKind::None,
+            key: None,
+        };
+        let payload = encode_hello_payload(HelloStatus::Ok, &child, &[0xff], "");
+        assert_eq!(payload[0], 0);
+        assert_eq!(&payload[1..9], &7u64.to_be_bytes());
+        assert_eq!(&payload[9..11], &[0, 0], "kind none, key absent");
+        assert_eq!(&payload[11..15], &1u32.to_be_bytes());
+        assert_eq!(payload[15], 0xff);
+        assert_eq!(&payload[16..], &0u32.to_be_bytes());
     }
 
     #[test]

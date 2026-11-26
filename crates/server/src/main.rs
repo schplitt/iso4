@@ -22,18 +22,19 @@ fn main() {
     // the Node host.
     oom::prefer_this_process_as_victim();
 
-    let (
-        socket_path,
+    let Args {
+        socket: socket_path,
         warm_budget_bytes,
         host_reserve_bytes,
         idle_settle_secs,
         cores,
         node_pid,
-        key,
-    ) = parse_args();
+        child,
+    } = parse_args();
+    let child = Arc::new(child);
 
     // Before V8 starts (`Engine::start` below), so a death in its start is recorded.
-    crash::install(&socket_path, key.as_deref());
+    crash::install(&socket_path, child.key.as_deref());
 
     if let Some(pid) = node_pid {
         process::watch_node(pid);
@@ -116,8 +117,8 @@ fn main() {
         match stream {
             Ok(stream) => {
                 let engine = Arc::clone(&engine);
-                let key = key.clone();
-                std::thread::spawn(move || session::handle_client(stream, engine, key));
+                let child = Arc::clone(&child);
+                std::thread::spawn(move || session::handle_client(stream, engine, child));
             }
             Err(e) => {
                 iso4_core::log!("[iso4-v8] accept error: {e}");
@@ -127,15 +128,17 @@ fn main() {
     }
 }
 
-fn parse_args() -> (
-    String,
-    u64,
-    u64,
-    u64,
-    Option<NonZeroUsize>,
-    Option<i32>,
-    Option<String>,
-) {
+struct Args {
+    socket: String,
+    warm_budget_bytes: u64,
+    host_reserve_bytes: u64,
+    idle_settle_secs: u64,
+    cores: Option<NonZeroUsize>,
+    node_pid: Option<i32>,
+    child: ipc::ChildFacts,
+}
+
+fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
     let mut warm_budget_bytes: u64 = 0;
@@ -144,6 +147,8 @@ fn parse_args() -> (
     let mut cores: Option<NonZeroUsize> = None;
     let mut node_pid: Option<i32> = None;
     let mut key: Option<String> = None;
+    let mut id: Option<u64> = None;
+    let mut kind = ipc::ChildKind::None;
 
     let mut i = 1;
     while i < args.len() {
@@ -242,6 +247,34 @@ fn parse_args() -> (
                 key = Some(value.clone());
                 i += 2;
             }
+            "--id" if i + 1 < args.len() => {
+                match args[i + 1].parse::<u64>() {
+                    Ok(n) => id = Some(n),
+                    Err(_) => {
+                        iso4_core::log!(
+                            "[iso4-v8] --id must be a non-negative integer, got {:?}",
+                            args[i + 1]
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
+            "--kind" if i + 1 < args.len() => {
+                // Only reported on Hello; absent = none.
+                kind = match args[i + 1].as_str() {
+                    "prefix" => ipc::ChildKind::Prefix,
+                    "oneoff" => ipc::ChildKind::Oneoff,
+                    "quarantine" => ipc::ChildKind::Quarantine,
+                    other => {
+                        iso4_core::log!(
+                            "[iso4-v8] --kind must be prefix, oneoff or quarantine, got {other:?}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                i += 2;
+            }
             arg => {
                 // Fatal, like every other bad input here. Continuing would
                 // leave a mistyped `--warm-budget-bytes` at its initial 0,
@@ -258,13 +291,18 @@ fn parse_args() -> (
         std::process::exit(1);
     });
 
-    (
+    let id = id.unwrap_or_else(|| {
+        iso4_core::log!("[iso4-v8] --id <u64> is required");
+        std::process::exit(1);
+    });
+
+    Args {
         socket,
         warm_budget_bytes,
         host_reserve_bytes,
         idle_settle_secs,
         cores,
         node_pid,
-        key,
-    )
+        child: ipc::ChildFacts { id, kind, key },
+    }
 }

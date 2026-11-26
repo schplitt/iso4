@@ -125,6 +125,10 @@ const DEFAULT_MAX_QUEUED_RUNS = 10_000
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
+// The next child's `--id`. One counter per module instance, so per thread:
+// ids are not unique across worker threads yet.
+let nextChildId = 1
+
 export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> {
   if (options !== undefined && 'maxIsolates' in options) {
     // Untyped callers would otherwise silently fall back to the default
@@ -186,6 +190,8 @@ export async function createSandbox(options?: SandboxOptions): Promise<Sandbox> 
   const proc = spawn(binaryPath, [
     '--socket',
     socketPath,
+    '--id',
+    String(nextChildId++),
     '--warm-budget-bytes',
     String(warmBudgetBytes),
     '--host-reserve-bytes',

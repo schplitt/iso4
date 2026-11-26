@@ -50,6 +50,7 @@ fn a_closed_stderr_pipe_does_not_end_the_session() {
     let child = Command::new(env!("CARGO_BIN_EXE_iso4-v8"))
         .arg("--socket")
         .arg(&socket)
+        .args(["--id", "1"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -76,9 +77,10 @@ fn a_closed_stderr_pipe_does_not_end_the_session() {
 
     let mut stream = UnixStream::connect(&socket).unwrap();
     stream.set_read_timeout(Some(TIMEOUT)).unwrap();
-    // Wire constants from `src/ipc.rs`: protocol 1, a format-15 serialized
-    // null as the probe, a 16-byte token.
+    // Wire constants from `src/ipc.rs`: protocol 1, role node, a format-15
+    // serialized null as the probe, a 16-byte token.
     let mut auth = 1u16.to_be_bytes().to_vec();
+    auth.push(0);
     auth.extend_from_slice(&3u32.to_be_bytes());
     auth.extend_from_slice(&[0xFF, 0x0F, 0x30]);
     auth.extend_from_slice(&16u32.to_be_bytes());

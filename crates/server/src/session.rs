@@ -69,11 +69,16 @@ impl Read for HandshakeReader<'_> {
 
 /// Best-effort `Hello` write on a rejected handshake. The connection is about
 /// to close either way, so a write failure here is only worth a log line.
-fn send_hello(stream: &mut UnixStream, status: ipc::HelloStatus, message: &str) {
+fn send_hello(
+    stream: &mut UnixStream,
+    status: ipc::HelloStatus,
+    child: &ipc::ChildFacts,
+    message: &str,
+) {
     if let Err(e) = ipc::write_rust_to_ts_frame(
         stream,
         ipc::RustToTsMessageType::Hello,
-        &ipc::encode_hello_payload(status, iso4_core::wire::probe(), message),
+        &ipc::encode_hello_payload(status, child, iso4_core::wire::probe(), message),
     ) {
         iso4_core::log!("[iso4-v8] failed to write rejection Hello frame: {e}");
     }
@@ -260,8 +265,8 @@ fn check_key(
     ))
 }
 
-/// `key` is this child's `--key`; every `Run` and `Precompile` must carry it.
-pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<String>) {
+/// `child` is this child's flags; every `Run` and `Precompile` must carry its key.
+pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, child: Arc<ipc::ChildFacts>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
     // The first frame comes from a peer that has shown nothing yet, so it is
@@ -319,6 +324,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<St
         send_hello(
             &mut stream,
             ipc::HelloStatus::ProtocolVersionMismatch,
+            &child,
             &message,
         );
         return;
@@ -340,6 +346,8 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<St
     let host_version = iso4_core::wire::probe_format_version(&auth.probe);
     let read_version = iso4_core::wire::read_format_version();
     match host_version {
+        // A supervisor's probe is parsed but never compared.
+        _ if auth.role == ipc::PeerRole::Supervisor => {}
         Some(v) if v <= read_version => {}
         _ => {
             let message = format!(
@@ -351,7 +359,12 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<St
                     .unwrap_or_else(|| "an unrecognised format".to_string()),
             );
             iso4_core::log!("[iso4-v8] {message} — closing");
-            send_hello(&mut stream, ipc::HelloStatus::V8FormatMismatch, &message);
+            send_hello(
+                &mut stream,
+                ipc::HelloStatus::V8FormatMismatch,
+                &child,
+                &message,
+            );
             return;
         }
     }
@@ -359,7 +372,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<St
     if let Err(e) = ipc::write_rust_to_ts_frame(
         &mut stream,
         ipc::RustToTsMessageType::Hello,
-        &ipc::encode_hello_payload(ipc::HelloStatus::Ok, iso4_core::wire::probe(), ""),
+        &ipc::encode_hello_payload(ipc::HelloStatus::Ok, &child, iso4_core::wire::probe(), ""),
     ) {
         iso4_core::log!("[iso4-v8] failed to write Hello frame: {e}");
         return;
@@ -449,7 +462,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<St
                 };
                 let run_id = req.run_id;
                 let what = || format!("run {run_id}");
-                if let Err(message) = check_key(key.as_deref(), frame_key.as_deref(), what) {
+                if let Err(message) = check_key(child.key.as_deref(), frame_key.as_deref(), what) {
                     engine.refuse(&caller, run_id, Refusal::Internal(message));
                     continue;
                 }
@@ -466,7 +479,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<St
                     }
                 };
                 let what = || format!("Precompile of prefix id {:?}", payload.id);
-                let error = match check_key(key.as_deref(), payload.key.as_deref(), what) {
+                let error = match check_key(child.key.as_deref(), payload.key.as_deref(), what) {
                     Err(message) => Some(Refusal::Internal(message).to_payload()),
                     Ok(()) => engine
                         .prepare(
@@ -729,12 +742,26 @@ mod tests {
         assert!(err.contains("stream chunk decode"), "{err}");
     }
 
+    /// A child started with `--id 1`, no `--kind`, and `--key` when `key` is set.
+    fn facts(key: Option<&str>) -> Arc<ipc::ChildFacts> {
+        Arc::new(ipc::ChildFacts {
+            id: 1,
+            kind: ipc::ChildKind::None,
+            key: key.map(str::to_string),
+        })
+    }
+
     /// Drive `handle_client` over a socket pair with the given Authenticate
     /// payload and return the first frame it writes back (if any).
     fn handshake(payload: Vec<u8>) -> Option<ipc::RustToTsFrame> {
+        handshake_as(payload, facts(None))
+    }
+
+    /// [`handshake`] against a child with the given flags.
+    fn handshake_as(payload: Vec<u8>, child: Arc<ipc::ChildFacts>) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
         let engine = Arc::new(iso4_core::testing::engine(0, 0));
-        let server = std::thread::spawn(move || handle_client(runtime, engine, None));
+        let server = std::thread::spawn(move || handle_client(runtime, engine, child));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)
             .unwrap();
@@ -758,9 +785,9 @@ mod tests {
         let (host, runtime) = UnixStream::pair().unwrap();
         let engine = Arc::new(iso4_core::testing::engine(0, 0));
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let key = key.map(str::to_string);
+        let child = facts(key);
         std::thread::spawn(move || {
-            handle_client(runtime, engine, key);
+            handle_client(runtime, engine, child);
             let _ = done_tx.send(());
         });
         (host, done_rx)
@@ -805,8 +832,13 @@ mod tests {
     }
 
     fn authenticate(probe: Vec<u8>) -> Vec<u8> {
+        authenticate_as(ipc::PeerRole::Node, probe)
+    }
+
+    fn authenticate_as(role: ipc::PeerRole, probe: Vec<u8>) -> Vec<u8> {
         ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
+            role,
             probe,
             descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         })
@@ -814,14 +846,37 @@ mod tests {
 
     /// `status`, `probe`, `message` out of a `Hello` payload.
     fn parse_hello(payload: &[u8]) -> (u8, Vec<u8>, String) {
-        let status = payload[0];
-        let probe_len = u32::from_be_bytes(payload[1..5].try_into().unwrap()) as usize;
-        let probe = payload[5..5 + probe_len].to_vec();
-        let msg_start = 5 + probe_len + 4;
+        let (status, _, rest) = split_hello(payload);
+        let probe_len = u32::from_be_bytes(rest[0..4].try_into().unwrap()) as usize;
+        let probe = rest[4..4 + probe_len].to_vec();
+        let msg_start = 4 + probe_len + 4;
         let msg_len =
-            u32::from_be_bytes(payload[5 + probe_len..msg_start].try_into().unwrap()) as usize;
-        let message = String::from_utf8(payload[msg_start..msg_start + msg_len].to_vec()).unwrap();
+            u32::from_be_bytes(rest[4 + probe_len..msg_start].try_into().unwrap()) as usize;
+        assert_eq!(rest.len(), msg_start + msg_len, "no trailing bytes");
+        let message = String::from_utf8(rest[msg_start..msg_start + msg_len].to_vec()).unwrap();
         (status, probe, message)
+    }
+
+    /// `status`, the child facts, and the bytes from the probe on.
+    fn split_hello(payload: &[u8]) -> (u8, ipc::ChildFacts, &[u8]) {
+        let id = u64::from_be_bytes(payload[1..9].try_into().unwrap());
+        let kind = match payload[9] {
+            0 => ipc::ChildKind::None,
+            1 => ipc::ChildKind::Prefix,
+            2 => ipc::ChildKind::Oneoff,
+            3 => ipc::ChildKind::Quarantine,
+            other => panic!("kind {other}"),
+        };
+        let (key, rest) = match payload[10] {
+            0 => (None, &payload[11..]),
+            1 => {
+                let len = u32::from_be_bytes(payload[11..15].try_into().unwrap()) as usize;
+                let key = String::from_utf8(payload[15..15 + len].to_vec()).unwrap();
+                (Some(key), &payload[15 + len..])
+            }
+            other => panic!("key presence {other}"),
+        };
+        (payload[0], ipc::ChildFacts { id, kind, key }, rest)
     }
 
     #[test]
@@ -887,6 +942,7 @@ mod tests {
     fn protocol_version_mismatch_is_refused_loudly() {
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION + 1,
+            role: ipc::PeerRole::Node,
             probe: iso4_core::wire::probe().to_vec(),
             descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
         });
@@ -894,6 +950,98 @@ mod tests {
         let (status, _, message) = parse_hello(&frame.payload);
         assert_eq!(status, ipc::HelloStatus::ProtocolVersionMismatch as u8);
         assert!(message.contains("protocol version mismatch"), "{message}");
+    }
+
+    #[test]
+    fn a_supervisor_with_a_wrong_probe_is_accepted() {
+        let frame = handshake(authenticate_as(ipc::PeerRole::Supervisor, vec![0x01, 0x02]))
+            .expect("expected a Hello frame");
+        let (status, probe, message) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::Ok as u8);
+        assert_eq!(probe, iso4_core::wire::probe(), "the child's own probe");
+        assert_eq!(message, "");
+    }
+
+    #[test]
+    fn a_supervisor_still_gets_the_version_check() {
+        let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
+            protocol_version: ipc::PROTOCOL_VERSION + 1,
+            role: ipc::PeerRole::Supervisor,
+            probe: iso4_core::wire::probe().to_vec(),
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
+        });
+        let frame = handshake(payload).expect("expected a Hello frame");
+        let (status, _, _) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::ProtocolVersionMismatch as u8);
+    }
+
+    #[test]
+    fn node_with_a_wrong_probe_is_still_refused() {
+        let frame = handshake(authenticate_as(ipc::PeerRole::Node, vec![0x01, 0x02]))
+            .expect("expected a Hello frame");
+        let (status, _, _) = parse_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::V8FormatMismatch as u8);
+    }
+
+    #[test]
+    fn an_unknown_role_closes_without_a_hello() {
+        let mut payload = authenticate(iso4_core::wire::probe().to_vec());
+        payload[2] = 2;
+        assert!(handshake(payload).is_none());
+    }
+
+    #[test]
+    fn hello_reports_the_child_facts() {
+        let child = Arc::new(ipc::ChildFacts {
+            id: u64::MAX,
+            kind: ipc::ChildKind::Oneoff,
+            key: Some("tenant-a".to_string()),
+        });
+        let frame = handshake_as(
+            authenticate(iso4_core::wire::probe().to_vec()),
+            Arc::clone(&child),
+        )
+        .expect("expected a Hello frame");
+        let (status, got, _) = split_hello(&frame.payload);
+        assert_eq!(status, ipc::HelloStatus::Ok as u8);
+        assert_eq!(got, *child);
+        // The probe and message still follow the facts, with nothing after.
+        let (_, probe, message) = parse_hello(&frame.payload);
+        assert_eq!(probe, iso4_core::wire::probe());
+        assert_eq!(message, "");
+    }
+
+    #[test]
+    fn hello_reports_no_kind_and_no_key_when_absent() {
+        let frame = handshake(authenticate(iso4_core::wire::probe().to_vec()))
+            .expect("expected a Hello frame");
+        let (_, got, _) = split_hello(&frame.payload);
+        assert_eq!(got, *facts(None));
+    }
+
+    #[test]
+    fn rejection_hellos_carry_the_child_facts() {
+        let child = Arc::new(ipc::ChildFacts {
+            id: 42,
+            kind: ipc::ChildKind::Prefix,
+            key: Some("k".to_string()),
+        });
+        let wrong_probe = authenticate(vec![0x01, 0x02]);
+        let wrong_version = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
+            protocol_version: ipc::PROTOCOL_VERSION + 1,
+            role: ipc::PeerRole::Node,
+            probe: iso4_core::wire::probe().to_vec(),
+            descriptor_token: vec![0xab; iso4_core::wire::DESCRIPTOR_TOKEN_LEN],
+        });
+        for (payload, want) in [
+            (wrong_probe, ipc::HelloStatus::V8FormatMismatch),
+            (wrong_version, ipc::HelloStatus::ProtocolVersionMismatch),
+        ] {
+            let frame = handshake_as(payload, Arc::clone(&child)).expect("expected a Hello frame");
+            let (status, got, _) = split_hello(&frame.payload);
+            assert_eq!(status, want as u8);
+            assert_eq!(got, *child);
+        }
     }
 
     // ── The demux: several runs on one connection ─────────────────────────
@@ -1615,6 +1763,7 @@ mod tests {
         // as any other malformed Authenticate.
         let payload = ipc::encode_authenticate_payload(&ipc::AuthenticatePayload {
             protocol_version: ipc::PROTOCOL_VERSION,
+            role: ipc::PeerRole::Node,
             probe: iso4_core::wire::probe().to_vec(),
             descriptor_token: vec![0xab; 8],
         });

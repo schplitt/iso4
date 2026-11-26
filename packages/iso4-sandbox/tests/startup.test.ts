@@ -149,3 +149,23 @@ describe('socket placement', () => {
     }
   }, 20_000)
 })
+
+describe('child id', () => {
+  test('each spawned child gets its own --id', async () => {
+    const idFile = join(dir, 'ids.txt')
+    const binaryPath = await fakeRuntime('records-id.mjs', `
+      import { appendFileSync } from 'node:fs'
+      const argv = process.argv
+      appendFileSync(${JSON.stringify(idFile)}, argv[argv.indexOf('--id') + 1] + '\\n')
+      process.exit(3)
+    `)
+
+    await expect(createSandbox({ binaryPath, maxConcurrentRuns: 1 })).rejects.toThrow()
+    await expect(createSandbox({ binaryPath, maxConcurrentRuns: 1 })).rejects.toThrow()
+
+    const ids = (await readFile(idFile, 'utf8')).trim().split('\n').map(Number)
+    expect(ids).toHaveLength(2)
+    expect(Number.isInteger(ids[0]) && ids[0]! >= 1).toBe(true)
+    expect(ids[1]).toBe(ids[0]! + 1)
+  })
+})
