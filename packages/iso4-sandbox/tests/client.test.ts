@@ -212,6 +212,36 @@ describe('RuntimeIpcClient', () => {
     await client.dispose()
   })
 
+  test('two connections sharing a run id counter never send the same run id', async () => {
+    const seen: number[] = []
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      for (;;) {
+        const frame = await reader.readFrame().catch(() => undefined)
+        if (frame?.messageType !== TsToRustMessageTypes.Run)
+          return
+        const runId = Buffer.from(frame.payload.buffer, frame.payload.byteOffset, 4).readUInt32BE(0)
+        seen.push(runId)
+        socket.write(encodeRustToTsFrame(RustToTsMessageTypes.Result, resultPayload(runId, 'ok')))
+      }
+    })
+
+    const runIds = { last: 0 }
+    const a = await RuntimeIpcClient.connect({ socketPath, descriptorToken, runIds })
+    const b = await RuntimeIpcClient.connect({ socketPath, descriptorToken, runIds })
+    await a.runRawCode('export default 1')
+    await b.runRawCode('export default 2')
+    await a.runRawCode('export default 3')
+    await b.runRawCode('export default 4')
+
+    expect(seen).toEqual([1, 2, 3, 4])
+    await a.dispose()
+    await b.dispose()
+  })
+
   test('dispose() sends Close before ending the socket', async () => {
     let sent!: Promise<number[]>
     const socketPath = await listen(async (socket) => {
@@ -752,7 +782,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
-    ;(client as unknown as { nextRunId: number }).nextRunId = 0x7FFFFFFF
+    ;(client as unknown as { runIds: { last: number } }).runIds.last = 0x7FFFFFFF
 
     await expect(client.runRawCode('export default 42')).resolves.toBeDefined()
     expect(sentRunId).toBe(0x80000000)
