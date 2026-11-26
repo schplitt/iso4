@@ -1,5 +1,68 @@
 # @iso4/sandbox
 
+## 0.10.0
+
+### Minor Changes
+
+- af44e16: feat(native): the runtime writes one fatal line to a `crash` file next to its socket and to stderr when it dies
+
+  The line is `key=value` (`[iso4-v8] fatal cause=oom-heap phase=oneoff run=1 msg="..."`), replaces the old out of memory sentence, and also covers V8 fatal errors and SIGSEGV, SIGTRAP, SIGABRT, SIGBUS and SIGILL, after which the runtime dies by the same signal.
+
+- b1a8ed1: feat(sandbox): allow `node:async_hooks` (`AsyncLocalStorage`) in prefix code
+
+  Create the instance at module scope and use it inside an exported handler, as in workerd; importing it from a prefix no longer fails with `ERR_MODULE_NOT_FOUND`.
+
+- ee6cf4c: feat(sandbox): calling a prefix the runtime no longer holds returns a failed result with `ERR_PREFIX_UNKNOWN`
+
+  Before, it threw `ERR_PREFIX_DISPOSED`. Calling a handle you disposed yourself still throws `ERR_PREFIX_DISPOSED`.
+
+- d73d77a: feat(sandbox): `prepare({ id, code })` takes a host-chosen prefix id, and `id` is now required
+
+  Calls to `prepare({ code })` without an `id` now throw a `TypeError`. Preparing an id still held with the same code and memory limits returns another handle to the same prefix (the last `dispose()` drops it); other code or other memory limits throw `ERR_PREFIX_ID_TAKEN`.
+  The runtime answers `DisposePrefix` with a new `DisposePrefixResult` frame, and the last handle's `dispose()` resolves once the runtime confirmed it, or once the connection or the runtime ended first.
+
+- b1a8ed1: feat(sandbox)!: remove `prefix.execute()` and the deprecated `prefix.run()`
+
+  A prefix is full code: runs call one of its exports with `prefix.call({ export, args })`. Move per-run code into an exported function on the prefix, or run it once with `sandbox.run({ code })`.
+
+- fc1da0e: feat(native): the runtime writes a `pid` file next to its socket
+
+  It fails to start if it cannot write that file or read its own start time, which on Linux needs a readable `/proc`.
+
+### Patch Changes
+
+- 90afc0f: fix(sandbox): bridge call records count the serialized values only
+
+  `argBytes` and `responseBytes`, and the `maxBridgeCallBytes` check, now measure the args and response blobs alone, no longer the frame header around them (a few dozen bytes per call).
+
+- 15f6bef: feat(native): the runtime takes an optional `--key` and checks it on every `Run` and `Precompile`
+
+  Both frames now carry an optional key after the run id or prefix id; Node sends none, so nothing changes for callers. A runtime started with `--key` refuses a frame whose key differs with `ERR_INTERNAL`, and prints the key on its crash line.
+
+- 09ca313: feat(native): the runtime takes a required `--id` and an optional `--kind`, and reports its id, kind and key on every `Hello`
+
+  `Authenticate` now carries a role byte after the protocol version (Node sends `node`; a `supervisor` skips the V8 probe comparison), and Node starts each runtime with its own `--id`. Nothing changes for callers.
+
+- 1074b67: fix(native): fail more heap-limit blow-ups with `ERR_MEMORY_LIMIT` instead of killing the runtime
+
+  A run that reaches its heap limit now fails with `ERR_MEMORY_LIMIT` in more cases instead of ending the runtime child, and a run that ends a turn with its heap over its hard memory line fails the same way. Some single allocations far past the limit still end the runtime child.
+
+- 1529533: feat(native): the runtime answers `ListPrefixes` from a supervisor-role connection with the prefixes it holds
+
+  Each row carries the prefix id, code hash, live or broken state and heap limits; a node-role connection is refused with `ERR_INTERNAL` and stays open. Node never sends the frame, so nothing changes for callers.
+
+- aab1bca: fix(native): name the run in the fatal OOM line when V8 runs out of memory on a GC worker thread
+
+  The line now names the run of the isolate that ran out of memory, also when V8 reports it from a worker thread, where it used to name no run.
+
+- 9e028c2: refactor(native): a prefix's heap cap is sent once at `prepare()` and stored by the runtime
+
+  `Precompile` carries the heap cap and `PrefixRun` no longer does, so every run on a prefix uses the cap set at prepare. The limits travel as two wire blocks, heap and run limits. No API change.
+
+- 7eebea2: fix: run ids are numbered per sandbox instead of per connection
+
+  A run id now names one run in the runtime, so `run=N` on the crash line and `culpritRunId` on errors point at a single run.
+
 ## 0.9.0
 
 ### Minor Changes
