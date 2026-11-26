@@ -96,7 +96,7 @@ async function main(): Promise<void> {
   }
 
   async function prepareAndCall(sandbox: SandboxModule.Sandbox, code: string, memoryMb: number): Promise<void> {
-    const prefix = await sandbox.prepare({ code, memoryMb })
+    const prefix = await sandbox.prepare({ id: crypto.randomUUID(), code, memoryMb })
     const result = await prefix.call({ export: 'f' })
     if (!result.ok)
       throw new Error(`[counted] prefix call failed: ${result.error.code}`)

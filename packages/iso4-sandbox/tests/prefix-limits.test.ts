@@ -35,6 +35,7 @@ function lastWireLimits(spy: ReturnType<typeof vi.spyOn>): Record<string, unknow
 describe('prepare({ limits }) as per-run defaults', () => {
   test('a run without limits sends the prefix defaults', async () => {
     const prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: 'export default () => 1',
       limits: { cpuTimeMs: 250, maxBridgeCalls: 3 },
     })
@@ -46,6 +47,7 @@ describe('prepare({ limits }) as per-run defaults', () => {
 
   test('per-run limits override field by field; an explicit undefined keeps the default', async () => {
     const prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: 'export default () => 1',
       limits: { cpuTimeMs: 250, maxBridgeCalls: 3 },
     })
@@ -59,7 +61,7 @@ describe('prepare({ limits }) as per-run defaults', () => {
   })
 
   test('a field set nowhere is absent on the wire so the runtime default applies', async () => {
-    const prefix = await sandbox.prepare({ code: 'export default () => 1', limits: { cpuTimeMs: 250 } })
+    const prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => 1', limits: { cpuTimeMs: 250 } })
     const spy = vi.spyOn(RuntimeIpcClient.prototype, 'prefixRun')
     await prefix.call({ export: 'default' })
     expect(lastWireLimits(spy)).not.toHaveProperty('wallTimeMs')
@@ -68,6 +70,7 @@ describe('prepare({ limits }) as per-run defaults', () => {
 
   test('the default is enforced by the runtime and a run can loosen it', async () => {
     const prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: 'export default async () => { await tool(); await tool(); return "ok" }',
       globals: { tool: async () => 1 },
       limits: { maxBridgeCalls: 1 },
@@ -83,10 +86,10 @@ describe('prepare({ limits }) as per-run defaults', () => {
 
   test('an invalid default rejects at prepare() without a round trip', async () => {
     const spy = vi.spyOn(RuntimeIpcClient.prototype, 'precompile')
-    await expect(sandbox.prepare({ code: 'export default 1', limits: { cpuTimeMs: -1 } }))
+    await expect(sandbox.prepare({ id: crypto.randomUUID(), code: 'export default 1', limits: { cpuTimeMs: -1 } }))
       .rejects
       .toThrow(TypeError)
-    await expect(sandbox.prepare({ code: 'export default 1', limits: 5 as never }))
+    await expect(sandbox.prepare({ id: crypto.randomUUID(), code: 'export default 1', limits: 5 as never }))
       .rejects
       .toThrow(TypeError)
     expect(spy).not.toHaveBeenCalled()
@@ -95,7 +98,7 @@ describe('prepare({ limits }) as per-run defaults', () => {
 
 test('the defaults are a snapshot: editing the caller object after prepare() changes nothing', async () => {
   const limits = { cpuTimeMs: 250 }
-  const prefix = await sandbox.prepare({ code: 'export default () => 1', limits })
+  const prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => 1', limits })
   limits.cpuTimeMs = -1
   const spy = vi.spyOn(RuntimeIpcClient.prototype, 'prefixRun')
   await prefix.call({ export: 'default' })

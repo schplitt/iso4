@@ -32,7 +32,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     for (let round = 0; round < 3; round++) {
       const prefixes = await Promise.all(
         Array.from({ length: 8 }, (_, i) =>
-          sandbox.prepare({ code: `export function tag() { return ${round * 8 + i} }` })),
+          sandbox.prepare({ id: crypto.randomUUID(), code: `export function tag() { return ${round * 8 + i} }` })),
       )
       const results = await Promise.all(
         prefixes.map(async (prefix, i) => {
@@ -55,6 +55,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     // Afterwards the prefix must still serve a clean call.
     await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
     await using prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `${COUNTER}\nexport function spin() { for (;;) {} }`,
     })
 
@@ -98,7 +99,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     // never depends on warmth).
     await using pressured = await createSandbox({ maxConcurrentRuns: 2, memoryBudgetMb: 8 })
     const prefixes = await Promise.all(
-      Array.from({ length: 3 }, () => pressured.prepare({ code: COUNTER })),
+      Array.from({ length: 3 }, () => pressured.prepare({ id: crypto.randomUUID(), code: COUNTER })),
     )
     try {
       for (let round = 0; round < 3; round++) {
@@ -128,7 +129,7 @@ describe('stress smoke: execution model under concurrent load', () => {
     // queue drains completely — no starvation, no dropped calls — and that
     // stats() keeps answering from its control connection mid-saturation.
     await using single = await createSandbox({ maxConcurrentRuns: 1 })
-    await using prefix = await single.prepare({ code: COUNTER })
+    await using prefix = await single.prepare({ id: crypto.randomUUID(), code: COUNTER })
 
     const flood = Promise.all(
       Array.from({ length: 32 }, () => prefix.call({ export: 'bump' })),

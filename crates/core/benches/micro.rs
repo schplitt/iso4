@@ -572,14 +572,18 @@ fn bench_engine(c: &mut Criterion) {
     });
 
     // One call into an idle warm instance.
-    let warm_prefix = engine.prepare(
-        "export function f(){ return 1 }".to_string(),
-        None,
-        HeapLimits::default(),
-        Vec::new(),
-        Vec::new(),
-        [0; 16],
-    );
+    let warm_prefix = "warm".to_string();
+    engine
+        .prepare(
+            warm_prefix.clone(),
+            "export function f(){ return 1 }".to_string(),
+            None,
+            HeapLimits::default(),
+            Vec::new(),
+            Vec::new(),
+            [0; 16],
+        )
+        .expect("stored");
     run_id += 1;
     let handle = prefix_run(&warm_prefix, run_id, Vec::new());
     expect_success(next(&host));
@@ -594,14 +598,18 @@ fn bench_engine(c: &mut Criterion) {
     });
 
     // One iteration = one warm prefix_run plus one host bridge call.
-    let bridge_prefix = engine.prepare(
-        "export async function f(){ return await tool() }".to_string(),
-        None,
-        HeapLimits::default(),
-        vec![HostGlobalDef::bridge("tool")],
-        Vec::new(),
-        [0; 16],
-    );
+    let bridge_prefix = "bridge".to_string();
+    engine
+        .prepare(
+            bridge_prefix.clone(),
+            "export async function f(){ return await tool() }".to_string(),
+            None,
+            HeapLimits::default(),
+            vec![HostGlobalDef::bridge("tool")],
+            Vec::new(),
+            [0; 16],
+        )
+        .expect("stored");
     let answer = testval::to_blob(&testval::TestValue::Number(1.0));
     let round_trip = |run_id: u32| {
         // The run binds `tool` to this caller's host session.

@@ -5,6 +5,7 @@
  * lazily opened UDS connections, and exposes the `Sandbox` + `Prefix` API.
  */
 
+import { Buffer } from 'node:buffer'
 import { access, mkdtemp, rm } from 'node:fs/promises'
 import { rmSync } from 'node:fs'
 import { availableParallelism, tmpdir, totalmem } from 'node:os'
@@ -689,6 +690,11 @@ function desyncResult(error: ProtocolDesyncError): RunFailure {
 }
 
 /**
+ * The longest `prepare({ id })`, in UTF-8 bytes; the runtime enforces it too.
+ */
+const MAX_PREFIX_ID_BYTES = 200
+
+/**
  * Codes the runtime reports for a run whose options are invalid. The client
  * checks first; this catches what it cannot know, such as a prefix whose
  * cold start broke it. Runs throw these, like `prepare()`, instead of returning them.
@@ -759,6 +765,15 @@ class SandboxImpl implements Sandbox {
    * descriptor this host emits.
    */
   private readonly brandKey: string
+  /**
+   * Live handles per prefix id; the runtime drops the prefix when the last
+   * one is disposed. `stored`: a prepare under this hold reached the runtime.
+   */
+  private readonly prefixHolds = new Map<string, { holders: number, stored: boolean }>()
+  /**
+   * Disposes still waiting for the runtime's answer, by id; a prepare of the id waits for it.
+   */
+  private readonly prefixDisposes = new Map<string, Promise<void>>()
   private _alive = true
 
   constructor(
@@ -978,6 +993,16 @@ class SandboxImpl implements Sandbox {
   ): Promise<Prefix<G, M>> {
     if (typeof options.code !== 'string')
       throw new TypeError(`prepare({ code }) must be a string, got ${options.code === null ? 'null' : typeof options.code}`)
+    const id: unknown = options.id
+    if (typeof id !== 'string')
+      throw new TypeError(`prepare({ id }) must be a string, got ${id === null ? 'null' : typeof id}`)
+    if (id.length === 0)
+      throw new TypeError('prepare({ id }) must not be empty')
+    if (!id.isWellFormed())
+      throw new TypeError('prepare({ id }) must be well-formed Unicode (no lone surrogates)')
+    const idBytes = Buffer.byteLength(id, 'utf8')
+    if (idBytes > MAX_PREFIX_ID_BYTES)
+      throw new TypeError(`prepare({ id }) must be at most ${MAX_PREFIX_ID_BYTES} UTF-8 bytes, got ${idBytes}`)
     validateMemoryMb(options.memoryMb, 'memoryMb')
     validateLimits(options.limits)
     // Per-prefix heap cap (#77): sent once on Precompile; the runtime stores
@@ -987,27 +1012,74 @@ class SandboxImpl implements Sandbox {
     const rawGlobals = options.globals ?? {} as G
     const { defs } = processGlobals(rawGlobals)
     const declaredGlobals = declareGlobals(rawGlobals)
-    return this.pool.withClient(async (client) => {
-      await materializeHostTypesInGlobals(defs, this.brandKey)
-      // The declared import shape travels as data and is stored with the
-      // prefix on the Rust side — it is the runtime's reference for building
-      // the modules on every run and for validating rebind attempts. The
-      // handler map is kept here as the per-run dispatch defaults.
-      const { bindings, handlers } = processImports(options.imports)
-      const { reply, hash } = await client.precompile({
-        code: options.code,
-        filename: options.filename,
-        heap: heapCapsForWire(prefixMemoryMb),
-        globals: defs,
-        imports: bindings,
+    // The runtime must drop the old prefix before this Precompile reaches it.
+    for (let pending = this.prefixDisposes.get(id); pending !== undefined; pending = this.prefixDisposes.get(id))
+      await pending.catch(() => {})
+    // Held from the request on, so a concurrent dispose of the same id cannot drop it.
+    const hold = this.prefixHolds.get(id) ?? { holders: 0, stored: false }
+    hold.holders++
+    this.prefixHolds.set(id, hold)
+    const release = async (): Promise<void> => {
+      if (--hold.holders > 0)
+        return
+      if (this.prefixHolds.get(id) === hold)
+        this.prefixHolds.delete(id)
+      if (hold.stored)
+        await this.dropPrefix(id)
+    }
+    let prefix: Prefix<G, M>
+    try {
+      prefix = await this.pool.withClient(async (client) => {
+        await materializeHostTypesInGlobals(defs, this.brandKey)
+        // The declared import shape travels as data and is stored with the
+        // prefix on the Rust side — it is the runtime's reference for building
+        // the modules on every run and for validating rebind attempts. The
+        // handler map is kept here as the per-run dispatch defaults.
+        const { bindings, handlers } = processImports(options.imports)
+        // Set before sending: a lost reply must still dispose what the runtime stored.
+        hold.stored = true
+        const { reply, hash } = await client.precompile({
+          id,
+          code: options.code,
+          filename: options.filename,
+          heap: heapCapsForWire(prefixMemoryMb),
+          globals: defs,
+          imports: bindings,
+        })
+        const result = decodePrecompileResultPayload(reply)
+
+        if (!result.ok)
+          throw thrownRunError(result.error)
+
+        return new PrefixImpl<G, M>(id, hash, this.pool, release, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, wireLimits(options.limits))
       })
-      const result = decodePrecompileResultPayload(reply)
+    } catch (error) {
+      await release().catch(() => {})
+      throw error
+    }
+    return prefix
+  }
 
-      if (!result.ok)
-        throw thrownRunError(result.error)
-
-      return new PrefixImpl<G, M>(result.prefixId, hash, this.pool, declaredGlobals, handlers, declaredImportShape(bindings), this.brandKey, wireLimits(options.limits))
-    })
+  /**
+   * Send `DisposePrefix` and wait for the answer. If the connection ended
+   * first and the sandbox is still alive, send it once more and ignore how
+   * that ends. Rejects only when the first request could not be sent.
+   * @param id the prefix id
+   */
+  private async dropPrefix(id: string): Promise<void> {
+    const send = (): Promise<boolean> => this.pool.withClient((client) => client.disposePrefix(id))
+    const disposed = (async () => {
+      if (await send() || !this._alive)
+        return
+      await send().catch(() => false)
+    })()
+    this.prefixDisposes.set(id, disposed)
+    try {
+      await disposed
+    } finally {
+      if (this.prefixDisposes.get(id) === disposed)
+        this.prefixDisposes.delete(id)
+    }
   }
 
   async dispose(): Promise<void> {
@@ -1044,6 +1116,10 @@ implements Prefix<G, M> {
   private readonly hash: Uint8Array
   private readonly pool: RunPool
   /**
+   * Gives up this handle's hold on the id; the last one disposes the prefix.
+   */
+  private readonly release: () => Promise<void>
+  /**
    * The global shape declared at `prepare()`, with the default handlers a run
    * falls back to when it does not override them (DESIGN.md §11.4).
    */
@@ -1076,6 +1152,7 @@ implements Prefix<G, M> {
     id: string,
     hash: Uint8Array,
     pool: RunPool,
+    release: () => Promise<void>,
     declaredGlobals: ReadonlyMap<string, DeclaredGlobal>,
     defaultImportHandlers: ImportHandlerMap,
     declaredImports: readonly ImportBindingPayload[],
@@ -1085,6 +1162,7 @@ implements Prefix<G, M> {
     this.id = id
     this.hash = hash
     this.pool = pool
+    this.release = release
     this.declaredGlobals = declaredGlobals
     this.defaultImportHandlers = defaultImportHandlers
     this.declaredImports = declaredImports
@@ -1247,8 +1325,8 @@ implements Prefix<G, M> {
     this.declaredGlobals = new Map()
     this.defaultImportHandlers = new Map()
     this.declaredImports = []
-    // Fire-and-forget - no response frame for DisposePrefix.
-    await this.pool.withClient((client) => client.disposePrefix(this.id))
+    // The last handle resolves once the runtime answered that the prefix is gone.
+    await this.release()
   }
 
   async [Symbol.asyncDispose](): Promise<void> {

@@ -34,6 +34,7 @@ import { createSafeFetch } from '@iso4/fetch'
 const sandbox = await createSandbox({ memoryMb: 128 })
 
 const prefix = await sandbox.prepare({
+  id: 'users',
   code: `
     const config = { apiBase: 'https://api.example.com' }
     export default async () => {
@@ -72,7 +73,7 @@ arguments — a `Request` crosses in, a `Response` crosses back, and the result
 carries the handler's return `value` instead of `exports`:
 
 ```ts
-const prefix = await sandbox.prepare({ code: workerBundle })
+const prefix = await sandbox.prepare({ id: 'worker', code: workerBundle })
 
 const result = await prefix.call({
   export: 'default.fetch', // or any named export, e.g. 'handleEvent'
@@ -209,7 +210,7 @@ instead. Validate it yourself where it matters — parse the source with a
 tool such as `oxc`, or do one trial run (its instance stays warm):
 
 ```ts
-const prefix = await sandbox.prepare({ code })
+const prefix = await sandbox.prepare({ id: 'checkout', code })
 // Call a side-effect-free export; a failure of the prefix itself carries `stage: 'prefix'`.
 const check = await prefix.call({ export: 'ready' })
 if (!check.ok && check.error.stage === 'prefix')

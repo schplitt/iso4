@@ -28,6 +28,7 @@ describe('outbound streaming bodies', () => {
 
   test('a generator body arrives as a real ReadableStream and drains fully', async () => {
     await using prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `
         export async function stream() {
           async function* body() {
@@ -56,6 +57,7 @@ describe('outbound streaming bodies', () => {
   test('a multi-window body streams fully under credit (4 MiB)', async () => {
     const TOTAL = 4 * 1024 * 1024
     await using prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `
         export async function big(total) {
           async function* body() {
@@ -83,6 +85,7 @@ describe('outbound streaming bodies', () => {
 
   test('pass-through: new Response(request.body) echoes an inbound stream', async () => {
     await using prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `
         export async function echo(req) {
           return new Response(req.body)
@@ -104,6 +107,7 @@ describe('outbound streaming bodies', () => {
 
   test('cancelling the host reader runs the generator finally; instance stays warm', async () => {
     await using prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `
         let cleanedUp = 0
         export function probe() { return cleanedUp }
@@ -146,6 +150,7 @@ describe('outbound streaming bodies', () => {
 
   test('a guest source failure rejects the read, not the run', async () => {
     await using prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `
         export async function broken() {
           async function* body() {
@@ -167,6 +172,7 @@ describe('outbound streaming bodies', () => {
 
   test('waitUntil and a streamed body share the epilogue', async () => {
     await using prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `
         import { waitUntil } from 'iso4:runtime'
         export async function both() {

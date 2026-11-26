@@ -54,6 +54,7 @@ export interface OneOffResourceLimits extends ResourceLimits {
   memoryMb?: number;
 }
 export interface PrecompileOptions<G extends HostGlobals, M extends Imports> {
+  id: string;
   code: string;
   memoryMb?: number | MemoryLimit;
   globals?: G;
@@ -236,7 +237,7 @@ export type SandboxExports = {
 } & {
   [name: string]: unknown;
 };
-export type SetupErrorCode = "ERR_PREFIX_DISPOSED" | "ERR_PREFIX_BROKEN" | "ERR_UNDECLARED_BINDING" | "ERR_RESERVED_NAME" | "ERR_FROZEN_BINDING" | "ERR_INVALID_REBIND";
+export type SetupErrorCode = "ERR_PREFIX_DISPOSED" | "ERR_PREFIX_BROKEN" | "ERR_UNDECLARED_BINDING" | "ERR_RESERVED_NAME" | "ERR_FROZEN_BINDING" | "ERR_INVALID_REBIND" | "ERR_PREFIX_ID_TAKEN";
 // #endregion
 
 // #region Functions

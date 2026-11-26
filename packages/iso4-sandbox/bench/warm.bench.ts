@@ -199,9 +199,9 @@ let batchPrefix!: Prefix
 
 try {
   // Call latency — one call per iteration, single slot.
-  syncPrefix = await latencyRt.prepare({ code: SYNC_HANDLER })
-  asyncPrefix = await latencyRt.prepare({ code: ASYNC_HANDLER })
-  realisticPrefix = await latencyRt.prepare({ code: REALISTIC_PREFIX })
+  syncPrefix = await latencyRt.prepare({ id: crypto.randomUUID(), code: SYNC_HANDLER })
+  asyncPrefix = await latencyRt.prepare({ id: crypto.randomUUID(), code: ASYNC_HANDLER })
+  realisticPrefix = await latencyRt.prepare({ id: crypto.randomUUID(), code: REALISTIC_PREFIX })
 
   assertOk(
     await syncPrefix.call({ export: 'default.fetch', args: [{ n: 1 }] }),
@@ -217,8 +217,8 @@ try {
   )
 
   // Throughput — concurrent calls across an 8-slot pool.
-  tpPrefixA = await throughputRt.prepare({ code: REALISTIC_PREFIX })
-  tpPrefixB = await throughputRt.prepare({ code: SYNC_HANDLER })
+  tpPrefixA = await throughputRt.prepare({ id: crypto.randomUUID(), code: REALISTIC_PREFIX })
+  tpPrefixB = await throughputRt.prepare({ id: crypto.randomUUID(), code: SYNC_HANDLER })
 
   assertOk(
     await tpPrefixA.call({ export: 'default.fetch', args: [{ n: 1 }] }),
@@ -230,7 +230,7 @@ try {
   )
 
   // Batched calls — one prefix, the batch size is the only variable.
-  batchPrefix = await throughputRt.prepare({ code: TRANSFORM })
+  batchPrefix = await throughputRt.prepare({ id: crypto.randomUUID(), code: TRANSFORM })
   assertBatch(
     await batchPrefix.call({ export: 'default.transform', args: [EVENTS.slice(0, 4)] }),
     4,

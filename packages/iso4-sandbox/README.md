@@ -36,8 +36,9 @@ import { createSafeFetch } from '@iso4/fetch'
 
 const sandbox = await createSandbox({ memoryMb: 128 }) // per-isolate heap cap
 
-// Store the code once; it is evaluated on each cold start
+// Store the code once under your own id; it is evaluated on each cold start
 const prefix = await sandbox.prepare({
+  id: 'users',
   code: `
     const config = { apiBase: 'https://api.example.com' }
     export default async () => {
@@ -64,6 +65,12 @@ if (result.ok) {
 
 await sandbox.dispose()
 ```
+
+`id` is required: any non-empty string of at most 200 UTF-8 bytes. Preparing
+an id the sandbox still holds with the same code and `memoryMb` returns
+another handle to the same prefix; the runtime drops it when the last handle
+is disposed. Other code or other memory limits under a held id throw
+`ERR_PREFIX_ID_TAKEN`.
 
 > `sandbox.prepare()` is the current name. The former name,
 > `sandbox.precompile()`, remains as a deprecated alias with identical
@@ -110,7 +117,7 @@ source with a tool such as `oxc`, or do one trial run (its instance stays
 warm, so nothing is wasted):
 
 ```ts
-const prefix = await sandbox.prepare({ code })
+const prefix = await sandbox.prepare({ id: 'checkout', code })
 // Call a side-effect-free export; a failure of the prefix itself carries `stage: 'prefix'`.
 const check = await prefix.call({ export: 'ready' })
 if (!check.ok && check.error.stage === 'prefix')
@@ -160,6 +167,7 @@ returned `Prefix<G>` only allows rebinding those names at call time:
 
 ```ts
 const prefix = await sandbox.prepare({
+  id: 'agent',
   code,
   globals: { fetch: defaultFetch, myTool: defaultTool },
 })
@@ -175,7 +183,7 @@ own `limits` overrides them field by field; anything set in neither place
 takes the runtime default.
 
 ```ts
-const prefix = await sandbox.prepare({ code, limits: { cpuTimeMs: 200, maxBridgeCalls: 10 } })
+const prefix = await sandbox.prepare({ id: 'agent', code, limits: { cpuTimeMs: 200, maxBridgeCalls: 10 } })
 
 prefix.call({ export: 'default' }) // cpuTimeMs 200, maxBridgeCalls 10
 prefix.call({ export: 'default', limits: { cpuTimeMs: 50 } }) // cpuTimeMs 50, maxBridgeCalls 10
@@ -253,8 +261,8 @@ gets there. The band is what lets a grown instance be replaced instead of
 killing a run at the number — an optimization for reuse.
 
 ```ts
-await sandbox.prepare({ code, memoryMb: { soft: 96, hard: 256 } }) // exact lines
-await sandbox.prepare({ code, memoryMb: { hard: 128 } }) // terminate at 128, never retire
+await sandbox.prepare({ id: 'big', code, memoryMb: { soft: 96, hard: 256 } }) // exact lines
+await sandbox.prepare({ id: 'strict', code, memoryMb: { hard: 128 } }) // terminate at 128, never retire
 ```
 
 **On a one-off `run()`**, a run that holds more than `memoryMb` when V8
@@ -337,6 +345,7 @@ module variable. Create it at module scope, use it in the handler:
 
 ```ts
 const prefix = await sandbox.prepare({
+  id: 'als',
   code: `
     import { AsyncLocalStorage } from 'node:async_hooks'
     const als = new AsyncLocalStorage()
@@ -360,7 +369,7 @@ named export — with real typed arguments. On a prepared prefix nothing is
 compiled per request:
 
 ```ts
-const prefix = await sandbox.prepare({ code: workerBundle })
+const prefix = await sandbox.prepare({ id: 'worker', code: workerBundle })
 
 const result = await prefix.call({
   export: 'default.fetch',
@@ -469,7 +478,9 @@ name the runtime owns), `ERR_UNDECLARED_BINDING`, `ERR_FROZEN_BINDING` or
 `ERR_PREFIX_DISPOSED`, or `ERR_PREFIX_BROKEN` (the prefix failed to
 evaluate on an earlier run; `cause` is that failure). The client checks
 these before anything is sent, and
-the runtime repeats the checks. A malformed option, such as a limit out of range or a
+the runtime repeats the checks. `prepare()` also rejects with
+`ERR_PREFIX_ID_TAKEN` when its `id` is still held with other code or other
+memory limits; only the runtime checks that one. A malformed option, such as a limit out of range or a
 global name that is not a well-formed string, rejects with a plain
 `TypeError`. Nothing ran, so retrying with the same options can never
 succeed. Every other code, including a syntax error (`ERR_USER_CODE`
@@ -485,6 +496,7 @@ const setupCodes: readonly string[] = [
   'ERR_INVALID_REBIND',
   'ERR_PREFIX_DISPOSED',
   'ERR_PREFIX_BROKEN',
+  'ERR_PREFIX_ID_TAKEN',
 ] satisfies SetupErrorCode[]
 
 try {

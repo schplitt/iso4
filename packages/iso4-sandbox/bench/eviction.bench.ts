@@ -83,8 +83,8 @@ function assertOk(result: CallResult, what: string): void {
 // ── Cold instance per call — hard pressure disables pooling ────────────────
 
 const pressured: Sandbox = await createSandbox({ ...benchBinary(), maxConcurrentRuns: 1, memoryBudgetMb: 8 })
-const coldSync: Prefix = await pressured.prepare({ code: SYNC_HANDLER })
-const coldRealistic: Prefix = await pressured.prepare({ code: REALISTIC_PREFIX })
+const coldSync: Prefix = await pressured.prepare({ id: crypto.randomUUID(), code: SYNC_HANDLER })
+const coldRealistic: Prefix = await pressured.prepare({ id: crypto.randomUUID(), code: REALISTIC_PREFIX })
 
 assertOk(
   await coldSync.call({ export: 'default.fetch', args: [{ n: 1 }] }),

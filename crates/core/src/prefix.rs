@@ -124,7 +124,7 @@ fn find_host_node<'a>(
 /// Source plus the declared global and import shape of one prepared prefix.
 /// Behind an `Arc`, so a run takes a refcount, not a deep copy.
 pub struct PrefixData {
-    /// The numeric half of the wire `prefix_id`, named by the fatal OOM line.
+    /// The engine's numeric alias for the prefix, named by the fatal OOM line.
     pub id: u64,
     /// The prefix module source, exactly as validated at precompile time.
     pub code: String,
@@ -148,12 +148,13 @@ pub struct PrefixData {
 }
 
 /// One stored prefix: runnable, or broken by a deterministic cold-start
-/// failure. A broken entry keeps only its hash and the clamped failure; the
-/// source is dropped and refusals share the failure by refcount.
+/// failure. A broken entry keeps only its hash, heap lines and the clamped
+/// failure; the source is dropped and refusals share the failure by refcount.
 pub enum PrefixEntry {
     Ready(Arc<PrefixData>),
     Broken {
         hash: [u8; 16],
+        heap: types::HeapLimits,
         cause: Arc<types::RunErrorPayload>,
     },
 }

@@ -327,6 +327,7 @@ describe('error handling', () => {
 describe('prepare + prefix.call()', () => {
   test('prefix evaluates and a call reads its state', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: 'globalThis.base = 100\nexport default () => globalThis.base + 1',
     })
     const result = await prefix.call({ export: 'default' })
@@ -338,6 +339,7 @@ describe('prepare + prefix.call()', () => {
 
   test('many calls against the same prefix', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: 'globalThis.multiplier = 10\nexport default (n) => n * globalThis.multiplier',
     })
     const results = await Promise.all(
@@ -360,6 +362,7 @@ describe('prepare + prefix.call()', () => {
     // isolation per run is simply wrong now. With one connection and
     // back-to-back runs, reuse is deterministic, so assert the carryover.
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         globalThis.counter = 0
         export function set() { globalThis.counter = 99; return 1 }
@@ -376,6 +379,7 @@ describe('prepare + prefix.call()', () => {
 
   test('prefix with pre-computed data structure', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         const squares = {}
         for (let i = 0; i <= 20; i++) squares[i] = i * i
@@ -392,6 +396,7 @@ describe('prepare + prefix.call()', () => {
 
   test('concurrent prefix runs are independent', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: 'globalThis.base = 5\nexport default (n) => globalThis.base + n',
     })
     const [a, b, c] = await Promise.all([
@@ -406,6 +411,7 @@ describe('prepare + prefix.call()', () => {
 
   test('console available in run code', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: 'export default () => { console.log("run log"); return 1 }',
     })
     const result = await prefix.call({ export: 'default' })
@@ -416,27 +422,27 @@ describe('prepare + prefix.call()', () => {
   })
 
   test('prefix.alive is false after dispose', async () => {
-    const prefix = await runtime.precompile({ code: '' })
+    const prefix = await runtime.precompile({ id: crypto.randomUUID(), code: '' })
     expect(prefix.alive).toBe(true)
     await prefix.dispose()
     expect(prefix.alive).toBe(false)
   })
 
   test('run on disposed prefix rejects with ERR_PREFIX_DISPOSED', async () => {
-    const prefix = await runtime.precompile({ code: '' })
+    const prefix = await runtime.precompile({ id: crypto.randomUUID(), code: '' })
     await prefix.dispose()
     await expect(prefix.call({ export: 'default' })).rejects.toMatchObject({ code: 'ERR_PREFIX_DISPOSED' })
   })
 
   test('a prefix syntax error fails the first run, not prepare()', async () => {
-    await using prefix = await runtime.prepare({ code: 'export default (((' })
+    await using prefix = await runtime.prepare({ id: crypto.randomUUID(), code: 'export default (((' })
     expect(prefix.status).toBe('ready')
     const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', name: 'SyntaxError', stage: 'prefix' } })
   })
 
   test('a broken prefix is remembered: later runs are refused with ERR_PREFIX_BROKEN', async () => {
-    const prefix = await runtime.prepare({ code: 'throw new TypeError("setup failed")' })
+    const prefix = await runtime.prepare({ id: crypto.randomUUID(), code: 'throw new TypeError("setup failed")' })
     const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_USER_CODE', name: 'TypeError', stage: 'prefix' } })
     // The failed cold start already marks the handle.
@@ -472,6 +478,7 @@ describe('prepare + prefix.call()', () => {
 
   test('a run that fails in run code leaves the prefix ready', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         export const ok = 1
         export function boom() { throw new Error("run code") }
@@ -547,6 +554,7 @@ describe('fetch bridge — real HTTP server (Phase 4)', () => {
 
   test('3 concurrent prefix runs all fetch the same server and sum correctly', async () => {
     const prefix = await runtime.precompile({
+      id: crypto.randomUUID(),
       code: `
         globalThis.fetchSum = async (url) => {
           const res = await fetch(url)
@@ -675,6 +683,7 @@ describe('globals bridge (Phase 4)', () => {
   test('prefix with declared globals can rebind per call', async () => {
     const callLog: string[] = []
     const prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         export default async () => {
           const res = await fetch('https://example.com')
@@ -703,7 +712,7 @@ describe('globals bridge (Phase 4)', () => {
   })
 
   test('globals not declared at prepare time → ERR_UNDECLARED_BINDING', async () => {
-    const prefix = await runtime.prepare({ code: 'export default () => 1' })
+    const prefix = await runtime.prepare({ id: crypto.randomUUID(), code: 'export default () => 1' })
     await expect(prefix.call({
       export: 'default',
       globals: { fetch: async () => ({ status: 200, headers: {}, body: null }) },
@@ -1146,6 +1155,7 @@ describe('source imports (Phase 6)', () => {
     // The prefix imports the declared source module and its exports close
     // over the binding. (DESIGN.md §4.3.)
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `import { multiply } from 'lib:math'; export default () => multiply(6, 7)`,
       imports: { 'lib:math': mathSource },
     })
@@ -1384,6 +1394,7 @@ describe('host imports (Phase 7)', () => {
 describe('imports rebinding enforcement (runtime)', () => {
   test('rebinding an undeclared specifier on prefix.call() → ERR_UNDECLARED_BINDING', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `export default () => 1`,
       imports: {
 
@@ -1402,6 +1413,7 @@ describe('imports rebinding enforcement (runtime)', () => {
 
   test('rebinding an undeclared function export on a declared specifier → ERR_UNDECLARED_BINDING', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `export default () => 1`,
       imports: {
 
@@ -1419,6 +1431,7 @@ describe('imports rebinding enforcement (runtime)', () => {
 
   test('rebinding a source-module specifier on prefix.call() → ERR_FROZEN_BINDING', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `export default () => 1`,
       imports: {
 
@@ -1435,6 +1448,7 @@ describe('imports rebinding enforcement (runtime)', () => {
 
   test('rebinding a data export with data on prefix.call() → ERR_FROZEN_BINDING', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `export default () => 1`,
       imports: {
 
@@ -1454,6 +1468,7 @@ describe('imports rebinding enforcement (runtime)', () => {
     // A function value passes the client-side checks, so this exercises the
     // Rust-side validation against the declared prefix shape.
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `export default () => 1`,
       imports: {
 
@@ -1471,6 +1486,7 @@ describe('imports rebinding enforcement (runtime)', () => {
 
   test('declared function leaf CAN be rebound and the new handler is used', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `import { search } from 'host:tools'; export default async () => await search()`,
       imports: {
 
@@ -1562,7 +1578,7 @@ describe('imports failure paths', () => {
     for (let i = 0; i < 2500; i++)
       deep = { c: deep }
     await expect(
-      runtime.prepare({ code: 'export const ok = true', imports: { 'host:x': { d: deep as never } } }),
+      runtime.prepare({ id: crypto.randomUUID(), code: 'export const ok = true', imports: { 'host:x': { d: deep as never } } }),
     ).rejects.toThrow(/imports\['host:x'\]\.d\.c\..*: host-module shapes may nest at most 64 levels deep/)
     const result = await runtime.run({ code: 'export default 1' })
     expect(result.ok).toBe(true)
@@ -2371,7 +2387,7 @@ describe('error edge cases', () => {
 
 describe('precompile stress', () => {
   test('20 concurrent calls — all independent', async () => {
-    await using prefix = await runtime.prepare({ code: 'globalThis.base = 7\nexport default (i) => globalThis.base * i' })
+    await using prefix = await runtime.prepare({ id: crypto.randomUUID(), code: 'globalThis.base = 7\nexport default (i) => globalThis.base * i' })
     const results = await Promise.all(
       Array.from({ length: 20 }, (_, i) => (
         prefix.call({ export: 'default', args: [i + 1] })
@@ -2386,6 +2402,7 @@ describe('precompile stress', () => {
 
   test('prefix with factorial + fibonacci lookup tables', async () => {
     await using prefix = await runtime.precompile({
+      id: crypto.randomUUID(),
       code: `
         const fact = [1]
         for (let i = 1; i <= 12; i++) fact[i] = fact[i - 1] * i
@@ -2412,8 +2429,8 @@ describe('precompile stress', () => {
 
   test('two independent prefixes run concurrently', async () => {
     const [pA, pB] = await Promise.all([
-      runtime.prepare({ code: 'globalThis.name = "alpha"\nexport default (s) => globalThis.name + s' }),
-      runtime.prepare({ code: 'globalThis.name = "beta"\nexport default (s) => globalThis.name + s' }),
+      runtime.prepare({ id: crypto.randomUUID(), code: 'globalThis.name = "alpha"\nexport default (s) => globalThis.name + s' }),
+      runtime.prepare({ id: crypto.randomUUID(), code: 'globalThis.name = "beta"\nexport default (s) => globalThis.name + s' }),
     ])
     const [r1, r2, r3, r4] = await Promise.all([
       pA.call({ export: 'default', args: ['1'] }),
@@ -2431,6 +2448,7 @@ describe('precompile stress', () => {
   test('prefix slot recycles correctly after dispose', async () => {
     for (let round = 0; round < 5; round++) {
       await using prefix = await runtime.prepare({
+        id: crypto.randomUUID(),
         code: `globalThis.round = ${round}\nexport default () => globalThis.round`,
       })
       const result = await prefix.call({ export: 'default' })
@@ -2443,6 +2461,7 @@ describe('precompile stress', () => {
 
   test('a failed call does not corrupt subsequent calls on the same prefix', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         globalThis.value = 99
         export function boom() { throw new Error("call fail") }
@@ -2535,6 +2554,7 @@ describe('globals bridge — BridgeWithShim (Phase 4)', () => {
     // frozen into the snapshot. This is the one place the value codec runs
     // outside a normal isolate, so it gets its own coverage.
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         import { version, limits } from 'tools:cfg'
         export const ready = true
@@ -2681,6 +2701,7 @@ describe('globals bridge — BridgeWithShim (Phase 4)', () => {
     const callLog: string[] = []
 
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         export default async (url) => {
           const res = await fetch(url)
@@ -2734,6 +2755,7 @@ describe('globals bridge — BridgeWithShim (Phase 4)', () => {
 
   test('string global in prefix is available across all calls', async () => {
     await using prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: 'export default () => BASE_URL',
       globals: { BASE_URL: `'https://api.example.com'` },
     })

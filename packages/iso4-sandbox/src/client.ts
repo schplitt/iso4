@@ -24,7 +24,7 @@ import {
   decodeRunCompletePayload,
   peekBridgeCallId,
   peekBridgeCallRunId,
-  peekPrecompileResultRequestId,
+  peekRequestId,
   peekRunCompletionBackgroundFlags,
   peekRunCompletionRunId,
   peekRunCompletionSlotAllowance,
@@ -272,7 +272,7 @@ export class RuntimeIpcClient {
   get load(): number {
     return (
       this.runs.size - this.graceRuns
-      + this.precompileWaiters.size
+      + this.requestWaiters.size
       + this.controlWaiters.length
     )
   }
@@ -294,10 +294,11 @@ export class RuntimeIpcClient {
   private readonly controlWaiters: ControlWaiter[] = []
 
   /**
-   * Pending `precompile()` requests keyed by their wire `requestId`, so a
-   * reply is matched by id and never by arrival order.
+   * Pending `precompile()` and `disposePrefix()` requests keyed by their wire
+   * `requestId`, so a reply is matched by id and never by arrival order.
    */
-  private readonly precompileWaiters = new Map<number, {
+  private readonly requestWaiters = new Map<number, {
+    expects: number
     resolve: (payload: Uint8Array) => void
     reject: (error: Error) => void
   }>()
@@ -715,18 +716,43 @@ export class RuntimeIpcClient {
     }
   }
 
-  private nextPrecompileId = 0
-  private nextPrecompileIdValue(): number {
+  private nextRequestId = 0
+  private nextRequestIdValue(): number {
     // Same discipline as run ids: wrap unsigned, skip any id still in
     // flight so a reply can never be matched to the wrong caller.
     do {
-      this.nextPrecompileId = (this.nextPrecompileId + 1) >>> 0
-    } while (this.precompileWaiters.has(this.nextPrecompileId))
-    return this.nextPrecompileId
+      this.nextRequestId = (this.nextRequestId + 1) >>> 0
+    } while (this.requestWaiters.has(this.nextRequestId))
+    return this.nextRequestId
+  }
+
+  /**
+   * Write a frame whose reply echoes `requestId`. Rejects if the write
+   * fails; `reply` rejects if the connection ends before the answer.
+   * @param requestId the id the frame carries
+   * @param frame the encoded request frame
+   * @param expects the reply frame type
+   */
+  private async idRequest(requestId: number, frame: Buffer, expects: number): Promise<{ reply: Promise<Uint8Array> }> {
+    const reply = new Promise<Uint8Array>((resolve, reject) => {
+      this.requestWaiters.set(requestId, { expects, resolve, reject })
+    })
+    // A teardown can reject the waiter while the request write below is
+    // still awaited — keep that window from surfacing as an unhandled
+    // rejection (the caller's await still observes it).
+    reply.catch(NOOP)
+    try {
+      await this.write(frame)
+    } catch (error) {
+      this.requestWaiters.delete(requestId)
+      throw error
+    }
+    return { reply }
   }
 
   async precompile(
     options: {
+      id: string
       code: string
       filename?: string
       heap?: WireHeapLimits
@@ -737,9 +763,10 @@ export class RuntimeIpcClient {
     if (this.disposed)
       throw new Error('runtime IPC client is disposed')
 
-    const requestId = this.nextPrecompileIdValue()
+    const requestId = this.nextRequestIdValue()
     const { payload, hash } = encodePrecompilePayload({
       requestId,
+      id: options.id,
       code: options.code,
       filename: options.filename,
       heap: options.heap,
@@ -747,19 +774,7 @@ export class RuntimeIpcClient {
       imports: options.imports,
     })
     const frame = encodeTsToRustFrame(TsToRustMessageTypes.Precompile, payload)
-    const reply = new Promise<Uint8Array>((resolve, reject) => {
-      this.precompileWaiters.set(requestId, { resolve, reject })
-    })
-    // A teardown can reject the waiter while the request write below is
-    // still awaited — keep that window from surfacing as an unhandled
-    // rejection (the caller's await still observes it).
-    reply.catch(NOOP)
-    try {
-      await this.write(frame)
-    } catch (error) {
-      this.precompileWaiters.delete(requestId)
-      throw error
-    }
+    const { reply } = await this.idRequest(requestId, frame, RustToTsMessageTypes.PrecompileResult)
     return { reply: await reply, hash }
   }
 
@@ -809,15 +824,21 @@ export class RuntimeIpcClient {
     return reply
   }
 
-  async disposePrefix(prefixId: string): Promise<void> {
+  /**
+   * Drop a prefix. `true` once the runtime answered that it is gone, `false`
+   * when this client or its connection ended first; a failed write rejects.
+   * @param prefixId the prefix's id
+   */
+  async disposePrefix(prefixId: string): Promise<boolean> {
     if (this.disposed)
-      return
-    await this.write(
-      encodeTsToRustFrame(
-        TsToRustMessageTypes.DisposePrefix,
-        encodeDisposePrefixPayload(prefixId),
-      ),
+      return false
+    const requestId = this.nextRequestIdValue()
+    const { reply } = await this.idRequest(
+      requestId,
+      encodeTsToRustFrame(TsToRustMessageTypes.DisposePrefix, encodeDisposePrefixPayload(requestId, prefixId)),
+      RustToTsMessageTypes.DisposePrefixResult,
     )
+    return reply.then(() => true, () => false)
   }
 
   async dispose(): Promise<void> {
@@ -913,9 +934,9 @@ export class RuntimeIpcClient {
         this.graceRuns = 0
         for (const waiter of this.controlWaiters.splice(0))
           waiter.reject(failure)
-        for (const [, waiter] of this.precompileWaiters)
+        for (const [, waiter] of this.requestWaiters)
           waiter.reject(failure)
-        this.precompileWaiters.clear()
+        this.requestWaiters.clear()
       }
     })()
   }
@@ -941,21 +962,26 @@ export class RuntimeIpcClient {
       case RustToTsMessageTypes.Log:
         return undefined
 
-      case RustToTsMessageTypes.PrecompileResult: {
-        // Routed by the echoed requestId: precompile replies can return out
-        // of request order (worker threads runtime-side), so FIFO matching
-        // would cross-assign prefix ids between concurrent prepare() calls.
-        const requestId = peekPrecompileResultRequestId(frame.payload)
+      case RustToTsMessageTypes.PrecompileResult:
+      case RustToTsMessageTypes.DisposePrefixResult: {
+        // Routed by the echoed requestId: replies can return out of request
+        // order, so FIFO matching would cross-assign them between callers.
+        const requestId = peekRequestId(frame.payload)
         const waiter = requestId === undefined
           ? undefined
-          : this.precompileWaiters.get(requestId)
-        if (requestId === undefined || waiter === undefined) {
+          : this.requestWaiters.get(requestId)
+        const [name, request] = frame.messageType === RustToTsMessageTypes.PrecompileResult
+          ? ['PrecompileResult', 'precompile']
+          : ['DisposePrefixResult', 'dispose']
+        if (requestId === undefined || waiter === undefined || waiter.expects !== frame.messageType) {
           throw new ProtocolDesyncError(
-            `PrecompileResult carries requestId ${requestId ?? '(truncated payload)'} `
-            + 'but no precompile with that id is pending on this connection',
+            `${name} carries requestId ${requestId ?? '(truncated payload)'} `
+            + `but no ${request} with that id is pending on this connection`,
           )
         }
-        this.precompileWaiters.delete(requestId)
+        if (frame.messageType === RustToTsMessageTypes.DisposePrefixResult && frame.payload.byteLength !== 4)
+          throw new ProtocolDesyncError(`DisposePrefixResult payload is ${frame.payload.byteLength} bytes, expected 4`)
+        this.requestWaiters.delete(requestId)
         waiter.resolve(frame.payload)
         return undefined
       }

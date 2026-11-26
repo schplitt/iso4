@@ -117,6 +117,8 @@ pub enum RunError {
     /// A PrefixRun rebind targets a declared location that is frozen with
     /// the prefix: a source module or a data leaf.
     FrozenBinding(String),
+    /// A `Precompile` named a held prefix id with other code or other heap limits.
+    PrefixIdTaken(String),
     /// Prefix top-level evaluation stayed pending after draining the
     /// microtask queue — it awaits something that can never resolve while a
     /// prefix evaluates (a never-settling promise).
@@ -185,6 +187,7 @@ impl RunError {
             RunError::UndeclaredBinding(_) => "ERR_UNDECLARED_BINDING",
             RunError::ReservedName(_) => "ERR_RESERVED_NAME",
             RunError::FrozenBinding(_) => "ERR_FROZEN_BINDING",
+            RunError::PrefixIdTaken(_) => "ERR_PREFIX_ID_TAKEN",
             RunError::PrefixDidNotSettle(_) => "ERR_PREFIX_DID_NOT_SETTLE",
             RunError::PrefixBridgeCall(_) => "ERR_PREFIX_BRIDGE_CALL",
             RunError::CallTargetNotFound(_) => "ERR_CALL_TARGET_NOT_FOUND",
@@ -222,6 +225,7 @@ impl RunError {
             | RunError::UndeclaredBinding(msg)
             | RunError::ReservedName(msg)
             | RunError::FrozenBinding(msg)
+            | RunError::PrefixIdTaken(msg)
             | RunError::PrefixDidNotSettle(msg)
             | RunError::PrefixBridgeCall(msg)
             | RunError::CallTargetNotFound(msg)

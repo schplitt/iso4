@@ -1163,7 +1163,7 @@ invalid before anything runs. Those reject `sandbox.run()` and
 `prefix.call()` exactly as they reject `prepare()` — a plain `Error` whose
 `code` is a `SetupErrorCode` (`ERR_RESERVED_NAME`, `ERR_UNDECLARED_BINDING`,
 `ERR_FROZEN_BINDING`, `ERR_INVALID_REBIND`, `ERR_PREFIX_DISPOSED`,
-`ERR_PREFIX_BROKEN`), or an
+`ERR_PREFIX_BROKEN`, `ERR_PREFIX_ID_TAKEN` from `prepare()` only), or an
 `Error` (`TypeError`, `ValueEncodeError`, …) without
 an iso4 code that the client raises for a malformed option (a limit,
 `memoryMb`, a global name that is not a well-formed string, host-module
@@ -1204,7 +1204,7 @@ await sandbox.run({
 })
 
 // prepared prefix — the common case, nothing compiled per request
-const prefix = await sandbox.prepare({ code: bundle })
+const prefix = await sandbox.prepare({ id: 'checkout', code: bundle })
 await prefix.call({ export: 'default.fetch', args: [request] })
 
 // rebinding globals per call — orthogonal, comes free
@@ -1301,7 +1301,7 @@ direction. Both tables start at `0x01`.
 | `0x02` | `Run`            | Start a sandboxed execution in a fresh isolate                         |
 | `0x03` | `Precompile`     | Store prefix code under a `PrefixId` (nothing is evaluated, §16.4)      |
 | `0x04` | `PrefixRun`      | Execute against a prepared prefix (served by a warm instance, §13.2.1) |
-| `0x05` | `DisposePrefix`  | Drop a stored prefix and its instances                                 |
+| `0x05` | `DisposePrefix`  | Drop a stored prefix and its instances; answered once dropped          |
 | `0x06` | `BridgeResponse` | Reply to a `BridgeCall` from Rust                                      |
 | `0x07` | `Terminate`      | Abort a run — soft (turn-boundary abandon) or hard (mid-turn kill) by mode byte; Rust replies with an `ERR_ABORTED` result (§14.7) |
 | `0x08` | `Stats`          | Ask for a registry snapshot (empty payload)                            |
@@ -1316,13 +1316,14 @@ TS → Rust byte: `0x0E`.
 | ------ | ------------------ | ------------------------------------------------------ |
 | `0x01` | `BridgeCall`       | Sandbox called `fetch` or a host-module function       |
 | `0x02` | `Result`           | Final result for a run (always sent exactly once)      |
-| `0x03` | `PrecompileResult` | Outcome of a `Precompile` (prefix id or error)         |
+| `0x03` | `PrecompileResult` | Outcome of a `Precompile` (ok or error)                |
 | `0x04` | `Log`              | Internal runtime diagnostics                           |
 | `0x05` | `Hello`            | Handshake accepted: protocol version + V8 format probe |
 | `0x06` | `StatsResult`      | The registry snapshot answering a `Stats` request      |
+| `0x0C` | `DisposePrefixResult` | A `DisposePrefix` is done: the prefix is dropped    |
 
 `0x07`–`0x0B` are `RunComplete` and the streaming frames (`docs/protocol.md`
-§2.2). Next free Rust → TS byte: `0x0C`.
+§2.2). Next free Rust → TS byte: `0x0D`.
 
 There is **no `StdioChunk` frame**: `console.*` output is buffered in the
 runtime and rides inside the `Result` frame, so a run's stdout/stderr arrive
@@ -1923,6 +1924,29 @@ Every `PrefixRun` carries it; a run whose id the runtime does not hold, or
 holds with another hash, fails with `ERR_PREFIX_UNKNOWN` (docs/protocol.md
 §5.2).
 
+**Prefix ids.** The host chooses the id: `prepare({ id, code })`, `id`
+required, any well-formed string of 1 to 200 UTF-8 bytes (a `TypeError`
+otherwise). The runtime generates none and never changes one; its log
+lines print ids escaped, and the crash line names a prefix by a numeric
+alias. Preparing an id the sandbox still holds, with the same hash and
+the same heap lines, returns another handle to the same prefix and
+compiles nothing. The client counts handles per id; each handle's
+`dispose()` gives up one, and the last one sends `DisposePrefix` and
+resolves when the runtime answers that the prefix is dropped. A `prepare()`
+of an id whose dispose is still unanswered waits for that answer first.
+When the connection ends before the answer, the dispose is sent once more,
+only while the sandbox is still alive; a `Precompile` that still meets the old prefix is
+answered by the held-id rules.
+Warm instances carry the prefix's alias, so a run of a reused id never
+joins an instance that evaluated the old code. Other
+code or other heap lines under a held id throw the setup error
+`ERR_PREFIX_ID_TAKEN`, whose message names which; the held prefix stays.
+A held broken prefix prepared again with the same code and heap lines is
+rebuilt instead: the runtime stores it afresh under a new alias, so a
+failure that does not repeat clears (workerd likewise drops an aborted
+worker and loads it afresh). A handle that saw the failure keeps its own
+`'broken'` status. One version per id until the pool's two live versions (§17.2).
+
 ### 11.4 Rebinding rules
 
 When `prefix.call()` provides `globals` or `imports`, the replacement
@@ -2166,6 +2190,7 @@ the generic host-bridge error path.
 
   const runtime = await createSandbox();
   const prefix = await runtime.prepare({
+    id: "agent",
     code: agentCode,
     globals: { fetch: createSafeFetch({ allowedHosts: [...] }) },
   });
@@ -3262,7 +3287,7 @@ cheaper check as well. The same codes surface either way; only where they
 surface moved.
 
 ```ts
-const prefix = await sandbox.prepare({ code })
+const prefix = await sandbox.prepare({ id: 'checkout', code })
 // Call a side-effect-free export; a prefix failure carries `stage: 'prefix'`.
 const check = await prefix.call({ export: 'ready' })
 if (!check.ok && check.error.stage === 'prefix') throw new Error(`broken prefix: ${check.error.message}`)
@@ -3306,8 +3331,7 @@ behavior.
 
 ### 17.2 Prefixes, versions, code custody
 
-- **Identity is (id, hash).** The id is host-chosen (generated by the
-  thread when absent); the hash is SHA-256/128 over the whole bundle. The
+- **Identity is (id, hash).** The id is host-chosen and required; the hash is SHA-256/128 over the whole bundle. The
   hash is the version.
 - **Prepare is lazy and goes through the supervisor**, which keeps no copy
   of the bundle: `prepare` registers id, key, hash and the holder; the
@@ -3487,7 +3511,7 @@ then moves into the section it belongs to.
 - Child id is the epoch. Ids come from a persisted counter (`next-id`) and are never reused inside one Node process; the socket path is derived from the id.
 - A child verifies what it is asked. `PrefixRun` carries the source hash; `Run` carries the key; the child refuses a mismatch with a miss code. The hash is computed by the Node thread over the whole `Precompile` body (code, filename, binding shape, data blobs), SHA-256 truncated to 128 bits; the child recomputes it over the body it receives, refuses a mismatch, and reports its own value in `ListPrefixes`.
 - Connection ids are `t<threadId>.<n>`. Node-chosen, n never resets in a thread.
-- Prefix ids are thread-generated when the host gives none. The supervisor never invents ids.
+- Prefix ids are always host-chosen (`prepare({ id })` requires one). The supervisor never invents ids.
 
 **Placement.**
 
