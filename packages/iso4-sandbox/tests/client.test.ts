@@ -184,10 +184,11 @@ describe('RuntimeIpcClient', () => {
 
       const runFrame = await reader.readFrame()
       expect(runFrame.messageType).toBe(TsToRustMessageTypes.Run)
-      // RunPayload: u32 runId + u32 codeLen + code + ...
+      // RunPayload: u32 runId + key (absent) + u32 codeLen + code + ...
       const view = Buffer.from(runFrame.payload.buffer, runFrame.payload.byteOffset, runFrame.payload.byteLength)
-      const codeLen = view.readUInt32BE(4)
-      const code = view.subarray(8, 8 + codeLen).toString('utf8')
+      expect(view[4]).toBe(0)
+      const codeLen = view.readUInt32BE(5)
+      const code = view.subarray(9, 9 + codeLen).toString('utf8')
       expect(code).toBe('export default 42')
 
       // Result frame carries the full RunCompletionPayload (no StdioChunk

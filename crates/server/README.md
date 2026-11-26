@@ -6,7 +6,8 @@ This is the only crate that knows the wire.
 ## What it does
 
 1. `main.rs` parses the flags (`--socket`, `--warm-budget-bytes`,
-   `--host-reserve-bytes`, `--idle-settle-secs`, `--cores`, `--node-pid`),
+   `--host-reserve-bytes`, `--idle-settle-secs`, `--cores`, `--node-pid`,
+   `--key`),
    opens the crash file, writes the pid file, prints one capacity line, creates one `Engine`, and
    accepts connections.
 2. `session.rs` runs each connection: the `Authenticate` handshake, then the
@@ -59,6 +60,9 @@ can read; access control is that directory, not a token.
 - `--node-pid <pid>`: check once a second whether that pid is gone (exited,
   a zombie, or reused by another process) and exit when it is. A pid whose
   details cannot be read counts as alive.
+- `--key <s>` (1 to 200 bytes): every `Run` and `Precompile` must carry this
+  key; absent, they must carry none. A mismatch fails that request with
+  `ERR_INTERNAL` and the connection stays. The crash line prints it.
 
 A bad value for any flag logs one line and exits 1.
 
@@ -85,6 +89,7 @@ signal it was going to die by:
 ```
 [iso4-v8] fatal cause=oom-heap phase=oneoff run=1 msg="Reached heap limit"
 [iso4-v8] fatal cause=SIGSEGV
+[iso4-v8] fatal cause=SIGSEGV key="tenant-a"
 ```
 
 DESIGN.md 4.1 has the fields. One death writes one line. If the file cannot

@@ -1287,10 +1287,29 @@ fn parse_code_fields(
     Ok((code, filename, heap))
 }
 
-/// Parse the payload bytes of a `Run` frame per `docs/protocol.md` §5.2.
-pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunRequest> {
+/// The longest key a frame or `--key` may carry, in UTF-8 bytes.
+pub const MAX_KEY_BYTES: usize = 200;
+
+/// Read an `Optional<String>` key; present means 1..=200 bytes.
+fn read_key(r: &mut PayloadReader) -> io::Result<Option<String>> {
+    let key = r.read_optional_string()?;
+    if let Some(key) = &key {
+        if key.is_empty() || key.len() > MAX_KEY_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("key must be 1..={MAX_KEY_BYTES} bytes, got {}", key.len()),
+            ));
+        }
+    }
+    Ok(key)
+}
+
+/// Parse the payload bytes of a `Run` frame per `docs/protocol.md` §5.2:
+/// the frame's key, then the request.
+pub fn parse_run_payload(payload: &[u8]) -> io::Result<(Option<String>, RunRequest)> {
     let mut r = PayloadReader::new(payload);
     let run_id = r.read_u32()?;
+    let key = read_key(&mut r)?;
     // A one-off gets a fresh isolate: strict cap, no band.
     let (code, filename, heap) = parse_code_fields(&mut r, BandPolicy::Strict)?;
     let limits = r.read_run_limits()?;
@@ -1298,16 +1317,19 @@ pub fn parse_run_payload(payload: &[u8]) -> io::Result<RunRequest> {
     let imports = r.read_import_bindings()?;
     let call = r.read_optional_call()?;
     r.assert_done()?;
-    Ok(RunRequest {
-        run_id,
-        code,
-        filename,
-        heap,
-        limits,
-        globals,
-        imports,
-        call,
-    })
+    Ok((
+        key,
+        RunRequest {
+            run_id,
+            code,
+            filename,
+            heap,
+            limits,
+            globals,
+            imports,
+            call,
+        },
+    ))
 }
 
 /// The prefix code hash: SHA-256 over the code + filename bytes, then the
@@ -1336,6 +1358,8 @@ pub struct PrecompilePayload {
     pub hash: [u8; 16],
     /// The host-chosen prefix id, 1..=200 bytes.
     pub id: String,
+    /// Must equal the child's `--key`; not hashed.
+    pub key: Option<String>,
     pub code: String,
     pub filename: Option<String>,
     /// The prefix's heap lines, applied to every run on it.
@@ -1359,6 +1383,7 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
             ),
         ));
     }
+    let key = read_key(&mut r)?;
     let code_start = r.offset;
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
@@ -1379,6 +1404,7 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
         request_id,
         hash,
         id,
+        key,
         code,
         filename,
         heap,
@@ -1988,6 +2014,7 @@ mod tests {
     fn encode_run_payload(run_id: u32, code: &str, filename: Option<&str>) -> Vec<u8> {
         let mut v = Vec::new();
         push_u32(&mut v, run_id);
+        v.push(0); // key: absent
         push_string(&mut v, code);
         // filename: Optional<String>
         match filename {
@@ -2040,7 +2067,7 @@ mod tests {
     #[test]
     fn parse_run_payload_minimal() {
         let bytes = encode_run_payload(1, "export default 42", None);
-        let p = parse_run_payload(&bytes).unwrap();
+        let p = parse_run_payload(&bytes).unwrap().1;
         assert_eq!(p.run_id, 1);
         assert_eq!(p.code, "export default 42");
         assert!(p.filename.is_none());
@@ -2051,7 +2078,7 @@ mod tests {
     #[test]
     fn parse_run_payload_with_filename() {
         let bytes = encode_run_payload(7, "export default 1", Some("agent.js"));
-        let p = parse_run_payload(&bytes).unwrap();
+        let p = parse_run_payload(&bytes).unwrap().1;
         assert_eq!(p.run_id, 7);
         assert_eq!(p.filename.as_deref(), Some("agent.js"));
     }
@@ -2060,6 +2087,7 @@ mod tests {
     fn parse_run_payload_with_limits() {
         let mut v = Vec::new();
         push_u32(&mut v, 42); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "code"); // code
         v.push(0); // no filename
         push_optional_u32(&mut v, Some(128)); // memory_mb
@@ -2076,7 +2104,7 @@ mod tests {
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         assert_eq!(p.run_id, 42);
         assert_eq!(
             p.heap.soft_memory_mb, 0,
@@ -2097,7 +2125,7 @@ mod tests {
         // DEFAULT_* constant. This is the whole point of the optional wire
         // encoding: the client no longer ships the default numbers.
         let bytes = encode_run_payload(1, "export default 1", None);
-        let p = parse_run_payload(&bytes).unwrap();
+        let p = parse_run_payload(&bytes).unwrap().1;
         assert_eq!(p.heap.soft_memory_mb, 0, "one-off: no soft line");
         assert_eq!(
             p.heap.hard_memory_mb, DEFAULT_MEMORY_MB,
@@ -2116,7 +2144,7 @@ mod tests {
     }
 
     /// Shared with `ipc.test.ts`: the same Precompile bytes, the same hash.
-    const PRECOMPILE_VECTOR: &str = "000000019c0151069957142d7b202a45e999faaa0000000170000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031";
+    const PRECOMPILE_VECTOR: &str = "000000019c0151069957142d7b202a45e999faaa000000017000000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031";
     const PRECOMPILE_VECTOR_HASH: &str = "9c0151069957142d7b202a45e999faaa";
 
     fn from_hex(hex: &str) -> Vec<u8> {
@@ -2131,6 +2159,7 @@ mod tests {
         let p = parse_precompile_payload(&from_hex(PRECOMPILE_VECTOR)).unwrap();
         assert_eq!(p.hash.to_vec(), from_hex(PRECOMPILE_VECTOR_HASH));
         assert_eq!(p.id, "p");
+        assert_eq!(p.key, None);
         assert_eq!(p.code, "export default 1");
         assert_eq!(p.filename.as_deref(), Some("a.js"));
         assert_eq!(p.globals.len(), 1);
@@ -2140,8 +2169,8 @@ mod tests {
     #[test]
     fn parse_precompile_payload_rejects_a_hash_mismatch() {
         let bytes = from_hex(PRECOMPILE_VECTOR);
-        // Byte 4 is in the hash, 24 in the id, 29 in the code, 58 in the heap block.
-        for (at, rejected) in [(4, true), (24, false), (29, true), (58, false)] {
+        // Byte 4 is in the hash, 24 in the id, 30 in the code, 59 in the heap block.
+        for (at, rejected) in [(4, true), (24, false), (30, true), (59, false)] {
             let mut v = bytes.clone();
             v[at] ^= 1;
             let result = parse_precompile_payload(&v);
@@ -2155,6 +2184,11 @@ mod tests {
 
     /// A `Precompile` of code "1" with no filename, heap or shape under `id`.
     fn precompile_with_id(id: &str) -> Vec<u8> {
+        precompile_with_key(id, None)
+    }
+
+    /// As [`precompile_with_id`], with `key` as raw bytes after the id.
+    fn precompile_with_key(id: &str, key: Option<&[u8]>) -> Vec<u8> {
         let mut code_fields = Vec::new();
         push_string(&mut code_fields, "1"); // code
         code_fields.push(0); // no filename
@@ -2163,6 +2197,7 @@ mod tests {
         push_u32(&mut v, 1); // request_id
         v.extend_from_slice(&prefix_hash(&code_fields, &shape_fields));
         push_string(&mut v, id);
+        push_raw_key(&mut v, key);
         v.extend_from_slice(&code_fields);
         v.extend_from_slice(&[0u8; 2]); // heap: memory_mb, hard_memory_mb absent
         v.extend_from_slice(&shape_fields);
@@ -2186,6 +2221,63 @@ mod tests {
         }
     }
 
+    /// An `Optional<String>` key written as raw bytes, so tests can send bad UTF-8.
+    fn push_raw_key(v: &mut Vec<u8>, key: Option<&[u8]>) {
+        match key {
+            Some(k) => {
+                v.push(1);
+                push_u32(v, k.len() as u32);
+                v.extend_from_slice(k);
+            }
+            None => v.push(0),
+        }
+    }
+
+    /// A minimal `Run` with `key` right after the run id.
+    fn run_with_key(key: Option<&[u8]>) -> Vec<u8> {
+        let mut v = Vec::new();
+        push_u32(&mut v, 5); // run_id
+        push_raw_key(&mut v, key);
+        push_string(&mut v, "1"); // code
+        v.push(0); // no filename
+        push_absent_limits(&mut v);
+        push_u32(&mut v, 0); // globals count
+        push_u32(&mut v, 0); // imports count
+        v.push(0); // call: absent
+        v
+    }
+
+    #[test]
+    fn both_frames_take_an_absent_key_or_one_of_1_to_200_bytes() {
+        let max = "k".repeat(MAX_KEY_BYTES);
+        for key in [None, Some("a"), Some("a b\"c\n"), Some(max.as_str())] {
+            let raw = key.map(str::as_bytes);
+            let (run_key, run) = parse_run_payload(&run_with_key(raw)).unwrap();
+            assert_eq!((run_key.as_deref(), run.run_id), (key, 5));
+            let pre = parse_precompile_payload(&precompile_with_key("p", raw)).unwrap();
+            assert_eq!((pre.key.as_deref(), pre.id.as_str()), (key, "p"));
+        }
+    }
+
+    #[test]
+    fn both_frames_reject_an_empty_long_or_non_utf8_key() {
+        let long = "k".repeat(MAX_KEY_BYTES + 1);
+        let bad: [(&[u8], &str); 3] = [
+            (b"", "key must be"),
+            (long.as_bytes(), "key must be"),
+            (&[0x66, 0xff], "not valid UTF-8"),
+        ];
+        for (key, text) in bad {
+            for e in [
+                parse_run_payload(&run_with_key(Some(key))).unwrap_err(),
+                parse_precompile_payload(&precompile_with_key("p", Some(key))).unwrap_err(),
+            ] {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+                assert!(e.to_string().contains(text), "unexpected: {e}");
+            }
+        }
+    }
+
     #[test]
     fn a_prefix_gets_the_band_a_one_off_does_not() {
         // Same absent heap block on both frame kinds — only the frame kind
@@ -2198,7 +2290,9 @@ mod tests {
             "a reused instance is retired at the cap and terminates above it",
         );
 
-        let oneoff = parse_run_payload(&encode_run_payload(1, "1", None)).unwrap();
+        let oneoff = parse_run_payload(&encode_run_payload(1, "1", None))
+            .unwrap()
+            .1;
         assert_eq!(oneoff.heap.soft_memory_mb, 0);
         assert_eq!(
             oneoff.heap.hard_memory_mb, DEFAULT_MEMORY_MB,
@@ -2238,6 +2332,7 @@ mod tests {
         // the default — the client uses 0 to opt out of a cap.
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
         push_optional_u32(&mut v, Some(0)); // memory_mb: explicitly unlimited
@@ -2254,7 +2349,7 @@ mod tests {
         push_u32(&mut v, 0); // imports count
         v.push(0); // call: absent
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         assert_eq!(p.heap.soft_memory_mb, 0);
         assert_eq!(
             p.heap.hard_memory_mb, 0,
@@ -2269,6 +2364,7 @@ mod tests {
     fn parse_run_payload_with_globals() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
         push_absent_limits(&mut v); // limits (all absent → defaults)
@@ -2282,7 +2378,7 @@ mod tests {
         push_u32(&mut v, 0); // 0 imports
         v.push(0); // call: absent
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         assert_eq!(p.globals.len(), 2);
         assert_eq!(p.globals[0].bridge_stub_name(), Some("fetch"));
         assert_eq!(p.globals[1].bridge_stub_name(), Some("myTool"));
@@ -2292,6 +2388,7 @@ mod tests {
     fn parse_run_payload_with_all_global_kinds() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
         push_absent_limits(&mut v); // limits
@@ -2321,7 +2418,7 @@ mod tests {
         push_u32(&mut v, 0); // 0 imports
         v.push(0); // call: absent
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         assert_eq!(p.globals.len(), 4);
         assert!(matches!(&p.globals[0], HostGlobalDef::Bridge { name, .. } if name == "fetch"));
         assert!(
@@ -2348,6 +2445,7 @@ mod tests {
     fn parse_run_payload_with_one_source_import() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "code"); // code
         v.push(0); // no filename
         push_absent_limits(&mut v); // limits
@@ -2358,7 +2456,7 @@ mod tests {
         push_string(&mut v, "export const add = (a, b) => a + b");
         v.push(0); // call: absent
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         assert_eq!(p.imports.len(), 1);
         assert_eq!(p.imports[0].specifier, "lib:math");
         assert!(matches!(
@@ -2371,6 +2469,7 @@ mod tests {
     fn parse_run_payload_with_multiple_source_imports() {
         let mut v = Vec::new();
         push_u32(&mut v, 1);
+        v.push(0); // key: absent
         push_string(&mut v, "code");
         v.push(0); // no filename
         push_absent_limits(&mut v); // limits
@@ -2384,7 +2483,7 @@ mod tests {
         push_string(&mut v, "export const b = 2");
         v.push(0); // call: absent
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         assert_eq!(p.imports.len(), 2);
         assert_eq!(p.imports[0].specifier, "lib:a");
         assert!(matches!(
@@ -2402,6 +2501,7 @@ mod tests {
     fn parse_run_payload_with_host_import_tree() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "code");
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -2426,7 +2526,7 @@ mod tests {
         v.push(0);
         v.push(0); // call: absent
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         assert_eq!(p.imports.len(), 1);
         assert_eq!(p.imports[0].specifier, "tools:search");
         let ImportModule::Host(exports) = &p.imports[0].module else {
@@ -2451,6 +2551,7 @@ mod tests {
     fn run_payload_with_host_shape_of_depth(depth: usize) -> Vec<u8> {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "code");
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -2473,7 +2574,8 @@ mod tests {
     #[test]
     fn parse_run_payload_accepts_host_shape_at_the_depth_limit() {
         let p = parse_run_payload(&run_payload_with_host_shape_of_depth(MAX_HOST_MODULE_DEPTH))
-            .unwrap();
+            .unwrap()
+            .1;
         let ImportModule::Host(exports) = &p.imports[0].module else {
             panic!("expected host module");
         };
@@ -2511,6 +2613,7 @@ mod tests {
     fn parse_run_payload_rejects_unknown_import_kind() {
         let mut v = Vec::new();
         push_u32(&mut v, 1);
+        v.push(0); // key: absent
         push_string(&mut v, "code");
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -2543,6 +2646,7 @@ mod tests {
     fn parse_run_payload_rejects_global_def_count_past_payload_end() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -2560,6 +2664,7 @@ mod tests {
     fn parse_run_payload_rejects_import_binding_count_past_payload_end() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "x"); // code
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -2578,6 +2683,7 @@ mod tests {
     fn parse_run_payload_rejects_host_module_export_count_past_payload_end() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "code");
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -2599,6 +2705,7 @@ mod tests {
     fn parse_run_payload_rejects_host_module_object_entry_count_past_payload_end() {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // run_id
+        v.push(0); // key: absent
         push_string(&mut v, "code");
         v.push(0); // no filename
         push_absent_limits(&mut v);
@@ -2675,7 +2782,7 @@ mod tests {
         push_u32(&mut v, 3); // argsBlob: value slot
         v.extend_from_slice(&[0xff, 0x0f, 0x41]);
 
-        let p = parse_run_payload(&v).unwrap();
+        let p = parse_run_payload(&v).unwrap().1;
         let call = p.call.expect("call spec");
         assert_eq!(call.export_path, "default.fetch");
         assert_eq!(call.args_blob, vec![0xff, 0x0f, 0x41]);

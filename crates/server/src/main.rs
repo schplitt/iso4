@@ -22,11 +22,18 @@ fn main() {
     // the Node host.
     oom::prefer_this_process_as_victim();
 
-    let (socket_path, warm_budget_bytes, host_reserve_bytes, idle_settle_secs, cores, node_pid) =
-        parse_args();
+    let (
+        socket_path,
+        warm_budget_bytes,
+        host_reserve_bytes,
+        idle_settle_secs,
+        cores,
+        node_pid,
+        key,
+    ) = parse_args();
 
     // Before V8 starts (`Engine::start` below), so a death in its start is recorded.
-    crash::install(&socket_path);
+    crash::install(&socket_path, key.as_deref());
 
     if let Some(pid) = node_pid {
         process::watch_node(pid);
@@ -109,7 +116,8 @@ fn main() {
         match stream {
             Ok(stream) => {
                 let engine = Arc::clone(&engine);
-                std::thread::spawn(move || session::handle_client(stream, engine));
+                let key = key.clone();
+                std::thread::spawn(move || session::handle_client(stream, engine, key));
             }
             Err(e) => {
                 iso4_core::log!("[iso4-v8] accept error: {e}");
@@ -119,7 +127,15 @@ fn main() {
     }
 }
 
-fn parse_args() -> (String, u64, u64, u64, Option<NonZeroUsize>, Option<i32>) {
+fn parse_args() -> (
+    String,
+    u64,
+    u64,
+    u64,
+    Option<NonZeroUsize>,
+    Option<i32>,
+    Option<String>,
+) {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<String> = None;
     let mut warm_budget_bytes: u64 = 0;
@@ -127,6 +143,7 @@ fn parse_args() -> (String, u64, u64, u64, Option<NonZeroUsize>, Option<i32>) {
     let mut idle_settle_secs: u64 = 0;
     let mut cores: Option<NonZeroUsize> = None;
     let mut node_pid: Option<i32> = None;
+    let mut key: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -211,6 +228,20 @@ fn parse_args() -> (String, u64, u64, u64, Option<NonZeroUsize>, Option<i32>) {
                 }
                 i += 2;
             }
+            "--key" if i + 1 < args.len() => {
+                // Every Run and Precompile must carry this key; absent = keyless.
+                let value = &args[i + 1];
+                if value.is_empty() || value.len() > ipc::MAX_KEY_BYTES {
+                    iso4_core::log!(
+                        "[iso4-v8] --key must be 1 to {} bytes, got {}",
+                        ipc::MAX_KEY_BYTES,
+                        value.len()
+                    );
+                    std::process::exit(1);
+                }
+                key = Some(value.clone());
+                i += 2;
+            }
             arg => {
                 // Fatal, like every other bad input here. Continuing would
                 // leave a mistyped `--warm-budget-bytes` at its initial 0,
@@ -234,5 +265,6 @@ fn parse_args() -> (String, u64, u64, u64, Option<NonZeroUsize>, Option<i32>) {
         idle_settle_secs,
         cores,
         node_pid,
+        key,
     )
 }

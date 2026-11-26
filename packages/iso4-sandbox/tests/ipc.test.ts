@@ -317,39 +317,41 @@ function readString(buf: Buffer, offset: number): { value: string, end: number }
 }
 
 describe('payload encoders', () => {
-  test('encodeRunPayload encodes runId and code correctly', () => {
+  test('encodeRunPayload encodes runId, an absent key, and code correctly', () => {
     const buf = encodeRunPayload({ runId: 7, code: 'export default 1' })
     expect(readU32BE(buf, 0)).toBe(7) // runId
-    const { value: code } = readString(buf, 4)
+    expect(buf[4]).toBe(0) // key: absent
+    const { value: code } = readString(buf, 5)
     expect(code).toBe('export default 1')
   })
 
   test('encodeRunPayload with no filename writes absent byte', () => {
     const buf = encodeRunPayload({ runId: 1, code: 'x' })
-    const codeEnd = 4 + 4 + 1 // runId + codeLen + 1 char
+    const codeEnd = 4 + 1 + 4 + 1 // runId + key + codeLen + 1 char
     expect(buf[codeEnd]).toBe(0) // filename absent
   })
 
   test('encodeRunPayload with filename writes present byte and string', () => {
     const buf = encodeRunPayload({ runId: 1, code: 'x', filename: 'agent' })
-    const codeEnd = 4 + 4 + 1
+    const codeEnd = 4 + 1 + 4 + 1
     expect(buf[codeEnd]).toBe(1) // filename present
     const { value: fn } = readString(buf, codeEnd + 1)
     expect(fn).toBe('agent')
   })
 
-  test('encodePrecompilePayload leads with its requestId, then the hash, then the id', () => {
+  test('encodePrecompilePayload leads with its requestId, then the hash, the id and an absent key', () => {
     const runBuf = encodeRunPayload({ runId: 0, code: 'x' })
     const { payload: preBuf, hash } = encodePrecompilePayload({ requestId: 12, id: 'p', code: 'x' })
-    // Same leading-id layout as Run, plus the hash (16) and the id (4 + 1),
-    // minus the run limits (8) and the trailing optional-call byte.
+    // Same leading-id and key layout as Run, plus the hash (16) and the id
+    // (4 + 1), minus the run limits (8) and the trailing optional-call byte.
     expect(preBuf.byteLength).toBe(runBuf.byteLength + 16 + 5 - 8 - 1)
     expect(readU32BE(preBuf, 0)).toBe(12)
     expect(hash.byteLength).toBe(16)
     expect(preBuf.subarray(4, 20).equals(hash)).toBe(true)
     const { value: id, end } = readString(preBuf, 20)
     expect(id).toBe('p')
-    const { value: code } = readString(preBuf, end)
+    expect(preBuf[end]).toBe(0) // key: absent
+    const { value: code } = readString(preBuf, end + 1)
     expect(code).toBe('x')
   })
 
@@ -363,7 +365,7 @@ describe('payload encoders', () => {
       globals: [{ kind: 'string', name: 'answer', expr: '42' }],
       imports: [{ specifier: 'lib:x', source: 'export const x = 1' }],
     })
-    expect(payload.toString('hex')).toBe('000000019c0151069957142d7b202a45e999faaa0000000170000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031')
+    expect(payload.toString('hex')).toBe('000000019c0151069957142d7b202a45e999faaa000000017000000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031')
     expect(hash.toString('hex')).toBe('9c0151069957142d7b202a45e999faaa')
   })
 
@@ -408,9 +410,9 @@ describe('payload encoders', () => {
       code: 'x',
       call: { exportPath: 'default.fetch', argsBlob },
     })
-    // Skip runId(4) + code(4+1) + filename absent(1) + heap(2) + limits(8) +
-    // globals count(4) + imports count(4)
-    let off = 4 + 4 + 1 + 1 + 10 + 4 + 4
+    // Skip runId(4) + key absent(1) + code(4+1) + filename absent(1) + heap(2) +
+    // limits(8) + globals count(4) + imports count(4)
+    let off = 4 + 1 + 4 + 1 + 1 + 10 + 4 + 4
     expect(buf[off]).toBe(1) // call: present
     off += 1
     const { value: path, end } = readString(buf, off)
@@ -442,8 +444,9 @@ describe('payload encoders', () => {
         { specifier: 'lib:math', source: 'export const add = (a, b) => a + b' },
       ],
     })
-    // Skip runId(4) + code(4+1) + filename absent(1) + heap(2) + limits(8) + globals count(4)
-    let off = 4 + 4 + 1 + 1 + 10 + 4
+    // Skip runId(4) + key absent(1) + code(4+1) + filename absent(1) + heap(2) +
+    // limits(8) + globals count(4)
+    let off = 4 + 1 + 4 + 1 + 1 + 10 + 4
     expect(readU32BE(buf, off)).toBe(1) // imports count
     off += 4
     const { value: specifier, end: e1 } = readString(buf, off)
@@ -470,7 +473,7 @@ describe('payload encoders', () => {
         },
       ],
     })
-    let off = 4 + 4 + 1 + 1 + 10 + 4
+    let off = 4 + 1 + 4 + 1 + 1 + 10 + 4
     expect(readU32BE(buf, off)).toBe(1) // imports count
     off += 4
     const { value: specifier, end: e1 } = readString(buf, off)
@@ -511,7 +514,7 @@ describe('payload encoders', () => {
         { specifier: 'lib:b', source: 'export const b = 2' },
       ],
     })
-    let off = 4 + 4 + 1 + 1 + 10 + 4
+    let off = 4 + 1 + 4 + 1 + 1 + 10 + 4
     expect(readU32BE(buf, off)).toBe(2) // imports count
     off += 4
     const { value: s1, end: e1 } = readString(buf, off)

@@ -31,12 +31,18 @@ const SIGNALS: [(c_int, &str); 5] = [
     (libc::SIGILL, "SIGILL"),
 ];
 
+/// The child's `--key`, set once before the handlers; read without allocating.
+static KEY: OnceLock<String> = OnceLock::new();
+
 /// Rust std's handler, which reports a stack overflow and otherwise returns.
 static PREVIOUS: [OnceLock<libc::sigaction>; 2] = [const { OnceLock::new() }; 2];
 
 /// Opens the crash file and installs the signal handlers. Call before V8
 /// starts; [`on_fatal`] goes to `EngineOptions::on_fatal`.
-pub fn install(socket_path: &str) {
+pub fn install(socket_path: &str, key: Option<&str>) {
+    if let Some(key) = key {
+        let _ = KEY.set(key.to_string());
+    }
     let dir = Path::new(socket_path).parent().unwrap_or(Path::new(""));
     let path = dir.join("crash");
     match std::fs::OpenOptions::new()
@@ -152,7 +158,7 @@ fn report(cause: &str, info: Option<&FatalInfo<'_>>) {
         buf: &mut buf,
         len: 0,
     };
-    format_line(&mut line, cause, info);
+    format_line(&mut line, cause, info, KEY.get().map(String::as_str));
     let bytes = line.buf.get(..line.len).unwrap_or(&[]);
     let fd = CRASH_FD.load(Ordering::Relaxed);
     // SAFETY: `bytes` is valid for its length; a failed write is ignored.
@@ -225,9 +231,9 @@ impl std::fmt::Write for Line<'_> {
     }
 }
 
-/// `[iso4-v8] fatal cause=… phase=… run=… prefix=… msg="…"\n`, absent values
-/// left out; a long msg is cut so the line stays within [`LINE_MAX`].
-fn format_line(line: &mut Line<'_>, cause: &str, info: Option<&FatalInfo<'_>>) {
+/// `[iso4-v8] fatal cause=… phase=… run=… prefix=… key="…" msg="…"\n`, absent
+/// values left out; a long msg is cut so the line stays within [`LINE_MAX`].
+fn format_line(line: &mut Line<'_>, cause: &str, info: Option<&FatalInfo<'_>>, key: Option<&str>) {
     let _ = write!(line, "[iso4-v8] fatal cause={cause}");
     if let Some(info) = info {
         if let Some(phase) = info.phase {
@@ -246,6 +252,14 @@ fn format_line(line: &mut Line<'_>, cause: &str, info: Option<&FatalInfo<'_>>) {
         if let Some(prefix) = info.prefix {
             let _ = write!(line, " prefix={prefix}");
         }
+    }
+    if let Some(key) = key {
+        if line.push(b" key=\"", 2) {
+            let _ = line.push_escaped(key.as_bytes());
+            line.push(b"\"", 1);
+        }
+    }
+    if let Some(info) = info {
         if (!info.message.is_empty() || !info.detail.is_empty()) && line.push(b" msg=\"", 2) {
             let _ = line.push_escaped(info.message)
                 && (info.detail.is_empty()
@@ -274,12 +288,16 @@ mod tests {
     }
 
     fn text(cause: &str, info: Option<&FatalInfo<'_>>) -> String {
+        keyed_text(cause, info, None)
+    }
+
+    fn keyed_text(cause: &str, info: Option<&FatalInfo<'_>>, key: Option<&str>) -> String {
         let mut buf = [0u8; LINE_MAX];
         let mut line = Line {
             buf: &mut buf,
             len: 0,
         };
-        format_line(&mut line, cause, info);
+        format_line(&mut line, cause, info, key);
         String::from_utf8(line.buf[..line.len].to_vec()).unwrap()
     }
 
@@ -344,6 +362,54 @@ mod tests {
             text("oom-heap", Some(&idle)),
             "[iso4-v8] fatal cause=oom-heap phase=idle prefix=18446744073709551615 msg=\"(d)\"\n"
         );
+    }
+
+    #[test]
+    fn the_key_sits_after_prefix_and_before_msg_on_every_kind_of_line() {
+        let full = FatalInfo {
+            run: Some(42),
+            prefix: Some(7),
+            message: b"Reached heap limit",
+            ..info(FatalCause::OomHeap, Some(FatalPhase::Run))
+        };
+        assert_eq!(
+            keyed_text("oom-heap", Some(&full), Some("tenant-a")),
+            "[iso4-v8] fatal cause=oom-heap phase=run run=42 prefix=7 key=\"tenant-a\" msg=\"Reached heap limit\"\n"
+        );
+        let v8_fatal = FatalInfo {
+            message: b"Check failed: x.",
+            ..info(FatalCause::V8Fatal, None)
+        };
+        assert_eq!(
+            keyed_text("v8-fatal", Some(&v8_fatal), Some("k")),
+            "[iso4-v8] fatal cause=v8-fatal key=\"k\" msg=\"Check failed: x.\"\n"
+        );
+        assert_eq!(
+            keyed_text("SIGSEGV", None, Some("k")),
+            "[iso4-v8] fatal cause=SIGSEGV key=\"k\"\n"
+        );
+    }
+
+    #[test]
+    fn the_key_is_escaped() {
+        assert_eq!(
+            keyed_text("SIGABRT", None, Some("a b\"c\nd\\")),
+            "[iso4-v8] fatal cause=SIGABRT key=\"a b\\\"c\\x0ad\\\\\"\n"
+        );
+    }
+
+    #[test]
+    fn a_long_msg_after_a_long_key_still_fits() {
+        let key = "\n".repeat(200);
+        let long = [b'x'; 2000];
+        let i = FatalInfo {
+            message: &long,
+            ..info(FatalCause::OomHeap, Some(FatalPhase::Run))
+        };
+        let line = keyed_text("oom-heap", Some(&i), Some(&key));
+        assert!(line.len() <= LINE_MAX, "{}", line.len());
+        assert!(line.contains(&format!("key=\"{}\"", "\\x0a".repeat(200))));
+        assert!(line.ends_with("\"\n"));
     }
 
     #[test]
