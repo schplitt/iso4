@@ -497,7 +497,9 @@ fn bench_policy(c: &mut Criterion) {
 fn bench_engine(c: &mut Criterion) {
     use iso4_core::testing::{channel_link, engine, testval};
     use iso4_core::{Addr, Caller, Engine, Inbound, NoopObserver, Outbound, RunHandle};
-    use iso4_types::{CallSpec, HostGlobalDef, PrefixRunRequest, ResourceLimits, RunRequest};
+    use iso4_types::{
+        CallSpec, HeapLimits, HostGlobalDef, PrefixRunRequest, RunLimits, RunRequest,
+    };
     use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
 
@@ -527,7 +529,7 @@ fn bench_engine(c: &mut Criterion) {
         let req = PrefixRunRequest {
             run_id,
             prefix_id: prefix_id.to_string(),
-            limits: ResourceLimits::default(),
+            limits: RunLimits::default(),
             globals,
             import_rebinds: Vec::new(),
             call: CallSpec {
@@ -553,7 +555,8 @@ fn bench_engine(c: &mut Criterion) {
                 run_id,
                 code: oneoff_code.clone(),
                 filename: None,
-                limits: ResourceLimits::default(),
+                heap: HeapLimits::default(),
+                limits: RunLimits::default(),
                 globals: Vec::new(),
                 imports: Vec::new(),
                 call: None,
@@ -571,6 +574,7 @@ fn bench_engine(c: &mut Criterion) {
     let warm_prefix = engine.prepare(
         "export function f(){ return 1 }".to_string(),
         None,
+        HeapLimits::default(),
         Vec::new(),
         Vec::new(),
     );
@@ -591,6 +595,7 @@ fn bench_engine(c: &mut Criterion) {
     let bridge_prefix = engine.prepare(
         "export async function f(){ return await tool() }".to_string(),
         None,
+        HeapLimits::default(),
         vec![HostGlobalDef::bridge("tool")],
         Vec::new(),
     );

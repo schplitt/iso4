@@ -610,21 +610,22 @@ time. Never per run, never per value.
 | `runId`    | `u32`                 | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.7. |
 | `code`     | `String`              | ESM source.                                                                                                 |
 | `filename` | `Optional<String>`    | Used in stack traces.                                                                                       |
-| `limits`   | `ResourceLimits`      | Only caller-set fields sent; runtime fills defaults.                                                        |
+| `heap`     | `HeapLimits`          | This run's heap lines (strict: no band). Only caller-set fields sent; runtime fills defaults.               |
+| `limits`   | `RunLimits`           | Only caller-set fields sent; runtime fills defaults.                                                        |
 | `globals`  | `List<GlobalDef>`     | Host globals + how the runtime installs each one.                                                           |
 | `imports`  | `List<ImportBinding>` | Source or host import declarations.                                                                         |
 | `call`     | `Optional<CallSpec>`  | Host → sandbox call resolved against the freshly evaluated module.                                          |
 
 `PrefixRunPayload`:
 
-| Field      | Encoding             | Notes                                                                                                                      |
-| ---------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `runId`    | `u32`                | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.7.                |
-| `prefixId` | `PrefixId`           | Prefix handle returned by `Precompile`.                                                                                    |
-| `limits`   | `ResourceLimits`     | Prefix defaults (`prepare({ limits })`) merged with the run's own, field by field; absent fields take runtime defaults.    |
-| `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs). |
-| `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                          |
-| `call`     | `CallSpec`           | Host → sandbox call resolved against the prefix module's exports. Not optional: a prefix run always calls an export.       |
+| Field      | Encoding             | Notes                                                                                                                                                                                  |
+| ---------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `runId`    | `u32`                | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.7.                                                                            |
+| `prefixId` | `PrefixId`           | Prefix handle returned by `Precompile`.                                                                                                                                                |
+| `limits`   | `RunLimits`          | Prefix defaults (`prepare({ limits })`) merged with the run's own, field by field; absent fields take runtime defaults. No heap block: the prefix's cap, set at `Precompile`, applies. |
+| `globals`  | `List<GlobalDef>`    | Bridge stubs to re-install; subset of predeclared. Always `bridge` kind (values are replayed from the stored prefix defs).                                                             |
+| `imports`  | `List<ImportRebind>` | Locations of host-import function leaves whose handler was replaced for this run.                                                                                                      |
+| `call`     | `CallSpec`           | Host → sandbox call resolved against the prefix module's exports. Not optional: a prefix run always calls an export.                                                                   |
 
 `CallSpec`:
 
@@ -658,18 +659,21 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 
 `PrecompilePayload`:
 
-| Field       | Encoding              | Notes                                                                                                               |
-| ----------- | --------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`; the host matches replies by id, never by order.                   |
-| `code`      | `String`              | ESM prefix source.                                                                                                  |
-| `filename`  | `Optional<String>`    | Used in stack traces.                                                                                               |
-| `limits`    | `ResourceLimits`      | Ignored by the runtime: nothing is evaluated at `Precompile`. The host keeps them as the prefix's per-run defaults. |
-| `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                                      |
-| `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                                          |
+| Field       | Encoding              | Notes                                                                                               |
+| ----------- | --------------------- | --------------------------------------------------------------------------------------------------- |
+| `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`; the host matches replies by id, never by order.   |
+| `code`      | `String`              | ESM prefix source.                                                                                  |
+| `filename`  | `Optional<String>`    | Used in stack traces.                                                                               |
+| `heap`      | `HeapLimits`          | The prefix's heap lines (managed: band applies). Stored with the prefix; every run on it gets them. |
+| `globals`   | `List<GlobalDef>`     | Declares the global shape; stored and replayed into every run.                                      |
+| `imports`   | `List<ImportBinding>` | Stored with the prefix; host imports declare bridge shape.                                          |
 
-`ResourceLimits`:
+`HeapLimits`, then `RunLimits`:
 
-Every field is `Optional<u32>`. The client sends only the limits the caller
+The limits travel as two blocks: `HeapLimits` (`memoryMb`, `hardMemoryMb`)
+on `Run` and `Precompile`, `RunLimits` (the other eight) on `Run` and
+`PrefixRun`. A prefix's heap cap is set once at `Precompile`; a `PrefixRun`
+cannot change it. Every field is `Optional<u32>`. The client sends only the limits the caller
 explicitly set; the runtime fills any absent field from its own defaults (it
 owns the default safety posture — the numbers below live in
 `crates/types/src/lib.rs` as the source of truth). An **absent** field
@@ -678,7 +682,8 @@ distinct from absent.
 
 | Field                | Encoding        | Default  | Notes                                                                                                                                                |
 | -------------------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memoryMb`           | `Optional<u32>` | `128`    | The **soft line** — the retirement trigger, not a kill. Zero = no soft line (and, with `hardMemoryMb` absent, no cap at all).                        |
+| `memoryMb`           | `Optional<u32>` | `128`    | `HeapLimits`. The **soft line** — the retirement trigger, not a kill. Zero = no soft line (and, with `hardMemoryMb` absent, no cap at all).          |
+| `hardMemoryMb`       | `Optional<u32>` | derived  | `HeapLimits`. The **hard line** — V8's terminating heap cap. Absent = derived from `memoryMb` (see below). Zero = uncapped.                          |
 | `cpuTimeMs`          | `Optional<u32>` | `5000`   | Zero = no limit.                                                                                                                                     |
 | `wallTimeMs`         | `Optional<u32>` | `30000`  | Caps the run's own logic time (the result's `wallTimeMs`): execution + async waits, each counted to its answer's arrival. Zero = no limit.           |
 | `maxExportBytes`     | `Optional<u32>` | `16 MiB` | Max byte length of the exports value blob. Zero = no limit. Violation → `ERR_EXPORT_TOO_LARGE`.                                                      |
@@ -687,31 +692,30 @@ distinct from absent.
 | `maxBridgeCallBytes` | `Optional<u32>` | `16 MiB` | Max byte length of one bridge call's serialized args. Zero = no limit (64 MiB framing cap applies). Violation → `ERR_BRIDGE_PAYLOAD_TOO_LARGE`.      |
 | `maxBridgeCalls`     | `Optional<u32>` | `10`     | Maximum total bridge calls (globals + host imports combined) a single run may make. Zero = no limit. Violation → `ERR_BRIDGE_CALL_LIMIT_EXCEEDED`.   |
 | `graceMs`            | `Optional<u32>` | `30000`  | Wall budget for `waitUntil` background work after the Result ships, one budget for the whole registered set. Zero disables the grace phase entirely. |
-| `hardMemoryMb`       | `Optional<u32>` | derived  | The **hard line** — V8's terminating heap cap. Absent = derived from `memoryMb` (see below). Zero = uncapped. Block's last field.                    |
 
 **The two heap lines (#169).** `memoryMb` and `hardMemoryMb` resolve together
-in `read_resource_limits`, so nothing downstream sees a half-decided cap. What
+in `read_heap_limits`, so nothing downstream sees a half-decided cap. What
 an ABSENT `hardMemoryMb` means depends on the frame kind, because the band
 exists only for isolates that get reused:
 
 - `Run` — **strict**. A one-off gets a fresh isolate, never reused, so there
   is nothing to retire: `memoryMb` is the terminating cap and there is no
   soft line. Identical to the pre-#169 behavior.
-- `PrefixRun` / `Precompile` — **managed**. Instances are reused, so
+- `Precompile` — **managed**. The prefix's instances are reused, so
   `memoryMb` is the retirement line and a band above it terminates.
 
-| Frame       | `memoryMb` | `hardMemoryMb` | Soft  | Hard              |
-| ----------- | ---------- | -------------- | ----- | ----------------- |
-| `Run`       | absent     | absent         | none  | `128`             |
-| `Run`       | `n`        | absent         | none  | `n`               |
-| `Run`       | any        | `h`            | none  | `h`               |
-| `PrefixRun` | absent     | absent         | `128` | `128 + band(128)` |
-| `PrefixRun` | `n`        | absent         | `n`   | `n + band(n)`     |
-| `PrefixRun` | `n`        | `h` (`n < h`)  | `n`   | `h`               |
-| `PrefixRun` | `0`        | `h`            | none  | `h`               |
-| `PrefixRun` | `n ≥ h`    | `h`            | none  | `h`               |
-| either      | `0`        | absent         | none  | uncapped          |
-| either      | any        | `0`            | none  | uncapped          |
+| Frame        | `memoryMb` | `hardMemoryMb` | Soft  | Hard              |
+| ------------ | ---------- | -------------- | ----- | ----------------- |
+| `Run`        | absent     | absent         | none  | `128`             |
+| `Run`        | `n`        | absent         | none  | `n`               |
+| `Run`        | any        | `h`            | none  | `h`               |
+| `Precompile` | absent     | absent         | `128` | `128 + band(128)` |
+| `Precompile` | `n`        | absent         | `n`   | `n + band(n)`     |
+| `Precompile` | `n`        | `h` (`n < h`)  | `n`   | `h`               |
+| `Precompile` | `0`        | `h`            | none  | `h`               |
+| `Precompile` | `n ≥ h`    | `h`            | none  | `h`               |
+| either       | `0`        | absent         | none  | uncapped          |
+| either       | any        | `0`            | none  | uncapped          |
 
 `band(n)` is `iso4_types::heap_band_mb` — `round(sqrt(8 × n))` MB, the geometric
 mean of the cap and 8 MB, so a small cap gets a large share of headroom and a
@@ -1302,7 +1306,7 @@ returns every other code as a failed result.
 | Code                                  | Cause                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `ERR_USER_CODE`                       | Uncaught exception or rejected top-level await in sandbox JS, in run or prefix code. A syntax error too: `name` is `SyntaxError`, `stack` carries the file and line (`<prefix>` or the prefix `filename` for a broken prefix), and for a source import the message names the specifier.                                                                                                                                                                                                                                                                                                                                  |
-| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's **hard** heap line (`memoryMb` plus its headroom band, or an explicit `hardMemoryMb` — a Runtime-level setting, carried in the limits slot of every frame by the host), or the V8 heap (not ArrayBuffer memory, which the allocator budget covers) was still over that line when a turn of the run, or the prefix's evaluation, ended, after a collection; far over the line it fails without one. Crossing the soft line produces no error at all.                                                                                                                         |
+| `ERR_MEMORY_LIMIT`                    | V8 heap + ArrayBuffer exceeded the isolate's **hard** heap line (`memoryMb` plus its headroom band, or an explicit `hardMemoryMb` — a Runtime-level setting, carried in the heap block of `Run` and `Precompile` by the host), or the V8 heap (not ArrayBuffer memory, which the allocator budget covers) was still over that line when a turn of the run, or the prefix's evaluation, ended, after a collection; far over the line it fails without one. Crossing the soft line produces no error at all.                                                                                                               |
 | `ERR_CPU_TIMEOUT`                     | Active JS execution exceeded `limits.cpuTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `ERR_WALL_TIMEOUT`                    | The run's own logic time (execution + async waits, counted to arrival — the result's `wallTimeMs`) exceeded `limits.wallTimeMs`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `ERR_ABORTED`                         | Host aborted the run (sent `Terminate` after its `AbortSignal` fired).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |

@@ -340,9 +340,9 @@ describe('payload encoders', () => {
   test('encodePrecompilePayload leads with its requestId', () => {
     const runBuf = encodeRunPayload({ runId: 0, code: 'x' })
     const preBuf = encodePrecompilePayload({ requestId: 12, code: 'x' })
-    // Same leading-id layout as Run; only the trailing optional-call byte
-    // differs.
-    expect(preBuf.byteLength).toBe(runBuf.byteLength - 1)
+    // Same leading-id layout as Run, minus the run limits (8) and the
+    // trailing optional-call byte.
+    expect(preBuf.byteLength).toBe(runBuf.byteLength - 8 - 1)
     expect(readU32BE(preBuf, 0)).toBe(12)
     const { value: code } = readString(preBuf, 4)
     expect(code).toBe('x')
@@ -354,9 +354,9 @@ describe('payload encoders', () => {
     expect(readU32BE(buf, 0)).toBe(3) // runId
     const { value: prefixId, end } = readString(buf, 4)
     expect(prefixId).toBe('42')
-    // limits(10) + globals count(4) + rebinds count(4), then the CallSpec
+    // run limits(8) + globals count(4) + rebinds count(4), then the CallSpec
     // with no presence byte: String exportPath + value slot.
-    const off = end + 10 + 4 + 4
+    const off = end + 8 + 4 + 4
     const { value: path, end: pathEnd } = readString(buf, off)
     expect(path).toBe('handler')
     const argsLength = readU32BE(buf, pathEnd)
@@ -376,7 +376,7 @@ describe('payload encoders', () => {
       code: 'x',
       call: { exportPath: 'default.fetch', argsBlob },
     })
-    // Skip runId(4) + code(4+1) + filename absent(1) + limits(10) +
+    // Skip runId(4) + code(4+1) + filename absent(1) + heap(2) + limits(8) +
     // globals count(4) + imports count(4)
     let off = 4 + 4 + 1 + 1 + 10 + 4 + 4
     expect(buf[off]).toBe(1) // call: present
@@ -409,7 +409,7 @@ describe('payload encoders', () => {
         { specifier: 'lib:math', source: 'export const add = (a, b) => a + b' },
       ],
     })
-    // Skip runId(4) + code(4+1) + filename absent(1) + limits(10) + globals count(4)
+    // Skip runId(4) + code(4+1) + filename absent(1) + heap(2) + limits(8) + globals count(4)
     let off = 4 + 4 + 1 + 1 + 10 + 4
     expect(readU32BE(buf, off)).toBe(1) // imports count
     off += 4

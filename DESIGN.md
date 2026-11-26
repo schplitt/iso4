@@ -2478,9 +2478,10 @@ running one.
 **Heap caps: per prefix, per one-off, sandbox default (#77).**
 `createSandbox({ memoryMb })` (default 128 MB, workerd's number) is the
 default; `prepare({ memoryMb })` overrides it per prefix (256 MB edge
-functions beside 32 MB codemode functions in one sandbox — the wire already
-carries the cap per run, instances of a prefix are created with its cap,
-and attach refuses a mismatch per the #81 ruling), and one-off `run()`
+functions beside 32 MB codemode functions in one sandbox — `Precompile`
+carries the cap and the runtime stores it with the prefix, `PrefixRun`
+carries none, instances of a prefix are created with its cap, and attach
+refuses a mismatch per the #81 ruling), and one-off `run()`
 takes `limits.memoryMb` since its isolate is fresh anyway — a plain number
 only there, because the soft line retires a warm instance and a one-off's
 isolate is never reused. What stays

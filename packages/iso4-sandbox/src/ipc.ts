@@ -14,17 +14,14 @@ import type {
 } from './types.js'
 
 /**
- * The limits shape the wire carries. `memoryMb` left `ResourceLimits` when it
- * became a Runtime-level setting (uniform heap cap, set at isolate
- * creation, impossible to renegotiate per run) — but the frame layout is
- * unchanged, so the encoder takes the public limits plus the sandbox-level
- * heap caps injected by the `Sandbox`/`Prefix` implementations.
+ * The heap block the wire carries on `Run` and `Precompile` (a prefix's cap
+ * is set at prepare; `PrefixRun` carries none).
  *
  * `memoryMb` is the advertised cap (the runtime's soft line);
  * `hardMemoryMb` overrides the terminating line, and when it is absent the
  * runtime derives that line from `memoryMb` plus its headroom band.
  */
-export type WireResourceLimits = ResourceLimits & {
+export interface WireHeapLimits {
   memoryMb?: number
   hardMemoryMb?: number
 }
@@ -803,12 +800,17 @@ class PayloadWriter {
     return this
   }
 
-  writeResourceLimits(limits: WireResourceLimits): this {
+  writeHeapLimits(heap: WireHeapLimits): this {
+    this.writeOptionalU32(heap.memoryMb)
+    this.writeOptionalU32(heap.hardMemoryMb)
+    return this
+  }
+
+  writeRunLimits(limits: ResourceLimits): this {
     // Each field is `Optional<u32>`: the client sends only the limits the
     // caller explicitly set. Absent fields are filled in by the runtime, which
     // owns the default safety posture (see `ResourceLimits` jsdoc). An explicit
     // `0` is distinct from absent — it disables that limit entirely.
-    this.writeOptionalU32(limits.memoryMb)
     this.writeOptionalU32(limits.cpuTimeMs)
     this.writeOptionalU32(limits.wallTimeMs)
     this.writeOptionalU32(limits.maxExportBytes)
@@ -817,7 +819,6 @@ class PayloadWriter {
     this.writeOptionalU32(limits.maxBridgeCallBytes)
     this.writeOptionalU32(limits.maxBridgeCalls)
     this.writeOptionalU32(limits.graceMs)
-    this.writeOptionalU32(limits.hardMemoryMb)
     return this
   }
 
@@ -1002,8 +1003,9 @@ class PayloadReader {
 // of truth — rich jsdoc and `@default` values live there). Every field is
 // optional: the client sends only what the caller explicitly set, and the
 // runtime fills any absent field from its own defaults. An explicit `0` is
-// distinct from absent and disables that limit entirely. `writeResourceLimits`
-// encodes each field as `Optional<u32>` accordingly.
+// distinct from absent and disables that limit entirely. `writeRunLimits`
+// encodes each field as `Optional<u32>` accordingly; the heap caps travel in
+// their own block (`writeHeapLimits`).
 
 // ── ImportBinding (wire form) ───────────────────────────────────────────────
 
@@ -1069,7 +1071,8 @@ export interface RunPayloadOptions {
   runId: number
   code: string
   filename?: string
-  limits?: WireResourceLimits
+  heap?: WireHeapLimits
+  limits?: ResourceLimits
   globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
   /**
@@ -1088,7 +1091,8 @@ export function encodeRunPayload(options: RunPayloadOptions): Buffer {
     .writeU32(options.runId)
     .writeString(options.code)
     .writeOptionalString(options.filename)
-    .writeResourceLimits(options.limits ?? {})
+    .writeHeapLimits(options.heap ?? {})
+    .writeRunLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImports(options.imports ?? [])
     .writeOptionalCall(options.call)
@@ -1107,14 +1111,17 @@ export interface PrecompilePayloadOptions {
   requestId: number
   code: string
   filename?: string
-  limits?: WireResourceLimits
+  /**
+   * The prefix's heap caps, applied to every run on it.
+   */
+  heap?: WireHeapLimits
   globals?: readonly GlobalDefPayload[]
   imports?: readonly ImportBindingPayload[]
 }
 
 /**
  * Encode a `PrecompilePayload` per `docs/protocol.md` §5.2.
- * Same as `RunPayload` without `runId`.
+ * Leads with `requestId`; carries the heap block but no run limits.
  * @param options
  */
 export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buffer {
@@ -1122,7 +1129,7 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buff
     .writeU32(options.requestId)
     .writeString(options.code)
     .writeOptionalString(options.filename)
-    .writeResourceLimits(options.limits ?? {})
+    .writeHeapLimits(options.heap ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImports(options.imports ?? [])
     .toBuffer()
@@ -1132,7 +1139,7 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): Buff
 
 export interface PrefixRunPayloadOptions {
   prefixId: string
-  limits?: WireResourceLimits
+  limits?: ResourceLimits
   globals?: readonly GlobalDefPayload[]
   /**
    * Host-import function-leaf rebindings. The declared module shapes are
@@ -1158,7 +1165,7 @@ export function encodePrefixRunPayload(
   return new PayloadWriter()
     .writeU32(options.runId)
     .writeString(options.prefixId)
-    .writeResourceLimits(options.limits ?? {})
+    .writeRunLimits(options.limits ?? {})
     .writeGlobalDefs(options.globals ?? [])
     .writeImportRebinds(options.importRebinds ?? [])
     .writeCall(options.call)
