@@ -1308,9 +1308,10 @@ direction. Both tables start at `0x01`.
 | `0x07` | `Terminate`      | Abort a run — soft (turn-boundary abandon) or hard (mid-turn kill) by mode byte; Rust replies with an `ERR_ABORTED` result (§14.7) |
 | `0x08` | `Stats`          | Ask for a registry snapshot (empty payload)                            |
 | `0x0D` | `Close`          | Orderly close of the connection (empty payload; no reply)              |
+| `0x0E` | `ListPrefixes`   | Ask which prefixes the child holds; supervisor role only               |
 
 `0x09`–`0x0C` are the streaming frames (`docs/protocol.md` §2.1). Next free
-TS → Rust byte: `0x0E`.
+TS → Rust byte: `0x0F`.
 
 **Rust → TS**
 
@@ -1323,9 +1324,10 @@ TS → Rust byte: `0x0E`.
 | `0x05` | `Hello`            | Handshake answer: status, the child's id, kind and key + V8 format probe |
 | `0x06` | `StatsResult`      | The registry snapshot answering a `Stats` request      |
 | `0x0C` | `DisposePrefixResult` | A `DisposePrefix` is done: the prefix is dropped    |
+| `0x0D` | `ListPrefixesResult` | The held prefixes (id, hash, state, cap), or a refusal |
 
 `0x07`–`0x0B` are `RunComplete` and the streaming frames (`docs/protocol.md`
-§2.2). Next free Rust → TS byte: `0x0D`.
+§2.2). Next free Rust → TS byte: `0x0E`.
 
 There is **no `StdioChunk` frame**: `console.*` output is buffered in the
 runtime and rides inside the `Result` frame, so a run's stdout/stderr arrive
@@ -3542,7 +3544,7 @@ then moves into the section it belongs to.
 - Drain: close the listener, answer what still arrives, exit at zero runs and zero Node connections. Grace = largest wall cap in flight + margin; a grace kill is booked as `killed`.
 - Crash record first, quarantine move second. `childGone{crashed, record}` is pushed the moment the record exists.
 - No replay after a crash. Every run on the dead child fails with `ERR_CHILD_CRASHED{ culprit: true | false | 'unknown' }`; only a connection cut before the handshake answer is re-asked once.
-- `ListPrefixes` returns id, key, the child-computed hash, state and cap, never the body (the pool never owns code). Broken entries are reported as broken and are never re-registered.
+- `ListPrefixes` returns id, the child-computed hash, state and cap, never the body (the pool never owns code) and no key (every `Hello` carries it). Broken entries are reported as broken and are never re-registered.
 
 **Decided by the maintainer, 2026-11-13.**
 
@@ -3576,7 +3578,7 @@ then moves into the section it belongs to.
 - Committed total, full, and the park, defined. Committed = the sum of heap caps of live isolates, an uncapped run at the default cap. Full = a new isolate is needed and `instances >= maxInstances`; join semantics (sharing a busy instance) stay. Park = one `--tick-ms`. Before the first `Grant` a child uses `--grant-bytes` and `--grant-instances` from argv; `--admission-line-bytes` goes.
 - The heap cap is set at prepare and not per call. `Precompile` carries it; `PrefixRun` carries the other limits (cpu, wall, bridge) only; one-off `Run` keeps its cap.
 - Build id is the git commit, baked at build time. `build.rs` embeds it; the platform package's `package.json` carries the same value so Node knows what to expect. Distinct from `PROTOCOL_VERSION`, which stays 1.
-- Frame payloads for the new frames. `Revoke{ id }`: no answer. `GoAway`: empty. `DisposeResult{ disposed | busy{ instances, running } }`. `ConsoleChunk{ runId, lines[{ seq, at, level, stream, text, phase }], dropped }`, keyed by the per-connection run id; `Result` still carries all lines under the same byte cap. `StatsPush{ instances, running, committedBytes, perPrefix[{ id, instances, idleHeap, idleMs, outcomes{} }] }`, at most once per `--tick-ms`. `Hello` (child to any): child id, kind, key, build id, protocol version. `ListPrefixesResult`: per prefix id, key, hash (child-computed), state, cap, body.
+- Frame payloads for the new frames. `Revoke{ id }`: no answer. `GoAway`: empty. `DisposeResult{ disposed | busy{ instances, running } }`. `ConsoleChunk{ runId, lines[{ seq, at, level, stream, text, phase }], dropped }`, keyed by the per-connection run id; `Result` still carries all lines under the same byte cap. `StatsPush{ instances, running, committedBytes, perPrefix[{ id, instances, idleHeap, idleMs, outcomes{} }] }`, at most once per `--tick-ms`. `Hello` (child to any): child id, kind, key, build id, protocol version. `ListPrefixesResult`: per prefix id, hash (child-computed), state, cap; no key (on `Hello`), no body.
 - Socket directory files: one line of text each, written before anything that depends on them. `sup.pid` and `<n>.pid` carry pid and start time; `next-id`, `incarnation` and the `.spawn` marker are fsynced before the exec; `sup.pid` is written before `ctl.sock` listens; `token` is written by the mkdir winner. The directory is `<tmp>/iso4-<pid>`, falling back to `/tmp` when the path would exceed 90 bytes (macOS `sun_path`). `<n>.crash` is written from the fatal path through a preopened fd into a preformatted buffer; the first child PR adds the V8 fatal callback and SIGABRT/SIGTRAP handlers that today only the OOM path has.
 - Error bookkeeping. `ERR_CHILD_DRAINING`, `ERR_PREFIX_UNKNOWN`, `ERR_CHILD_FULL`, `ERR_CHILD_UNREACHABLE` each enter `errors.rs`, `types.ts`, protocol section 7 and DESIGN.md in the PR that adds them. `retryable` and `overloaded` are new fields on the run error payload, set by the child for its codes and by Node for host-detected ones. `ERR_CAPACITY_MEMORY` stays on the wire; Node folds it into `ERR_POOL_FULL{memory}` after the re-ask.
 - PR order: 1a, 1b, 2a, 2b, then placement by key, the decider, quarantine, one-off children, second placement (§17.6). 1a: child, additive, today's Node unchanged (host id, key, hash, cap on `Precompile`; hash on `PrefixRun`; key on `Run`; connection id and role on the handshake; child facts on `Hello`; new flags; build id; `ListPrefixes`; `ERR_PREFIX_UNKNOWN`; the non-panicking writer; `.pid`). 1b: child, still additive (`Drain` with answer, `GoAway`, `DisposeResult`, `Revoke`, incarnation fence, crash and kill files with the fatal handlers, per-thread allowance share, `ConsoleChunk`, `StatsPush`). 2a: `iso4-pool` and the supervisor with one child, no Node change (directory files, pid poll, spawn, drain, adoption, incarnation, seq). 2b: Node (control client per thread, attach race, prepare via the supervisor, per-child slot pool, cache and re-ask, `stats()` over control, respawn). Only in 2b does `Precompile` leave the Node leg.

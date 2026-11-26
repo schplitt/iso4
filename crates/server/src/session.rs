@@ -387,7 +387,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, child: Arc<ipc
     // channel; runs execute on worker/instance threads and write their
     // outbound frames through ONE serialized writer, so frames from
     // concurrent runs never interleave mid-frame. Control frames
-    // (Precompile, DisposePrefix, Stats) are handled inline here.
+    // (Precompile, DisposePrefix, Stats, ListPrefixes) are handled inline here.
     let outbox = match ipc::Outbox::spawn(&stream) {
         Ok(o) => o,
         Err(e) => {
@@ -550,6 +550,40 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, child: Arc<ipc
                 ) {
                     iso4_core::log!("[iso4-v8] failed to write StatsResult frame: {e}");
                     break;
+                }
+            }
+            ipc::TsToRustMessageType::ListPrefixes => {
+                let request_id = match ipc::parse_list_prefixes_payload(&frame.payload) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        iso4_core::log!("[iso4-v8] malformed ListPrefixes payload: {e} — closing");
+                        break;
+                    }
+                };
+                let result = if auth.role == ipc::PeerRole::Supervisor {
+                    let list = engine.list_prefixes();
+                    wire::encode_list_prefixes_result_payload(
+                        request_id,
+                        Ok(&list),
+                        ipc::DEFAULT_MAX_FRAME_LENGTH,
+                    )
+                } else {
+                    iso4_core::log!("[iso4-v8] ListPrefixes from a node-role peer — refusing");
+                    let refusal =
+                        Refusal::Internal("ListPrefixes needs the supervisor role".to_string())
+                            .to_payload();
+                    wire::encode_list_prefixes_result_payload(
+                        request_id,
+                        Err(&refusal),
+                        ipc::DEFAULT_MAX_FRAME_LENGTH,
+                    )
+                };
+                if let Err(e) = outbox.send_frame(
+                    ipc::RustToTsMessageType::ListPrefixesResult,
+                    result,
+                    Vec::new(),
+                ) {
+                    iso4_core::log!("[iso4-v8] failed to write ListPrefixesResult frame: {e}");
                 }
             }
             ipc::TsToRustMessageType::BridgeResponse
@@ -1180,11 +1214,19 @@ mod tests {
 
     /// [`open_session`] for a child started with `--key <key>`.
     fn open_keyed_session(key: Option<&str>) -> (UnixStream, crossbeam_channel::Receiver<()>) {
+        open_session_as(ipc::PeerRole::Node, key)
+    }
+
+    /// [`open_session`] for a peer of `role`.
+    fn open_session_as(
+        role: ipc::PeerRole,
+        key: Option<&str>,
+    ) -> (UnixStream, crossbeam_channel::Receiver<()>) {
         let (mut host, done) = spawn_keyed_session(key);
         ipc::write_ts_to_rust_frame(
             &mut host,
             ipc::TsToRustMessageType::Authenticate,
-            &authenticate(iso4_core::wire::probe().to_vec()),
+            &authenticate_as(role, iso4_core::wire::probe().to_vec()),
         )
         .unwrap();
         let hello = ipc::read_rust_to_ts_frame(&mut host).expect("a Hello frame");
@@ -1199,6 +1241,17 @@ mod tests {
 
     /// [`precompile_payload`] with `key` after the id.
     fn precompile_keyed(request_id: u32, id: &str, key: Option<&str>, code: &str) -> Vec<u8> {
+        precompile_full(request_id, id, key, code, [None, None])
+    }
+
+    /// [`precompile_keyed`] with the heap block: `memoryMb`, `hardMemoryMb`.
+    fn precompile_full(
+        request_id: u32,
+        id: &str,
+        key: Option<&str>,
+        code: &str,
+        heap: [Option<u32>; 2],
+    ) -> Vec<u8> {
         let mut code_fields = (code.len() as u32).to_be_bytes().to_vec();
         code_fields.extend_from_slice(code.as_bytes());
         code_fields.push(0); // no filename
@@ -1209,7 +1262,15 @@ mod tests {
         v.extend_from_slice(id.as_bytes());
         push_key(&mut v, key);
         v.extend_from_slice(&code_fields);
-        v.extend_from_slice(&[0u8; 2]); // heap: both lines absent
+        for line in heap {
+            match line {
+                Some(mb) => {
+                    v.push(1);
+                    v.extend_from_slice(&mb.to_be_bytes());
+                }
+                None => v.push(0),
+            }
+        }
         v.extend_from_slice(&shape_fields);
         v
     }
@@ -1265,6 +1326,177 @@ mod tests {
             precompile_payload(2, "p", "export default 2"),
         );
         assert_eq!(again.payload, [0, 0, 0, 2, 1, 0]);
+    }
+
+    /// One `ListPrefixesResult` row: id, hash, state, memoryMb, hardMemoryMb.
+    type ListRow = (String, [u8; 16], u8, u32, u32);
+
+    /// Ask for the prefix list and decode an ok answer.
+    fn list_prefixes(host: &mut UnixStream, request_id: u32) -> Vec<ListRow> {
+        let answer = ask(
+            host,
+            ipc::TsToRustMessageType::ListPrefixes,
+            request_id.to_be_bytes().to_vec(),
+        );
+        assert_eq!(
+            answer.message_type,
+            ipc::RustToTsMessageType::ListPrefixesResult
+        );
+        let p = &answer.payload;
+        let u32_at = |at: usize| u32::from_be_bytes(p[at..at + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), request_id);
+        assert_eq!(&p[4..6], &[1, 0], "ok, no error");
+        let mut rows = Vec::new();
+        let mut at = 10;
+        for _ in 0..u32_at(6) {
+            let len = u32_at(at) as usize;
+            let id = String::from_utf8(p[at + 4..at + 4 + len].to_vec()).unwrap();
+            at += 4 + len;
+            let hash: [u8; 16] = p[at..at + 16].try_into().unwrap();
+            let state = p[at + 16];
+            rows.push((id, hash, state, u32_at(at + 17), u32_at(at + 21)));
+            at += 25;
+        }
+        assert_eq!(at, p.len(), "no trailing bytes");
+        rows
+    }
+
+    /// The hash a `Precompile` payload carries.
+    fn hash_of(precompile: &[u8]) -> [u8; 16] {
+        precompile[4..20].try_into().unwrap()
+    }
+
+    /// A `PrefixRun` of export `f` on `id`, default limits, no arguments.
+    fn prefix_run_payload(run_id: u32, id: &str, hash: [u8; 16]) -> Vec<u8> {
+        let mut p = run_id.to_be_bytes().to_vec();
+        pstr(&mut p, id);
+        p.extend_from_slice(&hash);
+        p.extend_from_slice(&[0u8; 8]); // run limits, all absent
+        p.extend_from_slice(&[0u8; 8]); // globals count, import rebinds count
+        pstr(&mut p, "f");
+        let args = testval::to_blob(&TestValue::Array(Vec::new()));
+        p.extend_from_slice(&(args.len() as u32).to_be_bytes());
+        p.extend_from_slice(&args);
+        p
+    }
+
+    #[test]
+    fn a_supervisor_lists_the_prefixes_sorted_with_their_state() {
+        iso4_core::testing::init_platform();
+        let (mut host, _done) = open_session_as(ipc::PeerRole::Supervisor, None);
+        assert!(list_prefixes(&mut host, 1).is_empty());
+
+        let b = precompile_full(1, "b", None, "export const f = () => 1", [None, None]);
+        let a = precompile_full(
+            2,
+            "a",
+            None,
+            "export const f = () => 2",
+            [Some(64), Some(100)],
+        );
+        let x = precompile_payload(3, "x", "throw new Error('boom')");
+        for (request_id, payload) in [(1u32, &b), (2, &a), (3, &x)] {
+            let stored = ask(
+                &mut host,
+                ipc::TsToRustMessageType::Precompile,
+                payload.clone(),
+            );
+            assert_eq!(stored.payload, [0, 0, 0, request_id as u8, 1, 0]);
+        }
+        // The first run of "x" fails its cold start and marks it broken.
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::PrefixRun,
+            &prefix_run_payload(1, "x", hash_of(&x)),
+        )
+        .unwrap();
+        let failed = ipc::read_rust_to_ts_frame(&mut host).expect("a Result");
+        assert_eq!(failed.message_type, ipc::RustToTsMessageType::Result);
+        assert_eq!(failed.payload[8], 0, "the cold start must fail");
+
+        let default = types::HeapLimits::default();
+        let (soft, hard) = (default.soft_memory_mb, default.hard_memory_mb);
+        assert_eq!(
+            list_prefixes(&mut host, 2),
+            [
+                ("a".to_string(), hash_of(&a), 0, 64, 100),
+                ("b".to_string(), hash_of(&b), 0, soft, hard),
+                ("x".to_string(), hash_of(&x), 1, soft, hard),
+            ]
+        );
+
+        let disposed = ask(
+            &mut host,
+            ipc::TsToRustMessageType::DisposePrefix,
+            dispose_payload(4, "b"),
+        );
+        assert_eq!(
+            disposed.message_type,
+            ipc::RustToTsMessageType::DisposePrefixResult
+        );
+        let ids: Vec<String> = list_prefixes(&mut host, 3)
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+        assert_eq!(ids, ["a", "x"]);
+
+        // The connection goes on.
+        let again = ask(
+            &mut host,
+            ipc::TsToRustMessageType::Precompile,
+            precompile_payload(5, "b", "export default 3"),
+        );
+        assert_eq!(again.payload, [0, 0, 0, 5, 1, 0]);
+    }
+
+    #[test]
+    fn a_node_peer_is_refused_the_list_and_the_connection_goes_on() {
+        let (mut host, _done) = open_session();
+        let stored = ask(
+            &mut host,
+            ipc::TsToRustMessageType::Precompile,
+            precompile_payload(1, "p", "export default 1"),
+        );
+        assert_eq!(stored.payload, [0, 0, 0, 1, 1, 0]);
+
+        let refused = ask(
+            &mut host,
+            ipc::TsToRustMessageType::ListPrefixes,
+            9u32.to_be_bytes().to_vec(),
+        );
+        assert_eq!(
+            refused.message_type,
+            ipc::RustToTsMessageType::ListPrefixesResult
+        );
+        assert_eq!(&refused.payload[..6], &[0, 0, 0, 9, 0, 1]);
+        let text = String::from_utf8_lossy(&refused.payload);
+        assert!(text.contains("ERR_INTERNAL"), "{text}");
+        assert!(
+            text.contains("ListPrefixes needs the supervisor role"),
+            "{text}"
+        );
+
+        let again = ask(
+            &mut host,
+            ipc::TsToRustMessageType::Precompile,
+            precompile_payload(2, "q", "export default 2"),
+        );
+        assert_eq!(again.payload, [0, 0, 0, 2, 1, 0]);
+    }
+
+    #[test]
+    fn a_malformed_list_prefixes_closes_the_connection() {
+        let (mut host, done) = open_session_as(ipc::PeerRole::Supervisor, None);
+        // A valid request is answered first, so the close below is the payload's.
+        assert!(list_prefixes(&mut host, 1).is_empty());
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::ListPrefixes,
+            &[0, 0, 0, 2, 0],
+        )
+        .unwrap();
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("a malformed ListPrefixes did not close the connection");
     }
 
     /// Child key, frame key, and the refusal text after "<what> carries ".

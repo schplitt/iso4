@@ -108,9 +108,11 @@ describe('typed frame codec', () => {
     expect(parseTsToRustMessageType(0x06)).toBe(TsToRustMessageTypes.BridgeResponse)
     expect(parseTsToRustMessageType(0x07)).toBe(TsToRustMessageTypes.Terminate)
     expect(parseTsToRustMessageType(0x0D)).toBe(TsToRustMessageTypes.Close)
+    expect(parseTsToRustMessageType(0x0E)).toBe(TsToRustMessageTypes.ListPrefixes)
     expect(parseRustToTsMessageType(0x02)).toBe(RustToTsMessageTypes.Result)
     expect(parseRustToTsMessageType(0x03)).toBe(RustToTsMessageTypes.PrecompileResult)
     expect(parseRustToTsMessageType(0x0C)).toBe(RustToTsMessageTypes.DisposePrefixResult)
+    expect(parseRustToTsMessageType(0x0D)).toBe(RustToTsMessageTypes.ListPrefixesResult)
   })
 })
 

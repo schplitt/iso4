@@ -67,6 +67,10 @@ export const TsToRustMessageTypes = {
    * Orderly close: the host is done with this connection. Empty payload.
    */
   Close: 0x0D,
+  /**
+   * Ask for the stored prefixes; supervisor role only. Node never sends it.
+   */
+  ListPrefixes: 0x0E,
 } as const
 
 export type TsToRustMessageType
@@ -115,6 +119,10 @@ export const RustToTsMessageTypes = {
    * Answer to a `DisposePrefix`: the prefix is dropped. Payload: `u32 requestId`.
    */
   DisposePrefixResult: 0x0C,
+  /**
+   * Answer to a `ListPrefixes`. Node never receives it.
+   */
+  ListPrefixesResult: 0x0D,
 } as const
 
 export type RustToTsMessageType
@@ -2306,6 +2314,7 @@ export function parseTsToRustMessageType(
     case TsToRustMessageTypes.StreamPull:
     case TsToRustMessageTypes.StreamCancel:
     case TsToRustMessageTypes.Close:
+    case TsToRustMessageTypes.ListPrefixes:
       return byte
     default:
       throw new Error(`unknown TS->Rust message type: ${formatByte(byte)}`)
@@ -2328,6 +2337,7 @@ export function parseRustToTsMessageType(
     case RustToTsMessageTypes.StreamChunk:
     case RustToTsMessageTypes.StreamEnd:
     case RustToTsMessageTypes.DisposePrefixResult:
+    case RustToTsMessageTypes.ListPrefixesResult:
       return byte
     default:
       throw new Error(`unknown Rust->TS message type: ${formatByte(byte)}`)
