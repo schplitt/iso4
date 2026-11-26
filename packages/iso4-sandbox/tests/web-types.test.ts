@@ -283,6 +283,7 @@ describe('host → sandbox nesting', () => {
 
   test('call() arguments may be deep and cyclic', async () => {
     const prefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `export function probe(deep, cyc) {
                let d = 0, v = deep
                while (!(v instanceof Response)) { v = v.c; d++ }

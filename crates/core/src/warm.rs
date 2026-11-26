@@ -495,6 +495,8 @@ struct Instance {
     /// The heap caps this instance's isolate was created with — attach
     /// refuses a mismatching run (#81 r6).
     caps: HeapCaps,
+    /// The engine alias of the prefix it evaluated; a reused id's new prefix never joins it.
+    prefix_alias: u64,
     /// Consecutive finishes above the soft line; `policy::SOFT_LINE_STRIKES`
     /// of them retire the instance.
     soft_strikes: u8,
@@ -508,6 +510,8 @@ struct Instance {
 struct PrefixEntry {
     instances: Vec<Instance>,
     demand: PrefixDemand,
+    /// The prefix alias `demand` was measured for; a reused id starts afresh.
+    alias: u64,
 }
 
 struct RegistryInner {
@@ -552,6 +556,11 @@ impl RegistryInner {
             }
             None => self.oneoff_demand.note_completion(wall_ms, cpu_ms, now),
         }
+        self.count_release(now);
+    }
+
+    /// One more clean release toward the slot recompute cadence.
+    fn count_release(&mut self, now: Instant) {
         self.releases_since_recompute += 1;
         if self.releases_since_recompute < RECOMPUTE_EVERY {
             return;
@@ -741,8 +750,8 @@ impl WarmRegistry {
         })
     }
 
-    /// Take an instance for a run of `prefix_id` asking for `caps`
-    /// (`hard_bytes: 0` = uncapped). Order: reuse the warmest idle instance; else decide
+    /// Take an instance for a run of `prefix_id` (the prefix with `prefix_alias`)
+    /// asking for `caps` (`hard_bytes: 0` = uncapped). Order: reuse the warmest idle instance; else decide
     /// join-or-spawn from the prefix's demand EWMAs (spawn on CPU demand,
     /// ceiling at cores; routing packs onto the fullest non-saturated
     /// instance, spilling over to a spawn and then to the least-utilized).
@@ -753,6 +762,7 @@ impl WarmRegistry {
     pub fn acquire(
         &self,
         prefix_id: &str,
+        prefix_alias: u64,
         caps: HeapCaps,
         spawn: &dyn Fn() -> std::io::Result<InstanceHandle>,
     ) -> Acquired {
@@ -764,6 +774,11 @@ impl WarmRegistry {
         let admit_warm = inner.pressure_pass(usage, self.warm_budget_bytes);
         let id = inner.next_instance_id;
         let entry = inner.prefixes.entry(prefix_id.to_string()).or_default();
+        // Aliases only grow: a late run of an older alias leaves the entry alone.
+        if prefix_alias > entry.alias {
+            entry.demand = PrefixDemand::default();
+            entry.alias = prefix_alias;
+        }
         entry.demand.note_arrival(now);
         // Instances whose owner thread retired itself while idle.
         let pooled = entry.instances.len();
@@ -783,7 +798,9 @@ impl WarmRegistry {
             .instances
             .iter()
             .enumerate()
-            .filter(|(_, i)| !i.dead && i.in_flight == 0 && i.caps == caps)
+            .filter(|(_, i)| {
+                !i.dead && i.in_flight == 0 && i.caps == caps && i.prefix_alias == prefix_alias
+            })
             .max_by_key(|(_, i)| i.handle.last_used)
             .map(|(pos, _)| pos);
         if let Some(pos) = idle_pos {
@@ -797,13 +814,18 @@ impl WarmRegistry {
             .instances
             .iter()
             .enumerate()
-            .filter(|(_, i)| !i.dead && !i.handle.load.is_retired() && i.caps == caps)
+            .filter(|(_, i)| {
+                !i.dead
+                    && !i.handle.load.is_retired()
+                    && i.caps == caps
+                    && i.prefix_alias == prefix_alias
+            })
             .map(|(pos, _)| pos)
             .collect();
         let live = entry
             .instances
             .iter()
-            .filter(|i| !i.dead && !i.handle.load.is_retired())
+            .filter(|i| !i.dead && !i.handle.load.is_retired() && i.prefix_alias == prefix_alias)
             .count();
 
         if joinable.is_empty() {
@@ -828,6 +850,7 @@ impl WarmRegistry {
                 handle,
                 in_flight: 1,
                 caps,
+                prefix_alias,
                 soft_strikes: 0,
                 dead: false,
             });
@@ -884,6 +907,7 @@ impl WarmRegistry {
                     handle,
                     in_flight: 1,
                     caps,
+                    prefix_alias,
                     soft_strikes: 0,
                     dead: false,
                 });
@@ -950,11 +974,15 @@ impl WarmRegistry {
         let usage = self.sample_usage();
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let inner = &mut *guard;
-        if !outcome_tainted {
+        // A disposed prefix's last runs must not feed a reused id's demand.
+        let counts = !outcome_tainted && prefix_alive;
+        if counts {
             inner.note_slot_sample(Some(prefix_id), wall_time_ms, cpu_time_ms);
+        } else if !outcome_tainted {
+            inner.count_release(Instant::now());
         }
         if let Some(entry) = inner.prefixes.get_mut(prefix_id) {
-            if !outcome_tainted {
+            if counts {
                 entry.demand.cpu_ms.update(cpu_time_ms);
                 if heap_used_bytes > 0 {
                     entry.demand.heap_bytes.update(heap_used_bytes as f64);
@@ -1225,7 +1253,7 @@ mod tests {
     }
 
     fn acquire_caps(reg: &WarmRegistry, prefix: &str, caps: HeapCaps) -> Acquired {
-        reg.acquire(prefix, caps, &|| {
+        reg.acquire(prefix, 0, caps, &|| {
             spawn_instance(counter_prefix(), 0, test_brand_key())
         })
     }
@@ -1856,7 +1884,7 @@ mod tests {
             job
         };
         let registry = WarmRegistry::new(0, 0);
-        let a = att(registry.acquire("p0", caps(TEST_CAP), &|| {
+        let a = att(registry.acquire("p0", 0, caps(TEST_CAP), &|| {
             spawn_instance(Arc::clone(&garbage), 0, test_brand_key())
         }));
         let outcome = call_via(&a, churn_job());
@@ -1879,7 +1907,7 @@ mod tests {
         );
 
         // The instance is still the same warm one, with its state intact.
-        let a2 = att(registry.acquire("p0", caps(TEST_CAP), &|| {
+        let a2 = att(registry.acquire("p0", 0, caps(TEST_CAP), &|| {
             panic!("the settled instance must be reused, not respawned")
         }));
         assert_eq!(a2.id, a.id);
@@ -1932,6 +1960,80 @@ mod tests {
         let fresh = att(acquire(&registry, "p0", TEST_CAP));
         assert_ne!(fresh.id, a.id, "disposed warmth must not serve");
         registry.release("p0", fresh.id, false, 0, 0.0, 0.0, true);
+    }
+
+    #[test]
+    fn a_reused_id_never_joins_the_old_prefixs_instance() {
+        let registry = WarmRegistry::new(0, 0);
+        // v1 passed the store lookup; then dispose and a v2 prepare of the same id
+        // happened before v1's acquire spawned its instance.
+        registry.dispose_prefix("p");
+        let v1 = att(registry.acquire("p", 1, caps(TEST_CAP), &|| {
+            spawn_instance(counter_prefix(), 0, test_brand_key())
+        }));
+        // Light measured demand already under v2's alias, so acquire keeps it:
+        // without the alias filters v2 would join v1's instance.
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            let entry = inner.prefixes.get_mut("p").unwrap();
+            entry.alias = 2;
+            entry.demand.cpu_ms.update(0.001);
+        }
+        let spawned = std::cell::Cell::new(false);
+        let v2 = att(registry.acquire("p", 2, caps(TEST_CAP), &|| {
+            spawned.set(true);
+            spawn_instance(counter_prefix(), 0, test_brand_key())
+        }));
+        assert!(spawned.get(), "v2 must spawn its own instance");
+        assert_ne!(v2.id, v1.id, "v2 joined v1's instance");
+        registry.release("p", v1.id, false, 0, 0.0, 0.0, false);
+        registry.release("p", v2.id, false, 0, 0.0, 0.0, true);
+        let v2_again = att(registry.acquire("p", 2, caps(TEST_CAP), &|| {
+            panic!("v2's idle instance must be reused")
+        }));
+        assert_eq!(v2_again.id, v2.id);
+        registry.release("p", v2_again.id, false, 0, 0.0, 0.0, true);
+    }
+
+    #[test]
+    fn a_reused_id_starts_with_fresh_demand() {
+        let registry = WarmRegistry::new(0, 0);
+        let acquire_v = |alias| {
+            att(registry.acquire("p", alias, caps(TEST_CAP), &|| {
+                spawn_instance(counter_prefix(), 0, test_brand_key())
+            }))
+        };
+        let first = acquire_v(1);
+        registry.release("p", first.id, false, 5_000_000, 1.0, 40.0, true);
+        // A busy v1 instance keeps the entry alive across dispose + re-prepare.
+        let busy = acquire_v(1);
+        registry.dispose_prefix("p");
+        let demand = |registry: &WarmRegistry| {
+            let inner = registry.inner.lock().unwrap();
+            let d = &inner.prefixes["p"].demand;
+            (d.cpu_ms.get(), d.heap_bytes.get())
+        };
+        let (cpu, heap) = demand(&registry);
+        assert_eq!(cpu, Some(40.0));
+        assert_ne!(heap, Some(TEST_CAP as f64), "v1 measured its heap");
+        let fresh = acquire_v(2);
+        assert_eq!(
+            demand(&registry),
+            (None, Some(TEST_CAP as f64)),
+            "v2 starts from the heap seed, not v1's numbers"
+        );
+        // A late acquire of v1 neither resets v2's demand nor takes the entry back.
+        let late = acquire_v(1);
+        assert_eq!(registry.inner.lock().unwrap().prefixes["p"].alias, 2);
+        assert_eq!(demand(&registry), (None, Some(TEST_CAP as f64)));
+        registry.release("p", late.id, false, 0, 0.0, 0.0, false);
+        registry.release("p", busy.id, false, 9_000_000, 1.0, 99.0, false);
+        assert_eq!(
+            demand(&registry),
+            (None, Some(TEST_CAP as f64)),
+            "v1's last run feeds nothing"
+        );
+        registry.release("p", fresh.id, false, 0, 0.0, 0.0, true);
     }
 
     #[test]

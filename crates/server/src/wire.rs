@@ -352,34 +352,26 @@ fn encode_run_error_payload(error: &RunErrorPayload, out: &mut Vec<u8>) {
 ///
 /// Wire layout:
 /// ```text
+/// u32   requestId
 /// u8    ok
-/// u8    prefixIdPresent  (1 when ok = true)
-///   String  prefixId
 /// u8    errorPresent     (1 when ok = false)
 ///   RunErrorPayload  error
 /// ```
 pub fn encode_precompile_result_payload(
     request_id: u32,
-    prefix_id: Option<&str>,
     error: Option<&RunErrorPayload>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&request_id.to_be_bytes());
-    match (prefix_id, error) {
-        (Some(id), _) => {
+    match error {
+        None => {
             encode_bool(true, &mut out);
-            out.push(1);
-            encode_string(id, &mut out);
             out.push(0);
         }
-        (_, Some(err)) => {
+        Some(err) => {
             encode_bool(false, &mut out);
-            out.push(0);
             out.push(1);
             encode_run_error_payload(err, &mut out);
-        }
-        (None, None) => {
-            unreachable!("encode_precompile_result_payload: must provide either prefix_id or error")
         }
     }
     out
@@ -596,6 +588,20 @@ mod tests {
             }),
             0,
         )
+    }
+
+    #[test]
+    fn a_precompile_result_carries_the_request_id_and_no_prefix_id() {
+        assert_eq!(
+            encode_precompile_result_payload(9, None),
+            [0, 0, 0, 9, 1, 0]
+        );
+        let error = iso4_core::RunError::PrefixIdTaken("taken".to_string()).to_payload();
+        let failed = encode_precompile_result_payload(9, Some(&error));
+        assert_eq!(&failed[..6], &[0, 0, 0, 9, 0, 1]);
+        let mut expected = failed[..6].to_vec();
+        encode_run_error_payload(&error, &mut expected);
+        assert_eq!(failed, expected);
     }
 
     #[test]

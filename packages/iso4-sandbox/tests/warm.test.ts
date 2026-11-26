@@ -30,7 +30,7 @@ describe('warm instances', () => {
   })
 
   test('module-scope state survives across calls on one instance', async () => {
-    await using prefix = await single.prepare({ code: COUNTER })
+    await using prefix = await single.prepare({ id: crypto.randomUUID(), code: COUNTER })
     for (const expected of [1, 2, 3]) {
       const result = await prefix.call({ export: 'bump' })
       expect(result.ok).toBe(true)
@@ -42,6 +42,7 @@ describe('warm instances', () => {
 
   test('a limit violation evicts: the next call cold-starts clean', async () => {
     await using prefix = await single.prepare({
+      id: crypto.randomUUID(),
       code: `${COUNTER}\nexport function spin() { for (;;) {} }`,
     })
     const warm = await prefix.call({ export: 'bump' })
@@ -71,8 +72,8 @@ describe('warm instances', () => {
     // explicitly disabled, warming B leaves A resident; only RSS pressure
     // (capacity.test.ts) or dispose() evicts.
     await using tiny = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 0 })
-    await using prefixA = await tiny.prepare({ code: COUNTER })
-    await using prefixB = await tiny.prepare({ code: COUNTER })
+    await using prefixA = await tiny.prepare({ id: crypto.randomUUID(), code: COUNTER })
+    await using prefixB = await tiny.prepare({ id: crypto.randomUUID(), code: COUNTER })
 
     const a1 = await prefixA.call({ export: 'bump' })
     expect(a1.ok && a1.value === 1).toBe(true)
@@ -89,7 +90,7 @@ describe('warm instances', () => {
   })
 
   test('heapUsedBytes is reported for prefix runs, absent for one-off runs', async () => {
-    await using prefix = await single.prepare({ code: COUNTER })
+    await using prefix = await single.prepare({ id: crypto.randomUUID(), code: COUNTER })
     const call = await prefix.call({ export: 'bump' })
     expect(call.ok).toBe(true)
     expect(call.heapUsedBytes).toBeGreaterThan(0)
@@ -102,7 +103,7 @@ describe('warm instances', () => {
   test('a prefix that blows the warm-up budget fails its first run with ERR_WARMUP_LIMIT', async () => {
     // prepare() evaluates nothing. The fixed warm-up budget (1s, Cloudflare's
     // script-startup model) fails the cold start with its own code.
-    await using prefix = await single.prepare({ code: 'for (;;) {}' })
+    await using prefix = await single.prepare({ id: crypto.randomUUID(), code: 'for (;;) {}' })
     const check = await prefix.call({ export: 'default' })
     expect(check).toMatchObject({ ok: false, error: { code: 'ERR_WARMUP_LIMIT' } })
     // Load-dependent: the budget never breaks the prefix, the next run cold-starts again.
@@ -131,6 +132,7 @@ describe('warm instances', () => {
     // out: a boundary failure, not a mid-execution kill — the instance and
     // its state survive (this used to evict).
     await using prefix = await single.prepare({
+      id: crypto.randomUUID(),
       code: `${COUNTER}\nexport async function hangOnBridge() { n++; await hang(); return n }`,
       globals: { hang: async () => new Promise(() => {}) },
     })
@@ -187,6 +189,7 @@ describe('warm instances', () => {
     // warm. Only an abort landing on actively-executing code still
     // terminates and evicts.
     await using prefix = await single.prepare({
+      id: crypto.randomUUID(),
       code: `${COUNTER}\nexport async function hangOnBridge() { n++; await hang(); return n }`,
       globals: { hang: async () => new Promise(() => {}) },
     })
@@ -225,8 +228,8 @@ describe('warm instances: concurrency', () => {
   })
 
   test('two prefixes stay warm concurrently without interference', async () => {
-    await using prefixA = await dual.prepare({ code: COUNTER })
-    await using prefixB = await dual.prepare({ code: COUNTER })
+    await using prefixA = await dual.prepare({ id: crypto.randomUUID(), code: COUNTER })
+    await using prefixB = await dual.prepare({ id: crypto.randomUUID(), code: COUNTER })
 
     for (const expected of [1, 2]) {
       const [a, b] = await Promise.all([
@@ -245,6 +248,7 @@ describe('warm instances: concurrency', () => {
     // so the two must overlap (the sandbox clock is frozen during execution,
     // so a spin-wait would never terminate); each sees its own fresh n.
     await using prefix = await dual.prepare({
+      id: crypto.randomUUID(),
       code: `let n = 0
 export async function slowBump() {
   await hold()

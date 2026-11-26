@@ -228,7 +228,8 @@ pub struct Capacity {
 /// starts its runs from one thread.
 pub struct Engine {
     prefixes: Mutex<HashMap<String, PrefixEntry>>,
-    next_prefix_id: AtomicU64,
+    /// Numeric prefix aliases for the crash line; ids come from the host.
+    next_alias: AtomicU64,
     /// Every prefix run is served by a resident instance from here; one-off
     /// runs share its slot accounting.
     warm: warm::WarmRegistry,
@@ -285,7 +286,7 @@ impl Engine {
     pub(crate) fn new(warm_budget_bytes: u64, hard_line_bytes: u64) -> Self {
         Self {
             prefixes: Mutex::new(HashMap::new()),
-            next_prefix_id: AtomicU64::new(0),
+            next_alias: AtomicU64::new(0),
             warm: warm::WarmRegistry::new(warm_budget_bytes, hard_line_bytes),
             admission_line_bytes: hard_line_bytes,
         }
@@ -316,50 +317,90 @@ impl Engine {
         sandbox::send_completion(&*caller.link, run_id, Outbound::Result { completion });
     }
 
-    /// Store a prefix and return its id. Nothing is evaluated: a broken
-    /// prefix fails its first run instead. `heap` applies to every run;
-    /// every run must carry `hash`.
+    /// Store a prefix under the host's `prefix_id`. Nothing is evaluated: a
+    /// broken prefix fails its first run instead. `heap` applies to every
+    /// run; every run must carry `hash`. A held id with the same hash and
+    /// heap is the same prefix; otherwise `PrefixIdTaken`.
+    #[allow(clippy::too_many_arguments)] // the prefix's parts, as the wire carries them
     pub fn prepare(
         &self,
+        prefix_id: String,
         code: String,
         filename: Option<String>,
         heap: types::HeapLimits,
         globals: Vec<types::HostGlobalDef>,
         imports: Vec<types::ImportBinding>,
         hash: [u8; 16],
-    ) -> String {
-        let id = self.next_prefix_id.fetch_add(1, Ordering::Relaxed);
-        let prefix_id = id.to_string();
+    ) -> Result<(), sandbox::RunError> {
         // Only bridge stubs are rebindable per run; value globals and shim
         // wrappers are replayed from the stored defs.
         let declared_globals: Vec<String> = globals
             .iter()
             .filter_map(|g| g.bridge_stub_name().map(str::to_string))
             .collect();
+        let mut store = self.prefixes.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(held) = store.get(&prefix_id) {
+            let (held_hash, held_heap, broken) = match held {
+                PrefixEntry::Ready(data) => (data.hash, data.heap, false),
+                PrefixEntry::Broken { hash, heap, .. } => (*hash, *heap, true),
+            };
+            let taken = if held_hash != hash {
+                Some(format!("prefix id \"{prefix_id}\" is held with other code"))
+            } else if held_heap != heap {
+                let limits = |h: types::HeapLimits| {
+                    let mut s = format!("memoryMb {}", h.soft_memory_mb);
+                    if held_heap.hard_memory_mb != heap.hard_memory_mb {
+                        s += &format!(", hardMemoryMb {}", h.hard_memory_mb);
+                    }
+                    s
+                };
+                Some(format!(
+                    "prefix id \"{prefix_id}\" is held with other memory limits (held: {}, asked: {})",
+                    limits(held_heap),
+                    limits(heap),
+                ))
+            } else {
+                None
+            };
+            match taken {
+                Some(message) => {
+                    drop(store);
+                    crate::log!(
+                        "[iso4-v8] Precompile — ERR_PREFIX_ID_TAKEN: prefix_id={prefix_id:?}"
+                    );
+                    return Err(sandbox::RunError::PrefixIdTaken(message));
+                }
+                None if !broken => {
+                    drop(store);
+                    crate::log!("[iso4-v8] prefix already held — prefix_id={prefix_id:?}");
+                    return Ok(());
+                }
+                // A broken prefix with the same code gets a fresh attempt under a new alias.
+                None => {}
+            }
+        }
+        let alias = self.next_alias.fetch_add(1, Ordering::Relaxed);
         crate::log!(
-            "[iso4-v8] prefix stored — prefix_id={prefix_id} \
+            "[iso4-v8] prefix stored — prefix_id={prefix_id:?} alias={alias} \
              ({} source bytes, {} declared globals, {} declared imports)",
             code.len(),
             declared_globals.len(),
             imports.len(),
         );
-        self.prefixes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(
-                prefix_id.clone(),
-                PrefixEntry::Ready(Arc::new(PrefixData {
-                    id,
-                    code,
-                    filename,
-                    hash,
-                    heap,
-                    globals,
-                    declared_globals,
-                    declared_imports: imports,
-                })),
-            );
-        prefix_id
+        store.insert(
+            prefix_id,
+            PrefixEntry::Ready(Arc::new(PrefixData {
+                id: alias,
+                code,
+                filename,
+                hash,
+                heap,
+                globals,
+                declared_globals,
+                declared_imports: imports,
+            })),
+        );
+        Ok(())
     }
 
     /// Forget a prefix and drop its idle instances. Busy instances finish
@@ -373,7 +414,7 @@ impl Engine {
             self.warm.dispose_prefix(prefix_id);
             existed
         };
-        crate::log!("[iso4-v8] DisposePrefix prefix_id={prefix_id} (existed={existed})");
+        crate::log!("[iso4-v8] DisposePrefix prefix_id={prefix_id:?} (existed={existed})");
     }
 
     pub fn stats(&self) -> warm::RegistryStats {
@@ -500,7 +541,7 @@ impl Engine {
             .get(&req.prefix_id)
             .and_then(|entry| match entry {
                 PrefixEntry::Ready(data) => Some(Ok(Arc::clone(data))),
-                PrefixEntry::Broken { hash, cause } if *hash == req.hash => {
+                PrefixEntry::Broken { hash, cause, .. } if *hash == req.hash => {
                     Some(Err(Arc::clone(cause)))
                 }
                 PrefixEntry::Broken { .. } => None,
@@ -510,7 +551,7 @@ impl Engine {
                 Some(Ok(data)) if data.hash == req.hash => data,
                 Some(Err(cause)) => {
                     crate::log!(
-                    "[iso4-v8] PrefixRun {run_id} — ERR_PREFIX_BROKEN: prefix_id={} cold start \
+                    "[iso4-v8] PrefixRun {run_id} — ERR_PREFIX_BROKEN: prefix_id={:?} cold start \
                      failed with {}: {}",
                     req.prefix_id, cause.code, cause.message
                 );
@@ -521,7 +562,7 @@ impl Engine {
                 }
                 Some(Ok(_)) | None => {
                     crate::log!(
-                        "[iso4-v8] PrefixRun {} — prefix_id={} not found with this hash",
+                        "[iso4-v8] PrefixRun {} — prefix_id={:?} not found with this hash",
                         run_id,
                         req.prefix_id
                     );
@@ -551,7 +592,7 @@ impl Engine {
         }
 
         trace!(
-            "[iso4-v8] PrefixRun {} (prefix_id={}, {} globals, {} imports, call={})",
+            "[iso4-v8] PrefixRun {} (prefix_id={:?}, {} globals, {} imports, call={})",
             run_id,
             req.prefix_id,
             req.globals.len(),
@@ -578,7 +619,10 @@ impl Engine {
             Pooled(warm::AttachedInstance),
             Cold(warm::InstanceHandle),
         }
-        let taken = match self.warm.acquire(&req.prefix_id, caps, &spawn) {
+        let taken = match self
+            .warm
+            .acquire(&req.prefix_id, prefix_data.id, caps, &spawn)
+        {
             warm::Acquired::Attached(att) => Taken::Pooled(att),
             warm::Acquired::Cold(handle) => Taken::Cold(handle),
             warm::Acquired::Refused(refusal) => return Err(Refusal::Capacity(refusal)),
@@ -611,14 +655,18 @@ impl Engine {
         let release: sandbox::ReleaseHook = {
             let engine = Arc::clone(self);
             let prefix_id = req.prefix_id.clone();
+            // A reused id may hold a newer prefix by now: act only on this one.
+            let alias = prefix_data.id;
             Box::new(move |outcome: sandbox::CallOutcome| {
                 // A deterministic cold-start failure marks the prefix broken;
                 // a prefix disposed meanwhile stays gone.
                 if outcome.prefix_failed {
                     if let Err(failure) = &outcome.result {
                         let mut store = engine.prefixes.lock().unwrap_or_else(|p| p.into_inner());
-                        if let Some(PrefixEntry::Ready(data)) = store.get(&prefix_id) {
-                            let hash = data.hash;
+                        if let Some(PrefixEntry::Ready(data)) =
+                            store.get(&prefix_id).filter(|e| is_alias(e, alias))
+                        {
+                            let (hash, heap) = (data.hash, data.heap);
                             // Stored for the prefix's lifetime: clamp like the
                             // wire does and drop the fields blob it never carries.
                             let raw = failure.error.to_payload();
@@ -632,7 +680,7 @@ impl Engine {
                                 ..raw
                             };
                             crate::log!(
-                                "[iso4-v8] prefix_id={prefix_id} marked broken: cold start \
+                                "[iso4-v8] prefix_id={prefix_id:?} marked broken: cold start \
                                  failed with {}: {}",
                                 cause.code,
                                 cause.message
@@ -641,6 +689,7 @@ impl Engine {
                                 prefix_id.clone(),
                                 PrefixEntry::Broken {
                                     hash,
+                                    heap,
                                     cause: Arc::new(cause),
                                 },
                             );
@@ -658,7 +707,7 @@ impl Engine {
                     Taken::Pooled(att) => {
                         let store = engine.prefixes.lock().unwrap_or_else(|p| p.into_inner());
                         let prefix_alive =
-                            matches!(store.get(&prefix_id), Some(PrefixEntry::Ready(_)));
+                            store.get(&prefix_id).is_some_and(|e| is_alias(e, alias));
                         engine.warm.release(
                             &prefix_id,
                             att.id,
@@ -726,6 +775,11 @@ impl Engine {
     }
 }
 
+/// The store entry is the live prefix with this alias.
+fn is_alias(entry: &PrefixEntry, alias: u64) -> bool {
+    matches!(entry, PrefixEntry::Ready(data) if data.id == alias)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,7 +826,9 @@ mod tests {
             hard_memory_mb: 32,
         };
         // `grow` keeps ~64 MB: fits the default cap, not this one.
-        let prefix_id = engine.prepare(
+        let prefix_id = "grow".to_string();
+        engine.prepare(
+            prefix_id.clone(),
             "export function grow() { const a = []; for (let i = 0; i < 64; i++) a.push(new Array(1 << 17).fill(i)); return a.length }"
                 .to_string(),
             None,
@@ -780,7 +836,8 @@ mod tests {
             Vec::new(),
             Vec::new(),
             [0; 16],
-        );
+        )
+        .expect("stored");
         let req = types::PrefixRunRequest {
             run_id: 1,
             prefix_id,
@@ -819,14 +876,18 @@ mod tests {
             call_ids: Arc::new(AtomicU32::new(0)),
             brand_key: String::new(),
         };
-        let prefix_id = engine.prepare(
-            "export const f = () => 1".to_string(),
-            None,
-            types::HeapLimits::default(),
-            Vec::new(),
-            Vec::new(),
-            [1; 16],
-        );
+        let prefix_id = "f".to_string();
+        engine
+            .prepare(
+                prefix_id.clone(),
+                "export const f = () => 1".to_string(),
+                None,
+                types::HeapLimits::default(),
+                Vec::new(),
+                Vec::new(),
+                [1; 16],
+            )
+            .expect("stored");
         for (prefix_id, hash) in [(prefix_id, [2; 16]), ("nope".to_string(), [1; 16])] {
             let req = types::PrefixRunRequest {
                 run_id: 1,
@@ -862,6 +923,7 @@ mod tests {
             "p".to_string(),
             PrefixEntry::Broken {
                 hash: [1; 16],
+                heap: types::HeapLimits::default(),
                 cause: Arc::new(cause),
             },
         );
@@ -886,5 +948,124 @@ mod tests {
             Err(Refusal::PrefixBroken { prefix_id, .. }) => assert_eq!(prefix_id, "p"),
             other => panic!("expected PrefixBroken, got {other:?}"),
         }
+    }
+
+    fn store(
+        engine: &Engine,
+        id: &str,
+        code: &str,
+        heap: types::HeapLimits,
+        hash: [u8; 16],
+    ) -> Result<(), sandbox::RunError> {
+        engine.prepare(
+            id.to_string(),
+            code.to_string(),
+            None,
+            heap,
+            Vec::new(),
+            Vec::new(),
+            hash,
+        )
+    }
+
+    fn alias_of(engine: &Engine, id: &str) -> u64 {
+        match engine.prefixes.lock().unwrap().get(id) {
+            Some(PrefixEntry::Ready(data)) => data.id,
+            _ => panic!("no ready prefix {id}"),
+        }
+    }
+
+    #[test]
+    fn a_held_id_with_the_same_hash_and_heap_is_the_same_prefix() {
+        let engine = Engine::new(0, 0);
+        let heap = types::HeapLimits::default();
+        store(&engine, "p", "export const a = 1", heap, [1; 16]).unwrap();
+        let alias = alias_of(&engine, "p");
+        store(&engine, "p", "export const a = 1", heap, [1; 16]).unwrap();
+        assert_eq!(alias_of(&engine, "p"), alias, "nothing stored again");
+    }
+
+    #[test]
+    fn a_held_id_with_other_code_or_heap_is_taken() {
+        let engine = Engine::new(0, 0);
+        let heap = |soft, hard| types::HeapLimits {
+            soft_memory_mb: soft,
+            hard_memory_mb: hard,
+        };
+        store(&engine, "p", "export const a = 1", heap(64, 87), [1; 16]).unwrap();
+        let taken = |result: Result<(), sandbox::RunError>| match result {
+            Err(e) => {
+                assert_eq!(e.code(), "ERR_PREFIX_ID_TAKEN");
+                e.message()
+            }
+            Ok(()) => panic!("expected ERR_PREFIX_ID_TAKEN"),
+        };
+        assert_eq!(
+            taken(store(
+                &engine,
+                "p",
+                "export const a = 2",
+                heap(64, 87),
+                [2; 16]
+            )),
+            "prefix id \"p\" is held with other code"
+        );
+        assert_eq!(
+            taken(store(&engine, "p", "export const a = 1", heap(128, 87), [1; 16])),
+            "prefix id \"p\" is held with other memory limits (held: memoryMb 64, asked: memoryMb 128)"
+        );
+        assert_eq!(
+            taken(store(&engine, "p", "export const a = 1", heap(128, 160), [1; 16])),
+            "prefix id \"p\" is held with other memory limits (held: memoryMb 64, hardMemoryMb 87, asked: memoryMb 128, hardMemoryMb 160)"
+        );
+        assert_eq!(alias_of(&engine, "p"), 0, "the held prefix stays");
+    }
+
+    #[test]
+    fn a_disposed_id_takes_other_code() {
+        let engine = Engine::new(0, 0);
+        let heap = types::HeapLimits::default();
+        store(&engine, "p", "export const a = 1", heap, [1; 16]).unwrap();
+        engine.dispose_prefix("p");
+        store(&engine, "p", "export const a = 2", heap, [2; 16]).unwrap();
+        assert_eq!(alias_of(&engine, "p"), 1, "a new prefix under the old id");
+    }
+
+    #[test]
+    fn a_broken_id_with_the_same_code_and_heap_is_rebuilt() {
+        let engine = Engine::new(0, 0);
+        let heap = types::HeapLimits::default();
+        let other_heap = types::HeapLimits {
+            soft_memory_mb: 64,
+            hard_memory_mb: 87,
+        };
+        let cause = Refusal::Internal("cold start".to_string()).to_payload();
+        let broken = || PrefixEntry::Broken {
+            hash: [1; 16],
+            heap,
+            cause: Arc::new(cause.clone()),
+        };
+        engine
+            .prefixes
+            .lock()
+            .unwrap()
+            .insert("p".to_string(), broken());
+        // Other code or other heap lines stay taken, broken or not.
+        let other = store(&engine, "p", "export const a = 2", heap, [2; 16]);
+        assert!(matches!(other, Err(sandbox::RunError::PrefixIdTaken(_))));
+        let other = store(&engine, "p", "export const a = 1", other_heap, [1; 16]);
+        assert!(matches!(other, Err(sandbox::RunError::PrefixIdTaken(_))));
+        assert!(matches!(
+            engine.prefixes.lock().unwrap().get("p"),
+            Some(PrefixEntry::Broken { .. })
+        ));
+        store(&engine, "p", "export const a = 1", heap, [1; 16]).unwrap();
+        let alias = alias_of(&engine, "p");
+        store(&engine, "p", "export const a = 1", heap, [1; 16]).unwrap();
+        assert_eq!(
+            alias_of(&engine, "p"),
+            alias,
+            "a ready prefix is not rebuilt"
+        );
     }
 }

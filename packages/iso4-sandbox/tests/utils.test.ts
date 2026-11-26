@@ -67,6 +67,7 @@ describe('the predicates agree with the runtime', () => {
 
   it.each(CANDIDATES)('prepare() takes host-module export %s iff isValidExportName, and the runtime builds the module', async (name) => {
     const prepared = sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `import * as t from 'host:t'\nexport default () => typeof t[${JSON.stringify(name)}]`,
       imports: { 'host:t': { [name]: () => 1 } },
     })
@@ -82,13 +83,14 @@ describe('the predicates agree with the runtime', () => {
   })
 
   it('a default host-module key is the module\'s default export', async () => {
-    const prefix = await sandbox.prepare({ code: `import t from 'host:t'\nexport default () => t()`, imports: { 'host:t': { default: () => 7 } } })
+    const prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: `import t from 'host:t'\nexport default () => t()`, imports: { 'host:t': { default: () => 7 } } })
     const result = await prefix.call({ export: 'default' })
     expect(result.ok && result.value).toBe(7)
   })
 
   it.each(CANDIDATES)('prepare() takes global %s iff isValidGlobalName, and the runtime installs it', async (name) => {
     const prepared = sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `export default () => globalThis[${JSON.stringify(name)}]`,
       globals: { [name]: { kind: 'data', value: 1 } } as never,
     })
@@ -103,7 +105,7 @@ describe('the predicates agree with the runtime', () => {
 
   it('prepare() refuses a global name that is not a well-formed string, like isValidGlobalName', async () => {
     expect(isValidGlobalName('y\uD800')).toBe(false)
-    await expect(sandbox.prepare({ code: '', globals: { 'y\uD800': { kind: 'data', value: 1 } } }))
+    await expect(sandbox.prepare({ id: crypto.randomUUID(), code: '', globals: { 'y\uD800': { kind: 'data', value: 1 } } }))
       .rejects
       .toThrow(TypeError)
   })
@@ -134,7 +136,7 @@ describe('the predicates agree with the runtime', () => {
       { kind: 'bridge-with-shim', shim: '(h) => h', handler: async () => 1, enumerable: false },
     ]
     for (const value of values) {
-      await expect(sandbox.prepare({ code: '', globals: { [name]: value } as never })).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME' })
+      await expect(sandbox.prepare({ id: crypto.randomUUID(), code: '', globals: { [name]: value } as never })).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME' })
       await expect(sandbox.run({ code: 'export default 1', globals: { [name]: value } as never })).rejects.toMatchObject({ code: 'ERR_RESERVED_NAME' })
       expect(await runtimeCode(name, value)).toBe('ERR_RESERVED_NAME')
     }

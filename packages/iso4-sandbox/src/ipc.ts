@@ -111,6 +111,10 @@ export const RustToTsMessageTypes = {
    * whose message the pending consumer read rejects with.
    */
   StreamEnd: 0x0B,
+  /**
+   * Answer to a `DisposePrefix`: the prefix is dropped. Payload: `u32 requestId`.
+   */
+  DisposePrefixResult: 0x0C,
 } as const
 
 export type RustToTsMessageType
@@ -1110,6 +1114,10 @@ export interface PrecompilePayloadOptions {
    * the router matches them by this id (the run frames' leading-id pattern).
    */
   requestId: number
+  /**
+   * The host-chosen prefix id, 1 to 200 UTF-8 bytes.
+   */
+  id: string
   code: string
   filename?: string
   /**
@@ -1139,9 +1147,10 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): { pa
   const writer = new PayloadWriter()
     .writeU32(options.requestId)
     .writeBytes(new Uint8Array(16)) // the hash, filled in below
-    .writeString(options.code)
-    .writeOptionalString(options.filename)
+    .writeString(options.id)
   const written = (): number => writer.parts.reduce((n, part) => n + part.byteLength, 0)
+  const codeStart = written()
+  writer.writeString(options.code).writeOptionalString(options.filename)
   const codeEnd = written()
   writer.writeHeapLimits(options.heap ?? {})
   const shapeStart = written()
@@ -1149,7 +1158,7 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): { pa
     .writeGlobalDefs(options.globals ?? [])
     .writeImports(options.imports ?? [])
     .toBuffer()
-  const hash = prefixHash(payload.subarray(20, codeEnd), payload.subarray(shapeStart))
+  const hash = prefixHash(payload.subarray(codeStart, codeEnd), payload.subarray(shapeStart))
   hash.copy(payload, 4)
   return { payload, hash }
 }
@@ -1199,11 +1208,13 @@ export function encodePrefixRunPayload(
 // ── DisposePrefixPayload ────────────────────────────────────────────────────
 
 /**
- * Encode a `DisposePrefix` payload — just the PrefixId string.
+ * Encode a `DisposePrefix` payload: the `u32 requestId` its
+ * `DisposePrefixResult` echoes, then the PrefixId string.
+ * @param requestId
  * @param prefixId
  */
-export function encodeDisposePrefixPayload(prefixId: string): Buffer {
-  return new PayloadWriter().writeString(prefixId).toBuffer()
+export function encodeDisposePrefixPayload(requestId: number, prefixId: string): Buffer {
+  return new PayloadWriter().writeU32(requestId).writeString(prefixId).toBuffer()
 }
 
 // ── TerminatePayload ────────────────────────────────────────────────────────
@@ -2086,17 +2097,18 @@ function exportsBlobToExports(raw: unknown): SandboxExports {
 // ── PrecompileResultPayload decoder ────────────────────────────────────────
 
 export type PrecompileResult
-  = | { ok: true, requestId: number, prefixId: string }
+  = | { ok: true, requestId: number }
     | { ok: false, requestId: number, error: { code: string, name: string, message: string, stack?: string } }
 
 /**
- * The leading `u32 requestId` of a `PrecompileResult` payload — how the
- * router matches a reply to its in-flight `precompile()` (replies can
- * return out of request order; see `PrecompilePayloadOptions.requestId`).
- * `undefined` when the payload is too short to carry one.
+ * The leading `u32 requestId` of a `PrecompileResult` or
+ * `DisposePrefixResult` payload — how the router matches a reply to its
+ * in-flight request (replies can return out of request order; see
+ * `PrecompilePayloadOptions.requestId`). `undefined` when the payload is
+ * too short to carry one.
  * @param buf
  */
-export function peekPrecompileResultRequestId(buf: Uint8Array): number | undefined {
+export function peekRequestId(buf: Uint8Array): number | undefined {
   if (buf.byteLength < 4)
     return undefined
   return Buffer.from(buf.buffer, buf.byteOffset, 4).readUInt32BE(0)
@@ -2109,8 +2121,6 @@ export function peekPrecompileResultRequestId(buf: Uint8Array): number | undefin
  * ```
  * u32   requestId          (echo of the Precompile's)
  * u8    ok
- * u8    prefixIdPresent   (1 when ok = true)
- *   String  prefixId
  * u8    errorPresent      (1 when ok = false)
  *   RunErrorPayload  error
  * ```
@@ -2122,16 +2132,11 @@ export function decodePrecompileResultPayload(buf: Uint8Array): PrecompileResult
   const ok = reader.readBool()
 
   if (ok) {
-    const prefixIdPresent = reader.readU8()
-    if (prefixIdPresent !== 1)
-      throw new PayloadDecodeError('expected prefixId present byte = 1 when ok = true')
-    const prefixId = reader.readString()
     reader.readU8() // errorPresent = 0
     reader.assertDone()
-    return { ok: true, requestId, prefixId }
+    return { ok: true, requestId }
   }
 
-  reader.readU8() // prefixIdPresent = 0
   const errorPresent = reader.readU8()
   if (errorPresent !== 1)
     throw new PayloadDecodeError('expected error present byte = 1 when ok = false')
@@ -2288,6 +2293,7 @@ export function parseRustToTsMessageType(
     case RustToTsMessageTypes.StreamCancel:
     case RustToTsMessageTypes.StreamChunk:
     case RustToTsMessageTypes.StreamEnd:
+    case RustToTsMessageTypes.DisposePrefixResult:
       return byte
     default:
       throw new Error(`unknown Rust->TS message type: ${formatByte(byte)}`)

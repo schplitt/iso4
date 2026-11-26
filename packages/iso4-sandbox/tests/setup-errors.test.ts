@@ -17,6 +17,7 @@ let wire: MockInstance[]
 beforeAll(async () => {
   sandbox = await createSandbox()
   prefix = await sandbox.prepare({
+    id: crypto.randomUUID(),
     code: `
       import { add, nested, dotted } from 'host:tools'
       export default () => 1
@@ -85,7 +86,7 @@ describe('ERR_RESERVED_NAME', () => {
   test.each(['console', 'Response', 'NaN', '__proto__'])('run() and prepare() refuse %s without a round trip', async (name) => {
     const message = `global '${name}' is reserved by the runtime and cannot be provided by the host`
     await expectClientRefusal(sandbox.run({ code: 'export default 1', globals: { [name]: { kind: 'data', value: 1 } } as never }), 'ERR_RESERVED_NAME', message)
-    await expectClientRefusal(sandbox.prepare({ code: '', globals: { [name]: async () => 1 } as never }), 'ERR_RESERVED_NAME', message)
+    await expectClientRefusal(sandbox.prepare({ id: crypto.randomUUID(), code: '', globals: { [name]: async () => 1 } as never }), 'ERR_RESERVED_NAME', message)
   })
 })
 
@@ -139,7 +140,7 @@ describe('ERR_INVALID_REBIND', () => {
 describe('malformed options', () => {
   test('prepare() throws a TypeError when code is not a string, without a round trip', async () => {
     for (const code of [undefined, null, 5, ['export default 1']]) {
-      await expect(sandbox.prepare({ code: code as never })).rejects.toThrow(TypeError)
+      await expect(sandbox.prepare({ id: crypto.randomUUID(), code: code as never })).rejects.toThrow(TypeError)
     }
     for (const spy of wire)
       expect(spy).not.toHaveBeenCalled()
@@ -154,7 +155,7 @@ describe('malformed options', () => {
 
 describe('ERR_PREFIX_DISPOSED', () => {
   test('prefix.call() on a disposed prefix refuses without a round trip', async () => {
-    const disposed = await sandbox.prepare({ code: 'export default () => 1' })
+    const disposed = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => 1' })
     await disposed.dispose()
     vi.clearAllMocks()
     const message = `prefix '${disposed.id}' has been disposed or never existed`
@@ -162,7 +163,7 @@ describe('ERR_PREFIX_DISPOSED', () => {
   })
 
   test('disposal wins over an already-aborted signal', async () => {
-    const disposed = await sandbox.prepare({ code: 'export default () => 1' })
+    const disposed = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => 1' })
     await disposed.dispose()
     vi.clearAllMocks()
     const signal = AbortSignal.abort('stop')
@@ -178,6 +179,7 @@ describe('ERR_PREFIX_DISPOSED', () => {
 describe('allowed rebinds still reach the runtime', () => {
   test('a shim global rebound by name with a function runs through its shim', async () => {
     const shimmedPrefix = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: `export default async () => await greet('ada')`,
       globals: { greet: { kind: 'bridge-with-shim', shim: '(s) => s.toUpperCase()', handler: async (n: string) => `default ${n}` } },
     })
@@ -207,7 +209,7 @@ describe('allowed rebinds still reach the runtime', () => {
 describe('the declared shape is a copy', () => {
   test('changing the caller\'s globals object after prepare() changes nothing', async () => {
     const globals: Record<string, unknown> = { tool: async () => 'default' }
-    const copied = await sandbox.prepare({ code: 'export default () => tool()', globals: globals as never })
+    const copied = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => tool()', globals: globals as never })
     globals['added'] = async () => 'added'
     globals['tool'] = { kind: 'data', value: 1 }
     expect(await copied.call({ export: 'default' })).toMatchObject({ ok: true, value: 'default' })
@@ -218,7 +220,7 @@ describe('the declared shape is a copy', () => {
   })
 
   test('dispose() drops the declared shapes and default handlers', async () => {
-    const dropped = await sandbox.prepare({ code: '', globals: { tool: async () => 1 }, imports: { 'host:t': { f: () => 1 } } })
+    const dropped = await sandbox.prepare({ id: crypto.randomUUID(), code: '', globals: { tool: async () => 1 }, imports: { 'host:t': { f: () => 1 } } })
     await dropped.dispose()
     const internals = dropped as unknown as { declaredGlobals: Map<string, unknown>, defaultImportHandlers: Map<string, unknown>, declaredImports: unknown[] }
     expect(internals.declaredGlobals.size).toBe(0)
@@ -274,6 +276,7 @@ describe('the client mirrors the runtime', () => {
     expect(RuntimeIpcClient.prototype.prefixRun).not.toHaveBeenCalled()
 
     const widened = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: 'export default () => 1',
       globals: { config: { kind: 'data', value: 1 }, expr: '1' },
       imports: {
@@ -301,8 +304,8 @@ describe('the client mirrors the runtime', () => {
   })
 
   test('a prefix the runtime dropped', async () => {
-    const ghost = await sandbox.prepare({ code: 'export default () => 1' })
-    const local = await sandbox.prepare({ code: 'export default () => 1' })
+    const ghost = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => 1' })
+    const local = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => 1' })
     await (ghost as unknown as { pool: RunPool }).pool.withClient((c) => c.disposePrefix(ghost.id))
     await local.dispose()
     // The runtime cannot tell a dropped prefix from one it never held: a failed result.
@@ -314,7 +317,7 @@ describe('the client mirrors the runtime', () => {
   })
 
   test('a prefix run with another code hash', async () => {
-    const prefix = await sandbox.prepare({ code: 'export default () => 1' })
+    const prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: 'export default () => 1' })
     const internals = prefix as unknown as { hash: Uint8Array }
     const hash = internals.hash
     internals.hash = new Uint8Array(16)
@@ -323,5 +326,199 @@ describe('the client mirrors the runtime', () => {
     internals.hash = hash
     expect(await prefix.call({ export: 'default' })).toMatchObject({ ok: true, value: 1 })
     await prefix.dispose()
+  })
+})
+
+describe('prefix ids', () => {
+  const realPrecompile = RuntimeIpcClient.prototype.precompile
+  const realDisposePrefix = RuntimeIpcClient.prototype.disposePrefix
+
+  test('prepare() throws a TypeError for a missing or bad id, without a round trip', async () => {
+    for (const id of [undefined, null, 5, '', 'x'.repeat(201), 'é'.repeat(101), 'a\uD800b']) {
+      await expect(sandbox.prepare({ id: id as never, code: 'export default 1' })).rejects.toThrow(TypeError)
+    }
+    for (const spy of wire)
+      expect(spy).not.toHaveBeenCalled()
+  })
+
+  test('any well-formed string up to 200 bytes is an id, kept as given', async () => {
+    for (const id of ['é'.repeat(100), 'line\nbreak "quoted"', ' ', '🦀']) {
+      const p = await sandbox.prepare({ id, code: 'export default () => 1' })
+      expect(p.id).toBe(id)
+      expect(await p.call({ export: 'default' })).toMatchObject({ ok: true, value: 1 })
+      await p.dispose()
+    }
+  })
+
+  test('the same id and code is the same prefix until its last handle is disposed', async () => {
+    const id = crypto.randomUUID()
+    const code = 'let n = 0; export default () => ++n'
+    const a = await sandbox.prepare({ id, code })
+    const b = await sandbox.prepare({ id, code })
+    expect(b).not.toBe(a)
+    expect([a.id, b.id]).toEqual([id, id])
+    expect(await a.call({ export: 'default' })).toMatchObject({ ok: true })
+    await a.dispose()
+    await a.dispose() // a handle disposes once
+    expect(await b.call({ export: 'default' })).toMatchObject({ ok: true })
+    await expect(sandbox.prepare({ id, code: 'export default () => 2' })).rejects.toMatchObject({ code: 'ERR_PREFIX_ID_TAKEN' })
+    await b.dispose()
+    const c = await sandbox.prepare({ id, code: 'export default () => 2' })
+    expect(await c.call({ export: 'default' })).toMatchObject({ ok: true, value: 2 })
+    await c.dispose()
+  })
+
+  test('other code under a held id throws ERR_PREFIX_ID_TAKEN', async () => {
+    const id = 'taken "id"'
+    const held = await sandbox.prepare({ id, code: 'export default () => 1' })
+    const error = await sandbox.prepare({ id, code: 'export default () => 2' }).then(() => undefined, (e: unknown) => e)
+    expect(Object.getPrototypeOf(error)).toBe(Error.prototype)
+    expect(error).toMatchObject({ name: 'Error', code: 'ERR_PREFIX_ID_TAKEN', message: 'prefix id "taken "id"" is held with other code' })
+    expect(await held.call({ export: 'default' })).toMatchObject({ ok: true, value: 1 })
+    await held.dispose()
+  })
+
+  test('other memory limits under a held id throw ERR_PREFIX_ID_TAKEN naming both', async () => {
+    const id = crypto.randomUUID()
+    const code = 'export default () => 1'
+    const held = await sandbox.prepare({ id, code, memoryMb: { soft: 64, hard: 96 } })
+    await expect(sandbox.prepare({ id, code, memoryMb: { soft: 80, hard: 96 } })).rejects.toMatchObject({
+      code: 'ERR_PREFIX_ID_TAKEN',
+      message: `prefix id "${id}" is held with other memory limits (held: memoryMb 64, asked: memoryMb 80)`,
+    })
+    await expect(sandbox.prepare({ id, code, memoryMb: { soft: 64, hard: 128 } })).rejects.toMatchObject({
+      code: 'ERR_PREFIX_ID_TAKEN',
+      message: `prefix id "${id}" is held with other memory limits (held: memoryMb 64, hardMemoryMb 96, asked: memoryMb 64, hardMemoryMb 128)`,
+    })
+    // A refused prepare holds nothing: the first handle's dispose still drops the prefix.
+    await held.dispose()
+    const again = await sandbox.prepare({ id, code, memoryMb: 32 })
+    expect(await again.call({ export: 'default' })).toMatchObject({ ok: true, value: 1 })
+    await again.dispose()
+  })
+
+  test('after await dispose() the id takes other code at once, every time', async () => {
+    const id = crypto.randomUUID()
+    for (let i = 0; i < 20; i++) {
+      const p = await sandbox.prepare({ id, code: `export default () => ${i}` })
+      expect(await p.call({ export: 'default' })).toMatchObject({ ok: true, value: i })
+      await p.dispose()
+    }
+  })
+
+  test('a prepare started while the dispose of its id is pending waits for the answer', async () => {
+    const id = crypto.randomUUID()
+    const order: string[] = []
+    vi.spyOn(RuntimeIpcClient.prototype, 'disposePrefix').mockImplementation(async function (this: RuntimeIpcClient, prefixId: string) {
+      order.push('dispose sent')
+      await new Promise((resolve) => {
+        setTimeout(resolve, 50)
+      })
+      const answered = await realDisposePrefix.call(this, prefixId)
+      order.push('dispose answered')
+      return answered
+    })
+    vi.spyOn(RuntimeIpcClient.prototype, 'precompile').mockImplementation(async function (this: RuntimeIpcClient, options) {
+      order.push(`precompile ${options.code}`)
+      return realPrecompile.call(this, options)
+    })
+    const old = await sandbox.prepare({ id, code: 'export default () => 1' })
+    const disposing = old.dispose()
+    const next = await sandbox.prepare({ id, code: 'export default () => 2' })
+    await disposing
+    expect(order).toEqual([
+      'precompile export default () => 1',
+      'dispose sent',
+      'dispose answered',
+      'precompile export default () => 2',
+    ])
+    expect(await next.call({ export: 'default' })).toMatchObject({ ok: true, value: 2 })
+    await next.dispose()
+  })
+
+  test('a prepare whose reply is lost still disposes what the runtime stored', async () => {
+    const id = crypto.randomUUID()
+    vi.spyOn(RuntimeIpcClient.prototype, 'precompile').mockImplementationOnce(async function (this: RuntimeIpcClient, options) {
+      await realPrecompile.call(this, options)
+      throw new Error('reply lost')
+    })
+    await expect(sandbox.prepare({ id, code: 'export default () => 1' })).rejects.toThrow('reply lost')
+    const next = await sandbox.prepare({ id, code: 'export default () => 2' })
+    expect(await next.call({ export: 'default' })).toMatchObject({ ok: true, value: 2 })
+    await next.dispose()
+  })
+
+  test('a dispose that got no answer is sent once more while the sandbox lives', async () => {
+    const id = crypto.randomUUID()
+    const old = await sandbox.prepare({ id, code: 'export default () => 1' })
+    // The connection ended before the runtime read the DisposePrefix: it still holds the prefix.
+    const drop = vi.spyOn(RuntimeIpcClient.prototype, 'disposePrefix').mockImplementationOnce(async () => false)
+    await old.dispose()
+    expect(drop).toHaveBeenCalledTimes(2)
+    const next = await sandbox.prepare({ id, code: 'export default () => 2' })
+    expect(drop).toHaveBeenCalledTimes(2)
+    expect(await next.call({ export: 'default' })).toMatchObject({ ok: true, value: 2 })
+    await next.dispose()
+  })
+
+  test('dispose() resolves when the sandbox closes or the child dies while it waits for the answer', async () => {
+    for (const end of ['sandbox dispose', 'child killed'] as const) {
+      const sb = await createSandbox()
+      const p = await sb.prepare({ id: 'x', code: 'export default () => 1' })
+      const sent = vi.spyOn(RuntimeIpcClient.prototype, 'disposePrefix')
+      const disposed = p.dispose()
+      await vi.waitFor(() => expect(sent).toHaveBeenCalled())
+      if (end === 'child killed')
+        (sb as unknown as { proc: { kill: (signal: string) => void } }).proc.kill('SIGKILL')
+      else
+        await sb.dispose()
+      await expect(disposed).resolves.toBeUndefined()
+      // A sandbox going down gets no second dispose.
+      if (end === 'sandbox dispose')
+        expect(sent).toHaveBeenCalledTimes(1)
+      sent.mockRestore()
+      await sb.dispose()
+    }
+  })
+
+  test('an unanswered dispose is not sent again once the sandbox is going down', async () => {
+    const sb = await createSandbox()
+    const p = await sb.prepare({ id: 'x', code: 'export default () => 1' })
+    let closing!: Promise<void>
+    const drop = vi.spyOn(RuntimeIpcClient.prototype, 'disposePrefix').mockImplementationOnce(async () => {
+      closing = sb.dispose()
+      return false
+    })
+    await expect(p.dispose()).resolves.toBeUndefined()
+    await closing
+    expect(drop).toHaveBeenCalledTimes(1)
+  })
+
+  test('dispose() still rejects when the sandbox was closed before it could send', async () => {
+    const sb = await createSandbox()
+    const p = await sb.prepare({ id: 'x', code: 'export default () => 1' })
+    const disposed = p.dispose().then(() => undefined, (e: unknown) => e)
+    await sb.dispose()
+    expect(await disposed).toMatchObject({ message: 'runtime is disposed' })
+  })
+
+  test('preparing a broken id with the same code again gives it a fresh attempt', async () => {
+    const id = crypto.randomUUID()
+    // Fails its first cold start only: the clock passes `until` before the rebuild.
+    const until = Date.now() + 300
+    const code = `if (Date.now() < ${until}) throw new Error('not yet'); export default () => 1`
+    const first = await sandbox.prepare({ id, code })
+    expect(await first.call({ export: 'default' })).toMatchObject({ ok: false, error: { stage: 'prefix', message: 'not yet' } })
+    expect(first.status).toBe('broken')
+    await new Promise((resolve) => {
+      setTimeout(resolve, Math.max(0, until - Date.now()) + 50)
+    })
+    const second = await sandbox.prepare({ id, code })
+    expect(await second.call({ export: 'default' })).toMatchObject({ ok: true, value: 1 })
+    // The first handle keeps its own broken status and refuses without a round trip.
+    await expect(first.call({ export: 'default' })).rejects.toMatchObject({ code: 'ERR_PREFIX_BROKEN' })
+    await first.dispose()
+    expect(await second.call({ export: 'default' })).toMatchObject({ ok: true, value: 1 })
+    await second.dispose()
   })
 })

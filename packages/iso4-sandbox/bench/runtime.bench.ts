@@ -42,7 +42,7 @@ function assertOk(result: RunResult | CallResult, what: string): void {
 
 const hotDirectRt: Runtime = await createRuntime({ ...benchBinary(), maxConcurrentRuns: 1 })
 const hotPrefixRt: Runtime = await createRuntime({ ...benchBinary(), maxConcurrentRuns: 1 })
-const hotPrefix: DynamicPrefix = await hotPrefixRt.prepare({ code: SAMPLE_PREFIX })
+const hotPrefix: DynamicPrefix = await hotPrefixRt.prepare({ id: crypto.randomUUID(), code: SAMPLE_PREFIX })
 
 afterAll(async () => {
   await hotDirectRt.dispose()
@@ -79,7 +79,7 @@ describe('cold start', () => {
     'prefix  (createRuntime → prepare → prefix.call → dispose)',
     async () => {
       const rt = await createRuntime({ ...benchBinary(), maxConcurrentRuns: 1 })
-      const prefix = await rt.prepare({ code: SAMPLE_PREFIX })
+      const prefix = await rt.prepare({ id: crypto.randomUUID(), code: SAMPLE_PREFIX })
       assertOk(await prefix.call({ export: 'default' }), 'bench cold prefix run')
       await rt.dispose()
     },

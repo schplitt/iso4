@@ -377,6 +377,7 @@ function parseFetchArgs(args: unknown[]): HostFetchRequest {
  * Pass directly as a global value:
  * ```ts
  * await sandbox.precompile({
+ *   id: 'agent',
  *   code: prefixSource,
  *   globals: { fetch: createSafeFetch({ rules: [...] }) },
  * })

@@ -871,10 +871,12 @@ export interface Sandbox {
    *
    * `prepare()` stores the source and declared shape; it does not evaluate
    * the prefix. It rejects only for options it can check without running
-   * anything: a reserved or malformed global name, an invalid import shape,
-   * a bad limit or `memoryMb`. A prefix that does not compile, throws at top
-   * level, imports something unknown, calls the bridge, never settles, or
-   * exceeds the warm-up budget fails on its first `call()` as an
+   * anything: a missing or bad `id`, a reserved or malformed global name,
+   * an invalid import shape, a bad limit or `memoryMb`, or an `id` still
+   * held with other code or other memory limits (`ERR_PREFIX_ID_TAKEN`). A
+   * prefix that does not compile, throws at top level, imports something
+   * unknown, calls the bridge, never settles, or exceeds the warm-up budget
+   * fails on its first `call()` as an
    * `{ ok: false }` result with the matching {@link RunErrorCode}
    * (`ERR_USER_CODE`, `ERR_MODULE_NOT_FOUND`, `ERR_IMPORT`,
    * `ERR_PREFIX_BRIDGE_CALL`, `ERR_PREFIX_DID_NOT_SETTLE`,
@@ -884,7 +886,7 @@ export interface Sandbox {
    * wasted:
    *
    * ```ts
-   * const prefix = await sandbox.prepare({ code: 'export const ready = () => true' })
+   * const prefix = await sandbox.prepare({ id: 'ready-check', code: 'export const ready = () => true' })
    * const check = await prefix.call({ export: 'ready' }) // a side-effect-free export
    * if (!check.ok && check.error.stage === 'prefix') throw new Error(`broken prefix: ${check.error.message}`)
    * ```
@@ -895,6 +897,7 @@ export interface Sandbox {
    *
    * ```ts
    * const prefix = await sandbox.prepare({
+   *   id: 'agent',
    *   code,
    *   globals: { fetch: myHandler, myTool: otherHandler },
    * })
@@ -967,6 +970,16 @@ export interface PrecompileOptions<
   G extends HostGlobals,
   M extends Imports,
 > {
+  /**
+   * The prefix's id, chosen by the host: any non-empty, well-formed string
+   * of at most 200 UTF-8 bytes (a `TypeError` otherwise). Preparing an id
+   * this sandbox still holds with the same code and memory limits returns
+   * another handle to the same prefix; the runtime drops it when the last
+   * handle is disposed. Other code or other memory limits under a held id
+   * throw `ERR_PREFIX_ID_TAKEN`.
+   */
+  id: string
+
   /**
    * ESM prefix source, evaluated at the start of every run. Top-level await works.
    *
@@ -1061,6 +1074,9 @@ export interface Prefix<
   G extends HostGlobals = {},
   M extends Imports = {},
 > {
+  /**
+   * The id passed to `prepare()`.
+   */
   readonly id: string
 
   /**
@@ -1070,7 +1086,7 @@ export interface Prefix<
    * the function's return value:
    *
    * ```ts
-   * const prefix = await sandbox.prepare({ code: bundle })
+   * const prefix = await sandbox.prepare({ id: 'checkout', code: bundle })
    * const result = await prefix.call({ export: 'default.fetch', args: [request] })
    * ```
    *
@@ -1082,8 +1098,13 @@ export interface Prefix<
   call: (options: PrefixCallOptions<G, M>) => Promise<CallResult>
 
   /**
-   * Release the prepared prefix. Subsequent call() calls reject with
-   * `ERR_PREFIX_DISPOSED`. Idempotent, and works on a broken prefix too.
+   * Release this handle. Subsequent call() calls on it reject with
+   * `ERR_PREFIX_DISPOSED`. The runtime drops the prefix when the last handle
+   * to its id is disposed; that handle's `dispose()` resolves once the
+   * runtime confirmed it, or once the connection or the runtime ended
+   * first (the next `prepare()` of the id then disposes it again). It
+   * rejects only when the request could not be sent, such as after
+   * `sandbox.dispose()`. Idempotent, and works on a broken prefix too.
    */
   dispose: () => Promise<void>
 
@@ -1709,8 +1730,9 @@ export type ResetCause = 'cpu' | 'memory' | 'wall' | 'abort' | 'internal' | 'uns
  * whose `code` is one of these; a run never returns them as a result. The
  * client checks first and throws without a runtime round trip; the runtime
  * repeats every check (except `ERR_INVALID_REBIND`) and the client throws its
- * answer the same way. `ERR_PREFIX_DISPOSED`: the prefix was disposed; a
- * prefix the runtime no longer holds fails with `ERR_PREFIX_UNKNOWN` instead.
+ * answer the same way; the runtime alone raises `ERR_PREFIX_ID_TAKEN`, from
+ * `prepare()`. `ERR_PREFIX_DISPOSED`: the prefix was disposed; a prefix the
+ * runtime no longer holds fails with `ERR_PREFIX_UNKNOWN` instead.
  */
 export type SetupErrorCode
   = | 'ERR_PREFIX_DISPOSED'
@@ -1751,6 +1773,12 @@ export type SetupErrorCode
      * Host-detected, never reported by the runtime.
      */
     | 'ERR_INVALID_REBIND'
+    /**
+     * `prepare()` named an id this sandbox still holds with other code or
+     * other memory limits; the message names which. Dispose every handle to
+     * the id first, or pick another id.
+     */
+    | 'ERR_PREFIX_ID_TAKEN'
 
 /**
  * Why a run failed, in a `{ ok: false }` result. Setup refusals are thrown

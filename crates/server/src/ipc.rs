@@ -74,7 +74,7 @@ pub enum TsToRustMessageType {
     Precompile = 0x03,
     /// Call an export of a stored prefix.
     PrefixRun = 0x04,
-    /// Release a stored snapshot. Idempotent.
+    /// Release a stored prefix. Idempotent; answered with `DisposePrefixResult`.
     DisposePrefix = 0x05,
     /// Reply to a `BridgeCall` sent by Rust.
     BridgeResponse = 0x06,
@@ -138,6 +138,8 @@ pub enum RustToTsMessageType {
     /// End of an outbound streamed body: clean EOF, or a guest source
     /// failure carrying a message the host's pending read rejects with.
     StreamEnd = 0x0B,
+    /// Answer to a `DisposePrefix`, sent once the prefix is dropped.
+    DisposePrefixResult = 0x0C,
 }
 
 /// Handshake status reported on a `Hello` frame.
@@ -1320,6 +1322,9 @@ pub fn prefix_hash(code_fields: &[u8], shape_fields: &[u8]) -> [u8; 16] {
     hash
 }
 
+/// The longest prefix id a `Precompile` may carry, in UTF-8 bytes.
+pub const MAX_PREFIX_ID_BYTES: usize = 200;
+
 /// Fully parsed `Precompile` frame payload per `docs/protocol.md` §5.2.
 /// Same fields as `RunRequest` but without `run_id`.
 #[derive(Debug)]
@@ -1329,6 +1334,8 @@ pub struct PrecompilePayload {
     pub request_id: u32,
     /// The host's code hash, checked against the bytes received.
     pub hash: [u8; 16],
+    /// The host-chosen prefix id, 1..=200 bytes.
+    pub id: String,
     pub code: String,
     pub filename: Option<String>,
     /// The prefix's heap lines, applied to every run on it.
@@ -1342,6 +1349,16 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
     let mut r = PayloadReader::new(payload);
     let request_id = r.read_u32()?;
     let hash = r.read_hash()?;
+    let id = r.read_string()?;
+    if id.is_empty() || id.len() > MAX_PREFIX_ID_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "prefix id must be 1..={MAX_PREFIX_ID_BYTES} bytes, got {}",
+                id.len()
+            ),
+        ));
+    }
     let code_start = r.offset;
     let code = r.read_string()?;
     let filename = r.read_optional_string()?;
@@ -1361,6 +1378,7 @@ pub fn parse_precompile_payload(payload: &[u8]) -> io::Result<PrecompilePayload>
     Ok(PrecompilePayload {
         request_id,
         hash,
+        id,
         code,
         filename,
         heap,
@@ -1391,13 +1409,14 @@ pub fn parse_prefix_run_payload(payload: &[u8]) -> io::Result<PrefixRunRequest> 
     })
 }
 
-/// Parse the payload bytes of a `DisposePrefix` frame.
-/// Payload is a single `PrefixId` (a length-prefixed UTF-8 string).
-pub fn parse_dispose_prefix_payload(payload: &[u8]) -> io::Result<String> {
+/// Parse the payload bytes of a `DisposePrefix` frame: `u32 requestId`,
+/// then the `PrefixId`.
+pub fn parse_dispose_prefix_payload(payload: &[u8]) -> io::Result<(u32, String)> {
     let mut r = PayloadReader::new(payload);
+    let request_id = r.read_u32()?;
     let id = r.read_string()?;
     r.assert_done()?;
-    Ok(id)
+    Ok((request_id, id))
 }
 
 /// Parse the payload bytes of a `Terminate` frame:
@@ -1606,6 +1625,7 @@ pub fn parse_rust_to_ts_message_type(byte: u8) -> io::Result<RustToTsMessageType
         0x09 => Ok(RustToTsMessageType::StreamCancel),
         0x0A => Ok(RustToTsMessageType::StreamChunk),
         0x0B => Ok(RustToTsMessageType::StreamEnd),
+        0x0C => Ok(RustToTsMessageType::DisposePrefixResult),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown Rust->TS message type: {byte:#04x}"),
@@ -1910,6 +1930,30 @@ mod tests {
     }
 
     #[test]
+    fn dispose_prefix_result_byte_matches_protocol_spec() {
+        assert_eq!(RustToTsMessageType::DisposePrefixResult as u8, 0x0C);
+        assert_eq!(
+            parse_rust_to_ts_message_type(0x0C).unwrap(),
+            RustToTsMessageType::DisposePrefixResult
+        );
+    }
+
+    #[test]
+    fn parse_dispose_prefix_payload_reads_the_request_id_then_the_id() {
+        let mut v = Vec::new();
+        push_u32(&mut v, 7);
+        push_string(&mut v, "p");
+        assert_eq!(
+            parse_dispose_prefix_payload(&v).unwrap(),
+            (7, "p".to_string())
+        );
+        // The pre-answer layout (a bare id) no longer parses.
+        let mut bare = Vec::new();
+        push_string(&mut bare, "p");
+        assert!(parse_dispose_prefix_payload(&bare).is_err());
+    }
+
+    #[test]
     fn log_byte_matches_protocol_spec() {
         assert_eq!(RustToTsMessageType::Log as u8, 0x04);
     }
@@ -2072,7 +2116,7 @@ mod tests {
     }
 
     /// Shared with `ipc.test.ts`: the same Precompile bytes, the same hash.
-    const PRECOMPILE_VECTOR: &str = "000000019c0151069957142d7b202a45e999faaa000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031";
+    const PRECOMPILE_VECTOR: &str = "000000019c0151069957142d7b202a45e999faaa0000000170000000106578706f72742064656661756c7420310100000004612e6a73010000004000000000010100000006616e737765720100000002343200000001000000056c69623a7800000000126578706f727420636f6e73742078203d2031";
     const PRECOMPILE_VECTOR_HASH: &str = "9c0151069957142d7b202a45e999faaa";
 
     fn from_hex(hex: &str) -> Vec<u8> {
@@ -2086,6 +2130,7 @@ mod tests {
     fn parse_precompile_payload_checks_the_shared_hash_vector() {
         let p = parse_precompile_payload(&from_hex(PRECOMPILE_VECTOR)).unwrap();
         assert_eq!(p.hash.to_vec(), from_hex(PRECOMPILE_VECTOR_HASH));
+        assert_eq!(p.id, "p");
         assert_eq!(p.code, "export default 1");
         assert_eq!(p.filename.as_deref(), Some("a.js"));
         assert_eq!(p.globals.len(), 1);
@@ -2095,8 +2140,8 @@ mod tests {
     #[test]
     fn parse_precompile_payload_rejects_a_hash_mismatch() {
         let bytes = from_hex(PRECOMPILE_VECTOR);
-        // Byte 4 is in the hash, 24 in the code, 53 in the heap block.
-        for (at, rejected) in [(4, true), (24, true), (53, false)] {
+        // Byte 4 is in the hash, 24 in the id, 29 in the code, 58 in the heap block.
+        for (at, rejected) in [(4, true), (24, false), (29, true), (58, false)] {
             let mut v = bytes.clone();
             v[at] ^= 1;
             let result = parse_precompile_payload(&v);
@@ -2108,10 +2153,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_prefix_gets_the_band_a_one_off_does_not() {
-        // Same absent heap block on both frame kinds — only the frame kind
-        // differs, and with it whether an absent hard override earns a band.
+    /// A `Precompile` of code "1" with no filename, heap or shape under `id`.
+    fn precompile_with_id(id: &str) -> Vec<u8> {
         let mut code_fields = Vec::new();
         push_string(&mut code_fields, "1"); // code
         code_fields.push(0); // no filename
@@ -2119,10 +2162,35 @@ mod tests {
         let mut v = Vec::new();
         push_u32(&mut v, 1); // request_id
         v.extend_from_slice(&prefix_hash(&code_fields, &shape_fields));
+        push_string(&mut v, id);
         v.extend_from_slice(&code_fields);
         v.extend_from_slice(&[0u8; 2]); // heap: memory_mb, hard_memory_mb absent
         v.extend_from_slice(&shape_fields);
-        let prefix = parse_precompile_payload(&v).unwrap();
+        v
+    }
+
+    #[test]
+    fn parse_precompile_payload_takes_ids_of_1_to_200_bytes() {
+        for id in ["x", &"é".repeat(100), "line\nbreak"] {
+            assert_eq!(
+                parse_precompile_payload(&precompile_with_id(id))
+                    .unwrap()
+                    .id,
+                id
+            );
+        }
+        for id in ["", &"x".repeat(201), &"é".repeat(101)] {
+            let e = parse_precompile_payload(&precompile_with_id(id)).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            assert!(e.to_string().contains("prefix id"), "unexpected: {e}");
+        }
+    }
+
+    #[test]
+    fn a_prefix_gets_the_band_a_one_off_does_not() {
+        // Same absent heap block on both frame kinds — only the frame kind
+        // differs, and with it whether an absent hard override earns a band.
+        let prefix = parse_precompile_payload(&precompile_with_id("p")).unwrap();
         assert_eq!(prefix.heap.soft_memory_mb, DEFAULT_MEMORY_MB);
         assert_eq!(
             prefix.heap.hard_memory_mb,

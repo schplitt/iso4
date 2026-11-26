@@ -46,8 +46,8 @@ describe('memory budget → live-isolate cap', () => {
     // the safety net) keeps BOTH prefixes resident — the old slot model would
     // have evicted A to warm B.
     await using single = await createSandbox({ maxConcurrentRuns: 1 })
-    await using prefixA = await single.prepare({ code: COUNTER })
-    await using prefixB = await single.prepare({ code: COUNTER })
+    await using prefixA = await single.prepare({ id: crypto.randomUUID(), code: COUNTER })
+    await using prefixB = await single.prepare({ id: crypto.randomUUID(), code: COUNTER })
 
     const a1 = await prefixA.call({ export: 'bump' })
     expect(a1.ok && a1.value === 1).toBe(true)
@@ -68,9 +68,9 @@ describe('memory budget → live-isolate cap', () => {
     // evicts nothing — under the old count model (256 ÷ 128 = 2 slots) prefix
     // C would have displaced A here.
     await using sandbox = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 4096 })
-    await using prefixA = await sandbox.prepare({ code: COUNTER })
-    await using prefixB = await sandbox.prepare({ code: COUNTER })
-    await using prefixC = await sandbox.prepare({ code: COUNTER })
+    await using prefixA = await sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER })
+    await using prefixB = await sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER })
+    await using prefixC = await sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER })
 
     for (const prefix of [prefixA, prefixB, prefixC]) {
       const first = await prefix.call({ export: 'bump' })
@@ -97,7 +97,7 @@ describe('memory budget → live-isolate cap', () => {
     // warmth. (Do NOT assert RSS drops — freed heap returns to the OS
     // lazily; that is what the futility check is for.)
     await using pressured = await createSandbox({ maxConcurrentRuns: 1, memoryBudgetMb: 8 })
-    await using prefix = await pressured.prepare({ code: COUNTER })
+    await using prefix = await pressured.prepare({ id: crypto.randomUUID(), code: COUNTER })
 
     const first = await prefix.call({ export: 'bump' })
     expect(first.ok).toBe(true)
@@ -275,7 +275,7 @@ describe('saturation queues FIFO', () => {
     // No queue knobs, deliberately: saturation always queues, and the wait
     // is bounded in practice because every run has wall/CPU limits.
     await using single = await createSandbox({ maxConcurrentRuns: 1 })
-    await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
+    await using prefix = await single.prepare({ id: crypto.randomUUID(), code: SLOW, globals: { hostSleep } })
 
     const busy = prefix.call({
       export: 'slow',
@@ -300,7 +300,7 @@ describe('saturation queues FIFO', () => {
     // Queue bound 0: the one slot is busy, so the next caller is refused
     // immediately as a failed result — nothing ran, telemetry is zero.
     await using single = await createSandbox({ maxConcurrentRuns: 1, maxQueuedRuns: 0 })
-    await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
+    await using prefix = await single.prepare({ id: crypto.randomUUID(), code: SLOW, globals: { hostSleep } })
 
     const busy = prefix.call({
       export: 'slow',
@@ -342,8 +342,8 @@ describe('per-workload heap caps (#77)', () => {
 
   test('a per-prefix cap binds that prefix; siblings keep the default', async () => {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
-    await using tight = await sandbox.prepare({ code: HOARD, memoryMb: 32 })
-    await using roomy = await sandbox.prepare({ code: HOARD })
+    await using tight = await sandbox.prepare({ id: crypto.randomUUID(), code: HOARD, memoryMb: 32 })
+    await using roomy = await sandbox.prepare({ id: crypto.randomUUID(), code: HOARD })
 
     const blown = await tight.call({ export: 'hoard', args: [64] })
     expect(blown.ok).toBe(false)
@@ -374,11 +374,11 @@ describe('per-workload heap caps (#77)', () => {
 
   test('prefix runs still reject a per-run memoryMb; bad caps throw', async () => {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
-    await using prefix = await sandbox.prepare({ code: COUNTER })
+    await using prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER })
     await expect(async () =>
       prefix.call({ export: 'bump', limits: { memoryMb: 64 } as never }),
     ).rejects.toThrow(/prepare\(\{ memoryMb \}\)/)
-    await expect(sandbox.prepare({ code: COUNTER, memoryMb: 1.5 })).rejects.toThrow(/memoryMb/)
+    await expect(sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER, memoryMb: 1.5 })).rejects.toThrow(/memoryMb/)
     await expect(sandbox.run({ code: '1', limits: { memoryMb: -1 } })).rejects.toThrow(/memoryMb/)
   })
 })
@@ -433,7 +433,7 @@ export function grow(mb) {
     // 64 MB retires at 64 and terminates at 64 + round(sqrt(8 × 64)) = 87,
     // so a run peaking at ~70 MB completes; the instance is retired for it
     // rather than the run being killed.
-    await using prefix = await sandbox.prepare({ code: PEAK, memoryMb: 64 })
+    await using prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: PEAK, memoryMb: 64 })
     const peaked = await prefix.call({
       export: 'peak',
       args: [70],
@@ -456,6 +456,7 @@ export function grow(mb) {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
     // Wide band: the soft line is what fires, the hard line is never near.
     await using leaky = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: LEAK,
       memoryMb: { soft: 32, hard: 512 },
     })
@@ -483,6 +484,7 @@ export function grow(mb) {
   test('a hard-line-only cap never retires, however much it retains', async () => {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 1 })
     await using leaky = await sandbox.prepare({
+      id: crypto.randomUUID(),
       code: LEAK,
       memoryMb: { hard: 512 },
     })
@@ -508,11 +510,11 @@ export function grow(mb) {
     ).rejects.toThrow(/number of megabytes/)
     // A soft line at or above the hard line could never fire first.
     await expect(
-      sandbox.prepare({ code: COUNTER, memoryMb: { soft: 64, hard: 64 } }),
+      sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER, memoryMb: { soft: 64, hard: 64 } }),
     ).rejects.toThrow(/must be below/)
     // `hard: 0` would leave V8 with no limit at all — a fatal process OOM.
     await expect(
-      sandbox.prepare({ code: COUNTER, memoryMb: { soft: 32, hard: 0 } }),
+      sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER, memoryMb: { soft: 32, hard: 0 } }),
     ).rejects.toThrow(/write memoryMb: 0 for uncapped/)
   })
 })
@@ -520,7 +522,7 @@ export function grow(mb) {
 describe('prefix-aware acquire (#77)', () => {
   test('waiting-heavy concurrent runs share one instance', async () => {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 4 })
-    await using prefix = await sandbox.prepare({ code: SLOW, globals: { hostSleep } })
+    await using prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: SLOW, globals: { hostSleep } })
 
     // Seed the prefix's demand averages: one completed run whose CPU share
     // is tiny (it parks on the host sleep). Until this completes, concurrent
@@ -570,7 +572,7 @@ describe('lazy connections', () => {
     // share a connection instead of opening one each — 4 overlapping calls
     // (the per-connection cap) ride the single connection prepare() opened.
     await using sandbox = await createSandbox({ maxConcurrentRuns: 8 })
-    await using prefix = await sandbox.prepare({ code: SLOW, globals: { hostSleep } })
+    await using prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: SLOW, globals: { hostSleep } })
 
     const four = await Promise.all(Array.from({ length: 4 }, () =>
       prefix.call({ export: 'slow', args: [150], limits: { cpuTimeMs: 5_000 } })))
@@ -648,7 +650,7 @@ describe('lazy connections', () => {
 describe('stats()', () => {
   test('reports idle warm instances and their measured heap', async () => {
     await using sandbox = await createSandbox({ maxConcurrentRuns: 2 })
-    await using prefix = await sandbox.prepare({ code: COUNTER })
+    await using prefix = await sandbox.prepare({ id: crypto.randomUUID(), code: COUNTER })
     const warm = await prefix.call({ export: 'bump' })
     expect(warm.ok).toBe(true)
 
@@ -670,7 +672,7 @@ describe('stats()', () => {
     // The control connection is not a pool slot: with the only slot held by
     // a running call, stats() must still answer — that is its whole point.
     await using single = await createSandbox({ maxConcurrentRuns: 1 })
-    await using prefix = await single.prepare({ code: SLOW, globals: { hostSleep } })
+    await using prefix = await single.prepare({ id: crypto.randomUUID(), code: SLOW, globals: { hostSleep } })
 
     const busy = prefix.call({
       export: 'slow',

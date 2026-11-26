@@ -177,6 +177,7 @@ describe('frozen clock — the other clock surfaces', () => {
 describe('frozen clock — warm prefix path', () => {
   test('prefix.call() runs are frozen and advance per call', async () => {
     const prefix = await runtime.prepare({
+      id: crypto.randomUUID(),
       code: `
         globalThis.bootTime = Date.now()
         export function probe() {

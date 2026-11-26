@@ -433,19 +433,20 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                         break;
                     }
                 };
-                let prefix_id = engine.prepare(
-                    payload.code,
-                    payload.filename,
-                    payload.heap,
-                    payload.globals,
-                    payload.imports,
-                    payload.hash,
-                );
-                let result = wire::encode_precompile_result_payload(
-                    payload.request_id,
-                    Some(&prefix_id),
-                    None,
-                );
+                let error = engine
+                    .prepare(
+                        payload.id,
+                        payload.code,
+                        payload.filename,
+                        payload.heap,
+                        payload.globals,
+                        payload.imports,
+                        payload.hash,
+                    )
+                    .err()
+                    .map(|e| e.to_payload());
+                let result =
+                    wire::encode_precompile_result_payload(payload.request_id, error.as_ref());
                 if let Err(e) = outbox.send_frame(
                     ipc::RustToTsMessageType::PrecompileResult,
                     result,
@@ -469,8 +470,19 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
             }
             ipc::TsToRustMessageType::DisposePrefix => {
                 match ipc::parse_dispose_prefix_payload(&frame.payload) {
-                    // No response frame: DisposePrefix is fire-and-forget.
-                    Ok(prefix_id) => engine.dispose_prefix(&prefix_id),
+                    Ok((request_id, prefix_id)) => {
+                        engine.dispose_prefix(&prefix_id);
+                        // Answered once dropped, so the host's next Precompile of this id finds it gone.
+                        if let Err(e) = outbox.send_frame(
+                            ipc::RustToTsMessageType::DisposePrefixResult,
+                            request_id.to_be_bytes().to_vec(),
+                            Vec::new(),
+                        ) {
+                            iso4_core::log!(
+                                "[iso4-v8] failed to write DisposePrefixResult frame: {e}"
+                            );
+                        }
+                    }
                     Err(e) => {
                         iso4_core::log!("[iso4-v8] malformed DisposePrefix payload: {e} — closing");
                         break;
@@ -960,6 +972,75 @@ mod tests {
         let hello = ipc::read_rust_to_ts_frame(&mut host).expect("a Hello frame");
         assert_eq!(hello.message_type, ipc::RustToTsMessageType::Hello);
         (host, done)
+    }
+
+    /// A `Precompile` of `code` under `id`, no filename, default heap, no shape.
+    fn precompile_payload(request_id: u32, id: &str, code: &str) -> Vec<u8> {
+        let mut code_fields = (code.len() as u32).to_be_bytes().to_vec();
+        code_fields.extend_from_slice(code.as_bytes());
+        code_fields.push(0); // no filename
+        let shape_fields = [0u8; 8]; // globals count, imports count
+        let mut v = request_id.to_be_bytes().to_vec();
+        v.extend_from_slice(&ipc::prefix_hash(&code_fields, &shape_fields));
+        v.extend_from_slice(&(id.len() as u32).to_be_bytes());
+        v.extend_from_slice(id.as_bytes());
+        v.extend_from_slice(&code_fields);
+        v.extend_from_slice(&[0u8; 2]); // heap: both lines absent
+        v.extend_from_slice(&shape_fields);
+        v
+    }
+
+    fn dispose_payload(request_id: u32, id: &str) -> Vec<u8> {
+        let mut v = request_id.to_be_bytes().to_vec();
+        v.extend_from_slice(&(id.len() as u32).to_be_bytes());
+        v.extend_from_slice(id.as_bytes());
+        v
+    }
+
+    /// Send one control frame and read its answer.
+    fn ask(
+        host: &mut UnixStream,
+        kind: ipc::TsToRustMessageType,
+        payload: Vec<u8>,
+    ) -> ipc::RustToTsFrame {
+        ipc::write_ts_to_rust_frame(host, kind, &payload).unwrap();
+        ipc::read_rust_to_ts_frame(host).expect("an answer")
+    }
+
+    #[test]
+    fn dispose_prefix_is_answered_for_a_held_and_an_unknown_id() {
+        let (mut host, _done) = open_session();
+        let stored = ask(
+            &mut host,
+            ipc::TsToRustMessageType::Precompile,
+            precompile_payload(1, "p", "export default 1"),
+        );
+        assert_eq!(
+            stored.message_type,
+            ipc::RustToTsMessageType::PrecompileResult
+        );
+        assert_eq!(stored.payload, [0, 0, 0, 1, 1, 0]);
+
+        for (request_id, id) in [(5, "p"), (6, "never-held")] {
+            let answer = ask(
+                &mut host,
+                ipc::TsToRustMessageType::DisposePrefix,
+                dispose_payload(request_id, id),
+            );
+            assert_eq!(
+                answer.message_type,
+                ipc::RustToTsMessageType::DisposePrefixResult
+            );
+            assert_eq!(answer.payload, request_id.to_be_bytes());
+        }
+
+        // Dropped before the answer: the id takes other code at once.
+        let again = ask(
+            &mut host,
+            ipc::TsToRustMessageType::Precompile,
+            precompile_payload(2, "p", "export default 2"),
+        );
+        assert_eq!(again.payload, [0, 0, 0, 2, 1, 0]);
     }
 
     #[test]

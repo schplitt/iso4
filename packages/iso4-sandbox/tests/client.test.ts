@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:net'
 import type { Server, Socket } from 'node:net'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { RuntimeIpcClient } from '../src/client'
 import {
   FrameReader,
@@ -301,7 +301,7 @@ describe('RuntimeIpcClient', () => {
     })
 
     const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
-    await expect(client.precompile({ code: 'export const x = 1' }))
+    await expect(client.precompile({ id: crypto.randomUUID(), code: 'export const x = 1' }))
       .rejects
       .toThrow(/Result frame carries runId/)
     await client.dispose()
@@ -311,17 +311,16 @@ describe('RuntimeIpcClient', () => {
     // Precompiles are answered on runtime worker threads, so replies can
     // return out of request order on a shared connection. The router must
     // match by the echoed requestId — FIFO matching would hand caller A
-    // caller B's prefix id.
-    const successPayload = (requestId: number, prefixId: string): Buffer => {
+    // caller B's reply.
+    const successPayload = (requestId: number): Buffer => {
       const head = Buffer.alloc(6)
       head.writeUInt32BE(requestId, 0)
       head[4] = 1 // ok
-      head[5] = 1 // prefixId present
-      const id = Buffer.from(prefixId, 'utf8')
-      const idLen = Buffer.alloc(4)
-      idLen.writeUInt32BE(id.byteLength, 0)
-      return Buffer.concat([head, idLen, id, Buffer.from([0])])
+      head[5] = 0 // no error
+      return head
     }
+    let first = 0
+    let second = 0
     const socketPath = await listen(async (socket) => {
       const reader = new FrameReader()
       socket.on('data', (chunk) => reader.push(chunk))
@@ -329,27 +328,79 @@ describe('RuntimeIpcClient', () => {
       writeHello(socket)
       const idOf = (frame: { payload: Uint8Array }): number =>
         Buffer.from(frame.payload.buffer, frame.payload.byteOffset, 4).readUInt32BE(0)
-      const first = idOf(await reader.readFrame())
-      const second = idOf(await reader.readFrame())
+      first = idOf(await reader.readFrame())
+      second = idOf(await reader.readFrame())
 
       // Answer the SECOND request first.
       socket.write(encodeRustToTsFrame(
         RustToTsMessageTypes.PrecompileResult,
-        successPayload(second, 'prefix-of-second'),
+        successPayload(second),
       ))
       socket.write(encodeRustToTsFrame(
         RustToTsMessageTypes.PrecompileResult,
-        successPayload(first, 'prefix-of-first'),
+        successPayload(first),
       ))
     })
 
     const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
     const [a, b] = await Promise.all([
-      client.precompile({ code: 'export const a = 1' }),
-      client.precompile({ code: 'export const b = 2' }),
+      client.precompile({ id: crypto.randomUUID(), code: 'export const a = 1' }),
+      client.precompile({ id: crypto.randomUUID(), code: 'export const b = 2' }),
     ])
-    expect(decodePrecompileResultPayload(a.reply)).toMatchObject({ ok: true, prefixId: 'prefix-of-first' })
-    expect(decodePrecompileResultPayload(b.reply)).toMatchObject({ ok: true, prefixId: 'prefix-of-second' })
+    expect(first).not.toBe(second)
+    expect(decodePrecompileResultPayload(a.reply)).toEqual({ ok: true, requestId: first })
+    expect(decodePrecompileResultPayload(b.reply)).toEqual({ ok: true, requestId: second })
+    await client.dispose()
+  })
+
+  test('disposePrefix resolves on the DisposePrefixResult that echoes its requestId', async () => {
+    let answer!: () => void
+    let sent!: { messageType: number, requestId: number }
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      const frame = await reader.readFrame()
+      const payload = Buffer.from(frame.payload.buffer, frame.payload.byteOffset, frame.payload.byteLength)
+      sent = { messageType: frame.messageType, requestId: payload.readUInt32BE(0) }
+      answer = () => {
+        const reply = Buffer.alloc(4)
+        reply.writeUInt32BE(sent.requestId, 0)
+        socket.write(encodeRustToTsFrame(RustToTsMessageTypes.DisposePrefixResult, reply))
+      }
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    let settled = false
+    const disposed = client.disposePrefix('p').then((answered) => {
+      settled = true
+      return answered
+    })
+    await vi.waitFor(() => expect(answer).toBeTypeOf('function'))
+    expect(sent.messageType).toBe(TsToRustMessageTypes.DisposePrefix)
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20)
+    })
+    expect(settled).toBe(false)
+    answer()
+    expect(await disposed).toBe(true)
+    expect(settled).toBe(true)
+    await client.dispose()
+  })
+
+  test('a pending disposePrefix resolves false when the connection goes away', async () => {
+    const socketPath = await listen(async (socket) => {
+      const reader = new FrameReader()
+      socket.on('data', (chunk) => reader.push(chunk))
+      await reader.readFrame() // Authenticate
+      writeHello(socket)
+      await reader.readFrame() // DisposePrefix, never answered
+      socket.destroy()
+    })
+
+    const client = await RuntimeIpcClient.connect({ socketPath, descriptorToken })
+    expect(await client.disposePrefix('p')).toBe(false)
     await client.dispose()
   })
 
