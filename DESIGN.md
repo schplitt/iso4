@@ -430,7 +430,9 @@ socket and to its stderr:
 limit"`. `cause` is `oom-heap` or `oom-other`; `phase` is `run`, `oneoff`
 for `sandbox.run()`, `cold-start` while the prefix evaluates (`run` names
 the run that triggered it), `idle` between runs, or `none` outside any
-isolate; a value that does not apply is left out. `msg` comes last, holds
+isolate; a value that does not apply is left out. `key` follows `prefix`:
+the child's `--key`, quoted and escaped like `msg`, on every kind of line,
+left out when the child has no key. `msg` comes last, holds
 V8's message and ` (<detail>)` if V8 gave one, escapes `"`, `\` and control
 bytes as `\"`, `\\` and `\xHH`, and is cut so the line stays within 1024
 bytes. The record belongs to the isolate, so heap OOMs raised on V8 worker
@@ -440,9 +442,9 @@ co-resident run's continuation resumed inside that turn is reported as the
 turn owner. OOMs raised with no current isolate (Zone exhaustion on
 background compile threads) reach the process-wide callback the child
 registers before V8 initializes, with `phase=none`. A V8 fatal error (a
-failed `CHECK`) writes `cause=v8-fatal` and `msg` only. The signals
+failed `CHECK`) writes `cause=v8-fatal`, `key` and `msg` only. The signals
 SIGSEGV, SIGTRAP, SIGABRT, SIGBUS and SIGILL write `cause=` with the signal
-name and nothing else; the handler then ends the process with that same
+name and `key`, nothing else; the handler then ends the process with that same
 signal, so the host sees the true cause (V8's own abort is a trap
 instruction in this build, so an OOM death is SIGTRAP). One death writes one
 line, whichever of these it passes through first. On the OOM path V8 still

@@ -609,6 +609,7 @@ time. Never per run, never per value.
 | Field      | Encoding              | Notes                                                                                                       |
 | ---------- | --------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `runId`    | `u32`                 | Unique on this connection; wraps unsigned at 2³². Echoed back on the `Result` and checked there — see §5.7. |
+| `key`      | `Optional<String>`    | Must equal the runtime's `--key`, see Keys below. The Node host sends it absent.                            |
 | `code`     | `String`              | ESM source.                                                                                                 |
 | `filename` | `Optional<String>`    | Used in stack traces.                                                                                       |
 | `heap`     | `HeapLimits`          | This run's heap lines (strict: no band). Only caller-set fields sent; runtime fills defaults.               |
@@ -666,6 +667,7 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 | `requestId` | `u32`                 | Correlation id, echoed on the `PrecompileResult`; the host matches replies by id, never by order.   |
 | `hash`      | 16 bytes              | The code hash, see below.                                                                           |
 | `id`        | `PrefixId`            | The host-chosen prefix id, 1 to 200 bytes (§5.3).                                                   |
+| `key`       | `Optional<String>`    | Must equal the runtime's `--key`, see Keys below. The Node host sends it absent.                    |
 | `code`      | `String`              | ESM prefix source.                                                                                  |
 | `filename`  | `Optional<String>`    | Used in stack traces.                                                                               |
 | `heap`      | `HeapLimits`          | The prefix's heap lines (managed: band applies). Stored with the prefix; every run on it gets them. |
@@ -674,8 +676,22 @@ limit applies — like bridge responses, the frame read is capped by `memoryMb`.
 
 The code hash is SHA-256 over two runs of this payload's bytes as encoded,
 `code` + `filename`, then `globals` + `imports` (skipping `heap`); its first
-16 bytes. `requestId`, `id` and the limits are not in it. The runtime recomputes
+16 bytes. `requestId`, `id`, `key` and the limits are not in it. The runtime recomputes
 it; a mismatch is a malformed payload and closes the connection.
+
+**Keys.** The runtime takes an optional `--key <s>` flag at start; absent, it
+is keyless. Every `Run` and `Precompile` carries a `key`, which must equal the
+runtime's exactly, and an absent key equals only an absent key: a keyed
+runtime refuses a frame without a key, a keyless runtime one with a key.
+`PrefixRun` carries no key; its prefix was checked at `Precompile`. A key
+that does not match fails that request alone with `ERR_INTERNAL` (a `Run`
+as a failed `Result`, a `Precompile` as a failed `PrecompileResult`, nothing
+stored); the message names the key the frame carried, quoted and escaped,
+and the connection stays open. A present key is any UTF-8 string of 1 to 200
+bytes; a frame whose key is empty or longer is a malformed payload and closes
+the connection. A `--key` value that is empty or longer than 200 bytes makes
+the runtime log one line and exit 1. The key is printed on the fatal crash
+line as `key="..."`.
 
 A `Precompile` for an id the runtime holds stores nothing: with the same
 `hash` and the same resolved heap lines it answers `ok` (the same prefix),
@@ -1147,11 +1163,11 @@ afterwards, so later calls report only their own lines.
 
 `PrecompileResultPayload`:
 
-| Field       | Encoding                    | Notes                                                                                                             |
-| ----------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `requestId` | `u32`                       | Echo of the `Precompile`'s correlation id.                                                                        |
-| `ok`        | `bool`                      | Success or failure.                                                                                               |
-| `error`     | `Optional<RunErrorPayload>` | Present when `ok = false`: `ERR_PREFIX_ID_TAKEN`, the only failure today (the runtime stores without evaluating). |
+| Field       | Encoding                    | Notes                                                                                                                                            |
+| ----------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `requestId` | `u32`                       | Echo of the `Precompile`'s correlation id.                                                                                                       |
+| `ok`        | `bool`                      | Success or failure.                                                                                                                              |
+| `error`     | `Optional<RunErrorPayload>` | Present when `ok = false`: `ERR_PREFIX_ID_TAKEN`, or `ERR_INTERNAL` for a key that does not match (§5.2). The runtime stores without evaluating. |
 
 ### 5.8 RunComplete payloads
 
@@ -1373,7 +1389,7 @@ by the runtime alone, on `Precompile`; the host throws it from `prepare()`.
 | `ERR_PROTOCOL_DESYNC`                 | **Host-detected, never sent by the runtime.** The host read a `Result` whose `runId` is not the one it sent, or a frame with no place in the run protocol, so the two sides lost frame alignment. The displaced run never reached an isolate: telemetry is zero rather than partial, and the connection is destroyed rather than reused. See §5.7.                                                                                                                                                                                                                                                                                                                                               |
 | `ERR_CAPACITY_MEMORY`                 | The memory admission refused the run: it needed a NEW isolate and measured global container memory plus the run's own hard line (band included) would cross the admission line (90% of container limit − host reserve) — or the run is uncapped (`memoryMb: 0`) while usage is at/above the budget. Nothing ran, telemetry is zero; retry when memory frees. Reuse of an existing warm instance is never refused for capacity.                                                                                                                                                                                                                                                                   |
 | `ERR_QUEUE_FULL`                      | **Host-detected, never sent by the runtime.** The run was shed at the host's `maxQueuedRuns` bound — that many callers were already waiting for a run slot. Never reached the runtime; telemetry is zero.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure; also answers a call that reached an instance whose thread had already exited.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `ERR_INTERNAL`                        | Runtime bug or unexpected host/runtime failure; also answers a call that reached an instance whose thread had already exited, and a `Run` or `Precompile` whose key does not match the runtime's `--key` (§5.2).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 ---
 

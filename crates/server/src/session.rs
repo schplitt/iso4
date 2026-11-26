@@ -234,7 +234,34 @@ fn frame_cap_for(heap: types::HeapLimits) -> u32 {
     }
 }
 
-pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
+/// `Err` with the host's refusal text when `frame` is not this child's key;
+/// absent equals absent.
+fn check_key(
+    own: Option<&str>,
+    frame: Option<&str>,
+    what: impl FnOnce() -> String,
+) -> Result<(), String> {
+    if own == frame {
+        return Ok(());
+    }
+    let what = what();
+    let describe = |key: Option<&str>| match key {
+        Some(k) => format!("key {k:?}"),
+        None => "no key".to_string(),
+    };
+    iso4_core::log!(
+        "[iso4-v8] {what} carries {}, this runtime has {} — refusing",
+        describe(frame),
+        describe(own)
+    );
+    Err(format!(
+        "{what} carries {}, which does not match this runtime",
+        describe(frame)
+    ))
+}
+
+/// `key` is this child's `--key`; every `Run` and `Precompile` must carry it.
+pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>, key: Option<String>) {
     // ── Step 1 & 2: authenticate ──────────────────────────────────────────
 
     // The first frame comes from a peer that has shown nothing yet, so it is
@@ -413,7 +440,7 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                 break;
             }
             ipc::TsToRustMessageType::Run => {
-                let req = match ipc::parse_run_payload(&frame.payload) {
+                let (frame_key, req) = match ipc::parse_run_payload(&frame.payload) {
                     Ok(p) => p,
                     Err(e) => {
                         iso4_core::log!("[iso4-v8] malformed Run payload: {e} — closing");
@@ -421,6 +448,11 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                     }
                 };
                 let run_id = req.run_id;
+                let what = || format!("run {run_id}");
+                if let Err(message) = check_key(key.as_deref(), frame_key.as_deref(), what) {
+                    engine.refuse(&caller, run_id, Refusal::Internal(message));
+                    continue;
+                }
                 start_run(&engine, &conn_runs, &caller, run_id, |register| {
                     engine.run(req, &caller, register)
                 });
@@ -433,18 +465,22 @@ pub fn handle_client(mut stream: UnixStream, engine: Arc<Engine>) {
                         break;
                     }
                 };
-                let error = engine
-                    .prepare(
-                        payload.id,
-                        payload.code,
-                        payload.filename,
-                        payload.heap,
-                        payload.globals,
-                        payload.imports,
-                        payload.hash,
-                    )
-                    .err()
-                    .map(|e| e.to_payload());
+                let what = || format!("Precompile of prefix id {:?}", payload.id);
+                let error = match check_key(key.as_deref(), payload.key.as_deref(), what) {
+                    Err(message) => Some(Refusal::Internal(message).to_payload()),
+                    Ok(()) => engine
+                        .prepare(
+                            payload.id,
+                            payload.code,
+                            payload.filename,
+                            payload.heap,
+                            payload.globals,
+                            payload.imports,
+                            payload.hash,
+                        )
+                        .err()
+                        .map(|e| e.to_payload()),
+                };
                 let result =
                     wire::encode_precompile_result_payload(payload.request_id, error.as_ref());
                 if let Err(e) = outbox.send_frame(
@@ -698,7 +734,7 @@ mod tests {
     fn handshake(payload: Vec<u8>) -> Option<ipc::RustToTsFrame> {
         let (mut host, runtime) = UnixStream::pair().unwrap();
         let engine = Arc::new(iso4_core::testing::engine(0, 0));
-        let server = std::thread::spawn(move || handle_client(runtime, engine));
+        let server = std::thread::spawn(move || handle_client(runtime, engine, None));
 
         ipc::write_ts_to_rust_frame(&mut host, ipc::TsToRustMessageType::Authenticate, &payload)
             .unwrap();
@@ -714,11 +750,17 @@ mod tests {
     /// thread finishes — so a session that never ends fails the test instead of
     /// hanging the suite.
     fn spawn_session() -> (UnixStream, crossbeam_channel::Receiver<()>) {
+        spawn_keyed_session(None)
+    }
+
+    /// [`spawn_session`] for a child started with `--key <key>`.
+    fn spawn_keyed_session(key: Option<&str>) -> (UnixStream, crossbeam_channel::Receiver<()>) {
         let (host, runtime) = UnixStream::pair().unwrap();
         let engine = Arc::new(iso4_core::testing::engine(0, 0));
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let key = key.map(str::to_string);
         std::thread::spawn(move || {
-            handle_client(runtime, engine);
+            handle_client(runtime, engine, key);
             let _ = done_tx.send(());
         });
         (host, done_rx)
@@ -863,6 +905,16 @@ mod tests {
         out.extend_from_slice(s.as_bytes());
     }
 
+    fn push_key(out: &mut Vec<u8>, key: Option<&str>) {
+        match key {
+            Some(k) => {
+                out.push(1);
+                pstr(out, k);
+            }
+            None => out.push(0),
+        }
+    }
+
     /// A minimal `Run` payload: one bridge global "tool", explicit wall and
     /// (optionally) CPU and memory, everything else at the runtime defaults.
     fn run_payload_full(
@@ -872,8 +924,21 @@ mod tests {
         cpu_ms: Option<u32>,
         wall_ms: u32,
     ) -> Vec<u8> {
+        run_payload_keyed(run_id, None, code, memory_mb, cpu_ms, wall_ms)
+    }
+
+    /// [`run_payload_full`] with `key` right after the run id.
+    fn run_payload_keyed(
+        run_id: u32,
+        key: Option<&str>,
+        code: &str,
+        memory_mb: Option<u32>,
+        cpu_ms: Option<u32>,
+        wall_ms: u32,
+    ) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&run_id.to_be_bytes());
+        push_key(&mut p, key);
         pstr(&mut p, code);
         p.push(0); // filename absent
                    // heap: memory, hardMemory; then cpu, wall, export, stdout,
@@ -962,7 +1027,12 @@ mod tests {
 
     /// Handshake on an open connection; returns after the Hello.
     fn open_session() -> (UnixStream, crossbeam_channel::Receiver<()>) {
-        let (mut host, done) = spawn_session();
+        open_keyed_session(None)
+    }
+
+    /// [`open_session`] for a child started with `--key <key>`.
+    fn open_keyed_session(key: Option<&str>) -> (UnixStream, crossbeam_channel::Receiver<()>) {
+        let (mut host, done) = spawn_keyed_session(key);
         ipc::write_ts_to_rust_frame(
             &mut host,
             ipc::TsToRustMessageType::Authenticate,
@@ -976,6 +1046,11 @@ mod tests {
 
     /// A `Precompile` of `code` under `id`, no filename, default heap, no shape.
     fn precompile_payload(request_id: u32, id: &str, code: &str) -> Vec<u8> {
+        precompile_keyed(request_id, id, None, code)
+    }
+
+    /// [`precompile_payload`] with `key` after the id.
+    fn precompile_keyed(request_id: u32, id: &str, key: Option<&str>, code: &str) -> Vec<u8> {
         let mut code_fields = (code.len() as u32).to_be_bytes().to_vec();
         code_fields.extend_from_slice(code.as_bytes());
         code_fields.push(0); // no filename
@@ -984,6 +1059,7 @@ mod tests {
         v.extend_from_slice(&ipc::prefix_hash(&code_fields, &shape_fields));
         v.extend_from_slice(&(id.len() as u32).to_be_bytes());
         v.extend_from_slice(id.as_bytes());
+        push_key(&mut v, key);
         v.extend_from_slice(&code_fields);
         v.extend_from_slice(&[0u8; 2]); // heap: both lines absent
         v.extend_from_slice(&shape_fields);
@@ -1041,6 +1117,89 @@ mod tests {
             precompile_payload(2, "p", "export default 2"),
         );
         assert_eq!(again.payload, [0, 0, 0, 2, 1, 0]);
+    }
+
+    /// Child key, frame key, and the refusal text after "<what> carries ".
+    const KEY_MISMATCHES: [(Option<&str>, Option<&str>, &str); 4] = [
+        (None, Some("k"), "key \"k\""),
+        (Some("k"), None, "no key"),
+        (Some("k"), Some("K"), "key \"K\""),
+        (Some("a b\"c"), Some("a b\"c\n"), "key \"a b\\\"c\\n\""),
+    ];
+
+    #[test]
+    fn a_run_with_another_key_is_refused_and_the_connection_goes_on() {
+        iso4_core::testing::init_platform();
+        for (own, sent, said) in KEY_MISMATCHES {
+            let (mut host, _done) = open_keyed_session(own);
+            ipc::write_ts_to_rust_frame(
+                &mut host,
+                ipc::TsToRustMessageType::Run,
+                &run_payload_keyed(1, sent, "export default 1", None, None, 10_000),
+            )
+            .unwrap();
+            let refusal = ipc::read_rust_to_ts_frame(&mut host).expect("a refusal Result");
+            assert_eq!(refusal.message_type, ipc::RustToTsMessageType::Result);
+            assert_eq!(&refusal.payload[0..4], &1u32.to_be_bytes());
+            assert_eq!(refusal.payload[8], 0, "the run must fail");
+            let text = String::from_utf8_lossy(&refusal.payload);
+            assert!(text.contains("ERR_INTERNAL"), "{text}");
+            let expected = format!("run 1 carries {said}, which does not match this runtime");
+            assert!(text.contains(&expected), "{own:?} {sent:?}: {text}");
+
+            // The same connection runs a frame with the child's own key.
+            ipc::write_ts_to_rust_frame(
+                &mut host,
+                ipc::TsToRustMessageType::Run,
+                &run_payload_keyed(2, own, "export default 7", None, None, 10_000),
+            )
+            .unwrap();
+            assert_eq!(read_success_result(&mut host).0, 2);
+        }
+    }
+
+    #[test]
+    fn a_precompile_with_another_key_is_refused_and_the_connection_goes_on() {
+        for (own, sent, said) in KEY_MISMATCHES {
+            let (mut host, _done) = open_keyed_session(own);
+            let refused = ask(
+                &mut host,
+                ipc::TsToRustMessageType::Precompile,
+                precompile_keyed(1, "p", sent, "export default 1"),
+            );
+            assert_eq!(
+                refused.message_type,
+                ipc::RustToTsMessageType::PrecompileResult
+            );
+            assert_eq!(&refused.payload[..6], &[0, 0, 0, 1, 0, 1]);
+            let text = String::from_utf8_lossy(&refused.payload);
+            assert!(text.contains("ERR_INTERNAL"), "{text}");
+            let expected = format!(
+                "Precompile of prefix id \"p\" carries {said}, which does not match this runtime"
+            );
+            assert!(text.contains(&expected), "{own:?} {sent:?}: {text}");
+
+            // Nothing was stored: other code under the id is not ERR_PREFIX_ID_TAKEN.
+            let stored = ask(
+                &mut host,
+                ipc::TsToRustMessageType::Precompile,
+                precompile_keyed(2, "p", own, "export default 2"),
+            );
+            assert_eq!(stored.payload, [0, 0, 0, 2, 1, 0]);
+        }
+    }
+
+    #[test]
+    fn a_malformed_key_closes_the_connection() {
+        let (mut host, done) = open_keyed_session(Some("k"));
+        ipc::write_ts_to_rust_frame(
+            &mut host,
+            ipc::TsToRustMessageType::Run,
+            &run_payload_keyed(1, Some(""), "export default 1", None, None, 10_000),
+        )
+        .unwrap();
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("an empty key did not close the connection");
     }
 
     #[test]

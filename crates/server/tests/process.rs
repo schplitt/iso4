@@ -113,10 +113,11 @@ fn authenticate(stream: &mut UnixStream) {
     assert_eq!(read_frame(stream)[..2], [0x05, 0], "Hello, status ok");
 }
 
-/// A `Run` frame (run id 1) with no filename, default limits but `memory_mb`,
-/// no globals, imports or call.
+/// A `Run` frame (run id 1) with no key or filename, default limits but
+/// `memory_mb`, no globals, imports or call.
 fn send_run(stream: &mut UnixStream, code: &str, memory_mb: Option<u32>) {
     let mut p = 1u32.to_be_bytes().to_vec();
+    p.push(0);
     p.extend_from_slice(&(code.len() as u32).to_be_bytes());
     p.extend_from_slice(code.as_bytes());
     p.push(0);
@@ -206,7 +207,14 @@ fn a_missing_socket_directory_fails_at_the_pid_file() {
 
 #[test]
 fn bad_flag_values_are_fatal() {
-    for (flag, value) in [("--cores", "0"), ("--cores", "x"), ("--node-pid", "x")] {
+    let long_key = "k".repeat(201);
+    for (flag, value) in [
+        ("--cores", "0"),
+        ("--cores", "x"),
+        ("--node-pid", "x"),
+        ("--key", ""),
+        ("--key", long_key.as_str()),
+    ] {
         let out = run_to_exit(&["--socket", "/unused/sock", flag, value]);
         assert_eq!(out.status.code(), Some(1), "{flag} {value}");
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -301,6 +309,21 @@ fn a_signal_death_writes_one_line_and_keeps_the_signal() {
         assert_eq!(stderr.matches("fatal cause=").count(), 1, "{stderr}");
         assert!(stderr.contains(&line), "{stderr}");
     }
+}
+
+#[test]
+fn a_signal_line_carries_the_key() {
+    let (mut spawned, _stream) = spawn(&["--key", "a b\"c\nd"]);
+    assert_eq!(
+        unsafe { libc::kill(spawned.child.id() as i32, libc::SIGSEGV) },
+        0
+    );
+    let status = exit_within(&mut spawned.child, TIMEOUT).expect("child exited");
+    assert_eq!(status.signal(), Some(libc::SIGSEGV));
+    assert_eq!(
+        crash_file(&spawned),
+        "[iso4-v8] fatal cause=SIGSEGV key=\"a b\\\"c\\x0ad\"\n"
+    );
 }
 
 #[test]

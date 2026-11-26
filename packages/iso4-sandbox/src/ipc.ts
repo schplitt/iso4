@@ -1094,6 +1094,7 @@ export interface RunPayloadOptions {
 export function encodeRunPayload(options: RunPayloadOptions): Buffer {
   return new PayloadWriter()
     .writeU32(options.runId)
+    .writeOptionalString(undefined) // key: Node sends none yet
     .writeString(options.code)
     .writeOptionalString(options.filename)
     .writeHeapLimits(options.heap ?? {})
@@ -1148,6 +1149,7 @@ export function encodePrecompilePayload(options: PrecompilePayloadOptions): { pa
     .writeU32(options.requestId)
     .writeBytes(new Uint8Array(16)) // the hash, filled in below
     .writeString(options.id)
+    .writeOptionalString(undefined) // key: Node sends none yet
   const written = (): number => writer.parts.reduce((n, part) => n + part.byteLength, 0)
   const codeStart = written()
   writer.writeString(options.code).writeOptionalString(options.filename)
